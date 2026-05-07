@@ -8,21 +8,23 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <future>
 #include <memory>
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "yuzu/transport/transport.hpp"
 
 using namespace yuzu::transport;
 
-TEST_CASE("backend_name maps both backends", "[transport]") {
+TEST_CASE("backend_name maps both backends", "[transport][factory]") {
     REQUIRE(backend_name(Backend::Grpc) == "grpc");
     REQUIRE(backend_name(Backend::Msquic) == "msquic");
 }
 
-TEST_CASE("parse_backend recognises documented spellings", "[transport]") {
+TEST_CASE("parse_backend recognises documented spellings", "[transport][factory]") {
     auto g = parse_backend("grpc");
     REQUIRE(g.has_value());
     REQUIRE(g.value() == Backend::Grpc);
@@ -41,7 +43,7 @@ TEST_CASE("parse_backend recognises documented spellings", "[transport]") {
     REQUIRE(bad.error().code == StatusCode::InvalidArgument);
 }
 
-TEST_CASE("StatusCode numeric values match google.rpc.Code", "[transport]") {
+TEST_CASE("StatusCode numeric values match google.rpc.Code", "[transport][factory]") {
     // Wire-stability commitment: the integer values are FROZEN to match
     // google.rpc.Code / grpc::StatusCode. PR 1b will harden this with
     // a static_assert against the generated proto enum; the smoke
@@ -55,13 +57,13 @@ TEST_CASE("StatusCode numeric values match google.rpc.Code", "[transport]") {
     REQUIRE(static_cast<int>(StatusCode::Unauthenticated) == 16);
 }
 
-TEST_CASE("Frame size constants follow the documented hierarchy", "[transport]") {
+TEST_CASE("Frame size constants follow the documented hierarchy", "[transport][factory]") {
     REQUIRE(kDefaultMaxFrameSize == 4u * 1024u * 1024u);
     REQUIRE(kAbsoluteMaxFrameSize == 64u * 1024u * 1024u);
     REQUIRE(kDefaultMaxFrameSize < kAbsoluteMaxFrameSize);
 }
 
-TEST_CASE("make_channel(Grpc) returns a usable Channel", "[transport]") {
+TEST_CASE("make_channel(Grpc) returns a usable Channel", "[transport][factory]") {
     Endpoint target{"127.0.0.1", 0};
     Credentials creds{};       // plaintext-default
     creds.verify_peer = false; // permitted in test build
@@ -84,7 +86,7 @@ TEST_CASE("make_channel(Grpc) returns a usable Channel", "[transport]") {
     ch->close();
 }
 
-TEST_CASE("make_channel rejects asymmetric mTLS material", "[transport]") {
+TEST_CASE("make_channel rejects asymmetric mTLS material", "[transport][dispatch]") {
     // governance UP-1: cert-without-key (or vice versa) silently produces
     // a non-null but unusable channel. Hardening adds a pre-flight check;
     // the resulting Channel surfaces construction_error_ via every call.
@@ -109,7 +111,7 @@ TEST_CASE("make_channel rejects asymmetric mTLS material", "[transport]") {
     REQUIRE(r.status.code == StatusCode::Unauthenticated);
 }
 
-TEST_CASE("make_channel rejects BackoffPolicy invariant violation", "[transport]") {
+TEST_CASE("make_channel rejects BackoffPolicy invariant violation", "[transport][dispatch]") {
     // governance UP-5: initial_delay > max_delay would produce
     // implementation-defined gRPC reconnect behaviour.
     Endpoint target{"127.0.0.1", 0};
@@ -132,7 +134,7 @@ TEST_CASE("make_channel rejects BackoffPolicy invariant violation", "[transport]
     REQUIRE(r.status.detail.find("initial_delay") != std::string::npos);
 }
 
-TEST_CASE("make_channel(Msquic) returns nullptr in PR 1a (impl is PR 3)", "[transport]") {
+TEST_CASE("make_channel(Msquic) returns nullptr in PR 1a (impl is PR 3)", "[transport][factory]") {
     Endpoint target{"127.0.0.1", 0};
     Credentials creds{};
     creds.verify_peer = false;
@@ -141,7 +143,7 @@ TEST_CASE("make_channel(Msquic) returns nullptr in PR 1a (impl is PR 3)", "[tran
     REQUIRE(ch == nullptr);
 }
 
-TEST_CASE("ServerListener registers handlers and reports is_serving", "[transport]") {
+TEST_CASE("ServerListener registers handlers and reports is_serving", "[transport][lifecycle]") {
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);
     REQUIRE_FALSE(listener->is_serving());
@@ -172,7 +174,8 @@ TEST_CASE("ServerListener registers handlers and reports is_serving", "[transpor
     REQUIRE_FALSE(listener->is_serving());
 }
 
-TEST_CASE("ServerListener register_unary parity with register_bidi_stream", "[transport]") {
+TEST_CASE("ServerListener register_unary parity with register_bidi_stream",
+          "[transport][lifecycle]") {
     // governance qe-S1: register_unary's malformed-name path was
     // structurally validated via the shared enforce_method_or_die but
     // not directly exercised. Add explicit coverage.
@@ -201,7 +204,7 @@ TEST_CASE("ServerListener register_unary parity with register_bidi_stream", "[tr
                       std::invalid_argument);
 }
 
-TEST_CASE("ServerListener rejects duplicate registration", "[transport]") {
+TEST_CASE("ServerListener rejects duplicate registration", "[transport][lifecycle]") {
     // governance UP-7: silent first-wins on collision is a debugging
     // foot-gun. Hardening makes the contract "throw on collision."
     auto listener = make_server_listener(Backend::Grpc);
@@ -234,7 +237,8 @@ TEST_CASE("ServerListener rejects duplicate registration", "[transport]") {
                       std::invalid_argument);
 }
 
-TEST_CASE("Channel::unary against unreachable target returns Unavailable", "[transport]") {
+TEST_CASE("Channel::unary against unreachable target returns Unavailable",
+          "[transport][dispatch]") {
     // PR 1b-1: real gRPC dispatch via grpc::GenericStub.
     // 127.0.0.1 with an unused port is the canonical unreachable target.
     // gRPC reports Unavailable for connect refused (or DeadlineExceeded
@@ -266,7 +270,7 @@ TEST_CASE("Channel::unary against unreachable target returns Unavailable", "[tra
              r.status.code == StatusCode::DeadlineExceeded));
 }
 
-TEST_CASE("Channel::unary serialize failure returns Internal", "[transport]") {
+TEST_CASE("Channel::unary serialize failure returns Internal", "[transport][dispatch]") {
     Endpoint target{"127.0.0.1", 1};
     Credentials creds{};
     creds.verify_peer = false;
@@ -288,7 +292,7 @@ TEST_CASE("Channel::unary serialize failure returns Internal", "[transport]") {
     REQUIRE(r.status.code == StatusCode::Internal);
 }
 
-TEST_CASE("Channel::unary cancel via stop_token returns Cancelled", "[transport]") {
+TEST_CASE("Channel::unary cancel via stop_token returns Cancelled", "[transport][dispatch]") {
     Endpoint target{"127.0.0.1", 1};
     Credentials creds{};
     creds.verify_peer = false;
@@ -360,31 +364,15 @@ private:
     std::string data_;
 };
 
-// Pick an ephemeral port by binding then immediately reading the
-// allocated port back from the listener. start() with port 0 instructs
-// the OS to assign a free port; we discover which one it picked via
-// the address gRPC reports back.
-//
-// Simpler: we bind start() with port 0 on a separate ServerBuilder
-// pre-flight, retrieve the port via the standard AddListeningPort
-// out-parameter, then re-use that port.
-//
-// Easier still: use port 0 as the bind, and use start_with_assigned_port
-// helper that returns the actual port. ServerBuilder::AddListeningPort
-// in gRPC takes an int* selected_port out-parameter that fills in the
-// chosen port AFTER BuildAndStart. The current ServerListener API doesn't
-// expose that — we work around by binding an ephemeral via a probe socket.
-//
-// For the smoke test we use a fixed high-numbered port and accept the
-// vanishingly-small race risk that another test on the same runner
-// claims it concurrently. (CI has no parallel test execution within a
-// single test binary; the only race is across binaries and these tests
-// are single-binary.)
-constexpr uint16_t kRoundTripPort = 50571;
+// Round-trip tests bind 127.0.0.1 with port 0 (ephemeral). After a
+// successful start(), listener->bound_endpoint() returns the
+// OS-assigned port; tests then connect a Channel against that port.
+// This eliminates the TIME_WAIT / CI-rerun flakiness of fixed ports
+// (governance qe-F1).
 
 } // namespace
 
-TEST_CASE("Client/server unary round-trip with registered handler", "[transport]") {
+TEST_CASE("Client/server unary round-trip with registered handler", "[transport][round-trip]") {
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);
 
@@ -404,13 +392,15 @@ TEST_CASE("Client/server unary round-trip with registered handler", "[transport]
     Credentials creds{};
     creds.verify_peer = false;
     creds.client_cert_mode = ClientCertMode::None;
-    Endpoint bind{"127.0.0.1", kRoundTripPort};
+    Endpoint bind{"127.0.0.1", 0}; // ephemeral port — avoids TIME_WAIT flake
     auto start_r = listener->start(bind, creds);
     REQUIRE(start_r.has_value());
     REQUIRE(listener->is_serving());
+    Endpoint bound = listener->bound_endpoint();
+    REQUIRE(bound.port != 0);
 
     // Client side
-    auto ch = make_channel(Backend::Grpc, bind, creds);
+    auto ch = make_channel(Backend::Grpc, bound, creds);
     REQUIRE(ch != nullptr);
     REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
 
@@ -426,18 +416,20 @@ TEST_CASE("Client/server unary round-trip with registered handler", "[transport]
     REQUIRE_FALSE(listener->is_serving());
 }
 
-TEST_CASE("Client/server unary returns Unimplemented for unknown method", "[transport]") {
+TEST_CASE("Client/server unary returns Unimplemented for unknown method",
+          "[transport][round-trip]") {
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);
 
     Credentials creds{};
     creds.verify_peer = false;
     creds.client_cert_mode = ClientCertMode::None;
-    Endpoint bind{"127.0.0.1", static_cast<uint16_t>(kRoundTripPort + 1)};
+    Endpoint bind{"127.0.0.1", 0};
     auto start_r = listener->start(bind, creds);
     REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
 
-    auto ch = make_channel(Backend::Grpc, bind, creds);
+    auto ch = make_channel(Backend::Grpc, bound, creds);
     REQUIRE(ch != nullptr);
     REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
 
@@ -451,7 +443,8 @@ TEST_CASE("Client/server unary returns Unimplemented for unknown method", "[tran
     listener->shutdown();
 }
 
-TEST_CASE("Client/server unary propagates handler-returned error status", "[transport]") {
+TEST_CASE("Client/server unary propagates handler-returned error status",
+          "[transport][round-trip]") {
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);
 
@@ -467,11 +460,12 @@ TEST_CASE("Client/server unary propagates handler-returned error status", "[tran
     Credentials creds{};
     creds.verify_peer = false;
     creds.client_cert_mode = ClientCertMode::None;
-    Endpoint bind{"127.0.0.1", static_cast<uint16_t>(kRoundTripPort + 2)};
+    Endpoint bind{"127.0.0.1", 0};
     auto start_r = listener->start(bind, creds);
     REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
 
-    auto ch = make_channel(Backend::Grpc, bind, creds);
+    auto ch = make_channel(Backend::Grpc, bound, creds);
     REQUIRE(ch != nullptr);
     REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
 
@@ -486,7 +480,97 @@ TEST_CASE("Client/server unary propagates handler-returned error status", "[tran
     listener->shutdown();
 }
 
-TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport]") {
+TEST_CASE("Client/server unary scrubs handler-thrown what() before wire",
+          "[transport][round-trip]") {
+    // governance sec-F1: handler exception what() must NOT cross the wire.
+    // The dispatcher returns Internal with a static "handler raised exception"
+    // string; the original what() is logged server-side, never sent.
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, const SerializableMessage&,
+                      SerializableMessage&) -> Status {
+        throw std::runtime_error("INTERNAL_DEPLOYMENT_PATH=/etc/secret");
+    };
+    auto factory = []() -> std::unique_ptr<SerializableMessage> {
+        return std::make_unique<StringMessage>();
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Throws", factory, factory, handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    auto start_r = listener->start(bind, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Grpc, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    StringMessage req, resp;
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    auto r = ch->unary("yuzu.test.v1.Echo/Throws", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Internal);
+    // Static summary, NOT the what() text that contained INTERNAL_DEPLOYMENT_PATH.
+    REQUIRE(r.status.detail.find("INTERNAL_DEPLOYMENT_PATH") == std::string::npos);
+    REQUIRE(r.status.detail.find("/etc/secret") == std::string::npos);
+    REQUIRE(r.status.detail.find("handler raised") != std::string::npos);
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("Client/server unary serialises N concurrent calls cleanly", "[transport][round-trip]") {
+    // governance qe-F5: dispatcher thread-safety under concurrent load.
+    // The cq_worker is single-threaded so handlers serialise; this test
+    // proves no race in the state machine and no leak across N completions.
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, const SerializableMessage& req,
+                      SerializableMessage& resp) -> Status {
+        const auto& sreq = static_cast<const StringMessage&>(req);
+        auto& sresp = static_cast<StringMessage&>(resp);
+        sresp.set_data("ok:" + sreq.data());
+        return Status{StatusCode::Ok, ""};
+    };
+    auto factory = []() -> std::unique_ptr<SerializableMessage> {
+        return std::make_unique<StringMessage>();
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Concurrent", factory, factory, handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    auto start_r = listener->start(bind, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    constexpr int N = 8;
+    std::vector<std::future<Status>> futures;
+    for (int i = 0; i < N; ++i) {
+        futures.push_back(std::async(std::launch::async, [bound, &creds, i] {
+            auto ch = make_channel(Backend::Grpc, bound, creds);
+            ch->wait_for_connected(std::chrono::seconds(2));
+            StringMessage req(std::to_string(i)), resp;
+            CallContext ctx;
+            ctx.deadline = std::chrono::seconds(5);
+            auto r = ch->unary("yuzu.test.v1.Echo/Concurrent", ctx, req, resp);
+            return r.status;
+        }));
+    }
+    for (auto& f : futures) {
+        REQUIRE(f.get().code == StatusCode::Ok);
+    }
+
+    listener->shutdown();
+}
+
+TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport][lifecycle]") {
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);
 

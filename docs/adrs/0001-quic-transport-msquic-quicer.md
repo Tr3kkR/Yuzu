@@ -206,6 +206,33 @@ clean across the whole gateway after the migration.
 | DPI / TLS-interception middleboxes (Bluecoat, Symantec ProxySG) cannot inspect QUIC handshake | Document operator bypass-list procedure for the Yuzu control-plane FQDN; add to security-hardening doc pre-PR 5; pilot-customer hand-test gate validates each design partner's DPI environment before default-flip |
 | Compliance questionnaire answer becomes stale (BoringSSL → OpenSSL/msquic) | Follow-up issue tracks questionnaire-update package (CAIQ encryption row, architecture whitepaper transport section, DPA "encryption in transit" annex, shared-responsibility matrix network-layer row) due no later than PR 6 (default-flip) merge |
 
+## Implementation status
+
+In-repo tracking of the migration progress so future Claude sessions
+and SOC 2 auditors can see what has shipped without grepping git log
+(governance round-3 F-5 + round-4 doc-S3).
+
+| PR | Description | Status |
+|---|---|---|
+| PR 0 | Spike (msquic ↔ quicer echo) | Pending — see "Spike validation gate" below |
+| PR 1a | Transport abstraction skeleton (header, proto, build wiring) | Merged |
+| PR 1b-1 | Client-side unary dispatch (grpc::GenericStub callback API) | Merged |
+| PR 1b-2 | Server-side AsyncGenericService dispatcher + ServerCall state machine | Merged |
+| PR 1b-3 | Client/server bidi-stream wiring (PrepareCall, ServerAsyncReaderWriter) | Pending |
+| PR 1c | Lift `agent.cpp` / `server.cpp` / `agent_service_impl` / `agent_registry` / `gateway_service_impl` onto Channel + ServerListener; populate CallContext::peer_san_identities; consult YUZU_ALLOW_INSECURE_TLS gate inside transport | Pending |
+| PR 2 | Conan toolchain bring-up (parallel to vcpkg) | Pending |
+| PR 3 | msquic transport implementation behind the same abstraction | Pending |
+| PR 4 | quicer Erlang gateway transport | Pending |
+| PR 5 | Dual-stack feature flag (`--transport=grpc|quic|auto`) | Pending |
+| PR 6 | Agent default cutover to QUIC | Pending |
+| PR 7 | Gateway default cutover to QUIC | Pending |
+| PR 8 | Big delete (gRPC + grpcbox + abseil + meson option-D + #501 absl-DLL workarounds) | Pending |
+| PR 9 | vcpkg deletion (Conan-only) | Pending |
+
+Update this table at every merge to `feat/quic-transport`. The table
+is the canonical "where are we" reference; the commit log is the
+audit trail.
+
 ## Spike validation gate (PR 0)
 
 Before any production code is written, PR 0 includes a throwaway spike

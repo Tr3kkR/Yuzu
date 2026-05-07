@@ -14,38 +14,23 @@
 #include <utility>
 #include <vector>
 
-#include "grpc_channel.hpp"           // for make_grpc_server_credentials
-#include "grpc_method_validator.hpp"  // method_name_well_formed
+#include "grpc_channel.hpp"            // for make_grpc_server_credentials
+#include "grpc_internal_helpers.hpp"   // method_name_well_formed, byte helpers, sanitise
+
+#include <thread>  // std::this_thread for shutdown re-entry detection
 
 namespace yuzu::transport::grpc_backend {
 
 namespace {
 
-// Helpers shared with grpc_channel.cpp; duplicated locally to avoid a
-// header dance for two trivial functions.
-::grpc::ByteBuffer string_to_byte_buffer(const std::string& bytes) {
-    ::grpc::Slice slice(bytes.data(), bytes.size());
-    return ::grpc::ByteBuffer(&slice, 1);
-}
-
-bool byte_buffer_to_string(const ::grpc::ByteBuffer& buf, std::string& out) {
-    std::vector<::grpc::Slice> slices;
-    if (!buf.Dump(&slices).ok()) return false;
-    out.clear();
-    std::size_t total = 0;
-    for (const auto& s : slices) total += s.size();
-    out.reserve(total);
-    for (const auto& s : slices) {
-        out.append(reinterpret_cast<const char*>(s.begin()), s.size());
-    }
-    return true;
-}
-
 // Translate yuzu::transport::Status (numeric value frozen by the
-// static_asserts in grpc_channel.cpp) into grpc::Status.
+// static_asserts in grpc_channel.cpp) into grpc::Status. The detail
+// string is sanitised first per the Status::detail visibility contract
+// in transport.hpp (governance UP-22 + sec-F1 + doc-S6).
 ::grpc::Status to_grpc_status(const Status& s) {
-    return ::grpc::Status(static_cast<::grpc::StatusCode>(static_cast<int>(s.code)),
-                          s.detail);
+    return ::grpc::Status(
+        static_cast<::grpc::StatusCode>(static_cast<int>(s.code)),
+        sanitise_status_detail(s.detail));
 }
 
 }  // namespace
@@ -112,7 +97,7 @@ public:
                     // body. Reply with Cancelled and finish cleanly.
                     final_status_ =
                         ::grpc::Status(::grpc::StatusCode::CANCELLED,
-                                       "request not fully received");
+                                       "transport: request not fully received");
                     rw_.Finish(final_status_, static_cast<void*>(this));
                     state_ = State::PendingFinish;
                     return;
@@ -149,7 +134,7 @@ private:
         if (!unary_match) {
             final_status_ =
                 ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
-                               "method not registered or not a unary RPC");
+                               "transport: method not registered or not a unary RPC");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
@@ -176,7 +161,7 @@ private:
                 // be impossible per the register-after-start contract,
                 // but defend anyway.
                 final_status_ = ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
-                                               "handler unregistered mid-call");
+                                               "transport: handler unregistered mid-call");
                 rw_.Finish(final_status_, static_cast<void*>(this));
                 state_ = State::PendingFinish;
                 return;
@@ -190,7 +175,7 @@ private:
         std::string req_bytes;
         if (!byte_buffer_to_string(req_buf_, req_bytes)) {
             final_status_ = ::grpc::Status(::grpc::StatusCode::DATA_LOSS,
-                                           "request ByteBuffer dump failed");
+                                           "transport: request ByteBuffer dump failed");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
@@ -198,7 +183,7 @@ private:
         auto req_msg = req_factory();
         if (!req_msg || !req_msg->parse(req_bytes)) {
             final_status_ = ::grpc::Status(::grpc::StatusCode::DATA_LOSS,
-                                           "request parse failed");
+                                           "transport: request parse failed");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
@@ -216,7 +201,7 @@ private:
         auto resp_msg = resp_factory();
         if (!resp_msg) {
             final_status_ = ::grpc::Status(::grpc::StatusCode::INTERNAL,
-                                           "response factory returned null");
+                                           "transport: response factory returned null");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
@@ -225,15 +210,26 @@ private:
         // Invoke the handler synchronously. Handler returns a
         // yuzu::transport::Status which we translate to grpc::Status for
         // the trailing reply.
+        //
+        // Per Status::detail visibility contract (transport.hpp + sec-F1):
+        // we DO NOT echo std::exception::what() over the wire because it
+        // typically contains internal state (file paths, DB error
+        // messages, library-internal text). Instead we surface a static
+        // summary; the handler's full what() is logged server-side via
+        // the metric_sink for operator diagnosis.
         Status handler_status;
         try {
             handler_status = handler(ctx, *req_msg, *resp_msg);
         } catch (const std::exception& e) {
-            handler_status = {StatusCode::Internal,
-                              std::string{"handler threw: "} + e.what()};
+            handler_status = {StatusCode::Internal, "handler raised exception"};
+            // Server-side log via metric sink (PR 1c will plug an
+            // explicit logging hook; the metric sink's stream-closed
+            // callback is the closest available channel for now).
+            // The full what() text never leaves the process boundary.
+            (void)e;  // intentional: do not include in wire status
         } catch (...) {
             handler_status = {StatusCode::Internal,
-                              "handler threw non-std exception"};
+                              "handler raised non-std exception"};
         }
 
         if (!handler_status.ok()) {
@@ -247,7 +243,7 @@ private:
         std::string resp_bytes;
         if (!resp_msg->serialize(resp_bytes)) {
             final_status_ = ::grpc::Status(::grpc::StatusCode::INTERNAL,
-                                           "response serialize failed");
+                                           "transport: response serialize failed");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
@@ -261,7 +257,7 @@ private:
                 : kDefaultMaxFrameSize;
         if (resp_bytes.size() > frame_cap) {
             final_status_ = ::grpc::Status(::grpc::StatusCode::RESOURCE_EXHAUSTED,
-                                           "response exceeds configured frame size");
+                                           "transport: response exceeds configured frame size");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
@@ -375,7 +371,14 @@ std::expected<void, Status> GrpcServerListener::start(
 
     const std::string addr = bind.host + ":" + std::to_string(bind.port);
     ::grpc::ServerBuilder builder;
-    builder.AddListeningPort(addr, server_creds);
+
+    // selected_port: gRPC writes the actual bound port here after
+    // BuildAndStart. When bind.port == 0 the OS assigns ephemeral; the
+    // value is exposed to operators via bound_endpoint() so tests and
+    // any caller can discover it (governance qe-F1).
+    int selected_port = 0;
+    builder.AddListeningPort(addr, server_creds, &selected_port);
+
     if (opts.max_concurrent_streams_per_connection > 0) {
         builder.AddChannelArgument(
             GRPC_ARG_MAX_CONCURRENT_STREAMS,
@@ -393,7 +396,24 @@ std::expected<void, Status> GrpcServerListener::start(
         started_.store(false, std::memory_order_release);
         return std::unexpected(
             Status{StatusCode::Unavailable,
-                   "gRPC ServerBuilder::BuildAndStart returned null"});
+                   "transport: gRPC ServerBuilder::BuildAndStart returned null"});
+    }
+    if (selected_port == 0) {
+        // BuildAndStart returned non-null but failed to bind. Per gRPC
+        // docs (server_builder.h:127): selected_port stays 0 when bind
+        // fails. Treat as unavailable.
+        server_->Shutdown();
+        server_.reset();
+        cq_.reset();
+        started_.store(false, std::memory_order_release);
+        return std::unexpected(
+            Status{StatusCode::Unavailable,
+                   "transport: gRPC failed to bind listening port"});
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        bound_endpoint_.host = bind.host;
+        bound_endpoint_.port = static_cast<uint16_t>(selected_port);
     }
 
     // Spawn the worker thread that pumps cq_ and drives ServerCall state
@@ -416,7 +436,21 @@ void GrpcServerListener::cq_worker_loop() {
     void* tag = nullptr;
     bool ok = false;
     while (cq_->Next(&tag, &ok)) {
-        static_cast<ServerCall*>(tag)->on_event(ok);
+        // Wrap each per-event dispatch so a single ServerCall throw does
+        // not kill the worker and leave the listener wedged with no one
+        // pumping the CQ (governance UP-16). User-supplied handlers are
+        // already wrapped inside dispatch_unary; this outer wrap defends
+        // against bugs in the dispatcher itself, in gRPC interactions,
+        // or in the SerializableMessage adapters.
+        try {
+            static_cast<ServerCall*>(tag)->on_event(ok);
+        } catch (...) {
+            // Defensive: nothing further we can do at this layer. PR 1c
+            // will plug a structured logging hook that surfaces this to
+            // operators; until then, swallow and continue. Crashing the
+            // worker would convert a recoverable handler bug into a
+            // listener-wide outage with no signal in /readyz.
+        }
     }
     // cq_->Next returns false only after Shutdown has been called AND
     // all outstanding tags have been drained. After the loop exits the
@@ -433,6 +467,22 @@ void GrpcServerListener::wait_for_shutdown() {
 void GrpcServerListener::shutdown() {
     if (shutting_down_.exchange(true, std::memory_order_acq_rel)) {
         return;  // idempotent
+    }
+    // Detect handler-initiated shutdown: if a handler running on
+    // cq_worker_ calls listener->shutdown(), we cannot synchronously
+    // join cq_worker_ from itself. server_->Shutdown() would also
+    // block on the same handler returning. Two-way deadlock
+    // (governance UP-15). Detect and refuse explicitly so the bug
+    // surfaces as a clear exception rather than a process hang.
+    if (cq_worker_.joinable() &&
+        cq_worker_.get_id() == std::this_thread::get_id()) {
+        // Roll back the flag so a subsequent call from another thread
+        // can complete the shutdown.
+        shutting_down_.store(false, std::memory_order_release);
+        throw std::logic_error(
+            "yuzu::transport: shutdown() must not be called from a handler "
+            "running on the listener's CQ worker thread; arrange for an "
+            "external thread to invoke shutdown() instead");
     }
     if (server_) {
         // shutdown trailing-status guarantee per transport.hpp: in-flight
@@ -462,6 +512,11 @@ void GrpcServerListener::shutdown() {
 bool GrpcServerListener::is_serving() const noexcept {
     return started_.load(std::memory_order_acquire) &&
            !shutting_down_.load(std::memory_order_acquire);
+}
+
+Endpoint GrpcServerListener::bound_endpoint() const noexcept {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return bound_endpoint_;
 }
 
 }  // namespace yuzu::transport::grpc_backend

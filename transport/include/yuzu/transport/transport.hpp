@@ -138,6 +138,28 @@ enum class StatusCode : int {
     Unauthenticated    = 16,
 };
 
+// Status::detail is ALWAYS transmitted to the remote peer over the
+// wire (gRPC carries it as the `grpc-message` HTTP/2 trailer). Treat
+// detail as a CLIENT-FACING string:
+//
+//   * Do not embed internal memory addresses, file paths, raw exception
+//     messages from internal libraries (DB driver, filesystem, OS), or
+//     any deployment-internal state.
+//   * For exception-driven error paths, prefer a static summary
+//     ("handler raised <ExceptionType>") rather than e.what(). The
+//     transport layer's dispatcher sanitises std::exception::what() to
+//     just the type name; it does NOT echo the message text into the
+//     wire status. Application handlers wishing to deliver caller-
+//     diagnosable detail should populate Status::detail explicitly with
+//     a sanitised message.
+//   * Transport-internal detail strings (returned by the transport
+//     layer itself, not by application handlers) carry the
+//     `"transport: "` prefix; handler-returned details have no prefix.
+//     Operators can grep status records to distinguish the two.
+//   * Detail must be ASCII printable. NUL bytes are silently mangled
+//     by gRPC's HTTP/2 trailer encoding (governance UP-22); the
+//     transport layer rejects detail strings exceeding 1024 bytes
+//     to prevent metadata-header bloat.
 struct Status {
     StatusCode code = StatusCode::Ok;
     std::string detail;
@@ -604,6 +626,17 @@ public:
     // not been called. Required for the dual-stack readiness probe
     // conjunction in PR 5+.
     virtual bool is_serving() const noexcept = 0;
+
+    // Returns the actual address the listener is bound to. After a
+    // successful start(), `port` is the OS-assigned port if the
+    // caller passed `bind.port = 0` for ephemeral allocation.
+    // Returns `{"", 0}` if start() has not succeeded.
+    //
+    // Use this to discover the bound port for tests and any caller
+    // that asked for ephemeral allocation. Documented contract: the
+    // returned value is stable across the lifetime of the listener
+    // (until shutdown), so callers may cache it.
+    virtual Endpoint bound_endpoint() const noexcept = 0;
 };
 
 // =====================================================================

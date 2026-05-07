@@ -19,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-#include "grpc_method_validator.hpp"  // method_name_well_formed
+#include "grpc_internal_helpers.hpp"  // method_name_well_formed, byte helpers, sanitise
 #include "transport.pb.h"             // proto StatusCode enum for static_assert
 #include "yuzu/secure_zero.hpp"
 
@@ -245,28 +245,10 @@ GrpcChannel::~GrpcChannel() {
 
 namespace {
 
-// Convert std::string bytes to grpc::ByteBuffer (single slice).
-::grpc::ByteBuffer string_to_byte_buffer(const std::string& bytes) {
-    ::grpc::Slice slice(bytes.data(), bytes.size());
-    return ::grpc::ByteBuffer(&slice, 1);
-}
-
-// Drain a grpc::ByteBuffer's slices into a flat std::string.
-bool byte_buffer_to_string(const ::grpc::ByteBuffer& buf, std::string& out) {
-    std::vector<::grpc::Slice> slices;
-    if (!buf.Dump(&slices).ok()) return false;
-    out.clear();
-    std::size_t total = 0;
-    for (const auto& s : slices) total += s.size();
-    out.reserve(total);
-    for (const auto& s : slices) {
-        out.append(reinterpret_cast<const char*>(s.begin()), s.size());
-    }
-    return true;
-}
-
 // Map gRPC's status enum to ours. Numeric values are FROZEN to match;
-// the static_assert block above pins this at compile time.
+// the static_assert block above pins this at compile time. Helpers
+// for ByteBuffer<->string and method-name validation live in
+// grpc_internal_helpers.hpp.
 StatusCode map_grpc_status(::grpc::StatusCode g) noexcept {
     return static_cast<StatusCode>(static_cast<int>(g));
 }
@@ -292,7 +274,7 @@ CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
     }
     if (!generic_stub_ || !channel_) {
         r.status = {StatusCode::Unavailable,
-                    "grpc_transport: channel not constructed"};
+                    "transport: channel not constructed"};
         return r;
     }
 
@@ -300,14 +282,14 @@ CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
     std::string req_bytes;
     if (!request.serialize(req_bytes)) {
         r.status = {StatusCode::Internal,
-                    "grpc_transport: request serialize failed"};
+                    "transport: request serialize failed"};
         return r;
     }
     if (req_bytes.size() > kAbsoluteMaxFrameSize) {
         // Outbound frame cap (absolute ceiling on the client side; per-listener
         // cap on the server side via ListenerOptions::max_frame_size).
         r.status = {StatusCode::ResourceExhausted,
-                    "grpc_transport: request exceeds kAbsoluteMaxFrameSize"};
+                    "transport: request exceeds kAbsoluteMaxFrameSize"};
         return r;
     }
 
@@ -325,7 +307,7 @@ CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
         if (k.size() > kMaxMetadataKeySize ||
             v.size() > kMaxMetadataValueSize) {
             r.status = {StatusCode::ResourceExhausted,
-                        "grpc_transport: metadata oversized"};
+                        "transport: metadata oversized"};
             return r;
         }
         gctx.AddMetadata(k, v);
@@ -373,17 +355,24 @@ CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
         std::string resp_bytes;
         if (!byte_buffer_to_string(resp_buf, resp_bytes)) {
             r.status = {StatusCode::DataLoss,
-                        "grpc_transport: response ByteBuffer dump failed"};
-        } else if (resp_bytes.size() > kAbsoluteMaxFrameSize) {
-            r.status = {StatusCode::ResourceExhausted,
-                        "grpc_transport: response exceeds kAbsoluteMaxFrameSize"};
-        } else if (!response.parse(resp_bytes)) {
-            // Per the parse() contract: false = wire corruption, fatal
-            // for the call. Translate to DataLoss.
-            r.status = {StatusCode::DataLoss,
-                        "grpc_transport: response parse failed"};
-        } else if (metric_sink_) {
-            metric_sink_->on_bytes_received("grpc", resp_bytes.size());
+                        "transport: response ByteBuffer dump failed"};
+        } else {
+            // Report bytes received BEFORE the frame-cap / parse gates so
+            // an oversized or malformed response still increments the
+            // counter — operators monitoring traffic want absolute bytes
+            // even on failure (governance HP-1).
+            if (metric_sink_) {
+                metric_sink_->on_bytes_received("grpc", resp_bytes.size());
+            }
+            if (resp_bytes.size() > kAbsoluteMaxFrameSize) {
+                r.status = {StatusCode::ResourceExhausted,
+                            "transport: response exceeds kAbsoluteMaxFrameSize"};
+            } else if (!response.parse(resp_bytes)) {
+                // Per the parse() contract: false = wire corruption, fatal
+                // for the call. Translate to DataLoss.
+                r.status = {StatusCode::DataLoss,
+                            "transport: response parse failed"};
+            }
         }
     }
 

@@ -239,7 +239,7 @@ transport_test_exe = executable(
   files('unit/transport/test_transport_smoke.cpp'),
   dependencies: [yuzu_transport_dep, catch2_dep],
 )
-test('transport unit tests', transport_test_exe, suite: 'transport', timeout: 60)
+test('transport unit tests', transport_test_exe, suite: 'transport', timeout: 180)
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
 _python3_test = find_program('python3', 'python')

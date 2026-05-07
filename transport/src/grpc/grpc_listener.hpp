@@ -55,6 +55,7 @@ public:
     void wait_for_shutdown() override;
     void shutdown() override;
     bool is_serving() const noexcept override;
+    Endpoint bound_endpoint() const noexcept override;
 
 private:
     struct UnaryRegistration {
@@ -77,6 +78,7 @@ private:
     std::map<std::string, UnaryRegistration> unary_handlers_;
     std::map<std::string, BidiStreamHandler> bidi_handlers_;
     ListenerOptions                          opts_;
+    Endpoint                                 bound_endpoint_;  // populated post-BuildAndStart
     std::unique_ptr<::grpc::Server>          server_;
     ::grpc::AsyncGenericService              generic_service_;
     std::unique_ptr<::grpc::ServerCompletionQueue> cq_;
