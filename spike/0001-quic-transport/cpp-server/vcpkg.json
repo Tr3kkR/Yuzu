@@ -4,5 +4,7 @@
   "description": "Throwaway msquic echo server for #376 PR 0 spike",
   "dependencies": [
     "msquic"
-  ]
+  ],
+  "_comment_baseline": "Pinned to the same vcpkg baseline as the root manifest so re-running the spike picks the same msquic version (2.4.8) the original evidence captured. Without this pin, vcpkg resolves against HEAD and silent version drift invalidates the audit-evidence README. Bump in lockstep with the root vcpkg.json baseline (governance round 5 build-ci S1 / UP-49).",
+  "builtin-baseline": "4b77da7fed37817f124936239197833469f1b9a8"
 }

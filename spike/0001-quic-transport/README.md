@@ -5,6 +5,18 @@ this directory exists only to validate the four pass criteria from the
 "Spike validation gate (PR 0)" section before any production code is
 written. Evidence captured under `docs/spike-results/0001-quic-transport/`.
 
+**Validated only on macOS arm64.** The CMakeLists.txt enforces this with a
+`FATAL_ERROR` gate; to re-run on another platform, replace `arm64-osx` in
+the toolchain paths with the matching vcpkg triplet. Multi-platform
+validation lands with PR 3 (msquic production transport) and PR 4 (quicer
+gateway).
+
+**Server-only TLS, NOT mTLS.** The spike server accepts any client without
+requesting a certificate. Pass criterion 1 ("TLS 1.3 handshake succeeds")
+is server-auth-only. Production transport defaults to
+`ClientCertMode::Require`; PR 3 must additionally validate mutual auth.
+Do NOT copy the spike's credential config block into production.
+
 ## Layout
 
 ```

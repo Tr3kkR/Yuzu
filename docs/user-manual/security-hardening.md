@@ -75,6 +75,15 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 - Never expose gRPC ports (50051/50052) to the internet
 - Use a reverse proxy (nginx, Caddy) for TLS termination on the dashboard
 
+> **Coming in #376 — QUIC transport migration.** PR 5 of the QUIC
+> migration adds a `--transport=grpc|quic|auto` flag and dual-stack
+> support; once the agent default flips (PR 6), the agent and gateway
+> will additionally need outbound UDP reachability on the same numeric
+> ports above. This table will be updated when PR 5 lands. Customers in
+> Zscaler / Netskope / Bluecoat environments should anticipate
+> validating UDP egress; tracking under #892 (pilot-customer hand-test
+> gate).
+
 ## Least-Privilege Deployment
 
 The systemd service units include security hardening:

@@ -2,7 +2,10 @@
 
 - **Status**: Accepted — spike validation passed 2026-05-07
   (`docs/spike-results/0001-quic-transport/README.md`).
-- **Accepted-by**: Nathan Dornbrook (project lead) on 2026-05-07
+- **Accepted-by**: Nathan Dornbrook (project lead) on 2026-05-07.
+  Approval references the spike-results files committed in `af706ea` and
+  the surrounding governance hardening rolled into governance round 5
+  (this branch); both are in-tree under git tamper-evidence.
 - **Date**: 2026-05-07
 - **Tracking issue**: #376
 - **Supersedes**: prior implicit decision to use gRPC (no ADR existed)
@@ -134,22 +137,38 @@ mTLS is preserved via msquic's TLS API.
 ### Cryptographic module posture (Workstream C)
 
 The current gRPC stack uses BoringSSL (vcpkg's gRPC port links its
-embedded copy). Post-migration the C++ side uses msquic with OpenSSL
-3.x on Linux/macOS and on Windows (we pin away from schannel for
-symmetry). The Erlang gateway side already uses OpenSSL via OTP's
-crypto application.
+embedded copy). Post-migration the C++ side uses msquic with
+**quictls/openssl 3.1.7-quic1** on Linux/macOS and on Windows (we pin
+away from schannel for symmetry). The Erlang gateway side continues to
+use upstream OpenSSL via OTP's crypto application.
+
+The fork distinction matters for compliance:
+- `quictls/openssl 3.1.7-quic1` is a **fork** of upstream OpenSSL 3.1.x
+  maintained by the QUIC ecosystem to add the QUIC API extensions
+  removed from the upstream 3.2 line. vcpkg's msquic 2.4.8 port vendors
+  it directly. It is NOT the upstream OpenSSL 3.x line.
+- The fork does not share an upstream-coordinated CVE disclosure
+  timeline with OpenSSL. A vulnerability patched in upstream 3.1.x may
+  be patched in the fork at a later date; Yuzu's exposure window is
+  bounded by the fork's release cadence and our vcpkg msquic port-bump
+  latency. CVE monitoring posture for the fork is part of the
+  questionnaire-update package (#891).
+- Customer-questionnaire answers MUST cite the fork explicitly, not
+  "OpenSSL 3.x".
 
 Yuzu does not currently claim FIPS 140-3 validation. If a future
-customer requires FIPS-validated TLS, OpenSSL 3.x ships a FIPS provider
-that satisfies that bar with explicit configuration; the migration
-preserves the option without committing to it. BoringSSL has its own
-FIPS-validated build (BoringCrypto) used by some downstream consumers,
-but Yuzu has never relied on it.
+customer requires FIPS-validated TLS, upstream OpenSSL 3.x ships a FIPS
+provider that satisfies that bar with explicit configuration; the
+quictls fork is NOT FIPS-validated. The migration preserves the
+upstream-OpenSSL FIPS option for a future re-platform without
+committing to it. BoringSSL has its own FIPS-validated build
+(BoringCrypto) used by some downstream consumers, but Yuzu has never
+relied on it.
 
-This posture is a customer-questionnaire-relevant change. The follow-up
-issue tracking the questionnaire-update package (CAIQ encryption row,
-architecture whitepaper transport section, DPA "encryption in transit"
-annex) is referenced in the consequences section below.
+This posture is a customer-questionnaire-relevant change. **Tracking
+issue: #891** — covers CAIQ encryption row, architecture whitepaper
+transport section, DPA "encryption in transit" annex, SRM network-layer
+row, and the fork-CVE-monitoring posture. Hard gate before PR 6 merge.
 
 ## Why quicer specifically
 
@@ -202,9 +221,9 @@ clean across the whole gateway after the migration.
 | mTLS cert rotation on msquic vs grpc::SslCredentials | PR 3 explicitly tests `cert_reloader` rotation; design `Credentials` interface to expose a reload callback; cert lifecycle policy doc required pre-PR 3 merge (Workstream B) |
 | quicer NIF crash takes BEAM VM down | Isolate quicer-using processes under their own supervisor; dialyzer-clean is mandatory before merge |
 | Agent fleet rollout breaks production | PR 5 dual-stack ⇒ PR 6 default-flip ⇒ rollback is just an agent flag change with server still dual-listening |
-| Customer enterprise networks block UDP/443 (firewalls, Zscaler, Netskope) | Documented `--transport grpc` flag preserves the old transport; `yuzu-agent --probe-transport` subcommand surfaces UDP reachability before fleet-wide flip; required pre-PR 5 merge |
-| DPI / TLS-interception middleboxes (Bluecoat, Symantec ProxySG) cannot inspect QUIC handshake | Document operator bypass-list procedure for the Yuzu control-plane FQDN; add to security-hardening doc pre-PR 5; pilot-customer hand-test gate validates each design partner's DPI environment before default-flip |
-| Compliance questionnaire answer becomes stale (BoringSSL → OpenSSL/msquic) | Follow-up issue tracks questionnaire-update package (CAIQ encryption row, architecture whitepaper transport section, DPA "encryption in transit" annex, shared-responsibility matrix network-layer row) due no later than PR 6 (default-flip) merge |
+| Customer enterprise networks block UDP/443 (firewalls, Zscaler, Netskope) | Documented `--transport grpc` flag preserves the old transport; `yuzu-agent --probe-transport` subcommand surfaces UDP reachability before fleet-wide flip; required pre-PR 5 merge. Pilot-customer hand-test gate tracked at **#892**. |
+| DPI / TLS-interception middleboxes (Bluecoat, Symantec ProxySG) cannot inspect QUIC handshake | Document operator bypass-list procedure for the Yuzu control-plane FQDN; add to security-hardening doc pre-PR 5; pilot-customer hand-test gate (**#892**) validates each design partner's DPI environment before default-flip |
+| Compliance questionnaire answer becomes stale (BoringSSL → OpenSSL/msquic) | Tracked at **#891** — CAIQ encryption row, architecture whitepaper transport section, DPA "encryption in transit" annex, SRM network-layer row, fork-CVE-monitoring posture. Hard gate before PR 6 merge. |
 
 ## Implementation status
 
@@ -289,14 +308,23 @@ OTP 28 / erts 16.4, msquic 2.4.8 (vcpkg port `arm64-osx`), quicer
 
 Two design choices that the production transport (`transport/`) must
 honour, pulled forward from spike findings (Caveats section of the
-spike-results README):
+spike-results README; ordering kept identical between this section and
+the README so a reader cross-referencing them does not see drift):
 
-1. quicer 0.2.x event tuples are **4-element** `{quic, Tag, Resource, Prop}`
-   even when the event has no payload (e.g. `peer_send_shutdown` ships
-   with `Prop = undefined`). 3-tuple patterns silently fall through.
-2. `quicer:async_send/3` without `?QUICER_SEND_FLAG_SYNC` does **not**
-   deliver `send_complete` events. Application-level back-pressure
-   tracking must use `send/2` (sync) or `async_send` *with* the SYNC bit.
+1. `quicer:async_send/3` without `?QUICER_SEND_FLAG_SYNC` does **not**
+   deliver `send_complete` events to the controlling process (gated at
+   `quicer/c_src/quicer_stream.c:1174` `if (send_ctx->is_sync)`).
+   Application-level back-pressure tracking must use `send/2` (sync) or
+   `async_send` *with* the SYNC bit.
+2. quicer 0.2.x event tuples are **4-element** `{quic, Tag, Resource,
+   Prop}` even when the event has no payload (the shape is built at
+   `quicer/c_src/quicer_nif.c:1710` via `enif_make_tuple4`). 3-tuple
+   patterns silently fall through to catchalls.
+
+Both constraints are tracked for PR 4 (Erlang gateway QUIC migration) at
+**#895** so the production gateway author has the complete patterns-to-
+inherit + patterns-to-NOT-inherit list before writing the production
+quicer client.
 
 ## Release communication checklist
 

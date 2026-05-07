@@ -249,8 +249,22 @@ namespace {
 // the static_assert block above pins this at compile time. Helpers
 // for ByteBuffer<->string and method-name validation live in
 // grpc_internal_helpers.hpp.
+//
+// gRPC docs say status codes are in the range [0, 16] but a future
+// gRPC revision could deliver a higher numeric value (or a corrupted
+// trailer could decode to one). Out-of-range values collapse to
+// StatusCode::Unknown rather than UB-via-blind-cast (governance round 5
+// cpp S3): the StatusCode enum is `: int` so a stray cast is not UB
+// today, but the result violates the documented closed-set semantics
+// and downstream code that switches on the enum would silently miss
+// the value.
 StatusCode map_grpc_status(::grpc::StatusCode g) noexcept {
-    return static_cast<StatusCode>(static_cast<int>(g));
+    const int v = static_cast<int>(g);
+    if (v < static_cast<int>(StatusCode::Ok) ||
+        v > static_cast<int>(StatusCode::Unauthenticated)) {
+        return StatusCode::Unknown;
+    }
+    return static_cast<StatusCode>(v);
 }
 
 }  // namespace
@@ -259,17 +273,20 @@ CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
                               const SerializableMessage& request,
                               SerializableMessage& response) {
     CallResult r;
+    // construction_error_ is built from `make_grpc_channel_credentials`
+    // detail strings which already carry the `"Credentials: "` prefix
+    // (sibling-prefix per the Status::detail contract block).
     if (!construction_error_.empty()) {
         r.status = {StatusCode::Unauthenticated, construction_error_};
         return r;
     }
     if (closed_.load(std::memory_order_acquire)) {
-        r.status = {StatusCode::Cancelled, "channel closed"};
+        r.status = {StatusCode::Cancelled, "transport: channel closed"};
         return r;
     }
     if (!method_name_well_formed(method)) {
         r.status = {StatusCode::InvalidArgument,
-                    "method name fails validation contract"};
+                    "transport: method name fails validation contract"};
         return r;
     }
     if (!generic_stub_ || !channel_) {
@@ -341,8 +358,14 @@ CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
         [&done_promise](::grpc::Status s) { done_promise.set_value(std::move(s)); });
     ::grpc::Status g_status = done_future.get();
 
-    r.status.code   = map_grpc_status(g_status.error_code());
-    r.status.detail = g_status.error_message();
+    r.status.code = map_grpc_status(g_status.error_code());
+    // SYMMETRIC scrub on receive (Status::detail contract block in
+    // transport.hpp). The remote peer's `grpc-message` bytes are
+    // attacker-controlled when the agent talks to a non-Yuzu peer;
+    // unsanitised inbound detail flowing into TransportMetricSink
+    // labels, audit envelope rows, or SSE-rendered status fragments
+    // is the UP-41 / sec-1 cluster (governance round 5).
+    r.status.detail = sanitise_status_detail(g_status.error_message());
 
     // Copy trailing metadata for the caller (per the abstraction
     // contract — initial vs trailing distinction lives in transport.hpp).
@@ -352,6 +375,8 @@ CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
     }
 
     if (g_status.ok()) {
+        // Even a successful gRPC status carries a (typically empty)
+        // detail string. Already scrubbed above; retained on success.
         std::string resp_bytes;
         if (!byte_buffer_to_string(resp_buf, resp_bytes)) {
             r.status = {StatusCode::DataLoss,
@@ -409,7 +434,7 @@ void GrpcChannel::close() {
     }
     if (metric_sink_) {
         metric_sink_->on_connection_closed(
-            "grpc", {StatusCode::Ok, "channel closed"});
+            "grpc", {StatusCode::Ok, "transport: channel closed"});
     }
     // grpc::Channel has no explicit close; dropping the shared_ptr is
     // sufficient. Active calls observe transient FAILURE on next op.

@@ -25,11 +25,11 @@ yuzu_transport_lib = static_library(
   'yuzu_transport',
   yuzu_transport_grpc_srcs,
   include_directories: yuzu_transport_inc,
-  dependencies: [grpcpp_dep, protobuf_dep, yuzu_proto_headers_dep, yuzu_sdk_dep],
+  dependencies: [grpcpp_dep, protobuf_dep, spdlog_dep, yuzu_proto_headers_dep, yuzu_sdk_dep],
 )
 
 yuzu_transport_dep = declare_dependency(
   link_with: yuzu_transport_lib,
   include_directories: yuzu_transport_inc,
-  dependencies: [grpcpp_dep, protobuf_dep, yuzu_proto_headers_dep, yuzu_sdk_dep],
+  dependencies: [grpcpp_dep, protobuf_dep, spdlog_dep, yuzu_proto_headers_dep, yuzu_sdk_dep],
 )

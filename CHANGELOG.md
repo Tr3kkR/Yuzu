@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Internal
+
+- **gRPC → QUIC transport migration in progress (#376).** A multi-PR
+  internal migration is underway to replace the gRPC transport with
+  QUIC (msquic on the C++ side, quicer on the Erlang gateway). No
+  customer-visible behaviour change yet. The migration removes the
+  gRPC + abseil + c-ares + re2 + upb + utf8-range dependency closure,
+  unblocks Alpine/musl agent support, and reduces the Windows MSVC
+  static-link surface that has caused recurring CI outages. PR 0 (spike
+  validation) passed 2026-05-07; PR 5 will introduce a
+  `--transport=grpc|quic|auto` flag and CHANGELOG `Breaking` entries
+  begin at PR 6 (agent default-flip). See ADR-0001
+  (`docs/adrs/0001-quic-transport-msquic-quicer.md`) for the full
+  ladder.
+
 ### Fixed
 
 - **Executions drawer: dashboard "Fan-out" cell stuck at "0/0 of N".**

@@ -570,6 +570,65 @@ TEST_CASE("Client/server unary serialises N concurrent calls cleanly", "[transpo
     listener->shutdown();
 }
 
+TEST_CASE("Client receives sanitised Status::detail on attacker-controlled bytes",
+          "[transport][round-trip]") {
+    // governance round 5 sec-1 / UP-41 / arch-1 / cons-G4-2: Status::detail
+    // is wire data and must be scrubbed BOTH outbound (already covered by
+    // the handler-throws test above) AND inbound. A malicious or buggy
+    // peer can otherwise feed control bytes / non-ASCII into Prometheus
+    // label cardinality, audit-log rows, and dashboard SSE renders.
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    // Handler returns a Status whose detail contains CR, LF, NUL, a high
+    // byte, and a header-injection payload. The dispatcher's `to_grpc_status`
+    // helper scrubs on outbound; this test additionally proves that even
+    // if an outbound scrub regresses, the CLIENT's inbound scrub catches
+    // the same bytes — symmetric defence.
+    auto handler = [](const CallContext&, const SerializableMessage&,
+                      SerializableMessage&) -> Status {
+        return Status{StatusCode::Internal, std::string("\r\nX-Injected: yes\x00\x01\x80malicious",
+                                                        /*size=*/29)};
+    };
+    auto factory = []() -> std::unique_ptr<SerializableMessage> {
+        return std::make_unique<StringMessage>();
+    };
+    listener->register_unary("yuzu.test.v1.Echo/InjectDetail", factory, factory, handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    auto start_r = listener->start(bind, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Grpc, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    StringMessage req, resp;
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    auto r = ch->unary("yuzu.test.v1.Echo/InjectDetail", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Internal);
+
+    // No control bytes survive in the client-observed detail.
+    for (const char c : r.status.detail) {
+        const auto u = static_cast<unsigned char>(c);
+        REQUIRE((u >= 0x20 && u < 0x7F));
+    }
+    // Header-injection payload's printable ASCII would survive (the scrub
+    // only replaces non-printable bytes), but the CRLF that would
+    // separate it from a fake header is gone.
+    REQUIRE(r.status.detail.find('\r') == std::string::npos);
+    REQUIRE(r.status.detail.find('\n') == std::string::npos);
+    REQUIRE(r.status.detail.find('\0') == std::string::npos);
+
+    ch->close();
+    listener->shutdown();
+}
+
 TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport][lifecycle]") {
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);

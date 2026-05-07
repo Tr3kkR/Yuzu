@@ -10,6 +10,18 @@
 
 set -euo pipefail
 
+# Restrict private-key files to the running user. Default umask 022 leaves
+# `*.key` world-readable; on a multi-user box that is a real exposure for
+# anyone who happens to clone the spike. Throwaway material or not, the
+# habit matters (governance round 5 sec-2).
+umask 0077
+
+# Reminder for anyone tempted to lift the cert config into production:
+# CN=localhost + EKU serverAuth+clientAuth + 30-day lifetime is a
+# DEVELOPMENT cert. The production transport's cert lifecycle is
+# governed by Workstream B (cert_lifecycle_policy_url in Credentials);
+# do NOT copy this script into a production install path.
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CERTS="$HERE/certs"
 mkdir -p "$CERTS"

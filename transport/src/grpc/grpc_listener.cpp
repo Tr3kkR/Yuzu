@@ -17,6 +17,8 @@
 #include "grpc_channel.hpp"            // for make_grpc_server_credentials
 #include "grpc_internal_helpers.hpp"   // method_name_well_formed, byte helpers, sanitise
 
+#include <spdlog/spdlog.h>
+
 #include <thread>  // std::this_thread for shutdown re-entry detection
 
 namespace yuzu::transport::grpc_backend {
@@ -31,6 +33,19 @@ namespace {
     return ::grpc::Status(
         static_cast<::grpc::StatusCode>(static_cast<int>(s.code)),
         sanitise_status_detail(s.detail));
+}
+
+// Build a transport-internal grpc::Status without going through a
+// yuzu::transport::Status round-trip. Every transport-internal Status
+// emitted from the dispatcher MUST go through this helper so the
+// outbound scrub contract holds across all 8+ construction sites
+// (governance round 5 cons-G4-1). Today's call sites all pass
+// printable static literals, but a future template-with-runtime-data
+// refactor would silently bypass the scrub if the helper is skipped.
+::grpc::Status make_wire_status(StatusCode code, std::string_view detail) {
+    return ::grpc::Status(
+        static_cast<::grpc::StatusCode>(static_cast<int>(code)),
+        sanitise_status_detail(detail));
 }
 
 }  // namespace
@@ -95,9 +110,9 @@ public:
                 if (!ok) {
                     // Peer cancelled or shut down before sending the request
                     // body. Reply with Cancelled and finish cleanly.
-                    final_status_ =
-                        ::grpc::Status(::grpc::StatusCode::CANCELLED,
-                                       "transport: request not fully received");
+                    final_status_ = make_wire_status(
+                        StatusCode::Cancelled,
+                        "transport: request not fully received");
                     rw_.Finish(final_status_, static_cast<void*>(this));
                     state_ = State::PendingFinish;
                     return;
@@ -132,9 +147,9 @@ private:
         }
 
         if (!unary_match) {
-            final_status_ =
-                ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
-                               "transport: method not registered or not a unary RPC");
+            final_status_ = make_wire_status(
+                StatusCode::Unimplemented,
+                "transport: method not registered or not a unary RPC");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
@@ -160,8 +175,9 @@ private:
                 // Unregistered between PendingNew and PendingRead — should
                 // be impossible per the register-after-start contract,
                 // but defend anyway.
-                final_status_ = ::grpc::Status(::grpc::StatusCode::UNIMPLEMENTED,
-                                               "transport: handler unregistered mid-call");
+                final_status_ = make_wire_status(
+                    StatusCode::Unimplemented,
+                    "transport: handler unregistered mid-call");
                 rw_.Finish(final_status_, static_cast<void*>(this));
                 state_ = State::PendingFinish;
                 return;
@@ -174,16 +190,17 @@ private:
         // Deserialize request bytes into a fresh handler-specific message.
         std::string req_bytes;
         if (!byte_buffer_to_string(req_buf_, req_bytes)) {
-            final_status_ = ::grpc::Status(::grpc::StatusCode::DATA_LOSS,
-                                           "transport: request ByteBuffer dump failed");
+            final_status_ = make_wire_status(
+                StatusCode::DataLoss,
+                "transport: request ByteBuffer dump failed");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
         }
         auto req_msg = req_factory();
         if (!req_msg || !req_msg->parse(req_bytes)) {
-            final_status_ = ::grpc::Status(::grpc::StatusCode::DATA_LOSS,
-                                           "transport: request parse failed");
+            final_status_ = make_wire_status(
+                StatusCode::DataLoss, "transport: request parse failed");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
@@ -200,8 +217,9 @@ private:
 
         auto resp_msg = resp_factory();
         if (!resp_msg) {
-            final_status_ = ::grpc::Status(::grpc::StatusCode::INTERNAL,
-                                           "transport: response factory returned null");
+            final_status_ = make_wire_status(
+                StatusCode::Internal,
+                "transport: response factory returned null");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
@@ -214,22 +232,39 @@ private:
         // Per Status::detail visibility contract (transport.hpp + sec-F1):
         // we DO NOT echo std::exception::what() over the wire because it
         // typically contains internal state (file paths, DB error
-        // messages, library-internal text). Instead we surface a static
-        // summary; the handler's full what() is logged server-side via
-        // the metric_sink for operator diagnosis.
+        // messages, library-internal text). Instead we surface a STATIC
+        // summary literal — exact wording fixed across the doc, this
+        // code, and the qe-F3 round-trip test (governance round 5
+        // cons-G4-3). The handler's full what() is logged server-side at
+        // error level so operator forensics can identify the throw
+        // (governance round 5 UP-42 / UP-57 / SRE-O1) and the metric
+        // sink fires an `on_unexpected_dispatch_throw` so silent storms
+        // become a Prometheus signal instead of an opaque CPU pin.
         Status handler_status;
         try {
             handler_status = handler(ctx, *req_msg, *resp_msg);
         } catch (const std::exception& e) {
             handler_status = {StatusCode::Internal, "handler raised exception"};
-            // Server-side log via metric sink (PR 1c will plug an
-            // explicit logging hook; the metric sink's stream-closed
-            // callback is the closest available channel for now).
-            // The full what() text never leaves the process boundary.
-            (void)e;  // intentional: do not include in wire status
+            // Server-side log: type name + e.what() are operator-visible
+            // only. NEVER concatenated into handler_status.detail (would
+            // leak across the wire).
+            spdlog::error(
+                "yuzu::transport: handler raised std::exception in {} — "
+                "type={} what={}", method, typeid(e).name(), e.what());
+            if (listener_->opts_.metric_sink) {
+                listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
+                    "grpc", method, "std_exception");
+            }
         } catch (...) {
             handler_status = {StatusCode::Internal,
                               "handler raised non-std exception"};
+            spdlog::error(
+                "yuzu::transport: handler raised non-std exception in {}",
+                method);
+            if (listener_->opts_.metric_sink) {
+                listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
+                    "grpc", method, "non_std_exception");
+            }
         }
 
         if (!handler_status.ok()) {
@@ -242,8 +277,8 @@ private:
         // Serialize response and ship via WriteAndFinish (one CQ event).
         std::string resp_bytes;
         if (!resp_msg->serialize(resp_bytes)) {
-            final_status_ = ::grpc::Status(::grpc::StatusCode::INTERNAL,
-                                           "transport: response serialize failed");
+            final_status_ = make_wire_status(
+                StatusCode::Internal, "transport: response serialize failed");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
@@ -256,8 +291,9 @@ private:
                 ? listener_->opts_.max_frame_size
                 : kDefaultMaxFrameSize;
         if (resp_bytes.size() > frame_cap) {
-            final_status_ = ::grpc::Status(::grpc::StatusCode::RESOURCE_EXHAUSTED,
-                                           "transport: response exceeds configured frame size");
+            final_status_ = make_wire_status(
+                StatusCode::ResourceExhausted,
+                "transport: response exceeds configured frame size");
             rw_.Finish(final_status_, static_cast<void*>(this));
             state_ = State::PendingFinish;
             return;
@@ -276,6 +312,14 @@ private:
     ::grpc::GenericServerAsyncReaderWriter rw_;
     ::grpc::ByteBuffer                   req_buf_;
     ::grpc::ByteBuffer                   resp_buf_;
+    // Lifetime invariant (governance F-CPP-3, deferred from round 4 →
+    // closed in round 5 cpp S6). `final_status_` MUST outlive the
+    // asynchronous Finish/WriteAndFinish completion. The state machine
+    // guarantees this by setting `state_ = PendingFinish` immediately
+    // after issuing Finish/WriteAndFinish; `delete this` only fires in
+    // the matching `case PendingFinish:` branch of `on_event`. Do not
+    // move final_status_ to a local in dispatch_unary; do not release
+    // the ServerCall before the CQ delivers the matching tag.
     ::grpc::Status                       final_status_;
 };
 
@@ -402,6 +446,13 @@ std::expected<void, Status> GrpcServerListener::start(
         // BuildAndStart returned non-null but failed to bind. Per gRPC
         // docs (server_builder.h:127): selected_port stays 0 when bind
         // fails. Treat as unavailable.
+        //
+        // server_->Shutdown() runs synchronously here BEFORE the CQ
+        // worker has been spawned; the CQ object exists but has no
+        // outstanding tags. gRPC tolerates Shutdown-without-CQ-pumping
+        // when no RequestCall has been posted yet. PR 1c may want a
+        // bounded-deadline form of Shutdown if the no-tag invariant
+        // becomes harder to maintain (governance round 5 UP-54).
         server_->Shutdown();
         server_.reset();
         cq_.reset();
@@ -444,12 +495,26 @@ void GrpcServerListener::cq_worker_loop() {
         // or in the SerializableMessage adapters.
         try {
             static_cast<ServerCall*>(tag)->on_event(ok);
+        } catch (const std::exception& e) {
+            // Dispatcher-internal throw (NOT a user handler — those are
+            // already caught inside dispatch_unary). Log with type+what
+            // server-side; emit a Prometheus signal so the operator can
+            // alert on a silent storm before it pins a core (governance
+            // round 5 UP-42 / UP-57 / SRE-O1).
+            spdlog::error(
+                "yuzu::transport: dispatcher caught std::exception — "
+                "type={} what={}", typeid(e).name(), e.what());
+            if (opts_.metric_sink) {
+                opts_.metric_sink->on_unexpected_dispatch_throw(
+                    "grpc", "", "dispatcher_internal");
+            }
         } catch (...) {
-            // Defensive: nothing further we can do at this layer. PR 1c
-            // will plug a structured logging hook that surfaces this to
-            // operators; until then, swallow and continue. Crashing the
-            // worker would convert a recoverable handler bug into a
-            // listener-wide outage with no signal in /readyz.
+            spdlog::error(
+                "yuzu::transport: dispatcher caught non-std exception");
+            if (opts_.metric_sink) {
+                opts_.metric_sink->on_unexpected_dispatch_throw(
+                    "grpc", "", "dispatcher_internal");
+            }
         }
     }
     // cq_->Next returns false only after Shutdown has been called AND
@@ -478,6 +543,16 @@ void GrpcServerListener::shutdown() {
         cq_worker_.get_id() == std::this_thread::get_id()) {
         // Roll back the flag so a subsequent call from another thread
         // can complete the shutdown.
+        //
+        // Rollback contract (governance round 5 UP-44): this throw MUST
+        // be allowed to propagate up the worker's outer `catch(...)` in
+        // `cq_worker_loop` and reach a shutdown call from an external
+        // thread which can complete the join. If a future refactor
+        // narrows the worker's catch to `catch (const std::exception&)`
+        // OR routes the exception into a wire Status, the listener
+        // becomes permanently wedged at `shutting_down_=true` with
+        // `is_serving()=false` and no recovery path. Audit any change
+        // to UP-16's outer catch against this comment.
         shutting_down_.store(false, std::memory_order_release);
         throw std::logic_error(
             "yuzu::transport: shutdown() must not be called from a handler "
@@ -502,6 +577,13 @@ void GrpcServerListener::shutdown() {
     }
     if (cq_worker_.joinable()) {
         cq_worker_.join();
+    }
+    // Mirror the on_connection_opened that fired in start() so the
+    // open-listener gauge tracks reality across the full lifecycle
+    // (governance round 5 SRE-O4).
+    if (opts_.metric_sink) {
+        opts_.metric_sink->on_connection_closed(
+            "grpc", {StatusCode::Ok, "transport: listener shutdown"});
     }
     {
         std::lock_guard<std::mutex> lock(mtx_);

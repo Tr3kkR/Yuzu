@@ -133,7 +133,7 @@ client's `sent_bytes` exactly, which is what the zero-loss criterion
 asks. The 5 s slow-reader pause is recorded explicitly:
 `slow_pause_observed_ms = 5005`.
 
-`server-slowreader.log` (slow-reader timing excerpt):
+`server-slowreader.log` (slow-reader timing excerpt — timestamps reformatted to relative for readability; raw file uses absolute wall-clock ms via `erlang:monotonic_time`):
 ```
 [t+0.000 s] [main] listening on udp/50053 mode=slow-reader ALPN=yuzu-spike
 [t+0.201 s] [conn] CONNECTED (TLS handshake done)
@@ -157,7 +157,7 @@ correctly at the QUIC frame level for the bidi-stream, half-close, and
 flow-control patterns Yuzu's transport will exercise.
 
 **ADR-0001 status moves from "Accepted — pending spike validation" to
-"Accepted".** PR 1c through PR 4 are unblocked by this evidence.
+"Accepted".** PRs 1b-3, 1c, 2, 3, 4 are unblocked by this evidence.
 
 ## Caveats / known small surprises (recorded for posterity)
 
@@ -169,17 +169,31 @@ flow-control patterns Yuzu's transport will exercise.
 - In quicer 0.2.x, `quicer:async_send/3` *without* the
   `?QUICER_SEND_FLAG_SYNC` flag does **not** deliver `send_complete`
   events to the controlling process (NIF only fires send_complete when
-  `is_sync` is set, see `quicer/c_src/quicer_stream.c`). For Yuzu's
-  production transport this means: any code path that wants to track
-  outbound chunk completion either uses `send/2` (sync) or
-  `async_send/3` with the SYNC flag bit; pure-async fire-and-forget
-  cannot be back-pressured at the application layer through send_complete.
+  `is_sync` is set, see `quicer/c_src/quicer_stream.c:1174`
+  `if (send_ctx->is_sync)` gate). For Yuzu's production transport this
+  means: any code path that wants to track outbound chunk completion
+  either uses `send/2` (sync) or `async_send/3` with the SYNC flag bit;
+  pure-async fire-and-forget cannot be back-pressured at the
+  application layer through send_complete.
 - All quicer event tuples are **4-element** `{quic, EventName, Resource,
   Prop}` — including events that don't carry a payload (e.g.
-  `peer_send_shutdown` ships with `Prop = undefined`). 3-tuple patterns
-  silently fall through to catchalls. Caught this in the spike;
-  `transport/quicer_transport.erl` work in PR 4 will use 4-tuple
-  patterns from the start.
+  `peer_send_shutdown` ships with `Prop = undefined`). The shape is
+  fixed in `quicer/c_src/quicer_nif.c:1710` `make_event` returning
+  `enif_make_tuple4(env, ATOM_QUIC, event_name, resource, prop)`.
+  3-tuple patterns silently fall through to catchalls. Caught this in
+  the spike; `transport/quicer_transport.erl` work in PR 4 will use
+  4-tuple patterns from the start.
+
+## Audit trail
+
+Run executed against `054cda0` (HEAD of `feat/quic-transport` at the time
+the spike server compiled). Spike code + this README were committed on
+top in `af706ea` (so the SHA referenced in the Environment table
+identifies the test environment, not the commit that introduced the
+evidence). Governance round 5 hardened the surrounding docs and
+addressed the spike-side findings (umask, loopback bind, no-mTLS
+warning, vcpkg baseline pin, Darwin gate); see governance commit on
+this branch for the closure list.
 
 ## File index
 

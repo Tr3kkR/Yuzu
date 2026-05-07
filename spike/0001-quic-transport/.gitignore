@@ -7,3 +7,7 @@ certs/*.key
 certs/*.crt
 certs/*.csr
 certs/*.srl
+
+# Erlang VM crash dumps — never commit (CLAUDE.md standing pitfalls table).
+erl_crash.dump
+**/erl_crash.dump

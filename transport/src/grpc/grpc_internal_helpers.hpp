@@ -14,9 +14,17 @@
 #include <string_view>
 #include <vector>
 
+#include "yuzu/transport/detail/sanitise.hpp"  // sanitise_status_detail
 #include "yuzu/transport/transport.hpp"
 
 namespace yuzu::transport::grpc_backend {
+
+// Re-export the cross-backend Status::detail sanitiser into the gRPC
+// backend's namespace so existing call sites (`sanitise_status_detail(s)`)
+// continue to resolve. The implementation lives in
+// `transport/include/yuzu/transport/detail/sanitise.hpp` so the future
+// msquic backend uses byte-identical scrub semantics.
+using ::yuzu::transport::sanitise_status_detail;
 
 // Method-name validator matching the proto contract — see
 // proto/yuzu/transport/framing/v1/transport.proto, HandshakeHello.method.
@@ -50,29 +58,6 @@ inline bool byte_buffer_to_string(const ::grpc::ByteBuffer& buf,
         out.append(reinterpret_cast<const char*>(s.begin()), s.size());
     }
     return true;
-}
-
-// Sanitise a Status::detail string before it crosses the wire. Per the
-// Status::detail visibility contract in transport.hpp:
-//   * truncate at 1024 bytes
-//   * replace non-printable / non-ASCII bytes with '?'
-//   * NUL bytes specifically would be silently mangled by gRPC's
-//     trailer encoding; replace them defensively (governance UP-22)
-inline std::string sanitise_status_detail(std::string_view in) {
-    constexpr std::size_t kMax = 1024;
-    std::string out;
-    const std::size_t n = std::min(in.size(), kMax);
-    out.reserve(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto c = static_cast<unsigned char>(in[i]);
-        if (c < 0x20 || c >= 0x7F) {
-            out.push_back('?');
-        } else {
-            out.push_back(static_cast<char>(c));
-        }
-    }
-    if (in.size() > kMax) out.append("...[truncated]");
-    return out;
 }
 
 }  // namespace yuzu::transport::grpc_backend

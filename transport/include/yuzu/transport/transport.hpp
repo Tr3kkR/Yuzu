@@ -145,21 +145,37 @@ enum class StatusCode : int {
 //   * Do not embed internal memory addresses, file paths, raw exception
 //     messages from internal libraries (DB driver, filesystem, OS), or
 //     any deployment-internal state.
-//   * For exception-driven error paths, prefer a static summary
-//     ("handler raised <ExceptionType>") rather than e.what(). The
-//     transport layer's dispatcher sanitises std::exception::what() to
-//     just the type name; it does NOT echo the message text into the
-//     wire status. Application handlers wishing to deliver caller-
-//     diagnosable detail should populate Status::detail explicitly with
-//     a sanitised message.
+//   * For exception-driven error paths, the transport's dispatcher
+//     replaces a thrown std::exception with the static literal
+//     "handler raised exception" on the wire (and "handler raised
+//     non-std exception" for non-std throws). The original e.what()
+//     text is logged server-side at error level and never crosses the
+//     process boundary. Application handlers wishing to deliver
+//     caller-diagnosable detail must populate Status::detail
+//     explicitly with a sanitised message.
 //   * Transport-internal detail strings (returned by the transport
-//     layer itself, not by application handlers) carry the
-//     `"transport: "` prefix; handler-returned details have no prefix.
-//     Operators can grep status records to distinguish the two.
-//   * Detail must be ASCII printable. NUL bytes are silently mangled
-//     by gRPC's HTTP/2 trailer encoding (governance UP-22); the
-//     transport layer rejects detail strings exceeding 1024 bytes
-//     to prevent metadata-header bloat.
+//     layer itself, not by application handlers) carry either the
+//     `"transport: "` prefix or, for credentials-construction errors,
+//     the `"Credentials: "` sub-prefix. Application-handler-returned
+//     details carry neither. Operators grep status records to tell
+//     the three apart.
+//   * Detail must be ASCII printable; non-printable / non-ASCII bytes
+//     are scrubbed to '?'. NUL bytes specifically would be silently
+//     mangled by gRPC's HTTP/2 trailer encoding (governance UP-22).
+//     The total size is capped at 1024 bytes, INCLUDING any
+//     `"...[truncated]"` marker; oversize input is truncated to fit.
+//
+// SYMMETRIC scrub obligation. Implementations MUST apply the same
+// length and printable-byte sanitisation BOTH to detail strings produced
+// locally (outbound) AND to detail strings received from the peer
+// (inbound) before surfacing them via CallResult::status, BidiStream
+// trailing status, or any TransportMetricSink callback. Receivers do
+// not trust the peer's adherence — a malicious or buggy peer can
+// otherwise feed control bytes / oversize blobs into Prometheus label
+// cardinality, audit-log rows, and dashboard SSE renders. The shared
+// helper at `transport/include/yuzu/transport/detail/sanitise.hpp`
+// (`yuzu::transport::sanitise_status_detail`) is the only sanctioned
+// implementation; both backends must route through it.
 struct Status {
     StatusCode code = StatusCode::Ok;
     std::string detail;
@@ -481,6 +497,19 @@ struct TransportMetricSink {
     // ALPN negotiation outcome. Called once per connection at handshake.
     virtual void on_alpn_negotiated(std::string_view backend,
                                     std::string_view negotiated_protocol) {}
+
+    // The dispatcher's per-event try/catch fires this callback when a
+    // throw escapes a handler invocation OR a transport-internal
+    // dispatch step (governance UP-42 / UP-57 / SRE-O1). `kind` is one
+    // of {"std_exception", "non_std_exception", "dispatcher_internal"}
+    // — cardinality is bounded so it is safe as a Prometheus label.
+    // `method` may be empty if the throw originated before method
+    // resolution. The callback MUST NOT throw and MUST NOT contain
+    // peer-supplied bytes (the caller never passes e.what() through
+    // this surface).
+    virtual void on_unexpected_dispatch_throw(std::string_view backend,
+                                              std::string_view method,
+                                              std::string_view kind) {}
 };
 
 // =====================================================================
@@ -633,9 +662,22 @@ public:
     // Returns `{"", 0}` if start() has not succeeded.
     //
     // Use this to discover the bound port for tests and any caller
-    // that asked for ephemeral allocation. Documented contract: the
-    // returned value is stable across the lifetime of the listener
-    // (until shutdown), so callers may cache it.
+    // that asked for ephemeral allocation. The returned value is
+    // stable across the lifetime of the listener so callers may cache
+    // it — but they MUST gate any "is this address live?" decision on
+    // is_serving(): after shutdown(), bound_endpoint() continues to
+    // return the last successfully-bound address (the field is not
+    // cleared), and a stale endpoint paired with a dead listener is
+    // exactly the false-green readiness pattern this contract aims to
+    // prevent (governance UP-40 / SRE-O2). The conjunction
+    // `is_serving() && bound_endpoint().port != 0` is the readiness
+    // signal; either half alone is insufficient.
+    //
+    // WILDCARD-host caveat. When `bind.host` is a wildcard literal
+    // (`"0.0.0.0"`, `"::"`, empty), bound_endpoint().host echoes the
+    // wildcard verbatim. Callers MUST NOT broadcast a wildcard host
+    // to peers in any federation, discovery, or health-share path —
+    // resolve to a routable interface address first (governance UP-56).
     virtual Endpoint bound_endpoint() const noexcept = 0;
 };
 

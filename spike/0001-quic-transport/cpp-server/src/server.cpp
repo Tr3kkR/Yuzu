@@ -109,6 +109,18 @@ QUIC_STATUS QUIC_API stream_callback(HQUIC stream, void* /*ctx*/, QUIC_STREAM_EV
                 if (g_args.mode == "slow-reader") {
                     // Schedule disable + re-enable on a detached thread so we don't
                     // block the msquic worker.
+                    //
+                    // Detached-thread teardown caveat (governance round 5
+                    // UP-50): if the connection is torn down before the
+                    // pause window completes, this thread may wake up and
+                    // call into a stream whose handle msquic has already
+                    // freed. Spike-only — main()'s wait loop runs up to
+                    // 90 s which empirically dominates the 7 s slow-reader
+                    // window. Production msquic transport in PR 3 MUST
+                    // NOT use detached threads for stream operations;
+                    // tie the timer to the connection's lifetime via a
+                    // dedicated msquic timer or a connection-scoped
+                    // worker that is cancelled on shutdown.
                     std::thread([stream]() {
                         std::this_thread::sleep_for(
                             std::chrono::milliseconds(g_args.slow_after_ms));
@@ -278,6 +290,18 @@ int main(int argc, char** argv) {
         &settings, sizeof(settings), nullptr, &g_configuration);
     if (QUIC_FAILED(st)) { std::fprintf(stderr, "ConfigurationOpen failed %d\n", st); return 1; }
 
+    // SECURITY: server-only TLS (not mTLS).
+    //
+    // QUIC_CREDENTIAL_FLAG_NONE means we accept any client without
+    // requesting a certificate. The spike's Pass criterion 1 ("TLS 1.3
+    // handshake succeeds with self-signed cert pair") is server-auth-only
+    // — half of the production transport's posture, which defaults to
+    // ClientCertMode::Require. Production msquic transport in PR 3 MUST
+    // additionally pass QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION
+    // and validate the peer cert against the server's CA bundle.
+    //
+    // Do NOT lift this credential block into PR 3 verbatim
+    // (governance round 5 sec-4).
     QUIC_CERTIFICATE_FILE cert_file = { g_args.key_path.c_str(), g_args.cert_path.c_str() };
     QUIC_CREDENTIAL_CONFIG cred = {};
     cred.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_FILE;
@@ -290,9 +314,18 @@ int main(int argc, char** argv) {
     st = g_msquic->ListenerOpen(g_registration, listener_callback, nullptr, &g_listener);
     if (QUIC_FAILED(st)) { std::fprintf(stderr, "ListenerOpen failed %d\n", st); return 1; }
 
+    // Bind loopback only. The spike has NO client-cert verification (see
+    // SECURITY note below at the credential block) and binding any-addr
+    // would expose an open echo service on whichever LAN the developer
+    // happens to be on (governance round 5 sec-3 / SRE-S1). The four
+    // pass-criterion runs all use --host localhost; restricting the
+    // bind matches that contract and removes the LAN exposure window.
     QUIC_ADDR addr = {};
-    QuicAddrSetFamily(&addr, QUIC_ADDRESS_FAMILY_UNSPEC);
+    QuicAddrSetFamily(&addr, QUIC_ADDRESS_FAMILY_INET);
     QuicAddrSetPort(&addr, g_args.port);
+    // 127.0.0.1 in network byte order = 0x0100007F.
+    auto* in_addr = reinterpret_cast<uint8_t*>(&addr.Ipv4.sin_addr);
+    in_addr[0] = 127; in_addr[1] = 0; in_addr[2] = 0; in_addr[3] = 1;
 
     st = g_msquic->ListenerStart(g_listener, &alpn, 1, &addr);
     if (QUIC_FAILED(st)) { std::fprintf(stderr, "ListenerStart failed 0x%x\n", st); return 1; }
