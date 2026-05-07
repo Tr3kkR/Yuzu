@@ -180,7 +180,7 @@ EXIT CODES
     3  - secedit operation failed; install was rolled back
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+[CmdletBinding()]
 param(
     [switch]$DryRun,
     [switch]$Check,
@@ -212,9 +212,24 @@ if (-not $IsWindows -and -not ($PSVersionTable.PSVersion.Major -lt 6)) {
     exit 2
 }
 
-# Helper indicators for -DryRun vs -WhatIf — both ride the SupportsShouldProcess
-# pipeline so PSCmdlet.ShouldProcess() is used uniformly.
-$Script:Effective = -not ($DryRun -or $WhatIfPreference)
+# Helper indicators for -DryRun vs -WhatIf.
+#
+# Original design routed everything through $PSCmdlet.ShouldProcess() so
+# `-WhatIf` would Just Work. That doesn't actually work in PowerShell:
+# $PSCmdlet is only populated for the SCRIPT itself (which has
+# [CmdletBinding(SupportsShouldProcess)] on its param block), not for
+# any non-advanced function called from it. Inside a regular `function`
+# the bare reference to $PSCmdlet returns $null, and any method call
+# against it throws "Object reference not set to an instance of an
+# object." Live-tested on Shulgi (Windows 11 + PS 7.6.1) — that's
+# exactly what the first DryRun blew up with.
+#
+# Fix: scope-pin a single boolean and have every state-changing call
+# gate on it. -WhatIf no longer drives the script (we removed
+# SupportsShouldProcess entirely below); -DryRun is the only knob.
+# That's sharper anyway — operators expect -DryRun on install scripts;
+# -WhatIf on a non-cmdlet is more of a niche-PS idiom.
+$Script:Effective = -not $DryRun
 
 function Write-Info  { param([string]$msg) Write-Host "[install-agent-user] $msg" }
 function Write-Warn  { param([string]$msg) Write-Host "[install-agent-user] WARN: $msg" -ForegroundColor Yellow }
@@ -257,34 +272,38 @@ function New-AgentAccount {
     $plainPassword = $sb.ToString()
     $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
 
-    if ($PSCmdlet.ShouldProcess($name, "Create local user account")) {
-        $user = New-LocalUser `
-            -Name $name `
-            -Password $securePassword `
-            -FullName "Yuzu Agent Daemon" `
-            -Description "Yuzu endpoint agent — runs as service account, no interactive login" `
-            -PasswordNeverExpires `
-            -UserMayNotChangePassword `
-            -AccountNeverExpires
-        Write-Info "  SID = $($user.SID)"
-
-        # Stash the password in a DPAPI blob so an operator can recover
-        # the account by re-running with a known credential. Encrypted
-        # under the LocalMachine scope so SYSTEM can read it; ACL'd to
-        # remove all other access.
-        $encrypted = ConvertFrom-SecureString $securePassword
-        Set-Content -Path $CredFile -Value $encrypted -Encoding UTF8
-        $acl = Get-Acl $CredFile
-        $acl.SetAccessRuleProtection($true, $false)  # disable inheritance, drop existing
-        $sysRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            'NT AUTHORITY\SYSTEM', 'FullControl', 'Allow')
-        $admRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            'BUILTIN\Administrators', 'FullControl', 'Allow')
-        $acl.AddAccessRule($sysRule)
-        $acl.AddAccessRule($admRule)
-        Set-Acl -Path $CredFile -AclObject $acl
-        Write-Info "  password stashed at $CredFile (SYSTEM + Administrators only)"
+    if (-not $Script:Effective) {
+        Write-Host "[dry-run] Create local user account: $name"
+        Write-Host "[dry-run] Stash random 24-char password in DPAPI blob at $CredFile"
+        return
     }
+
+    # New-LocalUser caps Description at 48 chars. Be terse.
+    $user = New-LocalUser `
+        -Name $name `
+        -Password $securePassword `
+        -FullName "Yuzu Agent Daemon" `
+        -Description "Yuzu endpoint agent — service, no login" `
+        -PasswordNeverExpires `
+        -UserMayNotChangePassword `
+        -AccountNeverExpires
+    Write-Info "  SID = $($user.SID)"
+
+    # Stash the password in a DPAPI blob so an operator can recover
+    # the account by re-running with a known credential. ACL'd to
+    # remove all other access (mode 0440 equivalent).
+    $encrypted = ConvertFrom-SecureString $securePassword
+    Set-Content -Path $CredFile -Value $encrypted -Encoding UTF8
+    $acl = Get-Acl $CredFile
+    $acl.SetAccessRuleProtection($true, $false)  # disable inheritance, drop existing
+    $sysRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        'NT AUTHORITY\SYSTEM', 'FullControl', 'Allow')
+    $admRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        'BUILTIN\Administrators', 'FullControl', 'Allow')
+    $acl.AddAccessRule($sysRule)
+    $acl.AddAccessRule($admRule)
+    Set-Acl -Path $CredFile -AclObject $acl
+    Write-Info "  password stashed at $CredFile (SYSTEM + Administrators only)"
 }
 
 function Remove-AgentAccount {
@@ -296,14 +315,18 @@ function Remove-AgentAccount {
     }
 
     Write-Step "deleting local user $name"
-    if ($PSCmdlet.ShouldProcess($name, "Delete local user account")) {
+    if ($Script:Effective) {
         Remove-LocalUser -Name $name
+    } else {
+        Write-Host "[dry-run] Remove-LocalUser -Name $name"
     }
 
     if (Test-Path $CredFile) {
         Write-Info "removing $CredFile"
-        if ($PSCmdlet.ShouldProcess($CredFile, "Remove credential file")) {
+        if ($Script:Effective) {
             Remove-Item $CredFile -Force
+        } else {
+            Write-Host "[dry-run] Remove-Item $CredFile -Force"
         }
     }
 }
@@ -331,8 +354,10 @@ function Add-AgentToGroups {
             continue
         }
         Write-Step "adding $name to group '$group'"
-        if ($PSCmdlet.ShouldProcess($group, "Add $name to group")) {
+        if ($Script:Effective) {
             Add-LocalGroupMember -Group $group -Member $name
+        } else {
+            Write-Host "[dry-run] Add-LocalGroupMember -Group '$group' -Member $name"
         }
     }
 }
@@ -346,8 +371,10 @@ function Remove-AgentFromGroups {
             Where-Object { $_.Name -like "*\$name" }
         if (-not $present) { continue }
         Write-Step "removing $name from group '$group'"
-        if ($PSCmdlet.ShouldProcess($group, "Remove $name from group")) {
+        if ($Script:Effective) {
             Remove-LocalGroupMember -Group $group -Member $name -ErrorAction SilentlyContinue
+        } else {
+            Write-Host "[dry-run] Remove-LocalGroupMember -Group '$group' -Member $name"
         }
     }
 }
@@ -444,6 +471,19 @@ function ConvertTo-LsaUnicodeString {
 
 function Grant-AccountPrivileges {
     param([string]$name, [string[]]$privileges)
+
+    # In dry-run mode the upstream account-create step didn't actually
+    # create the user, so Get-LocalUser would fail. Just announce what
+    # we would have done and return — the LSA P/Invoke setup is
+    # state-mutating-adjacent (LsaOpenPolicy needs a real handle) so
+    # there's no useful "preview" to print beyond the per-privilege list.
+    if (-not $Script:Effective) {
+        foreach ($priv in $privileges) {
+            Write-Host "[dry-run] LsaAddAccountRights($name, $priv)"
+        }
+        return
+    }
+
     Initialize-LsaTypes
 
     $sid = (Get-LocalUser -Name $name).SID
@@ -463,7 +503,10 @@ function Grant-AccountPrivileges {
     try {
         foreach ($priv in $privileges) {
             Write-Step "granting $priv to $name"
-            if (-not $PSCmdlet.ShouldProcess($name, "Grant $priv")) { continue }
+            if (-not $Script:Effective) {
+                Write-Host "[dry-run] LsaAddAccountRights($name, $priv)"
+                continue
+            }
 
             $u = ConvertTo-LsaUnicodeString $priv
             $arr = @($u)
@@ -503,7 +546,10 @@ function Revoke-AccountPrivileges {
     try {
         foreach ($priv in $privileges) {
             Write-Step "revoking $priv from $name"
-            if (-not $PSCmdlet.ShouldProcess($name, "Revoke $priv")) { continue }
+            if (-not $Script:Effective) {
+                Write-Host "[dry-run] LsaRemoveAccountRights($name, $priv)"
+                continue
+            }
             $u = ConvertTo-LsaUnicodeString $priv
             $arr = @($u)
             [void][YuzuLsa.Native]::LsaRemoveAccountRights($handle, $sidBytes, $false, $arr, 1)
@@ -519,6 +565,19 @@ function Revoke-AccountPrivileges {
 function New-AgentDirectories {
     param([string]$name)
 
+    # Resolve the user's SID once. We pass the SID object (not a string
+    # like ".\$name" or "$env:COMPUTERNAME\$name") to AddAccessRule
+    # because string-form identity translation goes through
+    # NTAccount.Translate() which can fail with "Some or all identity
+    # references could not be translated" on freshly-created local
+    # accounts whose name hasn't propagated through every Win32
+    # name-lookup cache yet. SIDs are always immediately resolvable
+    # because we just got them from Get-LocalUser.
+    $userSid = $null
+    if ($Script:Effective) {
+        $userSid = (Get-LocalUser -Name $name).SID
+    }
+
     $dirs = @{
         $StateDir   = "Modify"
         $CacheDir   = "Modify"
@@ -532,14 +591,16 @@ function New-AgentDirectories {
         $access = $entry.Value
         if (-not (Test-Path $dir)) {
             Write-Step "creating $dir"
-            if ($PSCmdlet.ShouldProcess($dir, "Create directory")) {
+            if ($Script:Effective) {
                 New-Item -Path $dir -ItemType Directory -Force | Out-Null
+            } else {
+                Write-Host "[dry-run] New-Item -Path '$dir' -ItemType Directory"
             }
         } else {
             Write-Info "  $dir already exists"
         }
 
-        if ($PSCmdlet.ShouldProcess($dir, "Apply ACL")) {
+        if ($Script:Effective) {
             $acl = Get-Acl $dir
             $acl.SetAccessRuleProtection($true, $false)  # disable inheritance, drop existing
 
@@ -552,9 +613,13 @@ function New-AgentDirectories {
 
             # Agent account gets the per-dir level access (Modify for
             # state/cache/log, ReadAndExecute for plugins/config).
+            # Pass the SID directly to bypass the NTAccount.Translate()
+            # name-lookup that fails on freshly-created local accounts.
             $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-                ".\$name", $access, 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+                $userSid, $access, 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
             Set-Acl -Path $dir -AclObject $acl
+        } else {
+            Write-Host "[dry-run] Set-Acl '$dir' (SYSTEM+Administrators full, $name $access)"
         }
     }
 }
@@ -563,8 +628,10 @@ function Remove-AgentDirectories {
     foreach ($dir in @($StateDir, $CacheDir, $ConfigDir, $PluginsDir)) {
         if (Test-Path $dir) {
             Write-Step "removing $dir"
-            if ($PSCmdlet.ShouldProcess($dir, "Remove directory")) {
+            if ($Script:Effective) {
                 Remove-Item -Path $dir -Recurse -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Host "[dry-run] Remove-Item -Path '$dir' -Recurse"
             }
         }
     }
@@ -573,8 +640,10 @@ function Remove-AgentDirectories {
         $stamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
         $archive = "${LogDir}.removed-$stamp"
         Write-Step "preserving $LogDir -> $archive"
-        if ($PSCmdlet.ShouldProcess($LogDir, "Rename to $archive")) {
+        if ($Script:Effective) {
             Rename-Item -Path $LogDir -NewName (Split-Path $archive -Leaf)
+        } else {
+            Write-Host "[dry-run] Rename-Item -Path '$LogDir' -NewName '$(Split-Path $archive -Leaf)'"
         }
     }
 }
@@ -595,10 +664,15 @@ function Set-DenyInteractiveLogon {
 
     Write-Step "configuring deny-interactive-logon for $name"
 
+    if (-not $Script:Effective) {
+        Write-Host "[dry-run] secedit /export → add $name's SID to SeDenyInteractiveLogonRight + SeDenyRemoteInteractiveLogonRight → secedit /configure"
+        return
+    }
+
     $exportFile = New-TemporaryFile
     $importFile = New-TemporaryFile
     try {
-        if ($PSCmdlet.ShouldProcess($name, "secedit export → modify → import")) {
+        if ($true) {
             # Export current Privilege Rights section.
             $sxArgs = @('/export', '/cfg', $exportFile.FullName,
                        '/areas', 'USER_RIGHTS', '/quiet')
@@ -609,36 +683,91 @@ function Set-DenyInteractiveLogon {
                 return
             }
 
-            # Read, mutate, write. We append `*<SID>` to the two rights
-            # if the SID isn't already there.
+            # Walk the file. Inside [Privilege Rights] we can either
+            # mutate the existing SeDeny* line (append `,*<SID>`) or
+            # — if the right isn't listed at all — add it before
+            # [Privilege Rights] ends (i.e., before the next section
+            # header or EOF). The "append to end of $newContent" pattern
+            # the prior code used silently broke when the export ended
+            # with [Version] (secedit /export /areas USER_RIGHTS does
+            # produce one), because the new line landed AFTER [Version],
+            # outside [Privilege Rights], and secedit /configure ignored
+            # it. Live evidence: SeDenyRemoteInteractiveLogonRight never
+            # got the SID; SeDenyInteractiveLogonRight did (because the
+            # export had a `Guest`-only entry to mutate in place).
             $sid = (Get-LocalUser -Name $name).SID.Value
             $content = Get-Content $exportFile.FullName
 
             $newContent = New-Object System.Collections.Generic.List[string]
+            $inPrivilegeRights = $false
             $sawDenyLocal = $false
             $sawDenyRemote = $false
+
             foreach ($line in $content) {
-                if ($line -match '^SeDenyInteractiveLogonRight\s*=') {
+                # Section transitions: opening [Privilege Rights] enters
+                # the section; any other [Foo] header exits it. Just
+                # before exiting, flush any missing rights INTO the
+                # section so secedit /configure sees them as part of
+                # [Privilege Rights].
+                if ($line -match '^\[Privilege Rights\]') {
+                    $inPrivilegeRights = $true
+                    $newContent.Add($line)
+                    continue
+                }
+                if ($line -match '^\[' -and $inPrivilegeRights) {
+                    if (-not $sawDenyLocal)  { $newContent.Add("SeDenyInteractiveLogonRight = *$sid") }
+                    if (-not $sawDenyRemote) { $newContent.Add("SeDenyRemoteInteractiveLogonRight = *$sid") }
+                    $sawDenyLocal = $true; $sawDenyRemote = $true  # don't re-flush at EOF
+                    $inPrivilegeRights = $false
+                    $newContent.Add($line)
+                    continue
+                }
+
+                # Mutate-in-place if the right is already present.
+                if ($inPrivilegeRights -and $line -match '^SeDenyInteractiveLogonRight\s*=') {
                     $sawDenyLocal = $true
                     if ($line -notmatch [regex]::Escape($sid)) { $line = "$line,*$sid" }
-                } elseif ($line -match '^SeDenyRemoteInteractiveLogonRight\s*=') {
+                } elseif ($inPrivilegeRights -and $line -match '^SeDenyRemoteInteractiveLogonRight\s*=') {
                     $sawDenyRemote = $true
                     if ($line -notmatch [regex]::Escape($sid)) { $line = "$line,*$sid" }
                 }
                 $newContent.Add($line)
             }
-            if (-not $sawDenyLocal)  { $newContent.Add("SeDenyInteractiveLogonRight = *$sid") }
-            if (-not $sawDenyRemote) { $newContent.Add("SeDenyRemoteInteractiveLogonRight = *$sid") }
+            # If [Privilege Rights] was the LAST section (no header
+            # after it), the section-transition flush above didn't run.
+            # Append any missing rights to the end — they're still
+            # inside [Privilege Rights] in that case.
+            if ($inPrivilegeRights) {
+                if (-not $sawDenyLocal)  { $newContent.Add("SeDenyInteractiveLogonRight = *$sid") }
+                if (-not $sawDenyRemote) { $newContent.Add("SeDenyRemoteInteractiveLogonRight = *$sid") }
+            }
 
             Set-Content -Path $importFile.FullName -Value $newContent -Encoding Unicode
 
-            $sxArgs = @('/configure', '/db', "$($env:TEMP)\yuzu-secedit.sdb",
-                       '/cfg', $importFile.FullName, '/areas', 'USER_RIGHTS',
-                       '/quiet')
-            $rc = (Start-Process -FilePath 'secedit.exe' -ArgumentList $sxArgs `
-                   -Wait -PassThru -NoNewWindow).ExitCode
-            if ($rc -ne 0) {
-                Write-Warn "secedit /configure returned $rc — deny-interactive may not be applied"
+            # Direct invocation rather than Start-Process — Start-Process
+            # with -NoNewWindow + -PassThru on PS7 returns inconsistent
+            # ExitCode values (sometimes 0, sometimes the spawned PID's
+            # last echo'd value). Live test on Shulgi: the manual call
+            # path returns 0 cleanly, the Start-Process path returned 1
+            # despite the underlying secedit log saying "User Rights
+            # configuration was completed successfully." Switching to
+            # direct invocation makes $LASTEXITCODE the truth signal.
+            $sdb = Join-Path $env:TEMP 'yuzu-secedit.sdb'
+            & secedit.exe /configure /db $sdb /cfg $importFile.FullName /areas USER_RIGHTS /quiet *>&1 | Out-Null
+            $rc = $LASTEXITCODE
+            # secedit exit codes: 0 = clean success, 1 = success with
+            # warnings (e.g., "SeImpersonatePrivilege must be assigned
+            # to SERVICE. This setting is adjusted." — a benign
+            # auto-correction secedit applies when the INF doesn't
+            # include service-required rights). Only 2+ is an actual
+            # failure. Live verification: rc=1 from this configure call
+            # produced a correctly-updated policy on Shulgi (Win11 26200,
+            # PS7.6.1). See %windir%\security\logs\scesrv.log if you
+            # need to chase a particular warning.
+            if ($rc -ge 2) {
+                Write-Warn "secedit /configure returned $rc - deny-interactive may not be applied"
+            } elseif ($rc -eq 1) {
+                Write-Info "  secedit completed (rc=1, success-with-warnings; see %windir%\security\logs\scesrv.log)"
             }
         }
     } finally {
@@ -713,7 +842,11 @@ if (-not $Check -and -not $Uninstall) {
     Write-Info "  config dir  : $ConfigDir"
     Write-Info ""
 
-    New-Item -Path $RootDir -ItemType Directory -Force | Out-Null
+    if ($Script:Effective) {
+        New-Item -Path $RootDir -ItemType Directory -Force | Out-Null
+    } else {
+        Write-Host "[dry-run] New-Item -Path '$RootDir' -ItemType Directory"
+    }
     New-AgentAccount  -name $AccountName
     Add-AgentToGroups -name $AccountName
     Grant-AccountPrivileges -name $AccountName -privileges $RequiredPrivileges
@@ -721,7 +854,7 @@ if (-not $Check -and -not $Uninstall) {
     Set-DenyInteractiveLogon -name $AccountName
 
     # Install marker so check / uninstall can find what we did.
-    if ($PSCmdlet.ShouldProcess($MarkerFile, "Write install marker")) {
+    if ($Script:Effective) {
         $marker = @{
             account_name      = $AccountName
             binary_path       = $BinaryPath
@@ -731,6 +864,8 @@ if (-not $Check -and -not $Uninstall) {
             groups            = $RequiredGroups
         }
         $marker | ConvertTo-Json -Depth 4 | Set-Content -Path $MarkerFile -Encoding UTF8
+    } else {
+        Write-Host "[dry-run] Write install marker to $MarkerFile"
     }
 
     Write-Info ""
