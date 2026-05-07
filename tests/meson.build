@@ -233,6 +233,14 @@ if build_server
   test('server unit tests', server_test_exe, suite: 'server', timeout: 180)
 endif
 
+# ── Transport unit tests (#376 PR 1+) ─────────────────────────────────────────
+transport_test_exe = executable(
+  'yuzu_transport_tests',
+  files('unit/transport/test_transport_smoke.cpp'),
+  dependencies: [yuzu_transport_dep, catch2_dep],
+)
+test('transport unit tests', transport_test_exe, suite: 'transport', timeout: 60)
+
 # ── Proto codegen tests ────────────────────────────────────────────────────
 _python3_test = find_program('python3', 'python')
 test('proto gen_proto version check',
