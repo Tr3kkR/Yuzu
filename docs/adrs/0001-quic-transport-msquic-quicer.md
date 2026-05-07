@@ -1,6 +1,9 @@
 # ADR-0001: Use msquic + quicer for QUIC transport
 
-- **Status**: Accepted
+- **Status**: Accepted — pending spike validation (PR 0). If the spike
+  fails any of the pass criteria below, status changes to Rejected and
+  a new ADR with the alternative is required.
+- **Accepted-by**: Nathan Dornbrook (project lead) on 2026-05-07
 - **Date**: 2026-05-07
 - **Tracking issue**: #376
 - **Supersedes**: prior implicit decision to use gRPC (no ADR existed)
@@ -128,6 +131,26 @@ mTLS is preserved via msquic's TLS API.
 - Has an actively maintained Erlang binding (quicer) by Emqx — no
   orphan-binding risk.
 
+### Cryptographic module posture (Workstream C)
+
+The current gRPC stack uses BoringSSL (vcpkg's gRPC port links its
+embedded copy). Post-migration the C++ side uses msquic with OpenSSL
+3.x on Linux/macOS and on Windows (we pin away from schannel for
+symmetry). The Erlang gateway side already uses OpenSSL via OTP's
+crypto application.
+
+Yuzu does not currently claim FIPS 140-3 validation. If a future
+customer requires FIPS-validated TLS, OpenSSL 3.x ships a FIPS provider
+that satisfies that bar with explicit configuration; the migration
+preserves the option without committing to it. BoringSSL has its own
+FIPS-validated build (BoringCrypto) used by some downstream consumers,
+but Yuzu has never relied on it.
+
+This posture is a customer-questionnaire-relevant change. The follow-up
+issue tracking the questionnaire-update package (CAIQ encryption row,
+architecture whitepaper transport section, DPA "encryption in transit"
+annex) is referenced in the consequences section below.
+
 ## Why quicer specifically
 
 - Maintained by Emqx, a high-load production user (MQTT broker over QUIC).
@@ -176,9 +199,12 @@ clean across the whole gateway after the migration.
 |---|---|
 | msquic ↔ quicer QUIC-frame interop divergence | PR 0 spike validates before any production code; pin both sides to compatible msquic versions |
 | Bidi-stream semantics: gRPC half-close + status trailers vs raw QUIC streams | Encode trailing-status as final protobuf message (`TrailingStatus`); document explicitly in `transport.hpp` |
-| mTLS cert rotation on msquic vs grpc::SslCredentials | PR 3 explicitly tests `cert_reloader` rotation; design `Credentials` interface to expose a reload callback |
+| mTLS cert rotation on msquic vs grpc::SslCredentials | PR 3 explicitly tests `cert_reloader` rotation; design `Credentials` interface to expose a reload callback; cert lifecycle policy doc required pre-PR 3 merge (Workstream B) |
 | quicer NIF crash takes BEAM VM down | Isolate quicer-using processes under their own supervisor; dialyzer-clean is mandatory before merge |
 | Agent fleet rollout breaks production | PR 5 dual-stack ⇒ PR 6 default-flip ⇒ rollback is just an agent flag change with server still dual-listening |
+| Customer enterprise networks block UDP/443 (firewalls, Zscaler, Netskope) | Documented `--transport grpc` flag preserves the old transport; `yuzu-agent --probe-transport` subcommand surfaces UDP reachability before fleet-wide flip; required pre-PR 5 merge |
+| DPI / TLS-interception middleboxes (Bluecoat, Symantec ProxySG) cannot inspect QUIC handshake | Document operator bypass-list procedure for the Yuzu control-plane FQDN; add to security-hardening doc pre-PR 5; pilot-customer hand-test gate validates each design partner's DPI environment before default-flip |
+| Compliance questionnaire answer becomes stale (BoringSSL → OpenSSL/msquic) | Follow-up issue tracks questionnaire-update package (CAIQ encryption row, architecture whitepaper transport section, DPA "encryption in transit" annex, shared-responsibility matrix network-layer row) due no later than PR 6 (default-flip) merge |
 
 ## Spike validation gate (PR 0)
 
@@ -203,6 +229,60 @@ plan, re-evaluate library choice (probable next move: lsquic + custom
 Erlang NIF, or stay on gRPC and re-scope), and update this ADR with
 status `Rejected` and a new ADR with the alternative.
 
+### Evidence capture (Workstream D)
+
+The spike output (msquic server log, quicer client log, frame-counter
+totals, half-close timing, slow-reader resume timing) is redirected to
+files under `docs/spike-results/0001-quic-transport/` (or attached as
+artifacts to issue #376) and committed to the repo. The retention
+target is the lifetime of the migration — these files are
+audit-evidence for the SOC 2 change-management trail (Workstream F)
+proving the architectural decision was validated before commitment.
+
+A separate `docs/spike-results/0001-quic-transport/README.md` summarises
+which environment ran the spike (host OS, msquic version, quicer
+version, cert-pair fingerprint), who ran it, and pass/fail per
+criterion. The named approver in this ADR's header signs off on the
+evidence by referencing the spike-results commit SHA in their approval.
+
+## Release communication checklist
+
+Each implementation PR in the ladder carries explicit
+operator-communication obligations:
+
+- **PR 5 (dual-stack feature flag)**:
+  - CHANGELOG `[Unreleased] – Added` entry naming the new
+    `--transport=grpc|quic|auto` flag
+  - `docs/user-manual/security-hardening.md` Network Requirements
+    section adding UDP/50051 (or whichever ports apply)
+  - `docs/user-manual/upgrading.md` version-table row documenting that
+    server $X+1 dual-listens, agents may stay on $X
+  - `--probe-transport` subcommand documented in the same section
+  - **Pilot-customer hand-test gate**: 1–3 design-partner customers
+    validate dual-stack in their actual enterprise networks (including
+    DPI/proxy infrastructure) for ≥ 1 week before PR 6 may merge
+
+- **PR 6 (agent default-flip to QUIC)**:
+  - CHANGELOG `Breaking` entry: agent default transport changes
+  - upgrading.md version-table row noting rollback path
+  - Compliance questionnaire-update issue closed (CAIQ + whitepaper +
+    DPA + SRM)
+
+- **PR 7 (gateway default-flip)**:
+  - CHANGELOG `Breaking` entry
+  - upgrading.md version-table row
+
+- **PR 8 (gRPC removal)**:
+  - CHANGELOG `Breaking` entry: agents older than this version cannot
+    connect
+  - CLAUDE.md target-architecture diagram updated (gRPC label → QUIC)
+  - `docs/per-target-agent-build-pipeline-scope.md` Status updated to
+    "Phase 2 unblocked"
+
+The governance pipeline runs on each PR; the docs-writer agent
+verifies the relevant items above land in the same commit as the
+behaviour change.
+
 ## References
 
 - Issue #376 — Strategic: Migrate transport off gRPC to QUIC
@@ -211,5 +291,7 @@ status `Rejected` and a new ADR with the alternative.
 - `.claude/agents/build-ci.md` — "Windows MSVC static-link history and #375"
 - `docs/per-target-agent-build-pipeline-scope.md` — Phase 2 dependency
 - `docs/dependency-rollout-2026-04-14.md` — #375 timeline
+- `docs/enterprise-readiness-soc2-first-customer.md` — Workstreams B/C/G
+  for compliance impact framing
 - [msquic on GitHub](https://github.com/microsoft/msquic)
 - [quicer on GitHub](https://github.com/emqx/quicer)

@@ -35,7 +35,7 @@ gen = custom_target(
         proto_root / 'yuzu/guardian/v1/guaranteed_state.proto',
         proto_root / 'yuzu/server/v1/management.proto',
         proto_root / 'yuzu/gateway/v1/gateway.proto',
-        proto_root / 'yuzu/transport/v1/transport.proto',
+        proto_root / 'yuzu/transport/framing/v1/transport.proto',
     ],
     output: [
         'common.pb.cc', 'common.pb.h', 'common.grpc.pb.cc', 'common.grpc.pb.h',
@@ -58,7 +58,7 @@ gen = custom_target(
         proto_root / 'yuzu/guardian/v1/guaranteed_state.proto',
         proto_root / 'yuzu/server/v1/management.proto',
         proto_root / 'yuzu/gateway/v1/gateway.proto',
-        proto_root / 'yuzu/transport/v1/transport.proto',
+        proto_root / 'yuzu/transport/framing/v1/transport.proto',
     ],
 )
 

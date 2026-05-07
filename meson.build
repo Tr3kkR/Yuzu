@@ -281,6 +281,9 @@ subdir('proto')
 # ── SDK ───────────────────────────────────────────────────────────────────────
 subdir('sdk')
 
+# ── Transport (yuzu::transport:: abstraction; #376 PR 1+) ────────────────────
+subdir('transport')
+
 # ── Agent ─────────────────────────────────────────────────────────────────────
 if build_agent
   subdir('agents/core')

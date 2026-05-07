@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package yuzu.transport.framing.v1;
+
+option cc_enable_arenas = true;
+
+// transport.proto — wire envelopes used by the QUIC transport implementation
+// when there is no gRPC framing layer available to carry status or trailers.
+//
+// This package is named `yuzu.transport.framing.v1` (not a peer of
+// `yuzu.agent.v1` / `yuzu.server.v1` / `yuzu.gateway.v1`) to telegraph that
+// it defines no service — only wire framing primitives consumed by the
+// transport layer itself.
+//
+// On gRPC, each RPC carries a final `grpc::Status` (code + detail string)
+// plus a metadata trailer map. On a raw QUIC stream we carry a single
+// QUIC bidirectional stream per logical RPC; the transport layer frames
+// each protobuf message with a 4-byte big-endian length prefix and emits
+// a final `TrailingStatus` message before half-closing the stream.
+//
+// This proto is consumed only by the transport layer
+// (transport/src/*) — service handlers above that layer never see these
+// envelopes directly.
+//
+// =====================================================================
+// Wire-stability commitment
+// =====================================================================
+//
+// All field numbers in this file are FROZEN. New fields MUST be additive
+// (proto3 default-zero semantics). StatusCode numeric values MUST match
+// `google.rpc.Code` and `grpc::StatusCode` permanently — they are
+// observed by error-mapping code in `server/core/src/error_codes.hpp`
+// and by every pre-existing call site that maps gRPC status to internal
+// error categories.
+//
+// v2 of this package is reserved for an incompatible re-framing only;
+// in-place evolution is preferred. Adding a new StatusCode value
+// requires updating the C++ enum class StatusCode in transport.hpp in
+// the same commit; a static_assert in the transport library keeps them
+// in sync.
+
+// StatusCode mirrors the canonical gRPC status codes one-for-one. The
+// numeric values match google.rpc.Code so existing error-mapping code in
+// the rest of the codebase continues to work.
+enum StatusCode {
+  STATUS_CODE_OK                  = 0;
+  STATUS_CODE_CANCELLED           = 1;
+  STATUS_CODE_UNKNOWN             = 2;
+  STATUS_CODE_INVALID_ARGUMENT    = 3;
+  STATUS_CODE_DEADLINE_EXCEEDED   = 4;
+  STATUS_CODE_NOT_FOUND           = 5;
+  STATUS_CODE_ALREADY_EXISTS      = 6;
+  STATUS_CODE_PERMISSION_DENIED   = 7;
+  STATUS_CODE_RESOURCE_EXHAUSTED  = 8;
+  STATUS_CODE_FAILED_PRECONDITION = 9;
+  STATUS_CODE_ABORTED             = 10;
+  STATUS_CODE_OUT_OF_RANGE        = 11;
+  STATUS_CODE_UNIMPLEMENTED       = 12;
+  STATUS_CODE_INTERNAL            = 13;
+  STATUS_CODE_UNAVAILABLE         = 14;
+  STATUS_CODE_DATA_LOSS           = 15;
+  STATUS_CODE_UNAUTHENTICATED     = 16;
+}
+
+// TrailingStatus is the final protobuf message every QUIC stream emits
+// before its sender half-closes. It carries the equivalent of the gRPC
+// trailing status block.
+//
+// Wire ordering invariant: this message MUST be the FINAL frame on the
+// stream in the sender's direction. The transport layer enforces this:
+//   - Receiving any frame after a TrailingStatus is wire corruption;
+//     the stream is cancelled with STATUS_CODE_DATA_LOSS.
+//   - Receiving two TrailingStatus frames is wire corruption; same
+//     handling.
+//   - Closing the stream WITHOUT a TrailingStatus frame is wire
+//     corruption; the receiver synthesises STATUS_CODE_UNKNOWN with
+//     detail "peer closed without trailing status".
+//
+// Metadata bounds (transport-enforced, see HandshakeHello below for
+// rationale): each key ≤ 256 bytes, each value ≤ 4096 bytes, total
+// entries ≤ 64. Oversized metadata triggers STATUS_CODE_RESOURCE_EXHAUSTED
+// at serialise time, before bytes are written to the wire. Audit
+// emitters that log trailing metadata MUST treat values as untrusted
+// and pass through `audit_safe_string()` to prevent stored XSS or log
+// injection.
+message TrailingStatus {
+  StatusCode code = 1;
+  string detail = 2;
+  map<string, string> metadata = 3;
+}
+
+// HandshakeHello is sent by the client side as the first frame on a new
+// QUIC stream so the server can route the stream to the correct service
+// handler. gRPC encodes this in HTTP/2 :path; we encode it in a leading
+// protobuf frame.
+//
+// Frame ordering invariant: this MUST be the first frame on a new bidi
+// stream. The server reads it, dispatches to the registered handler,
+// and the client begins writing data frames immediately — there is NO
+// server acknowledgement frame. A missing-handler condition is signalled
+// via TrailingStatus with STATUS_CODE_UNIMPLEMENTED.
+//
+// For wire-format compatibility with future versions, all field numbers
+// here must be considered frozen.
+message HandshakeHello {
+  // Fully-qualified RPC method name, e.g.
+  // "yuzu.agent.v1.AgentService/Subscribe".
+  //
+  // Validation contract (transport-enforced, before handler dispatch):
+  //   - MUST be non-empty (proto3 default of "" is rejected with
+  //     STATUS_CODE_INVALID_ARGUMENT; "" is NEVER routed to a handler
+  //     even if one happened to register that empty string).
+  //   - MUST match the regex `^[A-Za-z][A-Za-z0-9_.]*\/[A-Za-z][A-Za-z0-9_]*$`
+  //     (ASCII-printable, package.Service/Method shape; no path-traversal
+  //     segments, no Unicode, no slashes other than the single separator).
+  //   - MUST be ≤ 256 bytes.
+  //   - Dispatch is exact byte match. Case-insensitive matching is NOT
+  //     performed. Unicode normalisation (NFKC, NFC) is NOT performed.
+  //     Trailing whitespace, NUL bytes, and percent-escapes are rejected.
+  //   - Unregistered methods receive a TrailingStatus with
+  //     STATUS_CODE_UNIMPLEMENTED. Audit emitters log
+  //     `dispatch_rejected` (malformed, regex fail) distinctly from
+  //     `dispatch_unknown` (well-formed, no handler) so abuse signals
+  //     correlate cleanly.
+  string method = 1;
+
+  // Initial leading metadata (gRPC equivalent of trailing-metadata's
+  // counterpart at request start).
+  //
+  // Bounds (transport-enforced): each key ≤ 256 bytes, each value
+  // ≤ 4096 bytes, total entries ≤ 64. Oversized metadata triggers
+  // STATUS_CODE_RESOURCE_EXHAUSTED at serialise time. Audit emitters
+  // MUST treat values as untrusted (see TrailingStatus.metadata).
+  map<string, string> metadata = 2;
+
+  // Absolute deadline expressed as milliseconds since the Unix epoch
+  // (wall-clock, UTC). The server rejects or cancels the call if
+  // processing has not completed before this instant. A value of 0
+  // means "no deadline" (matches yuzu::transport::CallContext::deadline
+  // == milliseconds::zero() semantics on the C++ side).
+  int64 deadline_unix_millis = 3;
+}
