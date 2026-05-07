@@ -5129,7 +5129,14 @@ private:
             inventory_store_.get(), product_pack_store_.get(),
             /*sw_deploy_store=*/nullptr,
             /*device_token_store=*/nullptr,
-            /*license_store=*/nullptr, guaranteed_state_store_.get());
+            /*license_store=*/nullptr, guaranteed_state_store_.get(),
+            // session_revoke_fn — wipes both persisted (auth.db) and
+            // in-memory sessions for a username. AuthManager handles the
+            // dual-write internally so the REST handler stays
+            // implementation-agnostic.
+            [this](const std::string& username) -> std::size_t {
+                return auth_mgr_.invalidate_user_sessions(username);
+            });
 
         // -- Register MCP server routes ----------------------------------------
 

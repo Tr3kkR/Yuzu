@@ -18,6 +18,7 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 - **Hamburger menu** — upper-right dropdown with Settings, About (popup), and Logout.
 - **Auth middleware** — `set_pre_routing_handler` redirects unauthenticated requests to `/login`, returns 401 for API calls.
 - **HTMX paradigm** — Settings page uses HTMX for all server interactions; server renders HTML fragments. Vanilla JS reserved only for clipboard copy. Dominant UI pattern going forward.
+- **Session revocation REST surface (CC6.3 / CC6.8 evidence)** — `DELETE /api/v1/sessions?username=<name>` (admin-only, `UserManagement:Write`) for force-logout of another user, and `DELETE /api/v1/sessions/me` (any authenticated principal) for "Sign out everywhere". Both wrap `AuthManager::invalidate_user_sessions`, which performs the dual-write (DB rows first, then in-memory map) following the `remove_user`/`update_role` lock-ordering pattern. Two distinct audit actions — `session.revoke_all` (cross-user) and `session.revoke_all.self` (self via either route) — let SIEM rules split operator self-service from sibling-admin force-logout. Self-target via the admin path is permitted (recoverable by re-auth) and audited as `.self`; this is a deliberately weaker guard than the `#397/#403` self-target guard on DELETE-user / role-demote, which exists to prevent admin-role self-lockout.
 
 ## Granular RBAC (Phase 3)
 

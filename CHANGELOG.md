@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Session revocation REST surface (CC6.3 / CC6.8 evidence).**
+  `DELETE /api/v1/sessions?username=<name>` (admin-only via
+  `UserManagement:Write`) and `DELETE /api/v1/sessions/me` (authenticated
+  self-revoke) expose the previously internal `AuthDB::invalidate_all_sessions`
+  + `AuthManager::invalidate_user_sessions` primitives over REST, so
+  operators can force-log-out a compromised account from every device
+  and any user can sign out of every browser without operator
+  involvement. `AuthManager::invalidate_user_sessions` is now public and
+  performs the dual-write itself (DB rows first, then in-memory map),
+  mirroring the `remove_user` / `update_role` lock-ordering pattern.
+  Two distinct audit actions land:
+  - `session.revoke_all` — admin force-logging out a different user
+  - `session.revoke_all.self` — operator self-revoke (via either route)
+  so SIEM rules can split operator self-service from sibling-admin
+  force-logout. Self-target via the admin path is permitted (recoverable
+  by re-auth) but routes through the self audit action; this differs
+  from the `#397/#403` self-target guard on DELETE-user / role-demote,
+  which exists to prevent admin-role self-lockout.
+  Settings → Users gains a "Revoke sessions" button per non-self row
+  and a "Sign out everywhere" button on the operator's own row; both
+  use `hx-confirm` for blast-radius messaging.
+
 ### Fixed
 
 - **Executions drawer: dashboard "Fan-out" cell stuck at "0/0 of N".**
