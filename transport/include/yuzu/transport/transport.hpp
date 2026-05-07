@@ -58,9 +58,12 @@ namespace yuzu::transport {
 //
 // 1. Length-prefixed framing on QUIC: each protobuf message in either
 //    direction is preceded by a 4-byte big-endian length. The length
-//    MUST NOT exceed `kMaxFrameSize` (defined below). Receivers
-//    enforce this BEFORE allocating any per-frame buffer; an oversized
-//    length triggers stream cancellation with StatusCode::ResourceExhausted
+//    MUST NOT exceed the configured maximum frame size (default
+//    `kDefaultMaxFrameSize` = 4 MiB; per-listener override via
+//    `ListenerOptions::max_frame_size`; absolute ceiling
+//    `kAbsoluteMaxFrameSize` = 64 MiB). Receivers enforce this BEFORE
+//    allocating any per-frame buffer; an oversized length triggers
+//    stream cancellation with StatusCode::ResourceExhausted
 //    and an audit event. (gRPC implementation inherits HTTP/2 frame
 //    bounds from the gRPC library; the bound here is the application
 //    cap, distinct from the transport cap.)
@@ -77,11 +80,24 @@ namespace yuzu::transport {
 //    static_assert in the .cpp pins this to the proto enum so a future
 //    drift fails compilation, not silently mis-routes traffic.
 
-// Maximum size of a single framed protobuf message accepted by the
-// transport layer. Frames larger than this are rejected at the
-// length-prefix stage with StatusCode::ResourceExhausted; the stream
-// is cancelled and an audit event is emitted.
-inline constexpr std::size_t kMaxFrameSize = 64 * 1024 * 1024;  // 64 MiB
+// Default maximum size of a single framed protobuf message accepted
+// by the transport layer. Matches the gRPC library default (4 MiB) so
+// PR 1 (gRPC lift) does not silently widen the receive attack surface
+// relative to the pre-#376 codebase. Frames larger than this are
+// rejected at the length-prefix stage with StatusCode::ResourceExhausted;
+// the stream is cancelled and an audit event is emitted.
+//
+// Operators who legitimately need larger frames (e.g. fleet-wide
+// inventory aggregation reports) override on a per-listener basis via
+// `ListenerOptions::max_frame_size` and on a per-channel basis via
+// `BackoffPolicy`'s sibling `ChannelOptions` (added if/when a per-
+// connection cap is needed; today none of the legitimate Yuzu RPCs
+// exceed the default).
+//
+// Hard ceiling — implementations MUST refuse to be configured higher
+// than `kAbsoluteMaxFrameSize` regardless of operator request.
+inline constexpr std::size_t kDefaultMaxFrameSize  = 4 * 1024 * 1024;   // 4 MiB
+inline constexpr std::size_t kAbsoluteMaxFrameSize = 64 * 1024 * 1024;  // 64 MiB
 
 // Maximum size of a metadata key or value. Oversized metadata triggers
 // StatusCode::ResourceExhausted at serialise time, BEFORE bytes are
@@ -162,11 +178,18 @@ struct Endpoint {
 //     (consumption point is); copies returned from `reload()` are
 //     consumed once and zeroed on the same path.
 //   * `verify_peer = false` and `client_cert_mode = ClientCertMode::None`
-//     in production builds MUST be refused at startup unless the build
-//     was configured with `YUZU_ALLOW_INSECURE_TLS=1` (mirroring the
-//     existing server-side env gate). If observed, the transport logs
-//     an audit event of category `transport.insecure_tls_observed`
-//     before refusing the connection.
+//     in production builds MUST be refused — at startup AND on any
+//     subsequent reload — unless the build was configured with
+//     `YUZU_ALLOW_INSECURE_TLS=1` (mirroring the existing server-side
+//     env gate at `server/core/src/insecure_tls_gate.hpp`). The env
+//     gate is read once at process start; downstream the transport
+//     enforces the same posture on every reload(). If the gate is off
+//     and a reload returns insecure material, the reload FAILS as
+//     `StatusCode::FailedPrecondition`; the existing Credentials remain
+//     in force. The transport logs an audit event of category
+//     `transport.insecure_tls_observed` whenever insecure material is
+//     observed, regardless of whether the connection ultimately
+//     proceeded.
 //   * `reload` callback contract: invoked before each new connection
 //     (client) or each new TLS handshake (server). If the callback
 //     throws, the connection attempt FAILS with StatusCode::Unauthenticated.
@@ -174,11 +197,25 @@ struct Endpoint {
 //     the connection FAILS. If the returned material fails cert-chain
 //     validation against the configured CA, the connection FAILS.
 //     There is NO fallback to the previously-loaded Credentials and NO
-//     plaintext fallback. Reload-driven downgrades are explicitly
-//     rejected: if the live Credentials had `verify_peer = true` and the
-//     reloaded material has `verify_peer = false`, the reload fails as
-//     `StatusCode::FailedPrecondition` and the existing Credentials
-//     remain in force.
+//     plaintext fallback. Reload-driven downgrades are rejected on a
+//     partial-order basis (any change that strictly weakens
+//     authentication posture relative to the live state fails as
+//     `StatusCode::FailedPrecondition`):
+//       - `verify_peer`: live=true → reload=false NOT permitted.
+//       - `client_cert_mode`: ordinal Require > Request > None; a reload
+//         that strictly weakens (Require → Request, Require → None,
+//         Request → None) NOT permitted.
+//       - `alpn_protocols`: a reload that DROPS a previously-required
+//         protocol while keeping a weaker alternative (e.g. removing
+//         `yuzu/1` from a set that also contained `h2`) NOT permitted.
+//         Adding new protocols, or replacing the set with one of equal
+//         or stronger posture, IS permitted.
+//       - `sni_hostname`: change permitted (cosmetic, not security-
+//         relevant for endpoint validation when CA pinning is in force).
+//       - `cert_lifecycle_policy_url`: change permitted.
+//     The PEM material itself (cert, key, CA bundle) may rotate freely
+//     under reload; this contract regulates only the protocol-selector
+//     fields above.
 //   * `cert_lifecycle_policy_url` (when set) names a documented policy
 //     for cert validity, revocation, and rotation cadence — required
 //     before PR 3 merges per Workstream B. May be empty during
@@ -292,7 +329,7 @@ struct CallResult {
 //
 // `serialize()` failure semantics: returning false aborts the call
 // with StatusCode::Internal. Typical causes: arena exhaustion,
-// oversized output (> kMaxFrameSize), invariant violation in the
+// oversized output (> the listener's configured max_frame_size), invariant violation in the
 // underlying message. NEVER skip; never silently truncate.
 class SerializableMessage {
 public:
@@ -451,6 +488,15 @@ struct ListenerOptions {
 
     // Hard cap on connection count; zero = unbounded.
     uint32_t max_connections = 0;
+
+    // Maximum size of a single framed protobuf message accepted on
+    // this listener. Zero means use kDefaultMaxFrameSize (4 MiB,
+    // matching gRPC default). Implementations MUST refuse values
+    // greater than kAbsoluteMaxFrameSize (64 MiB). Operators with
+    // legitimate large-frame use cases (e.g. fleet-wide inventory
+    // aggregation) raise this explicitly; the explicit raise is
+    // operator-visible (logged at startup, exposed via metrics).
+    std::size_t max_frame_size = 0;
 
     // Optional metric sink (shared with consumers).
     std::shared_ptr<TransportMetricSink> metric_sink;
