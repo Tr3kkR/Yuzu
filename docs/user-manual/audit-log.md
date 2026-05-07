@@ -51,6 +51,8 @@ required.
 | `auth.login` | Session | Operator logs in via the dashboard or API |
 | `auth.logout` | Session | Operator logs out |
 | `auth.login_failed` | Session | Failed login attempt |
+| `session.revoke_all` | User | An admin force-logged out every active cookie session for a named user via `DELETE /api/v1/sessions?username=<name>`. `target_id=<username>`; `detail=count=<N>` (in-memory cookies wiped). `result=partial` with `detail=count=<N> db_error=true` if the AuthDB DELETE failed (operator should retry or restart). API tokens belonging to the user are NOT revoked by this action. |
+| `session.revoke_all.self` | User | A user wiped all their own sessions via `DELETE /api/v1/sessions/me`, OR an admin supplied their own username to the admin path. The `/me` flow also revokes API tokens; `detail=count=<N> api_tokens_revoked=<M>`. `result=denied` if a non-interactive credential (MCP token, service-scoped token) attempted self-revoke. |
 | `tag.set` | Tag | A tag is created or updated on an agent |
 | `tag.delete` | Tag | A tag is removed from an agent |
 | `instruction.execute` | Instruction | An instruction is dispatched to one or more agents |

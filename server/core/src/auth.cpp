@@ -501,19 +501,28 @@ void AuthManager::invalidate_session(const std::string& token) {
     sessions_.erase(token);
 }
 
-std::size_t AuthManager::invalidate_user_sessions(const std::string& username) {
-    // Mirror the remove_user / update_role pattern: drop persisted DB
-    // sessions first (without holding mu_), then wipe the in-memory map.
-    // The AuthDB result is intentionally not surfaced — its row count
-    // includes already-expired entries the cleanup sweeper hadn't reaped,
-    // which would mislead the caller's audit detail.
+AuthManager::RevokeResult
+AuthManager::invalidate_user_sessions(const std::string& username) {
+    // Lock-ordering: AuthDB call OUTSIDE mu_, then take mu_ for the
+    // in-memory erase. Same pattern as remove_user and update_role.
+    //
+    // Failure tolerance INTENTIONALLY DIFFERS from remove_user/update_role.
+    // Those abort on DB write failure because removing a user is a
+    // strictly-ordered durability operation: if the DB doesn't accept
+    // the change, the in-memory cache must not diverge or the server's
+    // first restart silently resurrects the deleted user. Revocation is
+    // different — the operator's mental model is "kill this session NOW",
+    // and the in-memory wipe IS the operationally-critical step (the
+    // active cookie validating against `sessions_` stops working
+    // immediately). We therefore wipe in-memory even on DB failure but
+    // surface `db_persisted=false` so the caller can audit the partial
+    // outcome and the operator knows to retry or restart.
+    bool db_persisted = true;
     if (auth_db_) {
         auto result = auth_db_->invalidate_all_sessions(username);
         if (!result) {
             spdlog::error("AuthDB invalidate_all_sessions failed for '{}'", username);
-            // Continue to in-memory wipe regardless — the caller asked us
-            // to revoke; partial success is better than leaving in-memory
-            // tokens valid because of a transient DB error.
+            db_persisted = false;
         }
     }
     std::unique_lock lock(mu_);
@@ -521,7 +530,7 @@ std::size_t AuthManager::invalidate_user_sessions(const std::string& username) {
     std::erase_if(sessions_, [&](const auto& pair) {
         return pair.second.username == username;
     });
-    return before - sessions_.size();
+    return RevokeResult{before - sessions_.size(), db_persisted};
 }
 
 // ── User management ─────────────────────────────────────────────────────────

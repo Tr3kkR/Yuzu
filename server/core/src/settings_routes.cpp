@@ -462,20 +462,24 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                         "<button class=\"btn btn-secondary\" "
                         "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                         "hx-delete=\"/api/v1/sessions/me\" "
-                        "hx-confirm=\"Sign out of every device? You will "
-                        "be redirected to the login page.\" "
+                        "hx-confirm=\"Sign out of every device AND revoke "
+                        "every API token you own? You will be redirected to "
+                        "the login page; any of your CI/CD or automation "
+                        "tokens will need to be re-issued.\" "
                         "hx-on::after-request=\"window.location='/login'\""
                         ">Sign out everywhere</button>";
             } else {
-                html += "<button class=\"btn btn-secondary\" "
+                html += "<button class=\"btn btn-danger\" "
                         "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;"
                         "margin-right:0.3rem\" "
                         "hx-delete=\"/api/v1/sessions?username=" +
                         html_escape(u.username) +
                         "\" "
+                        "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
                         "hx-confirm=\"Force &quot;" +
                         html_escape(u.username) +
-                        "&quot; to log in again? Active dashboard sessions will end immediately.\""
+                        "&quot; to log in again? Active dashboard sessions "
+                        "will end immediately. Their API tokens are NOT revoked.\""
                         ">Revoke sessions</button>"
                         "<button class=\"btn btn-danger\" "
                         "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "

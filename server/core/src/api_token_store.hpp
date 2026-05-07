@@ -61,6 +61,14 @@ public:
     /// Revoke a token by ID.
     bool revoke_token(const std::string& token_id);
 
+    /// Revoke every non-revoked token belonging to a principal. Returns
+    /// the number of tokens marked revoked. Used by the session-revocation
+    /// REST surface so "Sign out everywhere" actually revokes everywhere
+    /// (cookie sessions + API tokens), not just browser cookies. Without
+    /// this, a stolen-laptop incident leaves the on-laptop API token
+    /// fully functional and the operator UX silently lies.
+    std::size_t revoke_for_principal(const std::string& principal_id);
+
     /// Delete a token permanently.
     bool delete_token(const std::string& token_id);
 
