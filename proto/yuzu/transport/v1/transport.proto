@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package yuzu.transport.v1;
+
+option cc_enable_arenas = true;
+
+// transport.proto — wire envelopes used by the QUIC transport implementation
+// when there is no gRPC framing layer available to carry status or trailers.
+//
+// On gRPC, each RPC carries a final `grpc::Status` (code + detail string)
+// plus a metadata trailer map. On a raw QUIC stream we carry a single
+// QUIC bidirectional stream per logical RPC; the transport layer frames
+// each protobuf message with a 4-byte big-endian length prefix and emits
+// a final `TrailingStatus` message before half-closing the stream.
+//
+// This proto is consumed only by the transport layer
+// (sdk/src/transport/*) — service handlers above that layer never see
+// these envelopes directly.
+
+// StatusCode mirrors the canonical gRPC status codes so the abstraction
+// can carry the same semantics across both transport implementations.
+// Numeric values intentionally match google.rpc.Code so existing
+// error-mapping code in the rest of the codebase continues to work.
+enum StatusCode {
+  STATUS_CODE_OK                 = 0;
+  STATUS_CODE_CANCELLED          = 1;
+  STATUS_CODE_UNKNOWN            = 2;
+  STATUS_CODE_INVALID_ARGUMENT   = 3;
+  STATUS_CODE_DEADLINE_EXCEEDED  = 4;
+  STATUS_CODE_NOT_FOUND          = 5;
+  STATUS_CODE_ALREADY_EXISTS     = 6;
+  STATUS_CODE_PERMISSION_DENIED  = 7;
+  STATUS_CODE_RESOURCE_EXHAUSTED = 8;
+  STATUS_CODE_FAILED_PRECONDITION = 9;
+  STATUS_CODE_ABORTED            = 10;
+  STATUS_CODE_OUT_OF_RANGE       = 11;
+  STATUS_CODE_UNIMPLEMENTED      = 12;
+  STATUS_CODE_INTERNAL           = 13;
+  STATUS_CODE_UNAVAILABLE        = 14;
+  STATUS_CODE_DATA_LOSS          = 15;
+  STATUS_CODE_UNAUTHENTICATED    = 16;
+}
+
+// TrailingStatus is the final protobuf message every QUIC stream emits
+// before its sender half-closes. It carries the equivalent of the gRPC
+// trailing status block.
+message TrailingStatus {
+  StatusCode code = 1;
+  string detail = 2;
+  map<string, string> metadata = 3;
+}
+
+// HandshakeHello is sent by the client side as the first frame on a new
+// QUIC stream so the server can route the stream to the correct service
+// handler. gRPC encodes this in HTTP/2 :path; we encode it in a leading
+// protobuf frame.
+//
+// For wire-format compatibility with future versions, all field numbers
+// here must be considered frozen.
+message HandshakeHello {
+  // Fully-qualified RPC method name, e.g. "yuzu.agent.v1.AgentService/Subscribe".
+  string method = 1;
+  // Initial leading metadata (gRPC equivalent of trailing-metadata's
+  // counterpart at request start).
+  map<string, string> metadata = 2;
+  // Deadline relative to wall-clock at the moment the client dispatches
+  // the call, expressed as a unix-millis epoch. Zero means "no deadline".
+  int64 deadline_unix_millis = 3;
+}

@@ -35,6 +35,7 @@ gen = custom_target(
         proto_root / 'yuzu/guardian/v1/guaranteed_state.proto',
         proto_root / 'yuzu/server/v1/management.proto',
         proto_root / 'yuzu/gateway/v1/gateway.proto',
+        proto_root / 'yuzu/transport/v1/transport.proto',
     ],
     output: [
         'common.pb.cc', 'common.pb.h', 'common.grpc.pb.cc', 'common.grpc.pb.h',
@@ -43,6 +44,7 @@ gen = custom_target(
         'guaranteed_state.grpc.pb.cc', 'guaranteed_state.grpc.pb.h',
         'management.pb.cc', 'management.pb.h', 'management.grpc.pb.cc', 'management.grpc.pb.h',
         'gateway.pb.cc', 'gateway.pb.h', 'gateway.grpc.pb.cc', 'gateway.grpc.pb.h',
+        'transport.pb.cc', 'transport.pb.h', 'transport.grpc.pb.cc', 'transport.grpc.pb.h',
     ],
     command: [
         find_program('python3', 'python'),
@@ -56,15 +58,19 @@ gen = custom_target(
         proto_root / 'yuzu/guardian/v1/guaranteed_state.proto',
         proto_root / 'yuzu/server/v1/management.proto',
         proto_root / 'yuzu/gateway/v1/gateway.proto',
+        proto_root / 'yuzu/transport/v1/transport.proto',
     ],
 )
 
-# Ten source files (even indices) and ten headers (odd indices), in input order:
-#   common, agent, guaranteed_state, management, gateway — each with .pb + .grpc.pb pairs.
+# Twelve source files (even indices) and twelve headers (odd indices), in
+# input order: common, agent, guaranteed_state, management, gateway,
+# transport — each with .pb + .grpc.pb pairs.
 gen_srcs = [gen[0],  gen[2],  gen[4],  gen[6],  gen[8],
-            gen[10], gen[12], gen[14], gen[16], gen[18]]
+            gen[10], gen[12], gen[14], gen[16], gen[18],
+            gen[20], gen[22]]
 gen_hdrs = [gen[1],  gen[3],  gen[5],  gen[7],  gen[9],
-            gen[11], gen[13], gen[15], gen[17], gen[19]]
+            gen[11], gen[13], gen[15], gen[17], gen[19],
+            gen[21], gen[23]]
 
 # Override the project-wide -fvisibility=hidden so that proto symbols baked
 # into a consumer shared_library (libyuzu_agent_core.so /
