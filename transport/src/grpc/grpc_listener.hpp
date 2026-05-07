@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <grpcpp/generic/async_generic_service.h>
 #include <grpcpp/grpcpp.h>
 
 #include <atomic>
@@ -22,10 +23,13 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #include "yuzu/transport/transport.hpp"
 
 namespace yuzu::transport::grpc_backend {
+
+class ServerCall;  // implementation detail; defined in grpc_listener.cpp
 
 class GrpcServerListener final : public ServerListener {
 public:
@@ -61,14 +65,24 @@ private:
 
     void enforce_method_or_die(const std::string& method);
 
-    mutable std::mutex                  mtx_;
-    std::condition_variable             shutdown_cv_;
+    // ServerCall (defined in grpc_listener.cpp) drives the per-call state
+    // machine and reads back through these accessors. Friend grants
+    // access to unary_handlers_ for handler lookup.
+    friend class ServerCall;
+    void post_new_request_call();
+    void cq_worker_loop();
+
+    mutable std::mutex                       mtx_;
+    std::condition_variable                  shutdown_cv_;
     std::map<std::string, UnaryRegistration> unary_handlers_;
     std::map<std::string, BidiStreamHandler> bidi_handlers_;
-    ListenerOptions                     opts_;
-    std::unique_ptr<::grpc::Server>     server_;
-    std::atomic<bool>                   started_{false};
-    std::atomic<bool>                   shutting_down_{false};
+    ListenerOptions                          opts_;
+    std::unique_ptr<::grpc::Server>          server_;
+    ::grpc::AsyncGenericService              generic_service_;
+    std::unique_ptr<::grpc::ServerCompletionQueue> cq_;
+    std::thread                              cq_worker_;
+    std::atomic<bool>                        started_{false};
+    std::atomic<bool>                        shutting_down_{false};
 };
 
 }  // namespace yuzu::transport::grpc_backend

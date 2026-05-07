@@ -326,6 +326,166 @@ TEST_CASE("Channel::unary cancel via stop_token returns Cancelled", "[transport]
              r.status.code == StatusCode::DeadlineExceeded));
 }
 
+// =====================================================================
+// Round-trip tests (PR 1b-2): client unary dispatch ↔ server
+// AsyncGenericService dispatcher
+// =====================================================================
+//
+// These tests start a real listener on 127.0.0.1 with an ephemeral port,
+// register a unary handler, connect a Channel via make_channel, and
+// invoke unary() — exercising the full async state machine end to end.
+
+namespace {
+
+// Adapter: SerializableMessage that owns a std::string payload.
+// Used by both client (request/response) and server (handler) sides.
+class StringMessage final : public SerializableMessage {
+public:
+    StringMessage() = default;
+    explicit StringMessage(std::string s) : data_(std::move(s)) {}
+
+    bool serialize(std::string& out) const override {
+        out = data_;
+        return true;
+    }
+    bool parse(std::string_view in) override {
+        data_.assign(in.data(), in.size());
+        return true;
+    }
+
+    const std::string& data() const noexcept { return data_; }
+    void set_data(std::string s) { data_ = std::move(s); }
+
+private:
+    std::string data_;
+};
+
+// Pick an ephemeral port by binding then immediately reading the
+// allocated port back from the listener. start() with port 0 instructs
+// the OS to assign a free port; we discover which one it picked via
+// the address gRPC reports back.
+//
+// Simpler: we bind start() with port 0 on a separate ServerBuilder
+// pre-flight, retrieve the port via the standard AddListeningPort
+// out-parameter, then re-use that port.
+//
+// Easier still: use port 0 as the bind, and use start_with_assigned_port
+// helper that returns the actual port. ServerBuilder::AddListeningPort
+// in gRPC takes an int* selected_port out-parameter that fills in the
+// chosen port AFTER BuildAndStart. The current ServerListener API doesn't
+// expose that — we work around by binding an ephemeral via a probe socket.
+//
+// For the smoke test we use a fixed high-numbered port and accept the
+// vanishingly-small race risk that another test on the same runner
+// claims it concurrently. (CI has no parallel test execution within a
+// single test binary; the only race is across binaries and these tests
+// are single-binary.)
+constexpr uint16_t kRoundTripPort = 50571;
+
+} // namespace
+
+TEST_CASE("Client/server unary round-trip with registered handler", "[transport]") {
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    // Server-side handler: echoes request bytes back, prefixed with "ack:".
+    auto handler = [](const CallContext&, const SerializableMessage& req,
+                      SerializableMessage& resp) -> Status {
+        const auto& sreq = static_cast<const StringMessage&>(req);
+        auto& sresp = static_cast<StringMessage&>(resp);
+        sresp.set_data("ack:" + sreq.data());
+        return Status{StatusCode::Ok, ""};
+    };
+    auto factory = []() -> std::unique_ptr<SerializableMessage> {
+        return std::make_unique<StringMessage>();
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Echo", factory, factory, handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", kRoundTripPort};
+    auto start_r = listener->start(bind, creds);
+    REQUIRE(start_r.has_value());
+    REQUIRE(listener->is_serving());
+
+    // Client side
+    auto ch = make_channel(Backend::Grpc, bind, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    StringMessage req("hello"), resp;
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    auto r = ch->unary("yuzu.test.v1.Echo/Echo", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Ok);
+    REQUIRE(resp.data() == "ack:hello");
+
+    ch->close();
+    listener->shutdown();
+    REQUIRE_FALSE(listener->is_serving());
+}
+
+TEST_CASE("Client/server unary returns Unimplemented for unknown method", "[transport]") {
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", static_cast<uint16_t>(kRoundTripPort + 1)};
+    auto start_r = listener->start(bind, creds);
+    REQUIRE(start_r.has_value());
+
+    auto ch = make_channel(Backend::Grpc, bind, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    StringMessage req("hello"), resp;
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    auto r = ch->unary("yuzu.test.v1.Echo/NotRegistered", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Unimplemented);
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("Client/server unary propagates handler-returned error status", "[transport]") {
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, const SerializableMessage&,
+                      SerializableMessage&) -> Status {
+        return Status{StatusCode::PermissionDenied, "no soup for you"};
+    };
+    auto factory = []() -> std::unique_ptr<SerializableMessage> {
+        return std::make_unique<StringMessage>();
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Forbidden", factory, factory, handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", static_cast<uint16_t>(kRoundTripPort + 2)};
+    auto start_r = listener->start(bind, creds);
+    REQUIRE(start_r.has_value());
+
+    auto ch = make_channel(Backend::Grpc, bind, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    StringMessage req, resp;
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    auto r = ch->unary("yuzu.test.v1.Echo/Forbidden", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::PermissionDenied);
+    REQUIRE(r.status.detail == "no soup for you");
+
+    ch->close();
+    listener->shutdown();
+}
+
 TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport]") {
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);
