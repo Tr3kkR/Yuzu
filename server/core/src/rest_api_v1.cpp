@@ -504,14 +504,15 @@ void RestApiV1::register_routes(
     ServiceGroupFn service_group_fn, TagPushFn tag_push_fn, InventoryStore* inventory_store,
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
-    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry) {
+    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
+    SessionRevokeFn session_revoke_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
                     execution_tracker, schedule_engine, approval_manager, tag_store, audit_store,
                     std::move(service_group_fn), std::move(tag_push_fn), inventory_store,
                     product_pack_store, sw_deploy_store, device_token_store, license_store,
-                    guaranteed_state_store, metrics_registry);
+                    guaranteed_state_store, metrics_registry, std::move(session_revoke_fn));
 }
 
 void RestApiV1::register_routes(
@@ -523,7 +524,8 @@ void RestApiV1::register_routes(
     ServiceGroupFn service_group_fn, TagPushFn tag_push_fn, InventoryStore* inventory_store,
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
-    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry) {
+    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
+    SessionRevokeFn session_revoke_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1197,6 +1199,88 @@ void RestApiV1::register_routes(
         audit_fn(req, "api_token.revoke", "success", "ApiToken", token_id,
                  "owner=" + existing->principal_id);
         res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
+    });
+
+    // ── Sessions (/api/v1/sessions) ──────────────────────────────────────
+    //
+    // The DB primitive `AuthDB::invalidate_all_sessions(username)` and the
+    // in-memory counterpart `AuthManager::invalidate_user_sessions` shipped
+    // separately (used by `remove_user`/`update_role`). This block exposes
+    // them over REST so operators can:
+    //   - Force-log-out a user from every device (admin-driven, CC6.3/CC6.8
+    //     evidence — terminate or change in role).
+    //   - "Sign out everywhere" their own sessions without operator help
+    //     (self-driven, useful after a lost device).
+    //
+    // Self-target guard is applied differently from the DELETE-user / role
+    // demotion guards: revoking your own sessions is *recoverable* (re-auth
+    // and you're back), so the admin path allows it but routes through the
+    // self-revoke audit action so SIEM rules can distinguish operator
+    // self-service from a sibling-admin force-logout. The guard at
+    // `settings_routes.cpp` exists to prevent self-lockout from the admin
+    // role itself; that does not apply here.
+
+    // POST /api/v1/sessions/me/revoke — self-revoke, no admin gate.
+    // (DELETE on /me is conventional, but the dashboard's "Sign out
+    // everywhere" button benefits from the POST verb to avoid CSRF
+    // simple-request status; the underlying op is the same.)
+    sink.Delete("/api/v1/sessions/me", [auth_fn, audit_fn, session_revoke_fn](
+                                          const httplib::Request& req, httplib::Response& res) {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
+        if (!session_revoke_fn) {
+            res.status = 503;
+            res.set_content(error_json("session revocation unavailable", 503),
+                            "application/json");
+            return;
+        }
+        const auto count = session_revoke_fn(session->username);
+        audit_fn(req, "session.revoke_all.self", "success", "user", session->username,
+                 "count=" + std::to_string(count));
+        res.set_content(ok_json(JObj().add("revoked", static_cast<int64_t>(count)).str()),
+                        "application/json");
+    });
+
+    // DELETE /api/v1/sessions?username=<name> — admin-only force-logout.
+    // Gated by `UserManagement:Write` because the action mutates a user's
+    // access state (parity with role change / disable). `username` query
+    // parameter is required; an empty value 400s rather than silently
+    // wiping every session in the system.
+    sink.Delete("/api/v1/sessions", [auth_fn, perm_fn, audit_fn, session_revoke_fn](
+                                       const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "UserManagement", "Write"))
+            return;
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
+        if (!session_revoke_fn) {
+            res.status = 503;
+            res.set_content(error_json("session revocation unavailable", 503),
+                            "application/json");
+            return;
+        }
+        const auto username = req.get_param_value("username");
+        if (username.empty()) {
+            res.status = 400;
+            res.set_content(error_json("username query parameter required", 400),
+                            "application/json");
+            return;
+        }
+        const auto count = session_revoke_fn(username);
+        // Self-revoke via the admin path — distinguish in audit so
+        // forensics can tell operator self-service apart from a sibling
+        // admin force-logout. The action remains permitted (recoverable
+        // by re-auth, not a destructive principal change).
+        const std::string action =
+            (username == session->username) ? "session.revoke_all.self" : "session.revoke_all";
+        audit_fn(req, action, "success", "user", username,
+                 "count=" + std::to_string(count));
+        res.set_content(ok_json(JObj()
+                                    .add("username", username)
+                                    .add("revoked", static_cast<int64_t>(count))
+                                    .str()),
+                        "application/json");
     });
 
     // ── Quarantine (/api/v1/quarantine) ──────────────────────────────────

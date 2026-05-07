@@ -501,6 +501,29 @@ void AuthManager::invalidate_session(const std::string& token) {
     sessions_.erase(token);
 }
 
+std::size_t AuthManager::invalidate_user_sessions(const std::string& username) {
+    // Mirror the remove_user / update_role pattern: drop persisted DB
+    // sessions first (without holding mu_), then wipe the in-memory map.
+    // The AuthDB result is intentionally not surfaced — its row count
+    // includes already-expired entries the cleanup sweeper hadn't reaped,
+    // which would mislead the caller's audit detail.
+    if (auth_db_) {
+        auto result = auth_db_->invalidate_all_sessions(username);
+        if (!result) {
+            spdlog::error("AuthDB invalidate_all_sessions failed for '{}'", username);
+            // Continue to in-memory wipe regardless — the caller asked us
+            // to revoke; partial success is better than leaving in-memory
+            // tokens valid because of a transient DB error.
+        }
+    }
+    std::unique_lock lock(mu_);
+    const auto before = sessions_.size();
+    std::erase_if(sessions_, [&](const auto& pair) {
+        return pair.second.username == username;
+    });
+    return before - sessions_.size();
+}
+
 // ── User management ─────────────────────────────────────────────────────────
 
 bool AuthManager::has_users() const {

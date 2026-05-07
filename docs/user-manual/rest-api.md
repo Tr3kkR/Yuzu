@@ -655,6 +655,59 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
 
 ---
 
+### Sessions
+
+Operator and dashboard sessions are the cookie-based sessions issued by `POST /login`. The endpoints below let an admin force-log-out another user from every device, and let any authenticated principal sign out of every browser at once.
+
+The DB primitive (`AuthDB::invalidate_all_sessions`) and the in-memory counterpart already fire when a user is removed (`DELETE /api/settings/users/{username}`) or when their role changes; these REST endpoints expose the same primitive standalone for incident response and operator self-service.
+
+#### `DELETE /api/v1/sessions?username=<name>`
+
+Revoke every active session for a named user. The user remains valid (no role change, no account disable); they simply have to authenticate again to obtain a new session cookie.
+
+**Permission:** `UserManagement:Write`
+
+**Self-target behaviour.** An admin invoking this with their own username is permitted (signing yourself out of every device is recoverable — re-authenticate and you are back), but the audit row is recorded as `session.revoke_all.self` instead of `session.revoke_all` so SIEM rules can split operator self-service from a sibling-admin force-logout. This is a deliberately weaker guard than the `#397/#403` self-target guard on `DELETE /api/settings/users/{username}`, which exists to prevent admin-role self-lockout (an unrecoverable state).
+
+**Response:**
+
+```json
+{
+  "data": { "username": "alice", "revoked": 2 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`revoked` is the number of in-memory session cookies wiped. The persisted DB row count is intentionally not surfaced — it may include already-expired entries the cleanup sweeper had not yet reaped, which would mislead the audit chain.
+
+**Error (400) -- missing username:**
+
+```json
+{
+  "error": { "code": 400, "message": "username query parameter required" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `DELETE /api/v1/sessions/me`
+
+Self-revoke. Wipes every session belonging to the authenticated caller (cookie-based or API-token-derived). No admin permission required — this is intended as a "Sign out everywhere" UX so a user can recover from a lost device without operator involvement.
+
+**Permission:** authenticated session only.
+
+**Response:**
+
+```json
+{
+  "data": { "revoked": 3 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Audit:** every successful invocation emits `session.revoke_all.self` with `detail=count=<N>`. The dashboard's "Sign out everywhere" button on the operator's own row in Settings → Users uses this endpoint and follows up with a redirect to `/login`.
+
+---
+
 ### Quarantine
 
 Quarantine isolates a device from receiving commands or participating in normal operations. Quarantined devices remain connected but are blocked from instruction execution.

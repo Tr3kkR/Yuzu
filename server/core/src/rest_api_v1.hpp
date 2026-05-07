@@ -54,6 +54,14 @@ public:
     using ServiceGroupFn = std::function<void(const std::string& service_value)>;
     using TagPushFn = std::function<void(const std::string& agent_id, const std::string& key)>;
 
+    /// Wipe every session belonging to a username — both the persisted
+    /// `sessions` rows in `auth.db` and the in-memory `AuthManager::sessions_`
+    /// map. Returns the number of in-memory tokens erased (the DB row count
+    /// is not returned — it's an implementation detail and may include
+    /// already-expired entries the cleanup sweeper hadn't reaped).
+    /// Empty/missing callback = endpoint returns 503.
+    using SessionRevokeFn = std::function<std::size_t(const std::string& username)>;
+
     /// Production overload — constructs an HttplibRouteSink and delegates
     /// to the sink-based overload below.
     ///
@@ -74,7 +82,8 @@ public:
                          DeviceTokenStore* device_token_store = nullptr,
                          LicenseStore* license_store = nullptr,
                          GuaranteedStateStore* guaranteed_state_store = nullptr,
-                         yuzu::MetricsRegistry* metrics_registry = nullptr);
+                         yuzu::MetricsRegistry* metrics_registry = nullptr,
+                         SessionRevokeFn session_revoke_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -92,7 +101,8 @@ public:
                          DeviceTokenStore* device_token_store = nullptr,
                          LicenseStore* license_store = nullptr,
                          GuaranteedStateStore* guaranteed_state_store = nullptr,
-                         yuzu::MetricsRegistry* metrics_registry = nullptr);
+                         yuzu::MetricsRegistry* metrics_registry = nullptr,
+                         SessionRevokeFn session_revoke_fn = {});
 };
 
 } // namespace yuzu::server

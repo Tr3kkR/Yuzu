@@ -165,6 +165,15 @@ public:
     /// Destroy a session (logout).
     void invalidate_session(const std::string& token);
 
+    /// Wipe every session for a username, both in-memory and (if AuthDB
+    /// is configured) persisted in `auth.db`. Returns the number of
+    /// in-memory tokens erased — the DB row count is not surfaced as it
+    /// may include already-expired entries the cleanup sweeper hadn't
+    /// reaped. Caller is responsible for audit emission; this method does
+    /// no logging or event publishing so it can run while the caller
+    /// holds unrelated locks.
+    std::size_t invalidate_user_sessions(const std::string& username);
+
     /// List all configured users (password hashes omitted from caller view).
     std::vector<UserEntry> list_users() const;
 
