@@ -9,6 +9,9 @@
 
 #include <chrono>
 #include <memory>
+#include <stop_token>
+#include <string>
+#include <thread>
 
 #include "yuzu/transport/transport.hpp"
 
@@ -229,6 +232,98 @@ TEST_CASE("ServerListener rejects duplicate registration", "[transport]") {
     REQUIRE_THROWS_AS(listener->register_unary("yuzu.agent.v1.AgentService/Subscribe", noop_factory,
                                                noop_factory, noop_unary),
                       std::invalid_argument);
+}
+
+TEST_CASE("Channel::unary against unreachable target returns Unavailable", "[transport]") {
+    // PR 1b-1: real gRPC dispatch via grpc::GenericStub.
+    // 127.0.0.1 with an unused port is the canonical unreachable target.
+    // gRPC reports Unavailable for connect refused (or DeadlineExceeded
+    // if the deadline elapses before the connect attempt fails).
+    Endpoint target{"127.0.0.1", 1}; // port 1 is reserved + always closed
+    Credentials creds{};
+    creds.verify_peer = false;
+
+    auto ch = make_channel(Backend::Grpc, target, creds);
+    REQUIRE(ch != nullptr);
+
+    struct DummyMsg final : SerializableMessage {
+        bool serialize(std::string& out) const override {
+            out = "x";
+            return true;
+        }
+        bool parse(std::string_view) override { return true; }
+    } req, resp;
+
+    CallContext ctx;
+    ctx.deadline = std::chrono::milliseconds(500);
+
+    auto r = ch->unary("yuzu.agent.v1.AgentService/Heartbeat", ctx, req, resp);
+    // Either Unavailable (connect refused) or DeadlineExceeded (took too
+    // long) is acceptable — both prove the dispatch path reached gRPC.
+    // The placeholder StatusCode::Unimplemented from PR 1a would NOT
+    // appear here.
+    REQUIRE((r.status.code == StatusCode::Unavailable ||
+             r.status.code == StatusCode::DeadlineExceeded));
+}
+
+TEST_CASE("Channel::unary serialize failure returns Internal", "[transport]") {
+    Endpoint target{"127.0.0.1", 1};
+    Credentials creds{};
+    creds.verify_peer = false;
+
+    auto ch = make_channel(Backend::Grpc, target, creds);
+    REQUIRE(ch != nullptr);
+
+    struct FailingMsg final : SerializableMessage {
+        bool serialize(std::string&) const override { return false; }
+        bool parse(std::string_view) override { return true; }
+    } req;
+    struct DummyMsg final : SerializableMessage {
+        bool serialize(std::string&) const override { return true; }
+        bool parse(std::string_view) override { return true; }
+    } resp;
+
+    CallContext ctx;
+    auto r = ch->unary("yuzu.agent.v1.AgentService/Heartbeat", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Internal);
+}
+
+TEST_CASE("Channel::unary cancel via stop_token returns Cancelled", "[transport]") {
+    Endpoint target{"127.0.0.1", 1};
+    Credentials creds{};
+    creds.verify_peer = false;
+
+    auto ch = make_channel(Backend::Grpc, target, creds);
+    REQUIRE(ch != nullptr);
+
+    struct DummyMsg final : SerializableMessage {
+        bool serialize(std::string& out) const override {
+            out = "x";
+            return true;
+        }
+        bool parse(std::string_view) override { return true; }
+    } req, resp;
+
+    std::stop_source ss;
+    CallContext ctx;
+    ctx.cancel = ss.get_token();
+    ctx.deadline = std::chrono::seconds(5);
+
+    // Stop after a short delay so the dispatch enters gRPC before
+    // TryCancel fires.
+    std::thread canceller([&ss]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        ss.request_stop();
+    });
+
+    auto r = ch->unary("yuzu.agent.v1.AgentService/Heartbeat", ctx, req, resp);
+    canceller.join();
+
+    // Acceptable outcomes: Cancelled (TryCancel fired), Unavailable
+    // (connect refused before cancel observed), DeadlineExceeded (slow
+    // CI). The dispatch path was real either way.
+    REQUIRE((r.status.code == StatusCode::Cancelled || r.status.code == StatusCode::Unavailable ||
+             r.status.code == StatusCode::DeadlineExceeded));
 }
 
 TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport]") {

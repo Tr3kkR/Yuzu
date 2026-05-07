@@ -2,18 +2,52 @@
 
 #include "grpc_channel.hpp"
 
+#include <grpcpp/generic/generic_stub.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/security/credentials.h>
+#include <grpcpp/support/byte_buffer.h>
+#include <grpcpp/support/slice.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <limits>
+#include <optional>
+#include <stop_token>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "grpc_method_validator.hpp"  // method_name_well_formed
+#include "transport.pb.h"             // proto StatusCode enum for static_assert
 #include "yuzu/secure_zero.hpp"
+
+// Wire-stability assertion. Per the FROZEN commitment in
+// transport.proto and transport.hpp, the C++ enum class StatusCode and
+// the generated proto enum yuzu::transport::framing::v1::StatusCode
+// share numeric values. Drift here = silent error-mapping break.
+namespace {
+namespace pb = ::yuzu::transport::framing::v1;
+namespace yt = ::yuzu::transport;
+static_assert(static_cast<int>(yt::StatusCode::Ok) == pb::STATUS_CODE_OK);
+static_assert(static_cast<int>(yt::StatusCode::Cancelled) == pb::STATUS_CODE_CANCELLED);
+static_assert(static_cast<int>(yt::StatusCode::Unknown) == pb::STATUS_CODE_UNKNOWN);
+static_assert(static_cast<int>(yt::StatusCode::InvalidArgument) == pb::STATUS_CODE_INVALID_ARGUMENT);
+static_assert(static_cast<int>(yt::StatusCode::DeadlineExceeded) == pb::STATUS_CODE_DEADLINE_EXCEEDED);
+static_assert(static_cast<int>(yt::StatusCode::NotFound) == pb::STATUS_CODE_NOT_FOUND);
+static_assert(static_cast<int>(yt::StatusCode::AlreadyExists) == pb::STATUS_CODE_ALREADY_EXISTS);
+static_assert(static_cast<int>(yt::StatusCode::PermissionDenied) == pb::STATUS_CODE_PERMISSION_DENIED);
+static_assert(static_cast<int>(yt::StatusCode::ResourceExhausted) == pb::STATUS_CODE_RESOURCE_EXHAUSTED);
+static_assert(static_cast<int>(yt::StatusCode::FailedPrecondition) == pb::STATUS_CODE_FAILED_PRECONDITION);
+static_assert(static_cast<int>(yt::StatusCode::Aborted) == pb::STATUS_CODE_ABORTED);
+static_assert(static_cast<int>(yt::StatusCode::OutOfRange) == pb::STATUS_CODE_OUT_OF_RANGE);
+static_assert(static_cast<int>(yt::StatusCode::Unimplemented) == pb::STATUS_CODE_UNIMPLEMENTED);
+static_assert(static_cast<int>(yt::StatusCode::Internal) == pb::STATUS_CODE_INTERNAL);
+static_assert(static_cast<int>(yt::StatusCode::Unavailable) == pb::STATUS_CODE_UNAVAILABLE);
+static_assert(static_cast<int>(yt::StatusCode::DataLoss) == pb::STATUS_CODE_DATA_LOSS);
+static_assert(static_cast<int>(yt::StatusCode::Unauthenticated) == pb::STATUS_CODE_UNAUTHENTICATED);
+}  // anonymous namespace
 
 namespace yuzu::transport::grpc_backend {
 
@@ -184,6 +218,9 @@ GrpcChannel::GrpcChannel(Endpoint target, Credentials creds,
     const std::string addr =
         target_.host + ":" + std::to_string(target_.port);
     channel_ = ::grpc::CreateCustomChannel(addr, chan_creds, args);
+    if (channel_) {
+        generic_stub_ = std::make_unique<::grpc::GenericStub>(channel_);
+    }
 
     if (metric_sink_) metric_sink_->on_connection_opened("grpc");
 }
@@ -206,10 +243,39 @@ GrpcChannel::~GrpcChannel() {
     yuzu::secure_zero(creds_.server_key_pem);
 }
 
-CallResult GrpcChannel::unary(std::string_view method,
-                              const CallContext& /*ctx*/,
-                              const SerializableMessage& /*request*/,
-                              SerializableMessage& /*response*/) {
+namespace {
+
+// Convert std::string bytes to grpc::ByteBuffer (single slice).
+::grpc::ByteBuffer string_to_byte_buffer(const std::string& bytes) {
+    ::grpc::Slice slice(bytes.data(), bytes.size());
+    return ::grpc::ByteBuffer(&slice, 1);
+}
+
+// Drain a grpc::ByteBuffer's slices into a flat std::string.
+bool byte_buffer_to_string(const ::grpc::ByteBuffer& buf, std::string& out) {
+    std::vector<::grpc::Slice> slices;
+    if (!buf.Dump(&slices).ok()) return false;
+    out.clear();
+    std::size_t total = 0;
+    for (const auto& s : slices) total += s.size();
+    out.reserve(total);
+    for (const auto& s : slices) {
+        out.append(reinterpret_cast<const char*>(s.begin()), s.size());
+    }
+    return true;
+}
+
+// Map gRPC's status enum to ours. Numeric values are FROZEN to match;
+// the static_assert block above pins this at compile time.
+StatusCode map_grpc_status(::grpc::StatusCode g) noexcept {
+    return static_cast<StatusCode>(static_cast<int>(g));
+}
+
+}  // namespace
+
+CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
+                              const SerializableMessage& request,
+                              SerializableMessage& response) {
     CallResult r;
     if (!construction_error_.empty()) {
         r.status = {StatusCode::Unauthenticated, construction_error_};
@@ -224,11 +290,106 @@ CallResult GrpcChannel::unary(std::string_view method,
                     "method name fails validation contract"};
         return r;
     }
-    // PR 1b: dispatch through grpc::GenericStub. PR 1a returns
-    // Unimplemented so callers receive a deterministic placeholder
-    // and the surface compiles.
-    r.status = {StatusCode::Unimplemented,
-                "grpc_transport unary RPC dispatch lands in PR 1b"};
+    if (!generic_stub_ || !channel_) {
+        r.status = {StatusCode::Unavailable,
+                    "grpc_transport: channel not constructed"};
+        return r;
+    }
+
+    // Serialize request bytes via the SerializableMessage adapter.
+    std::string req_bytes;
+    if (!request.serialize(req_bytes)) {
+        r.status = {StatusCode::Internal,
+                    "grpc_transport: request serialize failed"};
+        return r;
+    }
+    if (req_bytes.size() > kAbsoluteMaxFrameSize) {
+        // Outbound frame cap (absolute ceiling on the client side; per-listener
+        // cap on the server side via ListenerOptions::max_frame_size).
+        r.status = {StatusCode::ResourceExhausted,
+                    "grpc_transport: request exceeds kAbsoluteMaxFrameSize"};
+        return r;
+    }
+
+    ::grpc::ByteBuffer req_buf  = string_to_byte_buffer(req_bytes);
+    ::grpc::ByteBuffer resp_buf;
+
+    ::grpc::ClientContext gctx;
+    if (ctx.deadline > std::chrono::milliseconds::zero()) {
+        gctx.set_deadline(std::chrono::system_clock::now() + ctx.deadline);
+    }
+    for (const auto& [k, v] : ctx.metadata) {
+        // Bound checks per the proto contract — defensive, since the
+        // CallContext is caller-controlled and an oversized metadata
+        // value would be rejected at the server's serialise time anyway.
+        if (k.size() > kMaxMetadataKeySize ||
+            v.size() > kMaxMetadataValueSize) {
+            r.status = {StatusCode::ResourceExhausted,
+                        "grpc_transport: metadata oversized"};
+            return r;
+        }
+        gctx.AddMetadata(k, v);
+    }
+
+    // Cancellation hook: when the caller's stop_token signals stop, call
+    // gctx.TryCancel() so the in-flight RPC observes a Cancelled status.
+    // The optional<stop_callback> ensures the hook is unregistered on
+    // function exit (RAII).
+    auto cancel_lambda = [&gctx]() noexcept { gctx.TryCancel(); };
+    using cancel_cb_t = std::stop_callback<decltype(cancel_lambda)>;
+    std::optional<cancel_cb_t> cancel_hook;
+    if (ctx.cancel.stop_possible()) {
+        cancel_hook.emplace(ctx.cancel, cancel_lambda);
+    }
+
+    if (metric_sink_) {
+        metric_sink_->on_stream_opened("grpc", method);
+        metric_sink_->on_bytes_sent("grpc", req_bytes.size());
+    }
+
+    // Synchronous wrapper around the callback-based UnaryCall API. The
+    // gRPC scheduler invokes on_completion on an internal thread; the
+    // promise/future hands off the resulting status to the caller
+    // thread. ByteBuffer storage is on the stack and survives until
+    // the callback fires (we wait on .get() before returning).
+    std::promise<::grpc::Status> done_promise;
+    auto done_future = done_promise.get_future();
+    generic_stub_->UnaryCall(
+        &gctx, std::string{method}, /*options=*/{}, &req_buf, &resp_buf,
+        [&done_promise](::grpc::Status s) { done_promise.set_value(std::move(s)); });
+    ::grpc::Status g_status = done_future.get();
+
+    r.status.code   = map_grpc_status(g_status.error_code());
+    r.status.detail = g_status.error_message();
+
+    // Copy trailing metadata for the caller (per the abstraction
+    // contract — initial vs trailing distinction lives in transport.hpp).
+    for (const auto& [k, v] : gctx.GetServerTrailingMetadata()) {
+        r.trailing_metadata.emplace(std::string(k.data(), k.size()),
+                                    std::string(v.data(), v.size()));
+    }
+
+    if (g_status.ok()) {
+        std::string resp_bytes;
+        if (!byte_buffer_to_string(resp_buf, resp_bytes)) {
+            r.status = {StatusCode::DataLoss,
+                        "grpc_transport: response ByteBuffer dump failed"};
+        } else if (resp_bytes.size() > kAbsoluteMaxFrameSize) {
+            r.status = {StatusCode::ResourceExhausted,
+                        "grpc_transport: response exceeds kAbsoluteMaxFrameSize"};
+        } else if (!response.parse(resp_bytes)) {
+            // Per the parse() contract: false = wire corruption, fatal
+            // for the call. Translate to DataLoss.
+            r.status = {StatusCode::DataLoss,
+                        "grpc_transport: response parse failed"};
+        } else if (metric_sink_) {
+            metric_sink_->on_bytes_received("grpc", resp_bytes.size());
+        }
+    }
+
+    if (metric_sink_) {
+        metric_sink_->on_stream_closed("grpc", method, r.status);
+    }
     return r;
 }
 

@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <grpcpp/generic/generic_stub.h>
 #include <grpcpp/grpcpp.h>
 
 #include <atomic>
@@ -62,6 +63,7 @@ private:
     BackoffPolicy                             backoff_;
     std::shared_ptr<TransportMetricSink>      metric_sink_;
     std::shared_ptr<::grpc::Channel>          channel_;        // null if construction failed
+    std::unique_ptr<::grpc::GenericStub>      generic_stub_;   // null if channel_ is null
     std::atomic<bool>                         closed_{false};
 
     // Diagnostic detail captured during construction. If non-empty,
