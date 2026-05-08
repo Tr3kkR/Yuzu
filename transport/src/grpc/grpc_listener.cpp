@@ -397,21 +397,42 @@ private:
             rw_.Finish(final_status_, static_cast<CqTag*>(&finish_tag_));
         });
             state_ = State::BidiActive;
-        } catch (const std::system_error& e) {
-            // std::thread ctor failed (typically EAGAIN under RLIMIT_NPROC
-            // or PID-cap squeeze). Reap the ServerCall via the unary
-            // Finish path so the peer sees Internal rather than hanging
-            // until deadline. spdlog before metric so operators correlate
-            // (governance UP-1).
+        } catch (const std::exception& e) {
+            // std::thread ctor failure surface is broader than
+            // std::system_error: libstdc++/libc++/MSVC STL all allocate
+            // internal thread-state on construction, so std::bad_alloc
+            // escapes via the same path. The captured lambda's
+            // std::function move during thread construction can also
+            // throw std::bad_alloc. A narrower catch (system_error) would
+            // let bad_alloc unwind through the cq_worker's tag handler
+            // and std::terminate the server — defeating the very UP-1
+            // fix we are landing here. Mirror the bidi handler-throw
+            // site's two-step catch (lines 369-388, 379-388).
             spdlog::error(
-                "yuzu::transport: bidi dispatcher std::thread ctor failed "
-                "in {} — what={}",
-                method_cache_, sanitise_status_detail(e.what()));
+                "yuzu::transport: bidi dispatcher construction failed in "
+                "{} — type={} what={}",
+                method_cache_, typeid(e).name(),
+                sanitise_status_detail(e.what()));
             if (listener_->opts_.metric_sink) {
                 listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
                     "grpc", method_cache_, "dispatcher_internal");
             }
             bidi_stream_.reset();  // not in use; release before Finish
+            final_status_ = make_wire_status(
+                StatusCode::Internal,
+                "transport: bidi dispatcher unavailable");
+            rw_.Finish(final_status_, static_cast<CqTag*>(this));
+            state_ = State::UnaryPendingFinish;
+        } catch (...) {
+            spdlog::error(
+                "yuzu::transport: bidi dispatcher construction failed in "
+                "{} (non-std exception)",
+                method_cache_);
+            if (listener_->opts_.metric_sink) {
+                listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
+                    "grpc", method_cache_, "dispatcher_internal");
+            }
+            bidi_stream_.reset();
             final_status_ = make_wire_status(
                 StatusCode::Internal,
                 "transport: bidi dispatcher unavailable");
