@@ -629,6 +629,247 @@ TEST_CASE("Client receives sanitised Status::detail on attacker-controlled bytes
     listener->shutdown();
 }
 
+// =====================================================================
+// PR 1b-3 — bidi round-trip
+// =====================================================================
+
+TEST_CASE("Client/server bidi round-trip echoes N frames", "[transport][round-trip][bidi]") {
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        while (stream.read(msg)) {
+            StringMessage out("echo:" + msg.data());
+            if (!stream.write(out)) {
+                return Status{StatusCode::Internal, "write failed"};
+            }
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiEcho", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    auto start_r = listener->start(bind, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Grpc, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(5);
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiEcho", ctx);
+    REQUIRE(stream != nullptr);
+
+    constexpr int N = 5;
+    for (int i = 0; i < N; ++i) {
+        StringMessage out(std::to_string(i));
+        REQUIRE(stream->write(out));
+        StringMessage in;
+        REQUIRE(stream->read(in));
+        REQUIRE(in.data() == "echo:" + std::to_string(i));
+    }
+    stream->writes_done();
+
+    StringMessage drain;
+    REQUIRE_FALSE(stream->read(drain)); // peer half-close after handler returns
+
+    Status final = stream->final_status();
+    REQUIRE(final.code == StatusCode::Ok);
+
+    listener->shutdown();
+}
+
+TEST_CASE("Client/server bidi propagates handler error status", "[transport][round-trip][bidi]") {
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        (void)stream.read(msg);
+        return Status{StatusCode::PermissionDenied, "no soup for you"};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiForbidden", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiForbidden", ctx);
+    REQUIRE(stream != nullptr);
+
+    StringMessage out("hi");
+    stream->write(out);
+    stream->writes_done();
+    StringMessage in;
+    REQUIRE_FALSE(stream->read(in));
+    Status final = stream->final_status();
+    REQUIRE(final.code == StatusCode::PermissionDenied);
+    REQUIRE(final.detail == "no soup for you");
+
+    listener->shutdown();
+}
+
+TEST_CASE("Bidi stream cancel via stop_token aborts in-flight read",
+          "[transport][round-trip][bidi]") {
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        // Block on read until peer cancels.
+        StringMessage msg;
+        while (stream.read(msg)) {
+            // echo if any frames arrive
+            StringMessage out("ack");
+            stream.write(out);
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiBlock", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    std::stop_source ss;
+    CallContext ctx;
+    ctx.cancel = ss.get_token();
+    ctx.deadline = std::chrono::seconds(5);
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiBlock", ctx);
+    REQUIRE(stream != nullptr);
+
+    std::thread canceller([&ss]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        ss.request_stop();
+    });
+
+    StringMessage in;
+    // Read should observe the cancel and return false.
+    REQUIRE_FALSE(stream->read(in));
+    canceller.join();
+
+    Status final = stream->final_status();
+    // Cancelled is the expected mapping; a fast Unavailable is also
+    // acceptable if gRPC saw the connection drop first.
+    REQUIRE((final.code == StatusCode::Cancelled || final.code == StatusCode::Unavailable));
+
+    listener->shutdown();
+}
+
+TEST_CASE("Bidi unknown method returns Unimplemented", "[transport][round-trip][bidi]") {
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiNotRegistered", ctx);
+    REQUIRE(stream != nullptr);
+    stream->writes_done();
+    StringMessage in;
+    REQUIRE_FALSE(stream->read(in));
+    Status final = stream->final_status();
+    REQUIRE(final.code == StatusCode::Unimplemented);
+
+    listener->shutdown();
+}
+
+TEST_CASE("Bidi handler-thrown what() is scrubbed before wire", "[transport][round-trip][bidi]") {
+    // Symmetric with the unary sec-F1 test — handler's std::exception
+    // text must NEVER reach the wire.
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        (void)stream.read(msg);
+        throw std::runtime_error("INTERNAL_DEPLOYMENT_PATH=/etc/secret");
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiThrows", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiThrows", ctx);
+    REQUIRE(stream != nullptr);
+    StringMessage out("ping");
+    stream->write(out);
+    stream->writes_done();
+    StringMessage in;
+    REQUIRE_FALSE(stream->read(in));
+    Status final = stream->final_status();
+    REQUIRE(final.code == StatusCode::Internal);
+    REQUIRE(final.detail.find("INTERNAL_DEPLOYMENT_PATH") == std::string::npos);
+    REQUIRE(final.detail.find("/etc/secret") == std::string::npos);
+    REQUIRE(final.detail.find("handler raised") != std::string::npos);
+
+    listener->shutdown();
+}
+
+TEST_CASE("Bidi stream destroyed without final_status terminates cleanly",
+          "[transport][round-trip][bidi]") {
+    // Lifetime invariant — dtor must cancel + drain the CQ even when
+    // the caller forgets final_status().
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        while (stream.read(msg)) {}
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiDrop", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    {
+        CallContext ctx;
+        ctx.deadline = std::chrono::seconds(2);
+        auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiDrop", ctx);
+        REQUIRE(stream != nullptr);
+        StringMessage out("x");
+        stream->write(out);
+        // No writes_done(); no final_status(). Dtor must clean up.
+    }
+
+    listener->shutdown();
+}
+
 TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport][lifecycle]") {
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);

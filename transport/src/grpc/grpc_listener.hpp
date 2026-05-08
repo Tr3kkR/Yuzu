@@ -6,10 +6,11 @@
 // <yuzu/transport/transport.hpp> and obtain instances via
 // make_server_listener(Backend::Grpc).
 //
-// This file is part of PR 1 of #376. PR 1a (this commit) covers
-// lifecycle (start/shutdown/wait_for_shutdown/is_serving) and handler
-// registration; the actual generic-dispatch wiring atop
-// grpc::AsyncGenericService lands in PR 1b.
+// PR 1b-3 of #376 extends the AsyncGenericService dispatcher to handle
+// bidi streams in addition to the unary path landed in PR 1b-2. The
+// completion-queue tag-dispatch model now goes through a virtual
+// CqTag interface so a single ServerCall can post multiple sub-tags
+// (read/write/finish) without ambiguity.
 
 #pragma once
 
@@ -28,6 +29,20 @@
 #include "yuzu/transport/transport.hpp"
 
 namespace yuzu::transport::grpc_backend {
+
+// Virtual interface implemented by anything posted as a CompletionQueue
+// tag. The cq_worker loop static_casts the tag to CqTag* and calls
+// on_event(ok); concrete callers (ServerCall, ServerCall sub-tags)
+// route the event to their state machine.
+//
+// Each tag pointer MUST remain valid until the matching CQ event has
+// been delivered; deletion happens in the terminal-state branch of the
+// concrete on_event.
+class CqTag {
+public:
+    virtual ~CqTag() = default;
+    virtual void on_event(bool ok) = 0;
+};
 
 class ServerCall;  // implementation detail; defined in grpc_listener.cpp
 
@@ -68,7 +83,7 @@ private:
 
     // ServerCall (defined in grpc_listener.cpp) drives the per-call state
     // machine and reads back through these accessors. Friend grants
-    // access to unary_handlers_ for handler lookup.
+    // access to unary_handlers_ / bidi_handlers_ for handler lookup.
     friend class ServerCall;
     void post_new_request_call();
     void cq_worker_loop();

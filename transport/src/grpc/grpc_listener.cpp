@@ -7,10 +7,14 @@
 #include <grpcpp/support/byte_buffer.h>
 #include <grpcpp/support/slice.h>
 
+#include <condition_variable>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -18,8 +22,6 @@
 #include "grpc_internal_helpers.hpp"   // method_name_well_formed, byte helpers, sanitise
 
 #include <spdlog/spdlog.h>
-
-#include <thread>  // std::this_thread for shutdown re-entry detection
 
 namespace yuzu::transport::grpc_backend {
 
@@ -39,9 +41,7 @@ namespace {
 // yuzu::transport::Status round-trip. Every transport-internal Status
 // emitted from the dispatcher MUST go through this helper so the
 // outbound scrub contract holds across all 8+ construction sites
-// (governance round 5 cons-G4-1). Today's call sites all pass
-// printable static literals, but a future template-with-runtime-data
-// refactor would silently bypass the scrub if the helper is skipped.
+// (governance round 5 cons-G4-1).
 ::grpc::Status make_wire_status(StatusCode code, std::string_view detail) {
     return ::grpc::Status(
         static_cast<::grpc::StatusCode>(static_cast<int>(code)),
@@ -54,35 +54,37 @@ namespace {
 // ServerCall — per-call state machine driven by the CQ worker thread.
 // =====================================================================
 //
-// Tag pointer = `this`. cq->Next returns the tag; the worker static_casts
-// and calls on_event(ok). The state machine advances; on terminal state
-// `delete this` releases the heap allocation.
+// One ServerCall instance is heap-allocated per RequestCall posted to
+// the AsyncGenericService. After the RequestCall completes (an actual
+// RPC arrived), the call dispatches to either the unary or the bidi
+// path based on which handler matches the method name.
 //
-// Lifecycle:
-//   PendingNew (RequestCall posted) →
-//     ok=true:  RequestCall completed → handle_request_arrived()
-//                 → if unary handler registered:
-//                     post a Read; state = PendingRead
-//                   else:
-//                     post a Finish(Unimplemented); state = PendingFinish
-//     ok=false: server is shutting down before the call landed → delete
+// Tag dispatch: the ServerCall itself is a CqTag (handles the start /
+// RequestCall and the unary path's PendingRead/PendingFinish). For the
+// bidi path, four sub-tag CqTag members route to dedicated callbacks
+// so the read/write/finish completions can be told apart.
 //
-//   PendingRead (Read posted) →
-//     ok=true:  request bytes arrived → invoke handler synchronously,
-//                 serialize response, post WriteAndFinish; state = PendingFinish
-//     ok=false: peer cancelled mid-read or shutdown → delete
-//
-//   PendingFinish (Finish or WriteAndFinish posted) →
-//     ok=true or false: terminal → delete
-class ServerCall final {
+// Lifetime: `delete this` in the terminal branches of on_event /
+// on_bidi_finish releases the heap allocation. `final_status_` and
+// the bidi sub-tag members live inside ServerCall so they outlive the
+// async ops by construction.
+class ServerCall final : public CqTag {
 public:
-    enum class State { PendingNew, PendingRead, PendingFinish };
+    enum class State {
+        PendingNew,           // RequestCall posted
+        UnaryPendingRead,     // unary: Read posted
+        UnaryPendingFinish,   // unary: Finish/WriteAndFinish posted
+        BidiActive,           // bidi: handler thread running
+        BidiPendingFinish,    // bidi: Finish posted, waiting for CQ
+    };
 
     explicit ServerCall(GrpcServerListener* listener)
-        : listener_(listener), rw_(&gctx_) {}
+        : listener_(listener),
+          rw_(&gctx_),
+          read_tag_{this},
+          write_tag_{this},
+          finish_tag_{this} {}
 
-    // Begin a new RequestCall on the listener. Heap-allocates a fresh
-    // ServerCall and posts it as a tag for the next incoming RPC.
     static void post_new(GrpcServerListener* listener) {
         if (listener->shutting_down_.load(std::memory_order_acquire)) {
             return;  // do not enqueue more after shutdown
@@ -90,81 +92,303 @@ public:
         auto* call = new ServerCall(listener);
         listener->generic_service_.RequestCall(
             &call->gctx_, &call->rw_, listener->cq_.get(),
-            listener->cq_.get(), static_cast<void*>(call));
+            listener->cq_.get(), static_cast<CqTag*>(call));
     }
 
-    void on_event(bool ok) {
+    void on_event(bool ok) override {
         switch (state_) {
             case State::PendingNew: {
                 if (!ok) {
                     delete this;
                     return;
                 }
-                // A real call has arrived. Post the next RequestCall so the
-                // listener accepts further RPCs while we handle this one.
                 ServerCall::post_new(listener_);
                 handle_request_arrived();
                 return;
             }
-            case State::PendingRead: {
+            case State::UnaryPendingRead: {
                 if (!ok) {
-                    // Peer cancelled or shut down before sending the request
-                    // body. Reply with Cancelled and finish cleanly.
                     final_status_ = make_wire_status(
                         StatusCode::Cancelled,
                         "transport: request not fully received");
-                    rw_.Finish(final_status_, static_cast<void*>(this));
-                    state_ = State::PendingFinish;
+                    rw_.Finish(final_status_, static_cast<CqTag*>(this));
+                    state_ = State::UnaryPendingFinish;
                     return;
                 }
                 dispatch_unary();
                 return;
             }
-            case State::PendingFinish: {
-                // Terminal — delete regardless of ok. ok=false here just
-                // means the channel was already going down when we tried
-                // to send the trailing status; nothing further to do.
+            case State::UnaryPendingFinish: {
                 delete this;
                 return;
             }
+            case State::BidiActive:
+            case State::BidiPendingFinish:
+                // ServerCall::on_event handles only the ServerCall
+                // base-tag; bidi sub-tag completions arrive via
+                // {read,write,finish}_tag_->on_event.
+                spdlog::error(
+                    "yuzu::transport: ServerCall base-tag fired in bidi "
+                    "state — programming error");
+                return;
         }
     }
 
+    // ---- Bidi sub-tag callbacks --------------------------------------
+    // Each is dispatched by a distinct CqTag member so the CQ event
+    // identifies which operation completed. All run on the cq_worker
+    // thread; they signal the handler thread via bidi_cv_.
+
+    void on_bidi_read(bool ok) {
+        {
+            std::lock_guard<std::mutex> lock(bidi_mtx_);
+            bidi_read_done_ = ok;
+        }
+        bidi_cv_.notify_all();
+    }
+
+    void on_bidi_write(bool ok) {
+        {
+            std::lock_guard<std::mutex> lock(bidi_mtx_);
+            bidi_write_done_ = ok;
+        }
+        bidi_cv_.notify_all();
+    }
+
+    void on_bidi_finish(bool /*ok*/) {
+        // Terminal for the bidi path. The handler thread has already
+        // returned (it scheduled Finish before exit); join it then
+        // self-delete.
+        if (handler_thread_.joinable()) {
+            handler_thread_.join();
+        }
+        delete this;
+    }
+
 private:
-    // After RequestCall completes, look up the handler and route.
-    // Tear-down on shutdown short-circuits the dispatch.
+    // Bidi sub-tag — each one is a distinct CqTag whose pointer the
+    // gRPC CQ uses to identify which operation completed.
+    struct ReadTag final : CqTag {
+        ServerCall* parent;
+        explicit ReadTag(ServerCall* p) : parent(p) {}
+        void on_event(bool ok) override { parent->on_bidi_read(ok); }
+    };
+    struct WriteTag final : CqTag {
+        ServerCall* parent;
+        explicit WriteTag(ServerCall* p) : parent(p) {}
+        void on_event(bool ok) override { parent->on_bidi_write(ok); }
+    };
+    struct FinishTag final : CqTag {
+        ServerCall* parent;
+        explicit FinishTag(ServerCall* p) : parent(p) {}
+        void on_event(bool ok) override { parent->on_bidi_finish(ok); }
+    };
+
+    // Server-side BidiStream surface. The handler thread calls into
+    // these methods; they post gRPC async ops on rw_ using the parent
+    // ServerCall's sub-tags and block on bidi_cv_ until the cq_worker
+    // delivers the matching event.
+    //
+    // Threading contract per transport.hpp: single-reader + single-
+    // writer concurrent. We rely on the caller to honour that; the
+    // bidi_mtx_ + bidi_cv_ pair tolerates one in-flight read and one
+    // in-flight write at a time.
+    class ServerBidiStream final : public BidiStream {
+    public:
+        explicit ServerBidiStream(ServerCall* call) : call_(call) {}
+
+        bool write(const SerializableMessage& msg) override {
+            std::string bytes;
+            if (!msg.serialize(bytes)) return false;
+            const std::size_t cap =
+                call_->listener_->opts_.max_frame_size > 0
+                    ? call_->listener_->opts_.max_frame_size
+                    : kDefaultMaxFrameSize;
+            if (bytes.size() > cap) return false;
+
+            std::unique_lock<std::mutex> lock(call_->bidi_mtx_);
+            if (call_->bidi_cancelled_) return false;
+            call_->bidi_write_done_.reset();
+            call_->bidi_write_buf_ = string_to_byte_buffer(bytes);
+            call_->rw_.Write(call_->bidi_write_buf_,
+                             static_cast<CqTag*>(&call_->write_tag_));
+            call_->bidi_cv_.wait(lock, [this] {
+                return call_->bidi_write_done_.has_value() ||
+                       call_->bidi_cancelled_;
+            });
+            if (call_->bidi_cancelled_) return false;
+            const bool ok = *call_->bidi_write_done_;
+            if (ok && call_->listener_->opts_.metric_sink) {
+                call_->listener_->opts_.metric_sink->on_bytes_sent(
+                    "grpc", bytes.size());
+            }
+            return ok;
+        }
+
+        bool read(SerializableMessage& msg) override {
+            std::unique_lock<std::mutex> lock(call_->bidi_mtx_);
+            if (call_->bidi_cancelled_) return false;
+            call_->bidi_read_done_.reset();
+            call_->bidi_read_buf_.Clear();
+            call_->rw_.Read(&call_->bidi_read_buf_,
+                            static_cast<CqTag*>(&call_->read_tag_));
+            call_->bidi_cv_.wait(lock, [this] {
+                return call_->bidi_read_done_.has_value() ||
+                       call_->bidi_cancelled_;
+            });
+            if (call_->bidi_cancelled_) return false;
+            if (!*call_->bidi_read_done_) return false;  // peer half-close
+            std::string bytes;
+            if (!byte_buffer_to_string(call_->bidi_read_buf_, bytes)) {
+                return false;
+            }
+            const std::size_t cap =
+                call_->listener_->opts_.max_frame_size > 0
+                    ? call_->listener_->opts_.max_frame_size
+                    : kDefaultMaxFrameSize;
+            if (bytes.size() > cap) {
+                // Frame exceeds configured cap — reject as DataLoss-class
+                // failure. transport.hpp parse() contract: false ⇒ stream
+                // is fatally corrupt; handler exits its read loop.
+                return false;
+            }
+            if (call_->listener_->opts_.metric_sink) {
+                call_->listener_->opts_.metric_sink->on_bytes_received(
+                    "grpc", bytes.size());
+            }
+            return msg.parse(bytes);
+        }
+
+        void writes_done() override {
+            // Server-side: writes_done() is implicit — the trailing
+            // status + half-close are emitted by the dispatcher's
+            // Finish() call after the handler returns. No-op here.
+        }
+
+        Status final_status() override {
+            // Server-side: handlers don't normally call final_status()
+            // on their own stream. Return Ok with no detail for parity
+            // with the BidiStream contract.
+            return Status{StatusCode::Ok, ""};
+        }
+
+        const std::map<std::string, std::string>& trailing_metadata()
+            const override {
+            static const std::map<std::string, std::string> empty;
+            return empty;
+        }
+
+        void cancel() override {
+            {
+                std::lock_guard<std::mutex> lock(call_->bidi_mtx_);
+                call_->bidi_cancelled_ = true;
+            }
+            call_->bidi_cv_.notify_all();
+            call_->gctx_.TryCancel();
+        }
+
+    private:
+        ServerCall* call_;
+    };
+
     void handle_request_arrived() {
         const std::string& method = gctx_.method();
 
-        // Look up handler under the listener's lock so a concurrent
-        // (but contractually-illegal) register_* race doesn't tear the
-        // map.
         bool unary_match = false;
+        bool bidi_match = false;
         {
             std::lock_guard<std::mutex> lock(listener_->mtx_);
             unary_match = listener_->unary_handlers_.contains(method);
-            // Bidi handlers are documented but dispatch lands in PR 1b-3.
+            bidi_match = listener_->bidi_handlers_.contains(method);
         }
 
-        if (!unary_match) {
-            final_status_ = make_wire_status(
-                StatusCode::Unimplemented,
-                "transport: method not registered or not a unary RPC");
-            rw_.Finish(final_status_, static_cast<void*>(this));
-            state_ = State::PendingFinish;
+        if (unary_match) {
+            rw_.Read(&req_buf_, static_cast<CqTag*>(this));
+            state_ = State::UnaryPendingRead;
+            return;
+        }
+        if (bidi_match) {
+            dispatch_bidi();
             return;
         }
 
-        // Read the request bytes. The handler runs inline once Read fires.
-        rw_.Read(&req_buf_, static_cast<void*>(this));
-        state_ = State::PendingRead;
+        final_status_ = make_wire_status(
+            StatusCode::Unimplemented,
+            "transport: method not registered");
+        rw_.Finish(final_status_, static_cast<CqTag*>(this));
+        state_ = State::UnaryPendingFinish;
+    }
+
+    void dispatch_bidi() {
+        const std::string& method = gctx_.method();
+
+        BidiStreamHandler handler;
+        {
+            std::lock_guard<std::mutex> lock(listener_->mtx_);
+            auto it = listener_->bidi_handlers_.find(method);
+            if (it == listener_->bidi_handlers_.end()) {
+                final_status_ = make_wire_status(
+                    StatusCode::Unimplemented,
+                    "transport: bidi handler unregistered mid-call");
+                rw_.Finish(final_status_, static_cast<CqTag*>(this));
+                state_ = State::UnaryPendingFinish;
+                return;
+            }
+            handler = it->second;
+        }
+
+        bidi_stream_  = std::make_unique<ServerBidiStream>(this);
+        state_        = State::BidiActive;
+        method_cache_ = method;  // copy out; gctx_ stays valid for lifetime
+
+        // Dispatcher thread: invokes the user handler with the bidi
+        // surface. Once the handler returns, schedule Finish via
+        // finish_tag_; the cq_worker then joins this thread and
+        // self-deletes the ServerCall.
+        handler_thread_ = std::thread([this, h = std::move(handler)]() mutable {
+            CallContext ctx;
+            ctx.peer_uri = gctx_.peer();
+
+            Status handler_status;
+            try {
+                handler_status = h(ctx, *bidi_stream_);
+            } catch (const std::exception& e) {
+                handler_status = {StatusCode::Internal,
+                                  "handler raised exception"};
+                spdlog::error(
+                    "yuzu::transport: bidi handler raised std::exception in "
+                    "{} — type={} what={}",
+                    method_cache_, typeid(e).name(),
+                    sanitise_status_detail(e.what()));
+                if (listener_->opts_.metric_sink) {
+                    listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
+                        "grpc", method_cache_, "std_exception");
+                }
+            } catch (...) {
+                handler_status = {StatusCode::Internal,
+                                  "handler raised non-std exception"};
+                spdlog::error(
+                    "yuzu::transport: bidi handler raised non-std exception "
+                    "in {}", method_cache_);
+                if (listener_->opts_.metric_sink) {
+                    listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
+                        "grpc", method_cache_, "non_std_exception");
+                }
+            }
+
+            // Schedule Finish on the cq_worker. After this, no further
+            // events arrive on the bidi sub-tags except finish_tag_.
+            // The dispatcher thread exits; the cq_worker's
+            // on_bidi_finish will join() this thread before delete this.
+            final_status_ = to_grpc_status(handler_status);
+            state_        = State::BidiPendingFinish;
+            rw_.Finish(final_status_, static_cast<CqTag*>(&finish_tag_));
+        });
     }
 
     void dispatch_unary() {
         const std::string& method = gctx_.method();
 
-        // Snapshot the handler under the lock so we can release it
-        // before invoking user code.
         std::function<std::unique_ptr<SerializableMessage>()> req_factory;
         std::function<std::unique_ptr<SerializableMessage>()> resp_factory;
         UnaryHandler handler;
@@ -172,14 +396,11 @@ private:
             std::lock_guard<std::mutex> lock(listener_->mtx_);
             auto it = listener_->unary_handlers_.find(method);
             if (it == listener_->unary_handlers_.end()) {
-                // Unregistered between PendingNew and PendingRead — should
-                // be impossible per the register-after-start contract,
-                // but defend anyway.
                 final_status_ = make_wire_status(
                     StatusCode::Unimplemented,
                     "transport: handler unregistered mid-call");
-                rw_.Finish(final_status_, static_cast<void*>(this));
-                state_ = State::PendingFinish;
+                rw_.Finish(final_status_, static_cast<CqTag*>(this));
+                state_ = State::UnaryPendingFinish;
                 return;
             }
             req_factory  = it->second.request_factory;
@@ -187,72 +408,43 @@ private:
             handler      = it->second.handler;
         }
 
-        // Deserialize request bytes into a fresh handler-specific message.
         std::string req_bytes;
         if (!byte_buffer_to_string(req_buf_, req_bytes)) {
             final_status_ = make_wire_status(
                 StatusCode::DataLoss,
                 "transport: request ByteBuffer dump failed");
-            rw_.Finish(final_status_, static_cast<void*>(this));
-            state_ = State::PendingFinish;
+            rw_.Finish(final_status_, static_cast<CqTag*>(this));
+            state_ = State::UnaryPendingFinish;
             return;
         }
         auto req_msg = req_factory();
         if (!req_msg || !req_msg->parse(req_bytes)) {
             final_status_ = make_wire_status(
                 StatusCode::DataLoss, "transport: request parse failed");
-            rw_.Finish(final_status_, static_cast<void*>(this));
-            state_ = State::PendingFinish;
+            rw_.Finish(final_status_, static_cast<CqTag*>(this));
+            state_ = State::UnaryPendingFinish;
             return;
         }
 
-        // Build CallContext for the handler. Server-side fields
-        // (peer_uri, peer_san_identities) populated from gctx_.
         CallContext ctx;
         ctx.peer_uri = gctx_.peer();
-        // peer_san_identities: gRPC's auth_context() exposes
-        // x509_subject_alternative_name property values. PR 1c may
-        // populate these once mTLS is wired through actual call sites;
-        // for PR 1b-2 the plaintext path leaves the vector empty.
 
         auto resp_msg = resp_factory();
         if (!resp_msg) {
             final_status_ = make_wire_status(
                 StatusCode::Internal,
                 "transport: response factory returned null");
-            rw_.Finish(final_status_, static_cast<void*>(this));
-            state_ = State::PendingFinish;
+            rw_.Finish(final_status_, static_cast<CqTag*>(this));
+            state_ = State::UnaryPendingFinish;
             return;
         }
 
-        // Invoke the handler synchronously. Handler returns a
-        // yuzu::transport::Status which we translate to grpc::Status for
-        // the trailing reply.
-        //
-        // Per Status::detail visibility contract (transport.hpp + sec-F1):
-        // we DO NOT echo std::exception::what() over the wire because it
-        // typically contains internal state (file paths, DB error
-        // messages, library-internal text). Instead we surface a STATIC
-        // summary literal — exact wording fixed across the doc, this
-        // code, and the qe-F3 round-trip test (governance round 5
-        // cons-G4-3). The handler's full what() is logged server-side at
-        // error level so operator forensics can identify the throw
-        // (governance round 5 UP-42 / UP-57 / SRE-O1) and the metric
-        // sink fires an `on_unexpected_dispatch_throw` so silent storms
-        // become a Prometheus signal instead of an opaque CPU pin.
         Status handler_status;
         try {
             handler_status = handler(ctx, *req_msg, *resp_msg);
         } catch (const std::exception& e) {
-            handler_status = {StatusCode::Internal, "handler raised exception"};
-            // Server-side log: type name + scrubbed e.what() are
-            // operator-visible only. NEVER concatenated into
-            // handler_status.detail (would leak across the wire).
-            // e.what() is scrubbed BEFORE crossing the spdlog boundary
-            // because a third-party library may throw an exception
-            // whose message contains CR/LF/NUL/control bytes — those
-            // would forge log rows in journald/ELK ingestion
-            // (governance round 5 re-review M2).
+            handler_status = {StatusCode::Internal,
+                              "handler raised exception"};
             spdlog::error(
                 "yuzu::transport: handler raised std::exception in {} — "
                 "type={} what={}", method, typeid(e).name(),
@@ -275,23 +467,19 @@ private:
 
         if (!handler_status.ok()) {
             final_status_ = to_grpc_status(handler_status);
-            rw_.Finish(final_status_, static_cast<void*>(this));
-            state_ = State::PendingFinish;
+            rw_.Finish(final_status_, static_cast<CqTag*>(this));
+            state_ = State::UnaryPendingFinish;
             return;
         }
 
-        // Serialize response and ship via WriteAndFinish (one CQ event).
         std::string resp_bytes;
         if (!resp_msg->serialize(resp_bytes)) {
             final_status_ = make_wire_status(
                 StatusCode::Internal, "transport: response serialize failed");
-            rw_.Finish(final_status_, static_cast<void*>(this));
-            state_ = State::PendingFinish;
+            rw_.Finish(final_status_, static_cast<CqTag*>(this));
+            state_ = State::UnaryPendingFinish;
             return;
         }
-        // Frame-size enforcement on the outbound side (mirror of the
-        // client-side guard). Matches the listener's configured cap if
-        // operator opted in via ListenerOptions::max_frame_size.
         const std::size_t frame_cap =
             listener_->opts_.max_frame_size > 0
                 ? listener_->opts_.max_frame_size
@@ -300,33 +488,45 @@ private:
             final_status_ = make_wire_status(
                 StatusCode::ResourceExhausted,
                 "transport: response exceeds configured frame size");
-            rw_.Finish(final_status_, static_cast<void*>(this));
-            state_ = State::PendingFinish;
+            rw_.Finish(final_status_, static_cast<CqTag*>(this));
+            state_ = State::UnaryPendingFinish;
             return;
         }
 
         resp_buf_     = string_to_byte_buffer(resp_bytes);
         final_status_ = ::grpc::Status::OK;
         rw_.WriteAndFinish(resp_buf_, ::grpc::WriteOptions(), final_status_,
-                           static_cast<void*>(this));
-        state_ = State::PendingFinish;
+                           static_cast<CqTag*>(this));
+        state_ = State::UnaryPendingFinish;
     }
 
-    State                                state_ = State::PendingNew;
-    GrpcServerListener*                  listener_ = nullptr;
-    ::grpc::GenericServerContext         gctx_;
+    State                                  state_     = State::PendingNew;
+    GrpcServerListener*                    listener_  = nullptr;
+    ::grpc::GenericServerContext           gctx_;
     ::grpc::GenericServerAsyncReaderWriter rw_;
-    ::grpc::ByteBuffer                   req_buf_;
-    ::grpc::ByteBuffer                   resp_buf_;
-    // Lifetime invariant (governance F-CPP-3, deferred from round 4 →
-    // closed in round 5 cpp S6). `final_status_` MUST outlive the
-    // asynchronous Finish/WriteAndFinish completion. The state machine
-    // guarantees this by setting `state_ = PendingFinish` immediately
-    // after issuing Finish/WriteAndFinish; `delete this` only fires in
-    // the matching `case PendingFinish:` branch of `on_event`. Do not
-    // move final_status_ to a local in dispatch_unary; do not release
-    // the ServerCall before the CQ delivers the matching tag.
-    ::grpc::Status                       final_status_;
+    ::grpc::ByteBuffer                     req_buf_;
+    ::grpc::ByteBuffer                     resp_buf_;
+    // final_status_ MUST outlive the asynchronous Finish/WriteAndFinish
+    // completion (governance F-CPP-3). The state machine guarantees
+    // this: state_ = *PendingFinish is set immediately after issuing
+    // Finish; `delete this` only fires in the matching PendingFinish
+    // branch of on_event / on_bidi_finish.
+    ::grpc::Status                         final_status_;
+
+    // Bidi-mode state (unused on the unary path).
+    ReadTag                                read_tag_;
+    WriteTag                               write_tag_;
+    FinishTag                              finish_tag_;
+    std::thread                            handler_thread_;
+    std::mutex                             bidi_mtx_;
+    std::condition_variable                bidi_cv_;
+    std::optional<bool>                    bidi_read_done_;
+    std::optional<bool>                    bidi_write_done_;
+    bool                                   bidi_cancelled_ = false;
+    ::grpc::ByteBuffer                     bidi_read_buf_;
+    ::grpc::ByteBuffer                     bidi_write_buf_;
+    std::unique_ptr<ServerBidiStream>      bidi_stream_;
+    std::string                            method_cache_;
 };
 
 // =====================================================================
@@ -344,8 +544,6 @@ GrpcServerListener::~GrpcServerListener() {
             // Documented as noexcept; swallow defensively.
         }
     }
-    // Worker thread is joined inside shutdown(); guard against
-    // dtor-without-shutdown for completeness.
     if (cq_worker_.joinable()) {
         cq_worker_.join();
     }
@@ -422,10 +620,6 @@ std::expected<void, Status> GrpcServerListener::start(
     const std::string addr = bind.host + ":" + std::to_string(bind.port);
     ::grpc::ServerBuilder builder;
 
-    // selected_port: gRPC writes the actual bound port here after
-    // BuildAndStart. When bind.port == 0 the OS assigns ephemeral; the
-    // value is exposed to operators via bound_endpoint() so tests and
-    // any caller can discover it (governance qe-F1).
     int selected_port = 0;
     builder.AddListeningPort(addr, server_creds, &selected_port);
 
@@ -449,16 +643,6 @@ std::expected<void, Status> GrpcServerListener::start(
                    "transport: gRPC ServerBuilder::BuildAndStart returned null"});
     }
     if (selected_port == 0) {
-        // BuildAndStart returned non-null but failed to bind. Per gRPC
-        // docs (server_builder.h:127): selected_port stays 0 when bind
-        // fails. Treat as unavailable.
-        //
-        // server_->Shutdown() runs synchronously here BEFORE the CQ
-        // worker has been spawned; the CQ object exists but has no
-        // outstanding tags. gRPC tolerates Shutdown-without-CQ-pumping
-        // when no RequestCall has been posted yet. PR 1c may want a
-        // bounded-deadline form of Shutdown if the no-tag invariant
-        // becomes harder to maintain (governance round 5 UP-54).
         server_->Shutdown();
         server_.reset();
         cq_.reset();
@@ -473,9 +657,6 @@ std::expected<void, Status> GrpcServerListener::start(
         bound_endpoint_.port = static_cast<uint16_t>(selected_port);
     }
 
-    // Spawn the worker thread that pumps cq_ and drives ServerCall state
-    // machines. Post the first RequestCall so the dispatch loop has work
-    // to do as soon as a client connects.
     cq_worker_ = std::thread([this] { cq_worker_loop(); });
     post_new_request_call();
 
@@ -495,19 +676,13 @@ void GrpcServerListener::cq_worker_loop() {
     while (cq_->Next(&tag, &ok)) {
         // Wrap each per-event dispatch so a single ServerCall throw does
         // not kill the worker and leave the listener wedged with no one
-        // pumping the CQ (governance UP-16). User-supplied handlers are
-        // already wrapped inside dispatch_unary; this outer wrap defends
-        // against bugs in the dispatcher itself, in gRPC interactions,
-        // or in the SerializableMessage adapters.
+        // pumping the CQ (governance UP-16). User handlers are caught
+        // inside dispatch_unary / the bidi dispatcher thread; this outer
+        // catch defends against bugs in the dispatcher itself, gRPC
+        // interactions, or SerializableMessage adapters.
         try {
-            static_cast<ServerCall*>(tag)->on_event(ok);
+            static_cast<CqTag*>(tag)->on_event(ok);
         } catch (const std::exception& e) {
-            // Dispatcher-internal throw (NOT a user handler — those are
-            // already caught inside dispatch_unary). Log with type +
-            // SCRUBBED what server-side; emit a Prometheus signal so the
-            // operator can alert on a silent storm before it pins a core
-            // (governance round 5 UP-42 / UP-57 / SRE-O1, plus M2
-            // scrub-before-spdlog).
             spdlog::error(
                 "yuzu::transport: dispatcher caught std::exception — "
                 "type={} what={}", typeid(e).name(),
@@ -525,9 +700,6 @@ void GrpcServerListener::cq_worker_loop() {
             }
         }
     }
-    // cq_->Next returns false only after Shutdown has been called AND
-    // all outstanding tags have been drained. After the loop exits the
-    // queue is fully consumed and worker thread can exit.
 }
 
 void GrpcServerListener::wait_for_shutdown() {
@@ -539,28 +711,10 @@ void GrpcServerListener::wait_for_shutdown() {
 
 void GrpcServerListener::shutdown() {
     if (shutting_down_.exchange(true, std::memory_order_acq_rel)) {
-        return;  // idempotent
+        return;
     }
-    // Detect handler-initiated shutdown: if a handler running on
-    // cq_worker_ calls listener->shutdown(), we cannot synchronously
-    // join cq_worker_ from itself. server_->Shutdown() would also
-    // block on the same handler returning. Two-way deadlock
-    // (governance UP-15). Detect and refuse explicitly so the bug
-    // surfaces as a clear exception rather than a process hang.
     if (cq_worker_.joinable() &&
         cq_worker_.get_id() == std::this_thread::get_id()) {
-        // Roll back the flag so a subsequent call from another thread
-        // can complete the shutdown.
-        //
-        // Rollback contract (governance round 5 UP-44): this throw MUST
-        // be allowed to propagate up the worker's outer `catch(...)` in
-        // `cq_worker_loop` and reach a shutdown call from an external
-        // thread which can complete the join. If a future refactor
-        // narrows the worker's catch to `catch (const std::exception&)`
-        // OR routes the exception into a wire Status, the listener
-        // becomes permanently wedged at `shutting_down_=true` with
-        // `is_serving()=false` and no recovery path. Audit any change
-        // to UP-16's outer catch against this comment.
         shutting_down_.store(false, std::memory_order_release);
         throw std::logic_error(
             "yuzu::transport: shutdown() must not be called from a handler "
@@ -568,27 +722,23 @@ void GrpcServerListener::shutdown() {
             "external thread to invoke shutdown() instead");
     }
     if (server_) {
-        // shutdown trailing-status guarantee per transport.hpp: in-flight
-        // handlers receive Unavailable. PR 1b-2 dispatcher honours this
-        // for unary calls — server_->Shutdown() causes the underlying
-        // gRPC layer to deliver UNAVAILABLE to clients whose calls are
-        // still in flight.
+        // PR 1b-3: bidi handlers in flight observe gRPC's UNAVAILABLE
+        // delivery via peer-side cancel; the gctx_.IsCancelled signal
+        // arrives as ok=false on outstanding Read/Write tags, so the
+        // ServerBidiStream::read/write returns false and the handler
+        // exits its loop. server_->Shutdown blocks until all Finish
+        // tags drain.
         //
-        // PR 1b-3 will need to pass a deadline (governance UP-13);
-        // current PR 1b-2 has no live bidi streams to wedge.
+        // PR 1c may want a deadline-bounded form (governance UP-13) so
+        // a stuck handler does not wedge shutdown indefinitely.
         server_->Shutdown();
     }
     if (cq_) {
-        // Shutdown the CQ AFTER server shutdown so any pending tags get
-        // drained with ok=false and ServerCall::on_event deletes them.
         cq_->Shutdown();
     }
     if (cq_worker_.joinable()) {
         cq_worker_.join();
     }
-    // Mirror the on_connection_opened that fired in start() so the
-    // open-listener gauge tracks reality across the full lifecycle
-    // (governance round 5 SRE-O4).
     if (opts_.metric_sink) {
         opts_.metric_sink->on_connection_closed(
             "grpc", {StatusCode::Ok, "transport: listener shutdown"});

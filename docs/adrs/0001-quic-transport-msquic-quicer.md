@@ -237,7 +237,7 @@ and SOC 2 auditors can see what has shipped without grepping git log
 | PR 1a | Transport abstraction skeleton (header, proto, build wiring) | Merged |
 | PR 1b-1 | Client-side unary dispatch (grpc::GenericStub callback API) | Merged |
 | PR 1b-2 | Server-side AsyncGenericService dispatcher + ServerCall state machine | Merged |
-| PR 1b-3 | Client/server bidi-stream wiring (PrepareCall, ServerAsyncReaderWriter) | Pending |
+| PR 1b-3 | Client/server bidi-stream wiring (PrepareCall, ServerAsyncReaderWriter) | Merged |
 | PR 1c | Lift `agent.cpp` / `server.cpp` / `agent_service_impl` / `agent_registry` / `gateway_service_impl` onto Channel + ServerListener; populate CallContext::peer_san_identities; consult YUZU_ALLOW_INSECURE_TLS gate inside transport | Pending |
 | PR 2 | Conan toolchain bring-up (parallel to vcpkg) | Pending |
 | PR 3 | msquic transport implementation behind the same abstraction | Pending |

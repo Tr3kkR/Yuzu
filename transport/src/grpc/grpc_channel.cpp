@@ -9,15 +9,22 @@
 #include <grpcpp/support/slice.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <future>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#include <spdlog/spdlog.h>
 
 #include "grpc_internal_helpers.hpp"  // method_name_well_formed, byte helpers, sanitise
 #include "transport.pb.h"             // proto StatusCode enum for static_assert
@@ -407,14 +414,320 @@ CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
     return r;
 }
 
+// =====================================================================
+// GrpcBidiStream — client-side bidi stream over grpc::GenericStub.
+// =====================================================================
+//
+// Implementation strategy:
+//   * Per-stream `grpc::CompletionQueue` + worker thread. Avoids
+//     coupling stream lifetimes to a shared CQ.
+//   * Each gRPC async op (StartCall / Write / Read / WritesDone /
+//     Finish) is posted with a distinct tag pointer. The worker pumps
+//     `cq_.Next()`, decodes the tag, sets the matching `optional<bool>`
+//     under `mtx_`, and notifies `cv_`.
+//   * The public BidiStream surface (write/read/writes_done/cancel/
+//     final_status) blocks on `cv_` until the matching event fires.
+//     Threading contract per transport.hpp: single-reader + single-
+//     writer concurrent. At most one Read tag and one Write tag are
+//     in flight at a time.
+//   * On terminal-state transitions the worker thread exits via
+//     `cq_.Shutdown()`; the dtor joins it.
+class GrpcBidiStream final : public BidiStream {
+public:
+    GrpcBidiStream(::grpc::GenericStub* stub, std::string method,
+                   const CallContext& ctx,
+                   std::shared_ptr<TransportMetricSink> sink)
+        : sink_(std::move(sink)), method_(std::move(method)) {
+        if (ctx.deadline > std::chrono::milliseconds::zero()) {
+            gctx_.set_deadline(std::chrono::system_clock::now() + ctx.deadline);
+        }
+        for (const auto& [k, v] : ctx.metadata) {
+            // CallContext metadata is caller-controlled. Defensive cap
+            // mirrors the unary path; oversize is reported on first op.
+            if (k.size() > kMaxMetadataKeySize ||
+                v.size() > kMaxMetadataValueSize) {
+                construction_error_ = "transport: metadata oversized";
+                continue;
+            }
+            gctx_.AddMetadata(k, v);
+        }
+        if (ctx.cancel.stop_possible()) {
+            cancel_hook_.emplace(ctx.cancel, CancelOnStop{this});
+        }
+
+        rw_ = stub->PrepareCall(&gctx_, method_, &cq_);
+        if (!rw_) {
+            construction_error_ = "transport: PrepareCall returned null";
+            // Worker still spawns so dtor / final_status() do not hang;
+            // it exits immediately when cq_ is shut down.
+            cq_.Shutdown();
+        }
+        worker_ = std::thread([this] { worker_loop(); });
+        if (rw_) {
+            rw_->StartCall(reinterpret_cast<void*>(kTagStart));
+            if (sink_) sink_->on_stream_opened("grpc", method_);
+        }
+    }
+
+    ~GrpcBidiStream() override {
+        try {
+            // Must terminate the call so cq_ can be shut down cleanly.
+            // If neither writes_done nor final_status was reached, the
+            // call is still live — force it down via TryCancel + Finish.
+            ensure_finished();
+        } catch (...) {
+            // dtor: swallow
+        }
+        cq_.Shutdown();
+        if (worker_.joinable()) worker_.join();
+        if (sink_) sink_->on_stream_closed("grpc", method_, final_yt_status_);
+    }
+
+    bool write(const SerializableMessage& msg) override {
+        if (!rw_ || !construction_error_.empty()) return false;
+        std::string bytes;
+        if (!msg.serialize(bytes)) return false;
+        if (bytes.size() > kAbsoluteMaxFrameSize) return false;
+        if (!await_started()) return false;
+
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (cancelled_ || writes_done_called_ || finished_) return false;
+        write_done_.reset();
+        write_buf_ = string_to_byte_buffer(bytes);
+        rw_->Write(write_buf_, reinterpret_cast<void*>(kTagWrite));
+        cv_.wait(lock, [this] {
+            return write_done_.has_value() || cancelled_;
+        });
+        if (cancelled_) return false;
+        const bool ok = *write_done_;
+        if (ok && sink_) sink_->on_bytes_sent("grpc", bytes.size());
+        return ok;
+    }
+
+    bool read(SerializableMessage& msg) override {
+        if (!rw_ || !construction_error_.empty()) return false;
+        if (!await_started()) return false;
+
+        ::grpc::ByteBuffer local_buf;
+        {
+            std::unique_lock<std::mutex> lock(mtx_);
+            if (cancelled_ || finished_) return false;
+            read_done_.reset();
+            read_buf_.Clear();
+            rw_->Read(&read_buf_, reinterpret_cast<void*>(kTagRead));
+            cv_.wait(lock, [this] {
+                return read_done_.has_value() || cancelled_;
+            });
+            if (cancelled_) return false;
+            if (!*read_done_) return false;  // peer half-close / cancel
+            local_buf = std::move(read_buf_);
+        }
+        std::string bytes;
+        if (!byte_buffer_to_string(local_buf, bytes)) return false;
+        if (bytes.size() > kAbsoluteMaxFrameSize) return false;
+        if (sink_) sink_->on_bytes_received("grpc", bytes.size());
+        return msg.parse(bytes);
+    }
+
+    void writes_done() override {
+        if (!rw_ || !construction_error_.empty()) return;
+        if (!await_started()) return;
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (cancelled_ || writes_done_called_ || finished_) return;
+        writes_done_called_ = true;
+        writes_done_done_.reset();
+        rw_->WritesDone(reinterpret_cast<void*>(kTagWritesDone));
+        cv_.wait(lock, [this] {
+            return writes_done_done_.has_value() || cancelled_;
+        });
+    }
+
+    Status final_status() override {
+        if (!construction_error_.empty()) {
+            return Status{StatusCode::Unauthenticated, construction_error_};
+        }
+        if (!rw_) return Status{StatusCode::Unavailable, "transport: stream not started"};
+
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (!finished_) {
+            // Drain reads until peer half-closes so trailing-status is
+            // valid. We do not loop on Read here — that's the caller's
+            // job (per transport.hpp: final_status() is called from the
+            // reader thread after read() has returned false). We just
+            // post Finish if not already, and wait for it.
+            if (!finishing_) {
+                finishing_ = true;
+                finish_done_.reset();
+                rw_->Finish(&final_grpc_status_,
+                            reinterpret_cast<void*>(kTagFinish));
+            }
+            cv_.wait(lock, [this] { return finish_done_.has_value(); });
+            finished_ = true;
+            final_yt_status_.code = map_grpc_status_local(final_grpc_status_.error_code());
+            // SYMMETRIC inbound scrub of Status::detail (transport.hpp
+            // contract block); sec-1 / UP-41 / cons-G4-2.
+            final_yt_status_.detail =
+                sanitise_status_detail(final_grpc_status_.error_message());
+            for (const auto& [k, v] : gctx_.GetServerTrailingMetadata()) {
+                trailing_metadata_.emplace(
+                    std::string(k.data(), k.size()),
+                    std::string(v.data(), v.size()));
+            }
+        }
+        return final_yt_status_;
+    }
+
+    const std::map<std::string, std::string>& trailing_metadata() const override {
+        return trailing_metadata_;
+    }
+
+    void cancel() override {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (cancelled_) return;
+            cancelled_ = true;
+        }
+        gctx_.TryCancel();
+        cv_.notify_all();
+    }
+
+private:
+    enum : uintptr_t {
+        kTagStart      = 1,
+        kTagWrite      = 2,
+        kTagRead       = 3,
+        kTagWritesDone = 4,
+        kTagFinish     = 5,
+    };
+
+    struct CancelOnStop {
+        GrpcBidiStream* self;
+        void operator()() const noexcept {
+            if (self) self->cancel();
+        }
+    };
+
+    static StatusCode map_grpc_status_local(::grpc::StatusCode g) noexcept {
+        const int v = static_cast<int>(g);
+        if (v < static_cast<int>(StatusCode::Ok) ||
+            v > static_cast<int>(StatusCode::Unauthenticated)) {
+            return StatusCode::Unknown;
+        }
+        return static_cast<StatusCode>(v);
+    }
+
+    bool await_started() {
+        std::unique_lock<std::mutex> lock(mtx_);
+        cv_.wait(lock, [this] {
+            return start_done_.has_value() || cancelled_;
+        });
+        if (cancelled_) return false;
+        return *start_done_;
+    }
+
+    void ensure_finished() {
+        // Called from dtor. If the caller never reached final_status(),
+        // we must terminate the call so cq_ can drain. TryCancel then
+        // Finish; wait briefly for the Finish tag.
+        bool need_finish = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (!finished_ && !finishing_) {
+                finishing_ = true;
+                need_finish = true;
+            }
+        }
+        if (need_finish) {
+            gctx_.TryCancel();
+            if (rw_) {
+                rw_->Finish(&final_grpc_status_,
+                            reinterpret_cast<void*>(kTagFinish));
+            }
+            std::unique_lock<std::mutex> lock(mtx_);
+            cv_.wait(lock, [this] { return finish_done_.has_value(); });
+            finished_ = true;
+        }
+    }
+
+    void worker_loop() {
+        void* tag = nullptr;
+        bool ok = false;
+        while (cq_.Next(&tag, &ok)) {
+            const auto kind = reinterpret_cast<uintptr_t>(tag);
+            std::lock_guard<std::mutex> lock(mtx_);
+            switch (kind) {
+                case kTagStart:      start_done_       = ok; break;
+                case kTagWrite:      write_done_       = ok; break;
+                case kTagRead:       read_done_        = ok; break;
+                case kTagWritesDone: writes_done_done_ = ok; break;
+                case kTagFinish:     finish_done_      = ok; break;
+                default:
+                    spdlog::error(
+                        "yuzu::transport: GrpcBidiStream worker saw "
+                        "unknown tag {}", kind);
+                    break;
+            }
+            cv_.notify_all();
+        }
+    }
+
+    ::grpc::ClientContext                                    gctx_;
+    ::grpc::CompletionQueue                                  cq_;
+    std::unique_ptr<::grpc::GenericClientAsyncReaderWriter>  rw_;
+    std::thread                                              worker_;
+    std::shared_ptr<TransportMetricSink>                     sink_;
+    std::string                                              method_;
+    std::string                                              construction_error_;
+
+    std::mutex                                               mtx_;
+    std::condition_variable                                  cv_;
+    std::optional<bool>                                      start_done_;
+    std::optional<bool>                                      write_done_;
+    std::optional<bool>                                      read_done_;
+    std::optional<bool>                                      writes_done_done_;
+    std::optional<bool>                                      finish_done_;
+    bool                                                     finishing_          = false;
+    bool                                                     finished_           = false;
+    bool                                                     writes_done_called_ = false;
+    bool                                                     cancelled_          = false;
+
+    ::grpc::ByteBuffer                                       write_buf_;
+    ::grpc::ByteBuffer                                       read_buf_;
+    ::grpc::Status                                           final_grpc_status_;
+    Status                                                   final_yt_status_;
+    std::map<std::string, std::string>                       trailing_metadata_;
+
+    std::optional<std::stop_callback<CancelOnStop>>          cancel_hook_;
+};
+
 std::unique_ptr<BidiStream> GrpcChannel::bidi_stream(
-    std::string_view /*method*/, const CallContext& /*ctx*/) {
-    // PR 1b: bidi via grpc::GenericStub::PrepareBidiStreamingCall.
-    // Returning nullptr in PR 1a is the deterministic placeholder
-    // (callers MUST check for null before use; PR 1b will also need
-    // the construction_error_ + closed_ + method-validation gates that
-    // unary() currently has — tracked as governance UP-8).
-    return nullptr;
+    std::string_view method, const CallContext& ctx) {
+    if (!construction_error_.empty()) {
+        // Construction-time error must surface via final_status() per
+        // BidiStream contract; we still return a usable wrapper so the
+        // caller's read/write paths fail uniformly.
+        struct DeadStream final : BidiStream {
+            std::string err;
+            std::map<std::string, std::string> empty_md;
+            bool write(const SerializableMessage&) override { return false; }
+            bool read(SerializableMessage&) override { return false; }
+            void writes_done() override {}
+            Status final_status() override { return {StatusCode::Unauthenticated, err}; }
+            const std::map<std::string, std::string>& trailing_metadata() const override {
+                return empty_md;
+            }
+            void cancel() override {}
+        };
+        auto d = std::make_unique<DeadStream>();
+        d->err = construction_error_;
+        return d;
+    }
+    if (closed_.load(std::memory_order_acquire)) return nullptr;
+    if (!method_name_well_formed(method)) return nullptr;
+    if (!generic_stub_ || !channel_) return nullptr;
+    return std::make_unique<GrpcBidiStream>(generic_stub_.get(),
+                                            std::string{method}, ctx,
+                                            metric_sink_);
 }
 
 bool GrpcChannel::wait_for_connected(std::chrono::milliseconds deadline) {
