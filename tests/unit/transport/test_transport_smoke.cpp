@@ -15,6 +15,8 @@
 #include <thread>
 #include <vector>
 
+#include "transport.pb.h" // generated from proto/yuzu/transport/framing/v1/transport.proto
+#include "yuzu/transport/proto_adapter.hpp"
 #include "yuzu/transport/transport.hpp"
 
 using namespace yuzu::transport;
@@ -868,6 +870,124 @@ TEST_CASE("Bidi stream destroyed without final_status terminates cleanly",
     }
 
     listener->shutdown();
+}
+
+// =====================================================================
+// PR 1c-1 — typed-proto adapter helpers
+// =====================================================================
+
+TEST_CASE("register_unary_pb dispatches typed protos end to end", "[transport][adapter]") {
+    namespace tpb = ::yuzu::transport::framing::v1;
+
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    // Handler receives typed HandshakeHello, populates typed
+    // TrailingStatus. No SerializableMessage downcasting at the call site.
+    register_unary_pb<tpb::HandshakeHello, tpb::TrailingStatus>(
+        *listener, "yuzu.test.v1.AdapterEcho/Echo",
+        [](const CallContext&, const tpb::HandshakeHello& req,
+           tpb::TrailingStatus& resp) -> Status {
+            resp.set_code(tpb::STATUS_CODE_OK);
+            resp.set_detail("hello:" + req.method());
+            return Status{StatusCode::Ok, ""};
+        });
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    tpb::HandshakeHello req;
+    req.set_method("yuzu.agent.v1.AgentService/Heartbeat");
+    tpb::TrailingStatus resp;
+
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    auto req_adapter = as_proto(req);
+    auto resp_adapter = as_proto(resp);
+    auto r = ch->unary("yuzu.test.v1.AdapterEcho/Echo", ctx, req_adapter, resp_adapter);
+    REQUIRE(r.status.code == StatusCode::Ok);
+    REQUIRE(resp.code() == tpb::STATUS_CODE_OK);
+    REQUIRE(resp.detail() == "hello:yuzu.agent.v1.AgentService/Heartbeat");
+
+    listener->shutdown();
+}
+
+TEST_CASE("read_pb / write_pb adapt bidi to typed protos", "[transport][adapter][bidi]") {
+    namespace tpb = ::yuzu::transport::framing::v1;
+
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    listener->register_bidi_stream("yuzu.test.v1.AdapterEcho/BidiEcho",
+                                   [](const CallContext&, BidiStream& stream) -> Status {
+                                       tpb::HandshakeHello in;
+                                       while (read_pb(stream, in)) {
+                                           tpb::TrailingStatus out;
+                                           out.set_code(tpb::STATUS_CODE_OK);
+                                           out.set_detail("ack:" + in.method());
+                                           if (!write_pb(stream, out)) {
+                                               return Status{StatusCode::Internal, "write failed"};
+                                           }
+                                       }
+                                       return Status{StatusCode::Ok, ""};
+                                   });
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(5);
+    auto stream = ch->bidi_stream("yuzu.test.v1.AdapterEcho/BidiEcho", ctx);
+    REQUIRE(stream != nullptr);
+
+    for (int i = 0; i < 3; ++i) {
+        tpb::HandshakeHello out;
+        out.set_method("frame_" + std::to_string(i));
+        REQUIRE(write_pb(*stream, out));
+
+        tpb::TrailingStatus in;
+        REQUIRE(read_pb(*stream, in));
+        REQUIRE(in.code() == tpb::STATUS_CODE_OK);
+        REQUIRE(in.detail() == "ack:frame_" + std::to_string(i));
+    }
+    stream->writes_done();
+    tpb::TrailingStatus drain;
+    REQUIRE_FALSE(read_pb(*stream, drain));
+    REQUIRE(stream->final_status().code == StatusCode::Ok);
+
+    listener->shutdown();
+}
+
+TEST_CASE("OwnedProtoMessage parses + serialises round-trip", "[transport][adapter]") {
+    namespace tpb = ::yuzu::transport::framing::v1;
+
+    OwnedProtoMessage<tpb::HandshakeHello> owned;
+    owned.value().set_method("yuzu.agent.v1.AgentService/Subscribe");
+
+    std::string bytes;
+    REQUIRE(owned.serialize(bytes));
+    REQUIRE_FALSE(bytes.empty());
+
+    OwnedProtoMessage<tpb::HandshakeHello> parsed;
+    REQUIRE(parsed.parse(bytes));
+    REQUIRE(parsed.value().method() == "yuzu.agent.v1.AgentService/Subscribe");
+
+    // Wire-corrupt input fails parse() — caller must treat as DataLoss.
+    OwnedProtoMessage<tpb::HandshakeHello> bad;
+    // Garbage bytes: non-zero unknown wire type combinations.
+    REQUIRE_FALSE(bad.parse(std::string_view("\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80", 10)));
 }
 
 TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport][lifecycle]") {

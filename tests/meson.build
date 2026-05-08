@@ -237,7 +237,10 @@ endif
 transport_test_exe = executable(
   'yuzu_transport_tests',
   files('unit/transport/test_transport_smoke.cpp'),
-  dependencies: [yuzu_transport_dep, catch2_dep],
+  # yuzu_proto_dep provides the link to libyuzu_proto.a so generated
+  # symbols (HandshakeHello, TrailingStatus) resolve. yuzu_transport_dep
+  # alone exposes only proto headers.
+  dependencies: [yuzu_transport_dep, yuzu_proto_dep, catch2_dep],
 )
 test('transport unit tests', transport_test_exe, suite: 'transport', timeout: 180)
 
