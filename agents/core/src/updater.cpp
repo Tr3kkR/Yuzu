@@ -9,6 +9,8 @@
 
 #include <yuzu/agent/updater.hpp>
 #include <yuzu/plugin.h> // yuzu_create_temp_file
+#include <yuzu/transport/proto_adapter.hpp>
+#include <yuzu/transport/transport.hpp>
 
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
@@ -242,7 +244,8 @@ int compare_semver(std::string_view a, std::string_view b) {
             int val = 0;
             std::from_chars(part.data(), part.data() + part.size(), val);
             parts[i] = val;
-            if (dot == std::string_view::npos) break;
+            if (dot == std::string_view::npos)
+                break;
             s.remove_prefix(dot + 1);
         }
         return parts;
@@ -250,8 +253,10 @@ int compare_semver(std::string_view a, std::string_view b) {
     auto pa = parse(a);
     auto pb = parse(b);
     for (int i = 0; i < 3; ++i) {
-        if (pa[i] < pb[i]) return -1;
-        if (pa[i] > pb[i]) return 1;
+        if (pa[i] < pb[i])
+            return -1;
+        if (pa[i] > pb[i])
+            return 1;
     }
     return 0;
 }
@@ -268,9 +273,12 @@ void Updater::stop() noexcept {
     stop_requested_.store(true, std::memory_order_release);
 }
 
-std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
+std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub, void* raw_channel) {
     if (!raw_stub) {
         return std::unexpected(UpdateError{"null gRPC stub"});
+    }
+    if (!raw_channel) {
+        return std::unexpected(UpdateError{"null transport channel"});
     }
 
     if (!config_.enabled) {
@@ -283,8 +291,9 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     }
 
     auto* stub = static_cast<pb::AgentService::Stub*>(raw_stub);
+    auto* channel = static_cast<::yuzu::transport::Channel*>(raw_channel);
 
-    // ── Step 1: Check for update ───────────────────────────────────────────
+    // ── Step 1: Check for update (lifted onto transport::Channel — PR 1c-3) ──
 
     pb::CheckForUpdateRequest check_req;
     check_req.set_agent_id(agent_id_);
@@ -293,14 +302,16 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     platform->set_os(os_);
     platform->set_arch(arch_);
 
-    grpc::ClientContext check_ctx;
     pb::CheckForUpdateResponse check_resp;
-    grpc::Status check_status = stub->CheckForUpdate(&check_ctx, check_req, &check_resp);
+    ::yuzu::transport::CallContext check_ctx{};
+    auto check_resp_adapter = ::yuzu::transport::as_proto(check_resp);
+    auto check_call = channel->unary("yuzu.agent.v1.AgentService/CheckForUpdate", check_ctx,
+                                     ::yuzu::transport::as_proto(check_req), check_resp_adapter);
 
-    if (!check_status.ok()) {
-        return std::unexpected(UpdateError{
-            std::format("CheckForUpdate RPC failed: {} (code {})", check_status.error_message(),
-                        static_cast<int>(check_status.error_code()))});
+    if (!check_call.status.ok()) {
+        return std::unexpected(UpdateError{std::format("CheckForUpdate RPC failed: {} (code {})",
+                                                       check_call.status.detail,
+                                                       static_cast<int>(check_call.status.code))});
     }
 
     if (!check_resp.update_available()) {
@@ -397,8 +408,8 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
             out.close();
             std::error_code ec;
             std::filesystem::remove(temp_path, ec);
-            return std::unexpected(UpdateError{
-                std::format("Download exceeds maximum size ({} MiB)", kMaxDownloadBytes / (1024 * 1024))});
+            return std::unexpected(UpdateError{std::format("Download exceeds maximum size ({} MiB)",
+                                                           kMaxDownloadBytes / (1024 * 1024))});
         }
     }
 

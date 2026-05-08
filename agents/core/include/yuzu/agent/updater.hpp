@@ -30,10 +30,17 @@ public:
     Updater(Updater&&) = delete;
     Updater& operator=(Updater&&) = delete;
 
-    /// Check for update via gRPC stub, download, verify, apply.
+    /// Check for update via the transport channel (CheckForUpdate),
+    /// download via the legacy gRPC stub (DownloadUpdate, deferred to
+    /// #376 PR 1c-4), verify, apply.
     /// Returns true if update applied and process should restart.
-    /// The stub parameter is AgentService::Stub* (void* to avoid proto header in public header).
-    [[nodiscard]] std::expected<bool, UpdateError> check_and_apply(void* stub);
+    /// The `stub` parameter is AgentService::Stub* (used for the still-on-grpc
+    /// DownloadUpdate server-streaming RPC). The `channel` parameter is
+    /// yuzu::transport::Channel* (used for the lifted unary CheckForUpdate
+    /// RPC). Both are typed as void* to keep proto and transport headers
+    /// out of this public surface; PR 1c-4 will collapse to a single
+    /// transport::Channel*.
+    [[nodiscard]] std::expected<bool, UpdateError> check_and_apply(void* stub, void* channel);
 
     /// On startup: delete .old files from successful prior updates.
     void cleanup_old_binary();

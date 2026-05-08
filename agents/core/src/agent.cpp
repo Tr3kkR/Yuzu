@@ -20,6 +20,8 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/updater.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
+#include <yuzu/transport/proto_adapter.hpp>
+#include <yuzu/transport/transport.hpp>
 #include <yuzu/version.hpp>
 
 #include <grpcpp/grpcpp.h>
@@ -42,6 +44,7 @@ __declspec(allocate(".CRT$XCB"))
 #endif
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -50,9 +53,12 @@ __declspec(allocate(".CRT$XCB"))
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <random>
+#include <stop_token>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -122,8 +128,68 @@ std::string read_file_contents(const std::filesystem::path& p) {
     return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
 }
 
+// Parse "host:port" / "[ipv6]:port" into the transport's Endpoint.
+// Returns nullopt on malformed input. Mirrors the server-side parser
+// (server.cpp parse_listen_address) used in #376 PR 1c-2; same hardening
+// (noexcept, std::from_chars, IPv6 bracket form, port bounds-checked).
+[[nodiscard]] std::optional<::yuzu::transport::Endpoint>
+parse_target_address(std::string_view addr) noexcept {
+    ::yuzu::transport::Endpoint e{};
+    if (addr.empty())
+        return std::nullopt;
+    std::string_view port_sv;
+    if (addr.front() == '[') {
+        auto close = addr.find(']');
+        if (close == std::string_view::npos)
+            return std::nullopt;
+        // Keep the brackets in host so the gRPC backend's
+        // `host + ":" + port` construction yields a valid address literal.
+        e.host = std::string{addr.substr(0, close + 1)};
+        if (close + 1 == addr.size())
+            return std::nullopt;
+        if (addr[close + 1] != ':')
+            return std::nullopt;
+        port_sv = addr.substr(close + 2);
+    } else {
+        auto colon = addr.rfind(':');
+        if (colon == std::string_view::npos)
+            return std::nullopt;
+        e.host = std::string{addr.substr(0, colon)};
+        port_sv = addr.substr(colon + 1);
+    }
+    if (e.host.empty() || port_sv.empty())
+        return std::nullopt;
+    uint32_t port_raw = 0;
+    auto* first = port_sv.data();
+    auto* last = port_sv.data() + port_sv.size();
+    auto [ptr, ec] = std::from_chars(first, last, port_raw);
+    if (ec != std::errc{} || ptr != last)
+        return std::nullopt;
+    if (port_raw == 0 || port_raw > 0xFFFFu)
+        return std::nullopt;
+    e.port = static_cast<uint16_t>(port_raw);
+    return e;
+}
+
+// RAII zeroisation of transport::Credentials private-key bytes on scope
+// exit. Mirrors the server-side guard in server.cpp (#376 PR 1c-2 gov
+// round 7 cpp F-CPP-1). The PEM private key is the only secret in the
+// struct; cert / CA bytes are public.
+struct CredentialsZeroOnExit {
+    ::yuzu::transport::Credentials& c;
+    ~CredentialsZeroOnExit() {
+        yuzu::secure_zero(c.client_key_pem);
+        yuzu::secure_zero(c.server_key_pem);
+    }
+};
+
 // Stream type alias: agent writes CommandResponse, reads CommandRequest.
 // (Subscribe RPC: stream CommandResponse -> stream CommandRequest)
+//
+// PR 1c-3 keeps Subscribe + DownloadUpdate on the legacy gRPC stub path
+// while Register / Heartbeat / CheckForUpdate move to transport::Channel.
+// PR 1c-4 will lift Subscribe + DownloadUpdate, at which point this
+// alias and the parallel grpc::Channel + Stub disappear.
 using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::CommandRequest>;
 
 // ── Bounded Thread Pool ──────────────────────────────────────────────────────
@@ -629,14 +695,24 @@ public:
         }
 
         CloudIdentity cloud_id; // Populated before registration (step 2b)
-        std::shared_ptr<grpc::ChannelCredentials> creds;
-        std::shared_ptr<grpc::Channel> channel;
-        std::unique_ptr<pb::AgentService::Stub> stub;
+
+        // ── #376 PR 1c-3 — agent-side transport lift ─────────────────────────
+        //
+        // Build a `transport::Credentials` from cfg_'s TLS material. PEM bytes
+        // are read once into the Credentials struct; the private-key field is
+        // zeroed on every exit path by `CredentialsZeroOnExit` (sibling parity
+        // with server.cpp's identical guard, #376 PR 1c-2 gov round 7
+        // cpp F-CPP-1).
+        //
+        // Subscribe + DownloadUpdate are deferred to PR 1c-4 — they still
+        // travel on the legacy `grpc::Channel` + `pb::AgentService::Stub`
+        // built below. The two channels share TLS material and the same wire
+        // endpoint; once 1c-4 lifts streaming, the legacy half disappears.
+        ::yuzu::transport::Credentials creds_t{};
         if (cfg_.tls_enabled) {
-            grpc::SslCredentialsOptions ssl_opts;
             if (!cfg_.tls_ca_cert.empty()) {
-                ssl_opts.pem_root_certs = read_file_contents(cfg_.tls_ca_cert);
-                if (ssl_opts.pem_root_certs.empty()) {
+                creds_t.ca_cert_pem = read_file_contents(cfg_.tls_ca_cert);
+                if (creds_t.ca_cert_pem.empty()) {
                     spdlog::error("Failed to read CA cert from {}", cfg_.tls_ca_cert.string());
                     return;
                 }
@@ -654,8 +730,8 @@ public:
                     return;
                 }
 
-                ssl_opts.pem_cert_chain = std::move(store_result.pem_cert_chain);
-                ssl_opts.pem_private_key = std::move(store_result.pem_private_key);
+                creds_t.client_cert_pem = std::move(store_result.pem_cert_chain);
+                creds_t.client_key_pem = std::move(store_result.pem_private_key);
                 spdlog::info("mTLS enabled: using certificate from {} store", cfg_.cert_store);
             } else {
                 const bool has_client_cert = !cfg_.tls_client_cert.empty();
@@ -666,23 +742,81 @@ public:
                 }
 
                 if (has_client_cert && has_client_key) {
-                    ssl_opts.pem_cert_chain = read_file_contents(cfg_.tls_client_cert);
-                    ssl_opts.pem_private_key = read_file_contents(cfg_.tls_client_key);
-                    if (ssl_opts.pem_cert_chain.empty() || ssl_opts.pem_private_key.empty()) {
+                    creds_t.client_cert_pem = read_file_contents(cfg_.tls_client_cert);
+                    creds_t.client_key_pem = read_file_contents(cfg_.tls_client_key);
+                    if (creds_t.client_cert_pem.empty() || creds_t.client_key_pem.empty()) {
                         spdlog::error("Failed to read client cert/key for mTLS");
                         return;
-                    } else {
-                        spdlog::info("mTLS enabled: using client certificate files");
                     }
+                    spdlog::info("mTLS enabled: using client certificate files");
                 }
             }
-            creds = grpc::SslCredentials(ssl_opts);
-            yuzu::secure_zero(ssl_opts.pem_private_key);
+            creds_t.verify_peer = true;
         } else {
-            creds = grpc::InsecureChannelCredentials();
+            // Plaintext path (test / dev). The transport refuses verify_peer=true
+            // with empty CA bundle, so explicitly opt-out here.
+            creds_t.verify_peer = false;
+        }
+        // RAII guard zeroes client_key_pem on every exit path (return,
+        // exception, normal scope exit). Mirrors the server-side guard.
+        CredentialsZeroOnExit creds_zero_guard{creds_t};
+
+        auto target_opt = parse_target_address(cfg_.server_address);
+        if (!target_opt) {
+            spdlog::error("Failed to parse --server-address: must be host:port with "
+                          "port 1..65535 (got '{}')",
+                          cfg_.server_address);
+            return;
         }
 
-        channel = grpc::CreateCustomChannel(cfg_.server_address, creds, ch_args);
+        // BackoffPolicy controls gRPC's INTERNAL channel reconnect (the
+        // GRPC_ARG_*_RECONNECT_BACKOFF_MS args). The application-level
+        // Register-retry loop below is separate; it carries its own delay
+        // computation because Register can fail for app-level reasons
+        // (pending approval) that aren't channel-level. Bumping max_delay
+        // to 5min matches the existing agent.cpp app-loop cap so the
+        // channel doesn't try faster than the app retries.
+        ::yuzu::transport::BackoffPolicy backoff{};
+        backoff.initial_delay = std::chrono::seconds(1);
+        backoff.max_delay = std::chrono::minutes(5);
+        backoff.multiplier = 2.0;
+        backoff.jitter_fraction = 0.2;
+
+        auto channel_t = ::yuzu::transport::make_channel(::yuzu::transport::Backend::Grpc,
+                                                         *target_opt, creds_t, backoff);
+        if (!channel_t) {
+            spdlog::error("Failed to construct transport channel (Grpc backend not linked)");
+            return;
+        }
+
+        // Block briefly for the initial channel handshake. wait_for_connected
+        // returns true once the TLS handshake completes; if it doesn't come up
+        // within the deadline we proceed to the reconnect loop and let the
+        // first Register fail-and-retry with stop-token-checked sleeps.
+        if (!channel_t->wait_for_connected(std::chrono::seconds(5))) {
+            spdlog::info("Initial transport channel not ready in 5s — proceeding to retry loop");
+        }
+
+        // Legacy grpc::Channel + Stub for Subscribe + DownloadUpdate.
+        // PR 1c-4 will lift these onto channel_t->bidi_stream(...) and
+        // delete this whole block. Until then the two channels coexist —
+        // they negotiate independent TLS sessions but share the same
+        // PEM material and target endpoint.
+        std::shared_ptr<grpc::ChannelCredentials> creds_grpc;
+        std::shared_ptr<grpc::Channel> channel;
+        std::unique_ptr<pb::AgentService::Stub> stub;
+        if (cfg_.tls_enabled) {
+            grpc::SslCredentialsOptions ssl_opts;
+            ssl_opts.pem_root_certs = creds_t.ca_cert_pem;
+            ssl_opts.pem_cert_chain = creds_t.client_cert_pem;
+            ssl_opts.pem_private_key = creds_t.client_key_pem;
+            creds_grpc = grpc::SslCredentials(ssl_opts);
+            yuzu::secure_zero(ssl_opts.pem_private_key);
+        } else {
+            creds_grpc = grpc::InsecureChannelCredentials();
+        }
+
+        channel = grpc::CreateCustomChannel(cfg_.server_address, creds_grpc, ch_args);
 
         stub = pb::AgentService::NewStub(channel);
 
@@ -712,7 +846,6 @@ public:
             }
 
             {
-                grpc::ClientContext ctx;
                 pb::RegisterRequest req;
                 auto* info = req.mutable_info();
                 info->set_agent_id(cfg_.agent_id);
@@ -815,9 +948,13 @@ public:
 
                 pb::RegisterResponse resp;
                 auto register_start = std::chrono::steady_clock::now();
-                auto status = stub->Register(&ctx, req, &resp);
-                if (!status.ok()) {
-                    spdlog::error("Failed to register with server: {}", status.error_message());
+                ::yuzu::transport::CallContext rctx{};
+                rctx.cancel = rpc_stop_src_.get_token();
+                auto resp_adapter = ::yuzu::transport::as_proto(resp);
+                auto reg_call = channel_t->unary("yuzu.agent.v1.AgentService/Register", rctx,
+                                                 ::yuzu::transport::as_proto(req), resp_adapter);
+                if (!reg_call.status.ok()) {
+                    spdlog::error("Failed to register with server: {}", reg_call.status.detail);
                     ++reconnect_count;
                     continue; // Retry registration
                 }
@@ -923,11 +1060,12 @@ public:
                 // 4b. Spawn OTA update check thread
                 if (cfg_.auto_update && updater_) {
                     auto* raw_stub = static_cast<void*>(stub.get());
-                    update_thread_ = std::thread([this, raw_stub]() {
+                    auto* raw_channel = static_cast<void*>(channel_t.get());
+                    update_thread_ = std::thread([this, raw_stub, raw_channel]() {
                         spdlog::info("OTA update checker started (interval={}s)",
                                      cfg_.update_check_interval.count());
                         while (!stop_requested_.load(std::memory_order_acquire)) {
-                            auto result = updater_->check_and_apply(raw_stub);
+                            auto result = updater_->check_and_apply(raw_stub, raw_channel);
                             if (result.has_value() && result.value()) {
                                 spdlog::info("OTA update applied - agent will restart");
                                 stop();
@@ -951,13 +1089,28 @@ public:
                 // 4c. Spawn heartbeat thread — piggybacks agent metrics in status_tags
                 {
                     heartbeat_stop_.store(false, std::memory_order_release);
-                    auto hb_stub = pb::AgentService::NewStub(channel);
-                    heartbeat_thread_ = std::thread([this, hb_stub = std::move(hb_stub)]() {
+                    // Cancellation signal threaded into each Heartbeat
+                    // CallContext. stop() / reconnect cleanup call
+                    // request_stop() to cancel any in-flight RPC. Replaces
+                    // the historic atomic<grpc::ClientContext*> pointer
+                    // dance (PR 1c-3).
+                    {
+                        std::lock_guard lk{heartbeat_stop_src_mu_};
+                        heartbeat_stop_src_.emplace();
+                    }
+                    auto* channel_raw = channel_t.get();
+                    heartbeat_thread_ = std::thread([this, channel_raw]() {
                         spdlog::info("Heartbeat thread started (interval={}s)",
                                      cfg_.heartbeat_interval.count());
-                        auto should_stop = [this]() {
+                        std::stop_token hb_stop_tok;
+                        {
+                            std::lock_guard lk{heartbeat_stop_src_mu_};
+                            hb_stop_tok = heartbeat_stop_src_->get_token();
+                        }
+                        auto should_stop = [this, &hb_stop_tok]() {
                             return stop_requested_.load(std::memory_order_acquire) ||
-                                   heartbeat_stop_.load(std::memory_order_acquire);
+                                   heartbeat_stop_.load(std::memory_order_acquire) ||
+                                   hb_stop_tok.stop_requested();
                         };
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
@@ -971,8 +1124,6 @@ public:
                                 break;
 
                             // Build heartbeat with piggybacked metrics
-                            grpc::ClientContext ctx;
-                            heartbeat_ctx_.store(&ctx, std::memory_order_release);
                             pb::HeartbeatRequest req;
                             req.set_session_id(session_id_);
                             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -994,15 +1145,21 @@ public:
                             tags["yuzu.healthy"] = "1";
 
                             pb::HeartbeatResponse resp;
-                            auto status = hb_stub->Heartbeat(&ctx, req, &resp);
-                            heartbeat_ctx_.store(nullptr, std::memory_order_release);
-                            if (!status.ok()) {
-                                spdlog::warn("Heartbeat failed: {}", status.error_message());
+                            ::yuzu::transport::CallContext hctx{};
+                            if (!session_id_.empty()) {
+                                hctx.metadata[kSessionMetadataKey] = session_id_;
+                            }
+                            hctx.cancel = hb_stop_tok;
+                            auto hb_resp_adapter = ::yuzu::transport::as_proto(resp);
+                            auto hb_call = channel_raw->unary(
+                                "yuzu.agent.v1.AgentService/Heartbeat", hctx,
+                                ::yuzu::transport::as_proto(req), hb_resp_adapter);
+                            if (!hb_call.status.ok()) {
+                                spdlog::warn("Heartbeat failed: {}", hb_call.status.detail);
                             } else {
                                 spdlog::debug("Heartbeat acknowledged (uptime={}s)", uptime);
                             }
                         }
-                        heartbeat_ctx_.store(nullptr, std::memory_order_release);
                         spdlog::info("Heartbeat thread stopped");
                     });
                 }
@@ -1256,10 +1413,18 @@ public:
                     update_thread_.join();
                 }
 
-                // Signal heartbeat thread to exit and cancel any in-flight RPC
+                // Signal heartbeat thread to exit and cancel any in-flight RPC.
+                // Both halves are needed: heartbeat_stop_ flips the loop-exit
+                // predicate even when sleeping between intervals; the
+                // stop_source request_stop() drives transport-level
+                // cancellation of an RPC currently in flight via the
+                // CallContext::cancel hook (replaces the historic
+                // grpc::ClientContext::TryCancel call).
                 heartbeat_stop_.store(true, std::memory_order_release);
-                if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
-                    hctx->TryCancel();
+                {
+                    std::lock_guard lk{heartbeat_stop_src_mu_};
+                    if (heartbeat_stop_src_)
+                        heartbeat_stop_src_->request_stop();
                 }
                 if (heartbeat_thread_.joinable()) {
                     heartbeat_thread_.join();
@@ -1303,13 +1468,23 @@ public:
             guardian_->stop();
         if (updater_)
             updater_->stop();
-        // Cancel the Subscribe stream to unblock the Read() call
+        // Cancel the Subscribe stream to unblock the Read() call. Subscribe
+        // is still on grpc::ClientReaderWriter — PR 1c-4 lifts it onto
+        // transport::BidiStream, at which point this becomes a stop_source.
         if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
             ctx->TryCancel();
         }
-        // Cancel any in-flight heartbeat RPC to unblock the heartbeat thread
-        if (auto* hctx = heartbeat_ctx_.load(std::memory_order_acquire)) {
-            hctx->TryCancel();
+        // Cancel any transport RPC carrying our stop token (Heartbeat,
+        // CheckForUpdate). Register's CallContext also takes this token,
+        // so an in-flight Register during shutdown also unblocks promptly.
+        rpc_stop_src_.request_stop();
+        // Heartbeat-thread-scoped stop_source — request_stop here so the
+        // heartbeat thread observes shutdown even when sleeping between
+        // intervals (the lambda checks hb_stop_tok.stop_requested()).
+        {
+            std::lock_guard lk{heartbeat_stop_src_mu_};
+            if (heartbeat_stop_src_)
+                heartbeat_stop_src_->request_stop();
         }
     }
 
@@ -1331,8 +1506,22 @@ private:
     std::string session_id_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> heartbeat_stop_{false};
+    // Subscribe + DownloadUpdate still ride on grpc::ClientContext until
+    // PR 1c-4 lifts them onto transport::BidiStream. The atomic-pointer
+    // dance is therefore retained for those two RPCs only.
     std::atomic<grpc::ClientContext*> subscribe_ctx_{nullptr};
-    std::atomic<grpc::ClientContext*> heartbeat_ctx_{nullptr};
+    // Cancellation hook for transport unary RPCs (Register, Heartbeat,
+    // CheckForUpdate). Threaded into each CallContext::cancel; stop()
+    // request_stop()s once and all subsequent and in-flight RPCs short-
+    // circuit through the transport's stop_callback hook.
+    std::stop_source rpc_stop_src_;
+    // Heartbeat-thread-scoped stop_source. Replaces the historic
+    // atomic<grpc::ClientContext*> heartbeat_ctx_ pointer. A fresh
+    // stop_source is created at the top of each connection cycle so that
+    // a request_stop() from a previous reconnect cleanup does not bleed
+    // into the next cycle. Mutex protects the optional swap.
+    std::mutex heartbeat_stop_src_mu_;
+    std::optional<std::stop_source> heartbeat_stop_src_;
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
     std::mutex stream_write_mu_;

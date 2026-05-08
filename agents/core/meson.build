@@ -16,7 +16,7 @@ yuzu_agent_core_lib = shared_library(
     include_directories('include'),
     include_directories('../../sdk/include'),
   ],
-  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, sqlite3_dep, nlohmann_dep] + agent_crypto_deps,
+  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, yuzu_transport_dep, spdlog_dep, sqlite3_dep, nlohmann_dep] + agent_crypto_deps,
   cpp_args: ['-DYUZU_AGENT_CORE_BUILDING'],
   install: true,
 )
