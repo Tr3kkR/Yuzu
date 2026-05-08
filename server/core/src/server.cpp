@@ -7,6 +7,7 @@
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
+#include <yuzu/transport/transport.hpp>
 #include <yuzu/version.hpp>
 #include "cert_reloader.hpp"
 #include "file_utils.hpp"
@@ -795,30 +796,29 @@ public:
 
     void run() override {
         spdlog::info("run(): entering");
-        grpc::EnableDefaultHealthCheckService(true);
 
-        std::shared_ptr<grpc::ServerCredentials> agent_creds = grpc::InsecureServerCredentials();
+        // Management + gateway-upstream services still ride on grpc::ServerBuilder
+        // (PR 1c-5 lifts those onto the transport abstraction). The agent
+        // listener has already been migrated to `transport::ServerListener` —
+        // see #376 PR 1c-2.
         std::shared_ptr<grpc::ServerCredentials> mgmt_creds = grpc::InsecureServerCredentials();
         if (cfg_.tls_enabled) {
-            auto tls =
+            // Validate agent-listener TLS material up front so the transport
+            // listener doesn't bring up half a service before failing on the
+            // management side.
+            auto agent_tls_validation =
                 build_tls_credentials(cfg_.tls_server_cert, cfg_.tls_server_key, cfg_.tls_ca_cert,
                                       cfg_.allow_one_way_tls, "agent listener");
-            if (tls) {
-                agent_creds = std::move(tls);
-            } else {
-                spdlog::error("TLS is enabled but credentials are invalid; refusing to start");
+            if (!agent_tls_validation) {
+                spdlog::error("TLS is enabled but agent-listener credentials are invalid; "
+                              "refusing to start");
                 return;
             }
 
             if (!cfg_.mgmt_tls_server_cert.empty() || !cfg_.mgmt_tls_server_key.empty() ||
                 !cfg_.mgmt_tls_ca_cert.empty()) {
                 // The management listener is governed by the SAME insecure-TLS gate
-                // as the agent listener (issue #79 / C-79-1). An operator who supplies
-                // --management-cert/--management-key without --management-ca-cert must
-                // also pass --insecure-skip-client-verify (which itself requires
-                // YUZU_ALLOW_INSECURE_TLS=1) — otherwise build_tls_credentials refuses.
-                // Previously this was hardcoded `true`, which silently accepted any
-                // unauthenticated peer on the management plane.
+                // as the agent listener (issue #79 / C-79-1).
                 auto mgmt_tls = build_tls_credentials(
                     cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key, cfg_.mgmt_tls_ca_cert,
                     cfg_.allow_one_way_tls, "management listener");
@@ -828,34 +828,58 @@ public:
                 }
                 mgmt_creds = std::move(mgmt_tls);
             } else {
-                mgmt_creds = agent_creds;
+                // No separate management cert/key — re-use the agent material.
+                mgmt_creds = std::move(agent_tls_validation);
             }
         }
 
-        grpc::ServerBuilder builder;
-        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
-        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
-        builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
-        builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
-        builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 30000);
-        builder.AddListeningPort(cfg_.listen_address, agent_creds);
-        builder.AddListeningPort(cfg_.management_address, mgmt_creds);
-        builder.RegisterService(&agent_service_);
-        builder.RegisterService(&mgmt_service_);
+        // -- Agent listener via yuzu::transport (#376 PR 1c-2) ----------------
+        agent_listener_ = ::yuzu::transport::make_server_listener(::yuzu::transport::Backend::Grpc);
+        if (!agent_listener_) {
+            spdlog::error("Failed to construct transport listener (Grpc backend not linked)");
+            return;
+        }
+        agent_service_.register_with(*agent_listener_);
+        ::yuzu::transport::Credentials agent_creds_t = build_transport_credentials();
+        if (cfg_.tls_enabled && agent_creds_t.server_cert_pem.empty()) {
+            spdlog::error("Failed to load agent-listener TLS material; refusing to start");
+            return;
+        }
+        ::yuzu::transport::Endpoint agent_bind = parse_listen_address(cfg_.listen_address);
+        ::yuzu::transport::ListenerOptions opts;
+        auto agent_start = agent_listener_->start(agent_bind, agent_creds_t, opts);
+        // SECURITY: zero PEM material as soon as the listener has consumed it
+        // (transport.hpp Credentials handling contract).
+        yuzu::secure_zero(agent_creds_t.server_key_pem);
+        if (!agent_start.has_value()) {
+            spdlog::error("Failed to start agent listener on {}: {}", cfg_.listen_address,
+                          agent_start.error().detail);
+            return;
+        }
+
+        // -- Management + gateway-upstream listener (still grpc::ServerBuilder) -
+        grpc::ServerBuilder mgmt_builder;
+        mgmt_builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
+        mgmt_builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
+        mgmt_builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+        mgmt_builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+        mgmt_builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS,
+                                        30000);
+        mgmt_builder.AddListeningPort(cfg_.management_address, mgmt_creds);
+        mgmt_builder.RegisterService(&mgmt_service_);
 
         if (gateway_service_) {
-            // Gateway upstream uses the same credentials as the management listener
-            // (internal traffic, typically mTLS between gateway and server).
-            builder.AddListeningPort(cfg_.gateway_upstream_address, mgmt_creds);
-            builder.RegisterService(gateway_service_.get());
+            mgmt_builder.AddListeningPort(cfg_.gateway_upstream_address, mgmt_creds);
+            mgmt_builder.RegisterService(gateway_service_.get());
             spdlog::info("Gateway upstream service enabled on {}", cfg_.gateway_upstream_address);
         }
 
-        agent_server_ = builder.BuildAndStart();
-
-        if (!agent_server_) {
-            spdlog::error("Failed to start gRPC server -- check that ports {} and {} are available",
-                          cfg_.listen_address, cfg_.management_address);
+        mgmt_server_ = mgmt_builder.BuildAndStart();
+        if (!mgmt_server_) {
+            spdlog::error("Failed to start management gRPC server -- check that ports "
+                          "{} and {} are available",
+                          cfg_.management_address, cfg_.gateway_upstream_address);
+            agent_listener_->shutdown();
             return;
         }
 
@@ -1039,7 +1063,11 @@ public:
                 });
         }
 
-        agent_server_->Wait();
+        // The transport listener owns its own internal threads; Wait()
+        // here on the management gRPC server is the main-thread blocker.
+        // shutdown() on either side wakes both.
+        mgmt_server_->Wait();
+        agent_listener_->wait_for_shutdown();
     }
 
     void stop() noexcept override {
@@ -1137,8 +1165,8 @@ public:
         // shutdown. Drain producers first, null the borrowed pointer
         // explicitly, then release the tracker.
         auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
-        if (agent_server_)
-            agent_server_->Shutdown(deadline);
+        if (agent_listener_)
+            agent_listener_->shutdown(); // transport graceful: in-flight handlers run to completion
         if (mgmt_server_)
             mgmt_server_->Shutdown(deadline);
 
@@ -1215,6 +1243,66 @@ private:
             yuzu::secure_zero(kc.private_key);
         }
         return creds;
+    }
+
+    // Construct the transport-abstraction Credentials for the agent
+    // listener. Mirrors `build_tls_credentials` for the gRPC listener;
+    // the bytes flow into the transport layer which secure_zeros the
+    // server_key_pem after the listener consumes it (see run()).
+    [[nodiscard]] ::yuzu::transport::Credentials build_transport_credentials() const {
+        ::yuzu::transport::Credentials c{};
+        if (!cfg_.tls_enabled) {
+            // Plaintext path is permitted only when --no-tls was passed,
+            // which itself flips an audit-loud reminder thread (see below).
+            c.verify_peer = false;
+            c.client_cert_mode = ::yuzu::transport::ClientCertMode::None;
+            return c;
+        }
+        if (!detail::validate_key_file_permissions(cfg_.tls_server_key, "agent listener")) {
+            return {};
+        }
+        c.server_cert_pem = detail::read_file_contents(cfg_.tls_server_cert);
+        c.server_key_pem = detail::read_file_contents(cfg_.tls_server_key);
+        if (!cfg_.tls_ca_cert.empty()) {
+            c.ca_cert_pem = detail::read_file_contents(cfg_.tls_ca_cert);
+            c.client_cert_mode = ::yuzu::transport::ClientCertMode::Require;
+            c.verify_peer = true;
+        } else {
+            // CLI parse layer already enforced the YUZU_ALLOW_INSECURE_TLS=1 +
+            // --insecure-skip-client-verify pair (see main.cpp); here we
+            // just translate it to the transport's posture knobs.
+            c.client_cert_mode = ::yuzu::transport::ClientCertMode::None;
+            c.verify_peer = false;
+        }
+        return c;
+    }
+
+    // Parse a "host:port" pair (or "[::]:port" for IPv6 wildcard) into the
+    // transport's Endpoint shape. Mirrors the historic
+    // `grpc::ServerBuilder::AddListeningPort(cfg_.listen_address, ...)` parse.
+    static ::yuzu::transport::Endpoint parse_listen_address(const std::string& addr) {
+        ::yuzu::transport::Endpoint e{};
+        if (addr.empty())
+            return e;
+        // IPv6 literal in brackets: "[::]:50051"
+        if (addr.front() == '[') {
+            auto close = addr.find(']');
+            if (close != std::string::npos) {
+                e.host = addr.substr(1, close - 1);
+                if (close + 2 <= addr.size() && addr[close + 1] == ':') {
+                    e.port = static_cast<uint16_t>(std::stoi(addr.substr(close + 2)));
+                }
+                return e;
+            }
+        }
+        auto colon = addr.rfind(':');
+        if (colon == std::string::npos) {
+            e.host = addr;
+            return e;
+        }
+        e.host = addr.substr(0, colon);
+        e.port = static_cast<uint16_t>(std::stoi(addr.substr(colon + 1)));
+        return e;
     }
 
     // -- Web server -----------------------------------------------------------
@@ -5379,7 +5467,7 @@ private:
     std::shared_ptr<grpc::Channel> gw_mgmt_channel_;
     std::unique_ptr<::yuzu::server::v1::ManagementService::Stub> gw_mgmt_stub_;
     std::shared_ptr<spdlog::logger> file_logger_;
-    std::unique_ptr<grpc::Server> agent_server_;
+    std::unique_ptr<::yuzu::transport::ServerListener> agent_listener_;
     std::unique_ptr<grpc::Server> mgmt_server_;
     std::unique_ptr<httplib::Server> web_server_;
     std::thread web_thread_;

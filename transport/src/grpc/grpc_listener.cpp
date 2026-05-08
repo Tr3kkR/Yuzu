@@ -58,15 +58,35 @@ void populate_call_context_from_grpc(CallContext& ctx,
                                      const ::grpc::ServerContext& gctx) {
     ctx.peer_uri = gctx.peer();
 
-    if (auto auth_ctx = gctx.auth_context()) {
-        // gRPC keys SAN values under "x509_subject_alternative_name"
-        // (one entry per SAN). Mirror the historic
-        // AgentServiceImpl::extract_peer_identities behaviour so the
-        // lifted handlers see the same identity set.
+    if (auto auth_ctx = gctx.auth_context();
+        auth_ctx && auth_ctx->IsPeerAuthenticated()) {
+        // Mirror AgentServiceImpl::extract_peer_identities (the historic
+        // pre-#376 source of truth for peer-identity authn): union of
+        // GetPeerIdentity() + CN + SAN, deduplicated, in stable order.
+        // Despite the abstraction's field being named `peer_san_identities`,
+        // it is the canonical "verified peer identities for authn"
+        // surface — the gRPC backend folds CN + GetPeerIdentity in so
+        // mTLS-CN-issued client certs (still common in the field) keep
+        // working after the lift. The msquic backend will make its own
+        // call but MUST satisfy the same authn contract.
+        auto append_unique = [&](std::string_view sv) {
+            if (sv.empty()) return;
+            if (ctx.peer_san_identities.size() >= kMaxMetadataEntries) return;
+            for (const auto& existing : ctx.peer_san_identities) {
+                if (existing == sv) return;
+            }
+            ctx.peer_san_identities.emplace_back(sv);
+        };
+        for (const auto& id : auth_ctx->GetPeerIdentity()) {
+            append_unique({id.data(), id.size()});
+        }
+        for (const auto& cn :
+             auth_ctx->FindPropertyValues("x509_common_name")) {
+            append_unique({cn.data(), cn.size()});
+        }
         for (const auto& sv :
              auth_ctx->FindPropertyValues("x509_subject_alternative_name")) {
-            if (ctx.peer_san_identities.size() >= kMaxMetadataEntries) break;
-            ctx.peer_san_identities.emplace_back(sv.data(), sv.size());
+            append_unique({sv.data(), sv.size()});
         }
     }
 

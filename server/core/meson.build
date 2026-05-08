@@ -229,14 +229,14 @@ yuzu_server_core_lib = static_library(
   )],
   include_directories: ['include'],
   cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
-  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
+  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, yuzu_transport_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep] + auth_crypto_deps + https_deps,
 )
 
 yuzu_server_core_dep = declare_dependency(
   link_with: yuzu_server_core_lib,
   include_directories: include_directories('include'),
-  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
+  dependencies: [yuzu_sdk_dep, yuzu_proto_dep, yuzu_transport_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep] + auth_crypto_deps + https_deps,
 )
 

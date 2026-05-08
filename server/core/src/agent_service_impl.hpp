@@ -13,14 +13,14 @@
 #include <unordered_set>
 #include <vector>
 
-#include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
-#include "agent.grpc.pb.h"
+#include <yuzu/transport/transport.hpp>
+#include "agent.pb.h"
 #include "agent_registry.hpp"
 #include "event_bus.hpp"
 
@@ -46,7 +46,15 @@ namespace yuzu::server::detail {
 
 namespace pb = ::yuzu::agent::v1;
 
-class AgentServiceImpl : public pb::AgentService::Service {
+/// Agent-facing service handlers for the gRPC `yuzu.agent.v1.AgentService`.
+///
+/// As of #376 PR 1c-2 the class no longer inherits from
+/// `pb::AgentService::Service`. Handlers take fully-typed proto messages
+/// + `transport::CallContext` and are registered with a
+/// `transport::ServerListener` via `register_with()`. The wire format is
+/// unchanged — both backends (grpc, msquic) speak the same proto
+/// envelope under the lift.
+class AgentServiceImpl {
 public:
     AgentServiceImpl(AgentRegistry& registry, EventBus& bus, bool require_client_identity,
                      auth::AuthManager& auth_mgr, auth::AutoApproveEngine& auto_approve,
@@ -84,15 +92,22 @@ public:
         execution_tracker_.store(tracker, std::memory_order_release);
     }
 
-    grpc::Status Register(grpc::ServerContext* context, const pb::RegisterRequest* request,
-                          pb::RegisterResponse* response) override;
+    /// Register this service's handlers against the transport listener.
+    /// Wire-equivalent with the pre-#376 grpc::ServerBuilder::RegisterService
+    /// path. Idempotent only relative to one listener instance — the
+    /// listener itself rejects duplicate method names.
+    void register_with(::yuzu::transport::ServerListener& listener);
 
-    grpc::Status Heartbeat(grpc::ServerContext* context, const pb::HeartbeatRequest* request,
-                           pb::HeartbeatResponse* response) override;
+    ::yuzu::transport::Status Register(const ::yuzu::transport::CallContext& ctx,
+                                       const pb::RegisterRequest& request,
+                                       pb::RegisterResponse& response);
 
-    grpc::Status
-    Subscribe(grpc::ServerContext* context,
-              grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) override;
+    ::yuzu::transport::Status Heartbeat(const ::yuzu::transport::CallContext& ctx,
+                                        const pb::HeartbeatRequest& request,
+                                        pb::HeartbeatResponse& response);
+
+    ::yuzu::transport::Status Subscribe(const ::yuzu::transport::CallContext& ctx,
+                                        ::yuzu::transport::BidiStream& stream);
 
     // Record send time for latency measurement.
     void record_send_time(const std::string& command_id);
@@ -123,13 +138,17 @@ public:
 
     // -- OTA Update RPCs -------------------------------------------------------
 
-    grpc::Status CheckForUpdate(grpc::ServerContext* context,
-                                const pb::CheckForUpdateRequest* request,
-                                pb::CheckForUpdateResponse* response) override;
+    ::yuzu::transport::Status CheckForUpdate(const ::yuzu::transport::CallContext& ctx,
+                                             const pb::CheckForUpdateRequest& request,
+                                             pb::CheckForUpdateResponse& response);
 
-    grpc::Status DownloadUpdate(grpc::ServerContext* context,
-                                const pb::DownloadUpdateRequest* request,
-                                grpc::ServerWriter<pb::DownloadUpdateChunk>* writer) override;
+    /// Server-streaming RPC lifted onto BidiStream. The legacy gRPC
+    /// server-streaming wire shape (one Req frame from client + END_STREAM,
+    /// then N Resp frames + trailers) is byte-equivalent to a bidi stream
+    /// where the client immediately calls writes_done() — see
+    /// `transport.hpp` server-stream pattern doc.
+    ::yuzu::transport::Status DownloadUpdate(const ::yuzu::transport::CallContext& ctx,
+                                             ::yuzu::transport::BidiStream& stream);
 
 private:
     AgentRegistry& registry_;
@@ -202,10 +221,13 @@ private:
     /// pair instead of a plain raw pointer.
     std::atomic<ExecutionTracker*> execution_tracker_{nullptr};
 
-    static std::vector<std::string> extract_peer_identities(const grpc::ServerContext& context);
-    static bool peer_identity_matches_agent_id(const grpc::ServerContext& context,
+    /// Match a claimed agent_id against the verified peer identities the
+    /// transport surfaced via `CallContext::peer_san_identities`. The
+    /// gRPC backend folds GetPeerIdentity + CN + SAN into that set; the
+    /// msquic backend will follow the same authn contract.
+    static bool peer_identity_matches_agent_id(const ::yuzu::transport::CallContext& ctx,
                                                const std::string& agent_id);
-    static std::string client_metadata_value(const grpc::ServerContext& context,
+    static std::string client_metadata_value(const ::yuzu::transport::CallContext& ctx,
                                              std::string_view key);
     static bool has_identity_overlap(const std::vector<std::string>& lhs,
                                      const std::vector<std::string>& rhs);

@@ -1,6 +1,6 @@
 #include "agent_service_impl.hpp"
 
-#include <grpc/grpc_security_constants.h>
+#include <yuzu/transport/proto_adapter.hpp>
 
 #include "analytics_event_store.hpp"
 #include "execution_tracker.hpp"
@@ -34,20 +34,56 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
       metrics_(metrics), require_client_identity_(require_client_identity),
       gateway_mode_(gateway_mode), update_registry_(update_registry) {}
 
+// -- register_with ------------------------------------------------------------
+
+void AgentServiceImpl::register_with(::yuzu::transport::ServerListener& listener) {
+    using namespace ::yuzu::transport;
+    register_unary_pb<pb::RegisterRequest, pb::RegisterResponse>(
+        listener, "yuzu.agent.v1.AgentService/Register",
+        [this](const CallContext& ctx, const pb::RegisterRequest& req,
+               pb::RegisterResponse& resp) -> Status { return Register(ctx, req, resp); });
+    register_unary_pb<pb::HeartbeatRequest, pb::HeartbeatResponse>(
+        listener, "yuzu.agent.v1.AgentService/Heartbeat",
+        [this](const CallContext& ctx, const pb::HeartbeatRequest& req,
+               pb::HeartbeatResponse& resp) -> Status { return Heartbeat(ctx, req, resp); });
+    register_unary_pb<pb::CheckForUpdateRequest, pb::CheckForUpdateResponse>(
+        listener, "yuzu.agent.v1.AgentService/CheckForUpdate",
+        [this](const CallContext& ctx, const pb::CheckForUpdateRequest& req,
+               pb::CheckForUpdateResponse& resp) -> Status {
+            return CheckForUpdate(ctx, req, resp);
+        });
+    listener.register_bidi_stream(
+        "yuzu.agent.v1.AgentService/Subscribe",
+        [this](const CallContext& ctx, BidiStream& stream) { return Subscribe(ctx, stream); });
+    listener.register_bidi_stream(
+        "yuzu.agent.v1.AgentService/DownloadUpdate",
+        [this](const CallContext& ctx, BidiStream& stream) { return DownloadUpdate(ctx, stream); });
+}
+
 // -- Register -----------------------------------------------------------------
 
-grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
-                                        const pb::RegisterRequest* request,
-                                        pb::RegisterResponse* response) {
+::yuzu::transport::Status AgentServiceImpl::Register(const ::yuzu::transport::CallContext& ctx,
+                                                     const pb::RegisterRequest& request_in,
+                                                     pb::RegisterResponse& response_in) {
+    using ::yuzu::transport::Status;
+    using ::yuzu::transport::StatusCode;
+
+    // Lifted-pointer aliases let the original method body keep its
+    // `request->`/`response->` shape unchanged. The generated proto
+    // accessors are const-correct on `request`; `response` mutations
+    // flow through to the caller-owned message via the reference.
+    const pb::RegisterRequest* request = &request_in;
+    pb::RegisterResponse* response = &response_in;
+
     metrics_.counter("yuzu_grpc_requests_total", {{"method", "Register"}, {"status", "received"}})
         .increment();
     const auto& info = request->info();
 
     if (require_client_identity_) {
-        if (!context || !peer_identity_matches_agent_id(*context, info.agent_id())) {
+        if (!peer_identity_matches_agent_id(ctx, info.agent_id())) {
             spdlog::warn("mTLS identity mismatch: claimed agent_id={}", info.agent_id());
-            return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
-                                "agent_id must match client certificate identity (CN/SAN)");
+            return Status{StatusCode::Unauthenticated,
+                          "agent_id must match client certificate identity (CN/SAN)"};
         }
     }
 
@@ -86,7 +122,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     ae.attributes = {{"reason", "invalid_token"}};
                     analytics_store_->emit(std::move(ae));
                 }
-                return grpc::Status::OK;
+                return Status{StatusCode::Ok, ""};
             }
             spdlog::info("Agent {} auto-enrolled via enrollment token", info.agent_id());
             // Persist enrollment so reconnections don't need a valid token.
@@ -96,7 +132,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 response->set_accepted(false);
                 response->set_reject_reason("enrollment denied by administrator");
                 response->set_enrollment_status("denied");
-                return grpc::Status::OK;
+                return Status{StatusCode::Ok, ""};
             }
         } else {
             // Tier 1.5: Auto-approve policies -- check before pending queue
@@ -104,10 +140,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             approval_ctx.hostname = info.hostname();
             approval_ctx.attestation_provider = request->attestation_provider();
 
-            // Extract peer IP from gRPC context (format: "ipv4:1.2.3.4:port")
-            if (context) {
-                auto peer = context->peer();
-                // Strip scheme prefix and port
+            // Extract peer IP from CallContext::peer_uri
+            // (format: "ipv4:1.2.3.4:port" / "ipv6:[::1]:port")
+            {
+                const auto& peer = ctx.peer_uri;
                 auto colon1 = peer.find(':');
                 if (colon1 != std::string::npos) {
                     auto ip_start = colon1 + 1;
@@ -131,7 +167,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     response->set_accepted(false);
                     response->set_reject_reason("enrollment denied by administrator");
                     response->set_enrollment_status("denied");
-                    return grpc::Status::OK;
+                    return Status{StatusCode::Ok, ""};
                 }
                 // Fall through to normal registration
             } else {
@@ -158,7 +194,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         ae.arch = info.platform().arch();
                         analytics_store_->emit(std::move(ae));
                     }
-                    return grpc::Status::OK;
+                    return Status{StatusCode::Ok, ""};
                 }
 
                 switch (*pending_status) {
@@ -166,7 +202,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     response->set_accepted(false);
                     response->set_reject_reason("still awaiting admin approval");
                     response->set_enrollment_status("pending");
-                    return grpc::Status::OK;
+                    return Status{StatusCode::Ok, ""};
 
                 case auth::PendingStatus::denied:
                     response->set_accepted(false);
@@ -183,7 +219,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                         ae.attributes = {{"reason", "admin_denied"}};
                         analytics_store_->emit(std::move(ae));
                     }
-                    return grpc::Status::OK;
+                    return Status{StatusCode::Ok, ""};
 
                 case auth::PendingStatus::approved:
                     spdlog::info("Agent {} enrolled (admin-approved)", info.agent_id());
@@ -266,9 +302,8 @@ enrolled:
 
     PendingRegistration pending;
     pending.agent_id = info.agent_id();
-    pending.register_peer = context ? context->peer() : std::string{};
-    pending.peer_identities =
-        context ? extract_peer_identities(*context) : std::vector<std::string>{};
+    pending.register_peer = ctx.peer_uri;
+    pending.peer_identities = ctx.peer_san_identities;
     pending.created_at = std::chrono::steady_clock::now();
     {
         std::lock_guard lock(pending_mu_);
@@ -276,14 +311,19 @@ enrolled:
         pending_by_session_id_[session_id] = std::move(pending);
     }
 
-    return grpc::Status::OK;
+    return Status{StatusCode::Ok, ""};
 }
 
 // -- Heartbeat ----------------------------------------------------------------
 
-grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* /*context*/,
-                                         const pb::HeartbeatRequest* request,
-                                         pb::HeartbeatResponse* response) {
+::yuzu::transport::Status AgentServiceImpl::Heartbeat(const ::yuzu::transport::CallContext& /*ctx*/,
+                                                      const pb::HeartbeatRequest& request_in,
+                                                      pb::HeartbeatResponse& response_in) {
+    using ::yuzu::transport::Status;
+    using ::yuzu::transport::StatusCode;
+    const pb::HeartbeatRequest* request = &request_in;
+    pb::HeartbeatResponse* response = &response_in;
+
     metrics_.counter("yuzu_grpc_requests_total", {{"method", "Heartbeat"}, {"status", "received"}})
         .increment();
 
@@ -306,7 +346,7 @@ grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* /*context*/,
     }
 
     if (agent_id.empty()) {
-        return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown session");
+        return Status{StatusCode::NotFound, "unknown session"};
     }
 
     // Store health snapshot and update session activity timestamp
@@ -323,22 +363,25 @@ grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* /*context*/,
     response->mutable_server_time()->set_millis_epoch(now_ms);
 
     spdlog::debug("Heartbeat from agent={} (session={})", agent_id, session_id);
-    return grpc::Status::OK;
+    return Status{StatusCode::Ok, ""};
 }
 
 // -- Subscribe ----------------------------------------------------------------
 
-grpc::Status AgentServiceImpl::Subscribe(
-    grpc::ServerContext* context,
-    grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) {
-    if (!context) {
-        return grpc::Status(grpc::StatusCode::INTERNAL, "missing server context");
-    }
+::yuzu::transport::Status AgentServiceImpl::Subscribe(const ::yuzu::transport::CallContext& ctx,
+                                                      ::yuzu::transport::BidiStream& stream_ref) {
+    using ::yuzu::transport::Status;
+    using ::yuzu::transport::StatusCode;
 
-    const auto session_id = client_metadata_value(*context, kSessionMetadataKey);
+    // Compatibility alias to keep the existing read-loop body — which
+    // accesses `stream->Read(...)` historically — readable. After PR 1c-2
+    // the read loop is rewritten to use `transport::read_pb(stream_ref, ...)`.
+    auto* stream = &stream_ref;
+
+    const auto session_id = client_metadata_value(ctx, kSessionMetadataKey);
     if (session_id.empty()) {
         spdlog::warn("Subscribe rejected: missing {} metadata", kSessionMetadataKey);
-        return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "missing session metadata");
+        return Status{StatusCode::FailedPrecondition, "missing session metadata"};
     }
 
     std::string agent_id;
@@ -348,21 +391,19 @@ grpc::Status AgentServiceImpl::Subscribe(
         auto it = pending_by_session_id_.find(session_id);
         if (it == pending_by_session_id_.end()) {
             spdlog::warn("Subscribe rejected: unknown or expired session id");
-            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
-                                "invalid or expired session");
+            return Status{StatusCode::FailedPrecondition, "invalid or expired session"};
         }
 
-        if (!gateway_mode_ && it->second.register_peer != context->peer()) {
+        if (!gateway_mode_ && it->second.register_peer != ctx.peer_uri) {
             spdlog::warn("Subscribe rejected: peer mismatch for session {}", session_id);
-            return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "peer mismatch");
+            return Status{StatusCode::Unauthenticated, "peer mismatch"};
         }
 
         if (require_client_identity_) {
-            const auto subscribe_ids = extract_peer_identities(*context);
-            if (!has_identity_overlap(it->second.peer_identities, subscribe_ids)) {
+            if (!has_identity_overlap(it->second.peer_identities, ctx.peer_san_identities)) {
                 spdlog::warn("Subscribe rejected: mTLS identity mismatch for session {}",
                              session_id);
-                return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "peer identity mismatch");
+                return Status{StatusCode::Unauthenticated, "peer identity mismatch"};
             }
         }
 
@@ -371,7 +412,7 @@ grpc::Status AgentServiceImpl::Subscribe(
     }
 
     spdlog::info("Agent subscribe stream opened for {}", agent_id);
-    registry_.set_stream(agent_id, stream, context);
+    registry_.set_stream(agent_id, stream);
     registry_.map_session(session_id, agent_id);
 
     auto subscribe_start = std::chrono::steady_clock::now();
@@ -384,9 +425,11 @@ grpc::Status AgentServiceImpl::Subscribe(
         analytics_store_->emit(std::move(ae));
     }
 
-    // Read loop -- process responses from the agent
+    // Read loop -- process responses from the agent. The transport's
+    // BidiStream::read returns false on peer half-close OR cancellation;
+    // either case exits the loop and falls through to session cleanup.
     pb::CommandResponse resp;
-    while (stream->Read(&resp)) {
+    while (::yuzu::transport::read_pb(*stream, resp)) {
         registry_.touch_activity(agent_id);
         if (resp.status() == pb::CommandResponse::RUNNING) {
             // Intercept __timing__ metadata
@@ -615,7 +658,7 @@ grpc::Status AgentServiceImpl::Subscribe(
         analytics_store_->emit(std::move(ae));
     }
 
-    return grpc::Status::OK;
+    return Status{StatusCode::Ok, ""};
 }
 
 // -- record_send_time ---------------------------------------------------------
@@ -1038,16 +1081,22 @@ void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const st
 
 // -- OTA Update RPCs ----------------------------------------------------------
 
-grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* /*context*/,
-                                              const pb::CheckForUpdateRequest* request,
-                                              pb::CheckForUpdateResponse* response) {
+::yuzu::transport::Status
+AgentServiceImpl::CheckForUpdate(const ::yuzu::transport::CallContext& /*ctx*/,
+                                 const pb::CheckForUpdateRequest& request_in,
+                                 pb::CheckForUpdateResponse& response_in) {
+    using ::yuzu::transport::Status;
+    using ::yuzu::transport::StatusCode;
+    const pb::CheckForUpdateRequest* request = &request_in;
+    pb::CheckForUpdateResponse* response = &response_in;
+
     metrics_
         .counter("yuzu_grpc_requests_total", {{"method", "CheckForUpdate"}, {"status", "received"}})
         .increment();
 
     if (!update_registry_) {
         response->set_update_available(false);
-        return grpc::Status::OK;
+        return Status{StatusCode::Ok, ""};
     }
 
     auto latest =
@@ -1055,13 +1104,13 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* /*context*/,
 
     if (!latest) {
         response->set_update_available(false);
-        return grpc::Status::OK;
+        return Status{StatusCode::Ok, ""};
     }
 
     // Compare: if agent already has latest or newer, no update
     if (compare_versions(latest->version, request->current_version()) <= 0) {
         response->set_update_available(false);
-        return grpc::Status::OK;
+        return Status{StatusCode::Ok, ""};
     }
 
     bool eligible = UpdateRegistry::is_eligible(request->agent_id(), latest->rollout_pct);
@@ -1076,30 +1125,41 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* /*context*/,
     spdlog::info("CheckForUpdate: agent {} v{} -> v{} (eligible={}, mandatory={})",
                  request->agent_id(), request->current_version(), latest->version, eligible,
                  latest->mandatory);
-    return grpc::Status::OK;
+    return Status{StatusCode::Ok, ""};
 }
 
-grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* /*context*/,
-                                              const pb::DownloadUpdateRequest* request,
-                                              grpc::ServerWriter<pb::DownloadUpdateChunk>* writer) {
+::yuzu::transport::Status
+AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& /*ctx*/,
+                                 ::yuzu::transport::BidiStream& stream) {
+    using ::yuzu::transport::Status;
+    using ::yuzu::transport::StatusCode;
+
     metrics_
         .counter("yuzu_grpc_requests_total", {{"method", "DownloadUpdate"}, {"status", "received"}})
         .increment();
 
-    if (!update_registry_) {
-        return grpc::Status(grpc::StatusCode::UNAVAILABLE, "OTA not configured");
+    // Server-streaming-via-bidi: client sends one request frame + writes_done(),
+    // we stream N response chunks, then close. read_pb returns false if the
+    // client cancelled or the stream is corrupt before we even saw the request.
+    pb::DownloadUpdateRequest request;
+    if (!::yuzu::transport::read_pb(stream, request)) {
+        return Status{StatusCode::Cancelled, "client closed before sending request"};
     }
 
-    auto pkg = update_registry_->latest_for(request->platform().os(), request->platform().arch());
-    if (!pkg || pkg->version != request->version()) {
-        return grpc::Status(grpc::StatusCode::NOT_FOUND, "version not found");
+    if (!update_registry_) {
+        return Status{StatusCode::Unavailable, "OTA not configured"};
+    }
+
+    auto pkg = update_registry_->latest_for(request.platform().os(), request.platform().arch());
+    if (!pkg || pkg->version != request.version()) {
+        return Status{StatusCode::NotFound, "version not found"};
     }
 
     auto file_path = update_registry_->binary_path(*pkg);
     std::ifstream file(file_path, std::ios::binary);
     if (!file) {
         spdlog::error("DownloadUpdate: binary file missing: {}", file_path.string());
-        return grpc::Status(grpc::StatusCode::NOT_FOUND, "binary file missing");
+        return Status{StatusCode::NotFound, "binary file missing"};
     }
 
     constexpr std::size_t kChunkSize = 64 * 1024; // 64KB
@@ -1113,71 +1173,38 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* /*context*/,
         chunk.set_offset(offset);
         chunk.set_total_size(pkg->file_size);
 
-        if (!writer->Write(chunk)) {
+        if (!::yuzu::transport::write_pb(stream, chunk)) {
             spdlog::warn("DownloadUpdate: client disconnected at offset {}", offset);
-            return grpc::Status::CANCELLED;
+            return Status{StatusCode::Cancelled, ""};
         }
 
         offset += file.gcount();
     }
 
     spdlog::info("DownloadUpdate: sent {} bytes of v{} to agent {}", offset, pkg->version,
-                 request->agent_id());
-    return grpc::Status::OK;
+                 request.agent_id());
+    return Status{StatusCode::Ok, ""};
 }
 
 // -- Private helpers ----------------------------------------------------------
 
-std::vector<std::string>
-AgentServiceImpl::extract_peer_identities(const grpc::ServerContext& context) {
-    std::vector<std::string> out;
-    auto auth_ctx = context.auth_context();
-    if (!auth_ctx || !auth_ctx->IsPeerAuthenticated()) {
-        return out;
-    }
-
-    auto append_unique = [&out](std::string_view s) {
-        if (s.empty())
-            return;
-        for (const auto& existing : out) {
-            if (existing == s)
-                return;
-        }
-        out.emplace_back(s);
-    };
-
-    for (const auto& id : auth_ctx->GetPeerIdentity()) {
-        append_unique(std::string_view{id.data(), id.size()});
-    }
-    for (const auto& cn : auth_ctx->FindPropertyValues(GRPC_X509_CN_PROPERTY_NAME)) {
-        append_unique(std::string_view{cn.data(), cn.size()});
-    }
-    for (const auto& san : auth_ctx->FindPropertyValues(GRPC_X509_SAN_PROPERTY_NAME)) {
-        append_unique(std::string_view{san.data(), san.size()});
-    }
-
-    return out;
-}
-
-bool AgentServiceImpl::peer_identity_matches_agent_id(const grpc::ServerContext& context,
+bool AgentServiceImpl::peer_identity_matches_agent_id(const ::yuzu::transport::CallContext& ctx,
                                                       const std::string& agent_id) {
     if (agent_id.empty())
         return false;
-    const auto identities = extract_peer_identities(context);
-    for (const auto& id : identities) {
+    for (const auto& id : ctx.peer_san_identities) {
         if (id == agent_id)
             return true;
     }
     return false;
 }
 
-std::string AgentServiceImpl::client_metadata_value(const grpc::ServerContext& context,
+std::string AgentServiceImpl::client_metadata_value(const ::yuzu::transport::CallContext& ctx,
                                                     std::string_view key) {
-    const auto& md = context.client_metadata();
-    auto it = md.find(std::string(key));
-    if (it == md.end())
+    auto it = ctx.metadata.find(std::string(key));
+    if (it == ctx.metadata.end())
         return {};
-    return std::string(it->second.data(), it->second.length());
+    return it->second;
 }
 
 bool AgentServiceImpl::has_identity_overlap(const std::vector<std::string>& lhs,

@@ -14,12 +14,12 @@
 #include <unordered_set>
 #include <vector>
 
-#include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <yuzu/metrics.hpp>
-#include "agent.grpc.pb.h"
+#include <yuzu/transport/transport.hpp>
+#include "agent.pb.h"
 #include "event_bus.hpp"
 #include "scope_engine.hpp"
 
@@ -46,7 +46,7 @@ struct PluginMeta {
 
 struct AgentSession {
     std::string agent_id;
-    std::string session_id;  // Unique per connection — used to prevent stale cleanup races
+    std::string session_id; // Unique per connection — used to prevent stale cleanup races
     std::string hostname;
     std::string os;
     std::string arch;
@@ -54,18 +54,22 @@ struct AgentSession {
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
     std::unordered_map<std::string, std::string> scopable_tags;
-    std::string gateway_node;  // Non-empty if agent is connected via gateway
+    std::string gateway_node; // Non-empty if agent is connected via gateway
 
     // Stream pointer -- valid only while Subscribe() RPC is active.
-    grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream = nullptr;
-    grpc::ServerContext* server_context = nullptr; // for timeout cancellation
+    // BidiStream is owned by the transport's per-call dispatcher; we hold
+    // a non-owning pointer that remains valid until the Subscribe handler
+    // returns. cancel() supersedes the legacy `grpc::ServerContext::
+    // TryCancel()` path used to expire stale sessions (see #376 PR 1c-2).
+    ::yuzu::transport::BidiStream* stream = nullptr;
     std::mutex stream_mu;
 
     // Last activity timestamp -- updated on Subscribe reads and Heartbeats.
     // Atomic to avoid acquiring the registry mutex on every stream Read.
     std::atomic<int64_t> last_activity_epoch_ms{
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count()};
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count()};
 };
 
 // -- Agent registry -----------------------------------------------------------
@@ -76,9 +80,7 @@ public:
 
     void register_agent(const pb::AgentInfo& info);
 
-    void set_stream(const std::string& agent_id,
-                    grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
-                    grpc::ServerContext* context = nullptr);
+    void set_stream(const std::string& agent_id, ::yuzu::transport::BidiStream* stream);
 
     void clear_stream(const std::string& agent_id);
 
@@ -142,8 +144,7 @@ public:
     std::vector<std::string> all_ids() const;
 
     // Look up the agent_id that was registered for a given Subscribe call.
-    std::string find_agent_by_stream(
-        grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream) const;
+    std::string find_agent_by_stream(::yuzu::transport::BidiStream* stream) const;
 
     std::size_t agent_count() const;
 
@@ -157,9 +158,9 @@ public:
     std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const;
 
     // Evaluate a scope expression against all agents, return matching agent IDs.
-    std::vector<std::string> evaluate_scope(const yuzu::scope::Expression& expr,
-                                            const TagStore* tag_store,
-                                            const CustomPropertiesStore* props_store = nullptr) const;
+    std::vector<std::string>
+    evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
+                   const CustomPropertiesStore* props_store = nullptr) const;
 
 private:
     mutable std::mutex mu_;
