@@ -1119,6 +1119,58 @@ TEST_CASE("OwnedProtoMessage parses + serialises round-trip", "[transport][adapt
     REQUIRE_FALSE(bad.parse(std::string_view("\x80\x80\x80\x80\x80\x80\x80\x80\x80\x80", 10)));
 }
 
+TEST_CASE("Server CallContext exposes peer_uri + initial metadata to handler",
+          "[transport][round-trip][callcontext]") {
+    // PR 1c-2 prerequisite: lifted handlers in agent_service_impl.cpp need to
+    // resolve their caller via CallContext alone — without grpc::ServerContext
+    // the metadata lookup (kSessionMetadataKey) and peer-identity validation
+    // (Subscribe peer-mismatch) cannot complete. Pin both fields so a future
+    // backend swap (msquic, PR 3) does not silently drop them.
+    namespace tpb = ::yuzu::transport::framing::v1;
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    std::string seen_peer_uri;
+    std::string seen_session_md;
+    register_unary_pb<tpb::HandshakeHello, tpb::TrailingStatus>(
+        *listener, "yuzu.test.v1.CtxEcho/Echo",
+        [&](const CallContext& ctx, const tpb::HandshakeHello&,
+            tpb::TrailingStatus& resp) -> Status {
+            seen_peer_uri = ctx.peer_uri;
+            if (auto it = ctx.metadata.find("x-yuzu-session-id"); it != ctx.metadata.end()) {
+                seen_session_md = it->second;
+            }
+            resp.set_code(tpb::STATUS_CODE_OK);
+            return Status{StatusCode::Ok, ""};
+        });
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    tpb::HandshakeHello req;
+    req.set_method("ignored");
+    tpb::TrailingStatus resp;
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    ctx.metadata["x-yuzu-session-id"] = "sess-abcd-1234";
+    auto req_adapter = as_proto(req);
+    auto resp_adapter = as_proto(resp);
+    auto r = ch->unary("yuzu.test.v1.CtxEcho/Echo", ctx, req_adapter, resp_adapter);
+    REQUIRE(r.status.code == StatusCode::Ok);
+    REQUIRE_FALSE(seen_peer_uri.empty());
+    // gRPC peer URIs are scheme-prefixed (ipv4:HOST:PORT, ipv6:..., unix:...)
+    // — the legacy AgentServiceImpl::Register relies on that exact shape.
+    REQUIRE((seen_peer_uri.starts_with("ipv4:") || seen_peer_uri.starts_with("ipv6:")));
+    REQUIRE(seen_session_md == "sess-abcd-1234");
+
+    listener->shutdown();
+}
+
 TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport][lifecycle]") {
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);

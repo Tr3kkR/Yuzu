@@ -48,6 +48,44 @@ namespace {
         sanitise_status_detail(detail));
 }
 
+// Populate `ctx.peer_uri`, `ctx.peer_san_identities`, and `ctx.metadata`
+// from the per-call grpc::ServerContext. Server-handler ergonomics
+// (PR 1c-2): without these fields, lifted handlers would still need a
+// grpc::ServerContext* to resolve their caller, which defeats the
+// abstraction. Bounded by the metadata limits in transport.hpp so a
+// misbehaving client cannot flood per-call state.
+void populate_call_context_from_grpc(CallContext& ctx,
+                                     const ::grpc::ServerContext& gctx) {
+    ctx.peer_uri = gctx.peer();
+
+    if (auto auth_ctx = gctx.auth_context()) {
+        // gRPC keys SAN values under "x509_subject_alternative_name"
+        // (one entry per SAN). Mirror the historic
+        // AgentServiceImpl::extract_peer_identities behaviour so the
+        // lifted handlers see the same identity set.
+        for (const auto& sv :
+             auth_ctx->FindPropertyValues("x509_subject_alternative_name")) {
+            if (ctx.peer_san_identities.size() >= kMaxMetadataEntries) break;
+            ctx.peer_san_identities.emplace_back(sv.data(), sv.size());
+        }
+    }
+
+    const auto& md = gctx.client_metadata();
+    std::size_t kept = 0;
+    for (const auto& kv : md) {
+        if (kept >= kMaxMetadataEntries) break;
+        if (kv.first.size() > kMaxMetadataKeySize) continue;
+        if (kv.second.size() > kMaxMetadataValueSize) continue;
+        // multimap may carry duplicate keys; CallContext::metadata is a
+        // std::map so a later occurrence overwrites — last-wins matches
+        // the pre-#376 behaviour of `client_metadata().equal_range(...)`
+        // callers that grab the first value and stop.
+        ctx.metadata.emplace(std::string(kv.first.data(), kv.first.size()),
+                             std::string(kv.second.data(), kv.second.size()));
+        ++kept;
+    }
+}
+
 }  // namespace
 
 // =====================================================================
@@ -359,7 +397,7 @@ private:
         try {
             handler_thread_ = std::thread([this, h = std::move(handler)]() mutable {
             CallContext ctx;
-            ctx.peer_uri = gctx_.peer();
+            populate_call_context_from_grpc(ctx, gctx_);
 
             Status handler_status;
             try {
@@ -482,7 +520,7 @@ private:
         }
 
         CallContext ctx;
-        ctx.peer_uri = gctx_.peer();
+        populate_call_context_from_grpc(ctx, gctx_);
 
         auto resp_msg = resp_factory();
         if (!resp_msg) {
