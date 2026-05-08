@@ -245,12 +245,18 @@ private:
             handler_status = handler(ctx, *req_msg, *resp_msg);
         } catch (const std::exception& e) {
             handler_status = {StatusCode::Internal, "handler raised exception"};
-            // Server-side log: type name + e.what() are operator-visible
-            // only. NEVER concatenated into handler_status.detail (would
-            // leak across the wire).
+            // Server-side log: type name + scrubbed e.what() are
+            // operator-visible only. NEVER concatenated into
+            // handler_status.detail (would leak across the wire).
+            // e.what() is scrubbed BEFORE crossing the spdlog boundary
+            // because a third-party library may throw an exception
+            // whose message contains CR/LF/NUL/control bytes — those
+            // would forge log rows in journald/ELK ingestion
+            // (governance round 5 re-review M2).
             spdlog::error(
                 "yuzu::transport: handler raised std::exception in {} — "
-                "type={} what={}", method, typeid(e).name(), e.what());
+                "type={} what={}", method, typeid(e).name(),
+                sanitise_status_detail(e.what()));
             if (listener_->opts_.metric_sink) {
                 listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
                     "grpc", method, "std_exception");
@@ -497,13 +503,15 @@ void GrpcServerListener::cq_worker_loop() {
             static_cast<ServerCall*>(tag)->on_event(ok);
         } catch (const std::exception& e) {
             // Dispatcher-internal throw (NOT a user handler — those are
-            // already caught inside dispatch_unary). Log with type+what
-            // server-side; emit a Prometheus signal so the operator can
-            // alert on a silent storm before it pins a core (governance
-            // round 5 UP-42 / UP-57 / SRE-O1).
+            // already caught inside dispatch_unary). Log with type +
+            // SCRUBBED what server-side; emit a Prometheus signal so the
+            // operator can alert on a silent storm before it pins a core
+            // (governance round 5 UP-42 / UP-57 / SRE-O1, plus M2
+            // scrub-before-spdlog).
             spdlog::error(
                 "yuzu::transport: dispatcher caught std::exception — "
-                "type={} what={}", typeid(e).name(), e.what());
+                "type={} what={}", typeid(e).name(),
+                sanitise_status_detail(e.what()));
             if (opts_.metric_sink) {
                 opts_.metric_sink->on_unexpected_dispatch_throw(
                     "grpc", "", "dispatcher_internal");

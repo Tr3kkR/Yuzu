@@ -503,10 +503,18 @@ struct TransportMetricSink {
     // dispatch step (governance UP-42 / UP-57 / SRE-O1). `kind` is one
     // of {"std_exception", "non_std_exception", "dispatcher_internal"}
     // — cardinality is bounded so it is safe as a Prometheus label.
-    // `method` may be empty if the throw originated before method
-    // resolution. The callback MUST NOT throw and MUST NOT contain
-    // peer-supplied bytes (the caller never passes e.what() through
-    // this surface).
+    //
+    // `method` is either empty (throw originated before method
+    // resolution, e.g. dispatcher_internal) OR a method name that has
+    // already been confirmed registered against the listener's handler
+    // map (i.e., chosen by the operator at startup). It is therefore
+    // bounded-cardinality from the operator-controlled set, NOT
+    // attacker-controlled. Implementations of this sink MAY label a
+    // Prometheus counter by `method` directly without bucketing.
+    // Implementations MUST NOT pass `e.what()` text through this
+    // surface (governance round 5 re-review M3 + M2).
+    //
+    // The callback MUST NOT throw.
     virtual void on_unexpected_dispatch_throw(std::string_view backend,
                                               std::string_view method,
                                               std::string_view kind) {}
