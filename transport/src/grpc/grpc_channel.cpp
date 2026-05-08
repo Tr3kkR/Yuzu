@@ -457,15 +457,33 @@ public:
 
         rw_ = stub->PrepareCall(&gctx_, method_, &cq_);
         if (!rw_) {
+            // PrepareCall failure path. Without explicit short-circuit
+            // bookkeeping, any subsequent write/read/writes_done would
+            // hang forever in `await_started()` (start_done_ never
+            // arrives because no StartCall is posted), and the dtor's
+            // `ensure_finished()` would deadlock waiting for a
+            // finish_done_ that no Finish ever produces (governance
+            // UP-5 / UP-6). Seed terminal-state flags here under no
+            // lock — the worker hasn't spawned yet — so every waiter
+            // observes the failure and returns immediately.
             construction_error_ = "transport: PrepareCall returned null";
-            // Worker still spawns so dtor / final_status() do not hang;
-            // it exits immediately when cq_ is shut down.
+            start_done_         = false;
+            finishing_          = true;
+            finished_           = true;
+            finish_done_        = false;
             cq_.Shutdown();
         }
+        // Member metric_emitted_open_ records whether on_stream_opened
+        // fired so the dtor's on_stream_closed mirror is symmetric
+        // (governance sec-L3). On the PrepareCall-null path we skip
+        // both halves; on the success path both fire.
         worker_ = std::thread([this] { worker_loop(); });
         if (rw_) {
             rw_->StartCall(reinterpret_cast<void*>(kTagStart));
-            if (sink_) sink_->on_stream_opened("grpc", method_);
+            if (sink_) {
+                sink_->on_stream_opened("grpc", method_);
+                metric_emitted_open_ = true;
+            }
         }
     }
 
@@ -480,7 +498,9 @@ public:
         }
         cq_.Shutdown();
         if (worker_.joinable()) worker_.join();
-        if (sink_) sink_->on_stream_closed("grpc", method_, final_yt_status_);
+        if (sink_ && metric_emitted_open_) {
+            sink_->on_stream_closed("grpc", method_, final_yt_status_);
+        }
     }
 
     bool write(const SerializableMessage& msg) override {
@@ -686,10 +706,15 @@ private:
     std::optional<bool>                                      read_done_;
     std::optional<bool>                                      writes_done_done_;
     std::optional<bool>                                      finish_done_;
-    bool                                                     finishing_          = false;
-    bool                                                     finished_           = false;
-    bool                                                     writes_done_called_ = false;
-    bool                                                     cancelled_          = false;
+    bool                                                     finishing_           = false;
+    bool                                                     finished_            = false;
+    bool                                                     writes_done_called_  = false;
+    bool                                                     cancelled_           = false;
+    // governance sec-L3: gauge balance for failed-construction streams.
+    // on_stream_opened fires only on the PrepareCall-success path; the
+    // dtor's matching on_stream_closed gates on this flag so the gauge
+    // does not go negative when a bidi_stream() call fails to construct.
+    bool                                                     metric_emitted_open_ = false;
 
     ::grpc::ByteBuffer                                       write_buf_;
     ::grpc::ByteBuffer                                       read_buf_;

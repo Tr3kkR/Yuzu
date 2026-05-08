@@ -338,14 +338,26 @@ private:
         }
 
         bidi_stream_  = std::make_unique<ServerBidiStream>(this);
-        state_        = State::BidiActive;
         method_cache_ = method;  // copy out; gctx_ stays valid for lifetime
 
         // Dispatcher thread: invokes the user handler with the bidi
         // surface. Once the handler returns, schedule Finish via
         // finish_tag_; the cq_worker then joins this thread and
         // self-deletes the ServerCall.
-        handler_thread_ = std::thread([this, h = std::move(handler)]() mutable {
+        //
+        // Lifetime invariant (governance UP-1): std::thread construction
+        // can throw on resource exhaustion (EAGAIN, RLIMIT_NPROC). If we
+        // set state_ = BidiActive BEFORE the thread spawn, a throwing
+        // ctor leaves the call in BidiActive with no thread, no Finish
+        // ever scheduled, and `delete this` never invoked — leaking
+        // ServerCall and hanging the peer until deadline. Order
+        // therefore matters: state_ is bumped to BidiActive only inside
+        // the try-block AFTER successful std::thread construction. On
+        // failure, fall back to the UnaryPendingFinish path with
+        // StatusCode::Internal so the cq_worker reaps via the existing
+        // Finish-tag completion.
+        try {
+            handler_thread_ = std::thread([this, h = std::move(handler)]() mutable {
             CallContext ctx;
             ctx.peer_uri = gctx_.peer();
 
@@ -384,6 +396,28 @@ private:
             state_        = State::BidiPendingFinish;
             rw_.Finish(final_status_, static_cast<CqTag*>(&finish_tag_));
         });
+            state_ = State::BidiActive;
+        } catch (const std::system_error& e) {
+            // std::thread ctor failed (typically EAGAIN under RLIMIT_NPROC
+            // or PID-cap squeeze). Reap the ServerCall via the unary
+            // Finish path so the peer sees Internal rather than hanging
+            // until deadline. spdlog before metric so operators correlate
+            // (governance UP-1).
+            spdlog::error(
+                "yuzu::transport: bidi dispatcher std::thread ctor failed "
+                "in {} — what={}",
+                method_cache_, sanitise_status_detail(e.what()));
+            if (listener_->opts_.metric_sink) {
+                listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
+                    "grpc", method_cache_, "dispatcher_internal");
+            }
+            bidi_stream_.reset();  // not in use; release before Finish
+            final_status_ = make_wire_status(
+                StatusCode::Internal,
+                "transport: bidi dispatcher unavailable");
+            rw_.Finish(final_status_, static_cast<CqTag*>(this));
+            state_ = State::UnaryPendingFinish;
+        }
     }
 
     void dispatch_unary() {

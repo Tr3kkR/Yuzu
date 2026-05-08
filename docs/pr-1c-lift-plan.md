@@ -21,7 +21,7 @@ merge; the existing UAT (`scripts/start-UAT.sh`) is the integration ledger.
 |---|---|---|---|---|
 | `yuzu.agent.v1.AgentService` | Register | unary | agent → server | agent.cpp client; agent_service_impl.cpp server |
 | | Heartbeat | unary | agent → server | agent.cpp; agent_service_impl |
-| | ExecuteCommand | server-stream | mgmt → agent | server.cpp callout (rare); agent_service_impl |
+| | ExecuteCommand | server-stream | mgmt → server (AgentService) | server.cpp callout (rare); agent_service_impl |
 | | Subscribe | bidi | agent ↔ server | agent.cpp (PRIMARY); agent_service_impl |
 | | ReportInventory | unary | agent → server | agent.cpp; agent_service_impl |
 | | CheckForUpdate | unary | agent → server | agent.cpp; agent_service_impl |

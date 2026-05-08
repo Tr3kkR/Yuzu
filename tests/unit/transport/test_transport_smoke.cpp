@@ -837,6 +837,135 @@ TEST_CASE("Bidi handler-thrown what() is scrubbed before wire", "[transport][rou
     listener->shutdown();
 }
 
+TEST_CASE("Bidi concurrent reader thread + writer thread coexist",
+          "[transport][round-trip][bidi]") {
+    // governance qe-SHOULD: the threading contract in transport.hpp
+    // permits a single-reader thread to run concurrent with a
+    // single-writer thread. Earlier bidi tests drove both halves from
+    // one caller thread; this test pins the dual-thread shape so a
+    // future deadlock between read+write cv waits would surface here.
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    constexpr int N = 16;
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        while (stream.read(msg)) {
+            StringMessage out("ack:" + msg.data());
+            if (!stream.write(out))
+                return Status{StatusCode::Internal, ""};
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiConc", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(10);
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiConc", ctx);
+    REQUIRE(stream != nullptr);
+
+    std::vector<std::string> received;
+    received.reserve(N);
+    std::mutex received_mtx;
+
+    auto reader = std::async(std::launch::async, [&] {
+        for (int i = 0; i < N; ++i) {
+            StringMessage in;
+            if (!stream->read(in))
+                break;
+            std::lock_guard<std::mutex> lk(received_mtx);
+            received.push_back(in.data());
+        }
+    });
+    auto writer = std::async(std::launch::async, [&] {
+        for (int i = 0; i < N; ++i) {
+            StringMessage out("frame_" + std::to_string(i));
+            if (!stream->write(out))
+                break;
+        }
+        stream->writes_done();
+    });
+    writer.get();
+    reader.get();
+    REQUIRE(received.size() == static_cast<std::size_t>(N));
+    for (int i = 0; i < N; ++i) {
+        REQUIRE(received[i] == "ack:frame_" + std::to_string(i));
+    }
+    REQUIRE(stream->final_status().code == StatusCode::Ok);
+
+    listener->shutdown();
+}
+
+TEST_CASE("Bidi server-stream pattern (client writes_done immediately, reads N)",
+          "[transport][round-trip][bidi]") {
+    // governance happy-path SHOULD #5: PR 1c-3 lifts ExecuteCommand /
+    // SendCommand / WatchEvents / DownloadUpdate as server-stream RPCs
+    // mapped onto BidiStream. The client immediately calls writes_done()
+    // and reads frames. This test pins that shape today so PR 1c-3
+    // lands on a verified abstraction surface.
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    constexpr int N = 5;
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        // Server ignores the read half (peer half-closes immediately)
+        // and emits N frames. Drain reads first to observe the
+        // client's writes_done flushing.
+        StringMessage drain;
+        while (stream.read(drain)) {
+            // server-streaming canonical: client should not write
+            // anything; if it does, ignore.
+        }
+        for (int i = 0; i < N; ++i) {
+            StringMessage out("server_frame_" + std::to_string(i));
+            if (!stream.write(out))
+                return Status{StatusCode::Internal, ""};
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/ServerStream", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(5);
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/ServerStream", ctx);
+    REQUIRE(stream != nullptr);
+
+    // Server-stream shape: tell server we're done writing, then read.
+    stream->writes_done();
+    // writes_done() is documented as silently idempotent — calling
+    // again should not throw or block.
+    stream->writes_done();
+
+    std::vector<std::string> received;
+    StringMessage in;
+    while (stream->read(in)) {
+        received.push_back(in.data());
+    }
+    REQUIRE(received.size() == static_cast<std::size_t>(N));
+    for (int i = 0; i < N; ++i) {
+        REQUIRE(received[i] == "server_frame_" + std::to_string(i));
+    }
+    REQUIRE(stream->final_status().code == StatusCode::Ok);
+
+    listener->shutdown();
+}
+
 TEST_CASE("Bidi stream destroyed without final_status terminates cleanly",
           "[transport][round-trip][bidi]") {
     // Lifetime invariant — dtor must cancel + drain the CQ even when
