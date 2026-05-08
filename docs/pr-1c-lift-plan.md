@@ -65,6 +65,15 @@ the branch — land one, rebase the next.
 
 ### PR 1c-1 — Adapter shim + ProtoMessage codegen helpers
 
+> **Merged 2026-05-08.** Adapter helpers shipped in
+> `transport/include/yuzu/transport/proto_adapter.hpp`
+> (`register_unary_pb<Req,Resp>`, `OwnedProtoMessage<T>`, `read_pb`/
+> `write_pb`), not the originally-planned per-side
+> `server/core/src/transport_adapters.{hpp,cpp}` /
+> `agents/core/src/transport_adapters.{hpp,cpp}` files. The per-side
+> files were not needed because the typed-proto wrap was generic
+> enough to live alongside the abstraction.
+
 * Add `server/core/src/transport_adapters.{hpp,cpp}` (and matching
   `agents/core/src/transport_adapters.{hpp,cpp}`) that wrap the
   per-RPC pb message-pair construction so handler bodies stay tidy:
@@ -78,6 +87,21 @@ the branch — land one, rebase the next.
 * Risk: low. Pure addition.
 
 ### PR 1c-2 — Server-side: lift `agent_service_impl` (agent-facing service)
+
+> **Merged 2026-05-08** (commits d19680b + f8b944d). Plan/actual
+> divergences worth noting:
+> * **YUZU_ALLOW_INSECURE_TLS gate** stayed at the CLI layer (`main.cpp`)
+>   — `cfg_.allow_one_way_tls` is passed as a bool argument to the new
+>   `build_transport_credentials()`. The transport layer never reads
+>   the env-var directly; the abstraction boundary is honoured.
+> * **`grpc::EnableDefaultHealthCheckService(true)` deletion**: confirmed
+>   removed. Yuzu does not consume gRPC health checks; readiness is HTTP
+>   `/readyz` (which now also gates on `agent_listener_->is_serving()`
+>   per gov round 7 SRE OBS-1).
+> * **Mgmt + gateway-upstream services** stayed on `grpc::ServerBuilder`
+>   bound to their own ports — PR 1c-5 lifts those next. Two listener
+>   objects with parallel shutdown until 1c-5 unifies them.
+
 
 * Drop `pb::AgentService::Service` inheritance from `AgentServiceImpl`.
   Keep the class as a stateful holder of dependencies (response_store,

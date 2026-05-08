@@ -239,7 +239,12 @@ and SOC 2 auditors can see what has shipped without grepping git log
 | PR 1b-1 | Client-side unary dispatch (grpc::GenericStub callback API) | Merged |
 | PR 1b-2 | Server-side AsyncGenericService dispatcher + ServerCall state machine | Merged |
 | PR 1b-3 | Client/server bidi-stream wiring (PrepareCall, ServerAsyncReaderWriter) | Merged |
-| PR 1c | Lift `agent.cpp` / `server.cpp` / `agent_service_impl` / `agent_registry` / `gateway_service_impl` onto Channel + ServerListener; populate CallContext::peer_san_identities; consult YUZU_ALLOW_INSECURE_TLS gate inside transport | Pending |
+| PR 1c-1 | Adapter shim — `register_unary_pb<Req,Resp>` + `OwnedProtoMessage<T>` typed-proto helpers in `transport/include/yuzu/transport/proto_adapter.hpp` | Merged |
+| PR 1c-2 | Server-side: drop `pb::AgentService::Service` inheritance, lift `AgentServiceImpl` onto `transport::ServerListener`; populate CallContext::peer_san_identities (CN+SAN+GetPeerIdentity union) + initial metadata in GrpcServerListener; `agent_server_` → `agent_listener_`; mgmt + gateway services stay on `grpc::ServerBuilder` (deferred to 1c-5); `grpc::EnableDefaultHealthCheckService` removed (Yuzu uses HTTP /readyz) | Merged |
+| PR 1c-3 | Agent-side unary lift — Register, Heartbeat, ReportInventory, CheckForUpdate onto `transport::Channel::unary` | Pending |
+| PR 1c-4 | Agent-side Subscribe (bidi) + DownloadUpdate (server-stream-via-bidi) lift; **hard predecessor: per-call dispatcher-thread fanout mitigation (UP-14 row above)** | Pending |
+| PR 1c-5 | Server-side: lift `gateway_service_impl` + `ManagementServiceImpl` + `gw_mgmt_channel_` onto transport; unify shutdown SLO across listeners (gov round 7 architect S1) | Pending |
+| PR 1c-6 | Cleanup + #896 readiness probe wiring (`is_serving() ∧ bound_endpoint().port != 0` already added to `/readyz` for the agent listener in 1c-2 hardening; 1c-6 closes the mgmt-side equivalent) + #897 trailing-metadata scrub | Pending |
 | PR 2 | Conan toolchain bring-up (parallel to vcpkg) | Pending |
 | PR 3 | msquic transport implementation behind the same abstraction | Pending |
 | PR 4 | quicer Erlang gateway transport | Pending |

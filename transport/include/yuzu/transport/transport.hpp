@@ -337,7 +337,17 @@ struct CallContext {
     std::map<std::string, std::string> metadata;
     std::stop_token cancel;
 
-    // Server-side only: populated by the transport before handler dispatch.
+    // Server-side only: populated by the transport backend before handler
+    // dispatch. Despite the field name, this is the canonical "verified
+    // peer identities for authn" surface across backends — NOT just the
+    // raw x509 SAN extension. The gRPC backend folds the union of
+    // `GetPeerIdentity()` + `x509_common_name` + `x509_subject_alternative_name`
+    // into the vector (deduplicated, first-wins); a future msquic backend
+    // (PR 3) MUST satisfy the same authn contract by populating an
+    // equivalent identity set so consumers like
+    // `AgentServiceImpl::peer_identity_matches_agent_id` accept/reject the
+    // same callers. Field rename to `peer_identities` is deferred to keep
+    // the lift commit narrow; semantics are documented here.
     std::string peer_uri;
     std::vector<std::string> peer_san_identities;
 };

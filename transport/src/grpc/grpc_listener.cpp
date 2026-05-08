@@ -91,18 +91,22 @@ void populate_call_context_from_grpc(CallContext& ctx,
     }
 
     const auto& md = gctx.client_metadata();
-    std::size_t kept = 0;
     for (const auto& kv : md) {
-        if (kept >= kMaxMetadataEntries) break;
+        if (ctx.metadata.size() >= kMaxMetadataEntries) break;
         if (kv.first.size() > kMaxMetadataKeySize) continue;
         if (kv.second.size() > kMaxMetadataValueSize) continue;
-        // multimap may carry duplicate keys; CallContext::metadata is a
-        // std::map so a later occurrence overwrites — last-wins matches
-        // the pre-#376 behaviour of `client_metadata().equal_range(...)`
-        // callers that grab the first value and stop.
-        ctx.metadata.emplace(std::string(kv.first.data(), kv.first.size()),
-                             std::string(kv.second.data(), kv.second.size()));
-        ++kept;
+        // gRPC's client_metadata() is a std::multimap — duplicate keys
+        // can carry distinct values. CallContext::metadata is a std::map.
+        // Pre-#376 callers used `multimap::find(key)` which returns the
+        // FIRST inserted occurrence; we must preserve that selection
+        // rule across the lift (gov round 7 sec LOW). Use try_emplace so
+        // a second occurrence of the same key is dropped, not allowed
+        // to overwrite. Counter accuracy (cpp F-CPP-6) flows from
+        // checking `metadata.size()` instead of a separate `kept`
+        // counter that double-counted skipped duplicates against the
+        // cap.
+        ctx.metadata.try_emplace(std::string(kv.first.data(), kv.first.size()),
+                                 std::string(kv.second.data(), kv.second.size()));
     }
 }
 

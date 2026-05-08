@@ -837,6 +837,8 @@ sudo systemctl start yuzu-server
 
 **Security hardening:** The systemd units include `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=true`, and `PrivateTmp=true` for defense-in-depth.
 
+**Graceful shutdown:** The shipped unit sets `TimeoutStopSec=30`. As of #376 PR 1c-2 the agent-facing transport listener performs an unbounded graceful drain on shutdown — in-flight Subscribe handlers run to completion rather than being force-cancelled at 5 s as in earlier releases. The 30 s `TimeoutStopSec` caps the worst case (a stuck handler under disk-full or Defender-quarantine) at half of systemd's 90 s default. Operators with longer-stream workloads (e.g. large `DownloadUpdate` transfers in flight at restart) should raise this in a drop-in (`systemctl edit yuzu-server`); operators with strict shutdown SLOs should keep it. Setting it below ~10 s is not recommended — Subscribe sessions that survive routine restarts will be cut off, prompting agents to reconnect to a server that is still draining.
+
 ### Development Stack Script
 
 The `scripts/start-stack.sh` script starts the full development stack locally (without Docker).

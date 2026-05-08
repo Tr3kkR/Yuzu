@@ -34,6 +34,19 @@ RestartSec=5
 # beyond ~16k concurrent agent connections.
 LimitNOFILE=65536
 
+# Graceful-stop budget. Post-#376 PR 1c-2 the agent-facing transport
+# listener performs an unbounded graceful drain on shutdown (in-flight
+# Subscribe handlers run to completion). Pre-PR-1c-2 the gRPC server
+# was force-cancelled at 5s. The 30s value below caps the worst case
+# at half of systemd's 90s default, so a stuck handler (UP-15: an
+# exception inside `analytics_store_->emit` mid-Subscribe; UP-2:
+# disk-full fsync stall) is SIGKILL-bounded at a predictable budget
+# rather than the systemd default. Operators with longer-stream
+# workloads should raise this; operators with strict shutdown SLOs
+# should keep it. PR 1c-5 unifies the agent + management shutdown
+# SLOs so a single deadline applies to both listeners.
+TimeoutStopSec=30
+
 WorkingDirectory=/var/lib/yuzu
 StateDirectory=yuzu
 LogsDirectory=yuzu

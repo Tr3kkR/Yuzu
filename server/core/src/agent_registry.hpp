@@ -61,6 +61,17 @@ struct AgentSession {
     // a non-owning pointer that remains valid until the Subscribe handler
     // returns. cancel() supersedes the legacy `grpc::ServerContext::
     // TryCancel()` path used to expire stale sessions (see #376 PR 1c-2).
+    //
+    // INVARIANT (gov round 7 architect S4): every read or write of `stream`
+    // — including `stream->write(...)`, `stream->cancel()`, and the bare
+    // `if (session->stream)` predicate — MUST hold `stream_mu`. The
+    // Subscribe handler frame is the writer (sets the pointer at handler
+    // entry, nulls it at handler exit via `clear_stream_if_session`); all
+    // other call sites (`send_to`, `send_to_all`, `reap_stale_sessions`,
+    // future SSE/gateway/broadcast paths) are readers. Without this
+    // discipline a reader can dereference the pointer after the Subscribe
+    // handler frame has unwound and the BidiStream has been destroyed by
+    // the transport's `delete this` async-state-machine.
     ::yuzu::transport::BidiStream* stream = nullptr;
     std::mutex stream_mu;
 

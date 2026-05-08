@@ -119,6 +119,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <atomic>
 #include <cctype>
 #include <charconv>
+#include <optional>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -841,16 +842,23 @@ public:
         }
         agent_service_.register_with(*agent_listener_);
         ::yuzu::transport::Credentials agent_creds_t = build_transport_credentials();
+        // RAII guard zeroes server_key_pem / client_key_pem on every exit
+        // path (success, listener-start failure, parse failure, exception).
+        // Closes cpp F-CPP-1 (secure_zero after throw leak).
+        CredentialsZeroOnExit zero_guard{agent_creds_t};
         if (cfg_.tls_enabled && agent_creds_t.server_cert_pem.empty()) {
             spdlog::error("Failed to load agent-listener TLS material; refusing to start");
             return;
         }
-        ::yuzu::transport::Endpoint agent_bind = parse_listen_address(cfg_.listen_address);
+        auto agent_bind_opt = parse_listen_address(cfg_.listen_address);
+        if (!agent_bind_opt) {
+            spdlog::error("Failed to parse --listen-address: must be host:port with "
+                          "port 1..65535 (got '{}'); refusing to start",
+                          cfg_.listen_address);
+            return;
+        }
         ::yuzu::transport::ListenerOptions opts;
-        auto agent_start = agent_listener_->start(agent_bind, agent_creds_t, opts);
-        // SECURITY: zero PEM material as soon as the listener has consumed it
-        // (transport.hpp Credentials handling contract).
-        yuzu::secure_zero(agent_creds_t.server_key_pem);
+        auto agent_start = agent_listener_->start(*agent_bind_opt, agent_creds_t, opts);
         if (!agent_start.has_value()) {
             spdlog::error("Failed to start agent listener on {}: {}", cfg_.listen_address,
                           agent_start.error().detail);
@@ -1067,6 +1075,14 @@ public:
         // here on the management gRPC server is the main-thread blocker.
         // shutdown() on either side wakes both.
         mgmt_server_->Wait();
+        // On the graceful-stop path `stop()` invoked
+        // `agent_listener_->shutdown()` before the mgmt server's drain
+        // returned, so the transport listener's `shutting_down_` flag is
+        // already set and the cv has fired. This call is a non-blocking
+        // confirmation that the cq_worker / dispatcher threads have
+        // joined — NOT a second blocking wait. The systemd
+        // `TimeoutStopSec=30` cap (deploy/systemd/yuzu-server.service)
+        // bounds the cumulative time across both halves.
         agent_listener_->wait_for_shutdown();
     }
 
@@ -1280,30 +1296,68 @@ private:
     // Parse a "host:port" pair (or "[::]:port" for IPv6 wildcard) into the
     // transport's Endpoint shape. Mirrors the historic
     // `grpc::ServerBuilder::AddListeningPort(cfg_.listen_address, ...)` parse.
-    static ::yuzu::transport::Endpoint parse_listen_address(const std::string& addr) {
+    // Parse "host:port" / "[ipv6]:port" into the transport's Endpoint.
+    // Returns std::nullopt on malformed input rather than throwing
+    // (#376 PR 1c-2 hardening, gov round 7 cpp F-CPP-1 / F-CPP-2 /
+    // architect S2 / unhappy UP-3 / UP-4): pre-hardening `std::stoi`
+    // threw on bogus port digits and on integer overflow >INT_MAX,
+    // unwinding past `secure_zero(server_key_pem)` and leaking PEM
+    // bytes; bare "[::1]" without a port silently bound an OS-allocated
+    // ephemeral port; values 65536..2147483647 silently truncated via
+    // `static_cast<uint16_t>`. `std::from_chars` is `noexcept` and
+    // rejects non-digit / out-of-range input cleanly; explicit
+    // `> 0xFFFFu` check closes the truncation gap.
+    static std::optional<::yuzu::transport::Endpoint>
+    parse_listen_address(const std::string& addr) noexcept {
         ::yuzu::transport::Endpoint e{};
         if (addr.empty())
-            return e;
-        // IPv6 literal in brackets: "[::]:50051"
+            return std::nullopt;
+        std::string_view port_sv;
         if (addr.front() == '[') {
             auto close = addr.find(']');
-            if (close != std::string::npos) {
-                e.host = addr.substr(1, close - 1);
-                if (close + 2 <= addr.size() && addr[close + 1] == ':') {
-                    e.port = static_cast<uint16_t>(std::stoi(addr.substr(close + 2)));
-                }
-                return e;
+            if (close == std::string::npos)
+                return std::nullopt;
+            e.host = addr.substr(1, close - 1);
+            if (close + 1 == addr.size()) {
+                // bare "[::1]" without ":port" — UP-3 silent ephemeral
+                return std::nullopt;
             }
+            if (addr[close + 1] != ':')
+                return std::nullopt;
+            port_sv = std::string_view{addr}.substr(close + 2);
+        } else {
+            auto colon = addr.rfind(':');
+            if (colon == std::string::npos)
+                return std::nullopt;
+            e.host = addr.substr(0, colon);
+            port_sv = std::string_view{addr}.substr(colon + 1);
         }
-        auto colon = addr.rfind(':');
-        if (colon == std::string::npos) {
-            e.host = addr;
-            return e;
-        }
-        e.host = addr.substr(0, colon);
-        e.port = static_cast<uint16_t>(std::stoi(addr.substr(colon + 1)));
+        if (port_sv.empty())
+            return std::nullopt;
+        unsigned int port_raw = 0;
+        const auto* first = port_sv.data();
+        const auto* last = first + port_sv.size();
+        auto [ptr, ec] = std::from_chars(first, last, port_raw);
+        if (ec != std::errc{} || ptr != last)
+            return std::nullopt;
+        if (port_raw > 0xFFFFu)
+            return std::nullopt;
+        e.port = static_cast<uint16_t>(port_raw);
         return e;
     }
+
+    // RAII zeroisation of Credentials private-key bytes on scope exit.
+    // Closes the `secure_zero`-after-throw leak (cpp F-CPP-1) by making
+    // the zeroisation guaranteed by the type system rather than by
+    // manual placement. Cert / CA bytes stay in place — public material
+    // and useful in core dumps for incident triage.
+    struct CredentialsZeroOnExit {
+        ::yuzu::transport::Credentials& c;
+        ~CredentialsZeroOnExit() {
+            yuzu::secure_zero(c.client_key_pem);
+            yuzu::secure_zero(c.server_key_pem);
+        }
+    };
 
     // -- Web server -----------------------------------------------------------
 
@@ -2110,6 +2164,19 @@ private:
                 // silent no-op on every response.
                 {"execution_tracker",
                  execution_tracker_ != nullptr && instr_db_pool_ && instr_db_pool_->is_open()},
+                // #376 PR 1c-2 hardening (gov round 7 SRE OBS-1): post-lift the
+                // agent gRPC port is owned by `transport::ServerListener`, an
+                // independent process from the SQLite stores above. A bind
+                // failure (port collision, TLS load failure, resource exhaust)
+                // leaves every store healthy but no agent can connect — pre-
+                // hardening /readyz reported "ready" in that state. The
+                // transport contract designates `is_serving() &&
+                // bound_endpoint().port != 0` as the canonical readiness
+                // signal (transport.hpp:680-685). Mgmt grpc::Server stays on
+                // its own path for now; PR 1c-5 will lift it onto the same
+                // transport surface and a parallel check will land then.
+                {"agent_listener", agent_listener_ != nullptr && agent_listener_->is_serving() &&
+                                       agent_listener_->bound_endpoint().port != 0},
             };
 
             std::string failed_list;
