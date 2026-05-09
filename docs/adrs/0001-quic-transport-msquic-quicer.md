@@ -247,7 +247,7 @@ and SOC 2 auditors can see what has shipped without grepping git log
 | PR 1c-6 | Cleanup + #896 readiness probe wiring (`is_serving() ∧ bound_endpoint().port != 0` already added to `/readyz` for the agent listener in 1c-2 hardening; 1c-6 closes the mgmt-side equivalent) + #897 trailing-metadata scrub | Pending |
 | PR 2 | Conan toolchain bring-up (parallel to vcpkg) | Pending |
 | PR 3 | msquic transport implementation behind the same abstraction | Pending |
-| PR 4 | quicer Erlang gateway transport | Pending |
+| PR 4 | quicer Erlang gateway transport (also removes grpcbox; gateway scaling decisions land here per ADR-0002) | Pending |
 | PR 5 | Dual-stack feature flag (`--transport=grpc|quic|auto`) | Pending |
 | PR 6 | Agent default cutover to QUIC | Pending |
 | PR 7 | Gateway default cutover to QUIC | Pending |
