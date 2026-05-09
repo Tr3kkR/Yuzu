@@ -161,21 +161,38 @@ the branch — land one, rebase the next.
   Land with the dual-stack `--transport=grpc` flag still defaulting to
   grpc backend, and the equivalent server side already on transport
   abstraction (PR 1c-2 is a hard predecessor).
-* **Hard predecessors** (originally three, two remain after #904):
+* **Hard predecessors** (originally three, one half remains after #904 + #902 + 1af8ab5):
   - ✅ **UP-14** (per-call dispatcher-thread fanout) — closed by **#904**
     bounded dispatcher pool (2026-05-09). Subscribe lift no longer
     spawns a per-stream OS thread on the server; pool size is operator-
     controlled via `ListenerOptions::bidi_dispatcher_pool_size`.
-  - ⏳ **#902** — DownloadUpdate idle-read deadline at the transport
-    layer. Without it, a misbehaving client can pin a pool slot
-    indefinitely by opening the stream and never sending the request
-    frame. The bounded pool prevents fleet-scale stack exhaustion but
-    does not free the slot — operator will see ResourceExhausted
-    rejections on legitimate concurrent DownloadUpdate calls until the
-    idle reader times out.
-  - ⏳ Round-trip test for the agent-side abstraction surface (the
-    deferred deliverable from PR 1c-3 — agent-cpp wiring tests for
-    `parse_target_address` and the Heartbeat stop_source per-cycle reset).
+  - ✅ **#902** (UP-8) — DownloadUpdate idle-read deadline at the
+    transport layer. Closed 2026-05-09 by adding an optional
+    `std::chrono::milliseconds deadline` parameter to
+    `BidiStream::read` (default zero = no deadline) and arming
+    `DownloadUpdate`'s request-frame read with 30 s. Pool slots
+    release after the idle deadline so legitimate concurrent calls
+    are no longer starved by stalled peers. Tests at
+    `tests/unit/transport/test_transport_smoke.cpp` `[transport][bidi][deadline]`:
+    server-side timeout, client-side timeout, happy-path no-fire.
+    Wire-status caveat on the gRPC backend documented in the
+    `BidiStream` contract block in
+    `transport/include/yuzu/transport/transport.hpp`: `TryCancel`
+    forces peer-observed status to `Cancelled` regardless of the
+    handler-supplied final status; the local `DeadlineExceeded`
+    signal via `final_status()` is what frees the pool slot.
+  - ✅ `parse_target_address` agent-side test coverage — closed
+    2026-05-09 by `1af8ab5` (`tests/unit/test_parse_target_address.cpp`,
+    22 cases / 44 assertions; rejection-path matrix + IPv6 happy
+    paths + `static_assert(noexcept(...))` contract pin).
+  - ⏳ Heartbeat per-cycle `stop_source` round-trip test — the
+    remaining half of the deferred PR 1c-3 agent-side wiring test.
+    Should exercise: `stop()` during in-flight Heartbeat →
+    `CallContext.cancel` observes the stop_token → unary RPC returns
+    `Cancelled` → `heartbeat_stop_src_` correctly `emplace()`d on next
+    reconnect cycle with no stale token bleed-through. Lives
+    naturally as an agent-side integration test (likely under
+    `tests/unit/agent/...`).
 
 ### PR 1c-5 — Server-side: lift `gateway_service_impl` + `ManagementServiceImpl` + gw_mgmt_channel_
 

@@ -1140,9 +1140,23 @@ AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& /*ctx*/,
 
     // Server-streaming-via-bidi: client sends one request frame + writes_done(),
     // we stream N response chunks, then close. read_pb returns false if the
-    // client cancelled or the stream is corrupt before we even saw the request.
+    // client cancelled or the stream is corrupt before we even saw the
+    // request. The 30s idle-read deadline (#902 / UP-8) bounds how long a
+    // misbehaving or stalled client can pin the bidi dispatcher pool slot
+    // without sending the request frame; the bounded pool from #904 caps
+    // fleet-scale stack exhaustion, but only the deadline frees the slot
+    // for legitimate concurrent DownloadUpdate calls.
+    constexpr auto kRequestReadDeadline = std::chrono::seconds(30);
     pb::DownloadUpdateRequest request;
-    if (!::yuzu::transport::read_pb(stream, request)) {
+    if (!::yuzu::transport::read_pb(stream, request, kRequestReadDeadline)) {
+        // Distinguish deadline expiry from peer-close / cancel so the
+        // wire status is precise; the BidiStream contract promotes
+        // final_status() to DeadlineExceeded only on the deadline path.
+        const auto why = stream.final_status();
+        if (why.code == StatusCode::DeadlineExceeded) {
+            return Status{StatusCode::DeadlineExceeded,
+                          "client did not send request frame within idle deadline"};
+        }
         return Status{StatusCode::Cancelled, "client closed before sending request"};
     }
 

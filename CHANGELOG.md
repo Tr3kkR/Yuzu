@@ -18,8 +18,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asymmetric backoff window (transport: 1s→5min, jittered 20%; legacy:
   gRPC defaults). Internal change — no operator-visible behaviour. The
   legacy half disappears in PR 1c-4 once `Subscribe` and
-  `DownloadUpdate` lift; #902 (DownloadUpdate idle-read deadline) is
-  the only remaining hard predecessor.
+  `DownloadUpdate` lift; the agent-side Heartbeat per-cycle
+  `stop_source` round-trip test is the remaining hard predecessor.
+- **`BidiStream::read` accepts an optional idle-read deadline (#902 /
+  UP-8).** New default-zero `std::chrono::milliseconds deadline`
+  parameter on the pure virtual; a positive value caps the per-call
+  wait at that duration. Expiry cancels the stream and surfaces as
+  `final_status() == DeadlineExceeded` on the side that armed the
+  deadline (server-side handler queries the flag via
+  `final_status()`; client-side caller sees DE directly). Bounds
+  bidi-dispatcher-pool-slot residency for misbehaving peers — the
+  `#904` bounded pool prevented fleet-scale stack exhaustion, but
+  only the deadline frees the slot for legitimate concurrent calls.
+  `DownloadUpdate` armed with a 30 s deadline on the request-frame
+  read. `read_pb` gained a matching deadline-aware overload. Wire
+  semantics on the gRPC backend: `TryCancel` from the deadline path
+  causes the peer to observe `Cancelled` regardless of the
+  handler-supplied final status; cross-side propagation of the
+  deadline reason is best-effort and documented in the BidiStream
+  contract block in `transport/include/yuzu/transport/transport.hpp`.
 - **gRPC → QUIC transport migration in progress (#376).** A multi-PR
   internal migration is underway to replace the gRPC transport with
   QUIC (msquic on the C++ side, quicer on the Erlang gateway). No

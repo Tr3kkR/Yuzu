@@ -524,7 +524,9 @@ public:
         return ok;
     }
 
-    bool read(SerializableMessage& msg) override {
+    bool read(SerializableMessage& msg,
+              std::chrono::milliseconds deadline =
+                  std::chrono::milliseconds::zero()) override {
         if (!rw_ || !construction_error_.empty()) return false;
         if (!await_started()) return false;
 
@@ -535,9 +537,27 @@ public:
             read_done_.reset();
             read_buf_.Clear();
             rw_->Read(&read_buf_, reinterpret_cast<void*>(kTagRead));
-            cv_.wait(lock, [this] {
+            const auto pred = [this] {
                 return read_done_.has_value() || cancelled_;
-            });
+            };
+            if (deadline > std::chrono::milliseconds::zero()) {
+                // Idle-read timeout (#902 / UP-8). On expiry: mark
+                // deadline-exceeded for final_status() reporting, flip
+                // cancelled_, then TryCancel via cancel() so the
+                // worker_loop drains the cq events normally and the
+                // dtor's ensure_finished() proceeds. Lock is released
+                // implicitly by cancel(); we re-test cancelled_ below.
+                if (!cv_.wait_for(lock, deadline, pred)) {
+                    read_deadline_exceeded_ = true;
+                    cancelled_              = true;
+                    cv_.notify_all();
+                    lock.unlock();
+                    gctx_.TryCancel();
+                    return false;
+                }
+            } else {
+                cv_.wait(lock, pred);
+            }
             if (cancelled_) return false;
             if (!*read_done_) return false;  // peer half-close / cancel
             local_buf = std::move(read_buf_);
@@ -592,6 +612,16 @@ public:
                 trailing_metadata_.emplace(
                     std::string(k.data(), k.size()),
                     std::string(v.data(), v.size()));
+            }
+            // BidiStream contract: if read() observed an idle-deadline
+            // expiry, final_status() reports DeadlineExceeded regardless
+            // of what the wire status says (which is invariably
+            // Cancelled because we TryCancel'd from the read path).
+            // #902 / UP-8.
+            if (read_deadline_exceeded_) {
+                final_yt_status_ = Status{
+                    StatusCode::DeadlineExceeded,
+                    "transport: bidi read deadline exceeded"};
             }
         }
         return final_yt_status_;
@@ -710,6 +740,13 @@ private:
     bool                                                     finished_            = false;
     bool                                                     writes_done_called_  = false;
     bool                                                     cancelled_           = false;
+    // Set by read() when its idle-read deadline lapses before a frame
+    // arrives (#902 / UP-8). final_status() promotes the wire-level
+    // Cancelled (from TryCancel) to DeadlineExceeded so the caller can
+    // distinguish deadline expiry from external cancel() / peer
+    // half-close — matches the BidiStream contract block in
+    // transport.hpp.
+    bool                                                     read_deadline_exceeded_ = false;
     // governance sec-L3: gauge balance for failed-construction streams.
     // on_stream_opened fires only on the PrepareCall-success path; the
     // dtor's matching on_stream_closed gates on this flag so the gauge
@@ -735,7 +772,9 @@ std::unique_ptr<BidiStream> GrpcChannel::bidi_stream(
             std::string err;
             std::map<std::string, std::string> empty_md;
             bool write(const SerializableMessage&) override { return false; }
-            bool read(SerializableMessage&) override { return false; }
+            bool read(SerializableMessage&,
+                      std::chrono::milliseconds = std::chrono::milliseconds::zero())
+                      override { return false; }
             void writes_done() override {}
             Status final_status() override { return {StatusCode::Unauthenticated, err}; }
             const std::map<std::string, std::string>& trailing_metadata() const override {

@@ -1434,3 +1434,166 @@ TEST_CASE("Bidi pool default size accepts moderate concurrency",
 
     listener->shutdown();
 }
+
+// =====================================================================
+// BidiStream::read idle-deadline (#902 / UP-8)
+// =====================================================================
+//
+// The deadline parameter caps how long a server- or client-side reader
+// will wait for an inbound frame before cancelling the stream. Closes
+// the gap where a misbehaving peer could pin a bidi dispatcher pool
+// slot indefinitely (#904 bounded the pool; the deadline is what
+// frees the slot for legit concurrent calls).
+
+TEST_CASE("Bidi read deadline expires when peer never writes (server side)",
+          "[transport][bidi][deadline]") {
+    using namespace std::chrono_literals;
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    std::atomic<bool> handler_observed_deadline{false};
+    auto handler = [&](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        const bool ok = stream.read(msg, 200ms);
+        if (!ok && stream.final_status().code == StatusCode::DeadlineExceeded) {
+            handler_observed_deadline.store(true, std::memory_order_release);
+            return Status{StatusCode::DeadlineExceeded, "test: read idle deadline"};
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiDeadline", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(2s));
+
+    CallContext ctx;
+    ctx.deadline = 5s;
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiDeadline", ctx);
+    REQUIRE(stream != nullptr);
+
+    // Client opens the stream and never writes — server-side read should
+    // observe deadline expiry within ~200ms (with generous slack for
+    // CI scheduler jitter). The wire-level final status the client sees
+    // is Cancelled (gRPC RST_STREAM from TryCancel — see contract block
+    // in transport.hpp); the canonical signal that the server timed out
+    // is the handler-side `final_status()` returning DeadlineExceeded,
+    // which we observe via the captured atomic.
+    StringMessage in;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = stream->read(in);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    REQUIRE_FALSE(ok);
+    // Should fire well under the 5s ctx deadline; slack accommodates
+    // CI scheduler jitter + handler tear-down.
+    REQUIRE(elapsed < 4s);
+
+    Status final = stream->final_status();
+    REQUIRE(final.code == StatusCode::Cancelled);
+    REQUIRE(handler_observed_deadline.load(std::memory_order_acquire));
+
+    listener->shutdown();
+}
+
+TEST_CASE("Bidi read deadline expires on client when server never writes",
+          "[transport][bidi][deadline]") {
+    using namespace std::chrono_literals;
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    // Server handler reads forever and never writes — exercises the
+    // client-side deadline path independently of the server-side flag.
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        while (stream.read(msg)) {
+            // discard
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiClientDeadline", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(2s));
+
+    CallContext ctx;
+    ctx.deadline = 10s;
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiClientDeadline", ctx);
+    REQUIRE(stream != nullptr);
+
+    // Drive a write so the call is actually established, then read
+    // with an idle deadline that the server will not satisfy.
+    StringMessage payload("hi");
+    REQUIRE(stream->write(payload));
+
+    StringMessage in;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = stream->read(in, 200ms);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    REQUIRE_FALSE(ok);
+    REQUIRE(elapsed < 4s);
+
+    Status final = stream->final_status();
+    REQUIRE(final.code == StatusCode::DeadlineExceeded);
+
+    listener->shutdown();
+}
+
+TEST_CASE("Bidi read deadline does not fire when frame arrives in time",
+          "[transport][bidi][deadline]") {
+    using namespace std::chrono_literals;
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    // Server immediately echoes one frame back, then half-closes.
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        if (!stream.read(msg)) {
+            return Status{StatusCode::Cancelled, ""};
+        }
+        StringMessage reply("ack:" + msg.data());
+        if (!stream.write(reply)) {
+            return Status{StatusCode::Cancelled, ""};
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiHappy", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(2s));
+
+    CallContext ctx;
+    ctx.deadline = 5s;
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiHappy", ctx);
+    REQUIRE(stream != nullptr);
+
+    StringMessage payload("ping");
+    REQUIRE(stream->write(payload));
+    stream->writes_done();
+
+    // Read with a generous deadline; server replies promptly. Final
+    // status is Ok; deadline never fires.
+    StringMessage in;
+    REQUIRE(stream->read(in, 5s));
+    REQUIRE(in.data() == "ack:ping");
+
+    StringMessage drain;
+    REQUIRE_FALSE(stream->read(drain, 5s)); // peer half-close, NOT timeout
+    Status final = stream->final_status();
+    REQUIRE(final.code == StatusCode::Ok);
+
+    listener->shutdown();
+}

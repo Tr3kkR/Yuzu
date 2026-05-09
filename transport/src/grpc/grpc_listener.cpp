@@ -294,17 +294,39 @@ private:
             return ok;
         }
 
-        bool read(SerializableMessage& msg) override {
+        bool read(SerializableMessage& msg,
+                  std::chrono::milliseconds deadline =
+                      std::chrono::milliseconds::zero()) override {
             std::unique_lock<std::mutex> lock(call_->bidi_mtx_);
             if (call_->bidi_cancelled_) return false;
             call_->bidi_read_done_.reset();
             call_->bidi_read_buf_.Clear();
             call_->rw_.Read(&call_->bidi_read_buf_,
                             static_cast<CqTag*>(&call_->read_tag_));
-            call_->bidi_cv_.wait(lock, [this] {
+            const auto pred = [this] {
                 return call_->bidi_read_done_.has_value() ||
                        call_->bidi_cancelled_;
-            });
+            };
+            if (deadline > std::chrono::milliseconds::zero()) {
+                // Idle-read timeout (#902 / UP-8). On expiry: mark
+                // deadline-exceeded for final_status() reporting, flip
+                // bidi_cancelled_ to short-circuit subsequent
+                // reads/writes, then TryCancel so the cq_worker
+                // eventually delivers the read_tag completion (with
+                // ok=false) and the dispatcher proceeds to Finish.
+                // Lock order: bidi_mtx_ is held across TryCancel; gctx_
+                // is owned by this ServerCall and TryCancel is
+                // documented thread-safe by gRPC.
+                if (!call_->bidi_cv_.wait_for(lock, deadline, pred)) {
+                    call_->bidi_read_deadline_exceeded_ = true;
+                    call_->bidi_cancelled_ = true;
+                    call_->bidi_cv_.notify_all();
+                    call_->gctx_.TryCancel();
+                    return false;
+                }
+            } else {
+                call_->bidi_cv_.wait(lock, pred);
+            }
             if (call_->bidi_cancelled_) return false;
             if (!*call_->bidi_read_done_) return false;  // peer half-close
             std::string bytes;
@@ -337,7 +359,16 @@ private:
         Status final_status() override {
             // Server-side: handlers don't normally call final_status()
             // on their own stream. Return Ok with no detail for parity
-            // with the BidiStream contract.
+            // with the BidiStream contract — UNLESS read() observed an
+            // idle-deadline expiry (#902 / UP-8), in which case the
+            // contract block in transport.hpp requires DeadlineExceeded
+            // so the handler can distinguish it from peer half-close /
+            // external cancel().
+            std::lock_guard<std::mutex> lock(call_->bidi_mtx_);
+            if (call_->bidi_read_deadline_exceeded_) {
+                return Status{StatusCode::DeadlineExceeded,
+                              "transport: bidi read deadline exceeded"};
+            }
             return Status{StatusCode::Ok, ""};
         }
 
@@ -688,6 +719,12 @@ private:
     std::optional<bool>                    bidi_read_done_;
     std::optional<bool>                    bidi_write_done_;
     bool                                   bidi_cancelled_ = false;
+    // Set by ServerBidiStream::read when its idle-read deadline lapses
+    // before a frame arrives (#902 / UP-8). Distinguishes deadline
+    // cancellation from peer half-close / external cancel() so that
+    // ServerBidiStream::final_status() can report DeadlineExceeded —
+    // matches BidiStream contract block.
+    bool                                   bidi_read_deadline_exceeded_ = false;
     ::grpc::ByteBuffer                     bidi_read_buf_;
     ::grpc::ByteBuffer                     bidi_write_buf_;
     std::unique_ptr<ServerBidiStream>      bidi_stream_;

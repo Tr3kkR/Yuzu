@@ -25,6 +25,7 @@
 
 #include <google/protobuf/message_lite.h>
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -187,12 +188,19 @@ void register_unary_pb(ServerListener& listener, std::string method,
 // register_unary_pb.
 
 // Read a typed proto from the stream into `out`. Returns false on
-// half-close, parse failure, or cancel — same contract as
-// `BidiStream::read` (transport.hpp).
+// half-close, parse failure, cancel, or idle-read deadline expiry —
+// same contract as `BidiStream::read` (transport.hpp).
+//
+// `deadline` defaults to zero (wait indefinitely). A positive value
+// caps the per-call wait; on expiry the stream is cancelled and
+// `BidiStream::final_status()` reports `DeadlineExceeded`. See the
+// BidiStream contract block in transport.hpp for the full semantics.
 template <typename T>
-bool read_pb(BidiStream& stream, T& out) {
+bool read_pb(BidiStream& stream, T& out,
+             std::chrono::milliseconds deadline =
+                 std::chrono::milliseconds::zero()) {
     ProtoMessage<T> wrap(out);
-    return stream.read(wrap);
+    return stream.read(wrap, deadline);
 }
 
 // Write a typed proto to the stream. Returns false on cancel /

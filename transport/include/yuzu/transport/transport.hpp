@@ -433,6 +433,14 @@ class ProtoMessage;  // defined in transport/proto_adapter.hpp
 //     while a reader is still draining is undefined.
 //   * `cancel()` is idempotent; calling it after `final_status()` has
 //     returned is a safe no-op.
+//   * Deadline expiry on `read(msg, deadline)` is internally equivalent
+//     to `cancel()` from a third thread firing exactly when the
+//     deadline lapses. Subsequent reads/writes return false; only the
+//     `final_status()` reporting changes (DeadlineExceeded vs
+//     Cancelled). This means deadline cancellation is observable on
+//     the writer thread too — a writer racing with a reader's
+//     deadline expiry will see false from `write()` after the
+//     deadline fires.
 //
 // Wire ordering contract (msquic backend):
 //   * The sender emits frames in `write()` order, each with a 4-byte
@@ -453,9 +461,49 @@ public:
     virtual bool write(const SerializableMessage& msg) = 0;
 
     // Read the next frame into msg. Returns true on success, false on
-    // half-close from the peer or on cancellation. Use `final_status()`
-    // after a false return to learn why.
-    virtual bool read(SerializableMessage& msg) = 0;
+    // half-close from the peer, on cancellation, or on idle-read deadline
+    // expiry. Use `final_status()` after a false return to learn why.
+    //
+    // `deadline` is an optional per-call idle timeout. Zero (the default)
+    // mirrors `CallContext::deadline` semantics — wait indefinitely until
+    // peer half-close or cancellation. A positive value caps the wait at
+    // that duration; if no frame arrives by then, the stream is cancelled
+    // (`gctx_.TryCancel()` on the gRPC backend; the analogous QUIC stream
+    // close on a future msquic backend), the read returns false, and
+    // `final_status()` reports `StatusCode::DeadlineExceeded` on both
+    // sides. Both backends MUST honour this — the deadline is what
+    // bounds the bidi dispatcher pool slot residency for misbehaving
+    // peers (#902 / UP-8).
+    //
+    // The deadline applies ONLY to this specific read call, not to the
+    // stream as a whole. A handler may call `read()` repeatedly with
+    // different deadlines (or the same one) to enforce per-frame idle
+    // policies. For example, a typical "client streams one request,
+    // server streams N responses" pattern caps just the first read
+    // (waiting for the request frame); subsequent server-side reads
+    // are short or use the default unbounded form because the peer is
+    // expected to half-close quickly.
+    //
+    // Server-side: deadline expiry surfaces to the handler as `read()`
+    // returning false; the handler should treat it like any other false
+    // return (the transport has already cancelled the stream). The
+    // handler MAY call `final_status()` on its own stream to learn that
+    // the false return was specifically deadline expiry (returns
+    // `DeadlineExceeded`) versus peer half-close or external cancel
+    // (returns `Ok`). Note: the wire-level trailing status the peer
+    // observes after a server-side deadline cancellation is
+    // `Cancelled` on the gRPC backend (gRPC's `TryCancel` sends
+    // RST_STREAM before `Finish` runs, and the supplied final status
+    // is overridden by that early cancel). Cross-side propagation of
+    // "the other side timed out" is therefore best-effort — it
+    // happens reliably for client-side deadlines (the client's own
+    // `final_status()` returns `DeadlineExceeded` from the local
+    // flag) but not for server-side ones. A future msquic backend MAY
+    // honour the handler-supplied final status more faithfully via
+    // its TrailingStatus frame.
+    virtual bool read(SerializableMessage& msg,
+                      std::chrono::milliseconds deadline =
+                          std::chrono::milliseconds::zero()) = 0;
 
     // Half-close the writer side (no more outgoing frames). Reader side
     // continues to drain incoming frames until the peer half-closes.
@@ -464,6 +512,13 @@ public:
     // Final status of the stream after both halves have closed. Blocks
     // until the trailing-status frame has been received from the peer.
     // MUST be called from the reader thread (or after it has finished).
+    //
+    // If `read()` returned false because its idle-read deadline expired,
+    // `final_status()` returns `StatusCode::DeadlineExceeded` regardless
+    // of whether the wire-level trailing status would otherwise have
+    // been Cancelled (because the deadline path cancels the stream
+    // internally). This makes "deadline vs cancel vs peer-close"
+    // distinguishable on both sides.
     virtual Status final_status() = 0;
 
     // Trailing metadata, available after final_status() returns.
