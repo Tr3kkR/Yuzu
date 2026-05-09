@@ -3,17 +3,23 @@
 # Run:    docker run --network host yuzu-agent --server localhost:50051 --no-tls
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────
-FROM --platform=$TARGETPLATFORM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b AS builder
+FROM --platform=$TARGETPLATFORM debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b AS builder
 
-# TARGETARCH is set by Docker buildx (amd64 / arm64). Translate to the vcpkg
-# triplet name (x64-linux / arm64-linux) so the same Dockerfile builds for
-# either arch.
-ARG TARGETARCH=amd64
-ENV TRIPLET=${TARGETARCH/amd64/x64}-linux
+# TRIPLET selects the vcpkg target. Pass --build-arg TRIPLET=arm64-linux for
+# arm64; default keeps the historical x64 build path.
+ARG TRIPLET=x64-linux
 
+# Base: debian:trixie-slim (Debian 13). gcc-13 13.3.0 ships in main; CDN
+# (deb.debian.org) is reliably reachable when Canonical's archive.ubuntu.com /
+# ports.ubuntu.com are blocked at the build host's network egress.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake ninja-build gcc-13 g++-13 pkg-config \
-    curl zip unzip tar git ca-certificates python3-pip \
+    cmake ninja-build gcc-13 g++-13 pkg-config make linux-libc-dev \
+    curl zip unzip tar git ca-certificates \
+    python3-pip python3-venv python3-yaml \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
+    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-13 100 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 100 \
     && pip3 install --break-system-packages meson==1.9.2 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -26,20 +32,24 @@ COPY vcpkg.json vcpkg-configuration.json ./
 RUN /opt/vcpkg/vcpkg install --triplet ${TRIPLET} --x-manifest-root=.
 
 COPY . .
+# LTO is intentionally OFF: the agent links against yuzu_proto (a non-LTO
+# static archive) plus libyuzu_agent_core (shared lib), and Debian gcc-13's
+# linker reports undefined-reference on protobuf type ctors/dtors when LTO
+# is enabled but the archives weren't compiled with -flto. Server build is
+# unaffected because its yuzu_proto static archive is private to its TU set.
 RUN meson setup builddir \
     --native-file meson/native/linux-gcc13.ini \
     --buildtype=release \
-    -Db_lto=true \
     -Dcmake_prefix_path=/src/vcpkg_installed/${TRIPLET} \
     -Dbuild_tests=false \
     -Dbuild_server=false \
     && meson compile -C builddir
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────
-FROM --platform=$TARGETPLATFORM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+FROM --platform=$TARGETPLATFORM debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 ca-certificates \
+    libssl3 libsqlite3-0 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu-agent \
     && mkdir -p /var/lib/yuzu-agent /usr/lib/yuzu/plugins \

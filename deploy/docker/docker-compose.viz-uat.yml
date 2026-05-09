@@ -65,8 +65,9 @@ services:
       - ${VIZ_UAT_CONFIG:-./viz-uat/yuzu-server.cfg}:/etc/yuzu/yuzu-server.cfg:ro
       - server-data:/var/lib/yuzu
     healthcheck:
+      # 127.0.0.1 not localhost (avoid IPv6-first resolve when server binds IPv4 only)
       test: ["CMD", "bash", "-c",
-             "exec 3<>/dev/tcp/localhost/8080 && printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q '200'"]
+             "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q '200'"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -89,7 +90,10 @@ services:
       server:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/healthz"]
+      # 127.0.0.1 (not localhost) — Alpine's getent resolves localhost to ::1
+      # first; the Erlang health endpoint binds IPv4 only, so the IPv6 lookup
+      # gets ECONNREFUSED.
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8081/healthz"]
       interval: 5s
       timeout: 3s
       retries: 30

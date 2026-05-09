@@ -76,77 +76,108 @@ cmd_fleet_snapshot() {
     fail "$VIZ_UAT_DIR/cookies.txt missing — run start first"
     exit 1
   fi
-  info "Dispatching crossplatform.tar.fleet_snapshot to all registered agents..."
 
-  # POST to /api/dashboard/run-instruction (or REST /api/v1/instructions/<id>/run).
-  # Use the legacy dashboard route since it's the simplest "fan-out to scope" path
-  # and start-UAT.sh's connectivity tests use it.
-  local cmd_id
-  cmd_id=$(curl -s -b "$VIZ_UAT_DIR/cookies.txt" \
-      -X POST "http://localhost:8080/api/dashboard/run-instruction" \
-      -d "id=crossplatform.tar.fleet_snapshot&scope=__all__" \
-      | grep -oE '"command_id"[[:space:]]*:[[:space:]]*"[a-f0-9-]+"' \
-      | grep -oE '[a-f0-9-]{36}' | head -1 || true)
+  # Re-login to refresh the cookie -- the start-time session may have been
+  # idle past the inactivity window. Cookie domain is "localhost" (the host
+  # name used for login), so all subsequent calls also go via localhost.
+  info "Refreshing operator session..."
+  curl -fsS -c "$VIZ_UAT_DIR/cookies.txt" \
+      "http://localhost:8080/login" \
+      -d "username=${ADMIN_USER}&password=${ADMIN_PASS}" -o /dev/null
 
-  if [ -z "$cmd_id" ]; then
-    warn "Could not parse command_id from /api/dashboard/run-instruction; "
-    warn "trying REST /api/v1/instructions/.../run as fallback..."
-    cmd_id=$(curl -s -b "$VIZ_UAT_DIR/cookies.txt" \
-        -X POST "http://localhost:8080/api/v1/instructions/crossplatform.tar.fleet_snapshot/run" \
-        -d "scope=__all__" \
-        | grep -oE '"command_id"[[:space:]]*:[[:space:]]*"[a-f0-9-]+"' \
-        | grep -oE '[a-f0-9-]{36}' | head -1 || true)
-  fi
-
-  if [ -z "$cmd_id" ]; then
-    fail "Could not dispatch tar.fleet_snapshot. Inspect:"
-    fail "  curl -v -b $VIZ_UAT_DIR/cookies.txt -X POST http://localhost:8080/api/dashboard/run-instruction -d 'id=crossplatform.tar.fleet_snapshot&scope=__all__'"
+  info "Looking up registered agents..."
+  local agents_json
+  agents_json=$(curl -fsS -b "$VIZ_UAT_DIR/cookies.txt" \
+      "http://localhost:8080/api/agents" 2>/dev/null)
+  local agent_ids_json
+  agent_ids_json=$(echo "$agents_json" \
+      | python3 -c 'import json,sys; print(json.dumps([a["agent_id"] for a in json.load(sys.stdin)]))')
+  local count
+  count=$(echo "$agent_ids_json" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+  if [ "$count" -lt 1 ]; then
+    fail "No registered agents -- run 'bash scripts/start-viz-uat.sh status' to inspect"
     exit 1
   fi
-  ok "Dispatched: command_id=$cmd_id"
+  ok "Found $count registered agent(s)"
 
-  info "Waiting up to 15s for response..."
-  local waited=0 response=""
-  while [ "$waited" -lt 15 ]; do
-    response=$(curl -s -b "$VIZ_UAT_DIR/cookies.txt" \
-        "http://localhost:8080/api/v1/responses?instruction_id=$cmd_id" 2>/dev/null || true)
-    if echo "$response" | grep -q '"output"'; then
+  info "Dispatching crossplatform.tar.fleet_snapshot..."
+  local resp
+  resp=$(curl -fsS -b "$VIZ_UAT_DIR/cookies.txt" \
+      -H "Content-Type: application/json" \
+      -X POST "http://localhost:8080/api/instructions/crossplatform.tar.fleet_snapshot/execute" \
+      -d "{\"agent_ids\":$agent_ids_json}" || true)
+  local cmd_id
+  cmd_id=$(echo "$resp" | python3 -c \
+    'import json,sys;j=json.load(sys.stdin);print(j.get("command_id",""))' 2>/dev/null || true)
+  if [ -z "$cmd_id" ]; then
+    fail "Could not dispatch tar.fleet_snapshot:"
+    fail "  $resp"
+    exit 1
+  fi
+  ok "Dispatched: command_id=$cmd_id  (agents_reached=$(echo "$resp" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("agents_reached",0))'))"
+
+  info "Waiting up to 20s for response..."
+  local waited=0 response="" body
+  while [ "$waited" -lt 20 ]; do
+    body=$(curl -fsS -b "$VIZ_UAT_DIR/cookies.txt" \
+        "http://localhost:8080/api/responses/$cmd_id" 2>/dev/null || true)
+    if echo "$body" | grep -q '"output"'; then
+      response=$body
       break
     fi
     sleep 1
     waited=$((waited + 1))
   done
 
-  if ! echo "$response" | grep -q '"output"'; then
+  if [ -z "$response" ]; then
     fail "Timed out waiting for fleet_snapshot response"
-    fail "  curl -b $VIZ_UAT_DIR/cookies.txt 'http://localhost:8080/api/v1/responses?instruction_id=$cmd_id'"
+    fail "  curl -b $VIZ_UAT_DIR/cookies.txt 'http://localhost:8080/api/responses/$cmd_id'"
     exit 1
   fi
 
-  ok "Response received. Output (jq-formatted, key fields):"
-  echo "$response" | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-for r in data if isinstance(data, list) else data.get("responses", [data]):
-    out = r.get("output", "")
+  ok "Response received. Parsed fleet_snapshot.v1:"
+  YUZU_VIZ_RESP="$response" python3 - <<'PY'
+import json, os
+data = json.loads(os.environ['YUZU_VIZ_RESP'])
+rows = data if isinstance(data, list) else data.get('responses', data.get('data', [data]))
+if not isinstance(rows, list):
+    rows = [rows]
+for r in rows:
+    out = r.get('output', '')
     try:
         snap = json.loads(out)
-        print(f"  agent_id: {r.get(\"agent_id\", \"?\")}")
-        print(f"  schema:        {snap.get(\"schema\")}")
-        print(f"  schema_minor:  {snap.get(\"schema_minor\")}")
-        print(f"  hostname:      {snap.get(\"hostname\")}")
-        print(f"  local_ips:     {snap.get(\"local_ips\")}")
-        print(f"  processes:     {len(snap.get(\"processes\", []))} entries (truncated={snap.get(\"truncated_processes\")})")
-        print(f"  connections:   {len(snap.get(\"connections\", []))} entries (truncated={snap.get(\"truncated_connections\")})")
-        if snap.get("process_source_paused"): print("  process_source_paused: TRUE")
-        if snap.get("tcp_source_paused"):     print("  tcp_source_paused:     TRUE")
-        print(f"  first 3 processes: {[(p[\"pid\"], p[\"name\"]) for p in snap.get(\"processes\", [])[:3]]}")
-        print(f"  first 3 conns:     {[(c[\"proto\"], c[\"local_addr\"], c[\"local_port\"], c[\"remote_addr\"], c[\"remote_port\"]) for c in snap.get(\"connections\", [])[:3]]}")
+        agent_id = r.get('agent_id', '?')
+        schema = snap.get('schema')
+        minor = snap.get('schema_minor')
+        host = snap.get('hostname')
+        ips = snap.get('local_ips')
+        nproc = len(snap.get('processes', []))
+        nconn = len(snap.get('connections', []))
+        tp = snap.get('truncated_processes')
+        tc = snap.get('truncated_connections')
+        print('  agent_id:      ' + str(agent_id))
+        print('  schema:        ' + str(schema) + ' (minor=' + str(minor) + ')')
+        print('  hostname:      ' + str(host))
+        print('  local_ips:     ' + str(ips))
+        print('  processes:     ' + str(nproc) + ' entries (truncated=' + str(tp) + ')')
+        print('  connections:   ' + str(nconn) + ' entries (truncated=' + str(tc) + ')')
+        if snap.get('process_source_paused'):
+            print('  process_source_paused: TRUE')
+        if snap.get('tcp_source_paused'):
+            print('  tcp_source_paused:     TRUE')
+        if nproc:
+            sample = [(p['pid'], p['name'], p.get('user', '')) for p in snap['processes'][:5]]
+            print('  first 5 procs: ' + str(sample))
+        if nconn:
+            sample = [(c['proto'], c['local_addr'] + ':' + str(c['local_port']),
+                       '->', c['remote_addr'] + ':' + str(c['remote_port']),
+                       c['state']) for c in snap['connections'][:5]]
+            print('  first 5 conns: ' + str(sample))
         print()
     except Exception as e:
-        print(f"  (unparseable output: {e})")
-        print(f"  raw: {out[:200]}")
-'
+        print('  (unparseable output, len=' + str(len(out)) + ': ' + str(e) + ')')
+        print('  raw[:300]: ' + out[:300])
+PY
 }
 
 # ── Generate server config ─────────────────────────────────────────────────
@@ -170,24 +201,37 @@ build_images() {
     info "VIZ_UAT_SKIP_BUILD=1 — skipping docker build"
     return
   fi
-  info "Building images for $VIZ_UAT_PLATFORM (this can take 25-40 min on first run)..."
+
+  # vcpkg triplet derived from host arch. Server + agent Dockerfiles take a
+  # --build-arg TRIPLET= (default x64-linux, override for arm64-linux).
+  local triplet
+  case "$VIZ_UAT_PLATFORM" in
+    linux/arm64) triplet=arm64-linux ;;
+    linux/amd64|linux/x64) triplet=x64-linux ;;
+    *) fail "unsupported VIZ_UAT_PLATFORM=$VIZ_UAT_PLATFORM"; exit 1 ;;
+  esac
+  info "Building images for $VIZ_UAT_PLATFORM (vcpkg triplet=$triplet) — first run is 25-40 min..."
   cd "$REPO_ROOT"
 
-  # buildx is required for --platform; Docker Desktop installs it by default.
-  for svc_dockerfile in \
-      "yuzu-server-viz-uat:latest:deploy/docker/Dockerfile.server" \
-      "yuzu-gateway-viz-uat:latest:deploy/docker/Dockerfile.gateway" \
-      "yuzu-agent-viz-uat:latest:deploy/docker/Dockerfile.agent"; do
-    local image=${svc_dockerfile%%:latest:*}:latest
-    local dockerfile=${svc_dockerfile##*:latest:}
-    info "  building $image ..."
-    docker build \
-        --platform "$VIZ_UAT_PLATFORM" \
-        -t "$image" \
-        -f "$dockerfile" \
-        .
-    ok "  built $image"
-  done
+  info "  building yuzu-server-viz-uat:latest ..."
+  docker build --platform "$VIZ_UAT_PLATFORM" \
+      --build-arg "TRIPLET=$triplet" \
+      -t yuzu-server-viz-uat:latest \
+      -f deploy/docker/Dockerfile.server .
+  ok "  built yuzu-server-viz-uat:latest"
+
+  info "  building yuzu-gateway-viz-uat:latest ..."
+  docker build --platform "$VIZ_UAT_PLATFORM" \
+      -t yuzu-gateway-viz-uat:latest \
+      -f deploy/docker/Dockerfile.gateway .
+  ok "  built yuzu-gateway-viz-uat:latest"
+
+  info "  building yuzu-agent-viz-uat:latest ..."
+  docker build --platform "$VIZ_UAT_PLATFORM" \
+      --build-arg "TRIPLET=$triplet" \
+      -t yuzu-agent-viz-uat:latest \
+      -f deploy/docker/Dockerfile.agent .
+  ok "  built yuzu-agent-viz-uat:latest"
 }
 
 # ── Wait helpers ───────────────────────────────────────────────────────────

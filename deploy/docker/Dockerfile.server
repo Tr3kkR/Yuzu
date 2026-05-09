@@ -22,17 +22,25 @@
 #   docker build -t yuzu-server -f deploy/docker/Dockerfile.server .
 
 # ── Stage 1: deps — toolchain + vcpkg packages (cached when vcpkg.json unchanged) ─
-FROM --platform=$TARGETPLATFORM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b AS deps
+FROM --platform=$TARGETPLATFORM debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b AS deps
 
-# TARGETARCH is set by Docker buildx (amd64 / arm64). Translate to the vcpkg
-# triplet name (x64-linux / arm64-linux) so the same Dockerfile can build for
-# either arch without modification.
-ARG TARGETARCH=amd64
-ENV TRIPLET=${TARGETARCH/amd64/x64}-linux
+# TRIPLET selects the vcpkg target. Pass --build-arg TRIPLET=arm64-linux for
+# arm64; the default keeps the historical x64 build behaviour.
+# (Pattern-substitution `${TARGETARCH/amd64/x64}` is unreliable: Docker's
+# Dockerfile-level expansion supports it but BuildKit's auto-populated
+# TARGETARCH only lands when no default value is given, and shell expansion
+# at RUN time depends on bash which dash-Debian doesn't have. Explicit
+# --build-arg sidesteps both pitfalls.)
+ARG TRIPLET=x64-linux
 
+# Base: debian:trixie-slim (Debian 13). gcc-13 13.3.0 ships in main; CDN
+# (deb.debian.org) is reliably reachable when Canonical's archive.ubuntu.com /
+# ports.ubuntu.com are blocked at the network egress (the trigger for this
+# switch — every ubuntu.com mirror was unreachable from the build host).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
-    curl zip unzip tar git ca-certificates python3-pip \
+    curl zip unzip tar git ca-certificates \
+    python3-pip python3-venv python3-yaml \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
     && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
     && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-13 100 \
@@ -74,19 +82,19 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 # ── Stage 3: runtime ─────────────────────────────────────────────────────
 #
 # RUNTIME INVARIANT: bash is required by docker-compose.uat.yml's healthcheck
-# (`bash -c 'exec 3<>/dev/tcp/localhost/8080 && ...'`). Ubuntu 24.04 ships
-# /bin/bash by default. Do not switch this base image to a minimal/distroless
-# variant or strip bash without first updating every compose file's healthcheck
-# block to use a tool that the new base provides (busybox wget, nc, etc.).
-# Governance Gate 7, architect SHOULD-2.
-FROM --platform=$TARGETPLATFORM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+# (`bash -c 'exec 3<>/dev/tcp/localhost/8080 && ...'`). debian:trixie-slim
+# does not ship /bin/bash; the apt install line below adds it explicitly.
+# If you switch this base image to a minimal/distroless variant, also update
+# every compose file's healthcheck block to use a tool the new base provides
+# (busybox wget, nc, etc.). Governance Gate 7, architect SHOULD-2.
+FROM --platform=$TARGETPLATFORM debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b
 
 # /var/log/yuzu uses 0750 (not the default 0755) to align with the deb postinst
 # (deploy/packaging/debian/postinst) and prevent log disclosure to other UIDs
 # in the container. Governance Gate 7, security LOW + release-deploy S-1 +
 # consistency N2.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 ca-certificates \
+    libssl3 libsqlite3-0 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu \
     && mkdir -p /var/lib/yuzu /etc/yuzu \
