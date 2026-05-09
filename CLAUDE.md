@@ -112,6 +112,35 @@ bash scripts/start-UAT.sh stop     # kill all
 bash scripts/start-UAT.sh status   # show running processes
 ```
 
+### viz-UAT (container-based, feat/viz-engine ladder)
+
+A separate container-based UAT stack lives at `scripts/start-viz-uat.sh` for the visualization feature ladder. It is **not** a replacement for `start-UAT.sh` — both bind host port 8080 and cannot run simultaneously.
+
+```bash
+bash scripts/start-viz-uat.sh                    # build + start + verify (~25-40 min cold, ~2 min cached)
+bash scripts/start-viz-uat.sh fleet-snapshot     # dispatch tar.fleet_snapshot + parse response
+bash scripts/start-viz-uat.sh status             # docker compose ps + last logs per service
+bash scripts/start-viz-uat.sh stop               # docker compose down -v + clean state dir
+```
+
+Differences from `start-UAT.sh`:
+
+| Property | `start-UAT.sh` | `start-viz-uat.sh` |
+|---|---|---|
+| Runtime | Native host processes | Three Docker containers (server + gateway + agent) |
+| Build | Reuses `build-{linux,macos,windows}/` | Builds inside `debian:trixie-slim` images (vcpkg + meson) |
+| Arch support | Host arch only | Apple Silicon arm64 (auto-detected) + linux/amd64 |
+| State dir | `/tmp/yuzu-uat/` | `/tmp/yuzu-viz-uat/` + Docker named volumes |
+| Analytics stack | Full (Prometheus, Grafana, ClickHouse) | None (viz feature does not exercise analytics yet) |
+| Scaling agents | One agent | `VIZ_UAT_AGENTS=N bash scripts/start-viz-uat.sh start` or `docker compose -f docker-compose.viz-uat.yml up -d --scale agent=N` |
+| Credentials | `admin / adminpassword1` (PBKDF2) | `admin / adminpassword1` (same posture) |
+
+**Docker arm64 build.** The Dockerfiles accept `--build-arg TRIPLET=arm64-linux` to select the `arm64-linux` vcpkg triplet. Unlike the meson cross-file (which cross-compiles from x64), this builds natively inside an `arm64` container — BuildKit pulls the arm64 base image automatically when `--platform linux/arm64` is passed. `start-viz-uat.sh` sets this automatically based on `uname -m`. Default ARG `TRIPLET=x64-linux` preserves the historical x64 path for `release.yml` (which still publishes amd64 only).
+
+**Compose file usage.** `deploy/docker/docker-compose.viz-uat.yml` requires `VIZ_UAT_CONFIG` to be set to an absolute path of a generated `yuzu-server.cfg`; the launcher exports it. Do not invoke `docker compose -f docker-compose.viz-uat.yml up` directly — go through the launcher.
+
+**Why two UAT scripts coexist.** `start-UAT.sh` is the canonical full UAT for change-management and pre-commit testing (`/test` skill). `start-viz-uat.sh` is dev-only infrastructure for the visualization feature ladder, with the renderer (PR 5+) eventually rendering against the live three-container stack. Once the renderer ships, the viz-UAT will gain a headless-browser smoke test step.
+
 ### Port assignments
 
 Server and gateway defaults do not conflict — all three components can run on the same box without overrides:

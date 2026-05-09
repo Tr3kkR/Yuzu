@@ -285,9 +285,12 @@ cmd_start() {
       "http://localhost:8080/login" \
       -d "username=${ADMIN_USER}&password=${ADMIN_PASS}" -o /dev/null
   local token_html
+  # Field name is `ttl_hours` per settings_routes.cpp:3167; the previous
+  # `ttl=86400` was silently dropped (resulting token had time_point::max
+  # expiry). 24h is plenty for a UAT session. (gov round 2, DEP-R2-1.)
   token_html=$(curl -fsS -b "$VIZ_UAT_DIR/cookies.txt" \
       -X POST "http://localhost:8080/api/settings/enrollment-tokens" \
-      -d "label=viz-uat&max_uses=1000&ttl=86400")
+      -d "label=viz-uat&max_uses=1000&ttl_hours=24")
   local enroll_token
   enroll_token=$(echo "$token_html" | grep -oE '[a-f0-9]{64}' | head -1)
   if [ -z "$enroll_token" ]; then
@@ -296,6 +299,8 @@ cmd_start() {
     exit 1
   fi
   echo "$enroll_token" > "$VIZ_UAT_DIR/enrollment-token"
+  chmod 600 "$VIZ_UAT_DIR/enrollment-token"
+  chmod 600 "$VIZ_UAT_DIR/cookies.txt" 2>/dev/null || true
   ok "Enrollment token issued (saved to $VIZ_UAT_DIR/enrollment-token)"
 
   # Phase 3: agent(s)

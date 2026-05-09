@@ -3,7 +3,7 @@
 # Run:    docker run --network host yuzu-agent --server localhost:50051 --no-tls
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────
-FROM --platform=$TARGETPLATFORM debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b AS builder
+FROM debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b AS builder
 
 # TRIPLET selects the vcpkg target. Pass --build-arg TRIPLET=arm64-linux for
 # arm64; default keeps the historical x64 build path.
@@ -32,11 +32,15 @@ COPY vcpkg.json vcpkg-configuration.json ./
 RUN /opt/vcpkg/vcpkg install --triplet ${TRIPLET} --x-manifest-root=.
 
 COPY . .
-# LTO is intentionally OFF: the agent links against yuzu_proto (a non-LTO
-# static archive) plus libyuzu_agent_core (shared lib), and Debian gcc-13's
-# linker reports undefined-reference on protobuf type ctors/dtors when LTO
-# is enabled but the archives weren't compiled with -flto. Server build is
-# unaffected because its yuzu_proto static archive is private to its TU set.
+# LTO is intentionally OFF for the agent: linking the executable across the
+# DSO boundary (libyuzu_agent_core.so) plus the static yuzu_proto archive
+# triggers Debian binutils 2.43+ undefined-reference errors on protobuf
+# type ctors/dtors. The same gcc-13 + binutils on Ubuntu noble swallowed
+# the mismatch silently; trixie's binutils is stricter about LTO contract
+# at DSO/static-archive boundaries. Server build keeps LTO because its
+# yuzu_proto archive is private to its TU set with no DSO crossing. The
+# proper fix is to propagate -flto into yuzu_proto's archive build, which
+# is a meson refactor out of scope for this PR.
 RUN meson setup builddir \
     --native-file meson/native/linux-gcc13.ini \
     --buildtype=release \
@@ -46,7 +50,7 @@ RUN meson setup builddir \
     && meson compile -C builddir
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────
-FROM --platform=$TARGETPLATFORM debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b
+FROM debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 libsqlite3-0 ca-certificates bash \

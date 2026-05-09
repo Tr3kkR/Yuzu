@@ -1,5 +1,14 @@
 # Yuzu Viz-UAT — server + gateway + agent in containers, no analytics stack
 #
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  DEV / UAT ONLY — DO NOT DEPLOY TO PRODUCTION                            ║
+# ║  This compose runs server with --no-tls --no-https --metrics-no-auth     ║
+# ║  --no-analytics --no-nvd-sync --no-ota. The launcher bakes               ║
+# ║  admin/adminpassword1 into yuzu-server.cfg. None of those flags or       ║
+# ║  credentials belong in any production deployment. If you are looking     ║
+# ║  for a production reference, see docs/user-manual/server-admin.md.       ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+#
 # Minimal three-service compose for exercising the feat/viz-engine ladder:
 #   * tar.fleet_snapshot action (PR 1)
 #   * FleetTopologyStore (PR 2; not yet REST-exposed)
@@ -10,21 +19,20 @@
 #   Server --> Gateway(:50063)  --> Agent            (command fanout)
 #   Operator (host) --> Server(:8080)                (REST API + dashboard)
 #
-# All three images build for the host's architecture via TARGETARCH-driven
-# Dockerfiles. On Apple Silicon (arm64) Docker buildx runs the build natively
-# in a linux/arm64 VM. Same Dockerfiles produce x64 images on Linux x64 hosts.
+# Both server and agent images build for the host's architecture via the
+# `--build-arg TRIPLET=arm64-linux` override the launcher applies. On Apple
+# Silicon Docker buildx runs the build natively in a linux/arm64 VM. The same
+# Dockerfiles produce x64 images on Linux x64 hosts (default TRIPLET=x64-linux).
 #
-# Usage:
+# Usage (always go through the launcher, not direct compose):
 #   bash scripts/start-viz-uat.sh           # build + start + verify
 #   bash scripts/start-viz-uat.sh stop      # docker compose down -v
 #   bash scripts/start-viz-uat.sh status    # ps + last logs
 #
-# Or directly:
-#   YUZU_ENROLLMENT_TOKEN=<token> docker compose \
-#     -f deploy/docker/docker-compose.viz-uat.yml up -d
-#
-# scripts/start-viz-uat.sh handles config generation + token issuance so the
-# compose itself stays declarative.
+# Direct `docker compose up` requires VIZ_UAT_CONFIG to point at an existing
+# yuzu-server.cfg (the launcher generates one with PBKDF2-hashed admin
+# credentials). Without VIZ_UAT_CONFIG set, compose treats the bind path as
+# missing -- there is no safe default.
 
 services:
   # ── Yuzu Server (gateway mode, no analytics, no NVD sync) ───────────────
@@ -62,7 +70,13 @@ services:
       - "8080:8080"   # Web dashboard + REST API (operator-facing)
       - "50055:50055" # Gateway upstream (debugging convenience)
     volumes:
-      - ${VIZ_UAT_CONFIG:-./viz-uat/yuzu-server.cfg}:/etc/yuzu/yuzu-server.cfg:ro
+      # VIZ_UAT_CONFIG must be set explicitly -- the launcher always exports
+      # it after generate_config() writes the cfg file. There is no compose
+      # default because the previous default `./viz-uat/yuzu-server.cfg`
+      # resolved relative to the compose-file directory (deploy/docker/),
+      # not the launcher's $VIZ_UAT_DIR, and silently bound a non-existent
+      # path. (governance round 2, xp-B1.)
+      - ${VIZ_UAT_CONFIG:?Set VIZ_UAT_CONFIG to an absolute path -- usually start-viz-uat.sh handles this}:/etc/yuzu/yuzu-server.cfg:ro
       - server-data:/var/lib/yuzu
     healthcheck:
       # 127.0.0.1 not localhost (avoid IPv6-first resolve when server binds IPv4 only)
