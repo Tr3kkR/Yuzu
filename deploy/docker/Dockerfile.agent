@@ -3,7 +3,13 @@
 # Run:    docker run --network host yuzu-agent --server localhost:50051 --no-tls
 
 # ── Stage 1: Build ────────────────────────────────────────────────────────
-FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b AS builder
+FROM --platform=$TARGETPLATFORM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b AS builder
+
+# TARGETARCH is set by Docker buildx (amd64 / arm64). Translate to the vcpkg
+# triplet name (x64-linux / arm64-linux) so the same Dockerfile builds for
+# either arch.
+ARG TARGETARCH=amd64
+ENV TRIPLET=${TARGETARCH/amd64/x64}-linux
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake ninja-build gcc-13 g++-13 pkg-config \
@@ -17,20 +23,20 @@ ENV VCPKG_ROOT=/opt/vcpkg
 
 WORKDIR /src
 COPY vcpkg.json vcpkg-configuration.json ./
-RUN /opt/vcpkg/vcpkg install --triplet x64-linux --x-manifest-root=.
+RUN /opt/vcpkg/vcpkg install --triplet ${TRIPLET} --x-manifest-root=.
 
 COPY . .
 RUN meson setup builddir \
     --native-file meson/native/linux-gcc13.ini \
     --buildtype=release \
     -Db_lto=true \
-    -Dcmake_prefix_path=/src/vcpkg_installed/x64-linux \
+    -Dcmake_prefix_path=/src/vcpkg_installed/${TRIPLET} \
     -Dbuild_tests=false \
     -Dbuild_server=false \
     && meson compile -C builddir
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────
-FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
+FROM --platform=$TARGETPLATFORM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 ca-certificates \
