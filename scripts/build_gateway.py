@@ -49,6 +49,8 @@ if sys.platform == "win32":
         cmd = [escript, rebar3_escript, "compile"]
     else:
         cmd = ["rebar3", "compile"]
+else:
+    cmd = ["rebar3", "compile"]
 
 result = subprocess.run(cmd, cwd=gateway_dir, env=env)
 sys.exit(result.returncode)
