@@ -17,6 +17,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
+#include <yuzu/agent/detail/parse_target_address.hpp>
 #include <yuzu/agent/updater.hpp>
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
@@ -128,48 +129,10 @@ std::string read_file_contents(const std::filesystem::path& p) {
     return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
 }
 
-// Parse "host:port" / "[ipv6]:port" into the transport's Endpoint.
-// Returns nullopt on malformed input. Mirrors the server-side parser
-// (server.cpp parse_listen_address) used in #376 PR 1c-2; same hardening
-// (noexcept, std::from_chars, IPv6 bracket form, port bounds-checked).
-[[nodiscard]] std::optional<::yuzu::transport::Endpoint>
-parse_target_address(std::string_view addr) noexcept {
-    ::yuzu::transport::Endpoint e{};
-    if (addr.empty())
-        return std::nullopt;
-    std::string_view port_sv;
-    if (addr.front() == '[') {
-        auto close = addr.find(']');
-        if (close == std::string_view::npos)
-            return std::nullopt;
-        // Keep the brackets in host so the gRPC backend's
-        // `host + ":" + port` construction yields a valid address literal.
-        e.host = std::string{addr.substr(0, close + 1)};
-        if (close + 1 == addr.size())
-            return std::nullopt;
-        if (addr[close + 1] != ':')
-            return std::nullopt;
-        port_sv = addr.substr(close + 2);
-    } else {
-        auto colon = addr.rfind(':');
-        if (colon == std::string_view::npos)
-            return std::nullopt;
-        e.host = std::string{addr.substr(0, colon)};
-        port_sv = addr.substr(colon + 1);
-    }
-    if (e.host.empty() || port_sv.empty())
-        return std::nullopt;
-    uint32_t port_raw = 0;
-    auto* first = port_sv.data();
-    auto* last = port_sv.data() + port_sv.size();
-    auto [ptr, ec] = std::from_chars(first, last, port_raw);
-    if (ec != std::errc{} || ptr != last)
-        return std::nullopt;
-    if (port_raw == 0 || port_raw > 0xFFFFu)
-        return std::nullopt;
-    e.port = static_cast<uint16_t>(port_raw);
-    return e;
-}
+// parse_target_address moved to <yuzu/agent/detail/parse_target_address.hpp>
+// so the agent unit test suite can exercise the rejection-path matrix in
+// isolation (governance QE-1, this round).
+using ::yuzu::agent::detail::parse_target_address;
 
 // RAII zeroisation of transport::Credentials private-key bytes on scope
 // exit. Mirrors the server-side guard in server.cpp (#376 PR 1c-2 gov

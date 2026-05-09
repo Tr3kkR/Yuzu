@@ -121,6 +121,12 @@ struct Config {
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only
 
     // Transport bidi dispatcher pool size (#904, governance UP-14).
+    // Applied to the agent-facing transport listener (port 50051) only;
+    // the management listener (port 50052) is still on the legacy
+    // grpc::ServerBuilder and is unaffected today. PR 1c-5 lifts the
+    // management plane onto transport::ServerListener, at which point
+    // this knob may need a sibling (e.g. mgmt_bidi_dispatcher_pool_size)
+    // if mgmt-plane bidi traffic appears.
     // 0 = backend default (auto-compute clamp(64, hardware_concurrency*8, 4096)).
     // Operators with direct-connect deployments above ~2K agents must
     // set this >= expected concurrent Subscribe count or front the

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **Agent unary RPCs lifted onto `transport::Channel` (#376 PR 1c-3).**
+  `Register`, `Heartbeat`, and `CheckForUpdate` now travel via
+  `yuzu::transport::Channel` (gRPC backend); `Subscribe` (bidi) and
+  `DownloadUpdate` (server-streaming) remain on the legacy
+  `grpc::Channel` + `pb::AgentService::Stub` for PR 1c-4. Both channels
+  coexist, share TLS material, and reconnect with a deliberately
+  asymmetric backoff window (transport: 1s→5min, jittered 20%; legacy:
+  gRPC defaults). Internal change — no operator-visible behaviour. The
+  legacy half disappears in PR 1c-4 once `Subscribe` and
+  `DownloadUpdate` lift; #902 (DownloadUpdate idle-read deadline) is
+  the only remaining hard predecessor.
 - **gRPC → QUIC transport migration in progress (#376).** A multi-PR
   internal migration is underway to replace the gRPC transport with
   QUIC (msquic on the C++ side, quicer on the Erlang gateway). No
@@ -21,6 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   begin at PR 6 (agent default-flip). See ADR-0001
   (`docs/adrs/0001-quic-transport-msquic-quicer.md`) for the full
   ladder.
+- **Gateway scaling direction captured in ADR-0002.** Proposed
+  direction toward WhatsApp/RabbitMQ density tier (10⁶ agents per
+  gateway node, 10⁵ as the floor) via process-per-connection on
+  quicer. Single-node first; clustering deferred to a follow-up ADR
+  gated on measured single-node ceiling. grpcbox removal rolls into
+  PR 4 of #376 — the QUIC migration is the natural inflection where
+  we own the connection lifecycle from the UDP socket up. ADR is
+  Status: Proposed pending project-lead sign-off and a 10⁴-agent soak
+  greenlight. See `docs/adrs/0002-gateway-scaling.md`.
 
 ### Fixed
 
@@ -56,6 +76,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--bidi-dispatcher-pool-size` CLI flag (server, #904 / governance
+  UP-14).** New flag (and `YUZU_BIDI_DISPATCHER_POOL_SIZE` env)
+  controls the bounded thread pool that runs the agent listener's
+  bidi-streaming RPCs (`Subscribe`, `DownloadUpdate`). Default
+  auto-computes to `clamp(64, hardware_concurrency × 8, 4096)`.
+  Direct-connect deployments above the default must raise the pool
+  to at least the expected concurrent Subscribe count; gateway-mode
+  deployments leave at default because the gateway terminates
+  Subscribe per-fleet. Does NOT apply to the management listener
+  (port 50052). See
+  [Bidi dispatcher pool sizing](docs/user-manual/server-admin.md#bidi-dispatcher-pool-sizing-direct-connect-deployments-only).
 - **Wall-clock `HH:MM:SS.mmm <TZ>` timestamps in the executions list
   and drawer.** Right-hand instruction-line timestamp and per-agent
   response arrival time now render in the operator's browser-local
@@ -84,6 +115,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Server agent listener: bounded bidi dispatcher pool (#904 /
+  governance UP-14).** The agent-facing transport listener now uses
+  a bounded thread pool for `Subscribe` and `DownloadUpdate` streams
+  instead of spawning one OS thread per active stream. Pool size
+  defaults to `clamp(64, hardware_concurrency × 8, 4096)`. **New
+  agent-visible error envelope:** when the pool is full, new
+  bidi-streaming RPCs are rejected with `StatusCode::ResourceExhausted`
+  detail `"transport: bidi dispatcher saturated"` rather than queueing
+  unboundedly or exhausting the OS thread budget. Closes the per-call
+  `std::thread` fanout that previously consumed ~8 MiB virtual stack
+  per active Subscribe (UP-14) and the cq_worker head-of-line block
+  on `handler_thread_.join()` (UP-13). Direct-connect deployments
+  with steady-state agent counts above the default must raise
+  `--bidi-dispatcher-pool-size` to match; gateway-mode deployments
+  see no behaviour change.
+- **Server systemd unit: `TasksMax=infinity` + `LimitNPROC=infinity`
+  (#904).** The shipped `deploy/systemd/yuzu-server.service` removes
+  the implicit cgroup-level thread budget so a configured
+  `--bidi-dispatcher-pool-size` is not silently throttled by systemd's
+  default `TasksMax` (~12K) or PAM `nproc`. Operators with custom
+  units must mirror this; operators on shared-tenant hosts who want
+  finite caps can override via `systemctl edit yuzu-server`. The
+  bounded dispatcher pool is the intended brake; `infinity` removes
+  a defence-in-depth control that compensates for plugin-side runaway
+  thread creation.
+- **Server compose files: `ulimits.nproc: 65536` + `pids_limit: -1`
+  (#904).** Both `deploy/docker/docker-compose.yml` and
+  `docker-compose.reference.yml` raise the container thread/process
+  budget to match the systemd defaults. Operators who copied the
+  reference compose lose the new ceilings on next pull and must
+  re-merge.
 - **Build-time content embed locked down — single source of truth.**
   Shipped `InstructionDefinition` YAMLs are embedded into
   `yuzu-server` at build time via `embed_content.py`; the runtime

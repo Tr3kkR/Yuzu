@@ -46,6 +46,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--management-cert` | *(none)* | Optional PEM cert for the **management listener** (port 50052 by default). If unset, the management listener reuses the agent listener's certificate. |
 | `--management-key` | *(none)* | Optional PEM key for the management listener. If `--management-cert`/`--management-key` are set without `--management-ca-cert`, the same `--insecure-skip-client-verify` + `YUZU_ALLOW_INSECURE_TLS=1` gate applies. |
 | `--management-ca-cert` | *(none)* | Optional CA cert for management client cert verification. Without this (and without `--insecure-skip-client-verify`), the management listener refuses to start. |
+| `--bidi-dispatcher-pool-size` | *(auto)* | Bounded thread pool size for the **agent listener's** bidi-streaming RPCs (`Subscribe`, `DownloadUpdate`). Default auto-computes to `clamp(64, hardware_concurrency × 8, 4096)`. Direct-connect deployments with steady-state agent counts above the default must raise this to at least the expected concurrent Subscribe count plus headroom; gateway-mode deployments can leave at default because the gateway terminates Subscribe per-fleet. Saturation rejects new bidi RPCs with `StatusCode::ResourceExhausted "transport: bidi dispatcher saturated"`. Does **not** apply to the management listener (port 50052). See [Bidi dispatcher pool sizing](#bidi-dispatcher-pool-sizing-direct-connect-deployments-only) for sizing guidance and OS thread-budget tuning. Env: `YUZU_BIDI_DISPATCHER_POOL_SIZE`. |
 | `--https-port` | `8443` | HTTPS listen port. |
 | `--https-cert` | *(none)* | Path to PEM-encoded TLS certificate file. Required unless `--no-https` is set. |
 | `--https-key` | *(none)* | Path to PEM-encoded TLS private key file. Required unless `--no-https` is set. The file must not be world-readable (Unix: `chmod 600`). |
@@ -845,12 +846,16 @@ The agent-facing transport listener runs a bounded thread pool for bidi-streamin
 
 **Default (auto-compute):** `clamp(64, hardware_concurrency × 8, 4096)` threads. On a 16-core server this is 128; on a 64-core server it is 512. Suitable for development, small fleets (<2K direct-connect agents), and **all gateway-mode deployments** regardless of fleet size.
 
-**When to raise it:** if you run **direct-connect** (no gateway in front of the server) and your steady-state Subscribe count exceeds the default, the listener will reject new Subscribe streams with `StatusCode::ResourceExhausted "transport: bidi dispatcher saturated"` once the pool is full. Each long-lived Subscribe holds one pool slot for the connection lifetime, so the pool must be sized at least as large as the expected concurrent agent count plus headroom for `DownloadUpdate` calls and dashboard SSE-equivalent surfaces. Set it explicitly in your server config or dashboard `ListenerOptions` once the field is exposed:
+**When to raise it:** if you run **direct-connect** (no gateway in front of the server) and your steady-state Subscribe count exceeds the default, the listener will reject new Subscribe streams with `StatusCode::ResourceExhausted "transport: bidi dispatcher saturated"` once the pool is full. Each long-lived Subscribe holds one pool slot for the connection lifetime, so the pool must be sized at least as large as the expected concurrent agent count plus headroom for `DownloadUpdate` calls and dashboard SSE-equivalent surfaces. Set it explicitly via the CLI flag or environment variable:
 
-```
+```bash
 # 10K direct-connect agents + 20% headroom + DownloadUpdate budget
-bidi_dispatcher_pool_size = 12500
+./yuzu-server --bidi-dispatcher-pool-size 12500 ...
+# or via environment
+YUZU_BIDI_DISPATCHER_POOL_SIZE=12500 ./yuzu-server ...
 ```
+
+A dashboard surface for `ListenerOptions` is not yet exposed; configure via flag or env only.
 
 **Gateway-mode does NOT need this knob** — the gateway terminates Subscribe per-fleet (one process per agent, lightweight), and the server only sees one upstream stream per gateway node. The default pool comfortably covers tens of gateway nodes.
 

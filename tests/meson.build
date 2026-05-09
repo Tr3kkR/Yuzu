@@ -88,6 +88,7 @@ agent_test_openssl_dep = dependency('openssl', required: true, include_type: 'sy
 agent_test_exe = executable(
   'yuzu_agent_tests',
   files(
+    'unit/test_parse_target_address.cpp',
     'unit/test_plugin_loader.cpp',
     'unit/test_sdk_utilities.cpp',
     'unit/test_temp_file.cpp',
@@ -106,7 +107,15 @@ agent_test_exe = executable(
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
   ],
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
+  dependencies: [
+    yuzu_agent_core_dep,
+    yuzu_sdk_dep,
+    agent_test_proto_dep,
+    yuzu_transport_dep,
+    nlohmann_dep,
+    catch2_dep,
+    agent_test_openssl_dep,
+  ],
   # Ensure the fixture plugin is built before the test runs so the lookup
   # inside test_plugin_loader.cpp finds it under MESON_BUILD_ROOT/tests/.
   link_depends: reserved_name_fixture_plugin,

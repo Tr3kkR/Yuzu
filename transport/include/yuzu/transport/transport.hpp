@@ -565,13 +565,41 @@ struct ListenerOptions {
     // 80 GiB virtual address space) the implicit fanout exhausted thread
     // creation budgets and head-of-line-blocked the cq_worker on
     // handler_thread_.join() (UP-13). Implementations MUST cap the
-    // dispatcher's concurrent thread count at this value and reject
-    // overflow with StatusCode::ResourceExhausted "transport: bidi
-    // dispatcher saturated" (rather than queueing unboundedly).
+    // dispatcher's concurrent thread count at this value.
+    //
+    // ── Saturation rejection contract (cross-backend) ────────────────────
+    // When in-flight handler count == pool size, new submissions MUST be
+    // REJECTED (not queued) by emitting:
+    //   * Status::code == StatusCode::ResourceExhausted, AND
+    //   * Status::detail exactly equal to the string literal
+    //     "transport: bidi dispatcher saturated".
+    // The exact-string mandate is load-bearing: operator dashboards and
+    // alert rules key on the literal text to distinguish capacity events
+    // from internal-throw failures (which use the distinct
+    // "transport: bidi dispatcher unavailable" detail). Both backends
+    // (gRPC today, msquic in #376 PR 3) MUST honour the literal text.
+    //
+    // ── Per-listener scope ───────────────────────────────────────────────
+    // This field configures THIS listener's pool only — it is NOT a
+    // process-wide setting. A server hosting multiple ServerListeners
+    // (eg. one for the agent-facing port and one for the management port)
+    // sets this independently per listener. Today only the agent-facing
+    // listener is on transport::ServerListener (#376 PR 1c-2); the
+    // management plane lifts in PR 1c-5, at which point operators MAY
+    // need a second knob if mgmt-plane bidi traffic appears.
+    //
+    // ── Drain ordering (cross-backend) ───────────────────────────────────
+    // Implementations MUST drain the bidi handler pool only AFTER the
+    // frame reader (cq_worker on gRPC; the analogous QUIC frame loop on
+    // msquic) has exited, so handlers parked on backend-internal
+    // condition variables observe completion events before the pool joins
+    // its workers. Reversing this order risks shutdown deadlock.
     //
     // Sizing guidance:
     //   * Zero => backend picks a sensible default (gRPC: clamp(64,
-    //     hardware_concurrency * 8, 4096); msquic: same).
+    //     hardware_concurrency * 8, 4096), with hardware_concurrency==0
+    //     treated as 4 to keep the floor at 64 in containers; msquic:
+    //     SHOULD match — see #376 PR 3 implementation comment).
     //   * Operators with steady-state >N concurrent bidi streams (eg.
     //     long-lived Subscribes per fleet agent on direct-connect
     //     deployments) MUST set this >= expected steady-state count, or
@@ -582,10 +610,10 @@ struct ListenerOptions {
     //     backpressure: a saturated server fails fast so callers retry
     //     elsewhere rather than amassing OS threads to exhaustion.
     //
-    // Bidi-only: unary handlers run on the cq_worker thread and are NOT
-    // gated by this pool (they are CPU-bound, run-to-completion, and
-    // the cq_worker drains them serially per the AsyncGenericService
-    // model).
+    // Bidi-only: unary handlers run on the cq_worker thread (or backend
+    // equivalent) and are NOT gated by this pool — they are CPU-bound,
+    // run-to-completion, and the frame reader drains them serially per
+    // the AsyncGenericService model.
     uint32_t bidi_dispatcher_pool_size = 0;
 
     // Maximum size of a single framed protobuf message accepted on

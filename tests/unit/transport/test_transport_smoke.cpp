@@ -1260,21 +1260,41 @@ TEST_CASE("Bidi pool rejects overflow with ResourceExhausted",
     // Pool size 1. Hold one bidi call open with a handler that blocks
     // on read until told to release. A second concurrent dispatch must
     // see ResourceExhausted because the single pool slot is occupied.
+    //
+    // Synchronisation is event-based, NOT sleep-based (governance QE-2,
+    // #473): the handler signals `handler_entered = true` once it has
+    // acquired the pool slot, and the test thread waits for that signal
+    // before issuing the saturating second dispatch. This pins the
+    // saturation invariant deterministically — without it, a slow
+    // CI runner (Defender-induced I/O serialisation on
+    // yuzu-local-windows is the canonical case) would race the second
+    // dispatch ahead of the pool worker, the second call would succeed,
+    // and the test would flake.
     auto listener = make_server_listener(Backend::Grpc);
     REQUIRE(listener != nullptr);
 
-    std::mutex release_mtx;
-    std::condition_variable release_cv;
+    std::mutex sync_mtx;
+    std::condition_variable sync_cv;
+    bool handler_entered = false;
     bool release_handler = false;
 
     auto blocking_handler = [&](const CallContext&, BidiStream& stream) -> Status {
         StringMessage msg;
+        {
+            // Signal the test thread that we are inside the handler and
+            // therefore holding the pool slot. The test will not issue
+            // the saturating second dispatch until it observes this.
+            std::lock_guard<std::mutex> lock(sync_mtx);
+            handler_entered = true;
+        }
+        sync_cv.notify_all();
         // Wait until the test signals release before we exit. While we
         // are waiting, the pool slot stays occupied.
-        std::unique_lock<std::mutex> lock(release_mtx);
-        release_cv.wait(lock, [&] { return release_handler; });
+        {
+            std::unique_lock<std::mutex> lock(sync_mtx);
+            sync_cv.wait(lock, [&] { return release_handler; });
+        }
         // After release, drain any pending reads and exit.
-        lock.unlock();
         while (stream.read(msg)) {}
         return Status{StatusCode::Ok, ""};
     };
@@ -1303,8 +1323,13 @@ TEST_CASE("Bidi pool rejects overflow with ResourceExhausted",
     REQUIRE(first != nullptr);
     StringMessage seed("seed");
     REQUIRE(first->write(seed));
-    // Give the server a moment to dispatch the handler onto the pool.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Wait deterministically until the handler has acquired the pool
+    // slot. Bounded by 5s so a wedged handler fails the test rather
+    // than hanging the suite.
+    {
+        std::unique_lock<std::mutex> lock(sync_mtx);
+        REQUIRE(sync_cv.wait_for(lock, std::chrono::seconds(5), [&] { return handler_entered; }));
+    }
 
     // Second call — pool is saturated. Server schedules Finish with
     // ResourceExhausted via the UnaryPendingFinish reaper path.
@@ -1322,10 +1347,10 @@ TEST_CASE("Bidi pool rejects overflow with ResourceExhausted",
     // Release the first handler so it exits the pool slot. After this
     // a third call must succeed.
     {
-        std::lock_guard<std::mutex> lock(release_mtx);
+        std::lock_guard<std::mutex> lock(sync_mtx);
         release_handler = true;
     }
-    release_cv.notify_all();
+    sync_cv.notify_all();
     first->writes_done();
     StringMessage drain1;
     REQUIRE_FALSE(first->read(drain1));
