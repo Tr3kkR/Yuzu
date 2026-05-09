@@ -199,9 +199,11 @@ the branch — land one, rebase the next.
     cycle-2 unary dispatched with the freshly-`emplace`d source.
     The suite documents that the gRPC backend's
     `populate_call_context_from_grpc` does not currently wire a
-    server-side stop_token (a `transport.hpp` contract claim that
-    the gRPC implementation does not yet honour) — separate
-    transport-layer follow-up.
+    server-side stop_token; the `transport.hpp` contract has been
+    softened to backend-best-effort (#916) so this gap is intentional
+    rather than a deviation. Server handlers detect peer disconnect via
+    `BidiStream::read()` returning false, which is the canonical
+    cross-backend pattern.
 
 ### PR 1c-5 — Server-side: lift `gateway_service_impl` + `ManagementServiceImpl` + gw_mgmt_channel_
 

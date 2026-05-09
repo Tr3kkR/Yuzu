@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **Server-side `CallContext::cancel` contract softened to backend-best-effort
+  (#916).** The historical `transport.hpp` claim that the transport manages a
+  per-call `stop_source` whose token surfaces peer disconnection on the server
+  side was aspirational — `populate_call_context_from_grpc` does not wire
+  `AsyncNotifyWhenDone` to a per-call source, so `CallContext::cancel` never
+  fires on the gRPC backend. The contract is now documented as backend-best-
+  effort: server handlers in this codebase already detect peer disconnect via
+  `BidiStream::read()` returning false (see `AgentServiceImpl::Subscribe` and
+  `AgentServiceImpl::DownloadUpdate`), which is reliable across backends and
+  the canonical pattern. Client-side `cancel` propagation is unchanged and
+  continues to reliably abort in-flight RPCs on all backends. Rationale (PR
+  1c-4 design): every current server handler is an event pump where `read()`
+  is the natural blocking primitive; promoting `cancel` to load-bearing would
+  require wiring `AsyncNotifyWhenDone` per call, which adds a CqTag to a hot
+  path that #904's bounded bidi dispatcher pool just fought to keep cheap.
+  Yuzu's submit-and-poll pattern keeps long-running work agent-side; server
+  handlers stay short and `read()`-driven, so this softening loses no
+  production functionality. Unblocks PR 1c-4 (#376).
 - **Agent unary RPCs lifted onto `transport::Channel` (#376 PR 1c-3).**
   `Register`, `Heartbeat`, and `CheckForUpdate` now travel via
   `yuzu::transport::Channel` (gRPC backend); `Subscribe` (bidi) and

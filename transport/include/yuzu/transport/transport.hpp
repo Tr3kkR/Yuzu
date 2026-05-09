@@ -323,11 +323,36 @@ struct Credentials {
 // the transport when constructing a CallContext for a dispatched call;
 // they are unused (empty) on the client side.
 //
-// Cancel propagation: client side passes its own stop_token. Server
-// side: the transport itself manages a stop_source whose token is
-// surfaced here, so handlers can detect peer disconnection and bail
-// early. Both sides observe `cancel.stop_requested()` to mean "abort
-// this call".
+// Cancel propagation:
+//
+//   * Client side: callers pass their own stop_token via
+//     `CallContext::cancel`. `cancel.stop_requested()` reliably aborts
+//     the in-flight RPC across all backends — the gRPC backend
+//     translates this to `gctx_.TryCancel()` via a stop_callback;
+//     msquic will translate to its native stream-shutdown primitive.
+//
+//   * Server side: `cancel` is BACKEND-BEST-EFFORT and may NEVER fire
+//     on the gRPC backend. The historical contract claimed the
+//     transport managed a per-call stop_source whose token surfaced
+//     peer disconnection; that wiring is not implemented on the gRPC
+//     backend and is deferred (#916). Server handlers in this codebase
+//     already detect peer disconnect via `read()` returning false on
+//     the BidiStream (see `AgentServiceImpl::Subscribe` and
+//     `AgentServiceImpl::DownloadUpdate`), which is reliable across
+//     backends and the canonical pattern. Do NOT add new server-side
+//     handlers that block on `cancel.stop_requested()` for peer-
+//     disconnect detection — use `read()`-returns-false instead, or
+//     add the gRPC AsyncNotifyWhenDone wiring under #916 first.
+//
+//     Rationale (2026-05-09 PR 1c-4 design grilling): every current
+//     server handler is an event pump where `read()` is the natural
+//     blocking primitive; promoting `cancel` to load-bearing would
+//     require wiring AsyncNotifyWhenDone per call, which adds a CqTag
+//     to a hot path that #904's bounded bidi dispatcher pool just
+//     fought to keep cheap. Yuzu's submit-and-poll pattern keeps
+//     long-running work agent-side; server handlers stay short and
+//     `read()`-driven, so this contract softening is no production
+//     functionality lost.
 //
 // Deadline = 0 (`std::chrono::milliseconds::zero()`) means "no
 // deadline" — matches the proto's deadline_unix_millis = 0 semantics.
