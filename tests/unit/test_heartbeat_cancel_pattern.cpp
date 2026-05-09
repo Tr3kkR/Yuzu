@@ -97,10 +97,10 @@ auto make_string_factory() {
 
 // Test harness — listener + channel pair pointed at the same ephemeral
 // port. Constructor performs full setup; destructor performs symmetric
-// shutdown. Built in-place at the call site (the embedded
-// `std::unique_ptr` members make the type non-copyable, and clang's
-// NRVO does not elide a `return UnaryFixture` from a static factory
-// here under C++23 / libc++ — see Catch2 + libc++ interaction).
+// shutdown. Built in-place at the call site by design: deleted move + copy
+// make the intent explicit (the listener+channel pair must be bound to
+// the test scope's lifetime so its `~UnaryFixture` runs before the next
+// test starts a fresh listener on the same port range).
 struct UnaryFixture {
     std::unique_ptr<::yuzu::transport::ServerListener> listener;
     std::unique_ptr<::yuzu::transport::Channel> channel;

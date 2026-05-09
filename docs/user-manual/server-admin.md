@@ -530,6 +530,34 @@ The server can distribute agent binary updates to enrolled endpoints.
 - Delete old versions to reclaim storage.
 - Only one version can be promoted (active) at a time.
 
+### Connection and timeout behaviour (since #902 / UP-8)
+
+The server enforces a **30-second idle-read deadline on the request frame** of every `DownloadUpdate` stream. The deadline applies *only* to the
+initial request frame — once the agent has sent the request and chunk
+streaming has started, there is no per-chunk deadline; chunk transfer time
+is bounded by binary size and network throughput, not by this control.
+
+**What an operator observes when the deadline fires:**
+
+* Server log line: `DownloadUpdate: idle-read deadline expired for peer=<agent-id-or-host:port> (pool slot released; agent will retry on next heartbeat)` (severity: warn).
+* Prometheus counter increment: `yuzu_grpc_requests_total{method="DownloadUpdate", status="deadline_exceeded"}`.
+* The agent observes wire status `Cancelled` (gRPC backend behaviour — see
+  `BidiStream` contract block in `transport/include/yuzu/transport/transport.hpp`)
+  and treats it as a generic update failure; the agent retries on its next
+  heartbeat cycle (default every 30 s) with no human intervention required.
+
+**Operational symptoms that should trigger investigation:**
+
+* `yuzu_grpc_requests_total{method="DownloadUpdate", status="deadline_exceeded"}` rate > 0 for 2 minutes — a fleet-wide misconfiguration (e.g., NAT/proxy delays the agent's first frame, agent build broken on initial connect) is silently retrying every heartbeat cycle.
+* `ResourceExhausted "transport: bidi dispatcher saturated"` paired with a high `deadline_exceeded` count — stalled peers are consuming pool slots and the deadline is the only mechanism freeing them; consider raising `--bidi-dispatcher-pool-size` or investigating the network path.
+* Agent log lines like `DownloadUpdate RPC failed: ... (code 1)` (where 1 = `Cancelled` per `transport::StatusCode`) repeating every heartbeat cycle — the same failure mode from the agent side.
+
+**What the deadline does NOT protect against:**
+
+* A slow legitimate transfer of a large binary on a slow link — chunk-streaming time has no deadline; size the pool's `TimeoutStopSec` for graceful shutdown accordingly (see "Graceful shutdown" below).
+* A malicious peer that sends a malformed request frame within the 30-second window — request validation occurs after the deadline-bounded read, so a peer that races the deadline still consumes a pool slot for the validation path.
+* Per-peer rate limiting — the deadline bounds slot-seconds per stalled stream, but a valid mTLS-authenticated client opening many streams in parallel is bounded only by the dispatcher pool size, not by per-peer counters. Tracked as a separate hardening item.
+
 ---
 
 ## RBAC Management
@@ -846,7 +874,7 @@ The agent-facing transport listener runs a bounded thread pool for bidi-streamin
 
 **Default (auto-compute):** `clamp(64, hardware_concurrency × 8, 4096)` threads. On a 16-core server this is 128; on a 64-core server it is 512. Suitable for development, small fleets (<2K direct-connect agents), and **all gateway-mode deployments** regardless of fleet size.
 
-**When to raise it:** if you run **direct-connect** (no gateway in front of the server) and your steady-state Subscribe count exceeds the default, the listener will reject new Subscribe streams with `StatusCode::ResourceExhausted "transport: bidi dispatcher saturated"` once the pool is full. Each long-lived Subscribe holds one pool slot for the connection lifetime, so the pool must be sized at least as large as the expected concurrent agent count plus headroom for `DownloadUpdate` calls and dashboard SSE-equivalent surfaces. Set it explicitly via the CLI flag or environment variable:
+**When to raise it:** if you run **direct-connect** (no gateway in front of the server) and your steady-state Subscribe count exceeds the default, the listener will reject new Subscribe streams with `StatusCode::ResourceExhausted "transport: bidi dispatcher saturated"` once the pool is full. Each long-lived Subscribe holds one pool slot for the connection lifetime, so the pool must be sized at least as large as the expected concurrent agent count plus headroom for `DownloadUpdate` calls and dashboard SSE-equivalent surfaces. Since #902, `DownloadUpdate` slots are bounded by a 30-second idle-read deadline on the request frame: a stalled or misbehaving agent that opens the stream and never sends the request frame has its slot reclaimed at 30 seconds, so headroom only needs to absorb peak *concurrent active* transfers, not stalled-forever streams. If you observe `ResourceExhausted` spikes lasting longer than 30 seconds on `DownloadUpdate` paths, the deadline may not be firing as expected — check `yuzu_grpc_requests_total{method="DownloadUpdate", status="deadline_exceeded"}` (see "Connection and timeout behaviour" under "OTA Agent Updates"). Set the pool explicitly via the CLI flag or environment variable:
 
 ```bash
 # 10K direct-connect agents + 20% headroom + DownloadUpdate budget

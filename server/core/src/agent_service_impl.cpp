@@ -1129,7 +1129,7 @@ AgentServiceImpl::CheckForUpdate(const ::yuzu::transport::CallContext& /*ctx*/,
 }
 
 ::yuzu::transport::Status
-AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& /*ctx*/,
+AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& ctx,
                                  ::yuzu::transport::BidiStream& stream) {
     using ::yuzu::transport::Status;
     using ::yuzu::transport::StatusCode;
@@ -1154,6 +1154,22 @@ AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& /*ctx*/,
         // final_status() to DeadlineExceeded only on the deadline path.
         const auto why = stream.final_status();
         if (why.code == StatusCode::DeadlineExceeded) {
+            // Operator-visible enforcement event (governance Gate 6 OBS-1
+            // / compliance F-1): emit a counter increment + warning log
+            // so dashboards can alert on deadline-induced slot churn and
+            // operators can attribute repeated DeadlineExceeded events
+            // to a specific peer. Peer identity is the canonical SAN
+            // identity from the mTLS handshake; falls back to peer_uri
+            // (host:port) when no SAN identities were validated.
+            metrics_
+                .counter("yuzu_grpc_requests_total",
+                         {{"method", "DownloadUpdate"}, {"status", "deadline_exceeded"}})
+                .increment();
+            const std::string peer =
+                ctx.peer_san_identities.empty() ? ctx.peer_uri : ctx.peer_san_identities.front();
+            spdlog::warn("DownloadUpdate: idle-read deadline expired for peer={} "
+                         "(pool slot released; agent will retry on next heartbeat)",
+                         peer);
             return Status{StatusCode::DeadlineExceeded,
                           "client did not send request frame within idle deadline"};
         }

@@ -23,6 +23,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   idle-deadline), and the agent-side wiring tests (`parse_target_address`
   via `1af8ab5`, Heartbeat per-cycle `stop_source` via this CHANGELOG's
   matching commit). PR 1c-4 itself is ready to be planned and shipped.
+- **Governance round 1 hardening for `1af8ab5..e075648`** (`#902` +
+  Heartbeat tests). Closes one BLOCKING + four convergent SHOULD findings
+  surfaced by Gates 2 / 4 / 6 reviewers. (1) `docs/user-manual/server-admin.md`
+  OTA Agent Updates section gained a "Connection and timeout behaviour"
+  subsection describing the 30 s idle-read deadline, what an operator
+  observes when it fires, and what investigation should follow; closes
+  doc-BLOCKING-1 (enterprise-readiness Finding 1). (2) `DownloadUpdate`
+  handler now emits `spdlog::warn` and increments
+  `yuzu_grpc_requests_total{method="DownloadUpdate", status="deadline_exceeded"}`
+  on every deadline expiry, including the peer SAN identity (or peer URI
+  fallback) — closes compliance F-1 (CC7.2 evidence gap), sre OBS-1, and
+  performance perf-S2 simultaneously. (3) Pool-sizing guidance in
+  `server-admin.md` updated to reflect post-#902 bounded-hold semantics:
+  headroom now only needs to absorb peak *concurrent active* transfers,
+  not stalled-forever streams; closes doc-SHOULD-1 / sre CAP-1. (4)
+  CLAUDE.md transport routed-concerns row gained the gRPC wire-status
+  caveat phrase ("peer observes `Cancelled` regardless of handler-supplied
+  final status because `gctx_.TryCancel()` sends RST_STREAM before
+  `Finish` runs — local `final_status()` is the canonical signal");
+  closes consist-SHOULD-1 / doc-NICE-1. (5) `tests/unit/test_heartbeat_cancel_pattern.cpp`
+  fixture-construction comment corrected — mandatory copy elision since
+  C++17 means a `static UnaryFixture make(...)` factory would actually
+  compile; the in-place pattern is by design (deleted move+copy bound to
+  test scope), not a workaround. Deferred follow-up issues filed for
+  CMP-2/OBS-1/OBS-2 saturation metric (#NEW-B), UP-101/UP-112 write-side
+  + disk-read deadline (#NEW-A), UP-116 per-peer DownloadUpdate rate
+  limit (#NEW-C), UP-108 `steady_clock` migration (#NEW-D), UP-110
+  negative-deadline guard / arch-S1 (#NEW-E), and sec-MEDIUM-1 / arch-S2
+  / UP-106 server-side stop_token contract claim resolution (#NEW-F).
 - **Agent-side Heartbeat per-cycle `stop_source` wiring pinned by tests
   (closes PR 1c-4 final hard predecessor).** Three new tests at
   `tests/unit/test_heartbeat_cancel_pattern.cpp` `[agent][heartbeat][cancel]`:
