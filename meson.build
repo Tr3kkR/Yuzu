@@ -386,11 +386,16 @@ if _rebar3.found()
   # isolation fix applies unconditionally so the race can't come
   # back if Linux kernel semantics ever change. `test_gateway.py`
   # honors REBAR_BASE_DIR when computing the ebin wipe path.
+  # Timeout matches `gateway ct` (300s). 120s was tight on slower cloud
+  # runners (scw-eager-lumiere) under coverage instrumentation when
+  # parallel meson test execution starves the eunit job of CPU —
+  # eunit reliably finishes in ~30-90s on a fast runner but landed at
+  # 120.03s under nightly's coverage build, killing the suite by SIGTERM.
   test('gateway eunit',
     _python3,
     args: [_gw_test_script, _gw_src, 'eunit'],
     suite: 'gateway',
-    timeout: 120,
+    timeout: 300,
     env: {'REBAR_BASE_DIR': _gw_src / '_build_eunit'},
   )
   test('gateway ct',
