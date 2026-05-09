@@ -167,6 +167,7 @@ yuzu_server_core_lib = static_library(
     'src/instruction_store.cpp',
     'src/execution_tracker.cpp',
     'src/execution_event_bus.cpp',
+    'src/fleet_topology_store.cpp',
     'src/approval_manager.cpp',
     'src/schedule_engine.cpp',
     'src/help_ui.cpp',
