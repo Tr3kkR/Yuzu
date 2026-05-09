@@ -73,6 +73,21 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # OTP + rebar3 for the gateway custom_target. Without these, this
+      # job inherits whatever Erlang the self-hosted runner has globally,
+      # which on the WSL2 runner has previously been older than the
+      # rebar3 binary on PATH — producing BEAM-loader failures of the
+      # form `op bs_add p x i u x: please re-compile this module with an
+      # Erlang/OTP 28 compiler`. Pin matches ci.yml + release.yml so any
+      # OTP bump moves all three workflows together.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
+
       - name: Reset ccache stats
         run: ccache -z
 
@@ -154,6 +169,21 @@ jobs:
             pkg-config curl zip unzip tar python3-pip ccache
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # OTP + rebar3 for the gateway custom_target. Without these, this
+      # job inherits whatever Erlang the self-hosted runner has globally,
+      # which on the WSL2 runner has previously been older than the
+      # rebar3 binary on PATH — producing BEAM-loader failures of the
+      # form `op bs_add p x i u x: please re-compile this module with an
+      # Erlang/OTP 28 compiler`. Pin matches ci.yml + release.yml so any
+      # OTP bump moves all three workflows together.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
 
       - name: Reset ccache stats
         run: ccache -z
@@ -237,6 +267,21 @@ jobs:
           # coverage report).
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # OTP + rebar3 for the gateway custom_target. Without these, this
+      # job inherits whatever Erlang the self-hosted runner has globally,
+      # which on the WSL2 runner has previously been older than the
+      # rebar3 binary on PATH — producing BEAM-loader failures of the
+      # form `op bs_add p x i u x: please re-compile this module with an
+      # Erlang/OTP 28 compiler`. Pin matches ci.yml + release.yml so any
+      # OTP bump moves all three workflows together.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
 
       - name: Reset ccache stats
         run: ccache -z
