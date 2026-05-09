@@ -144,6 +144,17 @@ jobs:
         if: always()
         run: ccache -s
 
+      - name: Upload meson testlog (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-testlog-asan
+          path: |
+            build-linux-asan/meson-logs/testlog.txt
+            build-linux-asan/meson-logs/testlog.junit.xml
+          retention-days: 14
+          if-no-files-found: warn
+
   # ── Sanitizers (TSan) ──────────────────────────────────────────────────
   sanitize-tsan:
     name: "Sanitizers (TSan)"
@@ -251,6 +262,17 @@ jobs:
       - name: ccache stats
         if: always()
         run: ccache -s
+
+      - name: Upload meson testlog (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-testlog-tsan
+          path: |
+            build-linux-tsan/meson-logs/testlog.txt
+            build-linux-tsan/meson-logs/testlog.junit.xml
+          retention-days: 14
+          if-no-files-found: warn
 
   # ── Coverage (gcov + gcovr) ────────────────────────────────────────────
   coverage:
@@ -385,6 +407,17 @@ jobs:
       - name: ccache stats
         if: always()
         run: ccache -s
+
+      - name: Upload meson testlog (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-testlog-coverage
+          path: |
+            build-linux-coverage/meson-logs/testlog.txt
+            build-linux-coverage/meson-logs/testlog.junit.xml
+          retention-days: 14
+          if-no-files-found: warn
 
   # ── Alert on nightly failure ───────────────────────────────────────────
   # Opens or comments on the `nightly-broken` issue if any of the three
