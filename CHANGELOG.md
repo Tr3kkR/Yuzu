@@ -18,8 +18,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asymmetric backoff window (transport: 1s→5min, jittered 20%; legacy:
   gRPC defaults). Internal change — no operator-visible behaviour. The
   legacy half disappears in PR 1c-4 once `Subscribe` and
-  `DownloadUpdate` lift; the agent-side Heartbeat per-cycle
-  `stop_source` round-trip test is the remaining hard predecessor.
+  `DownloadUpdate` lift. All three PR 1c-4 hard predecessors are now
+  closed: UP-14 (#904 bounded dispatcher pool), UP-8 (#902 `BidiStream::read`
+  idle-deadline), and the agent-side wiring tests (`parse_target_address`
+  via `1af8ab5`, Heartbeat per-cycle `stop_source` via this CHANGELOG's
+  matching commit). PR 1c-4 itself is ready to be planned and shipped.
+- **Agent-side Heartbeat per-cycle `stop_source` wiring pinned by tests
+  (closes PR 1c-4 final hard predecessor).** Three new tests at
+  `tests/unit/test_heartbeat_cancel_pattern.cpp` `[agent][heartbeat][cancel]`:
+  (1) the pure `std::optional<std::stop_source>::emplace` pattern that
+  agent.cpp uses at the top of each connection cycle produces a fresh,
+  not-yet-stop_requested token (guards the `if (!hb) hb.emplace()`
+  bug-class); (2) an in-flight unary on the cycle's token returns
+  `Cancelled` promptly when `request_stop()` fires (proves the
+  client-side `CallContext::cancel` hand-off into `GrpcChannel::unary`'s
+  `stop_callback` → `gctx_.TryCancel()` chain works); (3) cycle-1's
+  `request_stop` does not leak into a real cycle-2 unary dispatched
+  with the freshly-`emplace`d source. Test 2 measures the
+  client-observable cancel only — `populate_call_context_from_grpc`
+  does not currently wire a server-side stop_token (a contract claim
+  in `transport.hpp` that the gRPC backend implementation does not
+  yet honour); separate transport-layer follow-up.
 - **`BidiStream::read` accepts an optional idle-read deadline (#902 /
   UP-8).** New default-zero `std::chrono::milliseconds deadline`
   parameter on the pure virtual; a positive value caps the per-call

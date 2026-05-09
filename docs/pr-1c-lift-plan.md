@@ -161,7 +161,7 @@ the branch — land one, rebase the next.
   Land with the dual-stack `--transport=grpc` flag still defaulting to
   grpc backend, and the equivalent server side already on transport
   abstraction (PR 1c-2 is a hard predecessor).
-* **Hard predecessors** (originally three, one half remains after #904 + #902 + 1af8ab5):
+* **Hard predecessors** (all closed as of 2026-05-09; PR 1c-4 ready to plan):
   - ✅ **UP-14** (per-call dispatcher-thread fanout) — closed by **#904**
     bounded dispatcher pool (2026-05-09). Subscribe lift no longer
     spawns a per-stream OS thread on the server; pool size is operator-
@@ -185,14 +185,23 @@ the branch — land one, rebase the next.
     2026-05-09 by `1af8ab5` (`tests/unit/test_parse_target_address.cpp`,
     22 cases / 44 assertions; rejection-path matrix + IPv6 happy
     paths + `static_assert(noexcept(...))` contract pin).
-  - ⏳ Heartbeat per-cycle `stop_source` round-trip test — the
-    remaining half of the deferred PR 1c-3 agent-side wiring test.
-    Should exercise: `stop()` during in-flight Heartbeat →
-    `CallContext.cancel` observes the stop_token → unary RPC returns
-    `Cancelled` → `heartbeat_stop_src_` correctly `emplace()`d on next
-    reconnect cycle with no stale token bleed-through. Lives
-    naturally as an agent-side integration test (likely under
-    `tests/unit/agent/...`).
+  - ✅ Heartbeat per-cycle `stop_source` round-trip test — closed
+    2026-05-09 by `tests/unit/test_heartbeat_cancel_pattern.cpp`
+    (3 tests, 24 assertions, tag `[agent][heartbeat][cancel]`). The
+    suite pins the three production invariants the agent.cpp
+    connection loop relies on: (a) `std::optional<std::stop_source>::emplace`
+    REPLACES on each cycle so the new heartbeat thread observes a
+    fresh, not-stop_requested token; (b) an in-flight unary
+    threading its `CallContext::cancel` from the per-cycle source
+    returns `Cancelled` promptly when `request_stop()` fires (via
+    `GrpcChannel::unary`'s `stop_callback` → `gctx_.TryCancel()`
+    chain); (c) cycle-1's `request_stop` does not leak into a real
+    cycle-2 unary dispatched with the freshly-`emplace`d source.
+    The suite documents that the gRPC backend's
+    `populate_call_context_from_grpc` does not currently wire a
+    server-side stop_token (a `transport.hpp` contract claim that
+    the gRPC implementation does not yet honour) — separate
+    transport-layer follow-up.
 
 ### PR 1c-5 — Server-side: lift `gateway_service_impl` + `ManagementServiceImpl` + gw_mgmt_channel_
 
