@@ -839,6 +839,30 @@ sudo systemctl start yuzu-server
 
 **Graceful shutdown:** The shipped unit sets `TimeoutStopSec=30`. As of #376 PR 1c-2 the agent-facing transport listener performs an unbounded graceful drain on shutdown — in-flight Subscribe handlers run to completion rather than being force-cancelled at 5 s as in earlier releases. The 30 s `TimeoutStopSec` caps the worst case (a stuck handler under disk-full or Defender-quarantine) at half of systemd's 90 s default. Operators with longer-stream workloads (e.g. large `DownloadUpdate` transfers in flight at restart) should raise this in a drop-in (`systemctl edit yuzu-server`); operators with strict shutdown SLOs should keep it. Setting it below ~10 s is not recommended — Subscribe sessions that survive routine restarts will be cut off, prompting agents to reconnect to a server that is still draining.
 
+### Bidi dispatcher pool sizing (direct-connect deployments only)
+
+The agent-facing transport listener runs a bounded thread pool for bidi-streaming RPCs (`Subscribe`, `DownloadUpdate`). The pool replaces the per-call OS thread that the pre-#904 dispatcher spawned per active stream and caps the server's bidi-handler thread count at an operator-controlled value.
+
+**Default (auto-compute):** `clamp(64, hardware_concurrency × 8, 4096)` threads. On a 16-core server this is 128; on a 64-core server it is 512. Suitable for development, small fleets (<2K direct-connect agents), and **all gateway-mode deployments** regardless of fleet size.
+
+**When to raise it:** if you run **direct-connect** (no gateway in front of the server) and your steady-state Subscribe count exceeds the default, the listener will reject new Subscribe streams with `StatusCode::ResourceExhausted "transport: bidi dispatcher saturated"` once the pool is full. Each long-lived Subscribe holds one pool slot for the connection lifetime, so the pool must be sized at least as large as the expected concurrent agent count plus headroom for `DownloadUpdate` calls and dashboard SSE-equivalent surfaces. Set it explicitly in your server config or dashboard `ListenerOptions` once the field is exposed:
+
+```
+# 10K direct-connect agents + 20% headroom + DownloadUpdate budget
+bidi_dispatcher_pool_size = 12500
+```
+
+**Gateway-mode does NOT need this knob** — the gateway terminates Subscribe per-fleet (one process per agent, lightweight), and the server only sees one upstream stream per gateway node. The default pool comfortably covers tens of gateway nodes.
+
+**OS thread budget must match the pool size.** If you raise `bidi_dispatcher_pool_size`, also verify cgroup-level limits:
+
+* **systemd:** the shipped `yuzu-server.service` sets `TasksMax=infinity` and `LimitNPROC=infinity` so the cgroup never throttles thread creation. If you have a custom unit, mirror those.
+* **Docker / Podman:** the shipped compose files set `ulimits.nproc: 65536` and `pids_limit: -1`. Without these the container's pid cgroup throttles before your pool size is reached.
+* **Kubernetes:** add `pids: 65536` to the pod's resource requests (requires `pids` extended resource on the kubelet).
+* **Bare metal:** verify `/etc/security/limits.d/yuzu.conf` includes `yuzu  -  nproc  65536` (or your chosen ceiling).
+
+If thread creation throttles before the pool reaches its configured size, the listener falls back to the saturated-rejection path even though logical capacity exists. Operators see this as a sustained ResourceExhausted spike correlated with `pids.current` cgroup metrics.
+
 ### Development Stack Script
 
 The `scripts/start-stack.sh` script starts the full development stack locally (without Docker).

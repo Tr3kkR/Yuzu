@@ -85,8 +85,7 @@ int main(int argc, char* argv[]) {
     int rate_limit = 100;
     int login_rate_limit = 10;
 
-    app.add_option("--config", config_file, "Path to yuzu-server.cfg")
-        ->envname("YUZU_CONFIG");
+    app.add_option("--config", config_file, "Path to yuzu-server.cfg")->envname("YUZU_CONFIG");
     app.add_option("--data-dir", cfg.data_dir,
                    "Data directory for SQLite DBs (default: same directory as config file)")
         ->envname("YUZU_DATA_DIR");
@@ -104,10 +103,8 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_WEB_PORT");
     app.add_flag("--no-tls", "Disable TLS (insecure, for development only)")
         ->each([&cfg](const std::string&) { cfg.tls_enabled = false; });
-    app.add_option("--cert", cfg.tls_server_cert, "PEM server certificate")
-        ->envname("YUZU_CERT");
-    app.add_option("--key", cfg.tls_server_key, "PEM server private key")
-        ->envname("YUZU_KEY");
+    app.add_option("--cert", cfg.tls_server_cert, "PEM server certificate")->envname("YUZU_CERT");
+    app.add_option("--key", cfg.tls_server_key, "PEM server private key")->envname("YUZU_KEY");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
     bool deprecated_allow_one_way_tls_flag = false;
@@ -115,9 +112,8 @@ int main(int argc, char* argv[]) {
                  "Allow TLS without --ca-cert (disables mTLS client verification). "
                  "Requires YUZU_ALLOW_INSECURE_TLS=1.")
         ->each([&cfg](const std::string&) { cfg.allow_one_way_tls = true; });
-    app.add_flag("--allow-one-way-tls",
-                 "[DEPRECATED] Renamed to --insecure-skip-client-verify; "
-                 "still accepted for backward compatibility.")
+    app.add_flag("--allow-one-way-tls", "[DEPRECATED] Renamed to --insecure-skip-client-verify; "
+                                        "still accepted for backward compatibility.")
         ->each([&cfg, &deprecated_allow_one_way_tls_flag](const std::string&) {
             cfg.allow_one_way_tls = true;
             deprecated_allow_one_way_tls_flag = true;
@@ -161,9 +157,20 @@ int main(int argc, char* argv[]) {
         ->default_val(10)
         ->envname("YUZU_LOGIN_RATE_LIMIT");
 
+    // Bidi dispatcher pool (#904, governance UP-14). 0 = auto-compute
+    // (clamp(64, hardware_concurrency*8, 4096)). Operators with
+    // direct-connect deployments above ~2K agents must set this >=
+    // expected concurrent Subscribe count or route through the gateway.
+    // See docs/user-manual/server-admin.md "Bidi dispatcher pool sizing".
+    app.add_option("--bidi-dispatcher-pool-size", cfg.bidi_dispatcher_pool_size,
+                   "Bounded thread pool for bidi-streaming RPCs (Subscribe, "
+                   "DownloadUpdate). 0 = auto-compute. Direct-connect "
+                   "deployments above ~2K agents must set this >= expected "
+                   "concurrent Subscribe count.")
+        ->envname("YUZU_BIDI_DISPATCHER_POOL_SIZE");
+
     // Metrics auth
-    app.add_flag("--metrics-no-auth",
-                 "Allow unauthenticated /metrics access from any source")
+    app.add_flag("--metrics-no-auth", "Allow unauthenticated /metrics access from any source")
         ->each([&cfg](const std::string&) { cfg.metrics_require_auth = false; })
         ->envname("YUZU_METRICS_NO_AUTH");
 
@@ -307,8 +314,7 @@ int main(int argc, char* argv[]) {
     // ── Validate operator-supplied CSP extras (SOC2-C1, gov UP-1/UP-2) ──
     // Done immediately after CLI parse so operators see a clear startup
     // error rather than a silently-dropped CSP header on every response.
-    if (auto validated = yuzu::server::security::validate_csp_extra_sources(
-            cfg.csp_extra_sources);
+    if (auto validated = yuzu::server::security::validate_csp_extra_sources(cfg.csp_extra_sources);
         validated.has_value()) {
         cfg.csp_extra_sources = std::move(*validated);
     } else {
@@ -326,21 +332,19 @@ int main(int argc, char* argv[]) {
         if (install_service) {
             wchar_t exe_path[MAX_PATH];
             GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-            SC_HANDLE svc = CreateServiceW(scm, L"YuzuServer", L"Yuzu Server",
-                                           SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
-                                           SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
-                                           exe_path, nullptr, nullptr, nullptr, nullptr, nullptr);
+            SC_HANDLE svc =
+                CreateServiceW(scm, L"YuzuServer", L"Yuzu Server", SERVICE_ALL_ACCESS,
+                               SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+                               exe_path, nullptr, nullptr, nullptr, nullptr, nullptr);
             if (svc) {
                 SERVICE_DESCRIPTIONW desc;
-                desc.lpDescription =
-                    const_cast<wchar_t*>(L"Yuzu endpoint management server");
+                desc.lpDescription = const_cast<wchar_t*>(L"Yuzu endpoint management server");
                 ChangeServiceConfig2W(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
                 SERVICE_DELAYED_AUTO_START_INFO delayed = {TRUE};
                 ChangeServiceConfig2W(svc, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed);
-                SC_ACTION actions[3] = {
-                    {SC_ACTION_RESTART, 60000},
-                    {SC_ACTION_RESTART, 60000},
-                    {SC_ACTION_RESTART, 60000}};
+                SC_ACTION actions[3] = {{SC_ACTION_RESTART, 60000},
+                                        {SC_ACTION_RESTART, 60000},
+                                        {SC_ACTION_RESTART, 60000}};
                 SERVICE_FAILURE_ACTIONSW failure = {};
                 failure.dwResetPeriod = 86400;
                 failure.cActions = 3;
@@ -450,7 +454,8 @@ int main(int argc, char* argv[]) {
 
     // Verify SQLite was compiled with thread-safety (FULLMUTEX requires SQLITE_THREADSAFE != 0)
     if (sqlite3_threadsafe() == 0) {
-        spdlog::critical("SQLite compiled with SQLITE_THREADSAFE=0 — FULLMUTEX disabled, concurrent access unsafe");
+        spdlog::critical("SQLite compiled with SQLITE_THREADSAFE=0 — FULLMUTEX disabled, "
+                         "concurrent access unsafe");
         return EXIT_FAILURE;
     }
 
@@ -541,8 +546,7 @@ int main(int argc, char* argv[]) {
         auth_db = std::make_unique<yuzu::server::AuthDB>(cfg.data_dir);
         auto db_result = auth_db->initialize();
         if (!db_result) {
-            spdlog::error("Failed to initialize auth DB: {}",
-                         static_cast<int>(db_result.error()));
+            spdlog::error("Failed to initialize auth DB: {}", static_cast<int>(db_result.error()));
             return EXIT_FAILURE;
         }
         spdlog::info("Auth DB initialized successfully");
@@ -556,15 +560,11 @@ int main(int argc, char* argv[]) {
             // The admin user was already loaded into auth_mgr via load_config(),
             // so we can read it back and persist to the DB.
             for (const auto& user : auth_mgr.list_users()) {
-                auto seed_result = auth_db->upsert_user(
-                    user.username,
-                    user.hash_hex,
-                    user.salt_hex,
-                    user.role
-                );
+                auto seed_result =
+                    auth_db->upsert_user(user.username, user.hash_hex, user.salt_hex, user.role);
                 if (seed_result) {
-                    spdlog::info("Seeded user '{}' (role={}) into auth DB",
-                               user.username, auth::role_to_string(user.role));
+                    spdlog::info("Seeded user '{}' (role={}) into auth DB", user.username,
+                                 auth::role_to_string(user.role));
                 } else {
                     spdlog::warn("Failed to seed user '{}' into auth DB", user.username);
                 }

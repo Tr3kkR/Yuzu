@@ -1190,3 +1190,222 @@ TEST_CASE("ServerListener rejects oversize max_frame_size", "[transport][lifecyc
     // started_ exchange (governance UP-18).
     REQUIRE_FALSE(listener->is_serving());
 }
+
+// =====================================================================
+// #904 / UP-14 — bounded bidi dispatcher pool
+// =====================================================================
+//
+// Pre-#904 the dispatcher spawned one std::thread per active bidi RPC
+// (unbounded). The pool caps in-flight bidi handlers at
+// ListenerOptions::bidi_dispatcher_pool_size, rejects overflow with
+// StatusCode::ResourceExhausted, and reuses workers across calls so the
+// total OS-thread budget is operator-controlled.
+
+TEST_CASE("Bidi pool reuses workers across more sequential calls than pool_size",
+          "[transport][round-trip][bidi][pool]") {
+    // Pool size 2; run 6 sequential bidi calls. All must complete
+    // because the pool reuses workers — the OS thread budget never
+    // exceeds 2 even though 6 calls were dispatched in total.
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        while (stream.read(msg)) {
+            StringMessage out("echo:" + msg.data());
+            if (!stream.write(out)) {
+                return Status{StatusCode::Internal, "write failed"};
+            }
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/PoolReuse", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+
+    ListenerOptions opts;
+    opts.bidi_dispatcher_pool_size = 2;
+
+    REQUIRE(listener->start(bind, creds, opts).has_value());
+
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    constexpr int N = 6;
+    for (int i = 0; i < N; ++i) {
+        CallContext ctx;
+        ctx.deadline = std::chrono::seconds(5);
+        auto stream = ch->bidi_stream("yuzu.test.v1.Echo/PoolReuse", ctx);
+        REQUIRE(stream != nullptr);
+        StringMessage out("frame_" + std::to_string(i));
+        REQUIRE(stream->write(out));
+        StringMessage in;
+        REQUIRE(stream->read(in));
+        REQUIRE(in.data() == "echo:frame_" + std::to_string(i));
+        stream->writes_done();
+        StringMessage drain;
+        REQUIRE_FALSE(stream->read(drain));
+        REQUIRE(stream->final_status().code == StatusCode::Ok);
+    }
+
+    listener->shutdown();
+}
+
+TEST_CASE("Bidi pool rejects overflow with ResourceExhausted",
+          "[transport][round-trip][bidi][pool]") {
+    // Pool size 1. Hold one bidi call open with a handler that blocks
+    // on read until told to release. A second concurrent dispatch must
+    // see ResourceExhausted because the single pool slot is occupied.
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    std::mutex release_mtx;
+    std::condition_variable release_cv;
+    bool release_handler = false;
+
+    auto blocking_handler = [&](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        // Wait until the test signals release before we exit. While we
+        // are waiting, the pool slot stays occupied.
+        std::unique_lock<std::mutex> lock(release_mtx);
+        release_cv.wait(lock, [&] { return release_handler; });
+        // After release, drain any pending reads and exit.
+        lock.unlock();
+        while (stream.read(msg)) {}
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/PoolBlock", blocking_handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+
+    ListenerOptions opts;
+    opts.bidi_dispatcher_pool_size = 1;
+
+    REQUIRE(listener->start(bind, creds, opts).has_value());
+
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    // First call — occupies the single pool slot. Drive it via a
+    // concurrent thread so this test thread can issue the second
+    // (overflow) call while the first is parked.
+    CallContext ctx1;
+    ctx1.deadline = std::chrono::seconds(10);
+    auto first = ch->bidi_stream("yuzu.test.v1.Echo/PoolBlock", ctx1);
+    REQUIRE(first != nullptr);
+    StringMessage seed("seed");
+    REQUIRE(first->write(seed));
+    // Give the server a moment to dispatch the handler onto the pool.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // Second call — pool is saturated. Server schedules Finish with
+    // ResourceExhausted via the UnaryPendingFinish reaper path.
+    CallContext ctx2;
+    ctx2.deadline = std::chrono::seconds(5);
+    auto second = ch->bidi_stream("yuzu.test.v1.Echo/PoolBlock", ctx2);
+    REQUIRE(second != nullptr);
+    second->writes_done();
+    StringMessage drain;
+    REQUIRE_FALSE(second->read(drain));
+    Status second_final = second->final_status();
+    REQUIRE(second_final.code == StatusCode::ResourceExhausted);
+    REQUIRE(second_final.detail.find("saturated") != std::string::npos);
+
+    // Release the first handler so it exits the pool slot. After this
+    // a third call must succeed.
+    {
+        std::lock_guard<std::mutex> lock(release_mtx);
+        release_handler = true;
+    }
+    release_cv.notify_all();
+    first->writes_done();
+    StringMessage drain1;
+    REQUIRE_FALSE(first->read(drain1));
+    REQUIRE(first->final_status().code == StatusCode::Ok);
+
+    // Third call — pool slot freed, expect success.
+    CallContext ctx3;
+    ctx3.deadline = std::chrono::seconds(5);
+    auto third = ch->bidi_stream("yuzu.test.v1.Echo/PoolBlock", ctx3);
+    REQUIRE(third != nullptr);
+    third->writes_done();
+    StringMessage drain3;
+    REQUIRE_FALSE(third->read(drain3));
+    REQUIRE(third->final_status().code == StatusCode::Ok);
+
+    listener->shutdown();
+}
+
+TEST_CASE("Bidi pool default size accepts moderate concurrency",
+          "[transport][round-trip][bidi][pool]") {
+    // Default pool size resolves to clamp(64, hw*8, 4096). Drive 16
+    // concurrent bidi streams to exercise the worker pool under
+    // realistic concurrency without depending on the exact resolved
+    // size. All streams must complete successfully — the pool absorbs
+    // them in parallel rather than serialising on a single worker.
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        while (stream.read(msg)) {
+            StringMessage out("ack:" + msg.data());
+            if (!stream.write(out)) {
+                return Status{StatusCode::Internal, "write failed"};
+            }
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/PoolFanout", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    constexpr int K = 16;
+    std::vector<std::thread> drivers;
+    std::atomic<int> completed{0};
+    drivers.reserve(K);
+    for (int i = 0; i < K; ++i) {
+        drivers.emplace_back([&, i] {
+            CallContext ctx;
+            ctx.deadline = std::chrono::seconds(10);
+            auto stream = ch->bidi_stream("yuzu.test.v1.Echo/PoolFanout", ctx);
+            if (!stream)
+                return;
+            StringMessage out("frame_" + std::to_string(i));
+            if (!stream->write(out))
+                return;
+            StringMessage in;
+            if (!stream->read(in))
+                return;
+            if (in.data() != "ack:frame_" + std::to_string(i))
+                return;
+            stream->writes_done();
+            StringMessage drain;
+            (void)stream->read(drain);
+            if (stream->final_status().code == StatusCode::Ok) {
+                completed.fetch_add(1, std::memory_order_release);
+            }
+        });
+    }
+    for (auto& t : drivers)
+        t.join();
+    REQUIRE(completed.load(std::memory_order_acquire) == K);
+
+    listener->shutdown();
+}

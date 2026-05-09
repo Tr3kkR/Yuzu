@@ -7,8 +7,11 @@
 #include <grpcpp/support/byte_buffer.h>
 #include <grpcpp/support/slice.h>
 
+#include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -218,12 +221,16 @@ public:
     }
 
     void on_bidi_finish(bool /*ok*/) {
-        // Terminal for the bidi path. The handler thread has already
-        // returned (it scheduled Finish before exit); join it then
-        // self-delete.
-        if (handler_thread_.joinable()) {
-            handler_thread_.join();
-        }
+        // Terminal for the bidi path. The pool worker that ran
+        // run_bidi_handler has already returned to the dispatcher
+        // pool; nothing per-call to join. Self-delete.
+        //
+        // Pre-#904 (governance UP-14) this used to handler_thread_.join()
+        // a per-call std::thread, which head-of-line-blocked the
+        // cq_worker (UP-13) when a handler was slow to exit. The bounded
+        // dispatcher pool moved that concern to ListenerOptions::
+        // bidi_dispatcher_pool_size — operators bound the total thread
+        // count and the cq_worker no longer joins per-call threads.
         delete this;
     }
 
@@ -399,79 +406,40 @@ private:
             handler = it->second;
         }
 
-        bidi_stream_  = std::make_unique<ServerBidiStream>(this);
         method_cache_ = method;  // copy out; gctx_ stays valid for lifetime
 
-        // Dispatcher thread: invokes the user handler with the bidi
-        // surface. Once the handler returns, schedule Finish via
-        // finish_tag_; the cq_worker then joins this thread and
-        // self-deletes the ServerCall.
+        // Submit to the bounded dispatcher pool (governance UP-14, #904).
         //
-        // Lifetime invariant (governance UP-1): std::thread construction
-        // can throw on resource exhaustion (EAGAIN, RLIMIT_NPROC). If we
-        // set state_ = BidiActive BEFORE the thread spawn, a throwing
-        // ctor leaves the call in BidiActive with no thread, no Finish
-        // ever scheduled, and `delete this` never invoked — leaking
-        // ServerCall and hanging the peer until deadline. Order
-        // therefore matters: state_ is bumped to BidiActive only inside
-        // the try-block AFTER successful std::thread construction. On
-        // failure, fall back to the UnaryPendingFinish path with
-        // StatusCode::Internal so the cq_worker reaps via the existing
-        // Finish-tag completion.
+        // Lifetime invariant (governance UP-1): state_ MUST stay
+        // PendingNew until the call has been committed to the pool's
+        // queue. If a throw escapes the submit path BEFORE we set
+        // state_ = BidiActive, this ServerCall must reach the
+        // UnaryPendingFinish reaper via the explicit fall-through below
+        // — otherwise the cq_worker has no tag to deliver and the call
+        // leaks (peer hangs until deadline). The two-step catch matches
+        // the round-6 broadened pattern (std::bad_alloc may escape
+        // make_unique<ServerBidiStream> or deque::push_back; we MUST NOT
+        // let it unwind through the cq_worker).
+        bool enqueued = false;
         try {
-            handler_thread_ = std::thread([this, h = std::move(handler)]() mutable {
-            CallContext ctx;
-            populate_call_context_from_grpc(ctx, gctx_);
+            bidi_stream_ = std::make_unique<ServerBidiStream>(this);
+            handler_     = std::move(handler);
 
-            Status handler_status;
-            try {
-                handler_status = h(ctx, *bidi_stream_);
-            } catch (const std::exception& e) {
-                handler_status = {StatusCode::Internal,
-                                  "handler raised exception"};
-                spdlog::error(
-                    "yuzu::transport: bidi handler raised std::exception in "
-                    "{} — type={} what={}",
-                    method_cache_, typeid(e).name(),
-                    sanitise_status_detail(e.what()));
-                if (listener_->opts_.metric_sink) {
-                    listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
-                        "grpc", method_cache_, "std_exception");
-                }
-            } catch (...) {
-                handler_status = {StatusCode::Internal,
-                                  "handler raised non-std exception"};
-                spdlog::error(
-                    "yuzu::transport: bidi handler raised non-std exception "
-                    "in {}", method_cache_);
-                if (listener_->opts_.metric_sink) {
-                    listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
-                        "grpc", method_cache_, "non_std_exception");
-                }
+            std::unique_lock<std::mutex> pool_lock(listener_->bidi_pool_mtx_);
+            const uint32_t cap = listener_->bidi_pool_size_;
+            const uint32_t in_flight =
+                listener_->bidi_in_flight_.load(std::memory_order_acquire);
+            if (!listener_->bidi_pool_stop_.load(std::memory_order_acquire) &&
+                cap > 0 && in_flight < cap) {
+                listener_->bidi_pool_queue_.push_back(this);
+                listener_->bidi_in_flight_.fetch_add(
+                    1, std::memory_order_release);
+                state_   = State::BidiActive;
+                enqueued = true;
             }
-
-            // Schedule Finish on the cq_worker. After this, no further
-            // events arrive on the bidi sub-tags except finish_tag_.
-            // The dispatcher thread exits; the cq_worker's
-            // on_bidi_finish will join() this thread before delete this.
-            final_status_ = to_grpc_status(handler_status);
-            state_        = State::BidiPendingFinish;
-            rw_.Finish(final_status_, static_cast<CqTag*>(&finish_tag_));
-        });
-            state_ = State::BidiActive;
         } catch (const std::exception& e) {
-            // std::thread ctor failure surface is broader than
-            // std::system_error: libstdc++/libc++/MSVC STL all allocate
-            // internal thread-state on construction, so std::bad_alloc
-            // escapes via the same path. The captured lambda's
-            // std::function move during thread construction can also
-            // throw std::bad_alloc. A narrower catch (system_error) would
-            // let bad_alloc unwind through the cq_worker's tag handler
-            // and std::terminate the server — defeating the very UP-1
-            // fix we are landing here. Mirror the bidi handler-throw
-            // site's two-step catch (lines 369-388, 379-388).
             spdlog::error(
-                "yuzu::transport: bidi dispatcher construction failed in "
+                "yuzu::transport: bidi dispatcher submit failed in "
                 "{} — type={} what={}",
                 method_cache_, typeid(e).name(),
                 sanitise_status_detail(e.what()));
@@ -479,30 +447,110 @@ private:
                 listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
                     "grpc", method_cache_, "dispatcher_internal");
             }
-            bidi_stream_.reset();  // not in use; release before Finish
+            bidi_stream_.reset();
+            handler_ = nullptr;
             final_status_ = make_wire_status(
                 StatusCode::Internal,
                 "transport: bidi dispatcher unavailable");
             rw_.Finish(final_status_, static_cast<CqTag*>(this));
             state_ = State::UnaryPendingFinish;
+            return;
         } catch (...) {
             spdlog::error(
-                "yuzu::transport: bidi dispatcher construction failed in "
-                "{} (non-std exception)",
+                "yuzu::transport: bidi dispatcher submit failed in {} "
+                "(non-std exception)",
                 method_cache_);
             if (listener_->opts_.metric_sink) {
                 listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
                     "grpc", method_cache_, "dispatcher_internal");
             }
             bidi_stream_.reset();
+            handler_ = nullptr;
             final_status_ = make_wire_status(
                 StatusCode::Internal,
                 "transport: bidi dispatcher unavailable");
             rw_.Finish(final_status_, static_cast<CqTag*>(this));
             state_ = State::UnaryPendingFinish;
+            return;
         }
+
+        if (enqueued) {
+            // Wake at most one idle worker. The pool is bounded so the
+            // queue never holds more than `cap` calls concurrently.
+            listener_->bidi_pool_cv_.notify_one();
+            return;
+        }
+
+        // Pool saturated (or shutting down). Reject fast — peer sees
+        // ResourceExhausted immediately rather than waiting for a thread
+        // to free up. Operator can scale ListenerOptions::
+        // bidi_dispatcher_pool_size or front the listener with the
+        // gateway (which terminates Subscribe per-fleet).
+        bidi_stream_.reset();
+        handler_ = nullptr;
+        if (listener_->opts_.metric_sink) {
+            listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
+                "grpc", method_cache_, "dispatcher_internal");
+        }
+        final_status_ = make_wire_status(
+            StatusCode::ResourceExhausted,
+            "transport: bidi dispatcher saturated");
+        rw_.Finish(final_status_, static_cast<CqTag*>(this));
+        state_ = State::UnaryPendingFinish;
     }
 
+public:
+    // Invoked by a GrpcServerListener pool worker after popping this
+    // ServerCall off bidi_pool_queue_. Public so the pool worker can
+    // reach it from outside the class; private would require a friend
+    // declaration on the listener which is broader access. Runs the
+    // user handler with the bidi surface, then schedules Finish on the
+    // cq_worker. Lifetime: the ServerCall remains alive until
+    // on_bidi_finish reaps it (which fires when the wire Finish
+    // completes). The pool worker holds no per-call ownership after
+    // this method returns; bidi_in_flight_ decrement happens in the
+    // worker loop.
+    void run_bidi_handler() {
+        CallContext ctx;
+        populate_call_context_from_grpc(ctx, gctx_);
+
+        Status handler_status;
+        try {
+            handler_status = handler_(ctx, *bidi_stream_);
+        } catch (const std::exception& e) {
+            handler_status = {StatusCode::Internal,
+                              "handler raised exception"};
+            spdlog::error(
+                "yuzu::transport: bidi handler raised std::exception in "
+                "{} — type={} what={}",
+                method_cache_, typeid(e).name(),
+                sanitise_status_detail(e.what()));
+            if (listener_->opts_.metric_sink) {
+                listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
+                    "grpc", method_cache_, "std_exception");
+            }
+        } catch (...) {
+            handler_status = {StatusCode::Internal,
+                              "handler raised non-std exception"};
+            spdlog::error(
+                "yuzu::transport: bidi handler raised non-std exception "
+                "in {}", method_cache_);
+            if (listener_->opts_.metric_sink) {
+                listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
+                    "grpc", method_cache_, "non_std_exception");
+            }
+        }
+
+        // Schedule Finish on the cq_worker. After this, no further
+        // events arrive on the bidi sub-tags except finish_tag_. The
+        // pool worker returns to the queue; the cq_worker's
+        // on_bidi_finish self-deletes this ServerCall.
+        final_status_ = to_grpc_status(handler_status);
+        state_        = State::BidiPendingFinish;
+        rw_.Finish(final_status_, static_cast<CqTag*>(&finish_tag_));
+    }
+
+private:
     void dispatch_unary() {
         const std::string& method = gctx_.method();
 
@@ -634,7 +682,7 @@ private:
     ReadTag                                read_tag_;
     WriteTag                               write_tag_;
     FinishTag                              finish_tag_;
-    std::thread                            handler_thread_;
+    BidiStreamHandler                      handler_;       // bound at dispatch_bidi, run by pool worker
     std::mutex                             bidi_mtx_;
     std::condition_variable                bidi_cv_;
     std::optional<bool>                    bidi_read_done_;
@@ -774,6 +822,40 @@ std::expected<void, Status> GrpcServerListener::start(
         bound_endpoint_.port = static_cast<uint16_t>(selected_port);
     }
 
+    // Pool resolution + pre-spawn happens BEFORE we accept the first
+    // RPC (post_new_request_call below). If the pool fails to come up
+    // we tear down server_/cq_ synchronously so start() reports failure
+    // atomically — partial-listener state is never observable.
+    bidi_pool_size_ = resolve_bidi_pool_size(opts);
+    bidi_in_flight_.store(0, std::memory_order_release);
+    bidi_pool_stop_.store(false, std::memory_order_release);
+    try {
+        bidi_pool_threads_.reserve(bidi_pool_size_);
+        for (uint32_t i = 0; i < bidi_pool_size_; ++i) {
+            bidi_pool_threads_.emplace_back([this] { bidi_pool_worker_loop(); });
+        }
+    } catch (...) {
+        // Roll back: stop+join any successfully-started workers and
+        // tear down the server_/cq_ we already built so the caller sees
+        // a clean failed start, not a half-running listener.
+        bidi_pool_stop_.store(true, std::memory_order_release);
+        bidi_pool_cv_.notify_all();
+        for (auto& w : bidi_pool_threads_) {
+            if (w.joinable()) w.join();
+        }
+        bidi_pool_threads_.clear();
+        bidi_pool_size_ = 0;
+        if (server_) {
+            server_->Shutdown();
+            server_.reset();
+        }
+        cq_.reset();
+        started_.store(false, std::memory_order_release);
+        return std::unexpected(Status{
+            StatusCode::ResourceExhausted,
+            "transport: bidi dispatcher pool construction failed"});
+    }
+
     cq_worker_ = std::thread([this] { cq_worker_loop(); });
     post_new_request_call();
 
@@ -856,6 +938,18 @@ void GrpcServerListener::shutdown() {
     if (cq_worker_.joinable()) {
         cq_worker_.join();
     }
+
+    // Pool drain (governance UP-14, #904). At this point: server_ has
+    // drained outstanding Finish tags (so all in-flight bidi handlers
+    // have posted Finish and returned to the pool); cq_worker has
+    // exited (no new dispatches); workers are idle on bidi_pool_cv_.
+    // shutdown_bidi_pool sets the stop flag, wakes them, and joins.
+    // Pool MUST drain after cq_worker exits — handlers that blocked on
+    // bidi_cv_ depend on cq_worker delivering events; killing the pool
+    // before cq_worker finishes would risk hanging a handler waiting
+    // on a never-arriving event.
+    shutdown_bidi_pool();
+
     if (opts_.metric_sink) {
         opts_.metric_sink->on_connection_closed(
             "grpc", {StatusCode::Ok, "transport: listener shutdown"});
@@ -863,6 +957,96 @@ void GrpcServerListener::shutdown() {
     {
         std::lock_guard<std::mutex> lock(mtx_);
         shutdown_cv_.notify_all();
+    }
+}
+
+uint32_t GrpcServerListener::resolve_bidi_pool_size(
+    const ListenerOptions& opts) const noexcept {
+    if (opts.bidi_dispatcher_pool_size > 0) {
+        return opts.bidi_dispatcher_pool_size;
+    }
+    // Auto-compute. hardware_concurrency() can return 0 on some
+    // freestanding/containerised systems; treat 0 as 4 so the formula
+    // still produces a sensible default.
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    uint64_t computed = static_cast<uint64_t>(hw) * 8;
+    if (computed < 64) computed   = 64;
+    if (computed > 4096) computed = 4096;
+    return static_cast<uint32_t>(computed);
+}
+
+void GrpcServerListener::bidi_pool_worker_loop() {
+    while (true) {
+        ServerCall* call = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(bidi_pool_mtx_);
+            bidi_pool_cv_.wait(lock, [this] {
+                return bidi_pool_stop_.load(std::memory_order_acquire) ||
+                       !bidi_pool_queue_.empty();
+            });
+            // Stop flag is checked first: if shutdown raced with a
+            // submission, the submitter would have observed
+            // bidi_pool_stop_ and rejected. We MUST NOT pop a queued
+            // call after stop because cq_worker may already have
+            // exited — handler I/O ops would hang on bidi_cv_ with no
+            // one to deliver events.
+            if (bidi_pool_stop_.load(std::memory_order_acquire)) {
+                return;
+            }
+            call = bidi_pool_queue_.front();
+            bidi_pool_queue_.pop_front();
+        }
+        try {
+            call->run_bidi_handler();
+        } catch (const std::exception& e) {
+            // run_bidi_handler catches handler-thrown exceptions
+            // already; this outer catch defends against a throw in the
+            // dispatcher itself (e.g. CallContext population, status
+            // translation). Mirror cq_worker_loop's defence: log,
+            // emit dispatch_throw metric, do NOT propagate (would
+            // unwind the worker thread and shrink the pool below
+            // bidi_pool_size_).
+            spdlog::error(
+                "yuzu::transport: bidi pool worker caught std::exception — "
+                "type={} what={}", typeid(e).name(),
+                sanitise_status_detail(e.what()));
+            if (opts_.metric_sink) {
+                opts_.metric_sink->on_unexpected_dispatch_throw(
+                    "grpc", "", "dispatcher_internal");
+            }
+        } catch (...) {
+            spdlog::error(
+                "yuzu::transport: bidi pool worker caught non-std exception");
+            if (opts_.metric_sink) {
+                opts_.metric_sink->on_unexpected_dispatch_throw(
+                    "grpc", "", "dispatcher_internal");
+            }
+        }
+        bidi_in_flight_.fetch_sub(1, std::memory_order_release);
+    }
+}
+
+void GrpcServerListener::shutdown_bidi_pool() {
+    {
+        std::lock_guard<std::mutex> lock(bidi_pool_mtx_);
+        bidi_pool_stop_.store(true, std::memory_order_release);
+    }
+    bidi_pool_cv_.notify_all();
+    for (auto& w : bidi_pool_threads_) {
+        if (w.joinable()) w.join();
+    }
+    bidi_pool_threads_.clear();
+
+    // After all workers exited, the queue MUST be empty (cq_worker
+    // exited before this is called, so no new dispatch_bidi can run;
+    // existing in-flight handlers had already posted Finish and the
+    // worker decremented bidi_in_flight_). Defensive drain in case
+    // the listener was torn down without start ever accepting a call,
+    // or a future code path enqueues during shutdown.
+    while (!bidi_pool_queue_.empty()) {
+        delete bidi_pool_queue_.front();
+        bidi_pool_queue_.pop_front();
     }
 }
 

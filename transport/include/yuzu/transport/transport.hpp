@@ -558,6 +558,36 @@ struct ListenerOptions {
     // Hard cap on connection count; zero = unbounded.
     uint32_t max_connections = 0;
 
+    // Bounded thread pool that runs bidi handlers (governance UP-14, #904).
+    //
+    // Pre-#904 the dispatcher spawned one std::thread per active bidi RPC.
+    // At fleet scale (10K agent Subscribes × 8 MiB Linux default stack ≈
+    // 80 GiB virtual address space) the implicit fanout exhausted thread
+    // creation budgets and head-of-line-blocked the cq_worker on
+    // handler_thread_.join() (UP-13). Implementations MUST cap the
+    // dispatcher's concurrent thread count at this value and reject
+    // overflow with StatusCode::ResourceExhausted "transport: bidi
+    // dispatcher saturated" (rather than queueing unboundedly).
+    //
+    // Sizing guidance:
+    //   * Zero => backend picks a sensible default (gRPC: clamp(64,
+    //     hardware_concurrency * 8, 4096); msquic: same).
+    //   * Operators with steady-state >N concurrent bidi streams (eg.
+    //     long-lived Subscribes per fleet agent on direct-connect
+    //     deployments) MUST set this >= expected steady-state count, or
+    //     route through the gateway (which terminates Subscribe so the
+    //     server only sees per-gateway concurrency).
+    //   * In-flight handler count ≤ pool size; new submissions when the
+    //     pool is saturated are REJECTED, not queued. This is intentional
+    //     backpressure: a saturated server fails fast so callers retry
+    //     elsewhere rather than amassing OS threads to exhaustion.
+    //
+    // Bidi-only: unary handlers run on the cq_worker thread and are NOT
+    // gated by this pool (they are CPU-bound, run-to-completion, and
+    // the cq_worker drains them serially per the AsyncGenericService
+    // model).
+    uint32_t bidi_dispatcher_pool_size = 0;
+
     // Maximum size of a single framed protobuf message accepted on
     // this listener. Zero means use kDefaultMaxFrameSize (4 MiB,
     // matching gRPC default). Implementations MUST refuse values

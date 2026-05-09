@@ -858,6 +858,11 @@ public:
             return;
         }
         ::yuzu::transport::ListenerOptions opts;
+        // Operator-controlled bidi dispatcher pool size (#904, UP-14).
+        // 0 lets the transport backend pick an auto-default; non-zero
+        // pins the cap at the operator-specified value. Validated at
+        // start() — the backend logs the resolved size.
+        opts.bidi_dispatcher_pool_size = cfg_.bidi_dispatcher_pool_size;
         auto agent_start = agent_listener_->start(*agent_bind_opt, agent_creds_t, opts);
         if (!agent_start.has_value()) {
             spdlog::error("Failed to start agent listener on {}: {}", cfg_.listen_address,

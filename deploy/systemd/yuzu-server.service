@@ -34,6 +34,21 @@ RestartSec=5
 # beyond ~16k concurrent agent connections.
 LimitNOFILE=65536
 
+# Thread + process budget for direct-connect deployments (#904, governance
+# UP-14). The transport listener's bidi dispatcher pool is bounded by
+# ListenerOptions::bidi_dispatcher_pool_size — operators sizing for
+# fleets >5K direct-connect agents (no gateway in front of the server)
+# should raise the pool to match steady-state Subscribe count, which
+# means the cgroup-level thread budget must accommodate it. systemd's
+# default TasksMax (~12K typically) and the PAM nproc limit otherwise
+# silently throttle thread creation, surfacing as ResourceExhausted
+# "transport: bidi dispatcher saturated" responses without operator-
+# visible diagnostic. Gateway-mode deployments do NOT need this — the
+# gateway terminates Subscribe and the server only sees per-gateway
+# concurrency. Documented in docs/user-manual/server-admin.md.
+TasksMax=infinity
+LimitNPROC=infinity
+
 # Graceful-stop budget. Post-#376 PR 1c-2 the agent-facing transport
 # listener performs an unbounded graceful drain on shutdown (in-flight
 # Subscribe handlers run to completion). Pre-PR-1c-2 the gRPC server

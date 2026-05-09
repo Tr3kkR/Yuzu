@@ -67,10 +67,18 @@ services:
     # is 1024 — comfortably exhausted on a busy fleet by SSE EventSource
     # connections + agent gRPC streams + SQLite WAL + log handles.
     # Bump to 65536 so a single container can carry up to ~50k agents.
+    #
+    # `nproc` + `pids_limit` carry the same intent at the thread/process
+    # level for the bidi dispatcher pool (#904, governance UP-14).
+    # Direct-connect deployments sizing the pool for >5K Subscribes need
+    # the OS thread budget to match; gateway-mode deployments do not.
+    # See docs/user-manual/server-admin.md for sizing guidance.
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
+      nproc: 65536
+    pids_limit: -1
     volumes:
       # Single writable volume for all server state:
       #   - SQLite databases (response, audit, policy, RBAC, etc.)
