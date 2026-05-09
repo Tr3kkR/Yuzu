@@ -266,6 +266,10 @@ cmd_start() {
     cmd_stop || true
   fi
   mkdir -p "$VIZ_UAT_DIR"
+  # 0700 keeps coresident users from listing token + cookie filenames.
+  # Files inside also get explicit 0600 -- this dir-perm tightening is the
+  # final round-2 hygiene fix (compliance-F3 follow-up).
+  chmod 700 "$VIZ_UAT_DIR"
 
   build_images
   generate_config
