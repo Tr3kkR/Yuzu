@@ -36,7 +36,16 @@ jobs:
   # ── Sanitizers (ASan + UBSan) ──────────────────────────────────────────
   sanitize-asan:
     name: "Sanitizers (ASan+UBSan)"
-    runs-on: [self-hosted, Linux, X64]
+    # Pinned to Shulgi (yuzu-wsl2-linux). The ASan triplet (x64-linux-asan)
+    # is a forced cold-cache rebuild every run because per-instrumentation
+    # vcpkg packages can't be safely shared with the standard triplet — so
+    # the ASan job rebuilds the full dep tree from source on every nightly.
+    # On the small cloud runner (scw-eager-lumiere) that step alone runs
+    # 60+ minutes and routinely blows the 60-min job timeout. Shulgi
+    # (16-core 5950X) clears the same workload in ~15 min. TSan and
+    # Coverage share the warm x64-linux triplet cache so they don't need
+    # pinning and keep the runner pool flexible.
+    runs-on: [self-hosted, Linux, X64, yuzu-shulgi]
     timeout-minutes: 60
     env:
       # detect_odr_violation=0 mirrors ci.yml's matrix linux: gRPC's
