@@ -14,7 +14,7 @@ namespace yuzu::server {
 struct Config {
     std::string listen_address{"0.0.0.0:50051"};     // Agent-facing gRPC
     std::string management_address{"0.0.0.0:50052"}; // Operator-facing gRPC
-    std::string web_address{"127.0.0.1"};             // HTMX web UI bind address
+    std::string web_address{"127.0.0.1"};            // HTMX web UI bind address
     int web_port{8080};                              // HTMX web UI port
 
     bool tls_enabled{true};
@@ -79,7 +79,8 @@ struct Config {
     std::string oidc_client_secret; // Client secret (required for Entra web platform)
     std::string oidc_redirect_uri;  // Callback URL (auto-computed from web port if empty)
     std::string oidc_admin_group;   // Entra group ID that maps to admin role
-    bool oidc_skip_tls_verify{false}; // Disable TLS cert verification for OIDC (insecure, for dev only)
+    bool oidc_skip_tls_verify{
+        false}; // Disable TLS cert verification for OIDC (insecure, for dev only)
 
     // Response persistence
     int response_retention_days{90};
@@ -116,8 +117,11 @@ struct Config {
     int login_rate_limit{10}; // Max login attempts/second per IP
 
     // MCP (Model Context Protocol) server
-    bool mcp_disable{false};    // Kill switch: reject all MCP requests
-    bool mcp_read_only{false};  // Restrict MCP to read-only tools only
+    bool mcp_disable{false};   // Kill switch: reject all MCP requests
+    bool mcp_read_only{false}; // Restrict MCP to read-only tools only
+
+    // Fleet visualization (PR 3 of feat/viz-engine ladder)
+    bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)
 };
 
 /**

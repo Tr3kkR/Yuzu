@@ -195,6 +195,7 @@ yuzu_server_core_lib = static_library(
     'src/webhook_routes.cpp',
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
+    'src/viz_routes.cpp',
     'src/compliance_ui.cpp',
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',

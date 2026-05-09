@@ -51,11 +51,14 @@
 #include "compliance_routes.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
+#include "fleet_topology_store.hpp"
+#include "fleet_topology_types.hpp"
 #include "mcp_server.hpp"
 #include "notification_routes.hpp"
 #include "offload_routes.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_routes.hpp"
+#include "viz_routes.hpp"
 #include "webhook_routes.hpp"
 #include "workflow_routes.hpp"
 #include "runtime_config_store.hpp"
@@ -449,6 +452,187 @@ public:
             if (response_store_->is_open()) {
                 response_store_->start_cleanup();
             }
+        }
+
+        // Seed kill-switch from cfg_; runtime flip path can land later.
+        viz_disabled_.store(cfg_.viz_disable, std::memory_order_release);
+
+        // Initialize fleet topology store (PR 3 of feat/viz-engine).
+        //
+        // The fetcher dispatches `tar.fleet_snapshot` to every connected
+        // agent on cache miss, polls the response_store for matches keyed
+        // on the synthesised command_id, and returns whatever arrived
+        // before the deadline. Missing agents come back as stale=true rows
+        // so the renderer dims their cubes rather than disappearing them.
+        //
+        // Notes on integration choices:
+        //  * No execution_id is recorded for the fetcher dispatch. The
+        //    executions tracker is operator-facing; an automated cache
+        //    refill happening every 60s would otherwise spam its history
+        //    pane. record_send_time stays so the standard latency
+        //    histogram still observes these dispatches (sec-INFO-10:
+        //    intentionally opted-out of cmd_execution_ids_).
+        //  * forward_gateway_pending() drains commands queued for
+        //    gateway-proxied agents so a fleet that mixes direct and
+        //    gateway-connected hosts gets uniform dispatch.
+        //  * The poll loop sleeps in 100ms increments; a future PR can
+        //    swap in the response-arrival event bus when one exists.
+        if (response_store_) {
+            auto fetcher =
+                [this](std::chrono::milliseconds deadline) -> std::vector<RawAgentSnapshot> {
+                std::vector<RawAgentSnapshot> out;
+                if (!response_store_ || !response_store_->is_open())
+                    return out;
+
+                auto agent_ids = registry_.all_ids();
+                if (agent_ids.empty())
+                    return out;
+
+                const auto command_id =
+                    "viz.fleet_snapshot-" +
+                    auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+
+                detail::pb::CommandRequest cmd;
+                cmd.set_command_id(command_id);
+                cmd.set_plugin("tar");
+                cmd.set_action("fleet_snapshot");
+
+                agent_service_.record_send_time(command_id);
+
+                std::unordered_set<std::string> dispatched;
+                dispatched.reserve(agent_ids.size());
+                for (const auto& aid : agent_ids) {
+                    if (registry_.send_to(aid, cmd))
+                        dispatched.insert(aid);
+                }
+                forward_gateway_pending();
+
+                if (dispatched.empty())
+                    return out;
+
+                // Poll response_store for matching responses until we have
+                // one per dispatched agent OR the deadline elapses. Each
+                // response carries `instruction_id == command_id` (set by
+                // agent_service when the frame arrives -- naming overload
+                // we live with).
+                const auto t_deadline = std::chrono::steady_clock::now() + deadline;
+                std::vector<StoredResponse> matched;
+                std::unordered_set<std::string> seen;
+                while (std::chrono::steady_clock::now() < t_deadline &&
+                       seen.size() < dispatched.size()) {
+                    ResponseQuery q;
+                    q.limit = static_cast<int>(dispatched.size()) + 16;
+                    auto rows = response_store_->query(command_id, q);
+                    for (const auto& r : rows) {
+                        if (seen.insert(r.agent_id).second)
+                            matched.push_back(r);
+                    }
+                    if (seen.size() >= dispatched.size())
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+
+                // Deduplicate by agent_id (one response per agent expected;
+                // duplicates ignored).
+                std::unordered_set<std::string> have;
+                out.reserve(dispatched.size());
+                for (const auto& r : matched) {
+                    if (!have.insert(r.agent_id).second)
+                        continue;
+                    RawAgentSnapshot rs;
+                    rs.agent_id = r.agent_id;
+                    if (auto sess = registry_.get_session(r.agent_id))
+                        rs.os = sess->os;
+                    // CommandResponse::Status enum: 1 == SUCCESS. Anything
+                    // else (FAILURE / TIMEOUT / REJECTED / RUNNING-only-row)
+                    // is treated as a stale snapshot for renderer purposes.
+                    if (r.status != 1) {
+                        rs.stale = true;
+                        if (auto sess = registry_.get_session(r.agent_id))
+                            rs.hostname = sess->hostname;
+                        out.push_back(std::move(rs));
+                        continue;
+                    }
+                    try {
+                        auto j = nlohmann::json::parse(r.output);
+                        rs.hostname = j.value("hostname", "");
+                        rs.ts = j.value("ts", static_cast<int64_t>(0));
+                        if (j.contains("local_ips") && j["local_ips"].is_array()) {
+                            for (const auto& ip : j["local_ips"]) {
+                                if (ip.is_string())
+                                    rs.local_ips.push_back(ip.get<std::string>());
+                            }
+                        }
+                        rs.truncated_processes = j.value("truncated_processes", false);
+                        rs.truncated_connections = j.value("truncated_connections", false);
+                        if (j.contains("processes") && j["processes"].is_array()) {
+                            rs.processes.reserve(j["processes"].size());
+                            for (const auto& p : j["processes"]) {
+                                RawAgentSnapshot::RawProcess rp;
+                                rp.pid = p.value("pid", 0u);
+                                rp.ppid = p.value("ppid", 0u);
+                                rp.name = p.value("name", "");
+                                rp.cmdline = p.value("cmdline", "");
+                                rp.user = p.value("user", "");
+                                rs.processes.push_back(std::move(rp));
+                            }
+                        }
+                        if (j.contains("connections") && j["connections"].is_array()) {
+                            rs.connections.reserve(j["connections"].size());
+                            for (const auto& c : j["connections"]) {
+                                RawAgentSnapshot::RawConnection rc;
+                                rc.proto = c.value("proto", "");
+                                rc.local_addr = c.value("local_addr", "");
+                                rc.local_port = c.value("local_port", 0);
+                                rc.remote_addr = c.value("remote_addr", "");
+                                rc.remote_host = c.value("remote_host", "");
+                                rc.remote_port = c.value("remote_port", 0);
+                                rc.state = c.value("state", "");
+                                rc.pid = c.value("pid", 0u);
+                                rc.process_name = c.value("process_name", "");
+                                rs.connections.push_back(std::move(rc));
+                            }
+                        }
+                    } catch (const std::exception& ex) {
+                        spdlog::warn("FleetTopologyStore fetcher: failed to parse "
+                                     "fleet_snapshot.v1 from {}: {}",
+                                     r.agent_id, ex.what());
+                        rs.stale = true;
+                        if (auto sess = registry_.get_session(r.agent_id))
+                            rs.hostname = sess->hostname;
+                    }
+                    out.push_back(std::move(rs));
+                }
+
+                // Agents that were dispatched but never responded -> stale
+                // entries so the aggregate snapshot still shows them.
+                int dispatch_timeouts = 0;
+                for (const auto& aid : dispatched) {
+                    if (have.contains(aid))
+                        continue;
+                    RawAgentSnapshot rs;
+                    rs.agent_id = aid;
+                    rs.stale = true;
+                    if (auto sess = registry_.get_session(aid)) {
+                        rs.hostname = sess->hostname;
+                        rs.os = sess->os;
+                    }
+                    out.push_back(std::move(rs));
+                    ++dispatch_timeouts;
+                }
+                if (dispatch_timeouts > 0) {
+                    metrics_.counter("yuzu_viz_agent_dispatch_timeout_total")
+                        .increment(static_cast<double>(dispatch_timeouts));
+                }
+
+                return out;
+            };
+
+            // 60s TTL, 5s fetch deadline, 256 MiB max snapshot bytes from
+            // PR 2 defaults. nvd_db_ may be null if NVD store failed to open;
+            // the store handles that gracefully (vuln overlay becomes inert).
+            fleet_topology_store_ = std::make_unique<FleetTopologyStore>(
+                std::move(fetcher), nvd_db_ ? nvd_db_.get() : nullptr);
         }
 
         // Initialize audit store
@@ -4862,6 +5046,12 @@ private:
             },
             policy_store_.get(), [this]() -> std::string { return registry_.to_json(); });
 
+        // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
+        // (PR 3 of feat/viz-engine ladder)
+        viz_routes_ = std::make_unique<VizRoutes>();
+        viz_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
+                                     fleet_topology_store_.get(), &metrics_, &viz_disabled_);
+
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results
         dashboard_routes_ = std::make_unique<DashboardRoutes>();
@@ -5456,6 +5646,13 @@ private:
     std::unique_ptr<WebhookRoutes> webhook_routes_;
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
+
+    // Fleet visualization (PR 3 of feat/viz-engine ladder)
+    std::unique_ptr<FleetTopologyStore> fleet_topology_store_;
+    std::unique_ptr<VizRoutes> viz_routes_;
+    /// Atomic kill-switch consulted by VizRoutes on every request. Defaults
+    /// to cfg_.viz_disable; runtime config could expose a flip path later.
+    std::atomic<bool> viz_disabled_{false};
 
     // Phase 7: Runtime config, custom properties, health monitoring, workflows, product packs
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;

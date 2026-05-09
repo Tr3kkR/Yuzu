@@ -212,6 +212,7 @@ if build_server
       'unit/server/test_offload_target_store.cpp',
       'unit/server/test_rest_offload_targets.cpp',
       'unit/server/test_fleet_topology_store.cpp',
+      'unit/server/test_viz_routes.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

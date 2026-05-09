@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/viz/fleet` REST surface (PR 3 of the 11-PR `/viz/fleet` 3D fleet
+  network-topology ladder).** New `VizRoutes` exposes
+  `GET /api/v1/viz/fleet/topology` (JSON) and
+  `GET /fragments/viz/fleet/topology` (HTMX-friendly `<script
+  type="application/json">` wrapping the same JSON for parser-on-swap),
+  both gated on `Response.Read`, audited per request, and metered via
+  `yuzu_viz_topology_request_seconds` / `yuzu_viz_cache_{hit,miss}_total` /
+  `yuzu_viz_oversize_response_total` / `yuzu_viz_agent_dispatch_timeout_total`.
+  Query params: `include_vuln=1` flips to the vuln-overlay cache slot;
+  `fresh=1` invalidates the cache (separately audited) before the get;
+  `machines_max=N` (default 5000, ceiling 100000) caps response shape and
+  returns 413 + `oversize` audit when the materialised fleet exceeds it
+  (M-1 cap-check DoS gate). Kill switch via `--viz-disable` /
+  `YUZU_VIZ_DISABLE` returns 503 and audits `denied`/`kill_switch` so
+  flipping the switch leaves an evidence trail (DEP-1). The store's PR-2
+  fetcher seam is now wired: on cache miss, dispatches `tar.fleet_snapshot`
+  to every connected agent via `AgentRegistry::send_to`, drains
+  `forward_gateway_pending()` for gateway-proxied agents, polls the
+  response store for matches keyed on a synthesised `command_id` until the
+  5 s deadline, and returns whatever arrived; missing agents come back as
+  `stale=true` rows so the renderer dims rather than disappears them. The
+  fetcher dispatch intentionally opts out of the executions tracker
+  (`record_send_time` only, no `record_execution_id`) -- a 60 s automated
+  refresh would otherwise spam the operator-facing executions pane.
+  release.yml gains an explicit `--build-arg TRIPLET=x64-linux` ahead of
+  arm64 publishing (QE-R2-02). (#viz-engine ladder PR 3.)
+
 - **`tar.fleet_snapshot` action + server-side `FleetTopologyStore` (PRs 1+2
   of the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** New TAR
   plugin action enumerates running processes, open network connections,
