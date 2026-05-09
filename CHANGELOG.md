@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **Agent-side Subscribe + DownloadUpdate lifted onto `transport::Channel`
+  (#376 PR 1c-4).** The agent's `Subscribe` (bidi) and `DownloadUpdate`
+  (server-streaming-via-bidi) RPCs now travel through
+  `yuzu::transport::Channel` instead of the legacy `pb::AgentService::Stub`.
+  Subscribe's stream is a `std::shared_ptr<transport::BidiStream>` shared
+  across the OutputCallback worker pool + main read loop, with concurrent
+  `write()` serialised externally via `stream_write_mu_` (the abstraction
+  is single-writer thread-compatible per `transport.hpp:421`). The
+  per-cycle `subscribe_ctx_` atomic-pointer dance is replaced by a
+  `subscribe_stop_src_` `std::optional<std::stop_source>` (mutex-protected
+  swap), matching the `heartbeat_stop_src_` pattern from PR 1c-3 — emplace
+  at cycle entry, request_stop on shutdown / reconnect cleanup, reset on
+  cycle exit. DownloadUpdate uses the standard server-streaming-via-bidi
+  pattern: write request, `writes_done()`, drain chunks via `read_pb`
+  with a per-chunk 30 s idle deadline (symmetric with the server's
+  request-frame deadline from #902 / UP-8). All four agent RPCs now
+  share a single TLS session via HTTP/2 multiplexing on `channel_t`,
+  halving per-agent kernel socket count and amortising the TLS
+  handshake — meaningful at the WhatsApp/RabbitMQ-tier gateway scaling
+  target (ADR-0002). The legacy `creds_grpc` / `channel` triple +
+  diagnostic block + gRPC `KEEPALIVE_*` channel args remain dead-code
+  resident pending PR 1c-4 commit (iii) cleanup. New tests at
+  `tests/unit/test_agent_subscribe_lift.cpp` `[agent][subscribe][lift]`
+  and `[agent][download][lift]`: (1) Subscribe multi-frame fan-out
+  proto round-trip, (2) Subscribe per-cycle stop_source plumbing, (3)
+  Subscribe reconnect cycle (cycle-1 stop + reset, cycle-2 fresh
+  emplace + frame round-trip), (4) DownloadUpdate happy path with N
+  chunks + writes_done(), (5) DownloadUpdate per-chunk read deadline
+  expiry. Updater public API (`Updater::check_and_apply`) drops the
+  `void* stub` parameter; only `void* channel` remains.
 - **Server-side `CallContext::cancel` contract softened to backend-best-effort
   (#916).** The historical `transport.hpp` claim that the transport manages a
   per-call `stop_source` whose token surfaces peer disconnection on the server

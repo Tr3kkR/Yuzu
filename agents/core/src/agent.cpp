@@ -146,14 +146,14 @@ struct CredentialsZeroOnExit {
     }
 };
 
-// Stream type alias: agent writes CommandResponse, reads CommandRequest.
-// (Subscribe RPC: stream CommandResponse -> stream CommandRequest)
-//
-// PR 1c-3 keeps Subscribe + DownloadUpdate on the legacy gRPC stub path
-// while Register / Heartbeat / CheckForUpdate move to transport::Channel.
-// PR 1c-4 will lift Subscribe + DownloadUpdate, at which point this
-// alias and the parallel grpc::Channel + Stub disappear.
-using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::CommandRequest>;
+// Stream type alias: post-#376 PR 1c-4 the agent's Subscribe stream
+// rides on `yuzu::transport::BidiStream`. Bytes on the wire are
+// CommandResponse → and CommandRequest ← via `transport::read_pb` /
+// `transport::write_pb`; the abstraction enforces single-writer +
+// single-reader thread compatibility (transport.hpp:421), so concurrent
+// writes from the OutputCallback worker pool + the main read loop must
+// be serialised externally via `stream_write_mu_`.
+using SubscribeStream = ::yuzu::transport::BidiStream;
 
 // ── Bounded Thread Pool ──────────────────────────────────────────────────────
 // Replaces unbounded std::thread-per-command dispatch. Workers pull tasks from
@@ -243,7 +243,7 @@ static constexpr size_t kOutputFlushThreshold = 64 * 1024; // 64 KB auto-flush
 
 struct CommandContextImpl {
     std::shared_ptr<SubscribeStream> stream;
-    std::mutex* write_mu; // protects concurrent stream->Write()
+    std::mutex* write_mu; // protects concurrent BidiStream::write()
     std::string command_id;
     std::chrono::steady_clock::time_point start_time;
     std::atomic<bool> first_output_sent{false};
@@ -290,7 +290,7 @@ private:
         resp.set_output(std::move(combined));
 
         std::lock_guard lock(*write_mu);
-        stream->Write(resp, grpc::WriteOptions());
+        ::yuzu::transport::write_pb(*stream, resp);
     }
 };
 
@@ -760,14 +760,14 @@ public:
             spdlog::info("Initial transport channel not ready in 5s — proceeding to retry loop");
         }
 
-        // Legacy grpc::Channel + Stub for Subscribe + DownloadUpdate.
-        // PR 1c-4 will lift these onto channel_t->bidi_stream(...) and
-        // delete this whole block. Until then the two channels coexist —
-        // they negotiate independent TLS sessions but share the same
-        // PEM material and target endpoint.
+        // Legacy grpc::Channel kept alive ONLY for the post-Register
+        // diagnostic that surfaces grpc channel state into plugin_ctx_.
+        // After PR 1c-4 lifted Subscribe + DownloadUpdate onto
+        // channel_t, the stub itself is gone. (iii) drops the remaining
+        // legacy channel + creds_grpc + diagnostic block + keepalive
+        // args entirely.
         std::shared_ptr<grpc::ChannelCredentials> creds_grpc;
         std::shared_ptr<grpc::Channel> channel;
-        std::unique_ptr<pb::AgentService::Stub> stub;
         if (cfg_.tls_enabled) {
             grpc::SslCredentialsOptions ssl_opts;
             ssl_opts.pem_root_certs = creds_t.ca_cert_pem;
@@ -780,8 +780,6 @@ public:
         }
 
         channel = grpc::CreateCustomChannel(cfg_.server_address, creds_grpc, ch_args);
-
-        stub = pb::AgentService::NewStub(channel);
 
         // 2b. Detect cloud instance identity (for auto-approve)
         {
@@ -999,18 +997,32 @@ public:
                 updater_->cleanup_old_binary();
             }
 
-            // 4. Open Subscribe bidi stream
+            // 4. Open Subscribe bidi stream (#376 PR 1c-4 lifted)
             {
-                grpc::ClientContext sub_ctx;
+                ::yuzu::transport::CallContext sub_ctx{};
                 if (!session_id_.empty()) {
-                    sub_ctx.AddMetadata(kSessionMetadataKey, session_id_);
+                    sub_ctx.metadata[std::string(kSessionMetadataKey)] = session_id_;
                 }
-                subscribe_ctx_.store(&sub_ctx, std::memory_order_release);
+                // Per-cycle stop_source — request_stop() from stop() or
+                // reconnect cleanup cancels the in-flight Subscribe read
+                // via CallContext::cancel. emplace() at the top of each
+                // cycle guarantees a fresh, not-yet-stop_requested token
+                // (same pattern as heartbeat_stop_src_; see
+                // tests/unit/test_heartbeat_cancel_pattern.cpp for the
+                // canonical wiring invariants).
+                {
+                    std::lock_guard lk{subscribe_stop_src_mu_};
+                    subscribe_stop_src_.emplace();
+                    sub_ctx.cancel = subscribe_stop_src_->get_token();
+                }
 
-                std::shared_ptr<SubscribeStream> stream{stub->Subscribe(&sub_ctx)};
-                if (!stream) {
+                auto bidi = channel_t->bidi_stream("yuzu.agent.v1.AgentService/Subscribe", sub_ctx);
+                if (!bidi) {
                     spdlog::error("Failed to open Subscribe stream");
-                    subscribe_ctx_.store(nullptr, std::memory_order_release);
+                    {
+                        std::lock_guard lk{subscribe_stop_src_mu_};
+                        subscribe_stop_src_.reset();
+                    }
                     if (!stop_requested_.load(std::memory_order_acquire)) {
                         ++reconnect_count;
                         spdlog::warn("Subscribe failed — will attempt reconnect");
@@ -1018,17 +1030,17 @@ public:
                     }
                     break;
                 }
+                std::shared_ptr<SubscribeStream> stream{std::move(bidi)};
                 spdlog::info("Subscribe stream opened - waiting for commands");
 
                 // 4b. Spawn OTA update check thread
                 if (cfg_.auto_update && updater_) {
-                    auto* raw_stub = static_cast<void*>(stub.get());
                     auto* raw_channel = static_cast<void*>(channel_t.get());
-                    update_thread_ = std::thread([this, raw_stub, raw_channel]() {
+                    update_thread_ = std::thread([this, raw_channel]() {
                         spdlog::info("OTA update checker started (interval={}s)",
                                      cfg_.update_check_interval.count());
                         while (!stop_requested_.load(std::memory_order_acquire)) {
-                            auto result = updater_->check_and_apply(raw_stub, raw_channel);
+                            auto result = updater_->check_and_apply(raw_channel);
                             if (result.has_value() && result.value()) {
                                 spdlog::info("OTA update applied - agent will restart");
                                 stop();
@@ -1132,7 +1144,7 @@ public:
                 dedup_previous_.clear();
                 bool update_verified = false;
                 pb::CommandRequest cmd;
-                while (stream->Read(&cmd)) {
+                while (::yuzu::transport::read_pb(*stream, cmd)) {
                     if (stop_requested_.load(std::memory_order_acquire))
                         break;
 
@@ -1150,7 +1162,7 @@ public:
                             replay_resp.set_status(pb::CommandResponse::REJECTED);
                             replay_resp.set_output("command replay rejected: duplicate command_id");
                             std::lock_guard lock(stream_write_mu_);
-                            stream->Write(replay_resp, grpc::WriteOptions());
+                            ::yuzu::transport::write_pb(*stream, replay_resp);
                             continue;
                         }
                         // Double-buffer rotation: when current fills, discard previous,
@@ -1203,7 +1215,7 @@ public:
                                      {{"plugin", "__guard__"}})
                             .increment();
                         std::lock_guard lock(stream_write_mu_);
-                        stream->Write(resp, grpc::WriteOptions());
+                        ::yuzu::transport::write_pb(*stream, resp);
                         continue;
                     }
 
@@ -1223,7 +1235,7 @@ public:
                         resp.set_status(pb::CommandResponse::REJECTED);
                         resp.set_output("plugin not found: " + cmd.plugin());
                         std::lock_guard lock(stream_write_mu_);
-                        stream->Write(resp, grpc::WriteOptions());
+                        ::yuzu::transport::write_pb(*stream, resp);
                         continue;
                     }
 
@@ -1277,7 +1289,7 @@ public:
                                     expired_resp.mutable_sent_at()->set_millis_epoch(epoch);
 
                                     std::lock_guard lock(stream_write_mu_);
-                                    stream->Write(expired_resp, grpc::WriteOptions());
+                                    ::yuzu::transport::write_pb(*stream, expired_resp);
                                     return;
                                 }
                             }
@@ -1324,7 +1336,7 @@ public:
                             timing_resp.set_output("__timing__|exec_ms=" + std::to_string(exec_ms));
 
                             std::lock_guard lock(stream_write_mu_);
-                            stream->Write(timing_resp, grpc::WriteOptions());
+                            ::yuzu::transport::write_pb(*stream, timing_resp);
                         }
 
                         // Send final status
@@ -1342,7 +1354,7 @@ public:
                             final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
 
                             std::lock_guard lock(stream_write_mu_);
-                            stream->Write(final_resp, grpc::WriteOptions());
+                            ::yuzu::transport::write_pb(*stream, final_resp);
                         }
 
                         spdlog::info("Command {} finished (rc={}, exec={}ms)", cmd.command_id(), rc,
@@ -1357,11 +1369,14 @@ public:
                         reject_resp.set_status(pb::CommandResponse::REJECTED);
                         reject_resp.set_output("agent overloaded: command queue full");
                         std::lock_guard lock(stream_write_mu_);
-                        stream->Write(reject_resp, grpc::WriteOptions());
+                        ::yuzu::transport::write_pb(*stream, reject_resp);
                     }
                 }
 
-                subscribe_ctx_.store(nullptr, std::memory_order_release);
+                {
+                    std::lock_guard lk{subscribe_stop_src_mu_};
+                    subscribe_stop_src_.reset();
+                }
 
                 // Destroy thread pool BEFORE stream goes out of scope — this drains
                 // the queue, waits for in-flight tasks, and joins all worker threads,
@@ -1431,11 +1446,15 @@ public:
             guardian_->stop();
         if (updater_)
             updater_->stop();
-        // Cancel the Subscribe stream to unblock the Read() call. Subscribe
-        // is still on grpc::ClientReaderWriter — PR 1c-4 lifts it onto
-        // transport::BidiStream, at which point this becomes a stop_source.
-        if (auto* ctx = subscribe_ctx_.load(std::memory_order_acquire)) {
-            ctx->TryCancel();
+        // Cancel the Subscribe stream to unblock the in-flight read.
+        // Subscribe rides on `transport::BidiStream` (#376 PR 1c-4) and
+        // its CallContext::cancel is wired to `subscribe_stop_src_`;
+        // request_stop() here propagates through the transport's
+        // stop_callback hook to interrupt the parked read_pb.
+        {
+            std::lock_guard lk{subscribe_stop_src_mu_};
+            if (subscribe_stop_src_)
+                subscribe_stop_src_->request_stop();
         }
         // Cancel any transport RPC carrying our stop token (Heartbeat,
         // CheckForUpdate). Register's CallContext also takes this token,
@@ -1469,10 +1488,18 @@ private:
     std::string session_id_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> heartbeat_stop_{false};
-    // Subscribe + DownloadUpdate still ride on grpc::ClientContext until
-    // PR 1c-4 lifts them onto transport::BidiStream. The atomic-pointer
-    // dance is therefore retained for those two RPCs only.
-    std::atomic<grpc::ClientContext*> subscribe_ctx_{nullptr};
+    // Subscribe-thread-scoped stop_source (#376 PR 1c-4). A fresh
+    // stop_source is emplace()d at the top of each connection cycle so
+    // that a request_stop() from a previous reconnect cleanup does not
+    // bleed into the next cycle (same invariant as
+    // `heartbeat_stop_src_`; see
+    // `tests/unit/test_heartbeat_cancel_pattern.cpp` for the canonical
+    // wiring tests). Mutex protects the optional swap. The token is
+    // threaded into the Subscribe `CallContext::cancel` so that
+    // `request_stop()` from `stop()` propagates through the transport's
+    // stop_callback hook and interrupts the parked Subscribe read.
+    std::mutex subscribe_stop_src_mu_;
+    std::optional<std::stop_source> subscribe_stop_src_;
     // Cancellation hook for transport unary RPCs (Register, Heartbeat,
     // CheckForUpdate). Threaded into each CallContext::cancel; stop()
     // request_stop()s once and all subsequent and in-flight RPCs short-

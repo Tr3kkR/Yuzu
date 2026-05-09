@@ -12,8 +12,11 @@
 #include <yuzu/transport/proto_adapter.hpp>
 #include <yuzu/transport/transport.hpp>
 
-// Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
-#include "agent.grpc.pb.h"
+// Generated protobuf headers (flat output via proto/gen_proto.py).
+// Post-#376 PR 1c-4, this file no longer references the gRPC service
+// stubs — both CheckForUpdate (unary) and DownloadUpdate
+// (server-streaming-via-bidi) travel via `transport::Channel`.
+#include "agent.pb.h"
 
 #include <spdlog/spdlog.h>
 
@@ -273,10 +276,7 @@ void Updater::stop() noexcept {
     stop_requested_.store(true, std::memory_order_release);
 }
 
-std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub, void* raw_channel) {
-    if (!raw_stub) {
-        return std::unexpected(UpdateError{"null gRPC stub"});
-    }
+std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_channel) {
     if (!raw_channel) {
         return std::unexpected(UpdateError{"null transport channel"});
     }
@@ -290,7 +290,6 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub, void* 
         return false;
     }
 
-    auto* stub = static_cast<pb::AgentService::Stub*>(raw_stub);
     auto* channel = static_cast<::yuzu::transport::Channel*>(raw_channel);
 
     // ── Step 1: Check for update (lifted onto transport::Channel — PR 1c-3) ──
@@ -348,7 +347,7 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub, void* 
     }
     std::filesystem::path temp_path{path_buf};
 
-    // ── Step 3: Download the update binary ─────────────────────────────────
+    // ── Step 3: Download the update binary (#376 PR 1c-4 lifted to bidi) ──
 
     pb::DownloadUpdateRequest dl_req;
     dl_req.set_agent_id(agent_id_);
@@ -357,11 +356,32 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub, void* 
     dl_platform->set_os(os_);
     dl_platform->set_arch(arch_);
 
-    grpc::ClientContext dl_ctx;
-    auto reader = stub->DownloadUpdate(&dl_ctx, dl_req);
+    // Server-streaming-via-bidi: write the request frame, half-close the
+    // write side via writes_done(), then drain chunks. Per-chunk read
+    // deadline of 30s is the symmetric agent-side guard against a stalled
+    // server (mirrors the server's request-frame 30s deadline from #902).
+    // A stuck server pinning this client indefinitely is a mTLS-authed
+    // insider-DoS surface; the deadline gives up cleanly and frees the
+    // transport resources. See PR 1c-4 design grilling Q7.
+    ::yuzu::transport::CallContext dl_ctx{};
+    auto stream = channel->bidi_stream("yuzu.agent.v1.AgentService/DownloadUpdate", dl_ctx);
+    if (!stream) {
+        std::error_code ec;
+        std::filesystem::remove(temp_path, ec);
+        return std::unexpected(UpdateError{"Failed to open DownloadUpdate stream"});
+    }
+
+    if (!::yuzu::transport::write_pb(*stream, dl_req)) {
+        stream->cancel();
+        std::error_code ec;
+        std::filesystem::remove(temp_path, ec);
+        return std::unexpected(UpdateError{"Failed to send DownloadUpdate request frame"});
+    }
+    stream->writes_done();
 
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
+        stream->cancel();
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
         return std::unexpected(UpdateError{
@@ -370,17 +390,20 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub, void* 
 
     Sha256Hasher hasher;
     if (!hasher.is_valid()) {
+        stream->cancel();
         out.close();
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
         return std::unexpected(UpdateError{"Failed to initialize SHA-256 hasher"});
     }
 
+    constexpr auto kChunkReadDeadline = std::chrono::seconds(30);
     int64_t bytes_downloaded = 0;
     pb::DownloadUpdateChunk chunk;
 
-    while (reader->Read(&chunk)) {
+    while (::yuzu::transport::read_pb(*stream, chunk, kChunkReadDeadline)) {
         if (stop_requested_.load(std::memory_order_acquire)) {
+            stream->cancel();
             out.close();
             std::error_code ec;
             std::filesystem::remove(temp_path, ec);
@@ -390,6 +413,7 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub, void* 
         const auto& data = chunk.data();
         out.write(data.data(), static_cast<std::streamsize>(data.size()));
         if (!out) {
+            stream->cancel();
             out.close();
             std::error_code ec;
             std::filesystem::remove(temp_path, ec);
@@ -397,6 +421,7 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub, void* 
         }
 
         if (!hasher.update(data.data(), data.size())) {
+            stream->cancel();
             out.close();
             std::error_code ec;
             std::filesystem::remove(temp_path, ec);
@@ -405,6 +430,7 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub, void* 
 
         bytes_downloaded += static_cast<int64_t>(data.size());
         if (bytes_downloaded > kMaxDownloadBytes) {
+            stream->cancel();
             out.close();
             std::error_code ec;
             std::filesystem::remove(temp_path, ec);
@@ -413,15 +439,15 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub, void* 
         }
     }
 
-    grpc::Status dl_status = reader->Finish();
+    auto dl_status = stream->final_status();
     out.close();
 
-    if (!dl_status.ok()) {
+    if (dl_status.code != ::yuzu::transport::StatusCode::Ok) {
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
-        return std::unexpected(UpdateError{std::format("DownloadUpdate RPC failed: {} (code {})",
-                                                       dl_status.error_message(),
-                                                       static_cast<int>(dl_status.error_code()))});
+        return std::unexpected(
+            UpdateError{std::format("DownloadUpdate RPC failed: {} (code {})", dl_status.detail,
+                                    static_cast<int>(dl_status.code))});
     }
 
     spdlog::info("Downloaded {} bytes for update {}", bytes_downloaded,

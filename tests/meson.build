@@ -90,6 +90,7 @@ agent_test_exe = executable(
   files(
     'unit/test_parse_target_address.cpp',
     'unit/test_heartbeat_cancel_pattern.cpp',
+    'unit/test_agent_subscribe_lift.cpp',
     'unit/test_plugin_loader.cpp',
     'unit/test_sdk_utilities.cpp',
     'unit/test_temp_file.cpp',
