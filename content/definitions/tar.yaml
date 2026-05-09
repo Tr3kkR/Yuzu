@@ -1,6 +1,6 @@
 ## Timeline Activity Record (TAR) Definitions
 ## Continuous system state change tracking -- processes, network, services, users.
-## Plugin: tar | Actions: status, query, snapshot, export, configure, collect_fast, collect_slow
+## Plugin: tar | Actions: status, query, snapshot, export, configure, collect_fast, collect_slow, fleet_snapshot
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -579,6 +579,65 @@ spec:
 
   compatibility:
     minAgentVersion: "0.12.0"
+    requiredPlugins: [tar]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.tar.fleet_snapshot
+  displayName: TAR Fleet Snapshot
+  version: 1.0.0
+  description: >
+    Produces a single JSON document enumerating every running process and
+    open network connection on this host at the moment of invocation, in
+    the fleet_snapshot.v1 schema. Used by the server-side FleetTopologyStore
+    to assemble the 3D fleet network-topology view (/viz/fleet, ladder PR
+    5+). Each list is capped at 4096 entries; truncation is signalled by
+    truncated_processes and truncated_connections flags. Cmdlines are
+    redacted per the active redaction_patterns config (defaults always
+    apply). Process and tcp source pause states are honoured -- when paused,
+    the corresponding list is empty and source_paused.* markers appear in
+    the payload. Not typically invoked manually; the server pulls on demand
+    at the topology cache TTL.
+  tags: [tar, fleet, topology, visualization, internal]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: tar
+    action: fleet_snapshot
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: json_output
+        type: clob
+        description: "Single fleet_snapshot.v1 JSON document"
+
+  readablePayload: "Collect fleet topology snapshot"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: "0.13.0"
     requiredPlugins: [tar]
 
 status:

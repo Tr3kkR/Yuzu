@@ -23,6 +23,11 @@
  *
  * Header-only and stateless so the JSON serializer in fleet_topology_types
  * can include it without a link dependency.
+ *
+ * TODO(PR 7+): consider relocating to sdk/include/yuzu/process_category.hpp
+ * when the table stabilises so future agent-side classification (e.g. an
+ * "exclude system processes" filter) can reach this enum without crossing
+ * server/agent module boundaries.
  */
 
 #include <algorithm>
@@ -60,10 +65,10 @@ inline std::string lower_basename(std::string_view name) {
     auto slash = name.find_last_of("/\\");
     if (slash != std::string_view::npos)
         name.remove_prefix(slash + 1);
-    // Strip Windows .exe suffix
+    // Strip Windows .exe suffix (case-insensitive)
     if (name.size() > 4) {
         auto tail = name.substr(name.size() - 4);
-        if ((tail[0] == '.' || tail[0] == '.') && (tail[1] == 'e' || tail[1] == 'E') &&
+        if (tail[0] == '.' && (tail[1] == 'e' || tail[1] == 'E') &&
             (tail[2] == 'x' || tail[2] == 'X') && (tail[3] == 'e' || tail[3] == 'E')) {
             name.remove_suffix(4);
         }

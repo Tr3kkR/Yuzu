@@ -234,7 +234,7 @@ Audit actions: `tar.status.scan` (operator-triggered Scan fleet — emitted by P
 - `docs/yuzu-guardian-design-v1.1.md` — agent tamper-resistance, foundational to the process tree's data quality claim
 - `docs/yuzu-guardian-windows-implementation-plan.md` — Windows-first hardening PR ladder
 - `agents/plugins/tar/src/tar_aggregator.cpp` — the #539 retention pause that the retention-paused list surfaces
-- `agents/plugins/tar/src/tar_plugin.cpp` — the action surface (`tar.status`, `tar.configure`, future `tar.process_tree`, `tar.purge_source`)
+- `agents/plugins/tar/src/tar_plugin.cpp` — the action surface (`tar.status`, `tar.configure`, `tar.fleet_snapshot`, future `tar.process_tree`, `tar.purge_source`)
 - `server/core/src/dashboard_routes.cpp` — the existing TAR SQL fragment to be relocated and extended
 - `docs/data-architecture.md` — error code taxonomy, audit envelope conventions
 - `docs/yaml-dsl-spec.md` — DSL surface (gains `fromResultSet:` per scope-walking-design §7)

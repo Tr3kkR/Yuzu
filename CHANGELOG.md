@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`tar.fleet_snapshot` action + server-side `FleetTopologyStore` (PRs 1+2
+  of the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** New TAR
+  plugin action enumerates running processes, open network connections,
+  and host-bound IPs and emits a single `fleet_snapshot.v1` JSON document
+  on demand. Cmdlines are redacted using the union of operator config and
+  compiled-in default patterns. Source-pause states (`process_enabled`,
+  `tcp_enabled`) are honoured: when a source is paused, the corresponding
+  list is empty and `process_source_paused` / `tcp_source_paused` markers
+  appear in the document. Each list is hard-capped at 4096 entries with
+  truncation flags. New server-side `FleetTopologyStore` (memory-only,
+  LRU-of-2 by `include_vuln`, 60 s TTL, single-flight refill, fetcher
+  injected at construction, soft 256 MB memory cap, `wait_for`-bounded
+  caller wait) aggregates per-agent snapshots into a `fleet_topology.v1`
+  document for the upcoming `/viz/fleet` renderer. Cross-machine connection
+  scope (Local / InternalFleet / External) and `dst_agent_id` resolution
+  are computed via an `ip_to_agent` map built from each agent's `local_ips`,
+  with bracketed/zone-id IPv6 normalization and link-local defence-in-depth
+  filtering. Process categorisation (`process_category.hpp`) maps ~70 known
+  executable basenames to System / Browser / Database / Web / Runtime /
+  Other for renderer colouring. REST route + dashboard renderer arrive in
+  PR 3+; the action is dispatchable today via direct gRPC. (#viz-engine
+  ladder PRs 1, 2 and governance hardening round 1.)
+
 ### Fixed
 
 - **Executions drawer: dashboard "Fan-out" cell stuck at "0/0 of N".**

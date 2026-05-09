@@ -91,8 +91,11 @@ TEST_CASE("fleet_snapshot: processes round-trip", "[tar][fleet]") {
 }
 
 TEST_CASE("fleet_snapshot: connections round-trip", "[tar][fleet]") {
+    auto c1 =
+        make_conn("tcp", "10.0.0.7", 5432, "10.0.0.42", 54321, "ESTABLISHED", 100, "postgres");
+    c1.remote_host = "db.internal";
     std::vector<NetConnection> conns = {
-        make_conn("tcp", "10.0.0.7", 5432, "10.0.0.42", 54321, "ESTABLISHED", 100, "postgres"),
+        c1,
         make_conn("tcp", "127.0.0.1", 8080, "127.0.0.1", 41234, "ESTABLISHED", 200, "nginx"),
     };
     auto out = build_fleet_snapshot_json({}, conns, {}, "h", 1);
@@ -103,10 +106,34 @@ TEST_CASE("fleet_snapshot: connections round-trip", "[tar][fleet]") {
     CHECK(j["connections"][0]["local_addr"] == "10.0.0.7");
     CHECK(j["connections"][0]["local_port"] == 5432);
     CHECK(j["connections"][0]["remote_addr"] == "10.0.0.42");
+    CHECK(j["connections"][0]["remote_host"] == "db.internal"); // QE-S2
     CHECK(j["connections"][0]["remote_port"] == 54321);
     CHECK(j["connections"][0]["state"] == "ESTABLISHED");
     CHECK(j["connections"][0]["pid"] == 100);
     CHECK(j["connections"][0]["process_name"] == "postgres");
+    // remote_host must be present even when empty (default from make_conn)
+    CHECK(j["connections"][1]["remote_host"] == "");
+}
+
+TEST_CASE("fleet_snapshot: source_paused markers emitted when sources disabled", "[tar][fleet]") {
+    // plugin-B1 / compliance-F1 fix: paused process or tcp source must not
+    // silently leak data; the snapshot carries explicit markers.
+    auto out = build_fleet_snapshot_json({}, {}, {}, "h", 1, {},
+                                         /*process_source_enabled=*/false,
+                                         /*tcp_source_enabled=*/false);
+    auto j = json::parse(out);
+    CHECK(j["process_source_paused"] == true);
+    CHECK(j["tcp_source_paused"] == true);
+    CHECK(j["schema_minor"] == 1);
+}
+
+TEST_CASE("fleet_snapshot: schema_minor present in envelope", "[tar][fleet]") {
+    auto out = build_fleet_snapshot_json({}, {}, {}, "h", 1);
+    auto j = json::parse(out);
+    CHECK(j["schema_minor"] == 1);
+    // markers omitted when sources are enabled (default)
+    CHECK(!j.contains("process_source_paused"));
+    CHECK(!j.contains("tcp_source_paused"));
 }
 
 TEST_CASE("fleet_snapshot: cmdline redaction applied", "[tar][fleet][redaction]") {
@@ -141,7 +168,7 @@ TEST_CASE("fleet_snapshot: process truncation sets flag and caps array",
     std::vector<ProcessInfo> procs;
     for (int i = 0; i < 5; ++i)
         procs.push_back(make_proc(static_cast<uint32_t>(i), 0, "p" + std::to_string(i), "", "u"));
-    auto out = build_fleet_snapshot_json(procs, {}, {}, "h", 1, {}, /*max_rows=*/2);
+    auto out = build_fleet_snapshot_json(procs, {}, {}, "h", 1, {}, true, true, /*max_rows=*/2);
     auto j = json::parse(out);
 
     CHECK(j["processes"].size() == 2);
@@ -154,7 +181,7 @@ TEST_CASE("fleet_snapshot: connection truncation sets flag and caps array",
     std::vector<NetConnection> conns;
     for (int i = 0; i < 5; ++i)
         conns.push_back(make_conn("tcp", "10.0.0.1", 1000 + i, "10.0.0.2", 80, "EST", 1, "p"));
-    auto out = build_fleet_snapshot_json({}, conns, {}, "h", 1, {}, /*max_rows=*/3);
+    auto out = build_fleet_snapshot_json({}, conns, {}, "h", 1, {}, true, true, /*max_rows=*/3);
     auto j = json::parse(out);
 
     CHECK(j["connections"].size() == 3);
@@ -166,7 +193,7 @@ TEST_CASE("fleet_snapshot: max_rows<=0 falls back to default", "[tar][fleet][tru
     std::vector<ProcessInfo> procs;
     for (int i = 0; i < 10; ++i)
         procs.push_back(make_proc(static_cast<uint32_t>(i), 0, "p", "", "u"));
-    auto out = build_fleet_snapshot_json(procs, {}, {}, "h", 1, {}, /*max_rows=*/0);
+    auto out = build_fleet_snapshot_json(procs, {}, {}, "h", 1, {}, true, true, /*max_rows=*/0);
     auto j = json::parse(out);
     // 10 < kFleetSnapshotMaxRows so all kept and not truncated
     CHECK(j["processes"].size() == 10);

@@ -19,6 +19,10 @@
  *
  * Thread-safe: a std::shared_mutex guards the slots map; refill runs
  * outside the lock so dispatch latency doesn't block other slot reads.
+ *
+ * Lifetime: one instance per Server, owned by the daemon for its lifetime.
+ * Constructor is called once in server.cpp with the real fetcher injected;
+ * never per-request.
  */
 
 #include "fleet_topology_types.hpp"
@@ -51,12 +55,28 @@ public:
     /// @param fetcher        Required. Called on cache miss / expiry.
     /// @param nvd            Optional. When include_vuln=true and nvd is
     ///                       non-null, processes get worst_severity + cve_count.
+    ///                       NOTE: PR 2 ships the join wired but inert: the
+    ///                       agent's fleet_snapshot.v1 payload does not yet
+    ///                       carry installed versions, so match_inventory --
+    ///                       which requires a non-empty version per item --
+    ///                       returns no matches today. PR 10 (vulnerability
+    ///                       overlay) will either extend the agent payload
+    ///                       with versions or add a name-only path to NVD.
     /// @param ttl            Cache TTL; defaults to 60 s.
     /// @param fetch_deadline How long the fetcher gets before partial results
-    ///                       are accepted; defaults to 5 s.
+    ///                       are accepted; defaults to 5 s. Waiters on a
+    ///                       single-flight refill use ttl_+slack as their
+    ///                       cv.wait_for bound so a hung fetcher cannot block
+    ///                       caller threads forever (UP-8 / CAP-2).
+    /// @param max_snapshot_bytes Soft cap on the serialised snapshot size.
+    ///                       Refills exceeding this log a WARN and are NOT
+    ///                       cached (next get() retries) so a runaway fleet
+    ///                       cannot wedge the cache slot at multi-GB.
+    ///                       Defaults to 256 MB. Set 0 to disable.
     FleetTopologyStore(Fetcher fetcher, NvdDatabase* nvd = nullptr,
                        std::chrono::milliseconds ttl = std::chrono::seconds(60),
-                       std::chrono::milliseconds fetch_deadline = std::chrono::milliseconds(5000));
+                       std::chrono::milliseconds fetch_deadline = std::chrono::milliseconds(5000),
+                       std::size_t max_snapshot_bytes = 256ull * 1024 * 1024);
 
     FleetTopologyStore(const FleetTopologyStore&) = delete;
     FleetTopologyStore& operator=(const FleetTopologyStore&) = delete;
@@ -79,17 +99,35 @@ public:
     uint64_t refill_waiters() const noexcept {
         return refill_waiters_.load(std::memory_order_relaxed);
     }
+    /// Refills whose serialised size exceeded max_snapshot_bytes_ and were
+    /// therefore NOT cached. A runaway counter signals a misbehaving agent
+    /// (or the fleet outgrew the configured cap).
+    uint64_t refill_oversize_drops() const noexcept {
+        return refill_oversize_drops_.load(std::memory_order_relaxed);
+    }
+    /// Single-flight waiters that timed out on cv.wait_for before the refill
+    /// completed. Non-zero indicates the fetcher is exceeding its deadline.
+    uint64_t refill_wait_timeouts() const noexcept {
+        return refill_wait_timeouts_.load(std::memory_order_relaxed);
+    }
 
     /// Build a TopologySnapshot from raw inputs without any caching. Public
     /// so PR 3 can reuse the same logic in any future on-demand path that
     /// bypasses the cache (e.g. a per-machine drill-in endpoint).
     TopologySnapshot build_snapshot(std::vector<RawAgentSnapshot> raw, bool include_vuln) const;
 
+    /// Sentinel snapshot returned when the fetcher fails on a cold slot --
+    /// has generated_at set but machines empty. Public so PR 3 can render
+    /// "no fleet data" identically whether the failure was first-call or
+    /// later. (governance round 1, UP-9.)
+    TopologySnapshot empty_snapshot(bool include_vuln) const;
+
 private:
     Fetcher fetcher_;
     NvdDatabase* nvd_{nullptr};
     std::chrono::milliseconds ttl_;
     std::chrono::milliseconds fetch_deadline_;
+    std::size_t max_snapshot_bytes_;
 
     struct Slot {
         std::shared_ptr<const TopologySnapshot> snap;
@@ -106,6 +144,8 @@ private:
     std::atomic<uint64_t> cache_hits_{0};
     std::atomic<uint64_t> cache_misses_{0};
     std::atomic<uint64_t> refill_waiters_{0};
+    std::atomic<uint64_t> refill_oversize_drops_{0};
+    std::atomic<uint64_t> refill_wait_timeouts_{0};
 
     bool fresh_locked(const Slot& s) const;
 };

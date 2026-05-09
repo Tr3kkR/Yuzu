@@ -35,6 +35,7 @@ Run all tests: `meson test -C builddir --print-errorlogs`
 | `test_metrics_perf.cpp` | Metrics performance | High-throughput metric emission, contention under concurrent writers |
 | `test_tar_diff.cpp` | TAR diff engine | Process tree diff, network change detection, service state transitions |
 | `test_tar_store.cpp` | TAR store | Timeline event persistence, query by time range, agent scoping |
+| `test_fleet_snapshot.cpp` | TAR fleet_snapshot.v1 JSON builder | Envelope shape, processes/connections round-trip with `remote_host`, default + custom redaction patterns, truncation flags, `process_source_paused` / `tcp_source_paused` markers, `schema_minor` field, payload size bound at full cap (12 cases) |
 
 ### Untested Agent Components
 
@@ -117,6 +118,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_schedule_engine.cpp` | Scheduler | Cron scheduling, next-run calculation, scope-based targeting |
 | `test_webhook_store.cpp` | Webhooks | Subscription CRUD, HMAC-SHA256 signing, delivery |
 | `test_security_headers.cpp` | HTTP security headers (SOC2-C1) | `validate_csp_extra_sources` accept/reject grammar (control bytes, semicolons, unsafe keywords, hash/nonce expressions, quoted/unquoted tokens, position tracking), `build_csp` directives + extras + `upgrade-insecure-requests` gating, `build_permissions_policy` deny-all baseline, `build_referrer_policy`, `HeaderBundle::apply` six-header emission, end-to-end integration via `httplib::Server`/`httplib::Client` (38 cases) |
+| `test_fleet_topology_store.cpp` | FleetTopologyStore + process_category | `classify()` over ~70 known basenames (case-insensitive, `.exe`/path stripping), cross-machine IP resolution to `dst_agent_id`, scope classification (Local/InternalFleet/External), 0.0.0.0/:: + loopback + link-local skip from `ip_to_agent`, IPv6 bracket and zone-id normalization, no-remote-endpoint drop, agent self-connection scope, stale-agent passthrough, vuln-overlay-disabled-when-nvd-null, JSON shape (`fleet_topology.v1`), cache hit/miss/TTL, invalidate, `include_vuln` slot independence, single-flight, fetcher exception returns empty sentinel, oversized snapshot returned but not cached (27 cases) |
 
 ### Untested Server Components
 

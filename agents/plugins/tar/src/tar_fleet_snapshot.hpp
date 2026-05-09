@@ -12,6 +12,7 @@
  * Schema (one JSON object):
  *   {
  *     "schema": "fleet_snapshot.v1",
+ *     "schema_minor": 1,
  *     "ts": <int64_t epoch seconds>,
  *     "hostname": <string>,
  *     "local_ips": [<string>, ...],
@@ -25,8 +26,13 @@
  *        "state":<string>, "pid":<u32>, "process_name":<string>}, ...
  *     ],
  *     "truncated_processes": <bool>,
- *     "truncated_connections": <bool>
+ *     "truncated_connections": <bool>,
+ *     "process_source_paused": <bool>,    // optional, only when true
+ *     "tcp_source_paused":     <bool>     // optional, only when true
  *   }
+ *
+ * `schema_minor` allows additive evolution (e.g. PR 7 adding rss_kb) without
+ * a breaking version bump. Consumers MUST ignore unknown keys.
  */
 
 #include "tar_collectors.hpp"
@@ -55,6 +61,9 @@ inline constexpr int kFleetSnapshotMaxRows = 4096;
  * @param hostname         Reporting host's name.
  * @param ts               Epoch seconds at snapshot time.
  * @param redaction_patterns  Glob patterns for cmdline redaction (e.g. "*password*").
+ * @param process_source_enabled  When false, emits process_source_paused=true
+ *                                so the renderer can show "partial observation".
+ * @param tcp_source_enabled      Same for the tcp source.
  * @param max_rows         Truncation cap per list (defaults to kFleetSnapshotMaxRows).
  *
  * @return Single-line JSON string (no trailing newline).
@@ -64,6 +73,7 @@ std::string build_fleet_snapshot_json(
     const std::vector<NetConnection>& connections, const std::vector<std::string>& local_ips,
     const std::string& hostname, int64_t ts,
     const std::vector<std::string>& redaction_patterns = kDefaultRedactionPatterns,
+    bool process_source_enabled = true, bool tcp_source_enabled = true,
     int max_rows = kFleetSnapshotMaxRows);
 
 } // namespace yuzu::tar

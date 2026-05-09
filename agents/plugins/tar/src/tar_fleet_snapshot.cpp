@@ -22,6 +22,7 @@ std::string build_fleet_snapshot_json(const std::vector<yuzu::agent::ProcessInfo
                                       const std::vector<std::string>& local_ips,
                                       const std::string& hostname, int64_t ts,
                                       const std::vector<std::string>& redaction_patterns,
+                                      bool process_source_enabled, bool tcp_source_enabled,
                                       int max_rows) {
 
     if (max_rows <= 0)
@@ -65,6 +66,7 @@ std::string build_fleet_snapshot_json(const std::vector<yuzu::agent::ProcessInfo
         ips_arr.push_back(ip);
 
     json doc = {{"schema", "fleet_snapshot.v1"},
+                {"schema_minor", 1},
                 {"ts", ts},
                 {"hostname", hostname},
                 {"local_ips", std::move(ips_arr)},
@@ -72,6 +74,11 @@ std::string build_fleet_snapshot_json(const std::vector<yuzu::agent::ProcessInfo
                 {"connections", std::move(conn_arr)},
                 {"truncated_processes", truncated_procs},
                 {"truncated_connections", truncated_conns}};
+
+    if (!process_source_enabled)
+        doc["process_source_paused"] = true;
+    if (!tcp_source_enabled)
+        doc["tcp_source_paused"] = true;
 
     return doc.dump();
 }

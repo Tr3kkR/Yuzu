@@ -150,7 +150,31 @@ std::vector<std::string> enumerate_local_ips() {
 
 #endif
 
-#if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
+#ifdef _WIN32
+
+namespace {
+// Process-static WSA initialiser. gethostname is a Winsock function and
+// returns WSANOTINITIALISED until WSAStartup runs. cloud_identity.cpp owns
+// a sibling initialiser; this one keeps network_interfaces.cpp self-contained
+// so callers don't have to reason about which other module ran first.
+struct WsaInitializer {
+    WsaInitializer() {
+        WSADATA wsa{};
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+    }
+    ~WsaInitializer() { WSACleanup(); }
+};
+const WsaInitializer kWsaInit;
+} // namespace
+
+std::string get_hostname() {
+    char buf[256] = {};
+    if (::gethostname(buf, sizeof(buf) - 1) != 0)
+        return {};
+    return std::string(buf);
+}
+
+#elif defined(__linux__) || defined(__APPLE__)
 
 std::string get_hostname() {
     char buf[256] = {};

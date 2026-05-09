@@ -106,9 +106,11 @@ struct TopologySnapshot {
     std::vector<MachineNode> machines;
 };
 
-/// Input shape -- one parsed fleet_snapshot.v1 payload. The fetcher seam
+/// Input shape -- one parsed fleet_snapshot.v1 payload from a single agent.
+/// SERVER-INTERNAL ONLY; never serialised to a renderer. The fetcher seam
 /// produces a vector of these; FleetTopologyStore turns them into the
-/// aggregate above.
+/// aggregate above. Carries `cmdline` (which MachineNode deliberately drops
+/// post-redaction) so PR 7+ richer classification can use it.
 struct RawAgentSnapshot {
     std::string agent_id;
     /// Full hostname (from snapshot).
@@ -189,7 +191,10 @@ inline void to_json(nlohmann::json& j, const MachineNode& m) {
 }
 
 inline void to_json(nlohmann::json& j, const TopologySnapshot& s) {
+    // schema_minor allows additive evolution (e.g. PR 7 adding cpu_pct).
+    // Renderers MUST ignore unknown keys.
     j = {{"schema", "fleet_topology.v1"},
+         {"schema_minor", 1},
          {"generated_at", s.generated_at},
          {"include_vuln", s.include_vuln},
          {"machines", s.machines}};

@@ -345,8 +345,11 @@ TEST_CASE("cache: single-flight -- concurrent get() calls fan one fetch",
     CHECK(store.refill_waiters() >= 1); // some fraction of N-1 were waiters
 }
 
-TEST_CASE("cache: fetcher exception leaves slot empty and unblocks waiters",
+TEST_CASE("cache: fetcher exception returns empty sentinel, unblocks waiters",
           "[viz][cache][singleflight]") {
+    // UP-9 fix: get() must never return nullptr. On first-call fetcher
+    // exception, callers receive an empty TopologySnapshot rather than
+    // nullptr so PR 3's REST handler can serialise without null-check.
     std::atomic<int> calls{0};
     auto fetcher = [&calls](std::chrono::milliseconds) -> std::vector<RawAgentSnapshot> {
         ++calls;
@@ -355,10 +358,98 @@ TEST_CASE("cache: fetcher exception leaves slot empty and unblocks waiters",
     FleetTopologyStore store(fetcher, nullptr, std::chrono::seconds(60));
 
     auto snap = store.get(false);
-    CHECK(snap == nullptr);
+    REQUIRE(snap != nullptr);
+    CHECK(snap->machines.empty());
+    CHECK(snap->generated_at != 0);
     CHECK(calls.load() == 1);
-    // Subsequent get() should also try (slot empty, treat as miss).
+    // Subsequent get() should also retry (slot empty, treat as miss).
     auto snap2 = store.get(false);
-    CHECK(snap2 == nullptr);
+    REQUIRE(snap2 != nullptr);
+    CHECK(snap2->machines.empty());
     CHECK(calls.load() == 2);
+}
+
+// =============================================================================
+// New tests added in governance round 1
+// =============================================================================
+
+TEST_CASE("topology: agent self-connection classified as External, not Internal",
+          "[viz][topology][self]") {
+    // QE-S3 — connection from a host to one of its own non-loopback IPs
+    // should not be a fleet edge.
+    auto a = make_agent("agent-A", "hostA", {"10.0.0.7"});
+    a.connections.push_back(conn("tcp", "10.0.0.7", 50000, "10.0.0.7", 8080));
+
+    FleetTopologyStore store(fixed_fetcher({a}));
+    auto snap = store.get(false);
+    REQUIRE(snap->machines.at(0).connections.size() == 1);
+    CHECK(snap->machines[0].connections[0].scope == EdgeScope::External);
+    CHECK(snap->machines[0].connections[0].dst_agent_id.empty());
+}
+
+TEST_CASE("topology: link-local IPs in local_ips are skipped from ip_to_agent",
+          "[viz][topology][defence]") {
+    // cons-N3 — defence-in-depth: malformed agent emitting 169.254.x.x or
+    // fe80::* in local_ips must not seed cross-machine resolution.
+    auto a = make_agent("agent-A", "hostA", {"169.254.1.5", "fe80::abcd", "10.0.0.7"});
+    auto b = make_agent("agent-B", "hostB", {"10.0.0.42"});
+    b.connections.push_back(conn("tcp", "10.0.0.42", 50000, "169.254.1.5", 5432));
+    b.connections.push_back(conn("tcp6", "fd00::2", 50001, "fe80::abcd", 5432));
+
+    FleetTopologyStore store(fixed_fetcher({a, b}));
+    auto snap = store.get(false);
+    auto& edges = snap->machines[1].connections;
+    REQUIRE(edges.size() == 2);
+    CHECK(edges[0].scope == EdgeScope::External);
+    CHECK(edges[0].dst_agent_id.empty());
+    CHECK(edges[1].scope == EdgeScope::External);
+    CHECK(edges[1].dst_agent_id.empty());
+}
+
+TEST_CASE("topology: IPv6 bracketed and zone-id forms normalized for ip_to_agent lookup",
+          "[viz][topology][ipv6]") {
+    // UP-7 — agent A reports `fd00::1`; agent B's connection lists
+    // `[fd00::1]:443` (bracket form) or `fd00::1%eth0` (zone-id). All three
+    // must resolve to the same canonical key.
+    auto a = make_agent("agent-A", "hostA", {"fd00::1"});
+    auto b = make_agent("agent-B", "hostB", {"fd00::2"});
+    b.connections.push_back(conn("tcp6", "fd00::2", 50000, "[fd00::1]", 443));
+    b.connections.push_back(conn("tcp6", "fd00::2", 50001, "fd00::1%eth0", 443));
+
+    FleetTopologyStore store(fixed_fetcher({a, b}));
+    auto snap = store.get(false);
+    auto& edges = snap->machines[1].connections;
+    REQUIRE(edges.size() == 2);
+    CHECK(edges[0].scope == EdgeScope::InternalFleet);
+    CHECK(edges[0].dst_agent_id == "agent-A");
+    CHECK(edges[1].scope == EdgeScope::InternalFleet);
+    CHECK(edges[1].dst_agent_id == "agent-A");
+}
+
+TEST_CASE("cache: oversized snapshot is returned but not cached", "[viz][cache][cap]") {
+    // CAP-1 — when a refill exceeds max_snapshot_bytes, the caller still
+    // receives the snapshot for this request, but the cache slot is NOT
+    // populated (next get() refills from scratch).
+    std::atomic<int> calls{0};
+    auto a = make_agent("agent-A", "hostA", {});
+    for (int i = 0; i < 100; ++i)
+        a.processes.push_back(proc(static_cast<uint32_t>(i), 1, "p", "u"));
+    auto fetcher = [&calls, a](std::chrono::milliseconds) {
+        ++calls;
+        return std::vector<RawAgentSnapshot>{a};
+    };
+    // Set max_snapshot_bytes very low so the realistic snapshot blows past it.
+    FleetTopologyStore store(fetcher, nullptr, std::chrono::seconds(60),
+                             std::chrono::milliseconds(5000), /*max_snapshot_bytes=*/256);
+
+    auto snap1 = store.get(false);
+    REQUIRE(snap1 != nullptr);
+    REQUIRE(snap1->machines.size() == 1);
+    CHECK(calls.load() == 1);
+
+    // Second call should NOT be a cache hit -- slot was refused due to size.
+    auto snap2 = store.get(false);
+    REQUIRE(snap2 != nullptr);
+    CHECK(calls.load() == 2);
+    CHECK(store.refill_oversize_drops() >= 2);
 }

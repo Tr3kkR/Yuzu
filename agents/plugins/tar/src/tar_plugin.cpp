@@ -34,6 +34,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <format>
 #include <memory>
@@ -751,17 +752,58 @@ private:
     // Re-enumerates processes + connections + local IPs on demand and emits a
     // single JSON line conforming to fleet_snapshot.v1. Used by the server-side
     // FleetTopologyStore on cache miss to assemble the /viz/fleet topology.
-    // Read-only with respect to tar.db -- no rows written here.
+    //
+    // Locking: takes collect_mu_ to serialise OS-resource enumeration with the
+    // collect_fast / collect_slow paths. The action does not write to tar.db,
+    // but enumerate_processes() / enumerate_connections() open many fds and a
+    // concurrent collect_fast cycle would double the OS pressure (governance
+    // round 1, plugin-B2 + UP-1).
+    //
+    // Source gating: if the operator paused process or tcp capture (forensic
+    // hold, PII compliance regime), fleet_snapshot must respect that decision
+    // -- otherwise a paused source silently leaks data through the new path
+    // (governance round 1, plugin-B1 + compliance-F1). When a source is
+    // disabled, the corresponding list is emitted empty with truncated_*=false
+    // and the snapshot carries `source_paused.process` / `.tcp` markers.
+    //
+    // Redaction: kDefaultRedactionPatterns is unioned with the operator-loaded
+    // patterns so an empty config does NOT disable redaction
+    // (governance round 1, sec-M1 + compliance-F3).
     int do_fleet_snapshot(yuzu::CommandContext& ctx) {
+        std::lock_guard lock(collect_mu_);
         auto ts = now_epoch_seconds();
         auto hostname = yuzu::agent::get_hostname();
         auto local_ips = yuzu::agent::enumerate_local_ips();
-        auto processes = yuzu::agent::enumerate_processes();
-        auto connections = yuzu::tar::enumerate_connections();
-        auto redaction = load_redaction_patterns(*db_);
 
-        auto payload = yuzu::tar::build_fleet_snapshot_json(processes, connections, local_ips,
-                                                            hostname, ts, redaction);
+        const bool process_on = source_enabled(*db_, "process");
+        const bool tcp_on = source_enabled(*db_, "tcp");
+
+        std::vector<yuzu::agent::ProcessInfo> processes;
+        if (process_on) {
+            processes = yuzu::agent::enumerate_processes();
+        }
+        std::vector<yuzu::tar::NetConnection> connections;
+        if (tcp_on) {
+            connections = yuzu::tar::enumerate_connections();
+        }
+
+        // Defence-in-depth: union operator patterns with the compiled-in
+        // defaults so an empty/missing config still applies *password*, *secret*,
+        // *token*, *api_key*, *credential*. The `should_redact` matcher returns
+        // true on the first hit, so duplicates are harmless.
+        auto redaction = load_redaction_patterns(*db_);
+        for (const auto& def : yuzu::tar::kDefaultRedactionPatterns) {
+            if (std::find(redaction.begin(), redaction.end(), def) == redaction.end())
+                redaction.push_back(def);
+        }
+
+        spdlog::info("tar.fleet_snapshot host={} procs={} conns={} ips={} "
+                     "process_on={} tcp_on={}",
+                     hostname, processes.size(), connections.size(), local_ips.size(), process_on,
+                     tcp_on);
+
+        auto payload = yuzu::tar::build_fleet_snapshot_json(
+            processes, connections, local_ips, hostname, ts, redaction, process_on, tcp_on);
 
         ctx.write_output(payload);
         return 0;
