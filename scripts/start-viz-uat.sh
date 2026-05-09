@@ -28,6 +28,11 @@ COMPOSE_FILE="$REPO_ROOT/deploy/docker/docker-compose.viz-uat.yml"
 VIZ_UAT_DIR=${VIZ_UAT_DIR:-/tmp/yuzu-viz-uat}
 VIZ_UAT_AGENTS=${VIZ_UAT_AGENTS:-1}
 VIZ_UAT_SKIP_BUILD=${VIZ_UAT_SKIP_BUILD:-}
+# Compose references ${VIZ_UAT_CONFIG:?...} so it must be set for every
+# subcommand, not just `start`. The path itself only has to exist for `up`
+# (bind mount); `down`/`ps`/`logs` just need the variable defined to pass
+# compose's interpolation pass.
+export VIZ_UAT_CONFIG="${VIZ_UAT_CONFIG:-$VIZ_UAT_DIR/viz-uat/yuzu-server.cfg}"
 
 ADMIN_USER=admin
 ADMIN_PASS=adminpassword1
@@ -50,23 +55,23 @@ fail()  { printf "${COLOR_R}[xx]${COLOR_0} %s\n" "$*"; }
 
 cmd_stop() {
   info "Stopping viz-UAT stack..."
-  ( cd "$REPO_ROOT" && docker compose -f "$COMPOSE_FILE" \
-      --env-file <(echo "YUZU_ENROLLMENT_TOKEN=stub") \
-      down -v --remove-orphans ) || true
+  # YUZU_ENROLLMENT_TOKEN must be set to satisfy compose's `:?` interpolation
+  # check, but the value doesn't matter for `down` -- no agent is started.
+  ( cd "$REPO_ROOT" && YUZU_ENROLLMENT_TOKEN=stub \
+      docker compose -f "$COMPOSE_FILE" down -v --remove-orphans ) || true
   rm -rf "$VIZ_UAT_DIR"
   ok "Stopped + cleaned $VIZ_UAT_DIR"
 }
 
 cmd_status() {
-  ( cd "$REPO_ROOT" && docker compose -f "$COMPOSE_FILE" \
-      --env-file <(echo "YUZU_ENROLLMENT_TOKEN=stub") ps )
+  ( cd "$REPO_ROOT" && YUZU_ENROLLMENT_TOKEN=stub \
+      docker compose -f "$COMPOSE_FILE" ps )
   echo ""
   info "Last 20 lines from each service:"
   for svc in server gateway agent; do
     echo "── $svc ──"
-    ( cd "$REPO_ROOT" && docker compose -f "$COMPOSE_FILE" \
-        --env-file <(echo "YUZU_ENROLLMENT_TOKEN=stub") \
-        logs --tail=20 "$svc" 2>/dev/null ) || true
+    ( cd "$REPO_ROOT" && YUZU_ENROLLMENT_TOKEN=stub \
+        docker compose -f "$COMPOSE_FILE" logs --tail=20 "$svc" 2>/dev/null ) || true
     echo ""
   done
 }
@@ -275,7 +280,6 @@ cmd_start() {
   generate_config
 
   cd "$REPO_ROOT"
-  export VIZ_UAT_CONFIG="$VIZ_UAT_DIR/viz-uat/yuzu-server.cfg"
 
   # Phase 1: server + gateway (no token needed yet)
   info "Starting server + gateway..."
