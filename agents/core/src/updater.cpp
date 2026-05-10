@@ -8,6 +8,7 @@
  */
 
 #include <yuzu/agent/updater.hpp>
+#include <yuzu/metrics.hpp>
 #include <yuzu/plugin.h> // yuzu_create_temp_file
 #include <yuzu/transport/proto_adapter.hpp>
 #include <yuzu/transport/transport.hpp>
@@ -267,10 +268,20 @@ int compare_semver(std::string_view a, std::string_view b) {
 constexpr int64_t kMaxDownloadBytes = 512 * 1024 * 1024; // 512 MiB hard cap
 
 Updater::Updater(UpdateConfig config, std::string agent_id, std::string current_version,
-                 std::string os, std::string arch, std::filesystem::path exe_path)
+                 std::string os, std::string arch, std::filesystem::path exe_path,
+                 ::yuzu::MetricsRegistry* metrics)
     : config_{std::move(config)}, agent_id_{std::move(agent_id)},
       current_version_{std::move(current_version)}, os_{std::move(os)}, arch_{std::move(arch)},
-      exe_path_{std::move(exe_path)} {}
+      exe_path_{std::move(exe_path)}, metrics_{metrics} {
+    if (metrics_) {
+        metrics_->describe(
+            "yuzu_agent_ota_chunk_deadline_total",
+            "Per-frame OTA deadline expiries observed by the agent during DownloadUpdate. "
+            "phase=write tags request-frame write-deadline expiry; phase=read tags chunk "
+            "read-deadline expiry. CC7.2 evidence parity for #911 / UP-101.",
+            "counter");
+    }
+}
 
 void Updater::stop() noexcept {
     stop_requested_.store(true, std::memory_order_release);
@@ -371,7 +382,23 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_channel) {
         return std::unexpected(UpdateError{"Failed to open DownloadUpdate stream"});
     }
 
-    if (!::yuzu::transport::write_pb(*stream, dl_req)) {
+    // Per-frame write deadline (#911 / UP-101). The request frame is
+    // small, so a healthy peer accepts it in milliseconds; 5 s is a
+    // generous bound that surfaces a stuck transport (TLS renegotiation
+    // hang, NAT/firewall holding the stream, server bidi-pool saturation
+    // delaying the dispatcher accept) without false-firing on legitimate
+    // network jitter. Symmetric with kChunkReadDeadline below for the
+    // streaming phase.
+    constexpr auto kRequestWriteDeadline = std::chrono::seconds(5);
+    if (!::yuzu::transport::write_pb(*stream, dl_req, kRequestWriteDeadline)) {
+        // Distinguish deadline expiry from peer-close / cancel so the
+        // SRE-2 counter (#924) records the right reason. final_status
+        // is safe to call from this thread (we're the writer + reader).
+        const auto why = stream->final_status();
+        if (metrics_ && why.code == ::yuzu::transport::StatusCode::DeadlineExceeded) {
+            metrics_->counter("yuzu_agent_ota_chunk_deadline_total", {{"phase", "write"}})
+                .increment();
+        }
         // Cancel-without-writes_done is intentional: if write_pb failed the
         // request frame never landed on the server side, so there is no
         // half-close semantic to express — `cancel()` subsumes teardown.
@@ -446,6 +473,14 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_channel) {
 
     auto dl_status = stream->final_status();
     out.close();
+
+    // SRE-2 / #924: increment counter on chunk-read deadline expiry so
+    // operators can attribute slow-OTA incidents to a specific peer.
+    // Symmetric with the server-side `chunk_write_deadline_exceeded`
+    // counter; together they give CC7.2 evidence parity.
+    if (metrics_ && dl_status.code == ::yuzu::transport::StatusCode::DeadlineExceeded) {
+        metrics_->counter("yuzu_agent_ota_chunk_deadline_total", {{"phase", "read"}}).increment();
+    }
 
     if (dl_status.code != ::yuzu::transport::StatusCode::Ok) {
         std::error_code ec;

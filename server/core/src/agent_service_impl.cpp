@@ -1196,6 +1196,18 @@ AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& ctx,
     std::vector<char> buffer(kChunkSize);
     int64_t offset = 0;
 
+    // Per-chunk write deadline (#911 / UP-101). Bounds the time a slow-
+    // write peer (zero TCP receive window, NAT/firewall holding the
+    // stream, HTTP/2 flow-control window collapse) can pin a bidi
+    // dispatcher pool slot during the chunk-streaming phase. Symmetric
+    // with kRequestReadDeadline above. 30 s is generous: at the 64 KiB
+    // chunk size + an absolute floor of 1 KiB/s sustained throughput
+    // (slow corp link), a chunk takes ~64 s to drain — but a healthy
+    // peer accepts the local TCP buffer in milliseconds, so a 30 s wait
+    // is overwhelmingly attributable to peer trouble. Operators can
+    // increase this if the deployment targets unusually slow links.
+    constexpr auto kChunkWriteDeadline = std::chrono::seconds(30);
+
     while (file.read(buffer.data(), static_cast<std::streamsize>(kChunkSize)) ||
            file.gcount() > 0) {
         pb::DownloadUpdateChunk chunk;
@@ -1203,7 +1215,27 @@ AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& ctx,
         chunk.set_offset(offset);
         chunk.set_total_size(pkg->file_size);
 
-        if (!::yuzu::transport::write_pb(stream, chunk)) {
+        if (!::yuzu::transport::write_pb(stream, chunk, kChunkWriteDeadline)) {
+            // Distinguish deadline expiry from peer disconnect / cancel
+            // so the wire status is precise; the BidiStream contract
+            // promotes final_status() to DeadlineExceeded only on the
+            // deadline path. Counter + warn log mirror the request-read
+            // deadline branch above.
+            const auto why = stream.final_status();
+            if (why.code == StatusCode::DeadlineExceeded) {
+                metrics_
+                    .counter(
+                        "yuzu_grpc_requests_total",
+                        {{"method", "DownloadUpdate"}, {"status", "chunk_write_deadline_exceeded"}})
+                    .increment();
+                const std::string peer = ctx.peer_san_identities.empty()
+                                             ? ctx.peer_uri
+                                             : ctx.peer_san_identities.front();
+                spdlog::warn("DownloadUpdate: chunk-write deadline expired for peer={} "
+                             "at offset {} (pool slot released)",
+                             peer, offset);
+                return Status{StatusCode::DeadlineExceeded, "chunk-write deadline exceeded"};
+            }
             spdlog::warn("DownloadUpdate: client disconnected at offset {}", offset);
             return Status{StatusCode::Cancelled, ""};
         }

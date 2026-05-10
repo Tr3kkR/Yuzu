@@ -1547,6 +1547,139 @@ TEST_CASE("Bidi read deadline expires on client when server never writes",
     listener->shutdown();
 }
 
+// =====================================================================
+// BidiStream::write per-frame deadline (#911 / UP-101)
+// =====================================================================
+//
+// The deadline parameter caps how long a writer will wait for the
+// transport to accept a frame before cancelling the stream. Closes
+// the gap where a slow-write peer (collapsed TCP receive window,
+// NAT/firewall holding the stream, HTTP/2 flow-control window
+// exhaustion) could pin a bidi dispatcher pool slot indefinitely
+// during the chunk-streaming phase of a server-streaming-via-bidi
+// call (e.g. DownloadUpdate). Symmetric with the read-side idle
+// deadline (#902).
+
+TEST_CASE("Bidi write deadline plumbed through API on cancelled stream "
+          "(#911 / UP-101)",
+          "[transport][bidi][deadline][write]") {
+    using namespace std::chrono_literals;
+    // The mechanism that fires deadline expiry on `write(msg, deadline)`
+    // is structurally identical to the read-side path covered above —
+    // same `cv_.wait_for(lock, deadline, pred)` + on-expiry-cancel
+    // pattern in both backends (`grpc_channel.cpp::write` +
+    // `grpc_listener.cpp::write`). Engineering a reliable
+    // HTTP/2-flow-control fill in a CI test would require either
+    // tweaking gRPC channel args (default initial windows are ~4 MiB,
+    // not the spec's 64 KiB) or accepting flake. Instead, this test
+    // pins the API surface: the parameter is accepted, default-zero
+    // matches the unbounded contract, and post-cancel writes return
+    // false promptly even with a deadline armed (proving the cancel
+    // pred dominates).
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        while (stream.read(msg)) {
+            // drain
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiWriteApi", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(2s));
+
+    CallContext ctx;
+    ctx.deadline = 5s;
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiWriteApi", ctx);
+    REQUIRE(stream != nullptr);
+
+    // Sanity: write with default-zero deadline succeeds on a healthy
+    // stream — the new parameter does not regress today's contract.
+    StringMessage payload("hello");
+    REQUIRE(stream->write(payload));
+
+    // Cancel the stream. Subsequent writes (with or without deadline)
+    // return false immediately because the cancelled_ flag short-
+    // circuits the wait branch.
+    stream->cancel();
+
+    // Write with a positive deadline on a cancelled stream must return
+    // false promptly (well under the deadline) — the cancel pred fires
+    // immediately, no actual deadline wait happens. This proves the
+    // deadline parameter is wired through without breaking the cancel
+    // short-circuit.
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok_after_cancel = stream->write(payload, 5s);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    REQUIRE_FALSE(ok_after_cancel);
+    REQUIRE(elapsed < 1s);
+
+    // Drain server side cleanly: final_status blocks until handler
+    // returns, which it does once the cancel-induced read-false
+    // unblocks the handler's drain loop.
+    Status final = stream->final_status();
+    // Either Cancelled (cancel before any deadline fired) or Ok (server
+    // half-close raced with cancel) is acceptable; what matters is that
+    // we get a terminal status without hang.
+    REQUIRE((final.code == StatusCode::Cancelled || final.code == StatusCode::Ok));
+
+    listener->shutdown();
+}
+
+TEST_CASE("Bidi write deadline does not fire when peer reads promptly "
+          "(#911 / UP-101)",
+          "[transport][bidi][deadline][write]") {
+    using namespace std::chrono_literals;
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    // Server reads everything as fast as the client writes — a healthy
+    // peer. Client writes 16 frames with a 5 s deadline; deadline must
+    // never fire and final_status() returns Ok.
+    auto handler = [](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        while (stream.read(msg)) {
+            // Drain.
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiWriteHappy", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(2s));
+
+    CallContext ctx;
+    ctx.deadline = 30s;
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiWriteHappy", ctx);
+    REQUIRE(stream != nullptr);
+
+    StringMessage payload("hello");
+    for (int i = 0; i < 16; ++i) {
+        REQUIRE(stream->write(payload, 5s));
+    }
+    stream->writes_done();
+
+    StringMessage drain;
+    REQUIRE_FALSE(stream->read(drain)); // Peer half-close.
+    Status final = stream->final_status();
+    REQUIRE(final.code == StatusCode::Ok);
+
+    listener->shutdown();
+}
+
 TEST_CASE("Bidi read negative deadline is treated as zero (#915 / UP-110)",
           "[transport][bidi][deadline]") {
     using namespace std::chrono_literals;

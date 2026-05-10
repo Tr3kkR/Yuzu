@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **`BidiStream::write` per-frame deadline + agent-side OTA chunk-deadline
+  counter (#911 / UP-101 / SRE-2 / #924).** Adds an optional
+  `std::chrono::milliseconds deadline` parameter to `BidiStream::write`,
+  symmetric with the read-side idle deadline (#902 / UP-8). Default-zero
+  preserves today's unbounded-wait contract; negative values clamp to
+  zero (matching `BidiStream::read` per #915). The mechanism is identical
+  to the read side: `cv_.wait_for(lock, deadline, pred)` followed by
+  set-flag + TryCancel + return-false on expiry; `final_status()` then
+  promotes to `DeadlineExceeded` on either read- or write-deadline-fired
+  flags. Wired in both backends (`grpc_channel.cpp::GrpcBidiStream` +
+  `grpc_listener.cpp::ServerBidiStream`); the typed `write_pb` template
+  helper in `proto_adapter.hpp` gains a deadline parameter too.
+
+  Two production call sites adopt the new deadline:
+  - **Server `DownloadUpdate`** (`agent_service_impl.cpp`) arms each
+    chunk write with `kChunkWriteDeadline = 30 s`. On expiry the handler
+    increments
+    `yuzu_grpc_requests_total{method="DownloadUpdate",status="chunk_write_deadline_exceeded"}`,
+    emits a peer-attributed warn log, and returns DeadlineExceeded.
+    Bounds bidi-pool slot residency for slow-write peers (zero TCP
+    receive window, NAT/firewall holding the stream, HTTP/2
+    flow-control window collapse).
+  - **Agent `Updater`** (`updater.cpp`) arms the request-frame write
+    with `kRequestWriteDeadline = 5 s` (small frame, short timeout).
+
+  Companion observability change (SRE-2 / #924): `Updater` constructor
+  now takes an optional `MetricsRegistry*`; the agent passes `&metrics_`
+  at construction (`agent.cpp`). On per-frame deadline expiry the
+  updater increments
+  `yuzu_agent_ota_chunk_deadline_total{phase="write"|"read"}` —
+  `phase="write"` for the request-frame write deadline, `phase="read"`
+  for the chunk-read deadline. Closes the CC7.2 evidence asymmetry the
+  governance round called out (server side has chunk-deadline counters;
+  agent now does too).
+
+  Test coverage: new transport-smoke cases pin the API surface (default-
+  zero preserves contract, deadline parameter accepted on cancelled
+  streams without breaking the cancel short-circuit) plus a happy-path
+  case proving deadline does not fire when peer reads promptly. The
+  actual deadline-expiry mechanism is structurally identical to the
+  read-side path covered by `[transport][bidi][deadline]` cases above
+  (same `cv_.wait_for(lock, deadline, pred)` + on-expiry-cancel
+  pattern); engineering an HTTP/2-flow-control fill in CI would require
+  tweaking gRPC channel args (default initial windows are ~4 MiB) and
+  is rejected for flake reasons.
 - **NTP-step sanity log on unary `DeadlineExceeded` returns + MSVC chrono
   doc (#914 / UP-108).** gRPC's `ClientContext::set_deadline` accepts
   only `system_clock::time_point` (`grpcpp/support/time.h:46-47` deletes

@@ -458,14 +458,14 @@ class ProtoMessage;  // defined in transport/proto_adapter.hpp
 //     while a reader is still draining is undefined.
 //   * `cancel()` is idempotent; calling it after `final_status()` has
 //     returned is a safe no-op.
-//   * Deadline expiry on `read(msg, deadline)` is internally equivalent
-//     to `cancel()` from a third thread firing exactly when the
-//     deadline lapses. Subsequent reads/writes return false; only the
-//     `final_status()` reporting changes (DeadlineExceeded vs
-//     Cancelled). This means deadline cancellation is observable on
-//     the writer thread too — a writer racing with a reader's
-//     deadline expiry will see false from `write()` after the
-//     deadline fires.
+//   * Deadline expiry on `read(msg, deadline)` OR `write(msg, deadline)`
+//     is internally equivalent to `cancel()` from a third thread firing
+//     exactly when the deadline lapses. Subsequent reads/writes return
+//     false; only the `final_status()` reporting changes (DeadlineExceeded
+//     vs Cancelled). This means deadline cancellation is observable on
+//     both the reader and writer threads — a writer racing with a
+//     reader's deadline expiry sees false from `write()` after the
+//     deadline fires, and vice versa for reader vs writer deadline.
 //
 // Wire ordering contract (msquic backend):
 //   * The sender emits frames in `write()` order, each with a 4-byte
@@ -483,7 +483,32 @@ public:
     // Write a frame. Blocks until the frame is accepted into the transport
     // buffer (NOT until it lands on the wire). Returns false if the stream
     // has been finished (`writes_done()` called) or cancelled.
-    virtual bool write(const SerializableMessage& msg) = 0;
+    //
+    // `deadline` is an optional per-call write timeout. Zero (the default)
+    // mirrors `CallContext::deadline` semantics — wait indefinitely until
+    // the transport accepts the frame or the stream is cancelled. A
+    // positive value caps the wait at that duration; if the transport
+    // does not accept the frame by then (a slow-write peer with a
+    // collapsed receive window, NAT/firewall holding the stream, or
+    // HTTP/2 flow-control window exhaustion), the stream is cancelled
+    // (`gctx_.TryCancel()` on the gRPC backend; the analogous QUIC stream
+    // close on a future msquic backend), the write returns false, and
+    // `final_status()` reports `StatusCode::DeadlineExceeded`. Both
+    // backends MUST honour this — the deadline is what bounds bidi
+    // dispatcher pool slot residency for slow-write peers (#911 / UP-101)
+    // and is symmetric with the read-side idle deadline (#902 / UP-8).
+    //
+    // The deadline applies ONLY to this specific write call, not to the
+    // stream as a whole. A handler streaming N chunks may arm the same
+    // (or different) deadline on each frame; total stream lifetime is
+    // bounded by N × deadline rather than the per-frame value alone.
+    //
+    // **Negative deadlines are treated as zero** (no deadline / unbounded
+    // wait), symmetric with the read-side semantics. To express "expire
+    // immediately", pass `milliseconds(1)`.
+    virtual bool write(const SerializableMessage& msg,
+                       std::chrono::milliseconds deadline =
+                           std::chrono::milliseconds::zero()) = 0;
 
     // Read the next frame into msg. Returns true on success, false on
     // half-close from the peer, on cancellation, or on idle-read deadline

@@ -561,7 +561,9 @@ public:
         }
     }
 
-    bool write(const SerializableMessage& msg) override {
+    bool write(const SerializableMessage& msg,
+               std::chrono::milliseconds deadline =
+                   std::chrono::milliseconds::zero()) override {
         if (!rw_ || !construction_error_.empty()) return false;
         std::string bytes;
         if (!msg.serialize(bytes)) return false;
@@ -573,9 +575,29 @@ public:
         write_done_.reset();
         write_buf_ = string_to_byte_buffer(bytes);
         rw_->Write(write_buf_, reinterpret_cast<void*>(kTagWrite));
-        cv_.wait(lock, [this] {
+        const auto pred = [this] {
             return write_done_.has_value() || cancelled_;
-        });
+        };
+        // Negative deadline → treated as zero (unbounded). Symmetric with
+        // the read-side semantics; the `> zero()` check below routes
+        // negatives to the unbounded `else` branch (#915 / UP-110).
+        if (deadline > std::chrono::milliseconds::zero()) {
+            // Per-frame write deadline (#911 / UP-101). On expiry: mark
+            // deadline-exceeded for final_status() reporting, flip
+            // cancelled_, then TryCancel via lock-released path so the
+            // worker_loop drains the cq events normally and the dtor's
+            // ensure_finished() proceeds. Mirrors the read-side pattern.
+            if (!cv_.wait_for(lock, deadline, pred)) {
+                write_deadline_exceeded_ = true;
+                cancelled_               = true;
+                cv_.notify_all();
+                lock.unlock();
+                gctx_.TryCancel();
+                return false;
+            }
+        } else {
+            cv_.wait(lock, pred);
+        }
         if (cancelled_) return false;
         const bool ok = *write_done_;
         if (ok && sink_) sink_->on_bytes_sent("grpc", bytes.size());
@@ -677,15 +699,19 @@ public:
                     std::string(k.data(), k.size()),
                     std::string(v.data(), v.size()));
             }
-            // BidiStream contract: if read() observed an idle-deadline
-            // expiry, final_status() reports DeadlineExceeded regardless
-            // of what the wire status says (which is invariably
-            // Cancelled because we TryCancel'd from the read path).
-            // #902 / UP-8.
+            // BidiStream contract: if read() OR write() observed a
+            // deadline expiry, final_status() reports DeadlineExceeded
+            // regardless of what the wire status says (which is
+            // invariably Cancelled because we TryCancel'd from the
+            // read/write path). #902 / UP-8 / #911 / UP-101.
             if (read_deadline_exceeded_) {
                 final_yt_status_ = Status{
                     StatusCode::DeadlineExceeded,
                     "transport: bidi read deadline exceeded"};
+            } else if (write_deadline_exceeded_) {
+                final_yt_status_ = Status{
+                    StatusCode::DeadlineExceeded,
+                    "transport: bidi write deadline exceeded"};
             }
         }
         return final_yt_status_;
@@ -811,6 +837,10 @@ private:
     // half-close — matches the BidiStream contract block in
     // transport.hpp.
     bool                                                     read_deadline_exceeded_ = false;
+    // Set by write() when its per-frame write deadline lapses before
+    // the transport accepts the frame (#911 / UP-101). Same promotion
+    // semantics as read_deadline_exceeded_.
+    bool                                                     write_deadline_exceeded_ = false;
     // governance sec-L3: gauge balance for failed-construction streams.
     // on_stream_opened fires only on the PrepareCall-success path; the
     // dtor's matching on_stream_closed gates on this flag so the gauge
@@ -835,7 +865,9 @@ std::unique_ptr<BidiStream> GrpcChannel::bidi_stream(
         struct DeadStream final : BidiStream {
             std::string err;
             std::map<std::string, std::string> empty_md;
-            bool write(const SerializableMessage&) override { return false; }
+            bool write(const SerializableMessage&,
+                       std::chrono::milliseconds = std::chrono::milliseconds::zero())
+                       override { return false; }
             bool read(SerializableMessage&,
                       std::chrono::milliseconds = std::chrono::milliseconds::zero())
                       override { return false; }

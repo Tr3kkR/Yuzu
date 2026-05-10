@@ -8,6 +8,10 @@
 #include <filesystem>
 #include <string>
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::agent {
 
 struct UpdateError {
@@ -21,8 +25,14 @@ struct UpdateConfig {
 
 class YUZU_EXPORT Updater {
 public:
+    /// `metrics` is an optional pointer to the agent's MetricsRegistry so
+    /// the updater can emit `yuzu_agent_ota_chunk_deadline_total{phase=...}`
+    /// counters on per-frame write/read deadline expiry (#911 / SRE-2 /
+    /// #924). Pass nullptr to disable; the counters are otherwise
+    /// no-ops. Lifetime: the registry MUST outlive the Updater.
     Updater(UpdateConfig config, std::string agent_id, std::string current_version, std::string os,
-            std::string arch, std::filesystem::path exe_path);
+            std::string arch, std::filesystem::path exe_path,
+            ::yuzu::MetricsRegistry* metrics = nullptr);
     ~Updater() = default;
 
     Updater(const Updater&) = delete;
@@ -54,6 +64,7 @@ private:
     std::string arch_;
     std::filesystem::path exe_path_;
     std::atomic<bool> stop_requested_{false};
+    ::yuzu::MetricsRegistry* metrics_ = nullptr;
 
     /// Platform-specific binary replacement with rollback on failure.
     [[nodiscard]] std::expected<bool, UpdateError>

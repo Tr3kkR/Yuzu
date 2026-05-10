@@ -212,15 +212,23 @@ template <typename T>
 // already-finished / serialise overflow — same contract as
 // `BidiStream::write`.
 //
+// `deadline` defaults to zero (wait indefinitely). A positive value
+// caps the per-call wait; on expiry the stream is cancelled and
+// `BidiStream::final_status()` reports `DeadlineExceeded`. See the
+// BidiStream contract block in transport.hpp for the full semantics
+// (#911 / UP-101).
+//
 // `[[nodiscard]]`: a false return signals the stream is dead; further
 // writes will also fail and the caller usually wants to bail. Sites
 // that intentionally fire-and-forget (e.g. the agent's command-output
 // pump where a dead stream is detected by the next read iteration)
 // MUST use `(void)write_pb(...)` to express intent.
 template <typename T>
-[[nodiscard]] bool write_pb(BidiStream& stream, const T& msg) {
+[[nodiscard]] bool write_pb(BidiStream& stream, const T& msg,
+                            std::chrono::milliseconds deadline =
+                                std::chrono::milliseconds::zero()) {
     auto wrap = as_proto(msg);  // overload const-casts internally; safe for serialize-only
-    return stream.write(wrap);
+    return stream.write(wrap, deadline);
 }
 
 }  // namespace yuzu::transport

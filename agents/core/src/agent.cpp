@@ -959,7 +959,7 @@ public:
                 updater_ = std::make_unique<Updater>(
                     UpdateConfig{cfg_.auto_update, cfg_.update_check_interval}, cfg_.agent_id,
                     std::string{yuzu::kFullVersionString}, kAgentOs, kAgentArch,
-                    current_executable_path());
+                    current_executable_path(), &metrics_);
 
                 if (updater_->rollback_if_needed()) {
                     spdlog::warn("OTA rollback was triggered - running previous binary");

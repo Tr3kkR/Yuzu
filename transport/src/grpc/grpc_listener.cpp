@@ -266,7 +266,9 @@ private:
     public:
         explicit ServerBidiStream(ServerCall* call) : call_(call) {}
 
-        bool write(const SerializableMessage& msg) override {
+        bool write(const SerializableMessage& msg,
+                   std::chrono::milliseconds deadline =
+                       std::chrono::milliseconds::zero()) override {
             std::string bytes;
             if (!msg.serialize(bytes)) return false;
             const std::size_t cap =
@@ -281,10 +283,31 @@ private:
             call_->bidi_write_buf_ = string_to_byte_buffer(bytes);
             call_->rw_.Write(call_->bidi_write_buf_,
                              static_cast<CqTag*>(&call_->write_tag_));
-            call_->bidi_cv_.wait(lock, [this] {
+            const auto pred = [this] {
                 return call_->bidi_write_done_.has_value() ||
                        call_->bidi_cancelled_;
-            });
+            };
+            // Negative deadline → treated as zero (unbounded). Symmetric
+            // with the read-side semantics; the `> zero()` check below
+            // routes negatives to the unbounded `else` branch
+            // (#915 / UP-110).
+            if (deadline > std::chrono::milliseconds::zero()) {
+                // Per-frame write deadline (#911 / UP-101). On expiry:
+                // mark deadline-exceeded for final_status() reporting,
+                // flip bidi_cancelled_, then TryCancel so the cq_worker
+                // delivers the write_tag completion (with ok=false) and
+                // the dispatcher proceeds to Finish. Mirrors the
+                // read-side pattern.
+                if (!call_->bidi_cv_.wait_for(lock, deadline, pred)) {
+                    call_->bidi_write_deadline_exceeded_ = true;
+                    call_->bidi_cancelled_               = true;
+                    call_->bidi_cv_.notify_all();
+                    call_->gctx_.TryCancel();
+                    return false;
+                }
+            } else {
+                call_->bidi_cv_.wait(lock, pred);
+            }
             if (call_->bidi_cancelled_) return false;
             const bool ok = *call_->bidi_write_done_;
             if (ok && call_->listener_->opts_.metric_sink) {
@@ -365,15 +388,19 @@ private:
         Status final_status() override {
             // Server-side: handlers don't normally call final_status()
             // on their own stream. Return Ok with no detail for parity
-            // with the BidiStream contract — UNLESS read() observed an
-            // idle-deadline expiry (#902 / UP-8), in which case the
-            // contract block in transport.hpp requires DeadlineExceeded
-            // so the handler can distinguish it from peer half-close /
-            // external cancel().
+            // with the BidiStream contract — UNLESS read() OR write()
+            // observed a deadline expiry (#902 / UP-8 / #911 / UP-101),
+            // in which case the contract block in transport.hpp requires
+            // DeadlineExceeded so the handler can distinguish it from
+            // peer half-close / external cancel().
             std::lock_guard<std::mutex> lock(call_->bidi_mtx_);
             if (call_->bidi_read_deadline_exceeded_) {
                 return Status{StatusCode::DeadlineExceeded,
                               "transport: bidi read deadline exceeded"};
+            }
+            if (call_->bidi_write_deadline_exceeded_) {
+                return Status{StatusCode::DeadlineExceeded,
+                              "transport: bidi write deadline exceeded"};
             }
             return Status{StatusCode::Ok, ""};
         }
@@ -731,6 +758,10 @@ private:
     // ServerBidiStream::final_status() can report DeadlineExceeded —
     // matches BidiStream contract block.
     bool                                   bidi_read_deadline_exceeded_ = false;
+    // Set by ServerBidiStream::write when its per-frame write deadline
+    // lapses before the transport accepts the frame (#911 / UP-101).
+    // Same final_status() promotion semantics as bidi_read_deadline_exceeded_.
+    bool                                   bidi_write_deadline_exceeded_ = false;
     ::grpc::ByteBuffer                     bidi_read_buf_;
     ::grpc::ByteBuffer                     bidi_write_buf_;
     std::unique_ptr<ServerBidiStream>      bidi_stream_;
