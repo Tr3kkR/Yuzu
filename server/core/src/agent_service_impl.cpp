@@ -55,6 +55,18 @@ constexpr double kBucketCapacity = 5.0;
 
 bool AgentServiceImpl::admit_download_update(const std::string& peer) {
     using namespace std::chrono;
+    // Pin the NSDMI default in `DownloadUpdateBucket` (header) against
+    // `kBucketCapacity` so a future header edit that drifts the literal
+    // fails at compile time rather than silently shipping a bucket that
+    // starts at a different capacity than the cap. Lives here (not at
+    // namespace scope) because `DownloadUpdateBucket::kInitialTokens`
+    // is a private member; method-scope lookup picks it up.
+    // Closes cpp-expert SHOULD-1 (the comment-only mitigation wasn't
+    // enough).
+    static_assert(DownloadUpdateBucket::kInitialTokens == kBucketCapacity,
+                  "DownloadUpdateBucket::kInitialTokens must match kBucketCapacity; drift "
+                  "would silently ship buckets at a different starting capacity than the cap");
+
     // Refill rate ≈ 1 token per 90 minutes (= update_check_interval
     // default 6 h / 4). A normally-behaved agent checks for updates a
     // few times a day; the bucket is steady-state full. A misbehaving
@@ -113,11 +125,38 @@ void AgentServiceImpl::refund_download_update(const std::string& peer) {
 }
 
 void AgentServiceImpl::set_ota_chunk_write_deadline(std::chrono::seconds deadline) {
-    // Clamp non-positive values to the historical default so a
-    // misconfigured `--ota-chunk-write-deadline-secs 0` (or env-var
-    // typo coercing to 0) does not silently disable the deadline.
-    const int secs = deadline.count() > 0 ? static_cast<int>(deadline.count()) : 30;
+    // Two-sided clamp:
+    //   * `<= 0` → default (UP-302): a misconfigured `--ota-chunk-write
+    //     -deadline-secs 0` (or env-var typo coercing to 0) must not
+    //     silently disable the deadline; without the deadline the
+    //     bidi pool slot is held indefinitely (UP-101 re-opened).
+    //   * `> kOtaChunkWriteDeadlineMaxSecs` → upper bound (CH-101 /
+    //     UP-301): a typo of `INT_MAX` (or any absurdly large value)
+    //     would otherwise survive the cast and pin a pool slot for
+    //     ~68 years. 600 s ceiling is generous for satellite / 4G/LTE
+    //     and bounds worst-case pool occupancy.
+    // Both clamp paths emit a `spdlog::warn` so a misconfigured value
+    // is operator-visible at startup instead of silently swallowed.
+    const auto raw = deadline.count();
+    int64_t secs;
+    if (raw <= 0) {
+        spdlog::warn("set_ota_chunk_write_deadline: requested {} s clamped to default {} s "
+                     "(values <= 0 would disable the deadline; UP-302)",
+                     raw, kOtaChunkWriteDeadlineDefaultSecs);
+        secs = kOtaChunkWriteDeadlineDefaultSecs;
+    } else if (raw > kOtaChunkWriteDeadlineMaxSecs) {
+        spdlog::warn("set_ota_chunk_write_deadline: requested {} s clamped to maximum {} s "
+                     "(values above the ceiling would pin bidi pool slots; CH-101 / UP-301)",
+                     raw, kOtaChunkWriteDeadlineMaxSecs);
+        secs = kOtaChunkWriteDeadlineMaxSecs;
+    } else {
+        secs = raw;
+    }
     ota_chunk_write_deadline_secs_.store(secs, std::memory_order_release);
+}
+
+std::chrono::seconds AgentServiceImpl::ota_chunk_write_deadline() const noexcept {
+    return std::chrono::seconds{ota_chunk_write_deadline_secs_.load(std::memory_order_acquire)};
 }
 
 // -- register_with ------------------------------------------------------------
@@ -1248,8 +1287,10 @@ AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& ctx,
                 .counter("yuzu_grpc_requests_total",
                          {{"method", "DownloadUpdate"}, {"status", "rate_limited_per_peer"}})
                 .increment();
-            spdlog::warn("DownloadUpdate: per-peer rate limit exhausted for peer={}; "
-                         "returning ResourceExhausted",
+            spdlog::warn("DownloadUpdate: per-peer rate limit exhausted for peer={} "
+                         "(token NOT refunded — successful prior calls drained the "
+                         "bucket; this is the fast-valid monopolisation case the rate "
+                         "limit is designed for); returning ResourceExhausted",
                          peer_key);
             return Status{StatusCode::ResourceExhausted,
                           "per-peer DownloadUpdate rate limit exceeded"};

@@ -391,12 +391,13 @@ The OTA path emits both client-side (agent) and server-side (`yuzu-server`) coun
 
 ### Server side (extends `yuzu_grpc_requests_total`)
 
-`yuzu_grpc_requests_total{method="DownloadUpdate"}` gains two new bounded `status` values in 0.13.x:
+`yuzu_grpc_requests_total{method="DownloadUpdate"}` gains three bounded `status` values in 0.13.x:
 
 | Status | Cause | Operator action |
 |---|---|---|
-| `chunk_write_deadline_exceeded` | Per-chunk write deadline (30 s) fired during chunk streaming — peer's TCP receive window collapsed or NAT/firewall held the stream. | If sustained: investigate the network path, consider whether to front the listener with a gateway (which terminates closer to the agent edge). If a single peer: that peer's link is dropping. |
-| `rate_limited_per_peer` | Per-peer token bucket exhausted (5 tokens, ~1 token / 90 min refill). The peer hammered DownloadUpdate. | If a single peer: investigate that peer for misbehavior or compromise. If many peers: bucket sizing may be too tight for your fleet — file an issue (the constants are not yet operator-tunable). |
+| `chunk_write_deadline_exceeded` | Per-chunk write deadline fired during chunk streaming — peer's TCP receive window collapsed, NAT/firewall held the stream, or HTTP/2 flow-control window collapsed. Deadline is operator-tunable via `--ota-chunk-write-deadline-secs` / `YUZU_OTA_CHUNK_WRITE_DEADLINE_SECS` (default 30 s; #934 / UP-206). | If sustained on a slow-link fleet (satellite, residential 4G/LTE, congested corp WAN): raise the deadline. If a single peer: that peer's link is dropping; investigate the network path. Note that raising the deadline directly increases worst-case bidi pool occupancy — keep it well below half the heartbeat deadline (`kBidiHeartbeatDeadline = 30 s`) to avoid starving Subscribe / heartbeat traffic, and add `expected_concurrent_ota × (new_deadline / 30)` slots to your `--bidi-dispatcher-pool-size` headroom. |
+| `rate_limited_per_peer` | Per-peer token bucket exhausted (5 tokens, ~1 token / 90 min refill — the deadline side is operator-tunable via `--ota-chunk-write-deadline-secs`, but bucket capacity / refill rate are not yet operator-tunable). The peer hammered DownloadUpdate **with calls that succeeded** — chunk-write-deadline failures are refunded (see `rate_limit_token_refunded` below) so a slow-link peer cannot exhaust the bucket through deadline failures alone. | If a single peer: investigate that peer for misbehavior or compromise (a peer that drains the bucket via successful calls is the fast-valid monopolisation case the rate limit is designed to catch). If many peers: bucket sizing may be too tight for your fleet — file an issue. |
+| `rate_limit_token_refunded` | A chunk-write deadline fired and the consumed bucket token was refunded (#934 / UP-206). This counter must track `chunk_write_deadline_exceeded` 1:1 in steady state; divergence (`chunk_write_deadline_exceeded` − `rate_limit_token_refunded` > 0`) signals a refund-wiring regression. Companion event to a `chunk_write_deadline_exceeded` increment on the same call, not a standalone denial outcome. | Wire a Prometheus alert on `increase(...status="chunk_write_deadline_exceeded"[5m]) > increase(...status="rate_limit_token_refunded"[5m])`; non-zero divergence is a regression bug worth filing. |
 
 ### Agent side
 

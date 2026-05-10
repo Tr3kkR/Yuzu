@@ -577,9 +577,45 @@ public:
         // Wire operator-tunable OTA chunk-write deadline (#934 / UP-206).
         // Called unconditionally — even with --no-ota the setter is cheap
         // and the agent_service_ would otherwise pin the historical
-        // 30 s default. Setter clamps non-positive values to the default.
+        // 30 s default. Setter clamps non-positive values to the default
+        // and values above kOtaChunkWriteDeadlineMaxSecs (600 s) to that
+        // ceiling; both clamp paths emit a `spdlog::warn`.
         agent_service_.set_ota_chunk_write_deadline(
             std::chrono::seconds{cfg_.ota_chunk_write_deadline_seconds});
+
+        // Operator-visibility log (compliance CC8.1 / SHOULD-C2; sre
+        // SHOULD; happy-path SHOULD; enterprise-readiness SHOULD —
+        // 4-reviewer convergence). Operators tuning the deadline via
+        // CLI flag or env var need a startup-log line confirming the
+        // resolved value landed; without it they cannot answer "what
+        // value was the server running with at time T" without a
+        // process dump or knowing the CLI args from deployment tooling.
+        // Emits the live value (post-clamp) so a `--ota-chunk-write-
+        // deadline-secs 0` typo's clamp shows up cleanly.
+        const auto resolved_deadline = agent_service_.ota_chunk_write_deadline();
+        spdlog::info(
+            "OTA chunk-write deadline: {} s ({}; #934 / UP-206)", resolved_deadline.count(),
+            resolved_deadline.count() ==
+                    ::yuzu::server::detail::AgentServiceImpl::kOtaChunkWriteDeadlineDefaultSecs
+                ? "default"
+                : "operator-tuned");
+        // Heartbeat-starvation guard (sre NICE / UP-306). When an
+        // operator raises the chunk-write deadline above ~half the
+        // 30 s heartbeat deadline, a fleet of stalled OTA peers can
+        // pin every bidi pool slot for the chunk-write deadline window
+        // and starve heartbeat / Subscribe traffic. Warn at boot so
+        // the operator can confirm pool headroom — kBidiHeartbeatDeadline
+        // / 2 = 15 s; chosen as a conservative floor (deadline >= half
+        // heartbeat = at least one heartbeat cycle's worth of pool
+        // residency per stalled peer).
+        if (resolved_deadline.count() > 15) {
+            spdlog::warn("OTA chunk-write deadline ({} s) exceeds the heartbeat-cycle "
+                         "headroom (15 s); a fleet of stalled OTA peers can pin bidi pool "
+                         "slots for up to {} s. Add `expected_concurrent_ota × ({} / 30)` "
+                         "slots to --bidi-dispatcher-pool-size headroom (UP-306)",
+                         resolved_deadline.count(), resolved_deadline.count(),
+                         resolved_deadline.count());
+        }
 
         // Wire up cross-references for AgentServiceImpl
         // (done after stores are created below)

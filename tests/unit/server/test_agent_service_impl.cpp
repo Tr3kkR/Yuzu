@@ -508,18 +508,54 @@ TEST_CASE("refund_download_update: chunk-write deadline simulation — slow peer
 
 TEST_CASE("set_ota_chunk_write_deadline: non-positive values clamp to default",
           "[agent_service][ota][config]") {
-    // The CLI flag default-vals to 30 (= historical constexpr) so the
-    // happy path is well covered. The defensive path: a typo
+    // UP-302 / happy-path SHOULD: a typo
     // (`--ota-chunk-write-deadline-secs 0`) or env var coerced to
     // zero must not silently disable the deadline, which would
     // re-open UP-101 (slow-write peer pinning the bidi pool slot).
-    // The setter must clamp to the default. This is a behavioural
-    // pin — the actual deadline value isn't externally observable
-    // without a stream fixture, but the setter accepting any
-    // std::chrono::seconds without aborting is the contract.
+    // The setter clamps to the default (kOtaChunkWriteDeadlineDefaultSecs).
+    // Pinning the actual stored value via the new public getter
+    // (cpp-expert SHOULD-2 + qe SHOULD); without it the test could
+    // not distinguish "clamp-to-default" from "stored-as-given".
     GatewayResponseHarness h;
+    using AS = yuzu::server::detail::AgentServiceImpl;
+
     h.svc.set_ota_chunk_write_deadline(std::chrono::seconds{0});
+    CHECK(h.svc.ota_chunk_write_deadline() ==
+          std::chrono::seconds{AS::kOtaChunkWriteDeadlineDefaultSecs});
+
     h.svc.set_ota_chunk_write_deadline(std::chrono::seconds{-30});
-    h.svc.set_ota_chunk_write_deadline(std::chrono::seconds{120}); // operator-raised
-    SUCCEED("set_ota_chunk_write_deadline accepts boundary values without aborting");
+    CHECK(h.svc.ota_chunk_write_deadline() ==
+          std::chrono::seconds{AS::kOtaChunkWriteDeadlineDefaultSecs});
+}
+
+TEST_CASE("set_ota_chunk_write_deadline: operator-raised values within range round-trip",
+          "[agent_service][ota][config]") {
+    // Happy-path setter behavior. A satellite-fleet operator raises
+    // to 120; the setter accepts and the live value reflects that.
+    GatewayResponseHarness h;
+    h.svc.set_ota_chunk_write_deadline(std::chrono::seconds{120});
+    CHECK(h.svc.ota_chunk_write_deadline() == std::chrono::seconds{120});
+}
+
+TEST_CASE("set_ota_chunk_write_deadline: above-ceiling values clamp to upper bound",
+          "[agent_service][ota][config][up-301]") {
+    // CH-101 / UP-301 / security LOW-1: an operator typo of INT_MAX
+    // (or any absurdly large value) must not survive — the historical
+    // narrowing-cast hazard is now closed by both the upper clamp
+    // AND the widening to int64_t. A single zero-window peer would
+    // otherwise pin a bidi pool slot for ~68 years.
+    GatewayResponseHarness h;
+    using AS = yuzu::server::detail::AgentServiceImpl;
+
+    h.svc.set_ota_chunk_write_deadline(std::chrono::seconds{AS::kOtaChunkWriteDeadlineMaxSecs + 1});
+    CHECK(h.svc.ota_chunk_write_deadline() ==
+          std::chrono::seconds{AS::kOtaChunkWriteDeadlineMaxSecs});
+
+    // INT_MAX + 1 (won't fit in int but does fit in int64_t since
+    // chrono::seconds::rep is at least 35-bit signed integer per
+    // [time.duration.general], conventionally int64_t on all four
+    // target stdlibs).
+    h.svc.set_ota_chunk_write_deadline(std::chrono::seconds{int64_t{2'000'000'000}});
+    CHECK(h.svc.ota_chunk_write_deadline() ==
+          std::chrono::seconds{AS::kOtaChunkWriteDeadlineMaxSecs});
 }

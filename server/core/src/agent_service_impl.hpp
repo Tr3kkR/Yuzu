@@ -86,6 +86,26 @@ public:
     /// without first considering whether a shared `PerPeerRateLimiter`
     /// primitive should be extracted (architect S-1 / #933 documents
     /// the trigger condition for that extraction).
+    ///
+    /// **Sibling-handler asymmetry rationale.** Only `DownloadUpdate`
+    /// goes through the per-peer admit/refund pair. `Register` and
+    /// `Heartbeat` are unary, lightweight, and have their own
+    /// backpressure paths (session limits + heartbeat-cycle pacing).
+    /// `Subscribe` is a single long-lived bidi the agent must hold
+    /// open — admission is meaningless because the saturation guard
+    /// (#904 bidi pool bound) is the only relevant concept there.
+    /// `CheckForUpdate` is a unary metadata RPC with no I/O cost
+    /// worth metering. A future contributor adding a parallel rate
+    /// limit on Subscribe should design refund-on-non-monopolising-
+    /// failure from day one (architect S-2 follow-up).
+    ///
+    /// **Companion methods.** `refund_download_update` (per-call
+    /// conditional credit on chunk-write-deadline failure, #934) and
+    /// `set_ota_chunk_write_deadline` (boot-time-only operator-tunable
+    /// deadline, #934). Three methods, three lifecycles. Grouping
+    /// them behind a nested struct was considered (architect N-1)
+    /// and deferred — the doc blocks encode the contract clearly
+    /// enough at a 3-method footprint.
     bool admit_download_update(const std::string& peer);
 
     /// Refund a previously-consumed DownloadUpdate token (#934 /
@@ -104,11 +124,44 @@ public:
     /// Override the per-chunk write deadline applied during
     /// `DownloadUpdate` (#911 / UP-101 + #934 / UP-206). Wired by
     /// `ServerImpl` from `Config::ota_chunk_write_deadline_seconds`.
-    /// Values <= 0 are clamped to the default (30 s). Take care if
-    /// called after the listener has accepted streams: the new value
-    /// applies to the next call only — existing in-flight chunk writes
-    /// continue with the deadline observed at the start of their loop.
+    /// Values <= 0 clamp to the default (30 s). Values above
+    /// `kOtaChunkWriteDeadlineMaxSecs` (= 600 s, 10 min) clamp to that
+    /// upper bound — chaos CH-101 / UP-301: an operator typo of
+    /// `INT_MAX` would otherwise survive the narrowing cast and pin a
+    /// bidi pool slot for ~68 years. Both clamp paths emit a
+    /// `spdlog::warn` so a misconfigured value is operator-visible
+    /// instead of silently swallowed (UP-302).
+    ///
+    /// **Boot-time-only invariant.** Today the only call site is
+    /// `ServerImpl`'s constructor before the listener accepts. Wiring
+    /// this to a runtime REST/MCP knob without first adding (a) an
+    /// upper bound, (b) an audit event, (c) RBAC enforcement, would
+    /// re-open UP-101 (slow-write peer pinning bidi pool slots) by
+    /// way of an authenticated insider tuning the deadline arbitrarily
+    /// high.
+    ///
+    /// Take care if called after the listener has accepted streams:
+    /// the new value applies to the next call only — existing
+    /// in-flight chunk writes continue with the deadline observed at
+    /// the start of their loop (per-call snapshot, see
+    /// `ota_chunk_write_deadline_secs_` doc).
     void set_ota_chunk_write_deadline(std::chrono::seconds deadline);
+
+    /// Read-back of the live OTA chunk-write deadline. Test surface +
+    /// startup-log surface; not a runtime config-reload primitive.
+    /// Acquire-load matches the in-handler snapshot at the start of
+    /// the chunk loop in `DownloadUpdate`.
+    [[nodiscard]] std::chrono::seconds ota_chunk_write_deadline() const noexcept;
+
+    /// Upper bound for `set_ota_chunk_write_deadline`. Above this the
+    /// setter clamps and warns. 600 s (10 min) is a generous ceiling
+    /// for satellite / residential 4G/LTE / congested corp WAN slow
+    /// links — well above any realistic legitimate value while still
+    /// bounding worst-case bidi pool slot residency to a number an
+    /// operator can reason about (10 min × pool_size = pool-time
+    /// pinned by stalled OTA peers).
+    static constexpr int kOtaChunkWriteDeadlineMaxSecs = 600;
+    static constexpr int kOtaChunkWriteDeadlineDefaultSecs = 30;
 
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
@@ -281,7 +334,17 @@ private:
     /// matches the threat model (the limit is a fleet-monopolisation
     /// guard, not a persistent quota).
     struct DownloadUpdateBucket {
-        double tokens = 5.0;
+        // kInitialTokens is the default starting capacity. Pinned in
+        // a separate constant so an anonymous-namespace
+        // `static_assert` in `agent_service_impl.cpp` can prove the
+        // NSDMI default matches `kBucketCapacity` (the cap shared by
+        // admit + refund) at compile time. Without the indirection
+        // the static_assert would have to construct a default
+        // `DownloadUpdateBucket{}` whose `last_refill_at` NSDMI calls
+        // non-constexpr `steady_clock::now()`. Closes cpp-expert
+        // SHOULD-1 (ODR-drift mitigation comment alone wasn't enough).
+        static constexpr double kInitialTokens = 5.0;
+        double tokens = kInitialTokens;
         std::chrono::steady_clock::time_point last_refill_at = std::chrono::steady_clock::now();
     };
     std::mutex download_update_buckets_mu_;
@@ -294,9 +357,15 @@ private:
     /// `download_update_buckets_mu_` lock — the deadline lives on a
     /// different concern from the rate-limit bucket. Set by
     /// `set_ota_chunk_write_deadline` from `ServerImpl`'s constructor.
-    /// Stored in seconds; the call site widens to `std::chrono::seconds`
-    /// at use. Default 30 seconds matches the historical constexpr.
-    std::atomic<int> ota_chunk_write_deadline_secs_{30};
+    /// Stored as `int64_t` to match `std::chrono::seconds::rep` so the
+    /// setter does not narrow on hosts where `seconds::rep` is wider
+    /// than `int` (cpp-expert review of #934 + security LOW-1: the
+    /// historical `std::atomic<int>` would have been a narrowing UB
+    /// vector for an operator typo of `INT_MAX+1`; the `kOtaChunkWrite
+    /// DeadlineMaxSecs` upper clamp is the primary defence, the
+    /// widened atomic closes the residual cast hazard). Default 30
+    /// seconds matches `kOtaChunkWriteDeadlineDefaultSecs`.
+    std::atomic<int64_t> ota_chunk_write_deadline_secs_{kOtaChunkWriteDeadlineDefaultSecs};
 
     /// Match a claimed agent_id against the verified peer identities the
     /// transport surfaced via `CallContext::peer_san_identities`. The

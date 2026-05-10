@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Internal
+
+- **#934 / UP-206 hardening round 1.** Closet-clean Round-2 of the
+  closet-clean Round-2: governance gates 2-6 produced 3 BLOCKING +
+  ~12 SHOULD findings on the initial #934 commit; this round folds
+  the BLOCKING + the highest-convergence SHOULDs into one hardening
+  pass. CRITICAL/HIGH count: 0.
+  - **`docs/user-manual/metrics.md` table refresh (BLOCKING ×3 —
+    docs-writer, consistency B-1+B-2, sre, enterprise-readiness).**
+    Added `rate_limit_token_refunded` row with 1:1-tracking
+    invariant + recommended Prometheus alert recipe; replaced the
+    hardcoded "(30 s)" claim on `chunk_write_deadline_exceeded`
+    with the operator-tunable language; corrected the stale "the
+    constants are not yet operator-tunable" text on
+    `rate_limited_per_peer`.
+  - **Setter upper clamp + warn-on-clamp (CH-101 / UP-301 / security
+    LOW-1 + UP-302 / happy-path SHOULD).** New constant
+    `kOtaChunkWriteDeadlineMaxSecs = 600` ceilings the operator-set
+    deadline so an `INT_MAX` typo cannot pin a bidi pool slot for
+    ~68 years. Both clamp paths (`<= 0` and `> 600`) emit a
+    `spdlog::warn` so a misconfigured value is operator-visible
+    instead of silently swallowed.
+  - **Atomic widened from `int` to `int64_t`.** Matches
+    `std::chrono::seconds::rep` so the setter no longer narrows on
+    hosts where `seconds::rep` is wider than `int`. Closes the
+    residual cast hazard the upper clamp made unreachable in
+    practice (cpp-expert NICE-2 + security LOW-1 + consistency N-2).
+  - **Public getter `ota_chunk_write_deadline()`.** Test surface
+    + startup-log surface. Pins the clamp-to-default contract in
+    `set_ota_chunk_write_deadline: non-positive values clamp to
+    default` and the upper-bound contract in
+    `set_ota_chunk_write_deadline: above-ceiling values clamp` —
+    the previous `SUCCEED("...without aborting")` assertion was a
+    smoke test that did not pin the stored value (cpp-expert
+    SHOULD-2, qe SHOULD, happy-path SHOULD).
+  - **Startup log of resolved deadline.** `spdlog::info("OTA
+    chunk-write deadline: {} s ({}; #934 / UP-206)", ...)` at
+    `server.cpp` immediately after the setter call, with default
+    vs operator-tuned annotation. Operators can now answer "what
+    deadline value was the server running with at time T" from
+    journal alone (compliance SHOULD-C2 / CC8.1 audit gap; sre
+    SHOULD; happy-path SHOULD; enterprise-readiness SHOULD —
+    4-reviewer convergence).
+  - **Heartbeat-starvation guard at boot.** When the resolved
+    deadline exceeds 15 s (= half the 30 s heartbeat deadline),
+    boot emits a warn with operator pool-headroom guidance: "add
+    `expected_concurrent_ota × (deadline / 30)` slots to
+    `--bidi-dispatcher-pool-size`" (sre NICE / UP-306).
+  - **`DownloadUpdateBucket::kInitialTokens` static constant +
+    compile-time `static_assert` against `kBucketCapacity`.** Closes
+    the ODR-drift hazard the comment-only mitigation flagged
+    (cpp-expert SHOULD-1). The NSDMI now references the same
+    constant the admit/refund cap reads, and a future header edit
+    that drifts the literal fails at compile time.
+  - **Rate-limit-rejection log line refresh.** Now annotates
+    "token NOT refunded — successful prior calls drained the
+    bucket; this is the fast-valid monopolisation case the rate
+    limit is designed for" so an operator scanning logs can tell
+    at a glance that the deny was ALSO a token charge (vs the
+    chunk-write-deadline branch which logs "rate-limit token
+    refunded"). Closes consistency S-1.
+  - **Setter doc-block extended.** `set_ota_chunk_write_deadline`
+    now documents the boot-time-only invariant, both clamp
+    boundaries, and the rationale for not wiring it to a runtime
+    REST/MCP knob (security INFO + architect SHOULD).
+  - **Admit doc-block extended.** Documents the sibling-handler
+    asymmetry rationale (only DownloadUpdate has the per-peer
+    bucket; Register/Heartbeat/Subscribe/CheckForUpdate are
+    structurally different) so a future contributor doesn't add a
+    parallel bucket out of misplaced symmetry. Cross-references
+    `refund_download_update` and `set_ota_chunk_write_deadline`
+    so the three-method contract is discoverable from one site
+    (architect S-3 + consistency S-3).
+  - **`docs/user-manual/upgrading.md` 0.12.x row updated.** Now
+    correctly references the operator-tunable deadline + the
+    refund mechanic so pilot operators planning the upgrade
+    understand the revised slow-link posture
+    (enterprise-readiness SHOULD).
+
+  Test coverage: 2 new boundary-clamp test cases pin the upper-clamp
+  contract (UP-301) and the operator-raised range (120 s). The
+  prior `SUCCEED`-only setter test is replaced with two assertion
+  cases that pin the stored value via the new getter. Validated
+  on macOS arm64: server (1493 cases / 17521 assertions green,
+  ~25 s).
+
+  Deferred to follow-up issues (SHOULD findings out of scope for
+  this round): refund-divergence Grafana alert wiring (sre SHOULD);
+  pool-size guidance update for raised-deadline capacity (sre
+  SHOULD); cancel-path no-refund (UP-313 / CH-102 — design
+  discussion required to distinguish legit transport hiccup from
+  malicious cancel); refund-pattern doc note in
+  `docs/observability-conventions.md` (architect S-2); integration
+  test for the refund call site (qe SHOULD — requires bidi stream
+  fixture); concurrency test with TSan (qe NICE / UP-314); CLI
+  `-secs` suffix convention discussion (consistency S-2); bucket-map
+  size gauge (#933 / #935 already track).
+
 ### Added
 
 - **OTA chunk-write deadline operator-tunable + slow-link rate-limit
