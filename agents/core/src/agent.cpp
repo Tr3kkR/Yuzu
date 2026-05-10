@@ -25,12 +25,15 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/transport/transport.hpp>
 #include <yuzu/version.hpp>
 
-#include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
-// Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
-#include "agent.grpc.pb.h"
+// Generated protobuf headers (flat output via proto/gen_proto.py).
+// Post-#376 PR 1c-4 commit (iii), this file no longer references the
+// gRPC service stubs — Subscribe + DownloadUpdate ride
+// `transport::Channel::bidi_stream`; Register / Heartbeat /
+// CheckForUpdate ride `transport::Channel::unary` (PR 1c-3).
+#include "agent.pb.h"
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
@@ -608,8 +611,8 @@ public:
         // them — init runs before this sync. agent_actions::info is dispatched
         // post-init via execute(), so the fix is correct for that consumer.
         // Runtime keys written AFTER this point (agent.session_id at register
-        // time, agent.reconnect_count, agent.latency_ms, agent.grpc_channel_state,
-        // agent.connected_since) do NOT propagate — see CONS-B1 follow-up.
+        // time, agent.reconnect_count, agent.latency_ms, agent.connected_since)
+        // do NOT propagate — see CONS-B1 follow-up.
         //
         // Implementation extracted to plugin_config_sync.hpp so it can be
         // unit-tested without exposing PluginContextImpl outside this TU.
@@ -639,12 +642,10 @@ public:
             spdlog::info("Yuzu agent stopped");
         }};
 
-        // 2. Connect to server (tuned for low-latency bidirectional streaming)
-        grpc::ChannelArguments ch_args;
-        ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
-        ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
-        ch_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
-        ch_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+        // 2. Connect to server. HTTP/2 keepalive args (formerly applied
+        // here via `grpc::ChannelArguments`) now live inside
+        // `transport::GrpcChannel` — see `transport/src/grpc/grpc_channel.cpp`
+        // for the values (#376 PR 1c-4 commit (iii) cleanup).
 
         // Auto-discover client certificate if none explicitly configured
         if (cfg_.cert_auto_discovery && cfg_.tls_client_cert.empty() && cfg_.cert_store.empty()) {
@@ -763,27 +764,6 @@ public:
         if (!channel_t->wait_for_connected(std::chrono::seconds(5))) {
             spdlog::info("Initial transport channel not ready in 5s — proceeding to retry loop");
         }
-
-        // Legacy grpc::Channel kept alive ONLY for the post-Register
-        // diagnostic that surfaces grpc channel state into plugin_ctx_.
-        // After PR 1c-4 lifted Subscribe + DownloadUpdate onto
-        // channel_t, the stub itself is gone. (iii) drops the remaining
-        // legacy channel + creds_grpc + diagnostic block + keepalive
-        // args entirely.
-        std::shared_ptr<grpc::ChannelCredentials> creds_grpc;
-        std::shared_ptr<grpc::Channel> channel;
-        if (cfg_.tls_enabled) {
-            grpc::SslCredentialsOptions ssl_opts;
-            ssl_opts.pem_root_certs = creds_t.ca_cert_pem;
-            ssl_opts.pem_cert_chain = creds_t.client_cert_pem;
-            ssl_opts.pem_private_key = creds_t.client_key_pem;
-            creds_grpc = grpc::SslCredentials(ssl_opts);
-            yuzu::secure_zero(ssl_opts.pem_private_key);
-        } else {
-            creds_grpc = grpc::InsecureChannelCredentials();
-        }
-
-        channel = grpc::CreateCustomChannel(cfg_.server_address, creds_grpc, ch_args);
 
         // 2b. Detect cloud instance identity (for auto-approve)
         {
@@ -956,29 +936,13 @@ public:
                                             .count();
                 plugin_ctx_.config["agent.latency_ms"] = std::to_string(register_elapsed);
 
-                // Query gRPC channel state
-                if (channel) {
-                    auto state = channel->GetState(false);
-                    const char* state_str = "UNKNOWN";
-                    switch (state) {
-                    case GRPC_CHANNEL_IDLE:
-                        state_str = "IDLE";
-                        break;
-                    case GRPC_CHANNEL_CONNECTING:
-                        state_str = "CONNECTING";
-                        break;
-                    case GRPC_CHANNEL_READY:
-                        state_str = "READY";
-                        break;
-                    case GRPC_CHANNEL_TRANSIENT_FAILURE:
-                        state_str = "TRANSIENT_FAILURE";
-                        break;
-                    case GRPC_CHANNEL_SHUTDOWN:
-                        state_str = "SHUTDOWN";
-                        break;
-                    }
-                    plugin_ctx_.config["agent.grpc_channel_state"] = state_str;
-                }
+                // Channel-state diagnostic was removed in #376 PR 1c-4
+                // commit (iii) — pre-(iii) it queried the legacy
+                // `grpc::Channel` which carried no production traffic
+                // post-lift, so the surfaced state was misleading.
+                // `transport::Channel` exposes only `wait_for_connected`,
+                // not a state enum; if a future operator surface needs a
+                // ready/not-ready signal, plumb it through the abstraction.
                 spdlog::info("Registered with server (session={}, enrollment={})", session_id_,
                              enrollment_status.empty() ? "enrolled" : enrollment_status);
 

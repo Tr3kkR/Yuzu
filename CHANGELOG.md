@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **Legacy `grpc::Channel` + diagnostic block + keepalive args removed
+  from agent (#376 PR 1c-4 commit (iii)).** Pure deletion; commit (ii)
+  lifted Subscribe + DownloadUpdate onto `transport::Channel`, the
+  `1c05ce7` commit migrated the `GRPC_ARG_KEEPALIVE_*` args into
+  `transport::GrpcChannel`, so this commit removes:
+  - the four `GRPC_ARG_KEEPALIVE_*` `SetInt` calls at `agent.cpp:643-647`
+    (now resident inside `GrpcChannel`),
+  - the `creds_grpc`/`channel` declarations and TLS-creds-construction
+    block at `agent.cpp:768-784`,
+  - the post-Register diagnostic block at `agent.cpp:957-979` that
+    queried `channel->GetState()` and surfaced `agent.grpc_channel_state`
+    into `plugin_ctx_` (post-(ii) the legacy channel carried no
+    production traffic so the surfaced state was misleading; the
+    `diagnostics.connection_info` plugin gracefully handles the now-
+    absent key by displaying `unknown`),
+  - the `#include <grpcpp/grpcpp.h>` and `#include "agent.grpc.pb.h"`
+    headers (replaced with `agent.pb.h` since no service stubs are
+    referenced).
+  Plugin-config-sync comments updated to drop stale
+  `agent.grpc_channel_state` references. No behavioural change — the
+  legacy channel was idle since (ii) and the keepalive migration in
+  `1c05ce7` made this a pure cleanup. PR 1c-4 is now fully shipped.
 - **HTTP/2 keepalive args wired into `transport::GrpcChannel` (#376 PR
   1c-4 commit (iii) prerequisite, closes SRE-1).** Pre-PR-1c-4 the
   agent built a legacy `grpc::Channel` for Subscribe + DownloadUpdate

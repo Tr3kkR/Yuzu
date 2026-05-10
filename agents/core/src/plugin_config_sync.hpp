@@ -26,8 +26,8 @@
 //
 // Limitation (tracked separately): the sync is one-shot. Runtime keys
 // written to plugin_ctx_.config AFTER this call (e.g. agent.session_id,
-// agent.reconnect_count, agent.latency_ms, agent.grpc_channel_state,
-// agent.connected_since) do NOT propagate into per-plugin contexts.
+// agent.reconnect_count, agent.latency_ms, agent.connected_since)
+// do NOT propagate into per-plugin contexts.
 // Plugins reading those keys still observe stale snapshot values until
 // a future per-write fan-out helper closes the gap.
 

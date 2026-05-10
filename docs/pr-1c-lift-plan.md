@@ -161,10 +161,11 @@ the branch — land one, rebase the next.
   Land with the dual-stack `--transport=grpc` flag still defaulting to
   grpc backend, and the equivalent server side already on transport
   abstraction (PR 1c-2 is a hard predecessor).
-* **Status**: PR 1c-4 IN PROGRESS as of 2026-05-10. Three-commit chain:
-  (i) `0b5f89c` #916 contract softening Merged, (ii) `7269ba7` Subscribe +
-  DownloadUpdate lift Merged, (iii) legacy-block + keepalive-args cleanup
-  Pending. Tests at `tests/unit/test_agent_subscribe_lift.cpp` (5/102).
+* **Status**: PR 1c-4 COMPLETE as of 2026-05-10. Commits: (i) `0b5f89c`
+  #916 contract softening, (ii) `7269ba7` Subscribe + DownloadUpdate lift,
+  hardening rounds `98f25f9` + `3e14517`, keepalive migration `1c05ce7`
+  (closes SRE-1), (iii) cleanup. Tests at
+  `tests/unit/test_agent_subscribe_lift.cpp` (5 cases / 102 assertions).
 * **Hard predecessors** (all closed as of 2026-05-09):
   - ✅ **UP-14** (per-call dispatcher-thread fanout) — closed by **#904**
     bounded dispatcher pool (2026-05-09). Subscribe lift no longer
