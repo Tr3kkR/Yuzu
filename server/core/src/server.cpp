@@ -456,6 +456,15 @@ public:
 
         // Seed kill-switch from cfg_; runtime flip path can land later.
         viz_disabled_.store(cfg_.viz_disable, std::memory_order_release);
+        if (cfg_.viz_disable) {
+            // gov R3 F-1 (compliance): the per-request audit row only fires
+            // when a request hits the disabled endpoint. Operators deploying
+            // with --viz-disable from boot need a startup-time evidence line
+            // confirming the kill-switch took effect. Mirrors the MCP
+            // precedent at server.cpp:5161 below.
+            spdlog::warn("[VIZ] viz endpoint disabled by configuration "
+                         "(--viz-disable / YUZU_VIZ_DISABLE)");
+        }
 
         // Initialize fleet topology store (PR 3 of feat/viz-engine).
         //
@@ -488,9 +497,13 @@ public:
                 if (agent_ids.empty())
                     return out;
 
+                // Sibling dispatchers use `<plugin>-<hex>` (server.cpp:2820,
+                // 4879, 5014). Stick to that shape so anyone grepping
+                // response_store for `tar-` finds viz fetcher dispatches too,
+                // and so the `<plugin>-` prefix doesn't lie about the actual
+                // wire plugin (gov R3 C-3).
                 const auto command_id =
-                    "viz.fleet_snapshot-" +
-                    auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+                    "tar-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
                 detail::pb::CommandRequest cmd;
                 cmd.set_command_id(command_id);
@@ -1106,6 +1119,19 @@ public:
                         .set(static_cast<double>(api_token_store_->cache_misses()));
                     metrics_.gauge("yuzu_server_token_cache_size")
                         .set(static_cast<double>(api_token_store_->cache_size()));
+                }
+                // Publish FleetTopologyStore internals so the 256 MiB store-
+                // level oversize cap and single-flight refill timeouts are
+                // observable -- the route-level yuzu_viz_oversize_response_total
+                // only fires on the machines_max gate, not on the byte cap
+                // (gov R3 OBS-1).
+                if (fleet_topology_store_) {
+                    metrics_.gauge("yuzu_viz_refill_oversize_drops_total")
+                        .set(static_cast<double>(fleet_topology_store_->refill_oversize_drops()));
+                    metrics_.gauge("yuzu_viz_refill_wait_timeouts_total")
+                        .set(static_cast<double>(fleet_topology_store_->refill_wait_timeouts()));
+                    metrics_.gauge("yuzu_viz_refill_waiters_total")
+                        .set(static_cast<double>(fleet_topology_store_->refill_waiters()));
                 }
                 // Publish audit event write rate so the audit subsystem is observable.
                 if (audit_store_) {
@@ -2206,6 +2232,12 @@ private:
                 // silent no-op on every response.
                 {"execution_tracker",
                  execution_tracker_ != nullptr && instr_db_pool_ && instr_db_pool_->is_open()},
+                // gov R3 HC-1: FleetTopologyStore became load-bearing for
+                // /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology.
+                // Pure in-memory store with no is_open(); pointer-not-null is
+                // the right probe. Without this, a store-construction failure
+                // would leave /readyz "ready" while every viz request 503s.
+                {"fleet_topology_store", fleet_topology_store_ != nullptr},
             };
 
             std::string failed_list;

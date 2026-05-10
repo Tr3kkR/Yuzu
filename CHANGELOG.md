@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Fleet visualization fragment route now escapes `</script>` in the JSON
+  body before wrapping** (gov R3 sec-M2 / UP-16). nlohmann::json's `dump()`
+  does not escape `<` by default; an agent-controlled `hostname` or
+  `cmdline` containing the literal substring `</script>` would otherwise
+  terminate the `<script type="application/json" id="viz-data">` wrapper
+  early, allowing HTML to be injected into a dashboard or HTMX consumer
+  that swapped the fragment. The fix replaces `</` with `<\/` (a JSON-spec
+  alternate escape for `/`) before wrapping, with a regression test that
+  injects `</script><script>alert(1)</script>` as a hostname and verifies
+  exactly one closing `</script>` tag in the response.
+- **Fleet visualization audit result vocabulary realigned with siblings**
+  (gov R3 C-1 / ER-BLOCK-1). Previous `"ok"` / `"error"` / `"oversize"`
+  values landed in the `events_other_` Prometheus bucket and were silently
+  invisible to SOC 2 SIEM filters keyed on the canonical `"success"` /
+  `"failure"` / `"denied"` vocabulary. All `viz.fleet_topology` and
+  `viz.fleet_topology.invalidate` audit emissions now use the canonical
+  vocabulary; `target_type` switched from `"viz_topology"` to
+  `"FleetTopology"` (PascalCase per sibling convention) and `target_id`
+  from `"*"` to `""` (empty per `policy.invalidate_all` precedent at
+  `compliance_routes.cpp:696`). The 413 oversize branch maps to `denied`
+  with `oversize` in the detail field rather than a non-canonical result
+  value.
+
 ### Added
 
 - **`/viz/fleet` REST surface (PR 3 of the 11-PR `/viz/fleet` 3D fleet
@@ -16,25 +41,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   type="application/json">` wrapping the same JSON for parser-on-swap),
   both gated on `Response.Read`, audited per request, and metered via
   `yuzu_viz_topology_request_seconds` / `yuzu_viz_cache_{hit,miss}_total` /
-  `yuzu_viz_oversize_response_total` / `yuzu_viz_agent_dispatch_timeout_total`.
+  `yuzu_viz_oversize_response_total` / `yuzu_viz_agent_dispatch_timeout_total`,
+  plus three store-internal counters now exported to Prometheus
+  (`yuzu_viz_refill_oversize_drops_total`, `yuzu_viz_refill_wait_timeouts_total`,
+  `yuzu_viz_refill_waiters_total`) so the 256 MiB store-level oversize cap
+  and single-flight refill timeouts are observable (gov R3 OBS-1).
   Query params: `include_vuln=1` flips to the vuln-overlay cache slot;
   `fresh=1` invalidates the cache (separately audited) before the get;
   `machines_max=N` (default 5000, ceiling 100000) caps response shape and
-  returns 413 + `oversize` audit when the materialised fleet exceeds it
-  (M-1 cap-check DoS gate). Kill switch via `--viz-disable` /
-  `YUZU_VIZ_DISABLE` returns 503 and audits `denied`/`kill_switch` so
-  flipping the switch leaves an evidence trail (DEP-1). The store's PR-2
-  fetcher seam is now wired: on cache miss, dispatches `tar.fleet_snapshot`
+  returns 413 + `denied`/`oversize` audit when the materialised fleet
+  exceeds it (M-1 cap-check DoS gate). Kill switch via `--viz-disable` /
+  `YUZU_VIZ_DISABLE` returns 503 and audits `denied`/`kill_switch`;
+  tier-before-permission ordering means the kill switch takes effect even
+  for callers who would otherwise fail RBAC (gov R3 sec-M1/arch-B1), and
+  startup logs `[VIZ] viz endpoint disabled by configuration` when the
+  flag is set so operators have explicit evidence the kill switch took
+  effect (gov R3 F-1). `FleetTopologyStore` is now in the `/readyz`
+  store conjunction so a construction-failed store surfaces as
+  503-not-ready rather than a silent viz outage (gov R3 HC-1). The store's
+  PR-2 fetcher seam is wired: on cache miss, dispatches `tar.fleet_snapshot`
   to every connected agent via `AgentRegistry::send_to`, drains
   `forward_gateway_pending()` for gateway-proxied agents, polls the
-  response store for matches keyed on a synthesised `command_id` until the
-  5 s deadline, and returns whatever arrived; missing agents come back as
-  `stale=true` rows so the renderer dims rather than disappears them. The
-  fetcher dispatch intentionally opts out of the executions tracker
-  (`record_send_time` only, no `record_execution_id`) -- a 60 s automated
-  refresh would otherwise spam the operator-facing executions pane.
-  release.yml gains an explicit `--build-arg TRIPLET=x64-linux` ahead of
-  arm64 publishing (QE-R2-02). (#viz-engine ladder PR 3.)
+  response store for matches keyed on a synthesised `tar-<hex>` command_id
+  until the 5 s deadline, and returns whatever arrived; missing agents
+  come back as `stale=true` rows so the renderer dims rather than
+  disappears them. The fetcher dispatch intentionally opts out of the
+  executions tracker (`record_send_time` only, no `record_execution_id`)
+  -- a 60 s automated refresh would otherwise spam the operator-facing
+  executions pane. release.yml gains an explicit
+  `--build-arg TRIPLET=x64-linux` ahead of arm64 publishing (QE-R2-02).
+  (#viz-engine ladder PR 3.)
 
 - **`tar.fleet_snapshot` action + server-side `FleetTopologyStore` (PRs 1+2
   of the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** New TAR

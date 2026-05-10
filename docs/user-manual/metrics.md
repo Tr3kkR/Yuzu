@@ -59,6 +59,41 @@ All Yuzu metrics follow a consistent naming scheme.
 | `yuzu_server_` | Server process | `yuzu_server_http_requests_total`, `yuzu_server_connected_agents` |
 | `yuzu_server_cert_` | Certificate reload | `yuzu_server_cert_reloads_total`, `yuzu_server_cert_reload_failures_total` |
 | `yuzu_agent_` | Agent process | `yuzu_agent_plugin_executions_total`, `yuzu_agent_heartbeat_latency_seconds` |
+| `yuzu_viz_` | Fleet visualization (`/api/v1/viz/fleet/topology`) | `yuzu_viz_topology_request_seconds`, `yuzu_viz_cache_hit_total`, `yuzu_viz_refill_oversize_drops_total` |
+
+## Fleet visualization metrics
+
+The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST API §Fleet Visualization](rest-api.md)) exposes the following metrics. Routes share one `FleetTopologyStore` cache; all metrics are process-global.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_viz_topology_request_seconds` | histogram | End-to-end request latency on the success path (200). Default bucket boundaries above. Cache-hit p99 should be <100 ms; cache-miss p99 is bounded by the 5 s fetcher deadline + 0.5 s overhead. |
+| `yuzu_viz_cache_hit_total` | counter | Increments on each request that observed a TTL-fresh slot. Pair with `yuzu_viz_cache_miss_total` to compute hit rate. |
+| `yuzu_viz_cache_miss_total` | counter | Increments on each request that triggered a refill. With a 60 s TTL and 1 RPS dashboard polling, expect ~1/60 of all requests. |
+| `yuzu_viz_oversize_response_total` | counter | Increments on each `413` response (snapshot exceeded `machines_max`). Operator misconfiguration signal. |
+| `yuzu_viz_agent_dispatch_timeout_total` | counter | Increments per agent that was dispatched `tar.fleet_snapshot` but didn't respond within the 5 s deadline. A non-zero rate signals partial fleet outage. |
+| `yuzu_viz_refill_oversize_drops_total` | gauge | Refills whose serialised size exceeded `max_snapshot_bytes` (256 MiB default). The result is returned to the caller but NOT cached, so the next request re-runs the full fetcher. Non-zero indicates a misbehaving agent or an undersized cap. |
+| `yuzu_viz_refill_wait_timeouts_total` | gauge | Single-flight waiters that timed out on `cv.wait_for` before the refill completed. Non-zero indicates the fetcher is exceeding its deadline. |
+| `yuzu_viz_refill_waiters_total` | gauge | Number of fetch waiters that piggybacked on an in-flight refill (single-flight wins). High values indicate stampede risk on `/viz/fleet`. |
+
+### Recommended alerts
+
+```yaml
+- alert: VizFleetDispatchTimeoutsRising
+  expr: rate(yuzu_viz_agent_dispatch_timeout_total[5m]) > 5
+  for: 5m
+  annotations:
+    summary: "Fleet topology fetcher is timing out per-agent (partial fleet outage)"
+
+- alert: VizFleetSlowRequests
+  expr: histogram_quantile(0.99, sum(rate(yuzu_viz_topology_request_seconds_bucket[5m])) by (le)) > 5.5
+  for: 10m
+
+- alert: VizFleetRefillOversizeDrops
+  expr: increase(yuzu_viz_refill_oversize_drops_total[10m]) > 0
+  annotations:
+    summary: "FleetTopologyStore is dropping refills above 256 MiB cap; raise --max-snapshot-bytes or scope down the fleet"
+```
 
 ## Labels
 

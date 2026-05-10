@@ -2,14 +2,17 @@
  * viz_routes.cpp -- /viz/fleet REST + fragment routes (PR 3 of 11)
  *
  * Each handler:
- *  1. Tier/RBAC check via perm_fn_ ("Response", "Read") -- 401/403 paths
+ *  1. Kill-switch consult -- 503 with structured envelope. Tier-before-
+ *     permission ordering per docs/auth-architecture.md §3 + the MCP
+ *     precedent at mcp_server.cpp:355: cheap configuration-pinned guards
+ *     run BEFORE identity-bound RBAC. Audited so the kill switch leaves
+ *     an evidence trail even when the caller would have failed RBAC
+ *     anyway (DEP-1, gov R3 sec-M1/arch-B1).
+ *  2. Store-availability consult -- 503 if the store is null (server
+ *     started without the cache wired).
+ *  3. Tier/RBAC check via perm_fn_ ("Response", "Read") -- 401/403 paths
  *     fall out of the perm_fn_ contract and short-circuit before any
- *     dispatch. Tier-before-permission ordering is the security-guardian
- *     standing rule (docs/auth-architecture.md §3).
- *  2. Kill-switch consult -- 503 with structured envelope. Audited so
- *     enabling the kill switch leaves an evidence trail (DEP-1).
- *  3. Store-availability consult -- 503 if the store is null (server
- *     started with --no-viz or constructor never wired).
+ *     dispatch.
  *  4. Parse query params with strict numeric guards. Failures -> 400.
  *  5. Optional `?fresh=1` invalidates the cache before get(). Audited
  *     separately from the success row so the operator-driven cache flush
@@ -28,6 +31,12 @@
  * fragment wraps the JSON in `<script type="application/json"
  * id="viz-data">` so the renderer can parse-on-swap without an extra
  * round-trip (agentic-first A1 -- dashboard parity).
+ *
+ * Result-string vocabulary: "success" / "denied" / "failure" matching
+ * the audit_store counter buckets and sibling handlers (gov R3 C-1).
+ * Older drafts of this file used "ok" / "error" / "oversize" -- those
+ * buckets land in events_other_ in the Prometheus scrape, breaking
+ * SOC 2 SIEM filter assumptions.
  */
 
 #include "viz_routes.hpp"
@@ -67,20 +76,24 @@ bool parse_bool_param(const httplib::Request& req, std::string_view key, bool de
 
 } // namespace
 
-void VizRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
+void VizRoutes::register_routes(httplib::Server& svr, AuthFn /*auth_fn*/, PermFn perm_fn,
                                 AuditFn audit_fn, FleetTopologyStore* store,
                                 yuzu::MetricsRegistry* metrics,
                                 const std::atomic<bool>* kill_switch) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), store,
-                    metrics, kill_switch);
+    register_routes(sink, AuthFn{}, std::move(perm_fn), std::move(audit_fn), store, metrics,
+                    kill_switch);
 }
 
-void VizRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+void VizRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn perm_fn,
                                 AuditFn audit_fn, FleetTopologyStore* store,
                                 yuzu::MetricsRegistry* metrics,
                                 const std::atomic<bool>* kill_switch) {
-    auth_fn_ = std::move(auth_fn);
+    // auth_fn is accepted in the signature for parity with sibling
+    // register_routes overloads but never invoked here -- require_permission
+    // (which the perm_fn lambda wraps) calls require_auth internally, so a
+    // separate auth_fn call would just duplicate work. Discarded explicitly
+    // rather than stored, per gov R3 arch-S4.
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
     store_ = store;
@@ -98,35 +111,55 @@ void VizRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
              });
 }
 
+/// Replace any literal `</` in the serialised JSON with `<\/`. Required
+/// when embedding into `<script type="application/json">` because the
+/// HTML5 parser terminates the script element on the first `</script` it
+/// sees, regardless of context. nlohmann::json does NOT escape `<` by
+/// default (it's outside the JSON-mandatory escape set), so an
+/// agent-controlled hostname/cmdline string containing `</script>` would
+/// otherwise break out of the wrapper element. Backslash-solidus is
+/// spec-valid JSON ("\/" is an alternate escape for "/"). gov R3
+/// sec-M2/UP-16/CH-6 fix.
+void escape_json_for_script(std::string& s) {
+    std::string::size_type pos = 0;
+    while ((pos = s.find("</", pos)) != std::string::npos) {
+        s.replace(pos, 2, "<\\/");
+        pos += 3; // skip past the inserted backslash
+    }
+}
+
 void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& res,
                                 bool as_fragment) {
     const auto t_start = std::chrono::steady_clock::now();
 
-    // ── 1. RBAC ───────────────────────────────────────────────────────────
-    // perm_fn_ writes the 401/403 body and status itself; bail on false.
-    if (!perm_fn_(req, res, "Response", "Read"))
-        return;
-
-    // ── 2. Kill switch (DEP-1) ────────────────────────────────────────────
+    // ── 1. Kill switch (DEP-1, tier-before-permission) ────────────────────
+    // Cheap configuration-pinned guard runs before identity-bound RBAC so
+    // disable state is observable regardless of caller identity, matching
+    // the MCP precedent at mcp_server.cpp:355.
     if (kill_switch_ && kill_switch_->load(std::memory_order_acquire)) {
         res.status = 503;
         res.set_content(
             error_envelope(503, "viz endpoint disabled by operator (yuzu_viz_disabled)"),
             "application/json");
         if (audit_fn_)
-            audit_fn_(req, "viz.fleet_topology", "denied", "viz_topology", "*", "kill_switch");
+            audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "", "kill_switch");
         return;
     }
 
-    // ── 3. Store availability ────────────────────────────────────────────
+    // ── 2. Store availability ────────────────────────────────────────────
     if (!store_) {
         res.status = 503;
         res.set_content(error_envelope(503, "fleet topology store not available"),
                         "application/json");
         if (audit_fn_)
-            audit_fn_(req, "viz.fleet_topology", "error", "viz_topology", "*", "store_null");
+            audit_fn_(req, "viz.fleet_topology", "failure", "FleetTopology", "", "store_null");
         return;
     }
+
+    // ── 3. RBAC ───────────────────────────────────────────────────────────
+    // perm_fn_ writes the 401/403 body and status itself; bail on false.
+    if (!perm_fn_(req, res, "Response", "Read"))
+        return;
 
     // ── 4. Parse query params ────────────────────────────────────────────
     const bool include_vuln = parse_bool_param(req, "include_vuln", false);
@@ -141,16 +174,18 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
                 res.set_content(error_envelope(400, "machines_max must be in [1, 100000]"),
                                 "application/json");
                 if (audit_fn_)
-                    audit_fn_(req, "viz.fleet_topology", "denied", "viz_topology", "*",
+                    audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "",
                               "bad_machines_max");
                 return;
             }
         }
     } catch (const std::exception&) {
+        // std::stoi throws std::invalid_argument on non-numeric and
+        // std::out_of_range on overflow; both land here.
         res.status = 400;
         res.set_content(error_envelope(400, "invalid machines_max"), "application/json");
         if (audit_fn_)
-            audit_fn_(req, "viz.fleet_topology", "denied", "viz_topology", "*", "bad_machines_max");
+            audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "", "bad_machines_max");
         return;
     }
 
@@ -158,7 +193,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     if (fresh) {
         store_->invalidate();
         if (audit_fn_)
-            audit_fn_(req, "viz.fleet_topology.invalidate", "ok", "viz_topology", "*", "");
+            audit_fn_(req, "viz.fleet_topology.invalidate", "success", "FleetTopology", "", "");
     }
 
     // ── 6. Fetch (cache-hit fast-path or single-flight refill) ────────────
@@ -173,7 +208,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
         res.status = 500;
         res.set_content(error_envelope(500, "topology fetch failed"), "application/json");
         if (audit_fn_)
-            audit_fn_(req, "viz.fleet_topology", "error", "viz_topology", "*", "fetch_threw");
+            audit_fn_(req, "viz.fleet_topology", "failure", "FleetTopology", "", "fetch_threw");
         return;
     }
     // PR 2 invariant UP-9: get() never returns null. Defensive belt anyway.
@@ -181,7 +216,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
         res.status = 500;
         res.set_content(error_envelope(500, "topology fetch returned null"), "application/json");
         if (audit_fn_)
-            audit_fn_(req, "viz.fleet_topology", "error", "viz_topology", "*", "snap_null");
+            audit_fn_(req, "viz.fleet_topology", "failure", "FleetTopology", "", "snap_null");
         return;
     }
 
@@ -200,8 +235,8 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
                            "fleet topology exceeds machines_max -- raise the cap or scope down"),
             "application/json");
         if (audit_fn_)
-            audit_fn_(req, "viz.fleet_topology", "oversize", "viz_topology", "*",
-                      "machines=" + std::to_string(snap->machines.size()) +
+            audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "",
+                      "oversize machines=" + std::to_string(snap->machines.size()) +
                           " cap=" + std::to_string(machines_max));
         if (metrics_)
             metrics_->counter("yuzu_viz_oversize_response_total").increment();
@@ -215,10 +250,15 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     if (as_fragment) {
         // HTMX fragment: parser-recoverable script tag carrying the JSON.
         // The id is fixed so the renderer can locate it deterministically
-        // after htmx swaps the parent. No additional escaping needed --
-        // a JSON document cannot contain a literal `</script>` (would be
-        // an unescaped `<`, which json.dump emits as the escaped form).
-        std::string fragment = "<script type=\"application/json\" id=\"viz-data\">";
+        // after htmx swaps the parent. Escape `</` to `<\/` in the JSON
+        // body before wrapping -- nlohmann::json does NOT escape `<`, and
+        // an agent-controlled hostname/cmdline containing `</script>`
+        // would terminate the script element early without this fixup
+        // (gov R3 sec-M2/UP-16).
+        escape_json_for_script(body);
+        std::string fragment;
+        fragment.reserve(body.size() + 64); // gov R3 P-S2 fix
+        fragment.append("<script type=\"application/json\" id=\"viz-data\">");
         fragment.append(body);
         fragment.append("</script>");
         res.set_content(std::move(fragment), "text/html; charset=utf-8");
@@ -227,7 +267,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     }
 
     if (audit_fn_) {
-        audit_fn_(req, "viz.fleet_topology", "ok", "viz_topology", "*",
+        audit_fn_(req, "viz.fleet_topology", "success", "FleetTopology", "",
                   "machines=" + std::to_string(snap->machines.size()) +
                       " include_vuln=" + (include_vuln ? "1" : "0") + (fresh ? " fresh=1" : "") +
                       (as_fragment ? " fragment=1" : ""));

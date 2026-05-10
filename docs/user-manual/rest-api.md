@@ -2612,6 +2612,96 @@ Get infrastructure topology data. For full topology rendering, use the HTMX frag
 
 ---
 
+### Fleet Visualization (3D)
+
+The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` document that the `/viz/fleet` 3D renderer consumes. The endpoint dispatches `tar.fleet_snapshot` to every connected agent on cache miss, aggregates per-agent snapshots into machine cubes + interior process nodes + connection edges, and applies a 60 s LRU-of-2 cache (keyed on `include_vuln`).
+
+#### `GET /api/v1/viz/fleet/topology`
+
+Returns the full topology as JSON.
+
+**Permission:** `Response:Read`.
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `include_vuln` | bool (`0`/`1`) | `0` | When `1`, the per-process `worst_severity` and `cve_count` fields are populated from NVD CPE matching. (PR 2 hardening note: this overlay is wired but inert today because the agent payload doesn't carry installed versions; PR 10 of the ladder activates it.) Selects a separate cache slot from the default. |
+| `fresh` | bool (`0`/`1`) | `0` | When `1`, the cache slot is invalidated before the get. A separate audit row (`viz.fleet_topology.invalidate`) is emitted. Use sparingly — concurrent `?fresh=1` storms force every dispatch to wait on the single-flight refill. |
+| `machines_max` | integer in `[1, 100000]` | `5000` | Soft cap on the number of fleet machines returned. If the materialised snapshot has more than this, the route returns `413` rather than truncating (truncation would mislead operators about which subset they're seeing). |
+
+**Responses**
+
+| Status | When | Body |
+|---|---|---|
+| `200` | Success | `fleet_topology.v1` JSON envelope (see schema below) |
+| `400` | `machines_max` non-numeric, out of `[1, 100000]`, or overflows `int` | `{"error":{"code":400,"message":"..."}, "meta":{"api_version":"v1"}}` |
+| `403` | RBAC denied | Standard auth error envelope |
+| `413` | Snapshot exceeds `machines_max` | `{"error":{"code":413,"message":"fleet topology exceeds machines_max..."}, "meta":{"api_version":"v1"}}` |
+| `503` | Kill switch on (`--viz-disable`) or store unavailable | `{"error":{"code":503,"message":"..."}, "meta":{"api_version":"v1"}}` |
+
+**Schema (`fleet_topology.v1`)**
+
+```json
+{
+  "schema": "fleet_topology.v1",
+  "schema_minor": 1,
+  "generated_at": 1715299200,
+  "include_vuln": false,
+  "machines": [
+    {
+      "agent_id": "...",
+      "hostname": "host-1",
+      "os": "linux",
+      "local_ips": ["10.0.0.1"],
+      "ts": 1715299200,
+      "stale": false,
+      "processes": [
+        {"pid": 1234, "ppid": 1, "name": "postgres", "user": "postgres", "category": "Database"}
+      ],
+      "connections": [
+        {"proto": "tcp", "src_pid": 1234, "src_addr": "10.0.0.1", "src_port": 5432,
+         "dst_addr": "10.0.0.2", "dst_port": 54321, "scope": "internal_fleet",
+         "dst_agent_id": "...", "state": "ESTABLISHED"}
+      ]
+    }
+  ]
+}
+```
+
+`schema_minor` is bumped (not `schema`) on additive evolution; renderers MUST ignore unknown keys.
+
+**Audit emissions**
+
+Every request produces a `viz.fleet_topology` row (target_type `FleetTopology`, target_id empty). `?fresh=1` additionally produces a `viz.fleet_topology.invalidate` row immediately before the get. See [Audit Log](audit-log.md) for the full vocabulary.
+
+**Metrics**
+
+- `yuzu_viz_topology_request_seconds` (histogram) — per-request latency.
+- `yuzu_viz_cache_hit_total` / `yuzu_viz_cache_miss_total` (counters).
+- `yuzu_viz_oversize_response_total` (counter) — 413 cap-check fires.
+- `yuzu_viz_agent_dispatch_timeout_total` (counter) — agents that didn't respond within the 5 s fetcher deadline.
+- `yuzu_viz_refill_oversize_drops_total` (gauge) — store-level 256 MiB cap exceeded; refill not cached.
+- `yuzu_viz_refill_wait_timeouts_total` (gauge) — single-flight waiters that timed out on the refill.
+- `yuzu_viz_refill_waiters_total` (gauge) — single-flight piggyback depth.
+
+**Example**
+
+```bash
+curl -H 'Authorization: Bearer <token>' \
+     'http://localhost:8080/api/v1/viz/fleet/topology?include_vuln=0&machines_max=2000'
+```
+
+#### `GET /fragments/viz/fleet/topology`
+
+Identical data, wrapped in `<script type="application/json" id="viz-data">...</script>` for HTMX-driven swap-and-parse rendering. The `<` characters in JSON strings are escaped (`<\/`) before wrapping so an agent-controlled hostname or `cmdline` containing `</script>` cannot break out of the script element.
+
+**Permission, query params, status codes:** identical to the JSON route above.
+
+**Content-Type:** `text/html; charset=utf-8` (the body is HTML wrapping JSON, not JSON proper).
+
+---
+
 ### Fleet Statistics
 
 #### `GET /api/v1/statistics`
