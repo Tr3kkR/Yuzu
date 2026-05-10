@@ -6,6 +6,7 @@
  */
 
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/auth_db.hpp>
 
 #include "../test_helpers.hpp"
 
@@ -210,22 +211,109 @@ TEST_CASE("validate_session fails for garbage token", "[auth][session]") {
     REQUIRE_FALSE(mgr->validate_session("not-a-real-token").has_value());
 }
 
+// These two probes exercise the AuthManager + AuthDB integration path, which
+// had zero existing coverage. Filed alongside #947 — they confirm that the
+// authenticate() → validate_session() round-trip survives a server restart
+// against a populated data dir and a regenerated config file. If the #947
+// regression ever reappears at the unit level, one of these will fail first.
+
+TEST_CASE("authenticate+validate with AuthDB attached, clean dir",
+          "[auth][session][regression-947]") {
+    auto data_dir = yuzu::test::unique_temp_path("yuzu-947-clean-");
+    fs::create_directories(data_dir);
+
+    auto auth_db = std::make_unique<yuzu::server::AuthDB>(data_dir);
+    auto db_init = auth_db->initialize();
+    REQUIRE(db_init.has_value());
+
+    auto cfg = data_dir / "yuzu-server.cfg";
+    AuthManager mgr;
+    mgr.load_config(cfg);
+    mgr.set_data_dir(data_dir);
+
+    REQUIRE(mgr.upsert_user("alice", "secret123456", Role::admin));
+    auto seed = auth_db->upsert_user("alice", mgr.list_users().front().hash_hex,
+                                     mgr.list_users().front().salt_hex, Role::admin);
+    REQUIRE(seed.has_value());
+
+    mgr.set_auth_db(auth_db.get());
+
+    auto token = mgr.authenticate("alice", "secret123456");
+    REQUIRE(token.has_value());
+
+    auto session = mgr.validate_session(*token);
+    REQUIRE(session.has_value());
+    REQUIRE(session->username == "alice");
+}
+
+TEST_CASE("authenticate+validate with AuthDB attached, stale dir (restart)",
+          "[auth][session][regression-947]") {
+    auto data_dir = yuzu::test::unique_temp_path("yuzu-947-stale-");
+    fs::create_directories(data_dir);
+    auto cfg = data_dir / "yuzu-server.cfg";
+
+    // ── Run 1: populate auth.db + cfg, authenticate once, abandon. ─────
+    {
+        auto auth_db = std::make_unique<yuzu::server::AuthDB>(data_dir);
+        REQUIRE(auth_db->initialize().has_value());
+
+        AuthManager mgr1;
+        mgr1.load_config(cfg);
+        mgr1.set_data_dir(data_dir);
+        REQUIRE(mgr1.upsert_user("alice", "secret123456", Role::admin));
+        auto entry = mgr1.list_users().front();
+        REQUIRE(
+            auth_db->upsert_user("alice", entry.hash_hex, entry.salt_hex, Role::admin).has_value());
+        mgr1.set_auth_db(auth_db.get());
+
+        auto first = mgr1.authenticate("alice", "secret123456");
+        REQUIRE(first.has_value());
+        // session lives in mgr1.sessions_ only; it dies with mgr1.
+    }
+
+    // ── Run 2: same data_dir (stale auth.db survives), but the cfg gets
+    // regenerated with a FRESH PBKDF2 salt — exactly what the UAT does
+    // on each invocation. The OLD hash/salt remains in auth.db. ────────
+    {
+        fs::remove(cfg); // regenerate cfg from scratch
+
+        auto auth_db = std::make_unique<yuzu::server::AuthDB>(data_dir);
+        REQUIRE(auth_db->initialize().has_value());
+
+        AuthManager mgr2;
+        mgr2.load_config(cfg);
+        mgr2.set_data_dir(data_dir);
+        // Fresh upsert → new salt, new hash. cfg now disagrees with auth.db.
+        REQUIRE(mgr2.upsert_user("alice", "secret123456", Role::admin));
+        // Note: we do NOT re-seed auth.db here. main.cpp's seed path only
+        // fires when auth.db is empty (`users_result->empty()`), so on
+        // stale dirs the old DB row survives untouched.
+        mgr2.set_auth_db(auth_db.get());
+
+        auto token = mgr2.authenticate("alice", "secret123456");
+        REQUIRE(token.has_value()); // step 2: login OK
+        auto session = mgr2.validate_session(*token);
+        REQUIRE(session.has_value()); // step 3: BUG claim is this fails
+        REQUIRE(session->username == "alice");
+    }
+}
+
 TEST_CASE("validate_session rejects overly-long tokens (DoS protection #630)", "[auth][session]") {
     auto mgr = make_temp_auth();
     mgr->upsert_user("testuser", "secret123456", Role::admin); // min 12 chars
-    
+
     // Get a valid token via normal auth flow
     auto valid_token = mgr->authenticate("testuser", "secret123456");
     REQUIRE(valid_token.has_value());
     REQUIRE(valid_token->size() == 64); // Should be exactly 64 hex chars
-    
+
     // 65 chars — should be rejected
     std::string too_long_65 = *valid_token + "x";
     REQUIRE_FALSE(mgr->validate_session(too_long_65).has_value());
-    
+
     // 128 chars — should be rejected
     REQUIRE_FALSE(mgr->validate_session(std::string(128, 'a')).has_value());
-    
+
     // 1000 chars — should be rejected (DoS attempt)
     REQUIRE_FALSE(mgr->validate_session(std::string(1000, 'b')).has_value());
 }
