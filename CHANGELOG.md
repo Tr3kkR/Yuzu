@@ -97,11 +97,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   C++17 means a `static UnaryFixture make(...)` factory would actually
   compile; the in-place pattern is by design (deleted move+copy bound to
   test scope), not a workaround. Deferred follow-up issues filed for
-  CMP-2/OBS-1/OBS-2 saturation metric (#NEW-B), UP-101/UP-112 write-side
-  + disk-read deadline (#NEW-A), UP-116 per-peer DownloadUpdate rate
-  limit (#NEW-C), UP-108 `steady_clock` migration (#NEW-D), UP-110
-  negative-deadline guard / arch-S1 (#NEW-E), and sec-MEDIUM-1 / arch-S2
-  / UP-106 server-side stop_token contract claim resolution (#NEW-F).
+  CMP-2/OBS-1/OBS-2 saturation metric (#912), UP-101/UP-112 write-side
+  + disk-read deadline (#911), UP-116 per-peer DownloadUpdate rate
+  limit (#913), UP-108 `steady_clock` migration (#914), UP-110
+  negative-deadline guard / arch-S1 (#915), and sec-MEDIUM-1 / arch-S2
+  / UP-106 server-side stop_token contract claim resolution (#916,
+  closed by `0b5f89c` 2026-05-10 — softened to backend-best-effort).
 - **Agent-side Heartbeat per-cycle `stop_source` wiring pinned by tests
   (closes PR 1c-4 final hard predecessor).** Three new tests at
   `tests/unit/test_heartbeat_cancel_pattern.cpp` `[agent][heartbeat][cancel]`:
