@@ -1,6 +1,6 @@
 # Plan: Fleet network-topology 3D visualization (`feat/viz-engine`)
 
-> **Status note (2026-05-10):** PRs 1–5 + four hardening rounds shipped on `origin/feat/viz-engine` (15 commits ahead of `origin/dev`). Renderer cubes (PR-6+) still ahead. The 11-PR ladder below is unchanged from the original plan; consult `git log origin/dev..HEAD` for current rung progress.
+> **Status note (2026-05-10):** PRs 1–6 + six hardening rounds shipped on `origin/feat/viz-engine`. PR-7+ (interior process nodes / edges / vuln overlay) still ahead. The 11-PR ladder below is unchanged from the original plan; consult `git log origin/dev..HEAD` for current rung progress.
 >
 > **Provenance.** Drafted via the `/plan` skill on 2026-05-09 in worktree `/Users/nathan/Yuzu-viz`. This file is the version-controlled copy; the per-Claude-session original at `~/.claude/plans/we-re-in-a-git-encapsulated-yao.md` is unmaintained.
 

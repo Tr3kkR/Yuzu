@@ -104,10 +104,17 @@ public:
 
     /// Set the optional fetcher-duration observer (see
     /// FetchDurationObserver above). Pass an empty function to clear.
-    /// Thread-safe relative to ongoing get() calls only at startup --
-    /// callers are expected to wire this once during server bring-up
-    /// before the store sees real traffic. (Internal access is via a
-    /// snapshot of the std::function under slots_mu_.)
+    ///
+    /// Thread-safe: setter and `get()` synchronise on slots_mu_; `get()`
+    /// snapshots the std::function under the lock and invokes it after
+    /// dropping the lock. A re-wire applies to refills started after the
+    /// setter returns -- in-flight refills run their already-snapshotted
+    /// observer to completion. Re-wires are not torn-read-prone.
+    /// **Convention** (not enforced): callers wire this once during
+    /// server bring-up before the store sees real traffic; mid-traffic
+    /// re-wires work but accumulate split-bucket histogram observations
+    /// across the boundary, which is rarely useful operationally. (gov
+    /// R6 architect SHOULD-1.)
     void set_fetch_duration_observer(FetchDurationObserver observer);
 
     // ── Observability counters ─────────────────────────────────────────────

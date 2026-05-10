@@ -7,7 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`/viz/fleet` cube renderer + Sprite labels + hover tooltip (PR 6 of
+  the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** The fleet
+  page now renders one translucent cube per fleet machine on a deterministic
+  grid (FNV-1a 32-bit hash of `agent_id` for stable cross-reload layout).
+  Per-OS palette: Linux `#f0c674`, macOS `#a0a0a0`, Windows `#5294e2`,
+  default `#666666`. Live agents render at opacity `0.18`; stale agents
+  (no `tar.fleet_snapshot` response within the 5 s deadline) drop to
+  `0.08` so they remain visible without competing for visual attention.
+  Hostname `Sprite` labels appear above each cube and always face the
+  camera (truncated at 24 chars; full hostname visible in tooltip).
+  Hovering a cube surfaces a fixed-position tooltip via `THREE.Raycaster`
+  with hostname / OS / process count / connection count. Renderer also
+  guards against agent-controlled XSS via Array-spoofed `processes.length`
+  by coercing through `Number(...) | 0` and validates `Array.isArray` on
+  the topology payload before iteration.
+- **`yuzu_viz_topology_fetch_duration_seconds` Prometheus histogram (PR 6 / OBS-2).**
+  Times the inner agent-dispatch path (`tar.fleet_snapshot` fan-out +
+  aggregation) on cache-miss refills only, distinguishing "agent dispatch
+  is slow" from "the rest of the request is slow" (the existing
+  `yuzu_viz_topology_request_seconds` covers the full HTTP path). Wired
+  via a new opt-in `FleetTopologyStore::set_fetch_duration_observer()`
+  setter and a recommended `VizFleetSlowAgentDispatch` alert at p99 > 5 s
+  (the `tar.fleet_snapshot` deadline).
+
+### Changed
+
+- **`/viz/fleet` renderer module migrated from hand-written TU to
+  `embed_js.py` codegen** (PR 6). The renderer source of truth is now
+  `server/core/static/yuzu-viz.js`; the previous hand-written
+  `server/core/src/yuzu_viz_js_bundle.cpp` was deleted. The migration
+  was forced by the renderer bundle exceeding MSVC's 16,380-byte raw-
+  string-literal limit (C2026) at PR 6's additions; codegen via the
+  same `embed_js.py` pipeline used for ECharts and Three.js sidesteps
+  the limit by chunking. The `kYuzuVizJs` symbol name and consumer
+  contract are unchanged.
+
 ### Security
+
+- **Fleet renderer hardens tooltip against agent-controlled Array-spoof
+  XSS** (gov R6 UP-1 / sec-MEDIUM). The hover tooltip previously
+  interpolated `machine.processes.length` and `machine.connections.length`
+  raw into `innerHTML`. A hostile or compromised agent could ship
+  `processes: {length: "<svg/onload=...>"}` (a non-array object with a
+  string `length`) and the truthy `|| 0` short-circuit would return the
+  malicious string. Both fields now coerce through
+  `Array.isArray(...) ? Number(...) | 0 : 0`, so a 32-bit integer is the
+  only thing the template ever writes. The fetch path additionally
+  validates `Array.isArray(data.machines)` before iteration so a malformed
+  payload surfaces a payload-error overlay instead of a TypeError
+  misclassified as a network error.
+- **Distinct fetch-failure overlays for 401/403/503/413/network/schema
+  errors on `/viz/fleet`** (gov R6 UP-9 / UP-10 / UP-15 / UP-17). The
+  renderer surfaces a granular error message for each fetch outcome
+  rather than leaving the scene blank: session expiry, RBAC denial,
+  kill-switch flip, oversize fleet, network failure, truncated JSON,
+  schema mismatch, and missing/non-array `machines` field each get a
+  distinct operator-visible message. On 401/403/503/413 the renderer
+  also calls `clearFleet()` so previously-rendered cubes do not persist
+  alongside the denial overlay (mixed-signal regression noted in R6).
+- **Tooltip caps visual footprint against hostile-hostname DoS** (gov R6
+  UP-3). Hostnames up to 100 KB no longer break tooltip layout — the
+  tooltip pins `max-width:320px`, `max-height:240px`, `overflow:hidden`,
+  `word-break:break-all`. The full hostname is still escaped via
+  `escapeHtml` before innerHTML write.
 
 - **`/viz/fleet` page response now sets `Cache-Control: no-cache, no-store,
   must-revalidate`** (gov R4 UP-10 / DEP-1 / CHAOS-C3). The page references

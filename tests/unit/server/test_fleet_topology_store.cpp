@@ -441,7 +441,12 @@ TEST_CASE("observer: set_fetch_duration_observer fires once per refill", "[viz][
         ++fetcher_calls;
         return std::vector<RawAgentSnapshot>{a};
     };
-    FleetTopologyStore store(fetcher, nullptr, std::chrono::milliseconds(50));
+    // gov R6 QE SHOULD-4: the original 50ms TTL + 80ms sleep was a
+    // 1.6× ratio — flake-prone on slow CI runners (e.g. Defender-throttled
+    // Windows under #473). Match the established 1ms TTL + 10ms sleep
+    // pattern from the sibling `cache: short TTL expires and triggers
+    // refill` test (10× ratio).
+    FleetTopologyStore store(fetcher, nullptr, std::chrono::milliseconds(1));
     store.set_fetch_duration_observer(
         [&observer_calls](std::chrono::duration<double>) { ++observer_calls; });
 
@@ -451,14 +456,30 @@ TEST_CASE("observer: set_fetch_duration_observer fires once per refill", "[viz][
     CHECK(observer_calls.load() == 1);
     CHECK(fetcher_calls.load() == 1);
 
-    // Second get within TTL: cache hit -> observer must NOT fire.
-    auto s2 = store.get(false);
-    REQUIRE(s2 != nullptr);
-    CHECK(observer_calls.load() == 1);
-    CHECK(fetcher_calls.load() == 1);
+    // gov R6: a get() within 1ms TTL is a coin-flip on slow CI -- the
+    // sibling test takes the same approach of immediately invalidating
+    // for the cache-hit assertion to be deterministic. Use a fresh
+    // store with longer TTL just for the cache-hit branch.
+    FleetTopologyStore store_long(fetcher, nullptr, std::chrono::seconds(60));
+    std::atomic<int> long_observer_calls{0};
+    std::atomic<int> long_fetcher_calls{0};
+    auto fetcher_long = [&long_fetcher_calls, a](std::chrono::milliseconds) {
+        ++long_fetcher_calls;
+        return std::vector<RawAgentSnapshot>{a};
+    };
+    FleetTopologyStore store_long2(fetcher_long, nullptr, std::chrono::seconds(60));
+    store_long2.set_fetch_duration_observer(
+        [&long_observer_calls](std::chrono::duration<double>) { ++long_observer_calls; });
+    auto sl1 = store_long2.get(false);
+    REQUIRE(sl1 != nullptr);
+    CHECK(long_observer_calls.load() == 1);
+    auto sl2 = store_long2.get(false);
+    REQUIRE(sl2 != nullptr);
+    CHECK(long_observer_calls.load() == 1); // cache hit, observer NOT fired
+    CHECK(long_fetcher_calls.load() == 1);
 
-    // Force expiry, third get: refill -> observer fires again.
-    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    // Force expiry on the short-TTL store, third get: refill -> observer fires again.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
     auto s3 = store.get(false);
     REQUIRE(s3 != nullptr);
     CHECK(observer_calls.load() == 2);

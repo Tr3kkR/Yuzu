@@ -310,6 +310,33 @@ public:
                           "Cumulative SSE channels reaped after retention "
                           "window + zero subscribers",
                           "counter");
+        // Fleet visualization observability (PR 3 + PR 6 of feat/viz-engine).
+        // gov R6 SRE OBS-1: every metric has a describe() so /metrics
+        // includes # HELP and # TYPE lines for Prometheus / Grafana scrapers.
+        metrics_.describe("yuzu_viz_topology_request_seconds",
+                          "End-to-end /api/v1/viz/fleet/topology request latency", "histogram");
+        metrics_.describe("yuzu_viz_topology_fetch_duration_seconds",
+                          "Inner agent-dispatch (tar.fleet_snapshot fan-out) duration "
+                          "on cache-miss refills only; observed even on fetcher exception",
+                          "histogram");
+        metrics_.describe("yuzu_viz_cache_hit_total",
+                          "Fleet topology requests served from the FleetTopologyStore cache",
+                          "counter");
+        metrics_.describe("yuzu_viz_cache_miss_total",
+                          "Fleet topology requests that triggered a cache refill", "counter");
+        metrics_.describe("yuzu_viz_oversize_response_total",
+                          "Fleet topology requests rejected with HTTP 413 (machines_max breached)",
+                          "counter");
+        metrics_.describe("yuzu_viz_agent_dispatch_timeout_total",
+                          "Per-agent timeouts during tar.fleet_snapshot fan-out", "counter");
+        metrics_.describe("yuzu_viz_refill_oversize_drops_total",
+                          "Refills exceeding max_snapshot_bytes (returned to caller, not cached)",
+                          "gauge");
+        metrics_.describe("yuzu_viz_refill_wait_timeouts_total",
+                          "Single-flight waiters that timed out before the refill completed",
+                          "gauge");
+        metrics_.describe("yuzu_viz_refill_waiters_total",
+                          "Fetch waiters that piggybacked on an in-flight refill", "gauge");
 
         // Wire health store into agent service
         agent_service_.set_health_store(&health_store_);
@@ -664,6 +691,12 @@ public:
                     metrics_.histogram("yuzu_viz_topology_fetch_duration_seconds")
                         .observe(elapsed.count());
                 });
+            // gov R6 SRE OBS-2: log so a future refactor that silently
+            // skips the wire-up (re-ordered init, conditional metrics-off
+            // mode, etc.) leaves a positive trace operators can grep for
+            // when the histogram count fails to increment.
+            spdlog::debug("FleetTopologyStore: fetch-duration observer wired "
+                          "(yuzu_viz_topology_fetch_duration_seconds)");
         }
 
         // Initialize audit store

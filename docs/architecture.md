@@ -267,7 +267,10 @@ Operator                     Server                                  Agent
    │
    │── render() ───────────────┐
    │   (renderer module)       │  WebGLRenderer + OrbitControls camera +
-   │                           │  WASD pan; PR-6+ adds machine cubes,
+   │                           │  WASD pan; machine cubes (one per agent,
+   │                           │  deterministic FNV-1a grid, per-OS
+   │                           │  palette) + Sprite hostname labels +
+   │                           │  Raycaster hover tooltip; PR-7+ adds
    │                           │  process nodes, connection edges, vuln
    │                           │  overlays.
 ```
@@ -282,9 +285,9 @@ Operator                     Server                                  Agent
 
 **Why a kill switch?** WebGL has a much larger attack surface than HTML, the renderer module is large (~6 KB hand-written + ~717 KB vendored), and the data path fans out to every agent. Operators who never use the feature should be able to disable it cleanly. `--viz-disable` (or `YUZU_VIZ_DISABLE=1`) makes both the page and the REST surface return 503 with an audit row, ahead of any RBAC check (tier-before-permission per `docs/auth-architecture.md` §3).
 
-**Static-asset packaging.** The renderer is a Pattern-A hand-written TU (`yuzu_viz_js_bundle.cpp`); the page HTML is another (`viz_page_ui.cpp`); Three.js core and OrbitControls are Pattern-B codegen TUs (`embed_js.py` over `vendor/three.module.min.js` and `vendor/three-orbit-controls.js`). See `docs/cpp-conventions.md` "Static-asset translation units" for when to use each pattern.
+**Static-asset packaging.** The renderer was Pattern-A (hand-written `yuzu_viz_js_bundle.cpp`) through PR 5; at PR 6 the bundle exceeded MSVC's 16,380-byte raw-string-literal limit (C2026), and the renderer source migrated to `server/core/static/yuzu-viz.js` with `embed_js.py` codegen (Pattern B), matching the Three.js and OrbitControls pattern. The page HTML remains a Pattern-A hand-written TU (`viz_page_ui.cpp`). Vendored Three.js core and OrbitControls are Pattern-B over `vendor/three.module.min.js` and `vendor/three-orbit-controls.js`. See `docs/cpp-conventions.md` "Static-asset translation units" for when to use each pattern; `static/` houses our authoritative assets, `vendor/` houses upstream drops.
 
-**Extension seam.** PR-6+ fills `mount() → buildScene()` callouts in the renderer with machine cubes (one per agent), process nodes (interior of the cube), edges (intra-machine + cross-machine), and a vulnerability overlay when `?include_vuln=1`. The store, REST surface, audit, and kill switch are stable; renderer ships incrementally without further surface changes.
+**Extension seam.** PR 6 filled the renderer's `mount() → buildScene()` callouts with machine cubes + Sprite hostname labels + Raycaster hover tooltip. PR 7+ fills the same seam with process nodes (interior of the cube), edges (intra-machine + cross-machine), and a vulnerability overlay when `?include_vuln=1`. The store, REST surface, audit, and kill switch are stable; renderer ships incrementally without further surface changes.
 
 ## Storage Architecture
 

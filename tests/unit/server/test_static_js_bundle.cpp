@@ -352,10 +352,16 @@ TEST_CASE("static_js_bundle: kYuzuVizJs builds translucent cubes with MeshPhysic
     // 0.18 (live) / 0.08 (stale). A refactor that swaps to opaque cubes
     // would obscure interior process nodes (PR 7+) and break the visual
     // model.
+    //
+    // gov R6 QE SHOULD-1/SHOULD-2: bare `0.08` substring matches
+    // `dampingFactor=0.08` elsewhere in the bundle (false positive); bare
+    // `0.18` has no positional context. Pin the full ternary so the test
+    // measures the live-vs-stale opacity *relationship*, not just two
+    // numeric tokens that happen to appear somewhere.
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("MeshPhysicalMaterial"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("transparent: true"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("0.18"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("0.08"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("opacity: machine && machine.stale ? 0.08 : 0.18"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs builds Sprite hostname labels", "[static-js][viz]") {
@@ -430,7 +436,14 @@ TEST_CASE("static_js_bundle: kYuzuVizJs guards camera position against NaN/Infin
     // NaN cascades through every subsequent frame (renderer.render with
     // NaN matrices crashes WebGL on some drivers). The render loop must
     // detect and reset to a safe default.
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("Number.isFinite(camera.position"));
+    //
+    // gov R6 architect NICE-2: the reset must cover BOTH camera.position
+    // and controls.target -- the latter feeds back into camera.position
+    // via controls.update() each frame, so resetting only one would
+    // re-poison within one frame.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("Number.isFinite"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("camera.position.set"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("controls.target.set"));
 }
 
 // ── Fleet viz page HTML scaffold ────────────────────────────────────────────

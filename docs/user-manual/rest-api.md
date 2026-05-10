@@ -2632,8 +2632,27 @@ Browser-facing page that renders the 3D fleet topology. The page itself is auth-
 - Drag — rotate camera around scene origin (OrbitControls)
 - Mouse wheel — dolly in/out (clamped to `[4, 400]` units)
 - `W`/`A`/`S`/`D` — pan the view in camera screen space (window-level listener; suppressed when a text-editable target has focus, so typing in a future overlay-panel input does not eat keystrokes)
+- **Hover a machine cube** — surfaces a fixed-position tooltip with the cube's hostname, OS, process count, and connection count. The tooltip raycasts against cube meshes only (the wireframe outline overlay is skipped) and follows the cursor with a small offset to avoid flicker.
 
+**Renderer behaviour (PR 6):**
 
+The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#f0c674`, macOS/Darwin `#a0a0a0`, Windows `#5294e2`, default `#666666`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear above each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
+
+**Browser error handling.** When the JS renderer's fetch to `/api/v1/viz/fleet/topology` fails, the renderer surfaces a visible overlay (`#viz-error.shown`) on the canvas rather than leaving the scene blank. Any previously-rendered cubes are removed before the overlay is shown so the operator does not see "live data" cubes alongside a denial message.
+
+| API response | Overlay message |
+|---|---|
+| `401` | "Session expired. Please reload the page." |
+| `403` | "Access denied. Your role no longer permits viewing the fleet topology." |
+| `413` | "Fleet exceeds the configured `machines_max` cap. Ask an administrator to raise `--viz-machines-max` or scope the request via a management group." |
+| `503` | "Fleet visualization is currently disabled by an administrator." |
+| Other 4xx/5xx | "Failed to fetch fleet topology (HTTP <status>). Try reloading." |
+| Network failure | "Cannot reach server: <message>" |
+| Truncated JSON / malformed body | "Malformed JSON from server (truncated response or proxy issue): <message>" |
+| Schema mismatch | "Unexpected topology schema: <schema>. Reload the page (Ctrl+Shift+R) to pick up the new dashboard." |
+| Empty `machines` field (server bug) | "Server returned no machines field. This is a server-side bug; check the server log." |
+
+These overlays are in addition to the standard browser console entry. Previous releases (PR 5 and earlier) left the scene blank on every error condition.
 
 #### `GET /api/v1/viz/fleet/topology`
 
@@ -2696,7 +2715,8 @@ Every request produces a `viz.fleet_topology` row (target_type `FleetTopology`, 
 
 **Metrics**
 
-- `yuzu_viz_topology_request_seconds` (histogram) — per-request latency.
+- `yuzu_viz_topology_request_seconds` (histogram) — end-to-end request latency on the success path (auth + RBAC + store + serialisation + response).
+- `yuzu_viz_topology_fetch_duration_seconds` (histogram) — duration of the inner agent-dispatch path (`tar.fleet_snapshot` fan-out + response aggregation), measured only on cache-miss refills. Use to distinguish slow agent dispatch from slow auth / serialisation. Observed even on fetcher exception so a hung fetcher produces a visible upper-bound observation. (PR 6 / OBS-2.)
 - `yuzu_viz_cache_hit_total` / `yuzu_viz_cache_miss_total` (counters).
 - `yuzu_viz_oversize_response_total` (counter) — 413 cap-check fires.
 - `yuzu_viz_agent_dispatch_timeout_total` (counter) — agents that didn't respond within the 5 s fetcher deadline.

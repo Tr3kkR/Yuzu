@@ -33,9 +33,15 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-// Single global handle the page can poke at from the dev console for
-// debugging (window.YuzuViz.scene, .camera, .renderer, .controls).
+// Dev-console handle. The `__internal` namespace is intentional --
+// the namespace itself signals that nothing here is a stable API.
+// Future PRs (interior process nodes, edges, vuln overlay) will
+// reshape these fields freely; if you're a userscript or third-party
+// integration, do NOT depend on `window.YuzuViz.__internal.*`. Tests
+// and the developer console use this surface; everything else should
+// go through the REST endpoints. (gov R6 architect SHOULD-3.)
 window.YuzuViz = window.YuzuViz || {};
+window.YuzuViz.__internal = window.YuzuViz.__internal || {};
 
 const STEP = 1.5;             // WASD pan step in world units per frame at full speed
 const FOV = 50;               // perspective FOV (degrees)
@@ -169,6 +175,12 @@ function buildHostnameLabel(hostname) {
   ctx.fillText(label, canvas.width / 2, canvas.height / 2);
   const tex = new THREE.CanvasTexture(canvas);
   tex.minFilter = THREE.LinearFilter;
+  // gov R6 perf-F4: hostname canvas is rendered at fixed 256x64 and never
+  // sampled below its native resolution (Sprite is screen-space scaled,
+  // not perspective-shrunk). Disable mipmap generation -- saves ~30% GPU
+  // VRAM per sprite (no mip-chain build) and skips the synchronous GPU
+  // pipeline pause on each upload during addMachines() at high N.
+  tex.generateMipmaps = false;
   tex.needsUpdate = true;
   const mat = new THREE.SpriteMaterial({map: tex, transparent: true, depthTest: false});
   const sprite = new THREE.Sprite(mat);
@@ -371,17 +383,31 @@ function mount() {
   // (cheaper + avoids hit-test on the outline material).
   const cubeMeshes = [];
 
+  // gov R6 happy-S1 / UP-20: cubes carry a wireframe LineSegments child
+  // (added in buildCube). The straight `for child of fleetGroup.children`
+  // walk only sees the cube — wireframe geometry + material would never
+  // get disposed and VRAM would leak proportional to N * #refills. PR 11
+  // adds a 60s background refresher; without recursive disposal the leak
+  // would be cumulative. Use traverse() so every descendant material +
+  // geometry + texture lands on dispose().
+  function disposeNode(obj) {
+    if (obj.material) {
+      const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+      for (let i = 0; i < mats.length; i++) {
+        if (mats[i].map) mats[i].map.dispose();
+        mats[i].dispose();
+      }
+    }
+    if (obj.geometry) obj.geometry.dispose();
+  }
   function clearFleet() {
     while (fleetGroup.children.length > 0) {
       const child = fleetGroup.children[0];
       fleetGroup.remove(child);
-      // Best-effort GPU resource release. Sprite materials hold canvas
-      // textures we made here; cubes hold geometries + materials.
-      if (child.material) {
-        if (child.material.map) child.material.map.dispose();
-        child.material.dispose();
-      }
-      if (child.geometry) child.geometry.dispose();
+      // Recurse to release wireframe LineSegments + sprite-internal
+      // textures + any future per-machine sub-graph (PR 7 process
+      // nodes will land as children of cubes too).
+      child.traverse(disposeNode);
     }
     cubeMeshes.length = 0;
   }
@@ -414,7 +440,13 @@ function mount() {
       'position:absolute;pointer-events:none;background:rgba(0,0,0,0.85);' +
       'color:#fff;padding:0.4rem 0.6rem;border-radius:0.25rem;' +
       'font-size:0.78rem;line-height:1.3;z-index:6;display:none;' +
-      'max-width:280px;border:1px solid #444;';
+      // gov R6 UP-3: hostname / os come from agent payloads. Without
+      // word-break + overflow caps a 100KB hostname turns the tooltip
+      // into a screen-filling rectangle on hover. max-width caps the
+      // visual footprint; word-break:break-all forces wrapping inside
+      // a long unbroken string; max-height clips the worst case.
+      'max-width:320px;max-height:240px;overflow:hidden;' +
+      'word-break:break-all;border:1px solid #444;';
     root.appendChild(_tooltip);
     return _tooltip;
   }
@@ -423,8 +455,14 @@ function mount() {
   }
   function showTooltip(machine, evt) {
     const tip = ensureTooltip();
-    const proc = (machine.processes && machine.processes.length) || 0;
-    const conn = (machine.connections && machine.connections.length) || 0;
+    // gov R6 UP-1 / sec-MEDIUM: agent-controlled `processes` / `connections`
+    // could be a non-array masquerading as one (e.g. {length: '<svg/onload=…>'}).
+    // The `|| 0` short-circuit returns the malicious string and concatenates
+    // it raw into innerHTML. Coerce through Number(...)|0 so any non-numeric
+    // shape collapses to 0 and a 32-bit integer is the only thing the
+    // template ever interpolates.
+    const proc = Array.isArray(machine.processes) ? Number(machine.processes.length) | 0 : 0;
+    const conn = Array.isArray(machine.connections) ? Number(machine.connections.length) | 0 : 0;
     const stale = machine.stale ? ' <span style="color:#f0c674">(stale)</span>' : '';
     tip.innerHTML =
       '<div style="font-weight:600;margin-bottom:0.2rem">' +
@@ -496,18 +534,36 @@ function mount() {
         // blank scene. 401 means the session itself died; reload routes
         // through the server's auth middleware.
         if (r.status === 401) {
+          // gov R6 UP-15: scrub any cubes we'd previously rendered so the
+          // operator doesn't see "live data" cubes alongside an "access
+          // denied" overlay -- mixed signals would imply they still see
+          // the fleet despite the denial.
+          clearFleet();
           setError('Session expired. Please reload the page.');
           return null;
         }
         if (r.status === 403) {
+          clearFleet();
           setError('Access denied. Your role no longer permits viewing the fleet topology.');
           return null;
         }
         if (r.status === 503) {
+          clearFleet();
           setError('Fleet visualization is currently disabled by an administrator.');
           return null;
         }
+        if (r.status === 413) {
+          // gov R6 UP-6: opaque "HTTP 413" leaves the operator without an
+          // actionable next step. Name the cap so they know what to ask
+          // an admin to raise (or to scope the fleet down via management
+          // groups).
+          clearFleet();
+          setError('Fleet exceeds the configured machines_max cap. Ask an administrator to ' +
+                   'raise --viz-machines-max or scope the request via a management group.');
+          return null;
+        }
         if (!r.ok) {
+          clearFleet();
           setError('Failed to fetch fleet topology (HTTP ' + r.status + '). Try reloading.');
           return null;
         }
@@ -515,19 +571,53 @@ function mount() {
       })
       .then(function (data) {
         if (!data) return null;
+        // gov R6 UP-10: a malformed payload (TypeError on machines.slice or
+        // similar) would otherwise fall through to the network catch and
+        // be misclassified as a network error. Validate the shape first so
+        // the operator gets a payload-error message instead.
+        if (typeof data !== 'object' || data === null) {
+          setError('Malformed topology payload (not an object).');
+          return null;
+        }
         if (data.schema !== 'fleet_topology.v1') {
-          setError('Unexpected topology schema: ' + (data.schema || '<missing>'));
+          // gov R6 UP-8: future schema bump -> hint the operator to reload
+          // their browser cache, since the renderer is module-cached.
+          setError('Unexpected topology schema: ' + (data.schema || '<missing>') +
+                   '. Reload the page (Ctrl+Shift+R) to pick up the new dashboard.');
+          return null;
+        }
+        // gov R6 UP-9 / UP-10: distinguish "machines field missing/null"
+        // (server bug) and "machines is wrong type" (schema regression)
+        // from "0 machines" (legitimate empty fleet). Each gets a distinct
+        // operator-visible message.
+        if (data.machines === undefined || data.machines === null) {
+          clearError();
+          clearFleet();
+          setError('Server returned no machines field. This is a server-side bug; check the server log.');
+          return null;
+        }
+        if (!Array.isArray(data.machines)) {
+          clearError();
+          clearFleet();
+          setError('Malformed topology payload (machines is not an array).');
           return null;
         }
         clearError();
-        addMachines(data.machines || []);
+        addMachines(data.machines);
         return data;
       })
       .catch(function (err) {
         // gov R5 UP-17: network failures land here too; the user just
         // gets the same friendly overlay rather than a console-only
-        // exception.
-        setError('Cannot reach server: ' + (err && err.message ? err.message : 'network error'));
+        // exception. SyntaxError from r.json() also lands here (truncated
+        // body) -- distinguish in the message so the operator can tell
+        // "connection broken" from "server returned bad JSON".
+        const m = (err && err.message) ? err.message : 'network error';
+        const kind = (err && err.name === 'SyntaxError')
+                       ? 'Malformed JSON from server (truncated response or proxy issue)'
+                       : 'Cannot reach server';
+        clearFleet();
+        setError(kind + ': ' + m);
         return null;
       });
   }
@@ -549,10 +639,18 @@ function mount() {
     // Reset to a sane default and fall through to render so the operator
     // sees something rather than a hung scene.
     if (!_contextLost) {
-      if (!Number.isFinite(camera.position.x) ||
-          !Number.isFinite(camera.position.y) ||
-          !Number.isFinite(camera.position.z)) {
+      // gov R6 architect NICE-2: a poisoned `_offset` add can land non-
+      // finite values on BOTH camera.position and controls.target. Reset
+      // only camera.position would be insufficient because the next
+      // `controls.update()` call recomputes camera.position from the bad
+      // target, re-poisoning it within one frame. Reset both, then
+      // controls.update() so the target write takes effect for this frame.
+      const cp = camera.position;
+      const ct = controls.target;
+      if (!Number.isFinite(cp.x) || !Number.isFinite(cp.y) || !Number.isFinite(cp.z) ||
+          !Number.isFinite(ct.x) || !Number.isFinite(ct.y) || !Number.isFinite(ct.z)) {
         camera.position.set(35, 30, 35);
+        controls.target.set(0, 0, 0);
         camera.lookAt(0, 0, 0);
       }
       applyWasdPan();
@@ -570,16 +668,20 @@ function mount() {
 
   // Expose for dev-console inspection AND test code (idempotency guard,
   // mount-time assertions, manual data refresh). Not a public API.
-  window.YuzuViz.scene = scene;
-  window.YuzuViz.camera = camera;
-  window.YuzuViz.renderer = renderer;
-  window.YuzuViz.controls = controls;
-  window.YuzuViz.heldKeys = heldKeys;
-  window.YuzuViz.root = root;
-  window.YuzuViz.fleetGroup = fleetGroup;
-  window.YuzuViz.cubeMeshes = cubeMeshes;
-  window.YuzuViz.addMachines = addMachines;
-  window.YuzuViz.fetchAndRender = fetchAndRender;
+  // gov R6 architect SHOULD-3: dev-console handles live under __internal
+  // so the namespace itself signals "do not depend on this" to userscripts
+  // and third-party integrations. Tests use the same path.
+  const dev = window.YuzuViz.__internal;
+  dev.scene = scene;
+  dev.camera = camera;
+  dev.renderer = renderer;
+  dev.controls = controls;
+  dev.heldKeys = heldKeys;
+  dev.root = root;
+  dev.fleetGroup = fleetGroup;
+  dev.cubeMeshes = cubeMeshes;
+  dev.addMachines = addMachines;
+  dev.fetchAndRender = fetchAndRender;
 }
 
 // Mount on initial DOMContentLoaded (full page nav) and on htmx:afterSettle
