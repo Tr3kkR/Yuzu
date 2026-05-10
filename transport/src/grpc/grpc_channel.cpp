@@ -351,6 +351,13 @@ CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
     ::grpc::ByteBuffer resp_buf;
 
     ::grpc::ClientContext gctx;
+    // Capture monotonic time at deadline arming so an NTP step during the
+    // in-flight window can be detected on DeadlineExceeded returns. gRPC's
+    // ClientContext::set_deadline only accepts system_clock::time_point
+    // (grpcpp/support/time.h:46-47 deletes other clock overloads), so the
+    // wire deadline is system-clock based and a backward step expires it
+    // early. See `docs/ci-cpp23-troubleshooting.md` "NTP step risk" (#914).
+    const auto deadline_armed_at = std::chrono::steady_clock::now();
     if (ctx.deadline > std::chrono::milliseconds::zero()) {
         gctx.set_deadline(std::chrono::system_clock::now() + ctx.deadline);
     }
@@ -403,6 +410,27 @@ CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
     // labels, audit envelope rows, or SSE-rendered status fragments
     // is the UP-41 / sec-1 cluster (governance round 5).
     r.status.detail = sanitise_status_detail(g_status.error_message());
+
+    // NTP-step sanity log (#914 / UP-108). On a DeadlineExceeded return,
+    // compare elapsed steady-clock time against the configured deadline.
+    // If steady-elapsed is meaningfully shorter than the deadline (slack:
+    // 50 ms covers normal scheduler jitter), the wall-clock deadline
+    // fired early — the most likely cause is a backward system_clock NTP
+    // step during the in-flight window. The log is incident-triage only;
+    // user-visible status remains DeadlineExceeded.
+    if (r.status.code == StatusCode::DeadlineExceeded &&
+        ctx.deadline > std::chrono::milliseconds::zero()) {
+        const auto elapsed_steady =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - deadline_armed_at);
+        constexpr auto kSanitySlack = std::chrono::milliseconds(50);
+        if (elapsed_steady + kSanitySlack < ctx.deadline) {
+            spdlog::warn(
+                "transport: deadline fired but elapsed steady time was {} ms < "
+                "expected {} ms (method='{}') — possible system_clock NTP step",
+                elapsed_steady.count(), ctx.deadline.count(), method);
+        }
+    }
 
     // Copy trailing metadata for the caller (per the abstraction
     // contract — initial vs trailing distinction lives in transport.hpp).

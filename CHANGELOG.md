@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **NTP-step sanity log on unary `DeadlineExceeded` returns + MSVC chrono
+  doc (#914 / UP-108).** gRPC's `ClientContext::set_deadline` accepts
+  only `system_clock::time_point` (`grpcpp/support/time.h:46-47` deletes
+  other clock overloads), so a backward NTP step during an in-flight
+  unary RPC expires the deadline early. `transport/src/grpc/grpc_channel.cpp`
+  now captures `steady_clock::now()` at deadline arming; on
+  `DeadlineExceeded` returns, if elapsed steady-clock time is more than
+  50 ms shorter than the configured deadline, the call site logs
+  `transport: deadline fired but elapsed steady time was X ms < expected
+  Y ms — possible system_clock NTP step`. The signal is incident-triage
+  only; user-visible status is unchanged. Companion doc section added
+  to `docs/ci-cpp23-troubleshooting.md` covering the MSVC pre-19.38
+  `wait_for` history (Yuzu's project floor is exactly 19.38), the
+  gRPC API constraint, and the upstream issue/source pointers.
 - **PR 1c-4 lift coverage: nullptr open_bidi + concurrent shared-stream
   writes (#926 / #927).** Adds two test cases to
   `tests/unit/test_agent_subscribe_lift.cpp`:

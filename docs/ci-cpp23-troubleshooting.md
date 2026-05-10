@@ -116,6 +116,29 @@ project('myproject', 'cpp', default_options: ['cpp_std=c++23'])
 add_project_arguments('-std=c++23', language: 'cpp')
 ```
 
+### MSVC pre-19.38 `cv_.wait_for` + gRPC `system_clock` deadlines: NTP step risk (#914 / UP-108)
+
+`std::condition_variable::wait_for(lock, duration, pred)` is the workhorse primitive in any cross-platform RPC layer. The duration overload is supposed to be steady-clock-based, but **MSVC < 19.38 implemented it on `system_clock` internally** — meaning a backward NTP step adjustment expires the wait early, and a forward step delays it.
+
+| MSVC | `wait_for(lock, duration, pred)` clock |
+|------|----------------------------------------|
+| 19.34 (Windows Server 2019 default until rolled forward) | `system_clock` — vulnerable to NTP step |
+| 19.38+ | `steady_clock` — NTP-step-safe |
+
+Yuzu's project floor is exactly **MSVC 19.38**. Any backsliding to 19.34 surfaces as spurious `DeadlineExceeded` returns under chrony / ntpd step adjustments > 100 ms (and most enterprise NTP setups slew, but startup-time corrections, virtualization clock drift, or post-suspend resume can step several seconds).
+
+**The other half of this footgun is gRPC.** `grpc::ClientContext::set_deadline` accepts a `std::chrono::system_clock::time_point` per gRPC's published API (still true as of gRPC 1.62). gRPC's `TimePoint` adapter explicitly **deletes** non-system-clock overloads — you cannot pass a `steady_clock::time_point`. Every unary RPC and bidi stream construction in `transport/src/grpc/grpc_channel.cpp` therefore stamps a system-clock deadline, and any system-clock step during the in-flight window is observable as a premature `DeadlineExceeded`.
+
+**Mitigation in this repo:**
+
+1. The MSVC 19.38 floor is enforced in `meson.build`'s compiler-detection probe.
+2. Unary calls in `grpc_channel.cpp` capture `steady_clock::now()` at deadline arming and compare on `DeadlineExceeded` returns; if elapsed steady time is significantly less than the configured deadline (default slack: 50 ms), the call site logs `transport: deadline fired but elapsed steady time was X ms < expected Y ms — possible system_clock NTP step`. The signal is observable in incident triage but does not change the user-visible status.
+3. Revisit when gRPC exposes a steady-clock-based deadline API (no upstream issue at time of writing — file one if you bump into this in a downstream project).
+
+**References:**
+- MSVC 19.38 chrono migration: [microsoft/STL#1051](https://github.com/microsoft/STL/issues/1051)
+- gRPC `TimePoint` deletion of non-system_clock overloads: [grpcpp/support/time.h:46-47](https://github.com/grpc/grpc/blob/master/include/grpcpp/support/time.h)
+
 ---
 
 ## 3. macOS linker rejects GNU flags
