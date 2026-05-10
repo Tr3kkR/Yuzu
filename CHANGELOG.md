@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Vendored Three.js r168 + OrbitControls (PR 4 of the 11-PR
+  `/viz/fleet` 3D fleet network-topology ladder).** Two new build-time
+  embeds: `kThreeJs` (685 KB, three.js r168 minified ES module) and
+  `kThreeOrbitJs` (32 KB, OrbitControls ES module from
+  `examples/jsm/controls/OrbitControls.js`), wired through the existing
+  `embed_js.py` chunked-raw-string pipeline that ECharts already uses.
+  Static asset routes `GET /static/three.module.min.js` and
+  `GET /static/three-orbit-controls.js` serve them with
+  `Cache-Control: public, max-age=86400`. Both files MIT licensed; full
+  attribution in `server/core/vendor/three-NOTICE.txt` and
+  `three-orbit-NOTICE.txt`, summary line added to top-level NOTICE.
+  PR 5's page scaffold (`/viz/fleet`) loads them via
+  `<script type="importmap">` so the OrbitControls module's
+  `import ... from 'three'` resolves to the vendored bundle. Modern
+  Three.js (r150+) ships only as ES modules — the planned
+  `three.min.js` UMD path no longer exists upstream, so the file naming
+  reflects the ES-module reality. (#viz-engine ladder PR 4.)
+
 ### Security
 
 - **Fleet visualization fragment route now escapes `</script>` in the JSON

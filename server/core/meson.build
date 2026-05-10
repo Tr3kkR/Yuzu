@@ -65,6 +65,39 @@ echarts_embed = custom_target(
   ],
 )
 
+# Build-time embed of vendored Three.js r168 + OrbitControls (PR 4 of
+# feat/viz-engine ladder). Same chunked-raw-string pattern as ECharts;
+# fragment loader in PR 5 wires `<script type="importmap">` so the
+# OrbitControls module's `import ... from 'three'` resolves to the
+# vendored file. We ship the ES-module form rather than UMD because
+# Three.js dropped UMD in r150+ -- modern releases only publish
+# `three.module.min.js`. Symbols: kThreeJs (~685 KB), kThreeOrbitJs (~32 KB).
+three_embed = custom_target(
+  'three_js_bundle',
+  input: 'vendor/three.module.min.js',
+  output: 'three_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'ThreeJs',
+  ],
+)
+
+three_orbit_embed = custom_target(
+  'three_orbit_js_bundle',
+  input: 'vendor/three-orbit-controls.js',
+  output: 'three_orbit_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'ThreeOrbitJs',
+  ],
+)
+
 # Build-time embed of the Yuzu Design System CSS bundle. The source
 # kYuzuCss exceeded MSVC's 16,380-byte raw-string-literal limit (C2026)
 # after the design-token expansion. Chunking into ~14 KB
@@ -135,7 +168,7 @@ content_embed = custom_target(
 
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
-  [echarts_embed, yuzu_css_embed, inter_embed, content_embed,
+  [echarts_embed, three_embed, three_orbit_embed, yuzu_css_embed, inter_embed, content_embed,
   files(
     'src/server.cpp',
     'src/agent_registry.cpp',

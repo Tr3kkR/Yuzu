@@ -167,6 +167,9 @@ namespace yuzu::server {
 extern const std::string kYuzuCss; // server/core/static/yuzu.css (build-time embed)
 extern const std::string kYuzuChartsJs;
 extern const std::string kEChartsJs; // server/core/vendor/echarts.min.js (Apache-2.0)
+extern const std::string kThreeJs;   // server/core/vendor/three.module.min.js (MIT, three.js r168)
+extern const std::string
+    kThreeOrbitJs; // server/core/vendor/three-orbit-controls.js (MIT, three.js r168)
 extern const std::string_view
     kInterVariableWoff2; // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
 extern const std::vector<std::string>
@@ -2763,6 +2766,25 @@ private:
                 res.set_header("Cache-Control", "public, max-age=86400");
                 res.set_content(yuzu::server::kEChartsJs, "application/javascript; charset=utf-8");
             });
+
+        // PR 4 of feat/viz-engine: vendored Three.js r168 (MIT) + OrbitControls
+        // (MIT, ES module). Modern Three.js (r150+) ships only as ES modules,
+        // so PR 5's page scaffold loads these via `<script type="importmap">`
+        // mapping `"three"` to `/static/three.module.min.js` and
+        // `"three/addons/controls/OrbitControls.js"` to
+        // `/static/three-orbit-controls.js`. Cache-Control matches the
+        // ECharts pattern: public, max-age=86400, content-addressed by
+        // server binary version.
+        web_server_->Get(
+            "/static/three.module.min.js", [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "public, max-age=86400");
+                res.set_content(yuzu::server::kThreeJs, "application/javascript; charset=utf-8");
+            });
+        web_server_->Get("/static/three-orbit-controls.js", [](const httplib::Request&,
+                                                               httplib::Response& res) {
+            res.set_header("Cache-Control", "public, max-age=86400");
+            res.set_content(yuzu::server::kThreeOrbitJs, "application/javascript; charset=utf-8");
+        });
         // Inter variable webfont (SIL OFL) — the Yuzu design system's
         // default family. Single woff2 covers all weights via font-
         // variation-settings on the @font-face declaration in
