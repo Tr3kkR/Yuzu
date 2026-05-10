@@ -212,7 +212,7 @@ private:
         int lines = 50; // default
         auto lines_param = params.get("lines");
         if (!lines_param.empty()) {
-            auto [ptr, ec] = std::from_chars(
+            [[maybe_unused]] auto [ptr, ec] = std::from_chars(
                 lines_param.data(), lines_param.data() + lines_param.size(), lines);
             if (ec != std::errc{} || lines < 1) {
                 ctx.write_output("status|error|invalid lines parameter: must be a positive integer");

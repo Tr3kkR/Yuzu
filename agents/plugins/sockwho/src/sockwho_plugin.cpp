@@ -159,7 +159,7 @@ void build_maps(std::unordered_map<uint64_t, int>& inode_map,
     struct dirent* proc_entry = nullptr;
     while ((proc_entry = readdir(proc_dir)) != nullptr) {
         int pid = 0;
-        auto [ptr, ec] = std::from_chars(proc_entry->d_name,
+        [[maybe_unused]] auto [ptr, ec] = std::from_chars(proc_entry->d_name,
                                          proc_entry->d_name + std::strlen(proc_entry->d_name), pid);
         if (ec != std::errc{} || pid <= 0)
             continue;

@@ -13,6 +13,19 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
 /test                  — default mode (~30-45 min): build + upgrade test + standard gates
 /test --quick          — sanity check (~10 min): build + unit + EUnit + dialyzer (no live stack)
 /test --full           — pre-tag (~60-120 min): adds OTA, sanitizers, perf measurement, coverage enforce
+/test --instructions   — content-suite gate (~5-15 min): exercises all 184 safe + mutating
+                         InstructionDefinitions against a live UAT stack via REST.
+                         Standalone: brings up Phase 4 stack + the new Phase 5 instructions gate
+                         only. Skips build/upgrade/sanitizers/coverage. Use when content
+                         changes (yaml under `content/definitions/`) or after touching the
+                         instruction-engine dispatch path.
+/test --instructions-quarantine
+                       — quarantine ceremony (~30-40s): exercises the security.quarantine
+                         cluster (isolate / release / status / whitelist) with the
+                         self-disconnect/auto-resume dance. DO NOT RUN ON A REMOTE / SSH-ONLY
+                         HOST — see safety section below. PR C will add hand-written
+                         semantic-correctness tests for the 25 destructive instructions
+                         (`--instructions-destructive`).
 /test --force-cleanup  — tear down THIS RUN's dangling test containers before starting
 /test --keep-stack     — leave docker stacks running after the run (debugging)
 ```
@@ -20,6 +33,23 @@ Runbook for the Yuzu `/test` pipeline. This skill is a **bash-first orchestrator
 Modes are layered: `--full` includes everything `default` runs, `default` includes everything `--quick` runs. The most common invocation is bare `/test` before `git push`.
 
 **`--quick` does NOT include synthetic UAT or any other test that needs a live stack.** Quick mode is build + offline unit/EUnit/dialyzer only — there is no Phase 4 stack stand-up in quick mode, so no Phase 5 gate that requires HTTP to a live server. If you need stack-level confidence, use default mode.
+
+## Cross-platform support
+
+The skill runs on both **Linux** (CI, WSL2) and **macOS** (operator dev box). The orchestration prefers a single OS-aware script per concern over OS-specific forks:
+
+- Build dir is `build-linux` on Linux, `build-macos` on macOS — `scripts/setup.sh` auto-picks. The skill computes `BUILDDIR=build-$(host_os)` (with `darwin → macos`) via `scripts/test/_portable.sh` and uses `$BUILDDIR` everywhere.
+- Stack stand-up (Phase 4) calls `scripts/start-UAT.sh` — cross-platform; the historical `start-UAT.sh` name is a back-compat shim.
+- Port checks, disk-free, loadavg/CPU/mem fingerprints all go through `scripts/test/_portable.sh` (lsof + sysctl on macOS, ss + /proc on Linux).
+
+**macOS prerequisites:** GNU bash 5+ (`brew install bash` — stock /bin/bash 3.2 doesn't support `mapfile`/`declare -A`), kerl-installed Erlang, vcpkg with `VCPKG_ROOT` set, OrbStack or Docker Desktop installed (and launched once so its CLI symlinks populate `~/.orbstack/bin`).
+
+**What skips on macOS without a running Docker daemon:**
+- Phase 1 docker-image-build → SKIP (operator can build locally only what they need)
+- Phase 2 upgrade-test → SKIP via `test-upgrade-stack.sh`'s `docker_available` early-out, gate row records SKIP with operator-readable note
+- Phase 6 sanitizers → still dispatches to the `yuzu-wsl2-linux` self-hosted runner, unaffected by local Docker availability
+
+Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer, Phase 7a perf, Phase 7b coverage, Phase 8 teardown) runs natively on macOS.
 
 ## Workflow summary
 
@@ -38,17 +68,17 @@ Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent — STAYS UP
                                  stack before /release)
 Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
                                  e2e-api / e2e-mcp / e2e-security /
-                                 synthetic UAT / puppeteer)
+                                 synthetic UAT / puppeteer / instructions)
 Phase 6 — Sanitizers            (--full only — dispatched to yuzu-wsl2-linux runner)
 Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
 Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir,
                                  finalises run row; LEAVES THE UAT ALIVE on
-                                 purpose — do NOT call linux-start-UAT.sh stop)
+                                 purpose — do NOT call start-UAT.sh stop)
 ```
 
 **Wall-clock order: 0, 1, 2, 3, 7a-perf, 4, 5, 6, 7b-coverage, 8.** Perf is intentionally pulled forward of Phase 4 because it has no functional dependency on the UAT stack (every upstream RPC is meck'd inside the suite, gateway components run in-process) but its measurements are extremely sensitive to CPU/scheduler contention. Running perf on a quiet box — after Phase 1 binaries exist but before Phase 2's docker compose, Phase 4's native server+gateway+agent, and Phase 5's parallel fan-out — gives the most-isolated environment available in the pipeline. DB phase numbers stay stable (`phase=7` for both perf and coverage) so the report table groups them together at the end; the wall-clock split is purely an isolation guarantee.
 
-**Phase 8 leaves the UAT alive.** `scripts/test/teardown.sh` only stops Docker compose projects matching `yuzu-test-${RUN_ID}-*` (Phase 2 fixtures); it does not touch the native processes started by `linux-start-UAT.sh`. This is deliberate: a successful `/test --full` run leaves a working UAT at the tested HEAD so humans can sanity-check it before cutting `/release`. Do **not** add `bash scripts/linux-start-UAT.sh stop` to your orchestration — if the operator wants the stack down they can run it themselves.
+**Phase 8 leaves the UAT alive.** `scripts/test/teardown.sh` only stops Docker compose projects matching `yuzu-test-${RUN_ID}-*` (Phase 2 fixtures); it does not touch the native processes started by `start-UAT.sh`. This is deliberate: a successful `/test --full` run leaves a working UAT at the tested HEAD so humans can sanity-check it before cutting `/release`. Do **not** add `bash scripts/start-UAT.sh stop` to your orchestration — if the operator wants the stack down they can run it themselves.
 
 Phase 1 is the only mandatory-blocking phase — if HEAD doesn't compile, nothing else can run. Every other phase runs to completion regardless of upstream failures so the operator gets a prioritized fix list in one pass.
 
@@ -70,6 +100,14 @@ mkdir -p "$TEST_DIR" "$LOG_DIR"
 
 # Pick mode from operator args (default if no flag)
 MODE="${YUZU_TEST_MODE:-default}"  # quick / default / full
+
+# Cross-platform: BUILDDIR resolves to build-linux on Linux, build-macos
+# on macOS. All subsequent meson invocations use $BUILDDIR rather than a
+# hardcoded path. The helper file also exposes port_listening,
+# disk_free_gb, host_os, docker_available, ensure_docker_path.
+# shellcheck source=scripts/test/_portable.sh
+. scripts/test/_portable.sh
+BUILDDIR=$(build_dir)
 
 bash scripts/test/test-db-write.sh run-start \
     --run-id "$RUN_ID" \
@@ -106,7 +144,7 @@ bash scripts/test/test-db-write.sh gate \
 ## Phase 1 — Build HEAD
 
 Three sub-gates that can run in parallel via `&` + `wait`. Use the
-unconditional `meson compile -C build-linux` form rather than naming
+unconditional `meson compile -C "$BUILDDIR"` form rather than naming
 specific targets — the explicit-target form requires those targets to
 exist (`yuzu_server_tests` only exists when `-Dbuild_tests=true`) and
 the bare-name resolution can collide with sibling targets if multiple
@@ -117,7 +155,7 @@ subprojects define the same name.
 (
     set -e
     BUILD_START=$(date +%s)
-    if meson compile -C build-linux > "$LOG_DIR/build-cpp.log" 2>&1; then
+    if meson compile -C "$BUILDDIR" > "$LOG_DIR/build-cpp.log" 2>&1; then
         STATUS=PASS
     else
         STATUS=FAIL
@@ -133,7 +171,7 @@ subprojects define the same name.
 # Build Erlang gateway. Don't swallow ensure-erlang.sh errors — if Erlang
 # is missing, we want the rebar3 invocation to surface the real diagnosis.
 # `as prod release` (not just `compile`) is required so Phase 4's
-# linux-start-UAT.sh can launch the gateway from gateway/_build/prod/rel/.
+# start-UAT.sh can launch the gateway from gateway/_build/prod/rel/.
 (
     set -e
     BUILD_START=$(date +%s)
@@ -155,25 +193,36 @@ subprojects define the same name.
 # Build local docker images for the upgrade test target (skip in --quick).
 # Tag with the ghcr.io prefix directly so the upgrade-test compose file
 # picks it up without a separate `docker tag` step in Phase 2.
+# Cross-platform: SKIP gracefully if docker is unavailable (macOS dev box
+# without OrbStack/Docker Desktop running). Linux CI always has docker.
 if [[ "$MODE" != "quick" ]]; then
     (
         set -e
         BUILD_START=$(date +%s)
-        if docker build \
+        if ! docker_available; then
+            bash scripts/test/test-db-write.sh gate \
+                --run-id "$RUN_ID" --phase 1 --gate "Build (HEAD docker images)" \
+                --status SKIP --duration 0 \
+                --notes "docker not available — install/start OrbStack or Docker Desktop"
+        elif docker build \
             -t "ghcr.io/tr3kkr/yuzu-server:0.10.1-test-${RUN_ID}" \
             --label "yuzu.commit=$(git rev-parse HEAD)" \
             -f deploy/docker/Dockerfile.server . \
             > "$LOG_DIR/build-images.log" 2>&1; then
             STATUS=PASS
+            DUR=$(( $(date +%s) - BUILD_START ))
+            bash scripts/test/test-db-write.sh gate \
+                --run-id "$RUN_ID" --phase 1 --gate "Build (HEAD docker images)" \
+                --status "$STATUS" --duration "$DUR" --log "build-images.log"
+            bash scripts/test/test-db-write.sh timing \
+                --run-id "$RUN_ID" --gate phase1 --step docker-build --ms $((DUR * 1000))
         else
             STATUS=FAIL
+            DUR=$(( $(date +%s) - BUILD_START ))
+            bash scripts/test/test-db-write.sh gate \
+                --run-id "$RUN_ID" --phase 1 --gate "Build (HEAD docker images)" \
+                --status "$STATUS" --duration "$DUR" --log "build-images.log"
         fi
-        DUR=$(( $(date +%s) - BUILD_START ))
-        bash scripts/test/test-db-write.sh gate \
-            --run-id "$RUN_ID" --phase 1 --gate "Build (HEAD docker images)" \
-            --status "$STATUS" --duration "$DUR" --log "build-images.log"
-        bash scripts/test/test-db-write.sh timing \
-            --run-id "$RUN_ID" --gate phase1 --step docker-build --ms $((DUR * 1000))
     ) &
 fi
 
@@ -271,11 +320,11 @@ fi
 
 ## Phase 4 — Fresh Stack Stand-up
 
-Skipped in `--quick`. Default and `--full` use the existing `linux-start-UAT.sh` to bring up server+gateway+agent natively (faster than docker for Phase 5 e2e gates that hit the live stack):
+Skipped in `--quick`. Default and `--full` use the existing `start-UAT.sh` to bring up server+gateway+agent natively (faster than docker for Phase 5 e2e gates that hit the live stack):
 
 ```bash
 PHASE4_START=$(date +%s)
-if bash scripts/linux-start-UAT.sh > "$LOG_DIR/fresh-stack.log" 2>&1; then
+if bash scripts/start-UAT.sh > "$LOG_DIR/fresh-stack.log" 2>&1; then
     STATUS=PASS
 else
     STATUS=FAIL
@@ -286,7 +335,7 @@ bash scripts/test/test-db-write.sh gate \
     --status "$STATUS" --duration "$DUR" --log "fresh-stack.log"
 ```
 
-**`linux-start-UAT.sh` correctly returns non-zero on any connectivity test failure** (this is the post-PR1 behavior — earlier versions exited 0 unconditionally, see CHANGELOG `[Unreleased]`). The Phase 4 gate's PASS/FAIL accurately reflects whether the 6 inline connectivity tests passed against the fresh stack. The Phase 5 Synthetic UAT gate runs again standalone with sub-step timing capture into the test-runs DB — both gates are intentional, not a duplicate.
+**`start-UAT.sh` correctly returns non-zero on any connectivity test failure** (this is the post-PR1 behavior — earlier versions exited 0 unconditionally, see CHANGELOG `[Unreleased]`). The Phase 4 gate's PASS/FAIL accurately reflects whether the 6 inline connectivity tests passed against the fresh stack. The Phase 5 Synthetic UAT gate runs again standalone with sub-step timing capture into the test-runs DB — both gates are intentional, not a duplicate.
 
 ## Phase 5 — Test Gates (parallel)
 
@@ -351,7 +400,7 @@ The default-mode Phase 5 fan-out:
 
 ```bash
 gate_run "C++ unit (Catch2)" "unit-cpp.log" \
-    "meson test -C build-linux --suite agent --suite server --suite tar --suite proto --suite docs --print-errorlogs"
+    "meson test -C \"$BUILDDIR\" --suite agent --suite server --suite tar --suite proto --suite docs --print-errorlogs"
 
 gate_run "EUnit" "eunit.log" \
     "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; REBAR_BASE_DIR=\$PWD/_build_eunit rebar3 eunit --dir apps/yuzu_gw/test"
@@ -366,9 +415,9 @@ gate_run "CT suites" "ct.log" \
 # (separate dir from the regular test/ tree so CI's `rebar3 ct --dir
 # apps/yuzu_gw/test` discovery does NOT pick it up). Requires:
 #   1. A live yuzu-server reachable on 127.0.0.1:50055 (Phase 4 brings
-#      this up via linux-start-UAT.sh).
+#      this up via start-UAT.sh).
 #   2. YUZU_GW_TEST_TOKEN env var set to a valid enrollment token, OR
-#      linux-start-UAT.sh must have just run (its scratch dir is
+#      start-UAT.sh must have just run (its scratch dir is
 #      probed for the token).
 # Failing either prerequisite, the suite reports {test_case_failed,
 # "No enrollment token: …"} per-case rather than a useful skip — file
@@ -388,7 +437,7 @@ gate_run "MCP E2E" "e2e-mcp.log" \
 gate_run "Security E2E" "e2e-security.log" \
     "bash scripts/e2e-security-test.sh"
 
-# Synthetic UAT — Phase 4's linux-start-UAT.sh already ran its own 6
+# Synthetic UAT — Phase 4's start-UAT.sh already ran its own 6
 # tests; this gate runs them again standalone with timing capture into
 # the test-runs DB. Skip if Phase 4 was the source.
 gate_run "Synthetic UAT" "synthetic-uat.log" \
@@ -413,10 +462,96 @@ gate_run "Synthetic UAT" "synthetic-uat.log" \
         --status "$STATUS" --duration "$DUR" --log "puppeteer.log"
 ) &
 
+# Instructions content-suite gate — schema-driven REST exerciser.
+# Drives every safe + mutating InstructionDefinition (184 of 217) and
+# records per-instruction pass/fail/timing into the test-runs DB.
+# Destructive (25), interactive (5), and network-disrupting (3) classes
+# are opt-in via --risks; default-mode invocation excludes them.
+gate_run "Instructions" "instructions.log" \
+    "bash scripts/test/instructions-tests.sh \
+        --dashboard http://localhost:8080 \
+        --user admin --password 'YuzuUatAdmin1!' \
+        --run-id $RUN_ID --gate-name phase5-instructions \
+        --output $LOG_DIR/instructions-outcomes.json"
+
 wait
 ```
 
 `--quick` runs only the unit / EUnit / dialyzer subset (NO synthetic UAT — quick mode skips Phase 4 and has no live stack). `--full` adds the optional MCP agent gate (invokes `mcp-uat-tester` via the Agent tool against the live stack).
+
+### `--instructions` mode (content-suite standalone)
+
+When the operator runs `/test --instructions`, the orchestration is **truncated**: Phase 0 preflight, Phase 4 stack stand-up, then the Instructions gate from Phase 5, then Phase 8 teardown. No build, no upgrade test, no other Phase 5 gates, no sanitizers, no coverage. Use when:
+
+- A YAML under `content/definitions/` changed (added/edited/removed an InstructionDefinition).
+- The instruction-engine dispatch path (`workflow_routes.cpp` `POST /api/instructions/:id/execute`, `agent_service_impl.cpp` `cmd_execution_ids_`, response store) was touched.
+- Investigating a content regression flagged by the trend tooling.
+
+Wall clock is dominated by Phase 4 (~60-90s) and the gate itself (5-15 min for 184 instructions at parallelism=4). The gate writes per-instruction timings to `test_timings` so `bash scripts/test/test-db-query.sh --trend timing=phase5-instructions.<id>` shows latency drift over time.
+
+```bash
+# In --instructions mode:
+if [[ "$MODE" == "instructions" ]]; then
+    # Run only Phase 0, 4, the Instructions gate, and Phase 8.
+    # Build is not gated — operator should already have $BUILDDIR populated;
+    # if not, the start-UAT.sh in Phase 4 will surface the missing binary.
+    bash scripts/test/instructions-tests.sh \
+        --dashboard http://localhost:8080 \
+        --user admin --password 'YuzuUatAdmin1!' \
+        --run-id "$RUN_ID" --gate-name instructions \
+        --output "$LOG_DIR/instructions-outcomes.json"
+    # then jump straight to Phase 8 teardown
+fi
+```
+
+The gate's exit code is the run's overall_status: 0 → PASS, 1 → FAIL (one or more instruction fail/error), 2 → ABORTED (login or content-dir error).
+
+### `--instructions-quarantine` mode (the self-disconnect ceremony)
+
+> **DO NOT RUN ON A REMOTE / SSH-ONLY HOST.** The ceremony briefly cuts ALL external network. If your only access path to the box is SSH-over-the-network, you will lock yourself out until the un-quarantine fires (~25-30s) — and if the un-quarantine fails, you stay locked out until you physically reach the box. Run only on your local dev box (the one with a keyboard and a screen).
+>
+> Additional preconditions:
+> - The agent account must have the privileges declared in `docs/agent-privilege-model.md`. Run `sudo bash scripts/install-agent-user.sh` (Linux/macOS) or `powershell -ExecutionPolicy Bypass scripts/install-agent-user.ps1` from an elevated PowerShell (Windows) once per box before the first ceremony run; the install script is idempotent. Verify with `--check` / `-Check`.
+> - If the agent is running as an account WITHOUT the `pfctl` / `iptables` / `netsh` grants, the survivor will dispatch isolate but the firewall won't actually close — the survivor catches that in `confirm-blackout`, dispatches emergency release, and exits FAIL/1 without locking the box. That's the *safe* failure mode; it tells you the install script hasn't been run on this host.
+
+This mode exercises the four-instruction quarantine cluster (`security.quarantine.{isolate,release,status,whitelist}`) including the part the schema-driven runner can't: **the actual network blackout**. Because the blackout cuts Claude Code's path to api.anthropic.com, the ceremony is driven by a detached survivor (`scripts/test/instructions_quarantine_survivor.py`) that:
+
+1. Probes preconditions (UAT reachable, plugin loaded, external connectivity present, Yuzu localhost reachable).
+2. Dispatches `security.quarantine.isolate` with `server_ip=127.0.0.1` and `whitelist_ips=127.0.0.1`. The plugin auto-whitelists loopback on every platform, so localhost endpoints stay reachable.
+3. After a 5s grace, probes external destinations (1.1.1.1, 8.8.8.8, github.com, api.anthropic.com on :443) — they MUST be unreachable. Probes Yuzu localhost (8080, 50051, 8081) — they MUST be reachable.
+4. Sleeps 10s, re-probes external to confirm sustained blackout.
+5. Dispatches `security.quarantine.release`. Probes external to confirm recovery.
+6. Writes `results.json` to the state dir.
+7. (If `--launch-resume`) Tries to spawn a new Terminal with `claude --resume <session-id>` via `osascript` (macOS) or `tmux` (other platforms). Always falls back to writing `<state-dir>/relaunch.sh` for manual use.
+
+**Operator workflow inside Claude Code**:
+
+```bash
+bash scripts/test/instructions-quarantine.sh \
+    --dashboard http://localhost:8080 \
+    --user admin --password 'YuzuUatAdmin1!' \
+    --launch-resume      # macOS only — opens a new Terminal window
+```
+
+This script captures the current Claude session UUID from `~/.claude/projects/-Users-nathan-Yuzu/<uuid>.jsonl` (most recent), backgrounds the survivor via `setsid nohup`, prints PID + state-dir + instructions, and exits 0 immediately. The survivor runs ~30-40s asynchronously.
+
+**During the blackout**, this Claude Code session may lose its connection to api.anthropic.com. The user has three options:
+- Type `/exit` and let the survivor's auto-resume open a new Terminal
+- Wait for the connection to recover (it usually does after un-quarantine)
+- Manually run `bash /tmp/yuzu-quarantine-test/relaunch.sh` after the survivor finishes
+
+**On resume, read the results**:
+```bash
+cat /tmp/yuzu-quarantine-test/results.json
+```
+
+The results document each phase, every probe (with TCP latency), the agent's responses to isolate/release, and any operator-actionable note. Exit codes:
+- 0 — full ceremony passed: blackout sustained, recovery confirmed
+- 1 — blackout incomplete or recovery probe failed (firewall partially or fully not actually closed; OR external reachable mid-blackout)
+- 2 — precondition fail (login, plugin not loaded, no external connectivity at start) — no firewall change happened
+- 3 — release dispatch failed: **operator must clear firewall manually** (`pfctl -F all` / `iptables -F` / `netsh advfirewall reset`). The note in `results.json` tells you which.
+
+**Probe-only mode** (`--probe-only`) runs only the precondition checks via the schema-driven runner — verifies the quarantine plugin is loaded without any firewall side effect. Use this first if you've never run the ceremony on this box.
 
 ## Phase 6 — Sanitizers (PR2)
 
@@ -443,7 +578,7 @@ The gate script:
 
 ## Phase 7b — Coverage (PR2)
 
-Coverage runs locally on the operator's dev box, at the end of the pipeline (after Phase 5 gates and Phase 6 sanitizer dispatch). It uses `build-linux-coverage/` (separate from the main `build-linux/` to keep ccache hit rates intact). Coverage is contention-tolerant — it's measuring code-execution coverage, not throughput, so the live UAT stack from Phase 4 doesn't affect the numbers. The earlier perf step (Phase 7a) already ran on a quiet box.
+Coverage runs locally on the operator's dev box, at the end of the pipeline (after Phase 5 gates and Phase 6 sanitizer dispatch). It uses `${BUILDDIR}-coverage/` (separate from the main `${BUILDDIR}/` to keep ccache hit rates intact). Coverage is contention-tolerant — it's measuring code-execution coverage, not throughput, so the live UAT stack from Phase 4 doesn't affect the numbers. The earlier perf step (Phase 7a) already ran on a quiet box.
 
 ```bash
 if [[ "$MODE" == "full" ]]; then
@@ -465,7 +600,7 @@ fi
 
 **Coverage baseline update workflow.**
 1. Make a change you believe deserves a new coverage baseline (coverage up, or an accepted trade-off).
-2. **Pre-flight**: a clean `meson test -C build-linux-coverage` must pass — the gate refuses `--capture-baselines` with `FAIL: refused --capture-baselines: meson test exit=N` if it doesn't (UP-18 guard protecting you from anchoring a broken-environment baseline).
+2. **Pre-flight**: a clean `meson test -C ${BUILDDIR}-coverage` must pass — the gate refuses `--capture-baselines` with `FAIL: refused --capture-baselines: meson test exit=N` if it doesn't (UP-18 guard protecting you from anchoring a broken-environment baseline).
 3. Run `bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines`. The script rewrites the JSON file with current numbers + `captured_at` + `captured_commit` and prints a diff of old-vs-new values before overwrite so you can sanity-check the direction.
 4. `git add tests/coverage-baseline.json` alongside your feature commit. `git blame` is the audit trail.
 5. Do NOT capture a baseline in the middle of an unrelated change — the commit SHA recorded in the baseline becomes the receipt for "this is the code that earned these numbers."
@@ -553,6 +688,8 @@ The skill is designed so a single gate failure does NOT short-circuit the run. G
 | `--quick` | 0, 1 (no images), 5-subset, 8 | 8-15 min | "About to commit, want a fast sanity check" |
 | default | 0, 1, 2, 4, 5, 8 | 25-45 min | "About to push to dev" |
 | `--full` | 0-8 (PR2/PR3 features lit) | 60-120 min | "About to tag a release" |
+| `--instructions` | 0, 4, 5-instructions, 8 | 8-20 min | "Content YAML changed / dispatch path edited" |
+| `--instructions-quarantine` | 0, 4, ceremony | 30-40s | "Quarantine plugin / firewall behaviour edited" |
 
 Default mode is the recommended pre-push gate. The upgrade test in Phase 2 catches the highest-stakes class of bugs (silent data loss on schema migration) which no other local gate finds.
 

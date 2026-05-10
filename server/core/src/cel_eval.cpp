@@ -669,7 +669,7 @@ CelValue fn_duration(const CelValue& arg) {
             if (pos == num_start) return std::monostate{};
 
             int64_t num = 0;
-            auto [p, ec] = std::from_chars(ds.data() + num_start, ds.data() + pos, num);
+            [[maybe_unused]] auto [p, ec] = std::from_chars(ds.data() + num_start, ds.data() + pos, num);
             if (ec != std::errc{}) return std::monostate{};
 
             // Parse unit

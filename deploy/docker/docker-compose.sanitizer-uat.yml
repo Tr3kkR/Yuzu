@@ -36,7 +36,8 @@ services:
       - "50055:50055"
     volumes:
       - ${UAT_CONFIG}:/var/lib/yuzu/yuzu-server.cfg:ro
-      - ${UAT_CONTENT:-../../content/definitions}:/usr/share/yuzu/definitions:ro
+      # InstructionDefinitions are embedded into yuzu-server at build time
+      # (server/core/scripts/embed_content.py); no host mount required.
       - sanitizer-logs:/var/log/yuzu
     restart: "no"
 

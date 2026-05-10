@@ -2,7 +2,7 @@
 # visualization-demo.sh — End-to-end demo of issue #253 chart rendering.
 #
 # Prereq: a running UAT stack (server + gateway + at least one agent).
-#   bash scripts/linux-start-UAT.sh
+#   bash scripts/start-UAT.sh
 #
 # What it does:
 #   1. Imports an InstructionDefinition with `spec.visualization` set.
@@ -27,7 +27,7 @@ BASE="${YUZU_BASE_URL:-http://localhost:8080}"
 
 if [[ ! -f "$UAT/cookies.txt" ]]; then
     echo "✗ No session cookies at $UAT/cookies.txt" >&2
-    echo "  Run: bash scripts/linux-start-UAT.sh" >&2
+    echo "  Run: bash scripts/start-UAT.sh" >&2
     exit 1
 fi
 

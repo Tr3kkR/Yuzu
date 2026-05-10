@@ -212,3 +212,222 @@ TEST_CASE("AuthRoutes::emit_event — analytics event records principal from "
     }
     CHECK(found);
 }
+
+// ---------------------------------------------------------------------------
+// require_admin scope-enforcement tests (#520)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_admin — service-scoped token from admin is rejected",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    // Mint a token scoped to "finance-svc"; creator is an admin.
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("scoped", "test_user",
+                                            now + 3600, "finance-svc", "");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_admin(req, res);
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("service-scoped tokens cannot perform admin operations") !=
+          std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_admin — MCP token from admin is rejected",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-tok", "test_user",
+                                            now + 3600, "", "readonly");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_admin(req, res);
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("MCP tokens cannot perform admin operations") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_admin — unscoped admin token is accepted (regression guard)",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto raw = fix.api_tokens->create_token("plain", "test_user");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_admin(req, res);
+    CHECK(ok);
+    CHECK(res.status != 403);
+}
+
+// ---------------------------------------------------------------------------
+// require_permission MCP-tier enforcement tests (#520)
+// The tier (readonly/operator/supervised) is the primary boundary; the creator's
+// actual role is the secondary RBAC boundary. RBAC-disabled deployments still work.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_permission — readonly MCP tier blocks Execute regardless of RBAC",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    // Fixture has rbac_store=nullptr (RBAC disabled). test_user is admin.
+    // Tier enforcement must fire regardless of RBAC state.
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-rp", "test_user",
+                                            now + 3600, "", "readonly");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "Execution", "Execute");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("MCP token tier does not allow Execution:Execute") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_permission — readonly MCP tier allows Read without RBAC",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    // readonly tier permits Read; creator is admin; RBAC disabled → should pass.
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-rp2", "test_user",
+                                            now + 3600, "", "readonly");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "Infrastructure", "Read");
+    CHECK(ok);
+}
+
+// ---------------------------------------------------------------------------
+// require_scoped_permission MCP-tier enforcement tests (#520)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_scoped_permission — operator MCP tier allows Execute without RBAC",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    // operator tier permits Execution:Execute; creator is admin; RBAC disabled → pass.
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-rsp", "test_user",
+                                            now + 3600, "", "operator");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_scoped_permission(req, res, "Execution", "Execute", "agent-1");
+    CHECK(ok);
+}
+
+TEST_CASE("AuthRoutes::require_scoped_permission — readonly MCP tier blocks Execute",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-rsp2", "test_user",
+                                            now + 3600, "", "readonly");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_scoped_permission(req, res, "Execution", "Execute", "agent-1");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("MCP token tier does not allow Execution:Execute") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// supervised-tier approval enforcement on REST transport (sec-H1 / CH-1)
+// MCP server returns kApprovalRequired for supervised+destructive ops because
+// Phase 2 re-dispatch is not built. The REST transport must mirror that — a
+// supervised MCP token must not bypass the approval gate by switching endpoints.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_permission — supervised MCP token blocked from approval-gated Execute",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-sup-rp", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    // tier_allows("supervised", Execution, Execute) → true
+    // requires_approval("supervised", Execution, Execute) → true
+    // → must be blocked at the auth layer (approval re-dispatch is Phase 2)
+    bool ok = fix.ar->require_permission(req, res, "Execution", "Execute");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
+    CHECK(res.body.find("not yet implemented") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_scoped_permission — supervised MCP token blocked from approval-gated Delete",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-sup-rsp", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_scoped_permission(req, res, "Tag", "Delete", "agent-1");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_permission — supervised MCP token allows Read (not approval-gated)",
+          "[auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-sup-read", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "Infrastructure", "Read");
+    CHECK(ok);
+}
+
+// ---------------------------------------------------------------------------
+// Bearer token length guard tests (#630 — Claude review F4/F6)
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_auth — oversized Bearer token is rejected (DoS protection #630)",
+          "[auth_routes][dos]") {
+    AuthRoutesFixture fix;
+    std::string big_token(1000, 'a');
+    auto req = request_with_header("Authorization", "Bearer " + big_token);
+    httplib::Response res;
+
+    auto session = fix.ar->require_auth(req, res);
+    CHECK_FALSE(session.has_value());
+    CHECK(res.status == 401); // Rejected before reaching ApiTokenStore
+}
+
+TEST_CASE("AuthRoutes::require_auth — oversized X-Yuzu-Token is rejected (DoS protection #630)",
+          "[auth_routes][dos]") {
+    AuthRoutesFixture fix;
+    std::string big_token(1000, 'b');
+    auto req = request_with_header("X-Yuzu-Token", big_token);
+    httplib::Response res;
+
+    auto session = fix.ar->require_auth(req, res);
+    CHECK_FALSE(session.has_value());
+    CHECK(res.status == 401);
+}

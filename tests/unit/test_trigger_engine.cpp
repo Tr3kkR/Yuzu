@@ -345,7 +345,7 @@ TEST_CASE("TriggerEngine: non-startup triggers do not fire on start()", "[trigge
 
     // Only the startup trigger should fire immediately
     CHECK(recorder.count() == 1);
-    auto& [plugin, action, params] = recorder.calls[0];
+    [[maybe_unused]] auto& [plugin, action, params] = recorder.calls[0];
     CHECK(plugin == "p2");
 
     engine.stop();
@@ -447,7 +447,7 @@ TEST_CASE("TriggerEngine: file change trigger fires on modification", "[trigger_
 
     CHECK(fired);
     if (recorder.count() >= 1) {
-        auto& [plugin, action, params] = recorder.calls[0];
+        [[maybe_unused]] auto& [plugin, action, params] = recorder.calls[0];
         CHECK(plugin == "config_watcher");
         CHECK(action == "reload");
     }
@@ -669,7 +669,7 @@ TEST_CASE("TriggerEngine: parameters are forwarded to dispatch", "[trigger_engin
     engine.start();
     REQUIRE(recorder.count() == 1);
 
-    auto& [plugin, action, params] = recorder.calls[0];
+    [[maybe_unused]] auto& [plugin, action, params] = recorder.calls[0];
     CHECK(params.size() == 3);
     CHECK(params.at("scope") == "full");
     CHECK(params.at("format") == "json");

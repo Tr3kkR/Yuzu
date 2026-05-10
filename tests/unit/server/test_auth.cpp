@@ -210,6 +210,26 @@ TEST_CASE("validate_session fails for garbage token", "[auth][session]") {
     REQUIRE_FALSE(mgr->validate_session("not-a-real-token").has_value());
 }
 
+TEST_CASE("validate_session rejects overly-long tokens (DoS protection #630)", "[auth][session]") {
+    auto mgr = make_temp_auth();
+    mgr->upsert_user("testuser", "secret123456", Role::admin); // min 12 chars
+    
+    // Get a valid token via normal auth flow
+    auto valid_token = mgr->authenticate("testuser", "secret123456");
+    REQUIRE(valid_token.has_value());
+    REQUIRE(valid_token->size() == 64); // Should be exactly 64 hex chars
+    
+    // 65 chars — should be rejected
+    std::string too_long_65 = *valid_token + "x";
+    REQUIRE_FALSE(mgr->validate_session(too_long_65).has_value());
+    
+    // 128 chars — should be rejected
+    REQUIRE_FALSE(mgr->validate_session(std::string(128, 'a')).has_value());
+    
+    // 1000 chars — should be rejected (DoS attempt)
+    REQUIRE_FALSE(mgr->validate_session(std::string(1000, 'b')).has_value());
+}
+
 // ── Enrollment Tokens ────────────────────────────────────────────────────────
 
 TEST_CASE("create and validate enrollment token", "[auth][enrollment]") {

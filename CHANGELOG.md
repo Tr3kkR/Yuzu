@@ -7,7 +7,885 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_(no changes since v0.12.0-rc0 — first commit on top of the rc starts a new section here)_
+### Fixed
+
+- **Executions drawer: dashboard "Fan-out" cell stuck at "0/0 of N".**
+  `ExecutionTracker::update_agent_status` wrote to `agent_exec_status`
+  and published `agent-transition` SSE events but never invoked
+  `refresh_counts` to recompute the parent `executions` row's
+  `agents_responded` / `agents_success` / `agents_failure`. The aggregates
+  stayed at 0 forever and the row never crossed to terminal status.
+  `update_agent_status` now chains `refresh_counts` at the end of every
+  call (UAT 2026-05-06).
+- **Executions drawer: per-agent + responses tables now live-populate
+  via SSE — no page reload.** AgentServiceImpl now calls
+  `ExecutionTracker::update_agent_status` from every response-receipt
+  site (`Subscribe` and `process_gateway_response`, both RUNNING and
+  terminal branches), so `agent_exec_status` populates as responses
+  arrive and the existing `agent-transition` SSE bus fires for every
+  state change. The drawer JS schedules a 500 ms-debounced
+  `htmx.ajax(GET /fragments/executions/<id>/detail)` re-fetch on each
+  event so the responses table picks up new rows without a manual
+  refresh (UAT 2026-05-06).
+- **Executions drawer: spurious "exit=1 then exit=0" pair removed.**
+  Every dispatched instruction previously produced two response rows
+  per agent — a RUNNING data row and an empty terminal sentinel.
+  Operators read the non-zero `status` enum value (1=SUCCESS,
+  2=FAILURE, …) on the sentinel as a failure exit code that "happened
+  before" the real result. New `ResponseStore::finalize_terminal_status`
+  updates existing RUNNING rows in place when the terminal frame
+  carries no output, scoped to `(instruction_id, agent_id,
+  execution_id, status=0)`. Tri-state `FinalizeResult`
+  (`Updated`/`NoRow`/`Error`) prevents SQLITE_BUSY from silently
+  re-creating the sentinel (UAT 2026-05-06 #11; governance UP-3 / CH-1).
+
+### Added
+
+- **Wall-clock `HH:MM:SS.mmm <TZ>` timestamps in the executions list
+  and drawer.** Right-hand instruction-line timestamp and per-agent
+  response arrival time now render in the operator's browser-local
+  timezone (e.g. `12:22:33.251 BST`) instead of a relative
+  "Ns ago" string. Server emits `data-epoch-ms` on the cells; new JS
+  helpers (`formatLocalTime` + `renderLocalTimes`) format on
+  `DOMContentLoaded` and `htmx:afterSwap`. Title attribute and cell
+  fallback retain the ISO-8601 UTC timestamp for hover correlation
+  and no-JS environments (UAT 2026-05-06 #9).
+- **Server-side response arrival timestamp at millisecond precision.**
+  New `responses.received_at_ms` column (response_store v3 migration,
+  with idempotent pre-stamp probe mirroring v2) records when the
+  server received each response frame. Coexists with the legacy
+  seconds-precision `timestamp` column. The drawer's per-agent
+  responses table gained a "Time" column that renders this value as
+  wall-clock (UAT 2026-05-06 #10).
+- **Live-drawer regression test.** New
+  `tests/puppeteer/executions-uat-2026-05-06.mjs` operator-runnable
+  test pins the four UAT contracts: dispatch toast, drawer
+  populates without reload, wall-clock timestamps, single response
+  row per agent.
+- **`/readyz` covers `execution_tracker`.** Added to the readiness
+  conjunction so a failed instructions-DB pool surfaces as HTTP 503
+  rather than a silent no-op on every response receipt
+  (governance UAT 2026-05-06 SRE-1).
+
+### Changed
+
+- **Build-time content embed locked down — single source of truth.**
+  Shipped `InstructionDefinition` YAMLs are embedded into
+  `yuzu-server` at build time via `embed_content.py`; the runtime
+  never reads them from disk. **PyYAML is now a hard build dependency**
+  — `meson setup` runs `python -c "import yaml"` and `error()`s if
+  the import fails. The script itself hard-errors on missing
+  PyYAML, missing `content/` directory, or zero parsed definitions
+  (the historical "warn and emit empty bundle" fallback is removed,
+  which silently produced binaries with empty Instructions tabs).
+  Provision PyYAML with `pip install pyyaml` (Linux/macOS) or
+  `pacman -S python-yaml` (MSYS2). CI workflows updated to install
+  PyYAML on every leg (release Linux + macOS, ci.yml macOS +
+  Windows, `Dockerfile.runner-linux` apt manifest).
+- **Executions drawer SSE event volume.** Each per-agent state
+  change now publishes 2 events (`agent-transition` then
+  `execution-progress`) and 3 on the all-agents-responded threshold
+  (additional `execution-completed`). Custom SSE consumers should
+  expect the higher cadence; the drawer's debounced refresh is the
+  default consumer experience.
+- **Shutdown ordering.** gRPC servers now shut down BEFORE
+  `execution_tracker_` is reset so in-flight `Subscribe` /
+  `process_gateway_response` handlers cannot dereference a freed
+  tracker pointer mid-call (governance UAT 2026-05-06 architect B-1).
+
+### Removed
+
+- **Install packages no longer ship `content/definitions/`.** The
+  Debian `.deb`, Docker images (`Dockerfile.server`,
+  `Dockerfile.server-local`), Docker compose UAT mounts, Windows
+  Inno Setup `[Files]` block, and three release-archive staging
+  blocks (Linux/Windows/macOS) used to copy YAMLs to filesystem
+  paths the binary ignored — operator-misleading dead code. The
+  paths varied between packages
+  (`/usr/share/yuzu/content/definitions/` on .deb,
+  `/usr/share/yuzu/definitions/` on Docker, `{app}\content\definitions\`
+  on Windows). Operator runbooks pointing at any of those paths for
+  edits are obsolete; use the dashboard / REST `PATCH
+  /api/v1/definitions/<id>` to override shipped definitions
+  (operator edits persist in `instructions.db`). Old YAMLs left
+  on disk from prior installs are harmless and untouched on
+  upgrade.
+- **`docs/operations/disaster-recovery.md`** content-definitions
+  backup row removed — it pointed at filesystem YAMLs that no longer
+  ship; operator-customised definitions are already covered by the
+  `instructions.db` row.
+
+### Added
+
+- **Cross-platform `/test` pipeline (Linux + macOS).** The `/test`
+  orchestration was Linux-only — preflight required `ss`, `df -BG`,
+  iproute2, `/var/lib/docker`; perf-gate read `/proc`; the UAT bring-up
+  was named `linux-start-UAT.sh`. macOS operators couldn't run `/test`
+  locally and had to push-and-watch CI for cross-platform validation.
+  - New `scripts/test/_portable.sh` exposes `host_os`, `build_dir`,
+    `port_listening`, `disk_free_gb`, `loadavg_1m`, `cpu_brand`,
+    `mem_total_gb`, `ensure_docker_path` (probes OrbStack + Docker
+    Desktop bundle paths on macOS), `docker_available`. Branches on
+    `uname -s`; Linux behavior unchanged byte-for-byte.
+  - New canonical `scripts/start-UAT.sh` replaces `linux-start-UAT.sh`
+    as the cross-platform UAT bring-up. Same topology, ports, and 6
+    connectivity tests; uses lsof + grep -oE/awk in place of -oP. The
+    historical `scripts/linux-start-UAT.sh` is now a 9-line back-compat
+    shim that execs `start-UAT.sh`.
+  - `preflight.sh`, `perf-{gate,sample,cron-runner}.sh`, `teardown.sh`,
+    `test-upgrade-stack.sh` patched to use the helpers and gracefully
+    handle `docker_available` returning false. Phase 1 docker-image-build
+    and Phase 2 upgrade-test record SKIP gate rows on macOS without
+    OrbStack/Docker Desktop running rather than failing the run.
+  - `disk_free_gb` rounds to nearest (rather than floor) so a box with
+    exactly 20G free does not trip the default 20G preflight threshold.
+  - `cpu_brand` Linux fallback explicitly handles empty stdout from
+    `grep | sed` (which previously silently returned "" on ARM kernels
+    that don't emit `model name`).
+  - Bash 4+ guards added to `perf-gate.sh`, `teardown.sh`,
+    `test-fixtures-verify.sh` for parity with `preflight.sh`.
+  - macOS prerequisites: `brew install bash` (stock /bin/bash 3.2 lacks
+    `mapfile` / `declare -A`), kerl-installed Erlang, OrbStack or
+    Docker Desktop. `.claude/skills/test/SKILL.md` adds a
+    "Cross-platform support" section; `CLAUDE.md` UAT block points at
+    `scripts/start-UAT.sh`.
+
+- **Phase 8.3 Response Offloading governance hardening — round 3.**
+  Fixes for Gate 6 BLOCKING (SRE) + cheap SHOULD findings.
+  - **HC-1 (SRE BLOCKING)** — `OffloadTargetStore` now appears in both
+    `/readyz` and `/healthz` conjunctions in `server.cpp`. A migration
+    failure on `offload_targets.db` would otherwise have left the
+    probes reporting "ready"/"healthy" while every
+    `/api/v1/offload-targets` endpoint and the `AgentService` fan-out
+    silently no-opped. Mirrors the same pattern Guardian's
+    `guaranteed_state_store` follows. The `/healthz` `stores` map gains
+    an `offload_target` row.
+  - **RESTART-1 (SRE SHOULD)** — `Server::stop()` now calls
+    `offload_target_store_->flush_all()` after the web server stops
+    accepting requests but before any further teardown. Drains pending
+    batched events on graceful shutdown so a SIGTERM does not silently
+    drop a partial buffer. Detached delivery threads spawned by
+    `flush_all` are not joined (matches the WebhookStore precedent),
+    but the buffer state is consistent and the SQLite handle is still
+    open at the moment of dispatch.
+  - **Round-3 re-review residual finding (MEDIUM)** — `create_target`
+    now rejects control bytes (`< 0x20`) in `name` and `url` as well
+    as `auth_credential`. The DELETE-audit detail change in F-3 below
+    embeds `name` and `url` verbatim into the audit row's `detail`
+    field as `name=<n> url=<u>`; a control byte (CR/LF/NUL) in either
+    would line-split the audit row and forge a downstream event in
+    any SIEM that parses log lines individually. New test cases
+    `[offload_store][security]` pin the guard for both fields including
+    the embedded-NUL edge case.
+  - **F-3 (compliance SHOULD, 1-line fix)** — `DELETE
+    /api/v1/offload-targets/{id}` now snapshots the target's `name` and
+    `url` BEFORE calling `delete_target` and embeds them in the audit
+    row's `detail` field as `name=<n> url=<u>`. Closes the brief
+    compromise-and-cleanup forensic gap where a delete audit row carried
+    only the numeric id, leaving the URL recoverable only via a chain
+    join to the create row.
+  - **Enterprise BLOCKING (doc)** — `docs/user-manual/rest-api.md`
+    Offload Targets section now carries:
+    - A "Known authentication limitations" callout explaining that
+      Splunk HEC's `Authorization: Splunk <token>` header is NOT the
+      same as `bearer`, AWS S3/EventBridge/Kinesis require Sigv4 (not
+      shipped), and Azure Monitor/Sentinel require AAD token flow.
+      Removes the misleading "S3-bucket-receiver" example and replaces
+      with realistic targets (Datadog Logs, Elastic ingest, in-house
+      aggregator).
+    - A "Validating a new target" note explaining that there is no
+      synthetic-test endpoint and the validation procedure is to set
+      `batch_size=1`, fire an instruction, and poll `/deliveries`.
+    - A bold "Cleartext HTTP warning" stating that `http://` URLs
+      transmit data in cleartext and are not suitable for production
+      deployments containing customer endpoint data (compliance F-5).
+    - An "Operator trust model" callout documenting that
+      `Infrastructure:Write` operators can register any URL with no
+      allowlist / egress controls — known limitation tracked as a
+      roadmap follow-up.
+  - **Known follow-ups (deferred — sibling-pattern issues, not new in
+    this PR):**
+    - **Retention sweep on `offload_deliveries` and `webhook_deliveries`
+      (CAP-1 SRE BLOCKING for production deployments).** Both tables
+      grow unboundedly; ~21 GB/day at 100 events/sec * 5 targets *
+      `batch_size=1`. Offload mirrors the existing webhook gap; fix
+      should land for both stores together. Until then, deployments
+      handling sustained traffic should monitor `db_dir` disk usage and
+      prune deliveries manually.
+    - **SSRF allowlist for outbound URLs (compliance F-2 / chaos
+      CH-2).** Both webhook and offload stores accept arbitrary
+      operator-supplied URLs including RFC1918 / loopback / link-local
+      / cloud-metadata endpoints. The trust model accepts this as
+      operator-tier-privileged today; multi-tenant deployments will
+      need a network-egress allowlist before production use.
+    - **Prometheus metrics on the fan-out path (perf-S10 / OBS-1).**
+      `yuzu_offload_*` counters/histograms for delivery success/failure,
+      buffer depth, semaphore wait. WebhookStore has the same gap;
+      file as a joint follow-up.
+    - **`spec.offload.targets` per-instruction filter at the
+      dispatcher (UP-14).** The DSL field is documented + parsed
+      verbatim; the dispatcher does not yet extract or honour it.
+      Doc-warned; runtime wiring is the follow-up.
+    - **Outbound TLS cert verification + proxy support (SEC-1, SEC-2).**
+      `httplib::Client` defaults; cert verification is on but custom
+      CA bundles are not surfaced; `HTTPS_PROXY` env vars are not
+      respected. Same shape as webhooks.
+
+  **Tests:** new `[rest][offload]` 404-on-missing-target case for
+  `/deliveries`. Total `[offload]` count: 17 cases (was 11) /
+  100+ assertions including hardening-pin tests for sec-H1, sec-M2,
+  sec-M5, sec-L6, qe-S3 (batch accumulator), qe-S6 (migration v1),
+  HP-2 (deliveries 404).
+
+- **Phase 8.3 Response Offloading governance hardening — round 2.**
+  Fixes for Gate 3 + Gate 4 findings.
+  - **HP-1 / UP-6** — `agent_service_impl.cpp` outer-guard regression at
+    all three fire-event sites: round-1 hoisted `wh_payload.dump()` into
+    a single `body` to avoid double-serialise (perf-S1), but accidentally
+    nested the offload `fire_event` inside the `webhook_store_` null
+    check. Result: a deployment without a webhook store would silently
+    skip offload dispatch even when the offload store was healthy. Fix
+    splits the guards: outer `if (webhook OR offload)` builds the body
+    once; each sink fires under its own independent guard. Both
+    happy-path and unhappy-path Gate 4 reviewers caught this
+    independently — exactly the Pattern C "fix commit ships a worse bug
+    than the one it closes" hazard the governance ladder exists for.
+  - **HP-2** — `GET /api/v1/offload-targets/{id}/deliveries` now returns
+    404 when the underlying target does not exist, matching the sibling
+    `GET /api/v1/offload-targets/{id}` semantics. Previously returned
+    `{"deliveries":[]}` + 200, which an operator polling for a deleted
+    target could mistake for "delivery channel quiet" rather than "this
+    target is gone." OpenAPI 404 description updated accordingly.
+  - **arch-S1 / agentic A2** — `openapi_spec()` in `rest_api_v1.cpp`
+    now enumerates the five `/offload-targets*` paths so an
+    OpenAPI-driven client (operator scripting, agentic workers, REST
+    SDK generators) can discover the surface. Per
+    `agentic-first-principle.md` §A2, mounting under `/api/v1/`
+    requires enumeration through the openapi.json discovery channel.
+  - **perf-S1** — `wh_payload.dump()` hoisted to a local `const auto
+    body` once per fire-event site (3 sites in `agent_service_impl.cpp`)
+    rather than dumping per `fire_event` call. Halves the per-response
+    JSON serialise cost on the response-receipt hot path. Subject to
+    the outer-guard fix above so the optimisation does not silence
+    either sink.
+  - **perf-S2** — `offload_targets` table now carries a partial index
+    `idx_offload_targets_enabled WHERE enabled = 1` baked into the v1
+    migration. `fire_event`'s SELECT scans only the index for enabled
+    rows; at N>~50 targets the partial form is materially faster than
+    a full table scan and stays index-resident.
+  - **cpp-S-1** — `~OffloadTargetStore` destructor trade-off documented
+    in the public header (the in-flight detached delivery / SQLite
+    handle close race), so callers know not to assume flush-on-destroy.
+    Mirrors the WebhookStore precedent.
+  - **qe-B1** — `OffloadHarness` in `test_rest_offload_targets.cpp`
+    refactored to use `yuzu::test::TempDbFile` RAII (member declaration
+    order: `db_file` before `store`) so a partially-constructed
+    fixture cleans up the on-disk SQLite + WAL/SHM siblings on any
+    exit path including failed `REQUIRE(store->is_open())`. Closes the
+    qe-B1 leak pattern flagged by quality-engineer in Gate 3.
+  - **qe-S2** — Three `[offload_store][filter]` tests dropped their
+    `sleep_for(150ms)` synchronisation barriers. The filter decision
+    (target_filter / event_types / enabled) runs synchronously inside
+    `fire_event` before any thread is spawned, so the absence-of-delivery
+    assertion is deterministic without sleep. Tightens runtime by ~450ms
+    and removes a CI-runner-pause flake hazard.
+  - **qe-S3** — New test pins `batch_size > 1` accumulator behaviour:
+    fire 2 events into a `batch_size=3` target, verify no dispatch yet,
+    call `flush_all()`, poll `get_deliveries` for up to 5s, assert the
+    single resulting delivery has `event_count == 2` and a body of
+    shape `{"events":[…]}`.
+  - **qe-S6** — New test pins migration v1 outcome: open a fresh
+    on-disk store, query `schema_meta WHERE store='offload_target_store'`,
+    assert `version == 1`. Establishes the migration self-test pattern
+    for future v2+ schema work.
+  - **arch-INFO / capability-map** — `docs/capability-map.md` flips
+    20.7 Response Offloading to ✓ T3, bumps Future progress 32→33,
+    Overall 168→169, and corrects the Domain 20 row from `7|6|0|1`
+    to `7|7|0|0` (the round-2 re-review caught a three-way disagreement
+    between header bar, TOTAL row, and per-domain row that was
+    previously inconsistent).
+  - **doc-S2 (round 2)** — `docs/yaml-dsl-spec.md` `spec.offload`
+    caveat rewritten to remove the inaccurate "parsed and persisted
+    (`offload_spec` column reserved for v5 migration)" claim. The
+    field is preserved verbatim in `yaml_source` only and is not
+    extracted, denormalised, or honoured by the dispatcher in this
+    revision.
+  - **doc-S3 (round 2)** — `spec.offload` now carries the same
+    dashboard-YAML-editor strip caveat that `spec.visualization` and
+    `spec.responseTemplates` carry, plus a stronger "no current
+    runtime effect" warning so an operator authoring the field is not
+    misled into expecting filtering behaviour.
+
+  **Tests (separate from prod for changelog tracking, per
+  `feedback_test_commits.md`):** new `[offload_store][batch]` batch
+  accumulator pinning; new `[offload_store][migration]` v1 schema_meta
+  verification; new `[rest][offload]` 404-on-missing-target deliveries
+  test; harness refactor to `TempDbFile` RAII; sleep removal from
+  three filter tests.
+
+- **Phase 8.3 Response Offloading governance hardening — round 1.**
+  Single-pass fixes for governance Gate 2 BLOCKING and SHOULD items on
+  the Phase 8.3 work below.
+  - **sec-H1** — `auth_credential` now rejected at create-time when it
+    contains any byte `< 0x20`. Closed an outbound-request-smuggling
+    vector where an `Infrastructure:Write` operator could plant a CRLF
+    in a Bearer token to inject a second header (`X-Evil: 1`,
+    `Transfer-Encoding: chunked`) on every outbound POST. Basic and
+    HMAC are CRLF-safe by construction (base64 / hex output) but the
+    guard fires for all auth types as defence-in-depth. Pinned by
+    `[offload_store][security]` test cases against `\r\n`, `\n`-only,
+    `\r`-only, embedded `NUL`, and CRLF in Basic/HMAC paths.
+  - **sec-M2** — Defence-in-depth scheme guard now re-checks `tgt.url`
+    at dispatch time. Create-time guard rejects non-`http(s)` URLs,
+    but a tampered row (manual SQLite write, future update path)
+    would otherwise be dispatched verbatim. Mismatch records an
+    `invalid_scheme` delivery row and refuses to construct the HTTP
+    client.
+  - **sec-M4** — Destructor no longer calls `flush_all()`. Pending
+    buffered events are dropped on shutdown rather than spawning
+    detached worker threads that capture `this` and reach back into
+    `mtx_` / `db_` after the destructor closes the database. Matches
+    the WebhookStore precedent (no flush in dtor); operators that need
+    at-least-once semantics should set `batch_size=1` (immediate
+    dispatch) or build a queue at the receiver.
+  - **sec-M5** — `std::stoll` on the `(\d+)` regex captures in the
+    REST routes now wrapped in a `parse_id_segment()` helper that
+    treats `out_of_range` (21+ digit ids) as 404 rather than letting
+    httplib turn the throw into a 500. New test pins `GET
+    /api/v1/offload-targets/999999999999999999999 → 404`.
+  - **sec-L6** — `?limit=` query param on `/deliveries` clamped to
+    `[1, 1000]` to prevent operator-self-DoS via a billion-row vector
+    allocation. New test pins the clamp.
+  - **sec-L7** — Semaphore acquire/release wrapped in an RAII
+    `SemaGuard` so a `std::bad_alloc` or other exception between
+    acquire and release no longer leaks a delivery slot for the
+    lifetime of the process.
+  - **sec-L8** — `DELETE /api/v1/offload-targets/{id}` 404 path now
+    emits an audit row with `result=denied`, `detail=not_found`. The
+    successful-delete-only emission was a SIEM signal gap — operators
+    fishing for valid offload-target ids leave no trace today.
+  - **sec-INFO9** — Secret-leak paranoia test extended to cover
+    `GET /api/v1/offload-targets/{id}` and
+    `GET /api/v1/offload-targets/{id}/deliveries` in addition to the
+    list endpoint, so a future field-rename leaking the credential
+    via either single-target read fails the test.
+
+  **Docs:**
+  - **doc-B1** — `docs/user-manual/audit-log.md` now lists
+    `offload_target.create` and `offload_target.delete` in the logged
+    actions table with full `target_type` / `target_id` / `detail` /
+    `result` contracts. Result-vocabulary paragraph extended to cite
+    Phase 8.3 explicitly.
+  - **doc-S2** — `docs/yaml-dsl-spec.md` `spec.offload` caveat
+    rewritten. The previous draft claimed the field was "parsed and
+    persisted (`offload_spec` column on `instruction_definitions`
+    reserved for v5 migration)"; no such column exists and no parser
+    extracts the field. Updated to state accurately that the field is
+    preserved verbatim in `yaml_source` only and currently has no
+    runtime effect.
+  - **doc-S3** — `spec.offload` now carries the same dashboard YAML
+    editor strip caveat that `spec.visualization` and
+    `spec.responseTemplates` carry, so an operator authoring the
+    field is not misled into expecting runtime fan-out filtering.
+  - **doc-S4** — `audit-log.md` Event Structure table's `result` field
+    description updated from "success or failure" to
+    "success, denied, or failure" with a pointer to the Result
+    vocabulary section, fixing a stale row that the round-1
+    response-templates work also missed.
+
+- **Phase 8.3 Response Offloading (#255).** Configurable external HTTP
+  endpoints — *offload targets* — that receive a copy of `agent.registered`
+  and `execution.completed` events as they fire. Built around a sibling
+  `OffloadTargetStore` (`offload_targets.db`, migration v1) wired into
+  `AgentServiceImpl` next to the existing webhook fan-out, so every event
+  that fires a webhook also fans out to every enabled target whose
+  `event_types` filter matches.
+  - **Typed auth** — `none`, `bearer`, `basic`, `hmac`. Bearer adds
+    `Authorization: Bearer <token>`; Basic adds
+    `Authorization: Basic <base64(user:pass)>`; HMAC adds
+    `X-Yuzu-Signature: sha256=<hex>` so receivers can share verification
+    code with webhooks. `auth_credential` is persisted but **never**
+    returned by any REST surface (`list()` / `get()` / `get_by_name()`
+    redact; the test harness includes a paranoia assertion that the secret
+    string never appears in any serialised list body).
+  - **Server-side batching** — `batch_size > 1` accumulates events into a
+    per-target buffer and flushes on threshold; flush body is JSON of
+    shape `{"events":[…]}` plus an `X-Yuzu-Event-Count` header. SIEM /
+    data-warehouse receivers that prefer fewer larger requests can set
+    `batch_size = 50–500`; real-time alerting stays on `1`. `flush_all()`
+    drains pending buffers on store destruction.
+  - **Per-instruction filter (DSL)** — `spec.offload.targets: [<name>, …]`
+    in `InstructionDefinition` YAML restricts fan-out to a named subset
+    of targets. The store honours an explicit `target_filter` argument
+    on `fire_event`; the dispatcher does NOT yet extract the filter from
+    the originating definition (tracked as a follow-up so the global
+    fan-out path lands clean first). Documented in
+    `docs/yaml-dsl-spec.md` § `spec.offload`.
+  - **REST** — `GET/POST/DELETE /api/v1/offload-targets`,
+    `GET /api/v1/offload-targets/{id}`,
+    `GET /api/v1/offload-targets/{id}/deliveries`. RBAC:
+    `Infrastructure:Read` for GETs, `Infrastructure:Write` for POST/DELETE.
+    Audit events: `offload_target.create` (success | denied),
+    `offload_target.delete`. Routes are exposed via both
+    `httplib::Server` (production) and `HttpRouteSink` (tests) overloads
+    so the suite dispatches in-process without an acceptor thread (#438).
+  - **URL scheme guard** — only `http://` and `https://` are accepted at
+    create time; `ftp://`, `javascript:`, empty URL all rejected with -1
+    return + warning log + 400 + denied audit. Matches the WebhookStore
+    L12 hardening.
+  - **UNIQUE name + batch_size validation** — duplicate target names and
+    `batch_size < 1` rejected at create time so the dashboard can rely
+    on names as stable references.
+  - **Files:** new `server/core/src/offload_target_store.{hpp,cpp}` and
+    `server/core/src/offload_routes.{hpp,cpp}`; `server/core/src/server.cpp`
+    opens `offload_targets.db`, wires the store into AgentServiceImpl,
+    and registers routes; `server/core/src/agent_service_impl.{hpp,cpp}`
+    fires `agent.registered` and `execution.completed` to the offload
+    store at the same three call sites as webhooks; `docs/roadmap.md`
+    8.3 marked done; `docs/yaml-dsl-spec.md` adds `spec.offload`;
+    `docs/user-manual/rest-api.md` adds the Offload Targets section
+    with auth-header reference and per-event header table.
+
+  **Tests (separate from prod for changelog tracking):** new
+  `tests/unit/server/test_offload_target_store.cpp` (16 cases / 68
+  assertions — store CRUD, URL scheme, UNIQUE name, batch_size
+  validation, secret redaction, base64 RFC 4648 vectors,
+  RFC 4231 HMAC-SHA256 case 2, target_filter exclusion,
+  event_types filter exclusion, disabled-target skip, auth-type
+  string roundtrip with unknown→`None` fallback) and
+  `tests/unit/server/test_rest_offload_targets.cpp` (11 cases — list
+  empty, create 201, secret-redaction-paranoia,
+  GET/:id 200+404, DELETE remove+audit, POST 400 missing fields,
+  POST 400 invalid JSON, POST 400 bad URL scheme + denied audit,
+  403 perm denied, 503 null store, deliveries empty list).
+
+- **Response Templates governance hardening — round 2.** Round-2
+  re-review of the round-1 hardening commit caught a BLOCKING and three
+  SHOULD regressions that round-1 introduced or left unaddressed:
+  - **B-2** — OpenAPI PUT `requestBody.schema` referenced `#/components/
+    schemas/ResponseTemplate` but the schema was never defined; spec
+    validators / SDK generators would fail. Added the `ResponseTemplate`
+    schema to `components.schemas` (with required field, sort/filter
+    sub-schemas, `default` flag) and switched the POST inline schema to
+    the same `$ref` for sibling parity with `ManagementGroup`/`Tag`/
+    `GuaranteedStateRule`.
+  - **S-7** — round-1 emitted `result="failure"` on every 4xx audit
+    branch, but `audit-log.md` is explicit that 4xx is `denied` and only
+    internal 5xx is `failure`. Switched the 16 4xx audit emissions to
+    `denied`; the 3 persist-failure 500 emissions remain `failure` per
+    the documented vocabulary. `audit-log.md` table extended with the
+    explicit branch→result mapping for each new action.
+  - **S-8** — `rest-api.md` POST/PUT/DELETE error tables did not list
+    the new 413 (body cap) or 500 (persist failure) status codes.
+    Added explicit Errors tables on every verb and a bold callout that
+    the 64 KiB cap fires before parsing.
+  - **S-9** — `kRtMaxBodyBytes` is now annotated as scoped specifically
+    to the response-templates routes, with a comment pointing to the
+    follow-up hardening pass that would lift the convention to other
+    POST/PUT mutations (Guardian rules, management-group create, tag
+    PUT, token POST).
+  - **I-2** — `capability-map.md` headline figure updated from
+    `166/225 (74%)` to `168/225 (75%)`, matching the per-phase table
+    that round-1 already updated.
+
+- **Response Templates governance hardening round.** Single-pass fixes for
+  governance Gates 2–6 BLOCKING and critical-SHOULD items on the Phase 8.2
+  Response Templates work below.
+
+  **Code BLOCKING:**
+  - **UP-4 / sec-M3** — InstructionStore probe-and-stamp guard now checks
+    every `sqlite3_prepare_v2` and `sqlite3_step` return; failure
+    fails-closed (closes the DB) instead of silently falling through to
+    the migration ledger and tripping the `ALTER TABLE … ADD COLUMN`
+    duplicate-column error that would wedge boot with no diagnostic.
+  - **UP-8 / sec-M2 + sec-M4** — POST/PUT bodies on
+    `/api/v1/definitions/{id}/response-templates[/{tid}]` are now capped
+    at 64 KiB (returns 413). The YAML-import path's string-form re-parse
+    of `responseTemplates` is capped at 256 KiB and a malformed string
+    is dropped with a logged warning rather than passed through verbatim.
+    Closes the operator-tier JSON-bomb DoS that crashed the
+    single-process server via nlohmann's recursive-descent stack
+    overflow.
+  - **B-1 / arch-B1** — OpenAPI spec now lists the 5 new response-template
+    routes (List/Get/Create/Update/Delete). Closes the `agentic-first`
+    A2 (discovery) violation.
+  - **S-4 / sec-L3 / dsl-S2** — `import_definition_json` now silently
+    drops any `responseTemplates` element with `id == "__default__"`,
+    closing the stuck-state bug where an imported pack could inject a
+    reserved-id row that REST PUT/DELETE refused to remove.
+
+  **Code critical-SHOULD bundled in:**
+  - **sec-M1 / S-1** — failure-path audit emissions added to all three
+    response-template mutations (`response_template.{create,update,
+    delete}`) with `reason=<r>` codes
+    (`malformed_definition_id`, `body_too_large`, `invalid_json`,
+    `definition_not_found`, `template_not_found`, `validation_failed`,
+    `reserved_id`, `persist_failure`, `malformed_id`). Sibling parity
+    with `execution.visualization.fetch`.
+  - **F-3** — dashboard `/fragments/results` now treats the standalone
+    `?dir=` query param as evidence of operator sort intent
+    (`sort_explicit = req.has_param("sort") || req.has_param("dir")`),
+    so a URL with `dir=desc` and `template_id=X` no longer silently
+    overrides the operator's chosen direction.
+  - **OBS-3** — 500 (persist failure) branches now log at ERROR with
+    `def_id`, `tid`, and the underlying error string before returning
+    a generic `"persist failure"` envelope (no SQLite error text leaked
+    to clients).
+
+  **Docs BLOCKING:**
+  - **doc-B1** — `docs/user-manual/audit-log.md` table extended with
+    the three `response_template.*` actions and their failure-reason
+    vocabulary.
+  - **doc-B2** — `docs/capability-map.md` § 20.6 and § 28.2 flipped from
+    `:x:` to `:white_check_mark:`; phase totals updated (20: +1 done,
+    -1 open; 28: +1 done, -1 open; grand total 167→168 done, 55→54
+    open).
+  - **doc-B3** — `docs/user-manual/rest-api.md` Table of Contents now
+    lists "Response Templates" under Definitions.
+  - **doc-B4** — `docs/user-manual/server-admin.md` Upgrade Notes
+    section gains a vNEXT entry for migration v3 covering the
+    pre-upgrade snapshot command, the post-upgrade `schema_meta`
+    validation query, and the manual recovery path for the
+    probe-and-stamp boot-wedge case.
+
+- **Response Templates (Phase 8.2, issue #254).** Named response-view
+  configurations attached to an `InstructionDefinition` — column subset,
+  sort order, and filter presets the dashboard's filter-bar **View**
+  dropdown surfaces. Storage is a new `response_templates_spec` JSON
+  column on `instruction_definitions` (migration v3 with the same
+  probe-and-stamp guard used for v2). Every definition gets a synthesised
+  `__default__` template derived from `spec.result.columns` (preferred)
+  or the plugin's column schema, so the dropdown is never empty even
+  before an operator authors anything.
+
+  REST CRUD at
+  `/api/v1/definitions/{id}/response-templates[/{template_id}]` (List/Get
+  on `InstructionDefinition:Read`; POST/PUT/DELETE on
+  `InstructionDefinition:Write`). Reserved id `__default__` cannot be
+  authored, replaced, or deleted. Filter ops accepted: `equals`,
+  `not_equals`, `contains`, `starts_with`, `ends_with`. The dashboard
+  auto-applies `equals`-op filters to the URL filter map; other ops
+  are honoured by REST consumers but not auto-applied client-side in
+  this revision (planned to follow when `FacetFilter` grows an op field).
+
+  YAML authoring is `spec.responseTemplates: [{...}]`. Same caveat as
+  `spec.visualization`: the dashboard YAML editor's lightweight
+  line-scanner does not extract the templates spec into the indexed
+  column — author through `POST /api/v1/definitions/import` or the
+  REST template endpoints. Audit events: `response_template.create`,
+  `response_template.update`, `response_template.delete`. Files:
+  `server/core/src/response_templates_engine.{hpp,cpp}` (new),
+  `server/core/src/instruction_store.{hpp,cpp}` (column + migration v3),
+  `server/core/src/rest_api_v1.cpp` (5 routes),
+  `server/core/src/dashboard_routes.{hpp,cpp}` (selector + visibility +
+  template-driven sort/filter defaults), `docs/yaml-dsl-spec.md` §
+  `spec.responseTemplates`, `docs/user-manual/instructions.md` §
+  Response Templates, `docs/user-manual/rest-api.md` § Response
+  Templates.
+
+- **CodeQL SARIF post-processing filter** at `scripts/ci/filter-codeql-sarif.sh`
+  wedged between `analyze` and `upload-sarif` in `codeql.yml`. CodeQL's
+  `paths` / `paths-ignore` config keys do not reliably suppress C/C++
+  alerts whose location is a transitively-included header (the C++
+  extractor follows every `#include`; vendored `vcpkg_installed/` and
+  generated `build-*/` headers end up in the database; structural rules
+  fire on their AST). The filter drops non-security findings in those
+  paths but **preserves security-severity findings everywhere**,
+  including in vendored code — a vendor vulnerability that ships in our
+  binary is real customer exposure regardless of who wrote the bug.
+  Companion gist documents the upstream limitation:
+  https://gist.github.com/Tr3kkR/73fbe826634f97e97ebb138f4c6b98d8 .
+  Without this, every CodeQL run re-creates ~2154 noise alerts on
+  vendored/generated paths.
+- **CodeQL coverage fix — force compile in tracer step** (`CCACHE_RECACHE=true`
+  on `meson compile -C build-linux-codeql`). The tracer cannot observe
+  compile invocations that ccache short-circuits; with persistent ccache
+  on the self-hosted runner this had been silently dropping 98% of TUs
+  from the database since the runner was adopted, masking both standard
+  and custom-rule findings. Cost: cold-compile budget (~15-25 min Linux
+  vs ~3 min cached) — justified, since CodeQL coverage was the entire
+  point.
+- **Custom CodeQL query pack at `.github/codeql/queries/`** — Yuzu-specific
+  queries that the standard `security-and-quality` suite cannot encode
+  because the rules depend on per-project directory scope and the plugin
+  threat model (#371). First pass ships two queries:
+  `cpp/yuzu/plugin-command-exec-non-literal` (POSIX `system`/`popen`/`exec*`
+  in `agents/plugins/<name>/src/*` with a non-literal command argument)
+  and `cpp/yuzu/plugin-windows-process-spawn-non-literal` (the Windows
+  `CreateProcess*`/`ShellExecute*`/`WinExec` equivalent). The pattern
+  matches the four CRITICAL command-injection findings in waves 1-4 — a
+  custom query against the Yuzu CodeQL database would have caught all
+  four before they shipped. Wired into `codeql.yml` via
+  `queries: +security-and-quality,+./.github/codeql/queries`. The
+  remaining catalog from #371 (RBAC, audit-field, plugin-export, header-
+  bundle queries) is deferred to better-fit tooling — see #371's close-
+  out comment for the rationale.
+- **`/api/health` alias** of the existing `/health` endpoint (#620).
+  Both URLs now serve the same JSON body and both bypass authentication so
+  monitoring integrations that prefix every REST call with `/api/` keep
+  working. Both are also exempt from API rate limiting (so a NAT'd or
+  shared-bucket monitoring host can't 429-starve the probe), matching the
+  treatment `/livez` and `/readyz` already get. Restores the path that
+  operators had been pointing monitors at before the #401 fix moved the
+  canonical health endpoint to `/health`.
+
+  **Body shape now varies by auth.** Unauthenticated callers get the cheap
+  probe response: `status`, `uptime_seconds`, `agents.online`, `stores.*`,
+  `version`. Authenticated callers additionally get `agents.pending`,
+  `executions.{in_flight, completed_last_hour, failed_last_hour}`, and
+  `system.*` — these were always populated for everyone before, but
+  involve SQLite scans on every request and would be a DoS amplification
+  primitive now that the rate limiter no longer caps probe rate. Monitoring
+  dashboards that displayed `executions.*` from `/health` should switch
+  to the authenticated alternative or query an authenticated REST endpoint.
+- **Docs:** `docs/user-manual/server-admin.md` gains a "File Logging"
+  section covering `--log-file` semantics and the implicit-default
+  fallback, and a "Health Endpoints" section enumerating `/livez`,
+  `/readyz`, `/health`, and `/api/health` with guidance on which to use
+  for which monitoring scenario.
+- **Docs:** `docs/user-manual/rest-api.md` `GET /health` entry now notes
+  the `/api/health` alias and the explicit non-draining-aware contract.
+- **Docs:** `docs/user-manual/upgrading.md` v0.12.0 section gains an
+  "A3 UX ladder (#620, #622, #624)" sub-entry with the operator action
+  required for local compose overrides.
+
+### Removed
+
+- **Qodana code-quality workflow and `qodana.yaml`.** The JetBrains Qodana
+  scanner was wired up but unused; carrying the workflow added third-party-
+  action attack surface and a Token-Permissions Scorecard finding for no
+  benefit. Deleted `.github/workflows/qodana_code_quality.yml` and root
+  `qodana.yaml`; `scripts/check-compose-versions.sh`-style baseline-bump
+  references in `.github/workflows/vcpkg-baseline-update.yml` updated
+  accordingly. CodeQL + Scorecard + zizmor remain the active static-analysis
+  surface.
+
+### Changed
+
+- **Defensive hardening of `pre-release.yml` against template-injection.**
+  Eight `run:` blocks that interpolated `${{ needs.resolve.outputs.version }}`,
+  `${{ needs.resolve.outputs.prev_tag }}`, or related workflow_run-tainted
+  values directly into bash were refactored to bind them via the step's
+  `env:` block and reference the values as `"$VERSION"` / `"$PREV_TAG"` /
+  `"$NEW_VER"` in the script body. CodeQL flagged 4 critical
+  `actions/code-injection/critical` alerts on this file (lines 68, 84,
+  125, 923 in older revisions) — three of those four were already fixed
+  in earlier work; this pass extends the same env-binding pattern to
+  every other run-block interpolation in the file so future CodeQL
+  scans don't re-discover the same shape. Matrix-driven values
+  (`${{ matrix.distro }}` in the .deb / .rpm install steps) are kept
+  as-is because matrix entries are workflow-author-defined and not
+  externally controllable.
+
+- **Static-analysis alert cleanup pass.** Reduced the open code-scanning
+  alert backlog by ~70% in one pass:
+  - 15 vendored security-severity false-positives in `vcpkg_installed/`
+    and `vcpkg/buildtrees/` (abseil/protobuf/httplib/cli11) bulk-dismissed
+    as "won't fix" — outside Yuzu's patch surface; will re-dismiss on each
+    scan until upstream feedback is sent.
+  - 30 stale `zizmor/artipacked` alerts will auto-clear on next zizmor run
+    (every active `actions/checkout@v6.0.2` already carries
+    `persist-credentials: false`; alerts predate that fix).
+  - 8 Scorecard `TokenPermissionsID` alerts dismissed: 5 reflect
+    job-level write scopes the action documentation requires (release,
+    CLA bot, peter-evans/create-pull-request, Qodana before deletion),
+    matching the "top-level read, opt-in per job" policy noted in
+    `release.yml`'s comment block; 3 are stale against pre-permissions-
+    block commits.
+  - 9 cpp/unused-* deletions of truly dead code: unused `run_command*`
+    helpers in `network_actions_plugin.cpp` and `event_logs_plugin.cpp`,
+    `deployment_status_to_string` in `patch_manager.cpp`, the duplicate
+    `json_quoted` and unused `add_cors_headers` in `rest_api_v1.cpp`,
+    plus a few stale local-variable bindings.
+  - 4 platform-conditional helpers wrapped in matching `#if` so CodeQL
+    stops seeing them on the wrong platform: `run_command` in
+    `network_diag_plugin.cpp` (`__APPLE__` only), `run_command_exit` in
+    `services_plugin.cpp` (`__linux__ || __APPLE__`), `run_command` in
+    `ioc_plugin.cpp` (tightened from linux+apple to apple-only),
+    `run_command` in `sccm_plugin.cpp` (`_WIN32` only).
+  - 24 `[[maybe_unused]]` annotations on idiomatic `std::from_chars`
+    structured-binding `[ptr, ec]` / `[_, ec]` sites where only the
+    error code is needed.
+  - 8 cpp/unused-static-function alerts dismissed where CodeQL ignores
+    `[[maybe_unused]]`: settings_routes refactor-staging family pre-
+    extracted from the server.cpp god-object decomposition, plus the
+    `.CRT$XCB` Windows static-init function-pointer pair in `agent.cpp`
+    / `main.cpp` that's reached via linker-section magic CodeQL can't
+    follow.
+
+- **Better error message when `POST /api/policy-fragments` (or `/api/policies`)
+  receives YAML without a `kind:` field** (#621). The previous body
+  `kind must be 'PolicyFragment', got ''` left operators stuck because they
+  often sent JSON like `{"kind":"PolicyFragment", "yaml_source":"..."}`
+  expecting `kind` to be a request parameter. The error now includes a
+  full worked YAML example and a link to `docs/user-manual/policy-engine.md`,
+  while keeping the original `kind must be 'PolicyFragment'` (and `'Policy'`)
+  prefix so existing operator scripts that grep on it continue to work.
+  `docs/user-manual/policy-engine.md` gains a worked `curl` example covering
+  both the JSON-envelope and raw-YAML body forms.
+
+### Fixed
+
+- **`device.agent_actions.info` returns the real `plugins_count` and
+  the agent.plugins.N.* roster.** Per-plugin `PluginContextImpl` config
+  maps were snapshot-copied from `plugin_ctx_.config` during the load
+  loop in `agent.cpp`, freezing each one before the agent had populated
+  `agent.plugins.count`, `agent.modules.count`, the `agent.plugins.N.*`
+  roster, or any `agent.modules.N.*` entries written after that
+  plugin's own snapshot point. The `agent_actions:info` action then
+  read `(not set)` for `plugins_count` from its frozen context even
+  though the master config had the right value. A new
+  `sync_master_config_to_plugins` helper (extracted to
+  `agents/core/src/plugin_config_sync.hpp` for unit testing) re-walks
+  every per-plugin context after load completes and copies in every
+  master key. Validated end-to-end: `agent_actions info` from the
+  dashboard now returns `agent.plugins.count|45` matching the
+  "Loaded 45 plugin(s)" agent log line. Runtime keys written
+  post-registration (`agent.session_id`, `agent.reconnect_count`,
+  `agent.latency_ms`, `agent.grpc_channel_state`,
+  `agent.connected_since`) still observe stale snapshot values — that
+  pre-existing gap is tracked separately as `status_plugin runtime
+  staleness` follow-up.
+
+- **MCP token authorization restored to documented tier-first design
+  (#520, #630, branch `fix/520-630-auth-hardening`).** An earlier
+  hardening pass (`5fcb346`..`7c8d4ac`) conflated MCP tokens with
+  service-scoped tokens — required RBAC to be enabled and capped MCP
+  tokens at `ITServiceOwner` permissions regardless of the creator's
+  role. That broke the documented design (`docs/user-manual/mcp.md`
+  §"Authorization Tiers"): the tier (`readonly`/`operator`/`supervised`)
+  is the primary access boundary, applied independently of RBAC, with
+  the creator's actual role as the secondary RBAC layer. The regression
+  made MCP unusable for its intended purpose — agentic fleet management —
+  on every RBAC-disabled deployment.
+
+  Restored behavior:
+  - `auth_routes::require_permission()` and `require_scoped_permission()`
+    now call `mcp::tier_allows()` first, then fall through to the
+    standard RBAC/role check using the creator's actual role.
+  - Tier enforcement now applies on **all** transports (MCP JSON-RPC and
+    REST API) — closes a path-bypass where an MCP token used directly
+    on `/api/v1/...` could skip the tier check that `/mcp/v1/` enforces.
+  - Approval-gated operations (supervised tier on destructive ops) are
+    blocked on every transport with a new `auth.approval_required`
+    audit action until the Phase 2 re-dispatch path is built. This
+    closes a separation-of-duties gap where a supervised MCP token
+    issued by an admin could execute destructive operations via REST
+    without approval.
+  - `require_admin()` MCP block kept — admin/settings routes (user
+    management, TLS, OIDC) are not the MCP use case.
+  - RBAC-enabled and legacy-fallback denial paths now emit
+    `audit_log()` and use the structured JSON envelope, closing prior
+    audit-evidence gaps (CC7.2).
+  - `settings_routes.cpp` tier-string validation replaced with
+    `mcp::is_valid_tier()` to keep the canonical tier set in
+    `mcp_policy.hpp` as the single source of truth.
+
+  Audit detail string format changed for MCP-token denials. Operators
+  with SIEM rules pattern-matching the old strings (`"MCP token
+  blocked: RBAC not enabled"`, `"MCP token blocked: lacks
+  ITServiceOwner permission"`) must update them; see
+  `docs/user-manual/authentication.md` § "Audit Actions". The broken
+  intermediate (`5fcb346`..`7c8d4ac`) never shipped in a release —
+  no customer-facing upgrade notes are required.
+
+- **Docker healthchecks for `docker-compose.uat.yml`** (#622).
+  The server check used `curl` (not installed in the runtime image); the
+  gateway check used `CMD-SHELL` which on Alpine resolves to busybox `sh`
+  with no `/dev/tcp`. Replaced with `bash` + `/dev/tcp` (server, matches
+  `deploy/docker/docker-compose.reference.yml`) and busybox `wget --spider`
+  (gateway, no shell required). The compose stack now reports `healthy`
+  in `docker inspect`. Operators with a local copy of the same broken
+  pattern (e.g. an untracked `docker-compose.local.yml`) should mirror
+  the same change — see `docs/user-manual/upgrading.md`.
+  The bash healthcheck explicitly closes FD 3 after the grep to avoid
+  leaking CLOSE_WAIT sockets under sustained probe cadence.
+- **Server log directory in container deployments** (#624).
+  `Dockerfile.server` now creates `/var/log/yuzu` with mode 0750 and the
+  right ownership during the runtime stage, aligning with the deb postinst
+  and preventing log disclosure to other UIDs in the container. The
+  unconditional file-logger setup in `server.cpp` no longer logs
+  WARN/ERROR on failure — when the default log path is not writable it
+  now drops to a single INFO line and proceeds, since file logging is
+  best-effort observability. INFO (not DEBUG) is the right level so
+  operators auditing the SOC 2 evidence chain or troubleshooting "where
+  did my logs go?" still get a visible breadcrumb at default loglevel.
+  Operators who want explicit on-disk logs can pass `--log-file <path>`;
+  explicit-path failures still log at ERROR.
+
+### Tests
+
+- **Response Templates governance hardening test additions.** 11 new cases
+  in `tests/unit/server/test_rest_response_templates.cpp` covering the
+  Gate 7 hardening round: PUT-with-non-existent-template_id 404
+  (qe-B1), DELETE-of-operator-default re-instates synth (qe-B2),
+  malformed template_id rejected by route regex (qe-B4), PUT/DELETE/POST
+  403 paths (qe-S2), 503 path on POST/PUT/DELETE with null store
+  (qe-S6), oversized POST body returns 413 + failure audit (UP-8 +
+  sec-M1), success audits asserted on POST/PUT/DELETE (qe-S1 / sec-M1),
+  POST validation failure emits failure audit (sec-M1),
+  `import_definition_json` strips reserved `__default__` id (S-4),
+  oversized string-form import dropped to `[]` (sec-M4), and a
+  full-cycle migration v3 probe-and-stamp regression test (qe-B3) that
+  pre-seeds a DB with the column already present + `schema_meta` at v1
+  and verifies the InstructionStore opens cleanly. Total response-
+  templates suite now 43 cases / 237 assertions (was 32 / 154).
+
+- **Response Templates engine + REST coverage** (issue #254). New
+  `tests/unit/server/test_response_templates_engine.cpp` (18 cases /
+  pure-engine: parse round-trip incl. singular form, malformed JSON,
+  default synthesis from `result_schema` and from plugin column schema,
+  `resolve()` precedence rules, `validate_payload()` rejecting
+  `__default__` as authored id / missing name / unknown filter op /
+  multiple `default:true` / id collisions, serialise→parse round-trip)
+  and `tests/unit/server/test_rest_response_templates.cpp` (14 cases,
+  HTTP-level via `TestRouteSink`: synth-default visibility rules,
+  POST→list→PUT→DELETE round-trip, 400 on `__default__` mutation,
+  `result_schema` populating synthesised columns, 403/503/404 paths).
+  All 32 cases / 154 assertions green on first run; `[instruction_store]`
+  + `[visualization]` + `[rest][visualization]` regression-set still
+  green (62 cases, 285 assertions).
+
+- `tests/unit/test_trigger_engine.cpp`,
+  `tests/unit/server/test_patch_manager.cpp` — `[[maybe_unused]]` on three
+  `auto& [plugin, action, params]` structured bindings (only one binding
+  is asserted on per test) and removal of an unused `bool found_reboot`
+  in the patch_manager Windows-reboot test, in step with the
+  static-analysis alert-cleanup pass.
+
+- `tests/unit/server/test_agent_service_impl.cpp` — new file, 9 cases /
+  47 assertions covering `AgentServiceImpl::record_execution_id` and
+  `AgentServiceImpl::process_gateway_response`. Closes the gap explicitly
+  deferred at `tests/unit/server/test_workflow_routes.cpp:820` ("no
+  AgentServiceImpl in ExecHarness") by constructing a real
+  AgentServiceImpl and driving response receipt end-to-end into a real
+  `ResponseStore`. Pins four contracts from #117's response-streaming
+  call-out: (1) `record_execution_id` registers and clears the
+  command_id → execution_id mapping; (2) `process_gateway_response`
+  stamps execution_id on RUNNING streaming rows, terminal SUCCESS rows,
+  terminal FAILURE rows (with `error_detail`), and degrades to empty
+  execution_id for unmapped command_ids; (3) the HF-1 multi-agent
+  fan-out invariant — the terminal branch does NOT erase the mapping,
+  so 4 agents responding to the same `command_id` (with mixed terminal
+  statuses SUCCESS/FAILURE/TIMEOUT) all stamp the same `execution_id`;
+  (4) the `__timing__|...` sentinel takes the early-return branch in
+  the RUNNING handler and does NOT persist a row. The pre-existing
+  `test_workflow_routes.cpp:814` pin exercised the response-store level
+  only; this new file exercises the `process_gateway_response` upstream
+  path that the comment said had to be deferred to UAT. (#117)
+- `scripts/start-UAT.sh` (formerly `linux-start-UAT.sh`) — added
+  regression assertion that `/health`
+  and `/api/health` return 200 AND identical JSON bodies, guarding
+  against both the #620 regression and a future split of the dual-mount
+  handler lambda.
+- `tests/unit/server/test_policy_store.cpp` — extended the existing
+  wrong-kind / missing-kind cases to assert the new helpful content
+  (`apiVersion: yuzu.io/v1alpha1` substring + docs link), so the
+  improvement is pinned by the test surface rather than relying on a
+  fragile substring match. Adds a missing-`kind:` test for `create_policy`
+  (governance Gate 7 hardening — was asymmetric with `create_fragment`)
+  and pins the docs link on the `create_fragment` missing-kind branch
+  for the same symmetry reason.
 
 ## [0.12.0] - 2026-05-03
 
@@ -5056,4 +5934,3 @@ development independently from the primary software changelog.
 - Input validation on all REST API endpoints
 - Registry sensitive path audit logging
 - PRAGMA secure_delete on TAR database
-

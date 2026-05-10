@@ -143,7 +143,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     if (auto raw = kv_->get(kKvNamespace, kKeyGen); raw.has_value()) {
         std::uint64_t parsed = 0;
         const auto& s = *raw;
-        auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), parsed);
+        [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), parsed);
         if (ec == std::errc{})
             policy_generation_ = parsed;
     }

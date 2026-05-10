@@ -159,6 +159,7 @@ if build_server
       'unit/server/test_scope_engine.cpp',
       'unit/server/test_web_utils.cpp',
       'unit/server/test_workflow_routes.cpp',
+      'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',
       'unit/server/test_instruction_store.cpp',
@@ -204,6 +205,10 @@ if build_server
       'unit/server/test_static_js_bundle.cpp',
       'unit/server/test_visualization_engine.cpp',
       'unit/server/test_rest_visualization.cpp',
+      'unit/server/test_response_templates_engine.cpp',
+      'unit/server/test_rest_response_templates.cpp',
+      'unit/server/test_offload_target_store.cpp',
+      'unit/server/test_rest_offload_targets.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

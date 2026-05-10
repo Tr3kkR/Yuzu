@@ -456,10 +456,29 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
     if (yaml_source.size() > 1048576)
         return std::unexpected("YAML too large (max 1MB)");
 
-    // Validate kind
+    // Validate kind. Issue #621: the cryptic "got ''" error confused
+    // operators sending JSON like {"kind":"PolicyFragment", "yaml_source":"..."}
+    // — `kind` must be a YAML field inside `yaml_source`, not a top-level
+    // request parameter. Keep the "kind must be 'PolicyFragment'" prefix so
+    // existing operator scripts that grep on it still work, then append a
+    // worked example.
     auto kind = extract_yaml_value(yaml_source, "kind");
     if (kind != "PolicyFragment")
-        return std::unexpected("kind must be 'PolicyFragment', got '" + kind + "'");
+        return std::unexpected(
+            "kind must be 'PolicyFragment', got '" + kind +
+            "'. yaml_source must be a complete YAML document including "
+            "'apiVersion: yuzu.io/v1alpha1' and 'kind: PolicyFragment'. "
+            "Example:\n"
+            "  apiVersion: yuzu.io/v1alpha1\n"
+            "  kind: PolicyFragment\n"
+            "  metadata:\n"
+            "    name: my-fragment\n"
+            "  spec:\n"
+            "    check:\n"
+            "      plugin: <plugin>\n"
+            "      action: <action>\n"
+            "      compliance: <CEL expression>\n"
+            "See docs/user-manual/policy-engine.md.");
 
     // Extract metadata
     auto id_val = extract_yaml_value(yaml_source, "id");
@@ -840,10 +859,26 @@ PolicyStore::create_policy(const std::string& yaml_source) {
     if (yaml_source.size() > 1048576)
         return std::unexpected("YAML too large (max 1MB)");
 
-    // Validate kind
+    // Validate kind. See create_fragment() for the rationale on the
+    // verbose example — same UX issue (#621), different kind.
     auto kind = extract_yaml_value(yaml_source, "kind");
     if (kind != "Policy")
-        return std::unexpected("kind must be 'Policy', got '" + kind + "'");
+        return std::unexpected(
+            "kind must be 'Policy', got '" + kind +
+            "'. yaml_source must be a complete YAML document including "
+            "'apiVersion: yuzu.io/v1alpha1' and 'kind: Policy'. "
+            "Example:\n"
+            "  apiVersion: yuzu.io/v1alpha1\n"
+            "  kind: Policy\n"
+            "  metadata:\n"
+            "    name: my-policy\n"
+            "  spec:\n"
+            "    fragment: <fragment-name-or-id>\n"
+            "    scope: <scope-expression>\n"
+            "    triggers:\n"
+            "      - type: interval\n"
+            "        interval: 3600\n"
+            "See docs/user-manual/policy-engine.md.");
 
     // Extract metadata
     auto id_val = extract_yaml_value(yaml_source, "id");

@@ -1,0 +1,12 @@
+name: yuzu/cpp-queries
+version: 0.1.0
+description: |
+  Yuzu-specific CodeQL queries — patterns that the standard
+  security-and-quality suite cannot encode because they depend on
+  Yuzu-internal directory scope, ABI conventions, and threat model.
+
+  See issue #371 for design rationale and the full deferred catalog.
+library: false
+extractor: cpp
+dependencies:
+  codeql/cpp-all: "*"

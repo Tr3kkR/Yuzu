@@ -126,7 +126,7 @@ case "${YUZU_REUSE_STACK:-auto}" in
         if ! detect_phase4_stack; then
             echo "integration-test: YUZU_REUSE_STACK=1 set but no Phase 4 stack detected on" >&2
             echo "  127.0.0.1:8080 (/readyz) + :8081 (/healthz). Start the stack first with" >&2
-            echo "  'bash scripts/linux-start-UAT.sh' or unset YUZU_REUSE_STACK." >&2
+            echo "  'bash scripts/start-UAT.sh' or unset YUZU_REUSE_STACK." >&2
             exit 1
         fi
         REUSE_STACK=true

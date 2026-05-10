@@ -36,7 +36,16 @@ jobs:
   # ── Sanitizers (ASan + UBSan) ──────────────────────────────────────────
   sanitize-asan:
     name: "Sanitizers (ASan+UBSan)"
-    runs-on: [self-hosted, Linux, X64]
+    # Pinned to Shulgi (yuzu-wsl2-linux). The ASan triplet (x64-linux-asan)
+    # is a forced cold-cache rebuild every run because per-instrumentation
+    # vcpkg packages can't be safely shared with the standard triplet — so
+    # the ASan job rebuilds the full dep tree from source on every nightly.
+    # On the small cloud runner (scw-eager-lumiere) that step alone runs
+    # 60+ minutes and routinely blows the 60-min job timeout. Shulgi
+    # (16-core 5950X) clears the same workload in ~15 min. TSan and
+    # Coverage share the warm x64-linux triplet cache so they don't need
+    # pinning and keep the runner pool flexible.
+    runs-on: [self-hosted, Linux, X64, yuzu-shulgi]
     timeout-minutes: 60
     env:
       # detect_odr_violation=0 mirrors ci.yml's matrix linux: gRPC's
@@ -62,6 +71,7 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       - name: Install system packages
         run: |
@@ -71,6 +81,21 @@ jobs:
             pkg-config curl zip unzip tar python3-pip ccache
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # OTP + rebar3 for the gateway custom_target. Without these, this
+      # job inherits whatever Erlang the self-hosted runner has globally,
+      # which on the WSL2 runner has previously been older than the
+      # rebar3 binary on PATH — producing BEAM-loader failures of the
+      # form `op bs_add p x i u x: please re-compile this module with an
+      # Erlang/OTP 28 compiler`. Pin matches ci.yml + release.yml so any
+      # OTP bump moves all three workflows together.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
 
       - name: Reset ccache stats
         run: ccache -z
@@ -119,10 +144,28 @@ jobs:
         if: always()
         run: ccache -s
 
+      - name: Upload meson testlog (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-testlog-asan
+          path: |
+            build-linux-asan/meson-logs/testlog.txt
+            build-linux-asan/meson-logs/testlog.junit.xml
+          retention-days: 14
+          if-no-files-found: warn
+
   # ── Sanitizers (TSan) ──────────────────────────────────────────────────
   sanitize-tsan:
     name: "Sanitizers (TSan)"
-    runs-on: [self-hosted, Linux, X64]
+    # Pinned to Shulgi (yuzu-wsl2-linux). Same compute argument as the
+    # ASan job: the TSan triplet (x64-linux-tsan, issue #917) is a forced
+    # cold-cache rebuild every run because per-instrumentation vcpkg
+    # packages can't be safely shared with the standard or ASan triplets.
+    # On scw-eager-lumiere (small Scaleway VM) the from-source dep-tree
+    # rebuild blows the 60-min job timeout; Shulgi (16-core 5950X) clears
+    # the same workload in ~15 min.
+    runs-on: [self-hosted, Linux, X64, yuzu-shulgi]
     timeout-minutes: 60
     env:
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
@@ -143,6 +186,7 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       - name: Install system packages
         run: |
@@ -153,6 +197,21 @@ jobs:
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # OTP + rebar3 for the gateway custom_target. Without these, this
+      # job inherits whatever Erlang the self-hosted runner has globally,
+      # which on the WSL2 runner has previously been older than the
+      # rebar3 binary on PATH — producing BEAM-loader failures of the
+      # form `op bs_add p x i u x: please re-compile this module with an
+      # Erlang/OTP 28 compiler`. Pin matches ci.yml + release.yml so any
+      # OTP bump moves all three workflows together.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
+
       - name: Reset ccache stats
         run: ccache -z
 
@@ -162,32 +221,35 @@ jobs:
           vcpkgDirectory: '${{ github.workspace }}/vcpkg'
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
-      - name: vcpkg sentinel (x64-linux)
-        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux
+      - name: vcpkg sentinel (x64-linux-tsan)
+        run: bash scripts/ci/vcpkg-triplet-sentinel.sh x64-linux-tsan
 
-      - name: Install vcpkg packages
+      - name: Install vcpkg packages (TSan-instrumented)
         env:
-          # Shares the matrix linux cache — TSan uses the same x64-linux
-          # triplet so the package zips are bit-identical. Issue #569.
-          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-linux
+          # Dedicated per-triplet binary cache. TSan-instrumented
+          # packages can't share the standard x64-linux cache or the
+          # x64-linux-asan cache — different sanitizer flag sets produce
+          # different shadow-memory ABIs. Issue #917 / #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-tsan
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
-            --triplet x64-linux \
+            --triplet x64-linux-tsan \
+            --overlay-triplets=${{ github.workspace }}/triplets \
             --x-manifest-root=${{ github.workspace }}
 
       - name: Configure (Meson + TSan)
         env:
           CC: ccache gcc-13
           CXX: ccache g++-13
-          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux/lib/pkgconfig
+          PKG_CONFIG_PATH: ${{ github.workspace }}/vcpkg_installed/x64-linux-tsan/lib/pkgconfig
         run: |
           reconfig=""
           [[ -d build-linux-tsan/meson-info ]] && reconfig="--reconfigure"
           meson setup $reconfig build-linux-tsan \
             --native-file meson/native/linux-gcc13.ini \
             --buildtype=debug \
-            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux \
+            -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-linux-tsan \
             -Dbuild_tests=true \
             -Db_sanitize=thread
 
@@ -200,6 +262,17 @@ jobs:
       - name: ccache stats
         if: always()
         run: ccache -s
+
+      - name: Upload meson testlog (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-testlog-tsan
+          path: |
+            build-linux-tsan/meson-logs/testlog.txt
+            build-linux-tsan/meson-logs/testlog.junit.xml
+          retention-days: 14
+          if-no-files-found: warn
 
   # ── Coverage (gcov + gcovr) ────────────────────────────────────────────
   coverage:
@@ -223,6 +296,7 @@ jobs:
         with:
           submodules: recursive
           clean: false
+          persist-credentials: false
 
       - name: Install system packages
         run: |
@@ -230,10 +304,25 @@ jobs:
           sudo apt-get install -y \
             cmake ninja-build gcc-13 g++-13 \
             pkg-config curl zip unzip tar python3-pip ccache
-          # requirements-ci.txt is hash-pinned; gcovr is not.
+          # requirements-ci.txt is hash-pinned (includes gcovr for the
+          # coverage report).
           pip3 install --user --break-system-packages --require-hashes -r requirements-ci.txt
-          pip3 install --user --break-system-packages gcovr
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # OTP + rebar3 for the gateway custom_target. Without these, this
+      # job inherits whatever Erlang the self-hosted runner has globally,
+      # which on the WSL2 runner has previously been older than the
+      # rebar3 binary on PATH — producing BEAM-loader failures of the
+      # form `op bs_add p x i u x: please re-compile this module with an
+      # Erlang/OTP 28 compiler`. Pin matches ci.yml + release.yml so any
+      # OTP bump moves all three workflows together.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
 
       - name: Reset ccache stats
         run: ccache -z
@@ -319,6 +408,17 @@ jobs:
         if: always()
         run: ccache -s
 
+      - name: Upload meson testlog (on failure)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: meson-testlog-coverage
+          path: |
+            build-linux-coverage/meson-logs/testlog.txt
+            build-linux-coverage/meson-logs/testlog.junit.xml
+          retention-days: 14
+          if-no-files-found: warn
+
   # ── Alert on nightly failure ───────────────────────────────────────────
   # Opens or comments on the `nightly-broken` issue if any of the three
   # jobs above failed. The discipline rule is "no merge to main while
@@ -335,6 +435,8 @@ jobs:
     steps:
       - name: Open or update nightly-broken issue
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REF_NAME: ${{ github.ref_name }}
         with:
           script: |
             const label = 'nightly-broken';
@@ -348,8 +450,9 @@ jobs:
               : 'unknown (alert fired without specific job failures)';
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
             const sha = '${{ github.sha }}';
+            const refName = process.env.REF_NAME;
             const body = [
-              `Nightly run failed on \`${{ github.ref_name }}\` @ \`${sha.substring(0, 7)}\`.`,
+              `Nightly run failed on \`${refName}\` @ \`${sha.substring(0, 7)}\`.`,
               ``,
               `**Failed jobs:** ${summary}`,
               ``,
@@ -385,4 +488,70 @@ jobs:
                 body,
               });
               core.notice(`Opened nightly-broken issue #${created.data.number}`);
+            }
+
+  # ── Close nightly-broken on full green ─────────────────────────────────
+  # Symmetric counterpart to the `alert:` job above. Closes any open
+  # `nightly-broken` issue when all three nightly jobs (asan, tsan, coverage)
+  # succeed, so the discipline rule "no merge to main while nightly-broken
+  # is open" naturally clears as soon as the next green nightly lands.
+  # Iterates over all matching open issues, not just the first, so a stale
+  # duplicate from any prior bug doesn't linger.
+  close-on-green:
+    name: "Close nightly-broken on green"
+    needs: [sanitize-asan, sanitize-tsan, coverage]
+    if: success()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Close any open nightly-broken issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        with:
+          script: |
+            const label = 'nightly-broken';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const sha = '${{ github.sha }}';
+            const refName = process.env.REF_NAME;
+            const body = [
+              `Nightly run on \`${refName}\` @ \`${sha.substring(0, 7)}\` is **fully green**.`,
+              ``,
+              `**Run:** ${runUrl}`,
+              ``,
+              `Closing this issue automatically. The "no merge to main" discipline rule clears.`,
+              ``,
+              `(auto-closed by .github/workflows/nightly.yml — re-opened automatically by the alert job if a future nightly fails.)`,
+            ].join('\n');
+
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: 'open',
+              per_page: 100,
+            });
+
+            if (open.data.length === 0) {
+              core.notice('No open nightly-broken issues to close.');
+              return;
+            }
+
+            for (const issue of open.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              core.notice(`Closed nightly-broken issue #${issue.number}`);
             }

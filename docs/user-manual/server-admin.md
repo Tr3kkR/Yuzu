@@ -62,6 +62,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
+| `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
 
 ### Example
 
@@ -187,6 +188,48 @@ Plugin signature verification ships in two parts: an agent-side CMS verifier and
 **Operator distribution.** The server hosts the bundle at `GET /api/v1/agent/plugin-policy` (admin-only). Agents are pointed at a local copy via `--plugin-trust-bundle <path>`; the manual workflow today is `curl` + `jq` + write the JSON's `trust_bundle_pem` field to disk on each agent host. Automatic agent-side fetch is a forthcoming change.
 
 **Fleet-suicide caveat.** The Yuzu release pipeline does not yet sign the 44 in-tree plugins under `agents/plugins/`. **Do NOT enable "Require signed plugins" until you have signed every plugin your fleet uses, including the in-tree ones.** Use the transitional mode (bundle uploaded, Require off) during rollout. The Settings card surfaces this warning inline.
+
+### vNEXT — Response templates (#254, Phase 8.2)
+
+Phase 8.2 ships named response-view configurations attached to each `InstructionDefinition`: a column subset, sort order, and filter presets the dashboard's filter-bar **View** dropdown surfaces. The feature is purely additive — operators who never author a template see a synthesised `__default__` view that is byte-identical in behaviour to the prior "show all columns, sort by Agent" default.
+
+**Schema migration.** `instruction_definitions` gains one column: `response_templates_spec TEXT NOT NULL DEFAULT '[]'`. The migration ledger advances from v2 to v3. `ALTER TABLE ADD COLUMN` with a constant default is O(1) in SQLite (metadata-only, no table rewrite); the migration is non-destructive.
+
+**Pre-upgrade snapshot (recommended).** Take a backup of the InstructionStore database before upgrade:
+
+```bash
+cp /var/lib/yuzu/instructions.db /var/lib/yuzu/instructions.db.bak
+# or, for a hot-running server, use SQLite's online backup:
+sqlite3 /var/lib/yuzu/instructions.db ".backup /var/lib/yuzu/instructions.db.bak"
+```
+
+**Post-upgrade validation.**
+
+```bash
+sqlite3 /var/lib/yuzu/instructions.db \
+  "SELECT version FROM schema_meta WHERE store='instruction_store';"
+# expected output: 3
+```
+
+If the value is `2` instead of `3`, the migration did not run — check the server logs for `MigrationRunner: instruction_store migrated to v3` (or for a `probe-and-stamp failed` line in the InstructionStore section).
+
+**Boot wedge recovery.** A corrupt schema_meta row or a pre-existing `response_templates_spec` column with a missing schema_meta v3 stamp will trip the probe-and-stamp guard, which fails closed (server logs `InstructionStore: probe-and-stamp failed; closing database`). To recover, restore the snapshot or apply the column manually:
+
+```bash
+# Stop the server first.
+systemctl stop yuzu-server
+
+sqlite3 /var/lib/yuzu/instructions.db \
+  "ALTER TABLE instruction_definitions ADD COLUMN response_templates_spec TEXT NOT NULL DEFAULT '[]';"
+sqlite3 /var/lib/yuzu/instructions.db \
+  "INSERT OR REPLACE INTO schema_meta (store, version, upgraded_at) VALUES ('instruction_store', 3, strftime('%s','now'));"
+
+systemctl start yuzu-server
+```
+
+**New audit actions.** `response_template.create`, `response_template.update`, `response_template.delete` — see `audit-log.md` for the failure-reason vocabulary. SIEM rules already filtering on `success`/`denied` will pick these up unchanged.
+
+**Authoring caveats.** The dashboard YAML editor's lightweight line-scanner does not extract `spec.responseTemplates` into the indexed column; author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints. Imported templates with the reserved `id: __default__` are silently dropped during normalisation.
 
 ---
 
@@ -684,6 +727,30 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `GET` | `/api/v1/tag-compliance` | Tag compliance summary (JSON, via REST API v1). |
 
 ---
+
+## File Logging
+
+Yuzu writes logs to stdout by default. File logging is opt-in via `--log-file`, with a best-effort fallback at the platform default path (`/var/log/yuzu/server.log` on Linux, `C:\ProgramData\Yuzu\logs\server.log` on Windows, `~/Library/Logs/Yuzu/server.log` on macOS).
+
+| Path | Behaviour | Failure mode |
+|---|---|---|
+| `--log-file <path>` (explicit) | Writes to `<path>` in addition to stdout. | If the file/directory cannot be opened, server logs an ERROR and continues without file logging. |
+| Platform default path (implicit) | Writes to the platform default path if it exists and is writable. | If the directory cannot be created or the file cannot be opened, server logs a single INFO line and continues without file logging. The default fallback is best-effort observability, not load-bearing. |
+
+The Docker server image pre-creates `/var/log/yuzu` (mode 0750, owned by the `yuzu` user) so the implicit default path works out of the box. When mounting an external host volume at `/var/log/yuzu`, ensure the host directory is owned by the same UID as the in-container `yuzu` user (verify with `docker exec yuzu-server id yuzu`); a wrong-ownership mount silently degrades to stdout-only logging.
+
+## Health Endpoints
+
+Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and monitoring integrations. All four are unauthenticated and exempt from the API rate limiter.
+
+| Path | Use case | Body | Draining-aware |
+|---|---|---|---|
+| `/livez` | Kubernetes liveness probe — fast check that the HTTP listener is up. | `{"status":"ok"}` | No |
+| `/readyz` | Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain. | `{"status":"ready"}` (200) or `{"status":"draining"}` (503) | **Yes** |
+| `/health` | Monitoring dashboards (Prometheus blackbox exporter, Datadog, Nagios). Rich JSON with per-store status, agent counts, execution stats, and version. | Structured JSON — see [REST API: Health](rest-api.md#health). | No |
+| `/api/health` | Identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Restored in v0.12.0 (issue #620). | Identical to `/health`. | No |
+
+**Choose the right endpoint for your use case.** Load balancers that should drain in-flight traffic during a rolling deploy MUST use `/readyz` — `/health` and `/api/health` continue returning 200 during shutdown by design (Kubernetes pattern: liveness/health probes are not draining-aware). Aggressive monitoring poll cadences (sub-second) should target `/livez` rather than `/health` to minimise per-probe SQLite touches.
 
 ## Deployment
 

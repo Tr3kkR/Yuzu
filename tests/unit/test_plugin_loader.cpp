@@ -1,5 +1,8 @@
 #include <yuzu/agent/plugin_loader.hpp>
 
+// Internal helper exposed for unit testing — see header for contract.
+#include "../../agents/core/src/plugin_config_sync.hpp"
+
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -51,7 +54,8 @@ fs::path find_reserved_fixture_plugin() {
 
     for (const auto& p : candidates) {
         std::error_code ec;
-        if (fs::exists(p, ec) && !ec) return fs::absolute(p, ec);
+        if (fs::exists(p, ec) && !ec)
+            return fs::absolute(p, ec);
     }
     return {};
 }
@@ -79,8 +83,7 @@ struct SslFreer {
     void operator()(X509_NAME* p) const noexcept { X509_NAME_free(p); }
     void operator()(CMS_ContentInfo* p) const noexcept { CMS_ContentInfo_free(p); }
 };
-template <typename T>
-using ssl_ptr = std::unique_ptr<T, SslFreer>;
+template <typename T> using ssl_ptr = std::unique_ptr<T, SslFreer>;
 
 ssl_ptr<EVP_PKEY> generate_ec_key() {
     ssl_ptr<EVP_PKEY_CTX> ctx{EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr)};
@@ -92,21 +95,18 @@ ssl_ptr<EVP_PKEY> generate_ec_key() {
     return ssl_ptr<EVP_PKEY>{raw};
 }
 
-ssl_ptr<X509> mint_cert(EVP_PKEY* subject_key, EVP_PKEY* issuer_key,
-                        X509* issuer_cert, const std::string& cn,
-                        bool is_ca) {
+ssl_ptr<X509> mint_cert(EVP_PKEY* subject_key, EVP_PKEY* issuer_key, X509* issuer_cert,
+                        const std::string& cn, bool is_ca) {
     ssl_ptr<X509> cert{X509_new()};
     REQUIRE(cert);
     REQUIRE(X509_set_version(cert.get(), 2) == 1);
-    ASN1_INTEGER_set(X509_get_serialNumber(cert.get()),
-                     static_cast<long>(std::random_device{}()));
+    ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), static_cast<long>(std::random_device{}()));
     X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0);
     X509_gmtime_adj(X509_getm_notAfter(cert.get()), 60 * 60 * 24);
 
     X509_NAME* name = X509_get_subject_name(cert.get());
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
-                               reinterpret_cast<const unsigned char*>(cn.c_str()), -1,
-                               -1, 0);
+                               reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0);
     if (issuer_cert) {
         REQUIRE(X509_set_issuer_name(cert.get(), X509_get_subject_name(issuer_cert)) == 1);
     } else {
@@ -121,18 +121,15 @@ ssl_ptr<X509> mint_cert(EVP_PKEY* subject_key, EVP_PKEY* issuer_key,
     //           extendedKeyUsage=codeSigning
     X509V3_CTX v3ctx;
     X509V3_set_ctx_nodb(&v3ctx);
-    X509V3_set_ctx(&v3ctx, issuer_cert ? issuer_cert : cert.get(), cert.get(), nullptr,
-                   nullptr, 0);
+    X509V3_set_ctx(&v3ctx, issuer_cert ? issuer_cert : cert.get(), cert.get(), nullptr, nullptr, 0);
     const char* bc = is_ca ? "critical,CA:TRUE" : "critical,CA:FALSE";
-    if (auto* ext = X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_basic_constraints,
-                                        const_cast<char*>(bc))) {
+    if (auto* ext =
+            X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_basic_constraints, const_cast<char*>(bc))) {
         X509_add_ext(cert.get(), ext, -1);
         X509_EXTENSION_free(ext);
     }
-    const char* ku = is_ca ? "critical,keyCertSign,cRLSign"
-                           : "critical,digitalSignature";
-    if (auto* ext = X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_key_usage,
-                                        const_cast<char*>(ku))) {
+    const char* ku = is_ca ? "critical,keyCertSign,cRLSign" : "critical,digitalSignature";
+    if (auto* ext = X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_key_usage, const_cast<char*>(ku))) {
         X509_add_ext(cert.get(), ext, -1);
         X509_EXTENSION_free(ext);
     }
@@ -154,12 +151,12 @@ void write_pem_cert(const fs::path& path, X509* cert) {
     REQUIRE(PEM_write_bio_X509(bio.get(), cert) == 1);
 }
 
-void write_cms_signature(const fs::path& sig_path, const fs::path& payload_path,
-                         X509* leaf_cert, EVP_PKEY* leaf_key) {
+void write_cms_signature(const fs::path& sig_path, const fs::path& payload_path, X509* leaf_cert,
+                         EVP_PKEY* leaf_key) {
     ssl_ptr<BIO> in{BIO_new_file(payload_path.string().c_str(), "rb")};
     REQUIRE(in);
-    ssl_ptr<CMS_ContentInfo> cms{CMS_sign(leaf_cert, leaf_key, nullptr, in.get(),
-                                          CMS_BINARY | CMS_DETACHED | CMS_PARTIAL)};
+    ssl_ptr<CMS_ContentInfo> cms{
+        CMS_sign(leaf_cert, leaf_key, nullptr, in.get(), CMS_BINARY | CMS_DETACHED | CMS_PARTIAL)};
     REQUIRE(cms);
     REQUIRE(CMS_final(cms.get(), in.get(), nullptr, CMS_BINARY | CMS_DETACHED) == 1);
     ssl_ptr<BIO> out{BIO_new_file(sig_path.string().c_str(), "wb")};
@@ -184,35 +181,29 @@ struct SigningFixtures {
 // Used by the EKU-enforcement negative test which mints a leaf with
 // EKU=serverAuth instead of codeSigning to prove X509_PURPOSE_CODE_SIGN
 // rejects it (governance hardening round 1, sec-LOW-2 negative coverage).
-ssl_ptr<X509> mint_cert_eku(EVP_PKEY* subject_key, EVP_PKEY* issuer_key,
-                            X509* issuer_cert, const std::string& cn,
-                            const char* leaf_eku) {
+ssl_ptr<X509> mint_cert_eku(EVP_PKEY* subject_key, EVP_PKEY* issuer_key, X509* issuer_cert,
+                            const std::string& cn, const char* leaf_eku) {
     ssl_ptr<X509> cert{X509_new()};
     REQUIRE(cert);
     REQUIRE(X509_set_version(cert.get(), 2) == 1);
-    ASN1_INTEGER_set(X509_get_serialNumber(cert.get()),
-                     static_cast<long>(std::random_device{}()));
+    ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), static_cast<long>(std::random_device{}()));
     X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0);
     X509_gmtime_adj(X509_getm_notAfter(cert.get()), 60 * 60 * 24);
     X509_NAME* name = X509_get_subject_name(cert.get());
-    X509_NAME_add_entry_by_txt(
-        name, "CN", MBSTRING_ASC,
-        reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0);
-    REQUIRE(X509_set_issuer_name(cert.get(),
-                                  X509_get_subject_name(issuer_cert)) == 1);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                               reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0);
+    REQUIRE(X509_set_issuer_name(cert.get(), X509_get_subject_name(issuer_cert)) == 1);
     REQUIRE(X509_set_pubkey(cert.get(), subject_key) == 1);
     X509V3_CTX v3ctx;
     X509V3_set_ctx_nodb(&v3ctx);
     X509V3_set_ctx(&v3ctx, issuer_cert, cert.get(), nullptr, nullptr, 0);
-    if (auto* ext = X509V3_EXT_conf_nid(
-            nullptr, &v3ctx, NID_basic_constraints,
-            const_cast<char*>("critical,CA:FALSE"))) {
+    if (auto* ext = X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_basic_constraints,
+                                        const_cast<char*>("critical,CA:FALSE"))) {
         X509_add_ext(cert.get(), ext, -1);
         X509_EXTENSION_free(ext);
     }
-    if (auto* ext = X509V3_EXT_conf_nid(
-            nullptr, &v3ctx, NID_key_usage,
-            const_cast<char*>("critical,digitalSignature"))) {
+    if (auto* ext = X509V3_EXT_conf_nid(nullptr, &v3ctx, NID_key_usage,
+                                        const_cast<char*>("critical,digitalSignature"))) {
         X509_add_ext(cert.get(), ext, -1);
         X509_EXTENSION_free(ext);
     }
@@ -240,13 +231,12 @@ SigningFixtures build_signing_fixtures() {
     auto ca_key = generate_ec_key();
     auto ca_cert = mint_cert(ca_key.get(), ca_key.get(), nullptr, "Yuzu Test CA", true);
     auto leaf_key = generate_ec_key();
-    auto leaf_cert = mint_cert(leaf_key.get(), ca_key.get(), ca_cert.get(),
-                               "Yuzu Test Plugin Signer", false);
+    auto leaf_cert =
+        mint_cert(leaf_key.get(), ca_key.get(), ca_cert.get(), "Yuzu Test Plugin Signer", false);
 
     // A *different* CA used as the "wrong trust bundle" anchor
     auto other_key = generate_ec_key();
-    auto other_cert =
-        mint_cert(other_key.get(), other_key.get(), nullptr, "Other CA", true);
+    auto other_cert = mint_cert(other_key.get(), other_key.get(), nullptr, "Other CA", true);
 
     f.trust_bundle = f.dir / "trust-bundle.pem";
     f.other_trust_bundle = f.dir / "other-trust.pem";
@@ -317,8 +307,7 @@ TEST_CASE("kReservedPluginNames covers guardian, system, update",
 
 // ── Code-signing tests (#80) ─────────────────────────────────────────────────
 
-TEST_CASE("verify_plugin_signature accepts a valid CMS signature",
-          "[plugin_loader][signing]") {
+TEST_CASE("verify_plugin_signature accepts a valid CMS signature", "[plugin_loader][signing]") {
     auto fx = build_signing_fixtures();
     auto err = yuzu::agent::verify_plugin_signature(fx.plugin_file, fx.trust_bundle);
     INFO(err.value_or(""));
@@ -334,13 +323,11 @@ TEST_CASE("verify_plugin_signature reports kSignatureMissingReason when sig abse
     REQUIRE(err->starts_with(yuzu::agent::kSignatureMissingReason));
 }
 
-TEST_CASE("verify_plugin_signature rejects a tampered plugin file",
-          "[plugin_loader][signing]") {
+TEST_CASE("verify_plugin_signature rejects a tampered plugin file", "[plugin_loader][signing]") {
     auto fx = build_signing_fixtures();
     // Append a byte after signing — invalidates the digest.
     {
-        std::ofstream pf(fx.plugin_file,
-                         std::ios::binary | std::ios::app);
+        std::ofstream pf(fx.plugin_file, std::ios::binary | std::ios::app);
         pf << 'X';
     }
     auto err = yuzu::agent::verify_plugin_signature(fx.plugin_file, fx.trust_bundle);
@@ -361,14 +348,12 @@ TEST_CASE("verify_plugin_signature rejects when chain does not anchor in bundle"
 TEST_CASE("verify_plugin_signature rejects when trust bundle is unreadable",
           "[plugin_loader][signing]") {
     auto fx = build_signing_fixtures();
-    auto err = yuzu::agent::verify_plugin_signature(fx.plugin_file,
-                                                     fx.dir / "does-not-exist.pem");
+    auto err = yuzu::agent::verify_plugin_signature(fx.plugin_file, fx.dir / "does-not-exist.pem");
     REQUIRE(err.has_value());
     REQUIRE(err->starts_with(yuzu::agent::kSignatureUntrustedReason));
 }
 
-TEST_CASE("verify_plugin_signature rejects malformed PEM in sig file",
-          "[plugin_loader][signing]") {
+TEST_CASE("verify_plugin_signature rejects malformed PEM in sig file", "[plugin_loader][signing]") {
     auto fx = build_signing_fixtures();
     {
         std::ofstream sigf(fx.sig_file, std::ios::binary | std::ios::trunc);
@@ -393,21 +378,17 @@ TEST_CASE("verify_plugin_signature rejects a leaf without codeSigning EKU",
     // Re-mint a leaf chained to the SAME CA but with EKU=serverAuth
     // (TLS server) instead of codeSigning. Re-sign the plugin file with it.
     auto ca_key = generate_ec_key();
-    auto ca_cert =
-        mint_cert(ca_key.get(), ca_key.get(), nullptr, "Yuzu Test CA EKU", true);
+    auto ca_cert = mint_cert(ca_key.get(), ca_key.get(), nullptr, "Yuzu Test CA EKU", true);
     auto srv_leaf_key = generate_ec_key();
-    auto srv_leaf =
-        mint_cert_eku(srv_leaf_key.get(), ca_key.get(), ca_cert.get(),
-                      "TLS server (not a code signer)", "serverAuth");
+    auto srv_leaf = mint_cert_eku(srv_leaf_key.get(), ca_key.get(), ca_cert.get(),
+                                  "TLS server (not a code signer)", "serverAuth");
 
     // Replace the trust bundle with the new CA, replace the .sig with
     // one minted by the serverAuth leaf.
     write_pem_cert(fx.trust_bundle, ca_cert.get());
-    write_cms_signature(fx.sig_file, fx.plugin_file, srv_leaf.get(),
-                        srv_leaf_key.get());
+    write_cms_signature(fx.sig_file, fx.plugin_file, srv_leaf.get(), srv_leaf_key.get());
 
-    auto err = yuzu::agent::verify_plugin_signature(fx.plugin_file,
-                                                    fx.trust_bundle);
+    auto err = yuzu::agent::verify_plugin_signature(fx.plugin_file, fx.trust_bundle);
     REQUIRE(err.has_value());
     // Chain is technically valid (CA issued the leaf), but the EKU
     // gate rejects it — surfaces as untrusted-chain via the
@@ -415,8 +396,7 @@ TEST_CASE("verify_plugin_signature rejects a leaf without codeSigning EKU",
     REQUIRE(err->starts_with(yuzu::agent::kSignatureUntrustedReason));
 }
 
-TEST_CASE("PluginSigningPolicy::enabled flips with bundle path",
-          "[plugin_loader][signing]") {
+TEST_CASE("PluginSigningPolicy::enabled flips with bundle path", "[plugin_loader][signing]") {
     yuzu::agent::PluginSigningPolicy off{};
     REQUIRE_FALSE(off.enabled());
     yuzu::agent::PluginSigningPolicy on{"/some/path.pem", false};
@@ -441,8 +421,7 @@ TEST_CASE("PluginLoader::scan with require_signature on rejects unsigned plugin 
     auto result = yuzu::agent::PluginLoader::scan(plugin_dir, {}, policy);
     REQUIRE(result.loaded.empty());
     REQUIRE(result.errors.size() == 1);
-    REQUIRE(result.errors.front().reason.starts_with(
-        yuzu::agent::kSignatureMissingReason));
+    REQUIRE(result.errors.front().reason.starts_with(yuzu::agent::kSignatureMissingReason));
 }
 
 TEST_CASE("PluginLoader rejects a plugin declaring a reserved name",
@@ -485,4 +464,91 @@ TEST_CASE("PluginLoader rejects a plugin declaring a reserved name",
     REQUIRE(err.reason.find("__guard__") != std::string::npos);
 
     fs::remove_all(tmp);
+}
+
+// ─── Plugin config-sync (covers agent.cpp post-load sync invariant) ─────────
+//
+// The fix at agent.cpp ~line 564 (sync_master_config_to_plugins) is the
+// only thing that makes agent_actions::info return a populated
+// `agent.plugins.count` instead of `(not set)`. A regression — the loop
+// silently dropped or restricted to a key subset — would not crash, log,
+// or fail any other test. These cases pin the invariant directly.
+//
+// We exercise the helper through its templated public surface with a
+// FakeCtx stub so the test has no dependency on the (anonymous-namespace)
+// PluginContextImpl from agent.cpp.
+
+namespace {
+
+struct FakeCtx {
+    std::unordered_map<std::string, std::string> config;
+};
+
+} // namespace
+
+TEST_CASE("sync_master_config_to_plugins copies every master key into every plugin",
+          "[agent][config_sync]") {
+    std::unordered_map<std::string, std::string> master = {
+        {"agent.id", "abc"},
+        {"agent.plugins.count", "3"},
+        {"agent.modules.count", "5"},
+        {"agent.plugins.0.name", "os_info"},
+        {"agent.plugins.1.name", "discovery"},
+    };
+
+    std::unordered_map<std::string, std::unique_ptr<FakeCtx>> plugins;
+    plugins["os_info"] = std::make_unique<FakeCtx>();
+    plugins["discovery"] = std::make_unique<FakeCtx>();
+    plugins["status"] = std::make_unique<FakeCtx>();
+
+    yuzu::agent::detail::sync_master_config_to_plugins(master, plugins);
+
+    for (const auto& name : {"os_info", "discovery", "status"}) {
+        const auto& cfg = plugins[name]->config;
+        REQUIRE(cfg.at("agent.id") == "abc");
+        REQUIRE(cfg.at("agent.plugins.count") == "3");
+        REQUIRE(cfg.at("agent.modules.count") == "5");
+        REQUIRE(cfg.at("agent.plugins.0.name") == "os_info");
+        REQUIRE(cfg.at("agent.plugins.1.name") == "discovery");
+    }
+}
+
+TEST_CASE("sync_master_config_to_plugins overwrites stale snapshot values",
+          "[agent][config_sync]") {
+    // This is the actual production scenario: per-plugin contexts hold a
+    // snapshot taken before the master gained agent.plugins.count, so the
+    // pre-sync value is the empty string (or in the test, an old value).
+    std::unordered_map<std::string, std::string> master = {
+        {"agent.plugins.count", "45"},
+    };
+
+    std::unordered_map<std::string, std::unique_ptr<FakeCtx>> plugins;
+    auto stale = std::make_unique<FakeCtx>();
+    stale->config["agent.plugins.count"] = ""; // empty snapshot — the bug
+    plugins["agent_actions"] = std::move(stale);
+
+    yuzu::agent::detail::sync_master_config_to_plugins(master, plugins);
+
+    REQUIRE(plugins["agent_actions"]->config.at("agent.plugins.count") == "45");
+}
+
+TEST_CASE("sync_master_config_to_plugins is a no-op on empty master", "[agent][config_sync]") {
+    std::unordered_map<std::string, std::string> master;
+    std::unordered_map<std::string, std::unique_ptr<FakeCtx>> plugins;
+    auto p = std::make_unique<FakeCtx>();
+    p->config["agent.id"] = "preserved";
+    plugins["x"] = std::move(p);
+
+    yuzu::agent::detail::sync_master_config_to_plugins(master, plugins);
+
+    // Empty master must not erase pre-existing per-plugin keys.
+    REQUIRE(plugins["x"]->config.at("agent.id") == "preserved");
+}
+
+TEST_CASE("sync_master_config_to_plugins is a no-op on empty plugin set", "[agent][config_sync]") {
+    std::unordered_map<std::string, std::string> master = {{"agent.id", "abc"}};
+    std::unordered_map<std::string, std::unique_ptr<FakeCtx>> plugins;
+    // Must not throw or trip UB on empty target.
+    yuzu::agent::detail::sync_master_config_to_plugins(master, plugins);
+    REQUIRE(plugins.empty());
 }
