@@ -2632,11 +2632,22 @@ Browser-facing page that renders the 3D fleet topology. The page itself is auth-
 - Drag — rotate camera around scene origin (OrbitControls)
 - Mouse wheel — dolly in/out (clamped to `[4, 400]` units)
 - `W`/`A`/`S`/`D` — pan the view in camera screen space (window-level listener; suppressed when a text-editable target has focus, so typing in a future overlay-panel input does not eat keystrokes)
-- **Hover a machine cube** — surfaces a fixed-position tooltip with the cube's hostname, OS, process count, and connection count. The tooltip raycasts against cube meshes only (the wireframe outline overlay is skipped) and follows the cursor with a small offset to avoid flicker.
+- **Hover a machine cube body** — surfaces a fixed-position tooltip with the cube's hostname, OS, process count, and connection count. The cube tooltip is shown only when no interior process dot is intersected (process dots are raycasted first; see the process tooltip below). The wireframe outline overlay is excluded from hit-testing. Tooltip follows the cursor with a small offset to avoid flicker.
+- **Hover a process dot (interior of a cube)** — surfaces a process tooltip with the process's pid, name, user account, and category. Process dots are raycasted *before* cube meshes so an operator can hover a dot through the translucent cube face and still see process details (otherwise the cube's outer face would always win by ray distance and dots would be unreachable). Agent-controlled fields (name, user, category) are HTML-escaped before render and capped at 256 characters before escaping to bound CPU cost on pathological 1MB cmdline-as-comm payloads.
 
 **Renderer behaviour (PR 6):**
 
 The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#f0c674`, macOS/Darwin `#a0a0a0`, Windows `#5294e2`, default `#666666`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear above each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
+
+**Renderer behaviour (PR 7):**
+
+Each machine cube contains interior `SphereGeometry` dots, one per process reported in the `processes` array of the topology payload. Dots are coloured by process category using a fixed six-colour palette: system `#6e7681`, browser `#58a6ff`, database `#d29922`, web `#56d364`, runtime `#bc8cff`, other `#8b949e`. Category values in the JSON payload are lowercase strings matching `category_to_string()` in the server's process classifier (`server/core/src/process_category.hpp`); the renderer normalises with `String(category).trim().toLowerCase()` and uses `Object.prototype.hasOwnProperty.call` for the palette lookup so unknown / mixed-case / whitespace-padded values fall through to `other` and prototype keys (`constructor`, `__proto__`) cannot poison the colour pipeline.
+
+Dot positions are deterministic across reloads — `hash(pid|ppid)`-mod-bucket layout inside 78% of the cube's interior volume, with per-process `hash('j|pid')` jitter to break visual stripes. Per-machine processes are attached as a named child group (`yuzu-processes`) of each cube so they orbit and pan with the cube under OrbitControls without synchronisation overhead. To bound the worst-case render cost on heavily-threaded hosts (e.g. JVM thread pools), the renderer soft-caps at **1000 dots per cube**; the cube tooltip's `processes` count still reflects the true total reported by the agent.
+
+Hover-then-tooltip is rAF-throttled — `mousemove` fires up to ~120 Hz on macOS trackpads but the bidirectional raycast (process dots + cube meshes) only runs once per `requestAnimationFrame` tick (~60 Hz) so the dominant CPU cost stays bounded even at large fleets.
+
+To suppress process-level visibility for specific agents (privacy-sensitive hosts, regulated workloads, etc.), set `process_enabled=false` on those agents via `tar.configure` — see [`docs/user-manual/agent-plugins.md`](agent-plugins.md) §TAR for the per-source enable/disable surface. The `tar.fleet_snapshot` action will skip the process collector on those agents and the corresponding cubes will render with no interior dots (cube body and hover tooltip remain functional).
 
 **Browser error handling.** When the JS renderer's fetch to `/api/v1/viz/fleet/topology` fails, the renderer surfaces a visible overlay (`#viz-error.shown`) on the canvas rather than leaving the scene blank. Any previously-rendered cubes are removed before the overlay is shown so the operator does not see "live data" cubes alongside a denial message.
 
@@ -2695,7 +2706,7 @@ Returns the full topology as JSON.
       "ts": 1715299200,
       "stale": false,
       "processes": [
-        {"pid": 1234, "ppid": 1, "name": "postgres", "user": "postgres", "category": "Database"}
+        {"pid": 1234, "ppid": 1, "name": "postgres", "user": "postgres", "category": "database"}
       ],
       "connections": [
         {"proto": "tcp", "src_pid": 1234, "src_addr": "10.0.0.1", "src_port": 5432,

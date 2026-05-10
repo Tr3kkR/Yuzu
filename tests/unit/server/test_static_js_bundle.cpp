@@ -1,21 +1,37 @@
 /**
- * test_static_js_bundle.cpp — Unit tests for the embedded HTMX + HTMX-SSE
- * runtime bundles in server/core/src/static_js_bundle.cpp.
+ * test_static_js_bundle.cpp — Unit tests for every JavaScript / CSS / WOFF2
+ * asset embedded into the server binary.
  *
- * Guards against:
- *   - Chunk-boundary corruption (size drift)
+ * Two embed pipelines feed this file:
+ *
+ *   * Hand-written: `server/core/src/static_js_bundle.cpp` carries `kHtmxJs`
+ *     (HTMX 2.0.4 minified, 50918 bytes) and `kSseJs` (htmx-ext-sse 2.2.2,
+ *     8897 bytes) as raw-string-literal chunks. Update the file by hand
+ *     when bumping HTMX / SSE; update the pinned-size constants below in
+ *     lock-step.
+ *
+ *   * Build-time codegen via `server/core/scripts/embed_js.py` (and
+ *     `embed_binary.py` for woff2): the source files live under
+ *     `server/core/static/` and `server/core/vendor/`. Each compile
+ *     regenerates a `*_bundle.cpp` exposing the symbol as a
+ *     `std::string` (or `std::string_view` for binary). Symbols covered
+ *     here: `kEChartsJs`, `kThreeJs`, `kThreeOrbitControlsJs`,
+ *     `kYuzuVizJs`, `kInterVariableWoff2`, `kYuzuCss`, `kYuzuChartsJs`.
+ *
+ * Plus the page HTML constant `kVizFleetPageHtml` from
+ * `server/core/src/viz_page_ui.cpp` (separate TU at namespace scope).
+ *
+ * Tests guard against:
+ *   - Chunk-boundary corruption (size drift) for hand-written bundles
  *   - IDE reformatting that breaks raw-string-literal continuity
- *   - Accidental tampering with the embedded payload
- *   - Drift from upstream byte-identity (the served bundle should match
- *     what upstream HTMX 2.0.4 minified ships)
+ *   - Accidental tampering with embedded payloads
+ *   - Drift from upstream byte-identity (vendored bundles match upstream)
+ *   - Codegen-bundle contract drift (expected substrings, version pins,
+ *     ABI invariants for the renderer JS)
  *
- * Pinned upstream sizes (HTMX 2.0.4 minified, htmx-ext-sse 2.2.2):
- *   kHtmxJs = 50918 bytes
- *   kSseJs  = 8897 bytes
- *
- * If you intentionally update HTMX or htmx-ext-sse, regenerate
- * static_js_bundle.cpp via the chunking script and update the constants
- * below in lock-step.
+ * If you intentionally update a vendored asset or refactor the renderer
+ * (`server/core/static/yuzu-viz.js` ↔ `kYuzuVizJs`), update the relevant
+ * pinned constants below in lock-step.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -541,12 +557,19 @@ TEST_CASE("static_js_bundle: kYuzuVizJs escapes HTML in process tooltip fields",
     // already pins escapeHtml; this test pins that the SAME helper is
     // applied to the process tooltip's three interpolated string fields.
     // We assert via the showProcessTooltip body presence (above) plus
-    // an `escapeHtml((process` substring — the unique pattern for the
-    // process tooltip's defensive null-coalesce-then-escape idiom.
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("escapeHtml((process && process.name)"));
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("escapeHtml((process && process.user)"));
+    // a `(process && process.<field>)` substring inside the per-field
+    // tooltip null-coalesce. The full wrap is
+    // `escapeHtml(clampForTooltip((process && process.<field>) || ...))`
+    // — clampForTooltip caps agent-controlled strings at TOOLTIP_NAME_MAX
+    // BEFORE escapeHtml's synchronous regex (gov R7 UP-10), then
+    // escapeHtml escapes the bytes. Pinning `clampForTooltip((process &&`
+    // catches refactors that drop either wrap.
     CHECK_THAT(yuzu::server::kYuzuVizJs,
-               ContainsSubstring("escapeHtml((process && process.category)"));
+               ContainsSubstring("clampForTooltip((process && process.name)"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("clampForTooltip((process && process.user)"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("clampForTooltip((process && process.category)"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs coerces process pid through Number(...) | 0",
@@ -567,6 +590,132 @@ TEST_CASE("static_js_bundle: kYuzuVizJs maintains a flat processMeshes raycast i
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("const processMeshes = []"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("processMeshes.length = 0"));
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("processMeshes.push(dot)"));
+}
+
+// ── PR 7 hardening (R7 round) ───────────────────────────────────────────────
+
+TEST_CASE("static_js_bundle: kYuzuVizJs hardens pickCategoryColor against prototype walk",
+          "[static-js][viz][pr7][hardening]") {
+    // gov R7 sec-MEDIUM / UP-8: agent-controlled (or future-bug-injected)
+    // category="constructor"/"toString"/"__proto__" must not walk the
+    // prototype chain and return a truthy non-string that `||` fallback
+    // accepts as a valid hex. Pin the hasOwnProperty.call guard + the
+    // String(category).trim().toLowerCase() normalisation so a refactor
+    // that drops either falls loud.
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("Object.prototype.hasOwnProperty.call(CATEGORY_PALETTE, k)"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("String(category).trim().toLowerCase()"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs raycaster ordering occurs exactly once",
+          "[static-js][viz][pr7][hardening]") {
+    // gov R7 qe-S1: the position-ordering assertion (procHits before
+    // cubeHits) is correct but only checks FIRST occurrences. A future
+    // refactor adding a SECOND `intersectObjects(processMeshes ...)`
+    // call AFTER the cube call (e.g. a debug fallback) would still
+    // satisfy the position invariant. Pin the count to exactly one for
+    // each so any duplicate raycast call regresses the test.
+    auto count_substr = [](const std::string& hay, const std::string& needle) {
+        size_t n = 0;
+        size_t pos = 0;
+        while ((pos = hay.find(needle, pos)) != std::string::npos) {
+            ++n;
+            pos += needle.size();
+        }
+        return n;
+    };
+    CHECK(count_substr(yuzu::server::kYuzuVizJs, "intersectObjects(processMeshes, false)") == 1);
+    CHECK(count_substr(yuzu::server::kYuzuVizJs, "intersectObjects(cubeMeshes, false)") == 1);
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs processGroup is parented to cube (not fleetGroup)",
+          "[static-js][viz][pr7][hardening]") {
+    // gov R7 qe-S2: the architecture pick is per-machine subgroup
+    // attached to the cube. A refactor that re-parents the group to
+    // fleetGroup (sibling pattern) without removing `cube.add(processGroup)`
+    // would still pass the positive substring check above. Pin the
+    // negative — `fleetGroup.add(processGroup)` MUST NOT appear.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, !ContainsSubstring("fleetGroup.add(processGroup)"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs guards process build with try/catch",
+          "[static-js][viz][pr7][hardening]") {
+    // gov R7 UP-2: a throw inside buildProcessNode (e.g. THREE.Color on
+    // a malformed palette hex from a future typo) must NOT cascade out
+    // of addMachines. Pin the try/catch surrounding the per-process
+    // mesh construction so a refactor that drops the guard fails loud.
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("Yuzu viz: buildProcessNode failed; skipping dot."));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs clearFleet resets indices BEFORE traverse",
+          "[static-js][viz][pr7][hardening]") {
+    // gov R7 UP-1: if `traverse(disposeNode)` throws partway through
+    // (corrupt child material, future PR 8 edgeMesh with already-disposed
+    // geometry), the function exits without resetting cubeMeshes or
+    // processMeshes — leaving stale references the next mousemove
+    // raycasts against. Reset BEFORE the loop so a throw still leaves
+    // the indices empty (worst case: benign empty raycast). Pin the
+    // ordering: both `length = 0` resets must appear before the
+    // `while (fleetGroup.children.length > 0)` loop body.
+    auto pos_cube_reset = yuzu::server::kYuzuVizJs.find("cubeMeshes.length = 0");
+    auto pos_proc_reset = yuzu::server::kYuzuVizJs.find("processMeshes.length = 0");
+    auto pos_traverse = yuzu::server::kYuzuVizJs.find("child.traverse(disposeNode)");
+    REQUIRE(pos_cube_reset != std::string::npos);
+    REQUIRE(pos_proc_reset != std::string::npos);
+    REQUIRE(pos_traverse != std::string::npos);
+    CHECK(pos_cube_reset < pos_traverse);
+    CHECK(pos_proc_reset < pos_traverse);
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs caps tooltip name length (CPU DoS guard)",
+          "[static-js][viz][pr7][hardening]") {
+    // gov R7 UP-10: a 1MB process.name from a pathological cmdline-as-comm
+    // parse would stutter the tooltip render via synchronous regex over
+    // the full string in escapeHtml. Truncate to 256 chars before
+    // escapeHtml so the worst-case hover stays under the 16ms frame
+    // budget. Pin both the helper and the cap constant.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("clampForTooltip"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("TOOLTIP_NAME_MAX = 256"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs soft-caps process count per cube",
+          "[static-js][viz][pr7][hardening]") {
+    // gov R7 CAP-1 / SRE: agent-side kFleetSnapshotMaxRows is 4096.
+    // 4096 procs × 5000 machines = 20M dots worst-case — well past
+    // anything WebGL can handle pre-InstancedMesh (PR 11). Soft-cap
+    // dots per cube at PROCESS_PER_CUBE_SOFT_CAP for graceful
+    // degradation; the cube tooltip still shows the true count.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("PROCESS_PER_CUBE_SOFT_CAP = 1000"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs rAF-throttles the raycaster",
+          "[static-js][viz][pr7][hardening]") {
+    // gov R7 perf-F1: mousemove fires up to 120 Hz on macOS trackpads;
+    // bidirectional intersectObjects against potentially 10k+ meshes
+    // makes raycast the dominant CPU cost. Coalesce events to one
+    // raycast per requestAnimationFrame tick (~60 Hz cap). Pin the
+    // throttle pattern so a refactor that re-introduces direct
+    // mousemove → raycast fails the test.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("_rafScheduled"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("_pendingMouseEvt"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("processPendingMouse"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("requestAnimationFrame(processPendingMouse)"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs has a sane size budget",
+          "[static-js][viz][pr7][hardening]") {
+    // gov R7 OBS-1 / perf-F4: every other vendored bundle has a pinned
+    // size or floor. kYuzuVizJs only had `>= 1000`. Add a sane upper
+    // bound so PR 8/9/10/11 additions trip a guard rather than silently
+    // bloating the served asset to multi-MB. The bundle is currently
+    // ~45KB after R7; cap at 80KB to give PR 8/9 ~35KB of headroom
+    // without making the cap perpetually irrelevant. If a future PR
+    // legitimately needs more, raise this constant deliberately.
+    REQUIRE(yuzu::server::kYuzuVizJs.size() >= 1000);
+    CHECK(yuzu::server::kYuzuVizJs.size() < 80 * 1024);
 }
 
 // ── Fleet viz page HTML scaffold ────────────────────────────────────────────

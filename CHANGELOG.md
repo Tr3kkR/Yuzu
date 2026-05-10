@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/viz/fleet` interior process nodes coloured by category (PR 7 of the
+  11-PR `/viz/fleet` 3D fleet network-topology ladder).** Each fleet machine
+  cube now contains one `SphereGeometry` dot per process reported by
+  `tar.fleet_snapshot`, coloured from a fixed six-colour palette:
+  system `#6e7681`, browser `#58a6ff`, database `#d29922`, web `#56d364`,
+  runtime `#bc8cff`, other `#8b949e`. Categories are computed server-side
+  by `classify(process_name, user)` in `process_category.hpp`; the renderer
+  treats unknown / mixed-case / prototype-key inputs (`constructor`,
+  `__proto__`, `"DATABASE "`) as `other` via `String(...).trim().toLowerCase()`
+  + `Object.prototype.hasOwnProperty.call(palette, k)`. Dot positions are
+  deterministic across reloads — `hash(pid|ppid)`-mod-bucket inside 78% of
+  the cube's interior volume, jittered to break stripes. Hovering a dot
+  surfaces a tooltip with pid, name, user, and category; agent-controlled
+  string fields are HTML-escaped and clamped to 256 chars before escape to
+  bound the worst-case CPU cost on pathological 1MB names. Process dots
+  raycast *before* cube meshes so the operator can drill into a dot through
+  the translucent cube face. Per-machine `processGroup` is attached as a
+  child of each cube (architectural pick over a single sibling group to
+  keep PR 8 per-cube edges + PR 11 per-cube LOD trivial) and `clearFleet`'s
+  existing recursive `traverse(disposeNode)` walk releases all per-instance
+  geometry+material on every refresh. `mousemove` raycasts are
+  rAF-throttled (~60 Hz cap) and processes-per-cube are soft-capped at
+  1000 for graceful degradation on heavily-threaded hosts (the cube
+  tooltip's process-count still reports the true total reported by the
+  agent). PR 11 polish migrates the per-process Mesh pattern to
+  `InstancedMesh` for the 100k-machine ceiling.
 - **`/viz/fleet` cube renderer + Sprite labels + hover tooltip (PR 6 of
   the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** The fleet
   page now renders one translucent cube per fleet machine on a deterministic

@@ -111,8 +111,26 @@ const CATEGORY_PALETTE = {
 };
 function pickCategoryColor(category) {
   if (!category) return CATEGORY_PALETTE.other;
-  const k = String(category).toLowerCase();
-  return CATEGORY_PALETTE[k] || CATEGORY_PALETTE.other;
+  // gov R7 sec-MEDIUM: trim + lowercase normalises whitespace + case
+  // variants ("System ", "WEB", "Browser\t") so they don't fall through
+  // to `other`. Defence in depth — server-side classify() already emits
+  // canonical lowercase strings, so this only fires if a future code
+  // path bypasses classification.
+  const k = String(category).trim().toLowerCase();
+  // gov R7 sec-MEDIUM / UP-8: use Object.hasOwnProperty.call so an
+  // agent-controlled (or future-bug-injected) category="constructor" /
+  // "__proto__" / "toString" / "hasOwnProperty" cannot walk the
+  // prototype chain. Without this guard CATEGORY_PALETTE['constructor']
+  // returns the Object constructor (truthy non-string), bypasses the
+  // `||` fallback, and gets passed to new THREE.Color() which silently
+  // sets r/g/b = NaN and corrupts the material. Server-side classify()
+  // currently makes this unreachable (categories are computed from a
+  // typed enum, not an agent string), but the renderer must not assume
+  // the upstream contract — defence in depth.
+  if (Object.prototype.hasOwnProperty.call(CATEGORY_PALETTE, k)) {
+    return CATEGORY_PALETTE[k];
+  }
+  return CATEGORY_PALETTE.other;
 }
 
 // FNV-1a 32-bit hash of a string. Used to derive a stable per-agent
@@ -209,12 +227,44 @@ function buildCube(machine) {
 // of cell size, breaking the grid stripe pattern while preserving the
 // "same fleet renders identically across reloads" contract.
 //
+// gov R7 arch-S2 / UP-3 — pid recycling caveat. Position is keyed on
+// `(pid|ppid)` only. Linux pid namespaces wrap at 32768 by default
+// (~minutes on a busy build host); a process that exits and a new one
+// landing at the same pid will render at the SAME position. This is
+// intentional for v1 — it keeps the layout stable across reloads when
+// fleet-wide pid space is sparse — but PR 8+ might want to add a
+// `(pid, start_time_ts)` salt to disambiguate recycled processes. Until
+// then, operators on long-running dashboards should treat dot-position
+// stability as "same pid bucket", not "same process identity".
+//
+// gov R7 arch-S4 — PR 11 InstancedMesh migration. When that polish
+// lands, this function's per-process `{process, x, y, z}` placement
+// shape stays valid (it's input data for either Mesh-per-dot or
+// InstancedMesh-instance-per-dot), but `buildProcessNode` returning a
+// per-process Mesh changes contract: hit-test will return
+// `intersection.instanceId` instead of `intersection.object`, and
+// the `processMeshes` flat array collapses from N entries to ≤6
+// (one InstancedMesh per category since the palette is the natural
+// partitioning). Dispose contract changes — InstancedMesh.dispose
+// frees the whole instance pool. Test pins on
+// `THREE.SphereGeometry(0.22, 6, 4) + THREE.MeshBasicMaterial +
+// processMeshes.push(dot)` will need to lift to the new pattern.
+//
 // Interior fraction is 0.78 — keeps every dot well inside the cube faces
 // (which are at ±CUBE_SIZE/2) so process dots never visually escape the
 // cube on rotation. Combined with PROCESS_DOT_RADIUS the worst-case dot
 // surface stays inside ~95% of the cube edge.
 const PROCESS_DOT_RADIUS = 0.22;
 const PROCESS_INTERIOR_FRACTION = 0.78;
+// gov R7 CAP-1: soft cap on dots rendered per cube. Agent-side
+// `tar.fleet_snapshot` already truncates at `kFleetSnapshotMaxRows`
+// (4096); this bound is for graceful degradation when an agent on
+// a heavily-threaded host (e.g. a JVM with thousands of threads)
+// exceeds typical visualization tolerances. Operator sees 1000 dots;
+// the rest are silently dropped. The cube tooltip's `processes`
+// count still shows the true total. PR 11 InstancedMesh will lift
+// this materially.
+const PROCESS_PER_CUBE_SOFT_CAP = 1000;
 function placeProcessesInCube(processes, cubeSize) {
   if (!processes || processes.length === 0) return [];
   const N = processes.length;
@@ -263,13 +313,30 @@ function placeProcessesInCube(processes, cubeSize) {
 // MeshBasicMaterial (not Phong/PBR) because lighting on a 0.22-unit
 // dot is invisible and the basic shader is materially cheaper per draw
 // call. The colour comes straight from the category palette.
+// gov R7 UP-2: graceful-degradation wrapper around per-process mesh
+// construction. If THREE.Color, SphereGeometry, or MeshBasicMaterial
+// throws (e.g. a future palette-table typo emits a non-hex string,
+// or a Three.js minor bump gains stricter validation), the throw must
+// NOT cascade out of addMachines and leave a half-built processGroup
+// orphaned with N-K dots in processMeshes. Caller treats null return
+// as "skip this process; render the others".
 function buildProcessNode(process) {
-  const color = new THREE.Color(pickCategoryColor(process && process.category));
-  const geom = new THREE.SphereGeometry(PROCESS_DOT_RADIUS, 6, 4);
-  const mat = new THREE.MeshBasicMaterial({color: color});
-  const mesh = new THREE.Mesh(geom, mat);
-  mesh.userData.yuzuProcess = process;
-  return mesh;
+  try {
+    const color = new THREE.Color(pickCategoryColor(process && process.category));
+    const geom = new THREE.SphereGeometry(PROCESS_DOT_RADIUS, 6, 4);
+    const mat = new THREE.MeshBasicMaterial({color: color});
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.userData.yuzuProcess = process;
+    return mesh;
+  } catch (e) {
+    // Console-only; don't surface to the operator overlay (one bad
+    // process should not blank the whole fleet). spdlog-style breadcrumb
+    // for dev console + Sentry-style remote beacons should one ever land.
+    if (typeof console !== 'undefined' && console.warn) {
+      console.warn('Yuzu viz: buildProcessNode failed; skipping dot.', e);
+    }
+    return null;
+  }
 }
 
 function buildHostnameLabel(hostname) {
@@ -501,7 +568,15 @@ function mount() {
   // PR 7: process dots eligible for raycasting hit-tests. Maintained as a
   // flat array (rather than walking the per-cube subgroups) so the
   // raycaster does one Object3D.matrixWorld read per dot instead of
-  // recursing through each cube's child graph. cleared in clearFleet().
+  // recursing through each cube's child graph. Mirrors the `cubeMeshes`
+  // flat-array pattern declared just above (gov R7 C-S-4 — both
+  // siblings under fleetGroup follow the same lifecycle: const
+  // declaration in mount scope, push() in addMachines, .length = 0 in
+  // clearFleet, intersectObjects(arr, false) first arg in onMouseMove,
+  // exposure on __internal). PR 8 edge meshes will follow the same
+  // pattern; arch-S1 recommends folding all three flat indices into a
+  // single registration array to enforce the lockstep contract by
+  // construction.
   const processMeshes = [];
 
   // gov R6 happy-S1 / UP-20: cubes carry a wireframe LineSegments child
@@ -522,6 +597,18 @@ function mount() {
     if (obj.geometry) obj.geometry.dispose();
   }
   function clearFleet() {
+    // gov R7 UP-1: reset the flat raycast indices BEFORE walking the
+    // tree. If `traverse(disposeNode)` throws partway through (e.g. a
+    // future Sprite child has a corrupt material.map, or a PR 8
+    // edgeMesh's geometry was already disposed), the function exits
+    // with the throw and the trailing `length = 0` lines never run —
+    // leaving stale references to half-disposed meshes in cubeMeshes
+    // and processMeshes that the next mousemove raycasts against.
+    // Resetting first means the raycast index reflects the
+    // "no-longer-valid" state immediately; even on a throw, the worst
+    // case is a benign empty raycast rather than ray-against-disposed.
+    cubeMeshes.length = 0;
+    processMeshes.length = 0;
     while (fleetGroup.children.length > 0) {
       const child = fleetGroup.children[0];
       fleetGroup.remove(child);
@@ -532,10 +619,6 @@ function mount() {
       // background refresher; this would be cumulative).
       child.traverse(disposeNode);
     }
-    cubeMeshes.length = 0;
-    // PR 7: traversal already disposed every dot inside each cube's
-    // processGroup; just drop the flat raycast index alongside cubeMeshes.
-    processMeshes.length = 0;
   }
 
   function addMachines(machines) {
@@ -556,8 +639,27 @@ function mount() {
       // every transform on the cube — no synchronisation required as
       // the OrbitControls camera moves or as PR 11 toggles per-cube
       // visibility for LOD culling. Layout coordinates are cube-local.
-      const procs = Array.isArray(p.machine && p.machine.processes)
+      //
+      // gov R7 CAP-1: agent-side `tar.fleet_snapshot` caps at
+      // kFleetSnapshotMaxRows (4096 today). At the documented
+      // machines_max ceiling (100k) the worst-case fleet would render
+      // 4096 × 100,000 = 409M dots — well past anything WebGL can
+      // handle pre-InstancedMesh (PR 11). For PR 7 we soft-cap dots
+      // per cube at PROCESS_PER_CUBE_SOFT_CAP so a single
+      // pathological-host fleet (e.g. a JVM threadpool with 4000
+      // threads) doesn't lock up the renderer; the cap is well above
+      // typical-machine counts (~50–200) so normal operators are
+      // unaffected.
+      // gov R7 HP-1: the earlier `buildCube(p.machine)` and
+      // `buildHostnameLabel(p.machine.hostname)` calls already deref
+      // `p.machine` without a guard — by the time we reach here,
+      // `p.machine` is guaranteed non-null (`layoutMachines` filters
+      // bogus rows). Drop the redundant `p.machine &&` clause.
+      const allProcs = Array.isArray(p.machine.processes)
         ? p.machine.processes : [];
+      const procs = allProcs.length > PROCESS_PER_CUBE_SOFT_CAP
+        ? allProcs.slice(0, PROCESS_PER_CUBE_SOFT_CAP)
+        : allProcs;
       if (procs.length > 0) {
         const processGroup = new THREE.Group();
         processGroup.name = 'yuzu-processes';
@@ -566,6 +668,11 @@ function mount() {
         for (let j = 0; j < procPlacements.length; j++) {
           const pp = procPlacements[j];
           const dot = buildProcessNode(pp.process);
+          // gov R7 UP-2: buildProcessNode returns null on construction
+          // failure (e.g. THREE.Color throws). Skip the failed dot
+          // rather than letting the throw cascade — the rest of the
+          // fleet still renders.
+          if (!dot) continue;
           dot.position.set(pp.x, pp.y, pp.z);
           processGroup.add(dot);
           processMeshes.push(dot);
@@ -632,14 +739,28 @@ function mount() {
   // The shared #viz-tooltip element inherits the cube tooltip's
   // max-width/max-height/word-break caps so a 100KB process name cannot
   // DoS layout (gov R6 UP-3 mirror).
+  // gov R7 UP-10: agent-controlled `process.name` could be 1MB+ from a
+  // pathological cmdline-as-comm parse on Linux. escapeHtml runs a
+  // synchronous regex over the full string and would stutter 50ms+ per
+  // tooltip render. Cap at 256 chars before escapeHtml so the worst-case
+  // hover stays under the 16ms frame budget. The tooltip's existing
+  // word-break + max-height CSS cap (gov R6 UP-3) bounds layout; this
+  // truncation bounds CPU.
+  const TOOLTIP_NAME_MAX = 256;
+  function clampForTooltip(s) {
+    const str = String(s);
+    if (str.length <= TOOLTIP_NAME_MAX) return str;
+    return str.slice(0, TOOLTIP_NAME_MAX - 1) + '…';
+  }
   function showProcessTooltip(process, evt) {
     const tip = ensureTooltip();
     const pid = Number(process && process.pid) | 0;
     tip.innerHTML =
       '<div style="font-weight:600;margin-bottom:0.2rem">' +
-      'pid ' + pid + ': ' + escapeHtml((process && process.name) || '(unknown)') + '</div>' +
-      '<div>user: ' + escapeHtml((process && process.user) || '?') + '</div>' +
-      '<div>category: ' + escapeHtml((process && process.category) || 'other') + '</div>';
+      'pid ' + pid + ': ' +
+      escapeHtml(clampForTooltip((process && process.name) || '(unknown)')) + '</div>' +
+      '<div>user: ' + escapeHtml(clampForTooltip((process && process.user) || '?')) + '</div>' +
+      '<div>category: ' + escapeHtml(clampForTooltip((process && process.category) || 'other')) + '</div>';
     const rect = canvas.getBoundingClientRect();
     tip.style.left = (evt.clientX - rect.left + 12) + 'px';
     tip.style.top = (evt.clientY - rect.top + 12) + 'px';
@@ -656,7 +777,22 @@ function mount() {
 
   const _ray = new THREE.Raycaster();
   const _ndc = new THREE.Vector2();
-  function onMouseMove(evt) {
+  // gov R7 perf-F1: rAF-throttle the raycast. mousemove fires up to
+  // ~120 Hz on macOS trackpads. With cubeMeshes + processMeshes both
+  // potentially in the hundreds of thousands at fleet ceilings, two
+  // intersectObjects calls at 120 Hz is the renderer's dominant CPU
+  // cost (perf-F1). Coalesce events into one raycast per
+  // requestAnimationFrame tick (~60 Hz cap) by stashing the latest
+  // event and processing it at most once per frame. PR 11 polish adds
+  // a per-cube bounding-sphere prefilter (perf-F2) and InstancedMesh
+  // (which collapses processMeshes from N entries to 1).
+  let _pendingMouseEvt = null;
+  let _rafScheduled = false;
+  function processPendingMouse() {
+    _rafScheduled = false;
+    const evt = _pendingMouseEvt;
+    _pendingMouseEvt = null;
+    if (!evt) return;
     if (cubeMeshes.length === 0 && processMeshes.length === 0) {
       hideTooltip();
       return;
@@ -672,6 +808,13 @@ function mount() {
     // by distance and the operator can never hover a process dot
     // through the translucent shell. Raycast processMeshes first; only
     // fall through to cubeMeshes when no process is intersected.
+    //
+    // gov R7 arch-N1: when PR 8/9 land edge meshes, the ordering will
+    // become: processMeshes → edgeMeshes → cubeMeshes. Edges are 1D
+    // primitives drawn on top of cube faces; an operator hovering an
+    // edge through the translucent cube wants edge details, not cube
+    // details, but a hovered process dot still wins. Pin the order
+    // here so PR 8 doesn't have to re-derive it.
     if (processMeshes.length > 0) {
       const procHits = _ray.intersectObjects(processMeshes, false);
       if (procHits.length > 0 && procHits[0].object.userData.yuzuProcess) {
@@ -684,6 +827,13 @@ function mount() {
       showTooltip(hits[0].object.userData.yuzuMachine, evt);
     } else {
       hideTooltip();
+    }
+  }
+  function onMouseMove(evt) {
+    _pendingMouseEvt = evt;
+    if (!_rafScheduled) {
+      _rafScheduled = true;
+      requestAnimationFrame(processPendingMouse);
     }
   }
   canvas.addEventListener('mousemove', onMouseMove);
