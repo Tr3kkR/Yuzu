@@ -74,9 +74,18 @@ public:
     /// dev/UAT where mTLS is disabled. Internally also runs an
     /// opportunistic GC pass on stale entries (last_refill_at older
     /// than 24 h) so a long-lived server does not accumulate dead
-    /// buckets from short-lived peers. Public to allow direct unit
-    /// testing; the production caller is `DownloadUpdate` in the
-    /// implementation.
+    /// buckets from short-lived peers.
+    ///
+    /// **Public-but-internal**: the canonical production caller is
+    /// `AgentServiceImpl::DownloadUpdate` (one site, marked at the
+    /// call). Public visibility is retained so unit tests can drive
+    /// bucket logic without standing up a full bidi-stream fixture —
+    /// matches the existing pattern of public `record_execution_id` /
+    /// `process_gateway_response` helpers in this class. Treat as part
+    /// of the internal API: do not add new production call sites
+    /// without first considering whether a shared `PerPeerRateLimiter`
+    /// primitive should be extracted (architect S-1 / #933 documents
+    /// the trigger condition for that extraction).
     bool admit_download_update(const std::string& peer);
 
     void set_tag_store(TagStore* store) { tag_store_ = store; }
@@ -253,7 +262,7 @@ private:
         double tokens = 5.0;
         std::chrono::steady_clock::time_point last_refill_at = std::chrono::steady_clock::now();
     };
-    mutable std::mutex download_update_buckets_mu_;
+    std::mutex download_update_buckets_mu_;
     std::unordered_map<std::string, DownloadUpdateBucket> download_update_buckets_;
     std::chrono::steady_clock::time_point download_update_buckets_last_gc_ =
         std::chrono::steady_clock::now();

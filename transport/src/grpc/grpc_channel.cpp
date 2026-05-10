@@ -674,6 +674,11 @@ public:
         }
         if (!rw_) return Status{StatusCode::Unavailable, "transport: stream not started"};
 
+        // Idempotent under multi-call: the `finished_` short-circuit at
+        // the top of the if-block returns the cached `final_yt_status_`
+        // on every subsequent call, so a defensive double-read by the
+        // caller (or a race with a writer thread checking after the
+        // reader exits) is safe (closet-clean Round-1 #938.a).
         std::unique_lock<std::mutex> lock(mtx_);
         if (!finished_) {
             // Drain reads until peer half-closes so trailing-status is

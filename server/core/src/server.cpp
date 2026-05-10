@@ -206,9 +206,15 @@ public:
                           "(direction=opened|closed).",
                           "counter");
         metrics_.describe("yuzu_server_transport_active_streams",
-                          "Active transport streams on the agent listener (open minus "
-                          "closed). Operators can graph this versus "
-                          "yuzu_server_transport_bidi_pool_size to spot saturation.",
+                          "Active client-direction transport streams on the agent listener's "
+                          "MetricsRegistry. As of closet-clean Round-1 the gRPC backend wires "
+                          "on_stream_opened/on_stream_closed only on the channel side "
+                          "(grpc_channel.cpp), so this gauge counts streams the server itself "
+                          "OPENS as a client (gateway-upstream + gateway-cmd-forward), NOT "
+                          "incoming agent connections. The server-side ServerCall wiring is "
+                          "deferred to #938 follow-up; until then, prefer "
+                          "yuzu_server_transport_bidi_pool_in_flight to gauge incoming-stream "
+                          "saturation.",
                           "gauge");
         metrics_.describe("yuzu_server_transport_bytes_total",
                           "Total bytes flowing through the agent listener "

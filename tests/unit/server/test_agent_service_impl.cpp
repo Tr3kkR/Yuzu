@@ -336,7 +336,7 @@ TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
 // ── #913: per-peer DownloadUpdate token bucket ─────────────────────────────
 
 TEST_CASE("admit_download_update: bucket starts full and admits up to capacity",
-          "[agent_service][rate_limit][p913]") {
+          "[agent_service][rate_limit]") {
     GatewayResponseHarness h;
 
     // Default capacity is 5 tokens; the first 5 admissions for a fresh
@@ -353,7 +353,7 @@ TEST_CASE("admit_download_update: bucket starts full and admits up to capacity",
 
 TEST_CASE("admit_download_update: per-peer isolation — one peer's exhaustion "
           "does not block another",
-          "[agent_service][rate_limit][p913]") {
+          "[agent_service][rate_limit]") {
     GatewayResponseHarness h;
 
     // Drain peer-A.
@@ -373,7 +373,7 @@ TEST_CASE("admit_download_update: per-peer isolation — one peer's exhaustion "
 }
 
 TEST_CASE("admit_download_update: empty peer key still tracked under empty-string bucket",
-          "[agent_service][rate_limit][p913]") {
+          "[agent_service][rate_limit]") {
     // No SAN identity AND no peer_uri (impossible in practice; defensive
     // path). The empty-string key still gets a bucket; not special-cased.
     GatewayResponseHarness h;

@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **Closet-clean governance Round-2 trivial bundle (#933 + #937 + #938
+  partial).** Closes 2 full follow-up issues + half of a third without
+  changing any runtime behavior; pure annotation / comment / doc /
+  small-text cleanup. All from the Round-1 follow-up backlog.
+  - **#933 architect S-1**: `AgentServiceImpl::admit_download_update`
+    docstring clarified as public-but-internal (canonical caller is
+    `DownloadUpdate`; public visibility retained for unit testability,
+    matching the existing `record_execution_id` /
+    `process_gateway_response` pattern). Production call site at
+    `agent_service_impl.cpp:1200` gains a "canonical caller" comment.
+  - **#937.1**: `docs/ci-cpp23-troubleshooting.md` NTP/MSVC section
+    promoted from a sub-heading inside section 2 ("Apple Clang") to
+    its own section 3; sections 3-8 renumbered to 4-9.
+  - **#937.2**: `docs/adrs/0001-quic-transport-msquic-quicer.md`
+    mitigation matrix gains 4 new rows for UP-101 (chunk-write
+    deadline #911), UP-116 (per-peer rate limit #913), OBS-1 (bidi
+    pool saturation metric #912), OBS-2 (ServerTransportMetricSink
+    wiring #905). SOC 2 audit posture now reflects all closet-clean
+    Round-1 mitigations.
+  - **#937.3**: `docs/pr-1c-lift-plan.md` gains a "PR 1c-4 governance
+    follow-ups (shipped 2026-05-10)" subsection enumerating the 6
+    closet-clean commits + 13 closed/filed issues, so future Claude
+    sessions don't re-derive what shipped.
+  - **#937.4**: `docs/observability-conventions.md` label vocabulary
+    extended with `direction` / `kind` / `reason` / `phase` (the
+    transport-layer extension labels). Cardinality rule documented.
+  - **#937.5**: N/A — no standalone customer security questionnaire
+    doc exists; the OTA DoS narrative is captured in the ADR-0001
+    mitigation matrix (#937.2).
+  - **#938.a**: `final_status()` idempotency comment in
+    `transport/src/grpc/grpc_channel.cpp` — the `finished_`
+    short-circuit makes multi-call safe; previously implicit, now
+    explicit.
+  - **#938.b**: dropped unused `mutable` keyword on
+    `download_update_buckets_mu_` (no const member function locks
+    it; cpp-expert INFO-3).
+  - **#938.c**: rate-limit test tag renamed from `[p913]` to bare
+    `[agent_service][rate_limit]` (drops the issue-number convention
+    that was a one-off; matches existing tag style; qe Q8).
+  - **#938.d**: `yuzu_server_transport_active_streams` describe text
+    clarified — currently counts only client-direction streams (the
+    listener-side `on_stream_opened`/`closed` wiring is deferred to
+    a #938 follow-up). Contract was previously misleading.
+
+  No tests changed semantically (the tag rename only affects
+  `--filter` selection, not test behaviour). Validated on macOS
+  arm64: transport + server + agent suites green.
 - **Closet-clean governance Round-1 hardening.** Closet-clean follow-up
   governance produced 4 BLOCKING docs items + 1 BLOCKING qe item +
   1 SHOULD code item that downgraded from BLOCKING after sre Q1 corrected

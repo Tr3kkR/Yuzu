@@ -1197,6 +1197,9 @@ AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& ctx,
     {
         const std::string peer_key =
             ctx.peer_san_identities.empty() ? ctx.peer_uri : ctx.peer_san_identities.front();
+        // Canonical production call site for `admit_download_update`
+        // (the method is public-but-internal — see the doc block on
+        // its declaration in `agent_service_impl.hpp`).
         if (!admit_download_update(peer_key)) {
             metrics_
                 .counter("yuzu_grpc_requests_total",

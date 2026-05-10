@@ -210,6 +210,44 @@ the branch — land one, rebase the next.
     `BidiStream::read()` returning false, which is the canonical
     cross-backend pattern.
 
+#### PR 1c-4 governance follow-ups (shipped 2026-05-10)
+
+After PR 1c-4 merged, a closet-clean session shipped 6 follow-up
+commits closing the deferred governance backlog (range `62bf9d2..06cf8d5`),
+followed by `/governance` Round-1 hardening (`7cf8126`) which closed
+the BLOCKING items the closet-clean session itself produced.
+
+| Issue | Commit | Description |
+|---|---|---|
+| #915 (P1) | `4fb435c` | Negative-deadline contract clarified to clamp-to-zero (UP-110 / arch-S1) |
+| #929 (P2) | `4fb435c` | `[[nodiscard]]` on `read_pb` / `write_pb` |
+| #926 (P2) | `4f1d2c5` | qe S-2 nullptr open_bidi unit test |
+| #927 (P2) | `4f1d2c5` | qe S-3 concurrent shared-stream writes unit test |
+| #914 (P1) | `0143cee` | NTP-step sanity log on unary DeadlineExceeded + MSVC chrono doc |
+| #911 (P0) | `d34a091` | `BidiStream::write` per-frame deadline; server `DownloadUpdate` 30 s chunk-write deadline; agent `Updater` 5 s request-frame write deadline |
+| #924 (SRE-2) | `d34a091` | Agent OTA chunk-deadline counter (`yuzu_agent_ota_chunk_deadline_total{phase}`) |
+| #912 (P0) | `edcea4b` | `TransportMetricSink` saturation hooks + `bidi_pool_size`/`in_flight`/`saturated_total` metrics |
+| #905 | `edcea4b` | `ServerTransportMetricSink` wiring at agent-listener creation |
+| #925 (SRE-3) | `edcea4b` + `7cf8126` | Reconnect-reason label split (channel_fault / peer_halfclose / stream_open_failed / enrollment_pending) + 3 Grafana alerts |
+| #913 (P0) | `06cf8d5` | Per-peer DownloadUpdate token bucket rate limit (UP-116) |
+| #916 | `0b5f89c` | Server-side `CallContext::cancel` contract softened to backend-best-effort — closed on GitHub manually |
+
+Round-1 hardening (`7cf8126`) closed all BLOCKING governance items
+(4 docs + 1 metric describe dedup + 1 test-coverage drift) and folded
+in the load-bearing SHOULDs (in_flight contract drift, enrollment_pending
+4th label, alert annotation language). Remaining SHOULD/NICE items
+filed as **#932-#938**:
+
+| Issue | Description |
+|---|---|
+| #932 | UP-209 final_status wedge on dead server (P1) |
+| #933 | architect S-1 admit_download_update public surface (P2) |
+| #934 | UP-206 slow-link compound lockout — operator-tunable deadline + don't-consume-token-on-deadline (P1) |
+| #935 | sec MEDIUM-1 + UP-201/2/3/5 + sre Q10 — bucket cap + size metric + multi-server HA gap (P1) |
+| #936 | qe Q4/Q5/Q6 — ServerTransportMetricSink + OTA counter + reason-label test coverage (P2) |
+| #937 | doc SHOULD-FIX backlog (P2) |
+| #938 | code SHOULD/NICE backlog (P2) |
+
 ### PR 1c-5 — Server-side: lift `gateway_service_impl` + `ManagementServiceImpl` + gw_mgmt_channel_
 
 * Same pattern as 1c-2 for the management + gateway-upstream services.

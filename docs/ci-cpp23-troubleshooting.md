@@ -116,7 +116,9 @@ project('myproject', 'cpp', default_options: ['cpp_std=c++23'])
 add_project_arguments('-std=c++23', language: 'cpp')
 ```
 
-### MSVC pre-19.38 `cv_.wait_for` + gRPC `system_clock` deadlines: NTP step risk (#914 / UP-108)
+---
+
+## 3. MSVC pre-19.38 `cv_.wait_for` + gRPC `system_clock` deadlines: NTP step risk (#914 / UP-108)
 
 `std::condition_variable::wait_for(lock, duration, pred)` is the workhorse primitive in any cross-platform RPC layer. The duration overload is supposed to be steady-clock-based, but **MSVC < 19.38 implemented it on `system_clock` internally** — meaning a backward NTP step adjustment expires the wait early, and a forward step delays it.
 
@@ -141,7 +143,7 @@ Yuzu's project floor is exactly **MSVC 19.38**. Any backsliding to 19.34 surface
 
 ---
 
-## 3. macOS linker rejects GNU flags
+## 4. macOS linker rejects GNU flags
 
 **Symptom:** `ld: unknown option: -z` on macOS.
 
@@ -156,7 +158,7 @@ endif
 
 ---
 
-## 4. macOS-specific API differences
+## 5. macOS-specific API differences
 
 These are **platform differences**, not compiler version issues. They apply regardless of which Xcode you use.
 
@@ -166,7 +168,7 @@ These are **platform differences**, not compiler version issues. They apply rega
 
 ---
 
-## 5. vcpkg on CI: the 90-minute tax
+## 6. vcpkg on CI: the 90-minute tax
 
 Without binary caching, vcpkg builds gRPC + protobuf + abseil from source on every CI run. This takes 40-90 minutes.
 
@@ -193,7 +195,7 @@ vcpkg's release-only triplets (`x64-linux-release`, `arm64-osx-release`) can pro
 
 ---
 
-## 6. ccache: silently doing nothing
+## 7. ccache: silently doing nothing
 
 If you use Meson native files with a `[binaries]` section, Meson ignores `CC`/`CXX` environment variables — so your `CC='ccache gcc-13'` never reaches the compiler. ccache is installed, configured, and cached, but never invoked.
 
@@ -233,7 +235,7 @@ key: ccache-${{ matrix.compiler }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h
 
 ---
 
-## 7. CI workflow hygiene
+## 8. CI workflow hygiene
 
 Things we added after getting burned:
 
@@ -257,7 +259,7 @@ timeout-minutes: 90
 
 ---
 
-## 8. Validate locally with Docker
+## 9. Validate locally with Docker
 
 Don't iterate on CI by pushing and waiting 40 minutes. Build a local CI image with deps pre-compiled:
 

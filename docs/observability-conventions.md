@@ -7,7 +7,8 @@ The `sre` and `architect` agents load this document on any change that adds, rem
 - All metrics use the `yuzu_` prefix.
   - Server metrics: `yuzu_server_*`
   - Agent metrics: `yuzu_agent_*`
-- **Consistent label set:** `agent_id`, `plugin`, `method`, `status`, `os`, `arch`. Avoid one-off labels — they prevent cross-cutting Grafana queries.
+- **Consistent base label set:** `agent_id`, `plugin`, `method`, `status`, `os`, `arch`. Avoid one-off labels — they prevent cross-cutting Grafana queries.
+- **Transport-layer extension labels** (introduced with the transport abstraction): `direction` ∈ {sent, received, opened, closed}, `kind` ∈ {std_exception, non_std_exception, dispatcher_internal}, `reason` ∈ {channel_fault, peer_halfclose, stream_open_failed, enrollment_pending}, `phase` ∈ {write, read}. All bounded-cardinality and operator-controlled (or hard-coded enum), never attacker-supplied. Used on `yuzu_server_transport_*`, `yuzu_agent_ota_chunk_deadline_total`, `yuzu_agent_reconnections_total`. Adding a new transport-layer label here MUST keep the cardinality bounded — if the label value comes from the wire, validate it against an allowlist before passing to `metrics_.counter(..., {{label, value}})`.
 - **Histogram buckets** (default for latency-style histograms): `0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0`.
 - Health endpoints (`/livez`, `/readyz`, `/healthz`) reflect every component's health and are scrapable.
 
