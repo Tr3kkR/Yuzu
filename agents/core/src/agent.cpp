@@ -447,11 +447,13 @@ public:
                           "Plugins rejected at load time, labeled by reason", "counter");
         metrics_.describe("yuzu_agent_reconnections_total",
                           "Total agent connection-loop reconnects, labeled by reason "
-                          "(channel_fault | peer_halfclose | stream_open_failed). "
-                          "channel_fault = transport-level error (Register RPC failed, "
-                          "Subscribe stream final_status non-Ok). peer_halfclose = "
-                          "server gracefully closed bidi (Subscribe final_status Ok). "
-                          "stream_open_failed = open_bidi() returned null. SRE-3 / #925.",
+                          "(channel_fault | peer_halfclose | stream_open_failed | "
+                          "enrollment_pending). channel_fault = transport-level error "
+                          "(Register RPC failed, Subscribe stream final_status non-Ok). "
+                          "peer_halfclose = server gracefully closed bidi (Subscribe "
+                          "final_status Ok). stream_open_failed = open_bidi() returned "
+                          "null. enrollment_pending = RegisterResponse pending admin "
+                          "approval. SRE-3 / #925 + closet-clean Round-1.",
                           "counter");
     }
 
@@ -923,6 +925,14 @@ public:
                     if (resp.reject_reason().find("pending") != std::string::npos) {
                         spdlog::warn("Registration pending admin approval — retrying");
                         ++reconnect_count;
+                        // SRE-3 / #925: 4th reason label so dashboards see
+                        // pending-enrollment soak as distinct from
+                        // channel_fault / stream_open_failed (closet-clean
+                        // Round-1 hardening: architect S-2 / UP-212 / S-3).
+                        metrics_
+                            .counter("yuzu_agent_reconnections_total",
+                                     {{"reason", "enrollment_pending"}})
+                            .increment();
                         continue; // Retry until approved
                     }
                     spdlog::error("Server permanently rejected registration: {}",
@@ -934,6 +944,11 @@ public:
                 if (enrollment_status == "pending") {
                     spdlog::warn("Registration pending admin approval - retrying in backoff");
                     ++reconnect_count;
+                    // SRE-3 / #925: see comment at the prior pending site.
+                    metrics_
+                        .counter("yuzu_agent_reconnections_total",
+                                 {{"reason", "enrollment_pending"}})
+                        .increment();
                     continue; // Retry until approved
                 }
 

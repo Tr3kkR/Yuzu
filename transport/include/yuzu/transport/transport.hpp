@@ -656,11 +656,18 @@ struct TransportMetricSink {
     //
     // `on_bidi_pool_in_flight_delta(+1)` fires on enqueue (call accepted
     // into the pool); `on_bidi_pool_in_flight_delta(-1)` fires on
-    // dequeue (worker picked the call up and is about to run the
-    // handler). Implementations typically expose the running sum as a
-    // gauge. Note: the residency gauge measures queue depth, not
-    // concurrent handler count — a worker running a long-lived bidi
-    // handler holds 0 in-flight units.
+    // worker-loop completion AFTER the handler returns. Implementations
+    // typically expose the running sum as a gauge. The gauge therefore
+    // measures **slot residency including the active handler** — a
+    // worker running a long-lived bidi handler holds 1 in-flight unit
+    // for the handler's lifetime, not 0. This matches the operational
+    // intent of the `YuzuBidiPoolNearSaturation` alert
+    // (`in_flight / size > 0.8`): it pages when 80%+ of pool slots are
+    // currently in use, which is the actual "scale the pool" signal.
+    // (closet-clean Round-1 hardening: aligned contract with the gRPC
+    // backend's actual firing point, which decrements after
+    // `run_bidi_handler()` returns. cpp-expert INFO-2 / consistency S-1
+    // / UP-218.) Implementations MAY silently drop `delta == 0` calls.
     //
     // `on_bidi_pool_saturated` fires on the saturation reject path —
     // `bidi_dispatcher_pool_size` calls are already enqueued and a new

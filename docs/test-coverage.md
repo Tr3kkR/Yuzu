@@ -1,14 +1,14 @@
 # Test Coverage Tracking
 
-Last updated: 2026-05-10
+Last updated: 2026-05-10 (post PR 1c-4 closet-clean governance Round-1)
 
 ## Overview
 
 | Suite | Executable | Test Files | Status |
 |-------|-----------|------------|--------|
 | Agent unit tests | `yuzu_agent_tests` | 17 files | Active |
-| Server unit tests | `yuzu_server_tests` | 34 files | Active (requires `build_server=true`) |
-| Transport unit tests | `yuzu_transport_tests` | 1 file | Active |
+| Server unit tests | `yuzu_server_tests` | 35 files | Active (requires `build_server=true`) |
+| Transport unit tests | `yuzu_transport_tests` | 1 file (~42 cases) | Active |
 
 **Totals:** 52 test files. Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests.
 
@@ -38,7 +38,7 @@ Run all tests: `meson test -C builddir --print-errorlogs`
 | `test_tar_store.cpp` | TAR store | Timeline event persistence, query by time range, agent scoping |
 | `test_parse_target_address.cpp` | Agent target-address parser (#376 PR 1c-3) | host:port rejection-path matrix + IPv6 happy paths + `static_assert(noexcept(...))` contract pin (22 cases / 44 assertions) |
 | `test_heartbeat_cancel_pattern.cpp` | Agent Heartbeat per-cycle `stop_source` wiring (#376 PR 1c-3) | emplace replacement semantics, in-flight unary returns Cancelled on request_stop, cycle-2 fresh token (3 cases / 24 assertions) |
-| `test_agent_subscribe_lift.cpp` | Agent Subscribe + DownloadUpdate lift onto `transport::Channel` (#376 PR 1c-4) | Subscribe multi-frame proto round-trip, per-cycle stop_source plumbing, reconnect-cycle fresh-token, DownloadUpdate happy path with writes_done(), per-chunk read deadline expiry (5 cases / 102 assertions) |
+| `test_agent_subscribe_lift.cpp` | Agent Subscribe + DownloadUpdate lift onto `transport::Channel` (#376 PR 1c-4 + closet-clean) | Subscribe multi-frame proto round-trip, per-cycle stop_source plumbing, reconnect-cycle fresh-token, DownloadUpdate happy path with writes_done(), per-chunk read deadline expiry, **qe S-2 nullptr open_bidi (#926)**, **qe S-3 concurrent shared-stream writes (#927)** (7 cases / 125 assertions) |
 
 ### Untested Agent Components
 
@@ -121,6 +121,7 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_schedule_engine.cpp` | Scheduler | Cron scheduling, next-run calculation, scope-based targeting |
 | `test_webhook_store.cpp` | Webhooks | Subscription CRUD, HMAC-SHA256 signing, delivery |
 | `test_security_headers.cpp` | HTTP security headers (SOC2-C1) | `validate_csp_extra_sources` accept/reject grammar (control bytes, semicolons, unsafe keywords, hash/nonce expressions, quoted/unquoted tokens, position tracking), `build_csp` directives + extras + `upgrade-insecure-requests` gating, `build_permissions_policy` deny-all baseline, `build_referrer_policy`, `HeaderBundle::apply` six-header emission, end-to-end integration via `httplib::Server`/`httplib::Client` (38 cases) |
+| `test_agent_service_impl.cpp` | AgentServiceImpl response-path helpers + per-peer rate limit (#913) | record_execution_id mapping, process_gateway_response execution_id stamping, multi-agent fan-out non-erase invariant, terminal SUCCESS folds into RUNNING rows, re-mapping a command_id, **admit_download_update bucket-starts-full + per-peer isolation + empty-key handling** (closet-clean Round-1, 28 assertions in 3 [rate_limit] cases) |
 
 ### Untested Server Components
 
@@ -133,6 +134,27 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | **HTML fragment renderers** | Output is fragile HTML strings | Very Low |
 | **Web route handlers** | Requires full httplib mock | Low |
 | **TLS credential loading** | Requires filesystem + certs | Low |
+| **ServerTransportMetricSink** | Currently exercised only via the full agent listener integration; per-callback unit coverage deferred (consistency Q5 from PR 1c-4 closet governance) | Medium |
+| **OTA chunk-deadline counter increment** (`yuzu_agent_ota_chunk_deadline_total`) | Counter site in `agents/core/src/updater.cpp` only verified by inspection — no test drives the deadline-expiry path through the real `Updater` instance | Medium |
+| **Reconnect-reason label increments** | Counter sites in `agents/core/src/agent.cpp` connection loop verified by inspection — no test asserts the label value for `channel_fault` / `peer_halfclose` / `enrollment_pending` paths | Medium |
+
+---
+
+## Transport Tests
+
+### Tested
+
+| File | Component | What's Covered |
+|------|-----------|----------------|
+| `test_transport_smoke.cpp` | Transport abstraction smoke + bidi deadline battery | Channel + ServerListener happy paths, bidi round-trip, in-proc gRPC fixture, ALPN negotiation, **bidi read deadline (#902)**, **bidi write deadline (#911)** including negative-deadline-clamp + cancel-short-circuit + happy-path-with-deadline (closet-clean Round-1, 6 cases / 63 assertions in `[deadline]` battery), pool fanout + saturation reject path, `bound_endpoint()` semantics |
+
+### Untested Transport Paths
+
+| Path | Why Untested | Priority |
+|------|--------------|----------|
+| **Bidi write deadline expiry under HTTP/2 flow-control fill** | Engineering an HTTP/2 flow-control fill in CI is rejected as flake-prone; structurally identical to the read-side path which is covered | Low |
+| **Bidi pool gauge under-read on transient saturation** | UP-218 — needs synthetic burst harness | Medium |
+| **Token-bucket refill arithmetic** | Implementation is straightforward; deferred unit test would synthesize a stale `last_refill_at` and assert refill | Low |
 
 ---
 

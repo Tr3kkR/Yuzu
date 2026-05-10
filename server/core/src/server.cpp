@@ -227,10 +227,11 @@ public:
                           "from internal-failure signals (#912 / CMP-2).",
                           "counter");
         metrics_.describe("yuzu_server_transport_bidi_pool_in_flight",
-                          "Bidi dispatcher-pool calls currently in-flight on the agent "
-                          "listener (queued or dequeued-but-not-yet-decremented). "
-                          "Compare against yuzu_server_transport_bidi_pool_size for "
-                          "saturation alerting.",
+                          "Bidi dispatcher-pool slot residency on the agent listener: "
+                          "queued calls + active handlers. The matching -1 fires AFTER "
+                          "the handler returns, so a long-running bidi handler holds 1 "
+                          "unit for its lifetime. Compare against "
+                          "yuzu_server_transport_bidi_pool_size for saturation alerting.",
                           "gauge");
         metrics_.describe("yuzu_server_transport_bidi_pool_size",
                           "Bidi dispatcher-pool configured cap on the agent listener. "
@@ -332,7 +333,13 @@ public:
         metrics_.describe("yuzu_command_duration_seconds", "Command execution latency in seconds",
 
                           "histogram");
-        metrics_.describe("yuzu_grpc_requests_total", "Total gRPC requests by method and status",
+        metrics_.describe("yuzu_grpc_requests_total",
+                          "Total gRPC requests by method + status. Bounded status values: "
+                          "received, completed, deadline_exceeded, "
+                          "chunk_write_deadline_exceeded (#911), rate_limited_per_peer "
+                          "(#913). The terminal-status values (the last three) fire on "
+                          "the per-call denial path; received fires at handler entry; "
+                          "completed fires at successful handler return.",
                           "counter");
         metrics_.describe("yuzu_http_requests_total", "Total HTTP requests by path and status",
                           "counter");

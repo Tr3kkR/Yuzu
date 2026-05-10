@@ -33,14 +33,13 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
     : registry_(registry), bus_(bus), auth_mgr_(auth_mgr), auto_approve_(auto_approve),
       metrics_(metrics), require_client_identity_(require_client_identity),
       gateway_mode_(gateway_mode), update_registry_(update_registry) {
-    // #913 / UP-116 saturation reject metric description.
-    metrics_.describe("yuzu_grpc_requests_total",
-                      "Total gRPC requests by method + status (status="
-                      "received|completed|chunk_write_deadline_exceeded|"
-                      "rate_limited_per_peer|deadline_exceeded). The "
-                      "rate_limited_per_peer status fires when DownloadUpdate's "
-                      "per-peer token bucket is exhausted (#913).",
-                      "counter");
+    // `yuzu_grpc_requests_total` describe is owned by the canonical
+    // registration site at `server.cpp` `setup_metrics()`. Adding a second
+    // describe here would silently overwrite the help text depending on
+    // construction order (consistency B-1 / sre Q1 from PR 1c-4 closet
+    // governance round 1). The label-set extension for `rate_limited_per_peer`
+    // and `chunk_write_deadline_exceeded` is documented at the canonical
+    // site. Do not re-introduce a describe call here.
 }
 
 // -- admit_download_update (per-peer token bucket, #913) ----------------------

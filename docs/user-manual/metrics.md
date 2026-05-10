@@ -369,6 +369,54 @@ This data reveals your fleet's attack surface to anyone who can reach the metric
 
 > **Default posture:** The server binds to `127.0.0.1` and requires auth for remote `/metrics` access. No action is needed if you scrape from localhost.
 
+## Transport observability (#905 / #912)
+
+The agent listener pumps per-call observability into the `yuzu_server_transport_*` namespace. Wired in 0.13.x — pre-0.13 these metrics did not exist.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `yuzu_server_transport_streams_total` | counter | `direction` ∈ {opened, closed}, `method` | One increment per stream open + one per close. `direction` distinguishes start from end of stream lifetime. |
+| `yuzu_server_transport_active_streams` | gauge | (none) | Open streams minus closed streams. Eventually returns to 0; persistent non-zero post-quiet-period suggests a torn shutdown leaked an open count (operator: process restart resets). |
+| `yuzu_server_transport_bytes_total` | counter | `direction` ∈ {sent, received} | Total bytes flowing through the listener. Useful for sanity-checking throughput. |
+| `yuzu_server_transport_dispatcher_throws_total` | counter | `kind` ∈ {std_exception, non_std_exception, dispatcher_internal} | Dispatcher-layer exception counter. Distinct from `bidi_pool_saturated_total` — saturation is capacity, throws are bugs. Investigate any non-zero rate. |
+| `yuzu_server_transport_bidi_pool_size` | gauge | (none) | The configured `--bidi-dispatcher-pool-size`. Set once at start, zeroed at shutdown. |
+| `yuzu_server_transport_bidi_pool_in_flight` | gauge | (none) | Slot residency: queued calls + active handlers. Long-running bidi handlers hold 1 unit for their lifetime. |
+| `yuzu_server_transport_bidi_pool_saturated_total` | counter | `method` | Saturation rejects (peer saw `ResourceExhausted`). One per fired reject. |
+
+Three Grafana alerts ship in `deploy/grafana/yuzu-alerts.yml` against this surface — see `docs/ops-runbooks/transport-saturation.md` for the runbook.
+
+## OTA observability (#911 / #913 / #924)
+
+The OTA path emits both client-side (agent) and server-side (`yuzu-server`) counters so operators can correlate failure across the boundary.
+
+### Server side (extends `yuzu_grpc_requests_total`)
+
+`yuzu_grpc_requests_total{method="DownloadUpdate"}` gains two new bounded `status` values in 0.13.x:
+
+| Status | Cause | Operator action |
+|---|---|---|
+| `chunk_write_deadline_exceeded` | Per-chunk write deadline (30 s) fired during chunk streaming — peer's TCP receive window collapsed or NAT/firewall held the stream. | If sustained: investigate the network path, consider whether to front the listener with a gateway (which terminates closer to the agent edge). If a single peer: that peer's link is dropping. |
+| `rate_limited_per_peer` | Per-peer token bucket exhausted (5 tokens, ~1 token / 90 min refill). The peer hammered DownloadUpdate. | If a single peer: investigate that peer for misbehavior or compromise. If many peers: bucket sizing may be too tight for your fleet — file an issue (the constants are not yet operator-tunable). |
+
+### Agent side
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `yuzu_agent_ota_chunk_deadline_total` | counter | `phase` ∈ {write, read} | Per-frame deadline expiries observed by the agent during DownloadUpdate. `phase=write` = request-frame write deadline (5 s) tripped — usually means the channel is stuck before the request even landed. `phase=read` = chunk-read deadline (30 s) tripped — server stalled mid-stream or the channel is broken. |
+
+## Reconnect observability (SRE-3 / #925)
+
+`yuzu_agent_reconnections_total` gains a `reason` label in 0.13.x. **Existing bare-counter PromQL still works** (aggregates across labels); operators alerting on the bare counter need no migration.
+
+| Reason | Cause |
+|---|---|
+| `channel_fault` | Transport-level error: Register RPC failed, OR Subscribe stream final_status was non-Ok. The most operator-actionable signal — TLS rotation gone wrong, certificate expiry, listener restart loop. |
+| `peer_halfclose` | Server gracefully closed bidi (Subscribe final_status Ok). Benign — happens during planned restart. |
+| `stream_open_failed` | `open_bidi()` returned null (resource exhaustion, listener saturation, channel closed). |
+| `enrollment_pending` | RegisterResponse marked the agent pending admin approval. Will retry on next backoff cycle. |
+
+The `YuzuAgentChannelFaultRate` alert in `deploy/grafana/yuzu-alerts.yml` fires on `channel_fault` rate > 0.5/s sustained.
+
 ## Planned features
 
 | Feature | Roadmap | Description |

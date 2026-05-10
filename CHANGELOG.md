@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **Closet-clean governance Round-1 hardening.** Closet-clean follow-up
+  governance produced 4 BLOCKING docs items + 1 BLOCKING qe item +
+  1 SHOULD code item that downgraded from BLOCKING after sre Q1 corrected
+  the actual `MetricsRegistry::describe()` semantics (silent-overwrite,
+  not Prometheus-rejection). Round-1 hardening commit closes all 5
+  BLOCKING items + 4 SHOULDs:
+  - **Dedup `yuzu_grpc_requests_total` describe**: removed second
+    registration in `agent_service_impl.cpp` constructor (silently
+    overwrites the canonical `server.cpp` registration depending on
+    ctor order); extended the `server.cpp` description to enumerate
+    all bounded status values (consistency B-1 / sre Q1).
+  - **Fourth reconnect reason label `enrollment_pending`** at
+    `agent.cpp:925, 947`: previously the pending-enrollment paths
+    incremented `reconnect_count` without firing the labeled metric,
+    making admin-pending soaks invisible to dashboards (architect
+    S-2 / UP-212 / consistency S-3).
+  - **`on_bidi_pool_in_flight_delta` contract block aligned with
+    impl**: contract previously claimed "queue depth, not concurrent
+    handler count" but the gRPC backend decrements AFTER
+    `run_bidi_handler` returns, so the gauge actually measures slot
+    residency including active handler — which is the more useful
+    saturation signal. Updated transport.hpp + grpc_listener.cpp
+    inline comments + `ServerTransportMetricSink` describe text +
+    `YuzuBidiPoolNearSaturation` alert annotation (cpp-expert
+    INFO-2 / consistency S-1 / UP-218).
+  - **3 Grafana alerts gain `runbook_url` annotations + new runbook**:
+    `docs/ops-runbooks/transport-saturation.md` documents triage for
+    `YuzuBidiPoolSaturationRejects`, `YuzuBidiPoolNearSaturation`,
+    `YuzuAgentChannelFaultRate` — paging without runbook is the
+    pilot ship-stopper Gate 6 enterprise-readiness flagged
+    (ER-DOC-4 / compliance F2 / UP-221).
+  - **`docs/user-manual/server-admin.md`**: stale text claiming
+    chunk-streaming has no server-side deadline and per-peer rate
+    limit is a "separate hardening item" both replaced; new
+    bidi-pool-sizing guidance points to the new metric signals
+    (Gate 2 docs B-1 / ER-DOC-2).
+  - **`docs/user-manual/metrics.md`**: 9 new metric families /
+    label values documented under new sections "Transport
+    observability", "OTA observability", "Reconnect observability"
+    (Gate 2 docs B-2 / ER-DOC-3).
+  - **`docs/user-manual/upgrading.md`**: 0.12.x row gains note
+    covering chunk-write deadline, per-peer rate limit, reconnect-
+    reason label split, new Grafana alerts, new metric families
+    (Gate 2 docs B-4 / ER-DOC-1).
+  - **`docs/test-coverage.md`**: lift battery row updated to 7
+    cases / 125 assertions; new Transport Tests section added;
+    new agent_service_impl row covering `[rate_limit]` battery;
+    Untested-path tracking entries for ServerTransportMetricSink,
+    OTA chunk-deadline counter, reconnect-reason label increments
+    (qe BLOCKING).
+  - **Filed 7 follow-up issues** (#932-#938) for the SHOULD/NICE
+    items not addressed in Round-1: UP-209 final_status wedge,
+    architect S-1 admit_download_update public surface, UP-206
+    slow-link compound lockout, sec MEDIUM-1 + UP-201/2/3/5 + sre
+    Q10 bucket cap + size metric + HA gap, qe Q4/Q5/Q6 coverage
+    gaps, doc SHOULD-FIX backlog, code SHOULD/NICE backlog.
+
+  Validated on macOS arm64: transport (1.21 s) + server (28.73 s) +
+  agent (76.75 s) suites all green. No new test additions in this
+  hardening commit (the SHOULDs flagged uncovered paths are filed
+  as #936).
 - **Per-peer `DownloadUpdate` rate limit (#913 / UP-116).** The bounded
   bidi pool (#904) + idle-read deadline (#902) + chunk-write deadline
   (#911) cap slot-seconds, but a fast-valid mTLS-authed insider can

@@ -500,9 +500,13 @@ private:
                     1, std::memory_order_release);
                 state_   = State::BidiActive;
                 enqueued = true;
-                // Pool gauge delta on enqueue. Dequeue's matching -1
-                // fires in bidi_pool_worker_loop just before the
-                // handler runs (#912 / CMP-2 / OBS-1).
+                // Pool gauge delta on enqueue. Matching -1 fires in
+                // bidi_pool_worker_loop AFTER `run_bidi_handler` returns
+                // — the gauge measures slot residency including the
+                // active handler, not just queue depth (closet-clean
+                // Round-1 contract aligned with this firing point per
+                // cpp-expert INFO-2 / consistency S-1 / UP-218).
+                // (#912 / CMP-2 / OBS-1).
                 if (listener_->opts_.metric_sink) {
                     listener_->opts_.metric_sink
                         ->on_bidi_pool_in_flight_delta("grpc", +1);
@@ -1117,10 +1121,12 @@ void GrpcServerListener::bidi_pool_worker_loop() {
             }
         }
         bidi_in_flight_.fetch_sub(1, std::memory_order_release);
-        // #912: matching dequeue gauge delta. Note this fires AFTER the
-        // handler returns, so the residency gauge measures
-        // queue-depth-at-the-time-of-fanout — peak in-flight = pool
-        // size during sustained saturation, 0 during quiet periods.
+        // #912: matching dequeue gauge delta fires AFTER the handler
+        // returns, so the residency gauge measures slot-residency
+        // including active handler. Peak in_flight = pool_size while
+        // every slot is occupied; 0 during quiet periods. Contract
+        // block at transport.hpp `on_bidi_pool_in_flight_delta`
+        // documents this firing point (closet-clean Round-1).
         if (opts_.metric_sink) {
             opts_.metric_sink->on_bidi_pool_in_flight_delta("grpc", -1);
         }

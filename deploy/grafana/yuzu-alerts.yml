@@ -125,16 +125,18 @@ groups:
           severity: warning
         annotations:
           summary: "Bidi dispatcher pool is rejecting new calls"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/transport-saturation.md"
           description: >
             Method {{ $labels.method }} on the agent listener is being
             rejected with ResourceExhausted because the bidi dispatcher
             pool is at its configured cap. Sustained for >1m. Scale
             ListenerOptions::bidi_dispatcher_pool_size or front the
-            listener with the gateway.
+            listener with the gateway. See runbook for triage steps.
 
-      # Bidi dispatcher pool residency is approaching saturation —
-      # heads-up for capacity planning before the saturation reject
-      # path fires. (#912 / CMP-2)
+      # Bidi dispatcher pool slot residency (queued calls + active
+      # handlers) is approaching saturation — heads-up for capacity
+      # planning before the saturation reject path fires.
+      # (#912 / CMP-2)
       - alert: YuzuBidiPoolNearSaturation
         expr: >
           yuzu_server_transport_bidi_pool_in_flight
@@ -143,12 +145,16 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "Bidi dispatcher pool >80% of capacity for 5m"
+          summary: "Bidi dispatcher pool >80% slot residency for 5m"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/transport-saturation.md"
           description: >
-            In-flight bidi calls ({{ $value | humanizePercentage }} of
-            configured cap) sustained for >5m. Saturation rejects are
-            imminent. Scale bidi_dispatcher_pool_size or shed load via
-            the gateway.
+            Bidi dispatcher pool slot residency
+            ({{ $value | humanizePercentage }} of configured cap)
+            sustained for >5m. The gauge measures queued calls + active
+            handlers; at 80% sustained, the pool is mostly busy and
+            saturation rejects are imminent. Scale
+            bidi_dispatcher_pool_size or shed load via the gateway.
+            See runbook for the triage procedure.
 
       # Sustained agent-side channel faults across the fleet —
       # a transport-level regression (TLS rotation, certificate expiry,
@@ -163,7 +169,9 @@ groups:
           severity: warning
         annotations:
           summary: "Sustained agent channel-fault reconnect rate"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/transport-saturation.md"
           description: >
             Agents are reconnecting at {{ $value }}/s with reason=channel_fault
             (transport-level error). Check listener health, TLS material
             rotation, and the agent listener log for handshake failures.
+            See runbook for triage procedure.

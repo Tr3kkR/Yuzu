@@ -551,11 +551,15 @@ Since #376 PR 1c-4, the **agent** additionally enforces a symmetric 30-second pe
 * `ResourceExhausted "transport: bidi dispatcher saturated"` paired with a high `deadline_exceeded` count — stalled peers are consuming pool slots and the deadline is the only mechanism freeing them; consider raising `--bidi-dispatcher-pool-size` or investigating the network path.
 * Agent log lines like `DownloadUpdate RPC failed: ... (code 1)` (where 1 = `Cancelled` per `transport::StatusCode`) repeating every heartbeat cycle — the same failure mode from the agent side.
 
-**What the server-side deadline does NOT protect against:**
+**Per-chunk write deadline (#911 / UP-101):** in addition to the request-frame read deadline, the server enforces a 30-second per-chunk write deadline on `DownloadUpdate` (`kChunkWriteDeadline` constant in `agent_service_impl.cpp`). A peer whose TCP receive window has collapsed for >30 s — typical causes: a stuck NAT/firewall, HTTP/2 flow-control window collapse, a transparent proxy buffering badly — sees `DeadlineExceeded` and the server log emits `DownloadUpdate: chunk-write deadline expired for peer=<peer> at offset <N>`. The pool slot is reclaimed within the deadline; the agent retries OTA on its next heartbeat cycle. The counter `yuzu_grpc_requests_total{method="DownloadUpdate", status="chunk_write_deadline_exceeded"}` increments per fired deadline. Operators with genuinely high-latency or low-bandwidth deployments (satellite links, residential 4G/LTE) should observe this counter; if it fires regularly on healthy peers, file an issue — the constant is not yet operator-tunable.
 
-* A slow legitimate transfer of a large binary on a slow link — the server-side deadline is request-frame-only; chunk-streaming time on the server side has no deadline. Size the pool's `TimeoutStopSec` for graceful shutdown accordingly (see "Graceful shutdown" below). The agent-side per-chunk 30-second idle deadline is the symmetric guard that protects against a server stalled mid-stream.
+**Per-peer rate limit (#913 / UP-116):** the server enforces a per-peer-identity token bucket on `DownloadUpdate`. Capacity 5 tokens, refill ~1 token per 90 minutes (= `update_check_interval` default 6 h / 4). A normally-behaved agent never approaches the limit; a misbehaving agent (or compromised mTLS-authenticated peer) hammering OTA exhausts within seconds and sees `ResourceExhausted "per-peer DownloadUpdate rate limit exceeded"`. The counter `yuzu_grpc_requests_total{method="DownloadUpdate", status="rate_limited_per_peer"}` increments per rejected call; the server log emits `DownloadUpdate: per-peer rate limit exhausted for peer=<peer>`. Bucket state is **process-local and resets on server restart** — the limit is a fleet-monopolisation guard, not a persistent quota. In a multi-server HA deployment the buckets are NOT shared across servers; an agent rotated to a different server resets its bucket. The peer key is the verified mTLS SAN identity; mTLS-disabled deployments fall back to `peer_uri` (host:port) which is unstable across NAT port rotation — production deployments should always run with mTLS verification enabled.
+
+**What the deadlines + rate limit do NOT protect against:**
+
 * A malicious peer that sends a malformed request frame within the 30-second window — request validation occurs after the deadline-bounded read, so a peer that races the deadline still consumes a pool slot for the validation path.
-* Per-peer rate limiting — the deadline bounds slot-seconds per stalled stream, but a valid mTLS-authenticated client opening many streams in parallel is bounded only by the dispatcher pool size, not by per-peer counters. Tracked as a separate hardening item.
+* A multi-server HA deployment where an attacker connects to each server in turn — each server has an independent bucket, so an attacker with N servers gets 5×N tokens. Tracked as a follow-up item; mitigation requires shared bucket state (Redis/Dragonfly) or a sticky-session hint at the LB layer.
+* Slow-link agents that legitimately hit the 30 s chunk-write deadline — they retry on next heartbeat cycle (~30 s) and may consume bucket tokens; if the link genuinely cannot move 64 KiB in 30 s, the agent will fail OTA repeatedly. Workaround until the constant is operator-tunable: front the listener with a gateway that handles slow links closer to the edge.
 
 ---
 
@@ -883,6 +887,13 @@ YUZU_BIDI_DISPATCHER_POOL_SIZE=12500 ./yuzu-server ...
 ```
 
 A dashboard surface for `ListenerOptions` is not yet exposed; configure via flag or env only.
+
+**Metric-based saturation signals (#912 / OBS-1):** the bidi pool now exposes three metrics for capacity-planning queries:
+* `yuzu_server_transport_bidi_pool_size` (gauge) — the configured cap (= `--bidi-dispatcher-pool-size`).
+* `yuzu_server_transport_bidi_pool_in_flight` (gauge) — slot residency: queued calls + active handlers. The matching -1 fires AFTER the handler returns, so a long-running bidi handler holds 1 unit for its lifetime.
+* `yuzu_server_transport_bidi_pool_saturated_total{method}` (counter) — increments per saturation reject (peer sees `ResourceExhausted`).
+
+Use these for utilization queries: `yuzu_server_transport_bidi_pool_in_flight / yuzu_server_transport_bidi_pool_size > 0.8` is the threshold for the shipped `YuzuBidiPoolNearSaturation` Grafana alert (severity: critical, fires after 5 m sustained). The shipped `YuzuBidiPoolSaturationRejects` alert (severity: warning) fires when `rate(...bidi_pool_saturated_total[1m]) > 0` for 1 m. See `docs/ops-runbooks/transport-saturation.md` for the runbook.
 
 **Gateway-mode does NOT need this knob** — the gateway terminates Subscribe per-fleet (one process per agent, lightweight), and the server only sees one upstream stream per gateway node. The default pool comfortably covers tens of gateway nodes.
 
