@@ -252,11 +252,26 @@ jobs:
           # Erlang and doesn't contribute to C++ CodeQL, but the
           # custom_target must succeed or meson compile fails. Linux
           # only — Windows CodeQL leg does not build the gateway.
+          #
+          # `source scripts/ensure-erlang.sh` only mutates PATH in this
+          # step's shell. Subsequent steps (Configure, Build) run in fresh
+          # shells where Erlang is gone again, and the meson `gateway`
+          # custom_target dies with `/usr/bin/env: 'escript': No such
+          # file or directory` (run 25620458000). Echo the bin dirs of
+          # the resolved tools to $GITHUB_PATH so they are prepended for
+          # every subsequent step on the same runner.
           if command -v rebar3 >/dev/null 2>&1; then
             source scripts/ensure-erlang.sh
-            command -v erl >/dev/null || {
+            if command -v erl >/dev/null; then
+              for tool in erl escript rebar3; do
+                bin_dir=$(dirname "$(command -v "$tool" 2>/dev/null)" 2>/dev/null || true)
+                if [[ -n "$bin_dir" && -d "$bin_dir" ]]; then
+                  echo "$bin_dir" >> "$GITHUB_PATH"
+                fi
+              done
+            else
               echo "::warning::ensure-erlang.sh did not resolve erl on PATH"
-            }
+            fi
           else
             echo "rebar3 not installed — gateway target will be skipped"
           fi
