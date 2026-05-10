@@ -1688,6 +1688,7 @@ These capabilities are tracked but not yet scheduled. Each will become a GitHub 
 | # | Capability | Notes |
 |---|-----------|-------|
 | 4.10 | ARP scanning | Active subnet discovery (partially covered by `discovery` plugin `scan_subnet`) |
+| 8.4 | Mobile/tablet responsive operator dashboard | Dashboard currently breakpoints at 1280px / 1440px and is desktop-only. Sub-1280px layouts (tablet, mobile) deferred — wanted eventually but not scheduled. Tracked previously in #378 (375px) and #379 (768px), both closed as wontfix-deferred. |
 | 12.3 | WMI namespace enumeration | WMI discovery (partially covered by `wmi` plugin configurable namespace) |
 | 22.3 | License management | Seat count, expiry, feature entitlements (LicenseStore exists; key generation strategy TBD — see D1) |
 | 23.2 | Remote key-value access | Cross-agent storage access |
