@@ -71,7 +71,7 @@ echarts_embed = custom_target(
 # OrbitControls module's `import ... from 'three'` resolves to the
 # vendored file. We ship the ES-module form rather than UMD because
 # Three.js dropped UMD in r150+ -- modern releases only publish
-# `three.module.min.js`. Symbols: kThreeJs (~685 KB), kThreeOrbitJs (~32 KB).
+# `three.module.min.js`. Symbols: kThreeJs (~685 KB), kThreeOrbitControlsJs (~32 KB).
 three_embed = custom_target(
   'three_js_bundle',
   input: 'vendor/three.module.min.js',
@@ -86,15 +86,15 @@ three_embed = custom_target(
 )
 
 three_orbit_embed = custom_target(
-  'three_orbit_js_bundle',
+  'three_orbit_controls_js_bundle',
   input: 'vendor/three-orbit-controls.js',
-  output: 'three_orbit_js_bundle.cpp',
+  output: 'three_orbit_controls_js_bundle.cpp',
   command: [
     find_program('python3', 'python'),
     files('scripts/embed_js.py'),
     '@INPUT@',
     '@OUTPUT@',
-    'ThreeOrbitJs',
+    'ThreeOrbitControlsJs',
   ],
 )
 

@@ -36,7 +36,7 @@ extern const std::string kSseJs;
 namespace yuzu::server {
 extern const std::string kEChartsJs;
 extern const std::string kThreeJs;
-extern const std::string kThreeOrbitJs;
+extern const std::string kThreeOrbitControlsJs;
 extern const std::string kYuzuVizJs;
 extern const std::string_view kInterVariableWoff2;
 extern const std::string kYuzuCss;
@@ -230,25 +230,26 @@ TEST_CASE("static_js_bundle: kThreeJs has no embedded NULs", "[static-js][three]
     CHECK(yuzu::server::kThreeJs.find('\0') == std::string::npos);
 }
 
-TEST_CASE("static_js_bundle: kThreeOrbitJs has expected pinned size", "[static-js][three]") {
-    CHECK(yuzu::server::kThreeOrbitJs.size() == kExpectedThreeOrbitJsBytes);
+TEST_CASE("static_js_bundle: kThreeOrbitControlsJs has expected pinned size",
+          "[static-js][three]") {
+    CHECK(yuzu::server::kThreeOrbitControlsJs.size() == kExpectedThreeOrbitJsBytes);
 }
 
-TEST_CASE("static_js_bundle: kThreeOrbitJs imports from 'three'", "[static-js][three]") {
-    REQUIRE(yuzu::server::kThreeOrbitJs.size() >= 50);
+TEST_CASE("static_js_bundle: kThreeOrbitControlsJs imports from 'three'", "[static-js][three]") {
+    REQUIRE(yuzu::server::kThreeOrbitControlsJs.size() >= 50);
     // The unmodified ES-module file uses a bare specifier `from 'three'`
     // that the page's importmap resolves to `/static/three.module.min.js`.
     // Without this top-level import, the importmap contract in PR 5 is
     // broken; pin the substring so a vendor refresh that swaps the
     // import path fails the build instead of producing a runtime
     // ReferenceError on Quaternion / Spherical / Vector3.
-    CHECK_THAT(yuzu::server::kThreeOrbitJs, ContainsSubstring("from 'three'"));
+    CHECK_THAT(yuzu::server::kThreeOrbitControlsJs, ContainsSubstring("from 'three'"));
     // Public class still named OrbitControls.
-    CHECK_THAT(yuzu::server::kThreeOrbitJs, ContainsSubstring("class OrbitControls"));
+    CHECK_THAT(yuzu::server::kThreeOrbitControlsJs, ContainsSubstring("class OrbitControls"));
 }
 
-TEST_CASE("static_js_bundle: kThreeOrbitJs has no embedded NULs", "[static-js][three]") {
-    CHECK(yuzu::server::kThreeOrbitJs.find('\0') == std::string::npos);
+TEST_CASE("static_js_bundle: kThreeOrbitControlsJs has no embedded NULs", "[static-js][three]") {
+    CHECK(yuzu::server::kThreeOrbitControlsJs.find('\0') == std::string::npos);
 }
 
 // ── Yuzu fleet renderer (PR 5 of feat/viz-engine ladder) ────────────────────

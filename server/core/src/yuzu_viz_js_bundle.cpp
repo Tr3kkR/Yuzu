@@ -108,7 +108,12 @@ function mount() {
       canvas,
       antialias: true,
       alpha: true,
-      powerPreference: 'high-performance'
+      // gov R4 DEP-2: 'high-performance' would force the dGPU on hybrid
+      // laptops, costing battery for an empty grid + a few hundred
+      // translucent cubes. 'default' lets the browser pick (typically
+      // the iGPU on battery, dGPU on AC) which is plenty for our scene.
+      // Revisit if PR 11 LOD/instancing measurements show iGPU choking.
+      powerPreference: 'default'
     });
   } catch (e) {
     showError(root, 'WebGL not available in this browser: ' + (e && e.message));

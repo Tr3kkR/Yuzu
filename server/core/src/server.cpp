@@ -170,7 +170,7 @@ extern const std::string kYuzuChartsJs;
 extern const std::string kEChartsJs; // server/core/vendor/echarts.min.js (Apache-2.0)
 extern const std::string kThreeJs;   // server/core/vendor/three.module.min.js (MIT, three.js r168)
 extern const std::string
-    kThreeOrbitJs; // server/core/vendor/three-orbit-controls.js (MIT, three.js r168)
+    kThreeOrbitControlsJs; // server/core/vendor/three-orbit-controls.js (MIT, three.js r168)
 extern const std::string
     kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
 extern const std::string_view
@@ -2783,11 +2783,12 @@ private:
                 res.set_header("Cache-Control", "public, max-age=86400");
                 res.set_content(yuzu::server::kThreeJs, "application/javascript; charset=utf-8");
             });
-        web_server_->Get("/static/three-orbit-controls.js", [](const httplib::Request&,
-                                                               httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=86400");
-            res.set_content(yuzu::server::kThreeOrbitJs, "application/javascript; charset=utf-8");
-        });
+        web_server_->Get("/static/three-orbit-controls.js",
+                         [](const httplib::Request&, httplib::Response& res) {
+                             res.set_header("Cache-Control", "public, max-age=86400");
+                             res.set_content(yuzu::server::kThreeOrbitControlsJs,
+                                             "application/javascript; charset=utf-8");
+                         });
         // PR 5 of feat/viz-engine: yuzu-viz.js renderer module. Loaded as
         // type="module" so it can resolve the `import 'three'` bare
         // specifier through the importmap declared in viz_page_ui.cpp.

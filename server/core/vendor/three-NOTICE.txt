@@ -28,3 +28,12 @@ Source
 https://github.com/mrdoob/three.js (release r168)
 Vendored file: server/core/vendor/three.module.min.js
 SPDX-License-Identifier: MIT
+
+Integrity
+---------
+SHA-256: ee08b04912b21d9bf71f13658a65da65c113827601377076663e710c0b1772d0
+
+Recompute with `shasum -a 256 server/core/vendor/three.module.min.js`. The
+test suite pins the byte count (see tests/unit/server/test_static_js_bundle.cpp
+kExpectedThreeJsBytes). When refreshing the upstream release, update both
+this hash and the byte-count constant in lock-step.
