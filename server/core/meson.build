@@ -98,6 +98,24 @@ three_orbit_embed = custom_target(
   ],
 )
 
+# Build-time embed of the Yuzu fleet-viz renderer module (PR 5 + PR 6 of
+# feat/viz-engine ladder). Hand-written before PR 6 (~10 KB) when it fit
+# under MSVC's 16,380-byte raw-string-literal limit; PR 6 took the bundle
+# past that limit, so we now codegen via embed_js.py like ECharts and
+# Three.js. Symbol: kYuzuVizJs (std::string).
+yuzu_viz_js_embed = custom_target(
+  'yuzu_viz_js_bundle',
+  input: 'static/yuzu-viz.js',
+  output: 'yuzu_viz_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuVizJs',
+  ],
+)
+
 # Build-time embed of the Yuzu Design System CSS bundle. The source
 # kYuzuCss exceeded MSVC's 16,380-byte raw-string-literal limit (C2026)
 # after the design-token expansion. Chunking into ~14 KB
@@ -168,7 +186,7 @@ content_embed = custom_target(
 
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
-  [echarts_embed, three_embed, three_orbit_embed, yuzu_css_embed, inter_embed, content_embed,
+  [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed, yuzu_css_embed, inter_embed, content_embed,
   files(
     'src/server.cpp',
     'src/agent_registry.cpp',
@@ -230,7 +248,6 @@ yuzu_server_core_lib = static_library(
     'src/discovery_routes.cpp',
     'src/viz_routes.cpp',
     'src/viz_page_ui.cpp',
-    'src/yuzu_viz_js_bundle.cpp',
     'src/compliance_ui.cpp',
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',

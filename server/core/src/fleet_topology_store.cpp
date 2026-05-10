@@ -169,9 +169,14 @@ std::shared_ptr<const TopologySnapshot> FleetTopologyStore::get(bool include_vul
     // Take ownership of the refill.
     slot.refilling = true;
     cache_misses_.fetch_add(1, std::memory_order_relaxed);
+    // PR 6 / OBS-2: snapshot the observer under the lock so we don't race
+    // with set_fetch_duration_observer if someone re-wires it during
+    // bring-up. The observer call itself happens after we drop the lock.
+    auto observer_snapshot = fetch_observer_;
     lk.unlock();
 
     std::shared_ptr<const TopologySnapshot> result;
+    const auto fetch_started = std::chrono::steady_clock::now();
     try {
         auto raw = fetcher_(fetch_deadline_);
         result =
@@ -181,6 +186,19 @@ std::shared_ptr<const TopologySnapshot> FleetTopologyStore::get(bool include_vul
         // Fall through with result==nullptr; published below.
     } catch (...) {
         spdlog::error("FleetTopologyStore: fetcher threw unknown exception");
+    }
+    // PR 6 / OBS-2: emit the duration even on exception so a hung fetcher
+    // produces a visible upper-bound observation rather than silently
+    // missing from the histogram. Wrapped in try/catch so a misbehaving
+    // observer cannot poison the refill path.
+    if (observer_snapshot) {
+        try {
+            const auto elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - fetch_started);
+            observer_snapshot(elapsed);
+        } catch (...) {
+            // Observer threw; swallow to keep the store reliable.
+        }
     }
 
     // Memory-bound check: if the serialised snapshot exceeds max_snapshot_bytes_,
@@ -232,6 +250,11 @@ void FleetTopologyStore::invalidate() {
     for (auto& [_, slot] : slots_) {
         slot->snap.reset();
     }
+}
+
+void FleetTopologyStore::set_fetch_duration_observer(FetchDurationObserver observer) {
+    std::lock_guard lk(slots_mu_);
+    fetch_observer_ = std::move(observer);
 }
 
 // -- build_snapshot (the actual aggregation) ----------------------------------

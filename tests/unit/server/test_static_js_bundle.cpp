@@ -311,6 +311,128 @@ TEST_CASE("static_js_bundle: kYuzuVizJs has no embedded NULs", "[static-js][viz]
     CHECK(yuzu::server::kYuzuVizJs.find('\0') == std::string::npos);
 }
 
+// ── PR 6: cube layer ────────────────────────────────────────────────────────
+
+TEST_CASE("static_js_bundle: kYuzuVizJs declares per-OS palette for linux/darwin/windows",
+          "[static-js][viz]") {
+    // PR 6 colour palette. The hex values double as a contract: changing
+    // the palette is a deliberate UX decision, not a stealth refactor.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("OS_PALETTE"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("linux:"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("darwin:"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("windows:"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickOsColor"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs uses FNV-1a 32-bit hash for stable layout",
+          "[static-js][viz]") {
+    // Stable per-agent positions across reloads require a deterministic
+    // hash. FNV-1a 32-bit is identifiable by the 0x811c9dc5 offset basis
+    // and the 0x01000193 prime; pin both so a refactor that swaps to a
+    // randomised hash (and breaks the "same fleet renders the same way"
+    // contract) fails the test.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("0x811c9dc5"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("0x01000193"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("Math.imul"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs lays machines out on a ceil(sqrt(N)) grid",
+          "[static-js][viz]") {
+    // The grid layout is the placement contract -- without ceil(sqrt(N))
+    // the cubes pile up at the origin or fly off-screen at high N. Pin
+    // the function name + the ceil/sqrt math so a refactor to a different
+    // packing breaks the test rather than silently regressing UX.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("layoutMachines"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("Math.ceil(Math.sqrt"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs builds translucent cubes with MeshPhysicalMaterial",
+          "[static-js][viz]") {
+    // gov R6 PR-6: the cube material contract -- transparent + opacity
+    // 0.18 (live) / 0.08 (stale). A refactor that swaps to opaque cubes
+    // would obscure interior process nodes (PR 7+) and break the visual
+    // model.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("MeshPhysicalMaterial"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("transparent: true"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("0.18"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("0.08"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs builds Sprite hostname labels", "[static-js][viz]") {
+    // Hostname labels via Sprite + CanvasTexture so they always face the
+    // camera. Pin both Three classes so a swap to TextGeometry (which
+    // doesn't billboard) fails the test.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("THREE.Sprite"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("THREE.CanvasTexture"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("buildHostnameLabel"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs uses Raycaster for hover tooltip", "[static-js][viz]") {
+    // Hover tooltip is the discovery affordance for a cube's hostname /
+    // OS / counts. Without the raycaster wiring the tooltip never fires.
+    // Pin both the class and the listener.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("THREE.Raycaster"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("'mousemove'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("intersectObjects"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs creates #viz-tooltip dynamically", "[static-js][viz]") {
+    // The tooltip element is created lazily by the renderer (not
+    // pre-existing in the page HTML) so the page shell stays minimal.
+    // Pin the id so a refactor that renames it doesn't break the
+    // tooltip without anybody noticing.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("'viz-tooltip'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("ensureTooltip"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs escapes HTML in tooltip content", "[static-js][viz]") {
+    // gov R6 sec-M1: hostname / os come from agent-controlled fields.
+    // The tooltip uses .innerHTML for layout convenience, so the values
+    // MUST be escaped or an agent-controlled hostname like
+    // `<img onerror=alert()>` would execute. Pin both the helper and the
+    // mention of escaped chars.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("escapeHtml"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("&amp;"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("&lt;"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs fetches with same-origin credentials", "[static-js][viz]") {
+    // Same-origin credentials are required so the session cookie travels
+    // with the fetch. Without it a logged-in operator would see 401 even
+    // though their browser cookie is set.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("data-yuzu-viz-url"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("credentials: 'same-origin'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs handles 401 / 403 / 503 fetch outcomes",
+          "[static-js][viz]") {
+    // gov R5 UP-17: an admin who is demoted mid-session must see an
+    // explicit access-denied message rather than a blank scene. 503
+    // covers --viz-disable kill switch flipping under the operator's
+    // feet. Pin all three status codes; a refactor that collapses them
+    // into a generic catch-all breaks the granular UX.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("r.status === 401"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("r.status === 403"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("r.status === 503"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs validates fleet_topology.v1 schema string",
+          "[static-js][viz]") {
+    // The renderer must reject anything that isn't fleet_topology.v1 --
+    // a future schema bump (v2) would land at the same URL during a
+    // staged rollout, and rendering with the wrong shape gives nonsense.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("fleet_topology.v1"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs guards camera position against NaN/Infinity",
+          "[static-js][viz]") {
+    // gov R5 UP-7: a single bad input that pushes camera.position into
+    // NaN cascades through every subsequent frame (renderer.render with
+    // NaN matrices crashes WebGL on some drivers). The render loop must
+    // detect and reset to a safe default.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("Number.isFinite(camera.position"));
+}
+
 // ── Fleet viz page HTML scaffold ────────────────────────────────────────────
 
 TEST_CASE("viz page: contains the persistent canvas + viz-root structure", "[viz][page]") {

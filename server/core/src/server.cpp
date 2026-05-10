@@ -652,6 +652,18 @@ public:
             // the store handles that gracefully (vuln overlay becomes inert).
             fleet_topology_store_ = std::make_unique<FleetTopologyStore>(
                 std::move(fetcher), nvd_db_ ? nvd_db_.get() : nullptr);
+
+            // PR 6 / OBS-2: wire the agent-dispatch duration histogram.
+            // Distinguishes "agent dispatch is slow" from "the rest of
+            // the request is slow" -- viz_routes.cpp already times the
+            // whole HTTP path via yuzu_viz_topology_request_seconds.
+            // Captures only on cache miss / refill (warm requests skip
+            // the fetcher entirely).
+            fleet_topology_store_->set_fetch_duration_observer(
+                [this](std::chrono::duration<double> elapsed) {
+                    metrics_.histogram("yuzu_viz_topology_fetch_duration_seconds")
+                        .observe(elapsed.count());
+                });
         }
 
         // Initialize audit store

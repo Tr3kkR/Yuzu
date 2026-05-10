@@ -426,6 +426,86 @@ TEST_CASE("topology: IPv6 bracketed and zone-id forms normalized for ip_to_agent
     CHECK(edges[1].dst_agent_id == "agent-A");
 }
 
+// =============================================================================
+// PR 6 / OBS-2: fetch-duration observer
+// =============================================================================
+
+TEST_CASE("observer: set_fetch_duration_observer fires once per refill", "[viz][cache][obs]") {
+    // OBS-2 — every cache miss observer call lets server.cpp wire the
+    // fetch into a Prometheus histogram. Cache hits MUST NOT fire (the
+    // fetcher didn't run).
+    std::atomic<int> observer_calls{0};
+    std::atomic<int> fetcher_calls{0};
+    auto a = make_agent("agent-A", "hostA", {});
+    auto fetcher = [&fetcher_calls, a](std::chrono::milliseconds) {
+        ++fetcher_calls;
+        return std::vector<RawAgentSnapshot>{a};
+    };
+    FleetTopologyStore store(fetcher, nullptr, std::chrono::milliseconds(50));
+    store.set_fetch_duration_observer(
+        [&observer_calls](std::chrono::duration<double>) { ++observer_calls; });
+
+    // First get: cache miss -> fetcher runs -> observer fires.
+    auto s1 = store.get(false);
+    REQUIRE(s1 != nullptr);
+    CHECK(observer_calls.load() == 1);
+    CHECK(fetcher_calls.load() == 1);
+
+    // Second get within TTL: cache hit -> observer must NOT fire.
+    auto s2 = store.get(false);
+    REQUIRE(s2 != nullptr);
+    CHECK(observer_calls.load() == 1);
+    CHECK(fetcher_calls.load() == 1);
+
+    // Force expiry, third get: refill -> observer fires again.
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    auto s3 = store.get(false);
+    REQUIRE(s3 != nullptr);
+    CHECK(observer_calls.load() == 2);
+    CHECK(fetcher_calls.load() == 2);
+}
+
+TEST_CASE("observer: fetch-duration observer fires even on fetcher exception",
+          "[viz][cache][obs]") {
+    // OBS-2 — a hung / throwing fetcher must still produce a histogram
+    // observation; otherwise the gate that says "agent dispatch is slow"
+    // would silently miss the worst case.
+    std::atomic<int> observer_calls{0};
+    auto fetcher = [](std::chrono::milliseconds) -> std::vector<RawAgentSnapshot> {
+        throw std::runtime_error("boom");
+    };
+    FleetTopologyStore store(fetcher);
+    store.set_fetch_duration_observer(
+        [&observer_calls](std::chrono::duration<double>) { ++observer_calls; });
+
+    auto snap = store.get(false);
+    REQUIRE(snap != nullptr); // empty sentinel, never null
+    CHECK(observer_calls.load() == 1);
+}
+
+TEST_CASE("observer: cleared observer is not invoked", "[viz][cache][obs]") {
+    // Setting an empty std::function clears the observer slot. The
+    // refill path must check before calling.
+    std::atomic<int> observer_calls{0};
+    auto a = make_agent("agent-A", "hostA", {});
+    FleetTopologyStore store(fixed_fetcher({a}));
+    store.set_fetch_duration_observer(
+        [&observer_calls](std::chrono::duration<double>) { ++observer_calls; });
+    auto s1 = store.get(false);
+    REQUIRE(s1 != nullptr);
+    CHECK(observer_calls.load() == 1);
+
+    store.set_fetch_duration_observer(FleetTopologyStore::FetchDurationObserver{});
+    store.invalidate();
+    auto s2 = store.get(false);
+    REQUIRE(s2 != nullptr);
+    CHECK(observer_calls.load() == 1); // not incremented
+}
+
+// =============================================================================
+// (existing) cache: oversized snapshot
+// =============================================================================
+
 TEST_CASE("cache: oversized snapshot is returned but not cached", "[viz][cache][cap]") {
     // CAP-1 — when a refill exceeds max_snapshot_bytes, the caller still
     // receives the snapshot for this request, but the cache slot is NOT

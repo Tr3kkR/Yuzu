@@ -52,6 +52,17 @@ public:
     using Fetcher =
         std::function<std::vector<RawAgentSnapshot>(std::chrono::milliseconds deadline)>;
 
+    /// PR 6 / OBS-2: optional observer fired exactly once per refill, with
+    /// the wall-clock duration of the fetcher_() call only (not the cache
+    /// lock, not the build_snapshot pass). Server wires this to a
+    /// Prometheus histogram so operators can distinguish "agent dispatch
+    /// is slow" from "the rest of the request is slow" -- the existing
+    /// `yuzu_viz_topology_request_seconds` histogram measures the whole
+    /// HTTP path. Null-by-default; observer is invoked on success AND on
+    /// fetcher exception (so a hung fetcher still produces an upper-bound
+    /// observation).
+    using FetchDurationObserver = std::function<void(std::chrono::duration<double>)>;
+
     /// @param fetcher        Required. Called on cache miss / expiry.
     /// @param nvd            Optional. When include_vuln=true and nvd is
     ///                       non-null, processes get worst_severity + cve_count.
@@ -91,6 +102,14 @@ public:
     /// and by the operator-facing `?fresh=1` query parameter.
     void invalidate();
 
+    /// Set the optional fetcher-duration observer (see
+    /// FetchDurationObserver above). Pass an empty function to clear.
+    /// Thread-safe relative to ongoing get() calls only at startup --
+    /// callers are expected to wire this once during server bring-up
+    /// before the store sees real traffic. (Internal access is via a
+    /// snapshot of the std::function under slots_mu_.)
+    void set_fetch_duration_observer(FetchDurationObserver observer);
+
     // ── Observability counters ─────────────────────────────────────────────
     uint64_t cache_hits() const noexcept { return cache_hits_.load(std::memory_order_relaxed); }
     uint64_t cache_misses() const noexcept { return cache_misses_.load(std::memory_order_relaxed); }
@@ -124,6 +143,7 @@ public:
 
 private:
     Fetcher fetcher_;
+    FetchDurationObserver fetch_observer_;
     NvdDatabase* nvd_{nullptr};
     std::chrono::milliseconds ttl_;
     std::chrono::milliseconds fetch_deadline_;
