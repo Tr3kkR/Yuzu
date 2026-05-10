@@ -530,12 +530,11 @@ The server can distribute agent binary updates to enrolled endpoints.
 - Delete old versions to reclaim storage.
 - Only one version can be promoted (active) at a time.
 
-### Connection and timeout behaviour (since #902 / UP-8)
+### Connection and timeout behaviour (since #902 / UP-8 + #376 PR 1c-4)
 
-The server enforces a **30-second idle-read deadline on the request frame** of every `DownloadUpdate` stream. The deadline applies *only* to the
-initial request frame — once the agent has sent the request and chunk
-streaming has started, there is no per-chunk deadline; chunk transfer time
-is bounded by binary size and network throughput, not by this control.
+The server enforces a **30-second idle-read deadline on the request frame** of every `DownloadUpdate` stream. This deadline applies *only* to the initial request frame — it bounds slot-seconds against a stalled or malicious agent that opens the stream but never sends a request.
+
+Since #376 PR 1c-4, the **agent** additionally enforces a symmetric 30-second per-chunk idle deadline on its read side. If the server stalls between chunks for more than 30 seconds, the agent cancels the stream and retries on its next heartbeat cycle. This is the agent-side guard against a stalled or malicious server pinning the agent's OTA thread; legitimate large-binary transfers where chunks arrive continuously are not affected (the deadline is per-chunk *idle* time, not cumulative).
 
 **What an operator observes when the deadline fires:**
 
@@ -552,9 +551,9 @@ is bounded by binary size and network throughput, not by this control.
 * `ResourceExhausted "transport: bidi dispatcher saturated"` paired with a high `deadline_exceeded` count — stalled peers are consuming pool slots and the deadline is the only mechanism freeing them; consider raising `--bidi-dispatcher-pool-size` or investigating the network path.
 * Agent log lines like `DownloadUpdate RPC failed: ... (code 1)` (where 1 = `Cancelled` per `transport::StatusCode`) repeating every heartbeat cycle — the same failure mode from the agent side.
 
-**What the deadline does NOT protect against:**
+**What the server-side deadline does NOT protect against:**
 
-* A slow legitimate transfer of a large binary on a slow link — chunk-streaming time has no deadline; size the pool's `TimeoutStopSec` for graceful shutdown accordingly (see "Graceful shutdown" below).
+* A slow legitimate transfer of a large binary on a slow link — the server-side deadline is request-frame-only; chunk-streaming time on the server side has no deadline. Size the pool's `TimeoutStopSec` for graceful shutdown accordingly (see "Graceful shutdown" below). The agent-side per-chunk 30-second idle deadline is the symmetric guard that protects against a server stalled mid-stream.
 * A malicious peer that sends a malformed request frame within the 30-second window — request validation occurs after the deadline-bounded read, so a peer that races the deadline still consumes a pool slot for the validation path.
 * Per-peer rate limiting — the deadline bounds slot-seconds per stalled stream, but a valid mTLS-authenticated client opening many streams in parallel is bounded only by the dispatcher pool size, not by per-peer counters. Tracked as a separate hardening item.
 

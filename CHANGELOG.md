@@ -24,8 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cycle exit. DownloadUpdate uses the standard server-streaming-via-bidi
   pattern: write request, `writes_done()`, drain chunks via `read_pb`
   with a per-chunk 30 s idle deadline (symmetric with the server's
-  request-frame deadline from #902 / UP-8). All four agent RPCs now
-  share a single TLS session via HTTP/2 multiplexing on `channel_t`,
+  request-frame deadline from #902 / UP-8). All five agent RPCs the
+  agent currently initiates (Register, Heartbeat, CheckForUpdate,
+  Subscribe, DownloadUpdate) now share a single TLS session via
+  HTTP/2 multiplexing on `channel_t`,
   halving per-agent kernel socket count and amortising the TLS
   handshake — meaningful at the WhatsApp/RabbitMQ-tier gateway scaling
   target (ADR-0002). The legacy `creds_grpc` / `channel` triple +

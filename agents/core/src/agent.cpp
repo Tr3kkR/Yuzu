@@ -659,7 +659,7 @@ public:
 
         CloudIdentity cloud_id; // Populated before registration (step 2b)
 
-        // ── #376 PR 1c-3 — agent-side transport lift ─────────────────────────
+        // ── #376 PR 1c-3 / 1c-4 — agent-side transport lift ──────────────────
         //
         // Build a `transport::Credentials` from cfg_'s TLS material. PEM bytes
         // are read once into the Credentials struct; the private-key field is
@@ -667,10 +667,14 @@ public:
         // with server.cpp's identical guard, #376 PR 1c-2 gov round 7
         // cpp F-CPP-1).
         //
-        // Subscribe + DownloadUpdate are deferred to PR 1c-4 — they still
-        // travel on the legacy `grpc::Channel` + `pb::AgentService::Stub`
-        // built below. The two channels share TLS material and the same wire
-        // endpoint; once 1c-4 lifts streaming, the legacy half disappears.
+        // Post-PR-1c-4: all five agent RPCs the agent initiates (Register,
+        // Heartbeat, CheckForUpdate, Subscribe, DownloadUpdate) ride
+        // `channel_t` (transport::Channel). The legacy `grpc::Channel` built
+        // below is RETAINED only for the post-Register diagnostic block at
+        // ~line 957 that surfaces gRPC-channel state into plugin_ctx_. Cleanup
+        // (commit (iii) of PR 1c-4) deletes the legacy block + the
+        // `KEEPALIVE_*` args at ~line 643. No stub is built — Subscribe +
+        // DownloadUpdate use `channel_t->bidi_stream(...)`.
         ::yuzu::transport::Credentials creds_t{};
         if (cfg_.tls_enabled) {
             if (!cfg_.tls_ca_cert.empty()) {
@@ -1498,6 +1502,18 @@ private:
     // threaded into the Subscribe `CallContext::cancel` so that
     // `request_stop()` from `stop()` propagates through the transport's
     // stop_callback hook and interrupts the parked Subscribe read.
+    //
+    // End-of-cycle cleanup divergence vs `heartbeat_stop_src_` is
+    // intentional. Subscribe end-of-cycle calls `reset()` on the
+    // optional (clears state for the next cycle's emplace); heartbeat
+    // end-of-cycle calls `request_stop()` (signals the heartbeat thread
+    // to break out of its sleep loop, then joins the thread; the
+    // optional is then replaced at next-cycle emplace). Both achieve
+    // the same end state — fresh, not-yet-stop_requested token at next
+    // cycle — via different intermediate paths because the heartbeat
+    // thread's wakeup discipline depends on observing
+    // `stop_requested()`, while Subscribe is woken by the transport's
+    // stop_callback regardless of optional state.
     std::mutex subscribe_stop_src_mu_;
     std::optional<std::stop_source> subscribe_stop_src_;
     // Cancellation hook for transport unary RPCs (Register, Heartbeat,

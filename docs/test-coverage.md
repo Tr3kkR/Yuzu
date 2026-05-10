@@ -1,15 +1,16 @@
 # Test Coverage Tracking
 
-Last updated: 2026-03-26
+Last updated: 2026-05-10
 
 ## Overview
 
 | Suite | Executable | Test Files | Status |
 |-------|-----------|------------|--------|
-| Agent unit tests | `yuzu_agent_tests` | 14 files | Active |
+| Agent unit tests | `yuzu_agent_tests` | 17 files | Active |
 | Server unit tests | `yuzu_server_tests` | 34 files | Active (requires `build_server=true`) |
+| Transport unit tests | `yuzu_transport_tests` | 1 file | Active |
 
-**Totals:** 48 test files. Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests.
+**Totals:** 52 test files. Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests.
 
 Run all tests: `meson test -C builddir --print-errorlogs`
 
@@ -35,6 +36,9 @@ Run all tests: `meson test -C builddir --print-errorlogs`
 | `test_metrics_perf.cpp` | Metrics performance | High-throughput metric emission, contention under concurrent writers |
 | `test_tar_diff.cpp` | TAR diff engine | Process tree diff, network change detection, service state transitions |
 | `test_tar_store.cpp` | TAR store | Timeline event persistence, query by time range, agent scoping |
+| `test_parse_target_address.cpp` | Agent target-address parser (#376 PR 1c-3) | host:port rejection-path matrix + IPv6 happy paths + `static_assert(noexcept(...))` contract pin (22 cases / 44 assertions) |
+| `test_heartbeat_cancel_pattern.cpp` | Agent Heartbeat per-cycle `stop_source` wiring (#376 PR 1c-3) | emplace replacement semantics, in-flight unary returns Cancelled on request_stop, cycle-2 fresh token (3 cases / 24 assertions) |
+| `test_agent_subscribe_lift.cpp` | Agent Subscribe + DownloadUpdate lift onto `transport::Channel` (#376 PR 1c-4) | Subscribe multi-frame proto round-trip, per-cycle stop_source plumbing, reconnect-cycle fresh-token, DownloadUpdate happy path with writes_done(), per-chunk read deadline expiry (5 cases / 102 assertions) |
 
 ### Untested Agent Components
 
@@ -42,7 +46,7 @@ Run all tests: `meson test -C builddir --print-errorlogs`
 |-----------|-------------|----------|
 | **Plugin host** (dynamic loading) | Requires .dll/.so artifacts | Low |
 | **Trigger engine** | Covered by test_trigger_engine.cpp | Done |
-| **gRPC client** | Requires mock server | Medium |
+| **gRPC client — agent connection-loop integration** | The transport-layer bidi RPC patterns (Subscribe round-trip, DownloadUpdate streaming, per-cycle stop_source, deadline expiry) are now covered by `test_agent_subscribe_lift.cpp` and `test_heartbeat_cancel_pattern.cpp` via in-proc gRPC fixtures. What remains untested is the full `agent.cpp` connection-loop integration: shared_ptr<BidiStream> across the OutputCallback worker pool, reconnect-backoff scheduler, channel-state diagnostic, dedup-buffer rotation under churn. | Medium |
 | **Certificate discovery** | Windows-specific CryptoAPI | Low |
 | **Cloud identity** | Requires cloud environment | Low |
 | **Identity store** | File I/O, low logic density | Low |

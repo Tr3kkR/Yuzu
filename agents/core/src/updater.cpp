@@ -372,6 +372,11 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_channel) {
     }
 
     if (!::yuzu::transport::write_pb(*stream, dl_req)) {
+        // Cancel-without-writes_done is intentional: if write_pb failed the
+        // request frame never landed on the server side, so there is no
+        // half-close semantic to express — `cancel()` subsumes teardown.
+        // The success path below half-closes via `writes_done()` because
+        // the server's lifted handler is server-streaming-via-bidi shape.
         stream->cancel();
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
