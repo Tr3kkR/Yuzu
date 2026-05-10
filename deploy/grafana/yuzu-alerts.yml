@@ -112,3 +112,58 @@ groups:
         annotations:
           summary: "High agent disconnect rate on gateway"
           description: "{{ $value }}/s agent disconnections on gateway node {{ $labels.node }}."
+
+      # Bidi dispatcher pool is rejecting new calls — capacity signal.
+      # Distinct from a single-fire transient: requires a sustained
+      # reject rate across the 1m window. Prefer scaling
+      # bidi_dispatcher_pool_size or fronting with the gateway.
+      # (#912 / CMP-2 / OBS-1 / UP-111)
+      - alert: YuzuBidiPoolSaturationRejects
+        expr: rate(yuzu_server_transport_bidi_pool_saturated_total[1m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Bidi dispatcher pool is rejecting new calls"
+          description: >
+            Method {{ $labels.method }} on the agent listener is being
+            rejected with ResourceExhausted because the bidi dispatcher
+            pool is at its configured cap. Sustained for >1m. Scale
+            ListenerOptions::bidi_dispatcher_pool_size or front the
+            listener with the gateway.
+
+      # Bidi dispatcher pool residency is approaching saturation —
+      # heads-up for capacity planning before the saturation reject
+      # path fires. (#912 / CMP-2)
+      - alert: YuzuBidiPoolNearSaturation
+        expr: >
+          yuzu_server_transport_bidi_pool_in_flight
+          / yuzu_server_transport_bidi_pool_size > 0.8
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Bidi dispatcher pool >80% of capacity for 5m"
+          description: >
+            In-flight bidi calls ({{ $value | humanizePercentage }} of
+            configured cap) sustained for >5m. Saturation rejects are
+            imminent. Scale bidi_dispatcher_pool_size or shed load via
+            the gateway.
+
+      # Sustained agent-side channel faults across the fleet —
+      # a transport-level regression (TLS rotation, certificate expiry,
+      # listener restart loop) typically manifests here before
+      # higher-level metrics catch up. (SRE-3 / #925)
+      - alert: YuzuAgentChannelFaultRate
+        expr: >
+          rate(yuzu_agent_reconnections_total{reason="channel_fault"}[5m])
+          > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained agent channel-fault reconnect rate"
+          description: >
+            Agents are reconnecting at {{ $value }}/s with reason=channel_fault
+            (transport-level error). Check listener health, TLS material
+            rotation, and the agent listener log for handshake failures.

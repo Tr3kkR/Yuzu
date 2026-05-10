@@ -500,6 +500,13 @@ private:
                     1, std::memory_order_release);
                 state_   = State::BidiActive;
                 enqueued = true;
+                // Pool gauge delta on enqueue. Dequeue's matching -1
+                // fires in bidi_pool_worker_loop just before the
+                // handler runs (#912 / CMP-2 / OBS-1).
+                if (listener_->opts_.metric_sink) {
+                    listener_->opts_.metric_sink
+                        ->on_bidi_pool_in_flight_delta("grpc", +1);
+                }
             }
         } catch (const std::exception& e) {
             spdlog::error(
@@ -553,6 +560,13 @@ private:
         bidi_stream_.reset();
         handler_ = nullptr;
         if (listener_->opts_.metric_sink) {
+            // #912: saturation has its own dedicated counter so
+            // operators can distinguish "pool full → resize" from
+            // "internal failure → investigate". The legacy
+            // dispatcher_internal increment stays for backward
+            // compatibility with dashboards that already track it.
+            listener_->opts_.metric_sink->on_bidi_pool_saturated(
+                "grpc", method_cache_);
             listener_->opts_.metric_sink->on_unexpected_dispatch_throw(
                 "grpc", method_cache_, "dispatcher_internal");
         }
@@ -903,6 +917,11 @@ std::expected<void, Status> GrpcServerListener::start(
     bidi_pool_size_ = resolve_bidi_pool_size(opts);
     bidi_in_flight_.store(0, std::memory_order_release);
     bidi_pool_stop_.store(false, std::memory_order_release);
+    // #912: emit the pool-size gauge once so operators can graph the
+    // configured cap alongside `on_bidi_pool_in_flight_delta` residency.
+    if (opts.metric_sink) {
+        opts.metric_sink->on_bidi_pool_size("grpc", bidi_pool_size_);
+    }
     try {
         bidi_pool_threads_.reserve(bidi_pool_size_);
         for (uint32_t i = 0; i < bidi_pool_size_; ++i) {
@@ -1098,6 +1117,13 @@ void GrpcServerListener::bidi_pool_worker_loop() {
             }
         }
         bidi_in_flight_.fetch_sub(1, std::memory_order_release);
+        // #912: matching dequeue gauge delta. Note this fires AFTER the
+        // handler returns, so the residency gauge measures
+        // queue-depth-at-the-time-of-fanout — peak in-flight = pool
+        // size during sustained saturation, 0 during quiet periods.
+        if (opts_.metric_sink) {
+            opts_.metric_sink->on_bidi_pool_in_flight_delta("grpc", -1);
+        }
     }
 }
 
@@ -1111,6 +1137,11 @@ void GrpcServerListener::shutdown_bidi_pool() {
         if (w.joinable()) w.join();
     }
     bidi_pool_threads_.clear();
+    // #912: zero out the pool-size gauge so dashboards distinguish
+    // "listener up, pool quiescing" from "listener gone".
+    if (opts_.metric_sink) {
+        opts_.metric_sink->on_bidi_pool_size("grpc", 0);
+    }
 
     // After all workers exited, the queue MUST be empty (cq_worker
     // exited before this is called, so no new dispatch_bidi can run;

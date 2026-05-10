@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **Bidi dispatcher pool saturation metric + ServerTransportMetricSink
+  wiring + reconnect-reason label (#912 / #905 / SRE-3 / #925).** Three
+  related observability changes that close the post-PR-1c-4 monitoring
+  gaps in one motion.
+
+  * **#912 / CMP-2 / OBS-1 / UP-111**: `TransportMetricSink` gains three
+    new methods — `on_bidi_pool_size`, `on_bidi_pool_in_flight_delta`,
+    `on_bidi_pool_saturated`. The gRPC listener wires them at pool init,
+    enqueue/dequeue, and the saturation-reject path. Operators can now
+    distinguish "pool full → resize" from "internal failure →
+    investigate" — the legacy `dispatcher_internal` increment still
+    fires alongside for backward dashboards.
+
+  * **#905 / OBS-2**: New `detail::ServerTransportMetricSink` in
+    `server.cpp` derives from `TransportMetricSink` and pumps every hook
+    into `MetricsRegistry`. The agent listener now passes
+    `opts.metric_sink = std::make_shared<ServerTransportMetricSink>(metrics_)`
+    at start, so the previously-dead `yuzu_server_transport_*` surface
+    fills with real data: `streams_total{direction,method}` (counter),
+    `active_streams` (gauge), `bytes_total{direction}` (counter),
+    `dispatcher_throws_total{kind}` (counter),
+    `bidi_pool_saturated_total{method}` (counter),
+    `bidi_pool_in_flight` + `bidi_pool_size` (gauges).
+
+  * **SRE-3 / #925**: `yuzu_agent_reconnections_total` is now labeled by
+    `reason`. Three operator-actionable values:
+    `channel_fault` (Register RPC failed OR Subscribe stream
+    final_status non-Ok — transport-level error), `peer_halfclose`
+    (server gracefully closed bidi, final_status Ok),
+    `stream_open_failed` (open_bidi() returned null, e.g. listener
+    saturation). Cardinality is bounded (3 values).
+
+  Companion alert rules added to `deploy/grafana/yuzu-alerts.yml`:
+  `YuzuBidiPoolSaturationRejects` (warn on any saturation reject
+  sustained for 1 m), `YuzuBidiPoolNearSaturation` (critical when
+  in-flight / size > 0.8 for 5 m), `YuzuAgentChannelFaultRate` (warn
+  when channel_fault reconnects exceed 0.5/s for 5 m). The first two
+  satisfy the 3-reviewer-converged BLOCKING ask from PR 1c-4 governance
+  Gate 6 (compliance + sre + enterprise-readiness).
 - **`BidiStream::write` per-frame deadline + agent-side OTA chunk-deadline
   counter (#911 / UP-101 / SRE-2 / #924).** Adds an optional
   `std::chrono::milliseconds deadline` parameter to `BidiStream::write`,

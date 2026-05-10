@@ -445,6 +445,14 @@ public:
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
         metrics_.describe("yuzu_agent_plugin_rejected_total",
                           "Plugins rejected at load time, labeled by reason", "counter");
+        metrics_.describe("yuzu_agent_reconnections_total",
+                          "Total agent connection-loop reconnects, labeled by reason "
+                          "(channel_fault | peer_halfclose | stream_open_failed). "
+                          "channel_fault = transport-level error (Register RPC failed, "
+                          "Subscribe stream final_status non-Ok). peer_halfclose = "
+                          "server gracefully closed bidi (Subscribe final_status Ok). "
+                          "stream_open_failed = open_bidi() returned null. SRE-3 / #925.",
+                          "counter");
     }
 
     void run() override {
@@ -903,6 +911,12 @@ public:
                 if (!reg_call.status.ok()) {
                     spdlog::error("Failed to register with server: {}", reg_call.status.detail);
                     ++reconnect_count;
+                    // SRE-3 / #925: label reconnect by reason. Register
+                    // RPC failure is always a transport-level issue
+                    // (TLS handshake fail, TCP RST, listener down).
+                    metrics_
+                        .counter("yuzu_agent_reconnections_total", {{"reason", "channel_fault"}})
+                        .increment();
                     continue; // Retry registration
                 }
                 if (!resp.accepted()) {
@@ -995,6 +1009,14 @@ public:
                     }
                     if (!stop_requested_.load(std::memory_order_acquire)) {
                         ++reconnect_count;
+                        // SRE-3 / #925: open_bidi() returned null —
+                        // canonical "stream_open_failed" reason
+                        // (resource exhaustion, listener saturation,
+                        // channel closed by the transport).
+                        metrics_
+                            .counter("yuzu_agent_reconnections_total",
+                                     {{"reason", "stream_open_failed"}})
+                            .increment();
                         spdlog::warn("Subscribe failed — will attempt reconnect");
                         continue;
                     }
@@ -1408,7 +1430,19 @@ public:
 
                 if (!stop_requested_.load(std::memory_order_acquire)) {
                     ++reconnect_count;
-                    metrics_.counter("yuzu_agent_reconnections_total").increment();
+                    // SRE-3 / #925: distinguish a graceful peer
+                    // half-close (server closed bidi cleanly) from a
+                    // channel-level fault (deadline, RST, TLS failure,
+                    // unavailable). final_status() is safe here: the
+                    // read loop above returned false (handler thread
+                    // is the reader), so the contract pre-condition
+                    // for final_status() is satisfied.
+                    const auto fs = stream->final_status();
+                    const char* reason = (fs.code == ::yuzu::transport::StatusCode::Ok)
+                                             ? "peer_halfclose"
+                                             : "channel_fault";
+                    metrics_.counter("yuzu_agent_reconnections_total", {{"reason", reason}})
+                        .increment();
                     spdlog::warn("Connection lost — will attempt reconnect");
                     continue; // Back to reconnect loop
                 }

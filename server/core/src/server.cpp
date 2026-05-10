@@ -177,6 +177,124 @@ namespace yuzu::server {
 
 namespace detail {
 
+// -- ServerTransportMetricSink (#905 + #912) ---------------------------------
+//
+// Concrete `transport::TransportMetricSink` implementation that wires
+// the agent listener's per-call observability hooks into the server's
+// MetricsRegistry. Closes #905 (sink wiring) + #912 (bidi pool
+// saturation gauge + counter). The sink is held by shared_ptr because
+// `ListenerOptions::metric_sink` is shared_ptr-typed; the listener
+// drops the reference on shutdown.
+//
+// Counter / gauge naming follows the `yuzu_server_transport_*` prefix
+// already documented in the TransportMetricSink contract block. All
+// labels are operator-controlled / bounded-cardinality:
+//   * `direction` ∈ {"sent","received"} — bytes counters.
+//   * `method` is the registered handler method (operator-controlled
+//     at startup; never attacker-supplied).
+//   * `kind` ∈ {"std_exception","non_std_exception","dispatcher_internal"}.
+//
+// Concurrency: every callback fires from a transport-internal worker
+// thread (cq_worker, bidi_pool_worker, or the user's handler). The
+// MetricsRegistry counter / gauge handles are thread-safe by contract;
+// the sink itself is stateless apart from its non-owning registry ref.
+class ServerTransportMetricSink final : public ::yuzu::transport::TransportMetricSink {
+public:
+    explicit ServerTransportMetricSink(::yuzu::MetricsRegistry& metrics) : metrics_(metrics) {
+        metrics_.describe("yuzu_server_transport_streams_total",
+                          "Total transport streams opened by the agent listener "
+                          "(direction=opened|closed).",
+                          "counter");
+        metrics_.describe("yuzu_server_transport_active_streams",
+                          "Active transport streams on the agent listener (open minus "
+                          "closed). Operators can graph this versus "
+                          "yuzu_server_transport_bidi_pool_size to spot saturation.",
+                          "gauge");
+        metrics_.describe("yuzu_server_transport_bytes_total",
+                          "Total bytes flowing through the agent listener "
+                          "(direction=sent|received).",
+                          "counter");
+        metrics_.describe("yuzu_server_transport_dispatcher_throws_total",
+                          "Total dispatcher-layer exceptions caught by the transport "
+                          "per-event try/catch on the agent listener "
+                          "(kind=std_exception|non_std_exception|dispatcher_internal).",
+                          "counter");
+        metrics_.describe("yuzu_server_transport_bidi_pool_saturated_total",
+                          "Bidi dispatcher-pool saturation rejects on the agent listener "
+                          "(method label is operator-controlled). Distinct from "
+                          "yuzu_server_transport_dispatcher_throws_total{kind=dispatcher_internal} "
+                          "so operators can alert on capacity-resize signals separately "
+                          "from internal-failure signals (#912 / CMP-2).",
+                          "counter");
+        metrics_.describe("yuzu_server_transport_bidi_pool_in_flight",
+                          "Bidi dispatcher-pool calls currently in-flight on the agent "
+                          "listener (queued or dequeued-but-not-yet-decremented). "
+                          "Compare against yuzu_server_transport_bidi_pool_size for "
+                          "saturation alerting.",
+                          "gauge");
+        metrics_.describe("yuzu_server_transport_bidi_pool_size",
+                          "Bidi dispatcher-pool configured cap on the agent listener. "
+                          "Set once at start, zeroed on shutdown.",
+                          "gauge");
+    }
+
+    void on_stream_opened(std::string_view backend, std::string_view method) override {
+        metrics_
+            .counter("yuzu_server_transport_streams_total",
+                     {{"direction", "opened"}, {"method", std::string{method}}})
+            .increment();
+        metrics_.gauge("yuzu_server_transport_active_streams").increment();
+    }
+
+    void on_stream_closed(std::string_view backend, std::string_view method,
+                          ::yuzu::transport::Status final) override {
+        metrics_
+            .counter("yuzu_server_transport_streams_total",
+                     {{"direction", "closed"}, {"method", std::string{method}}})
+            .increment();
+        metrics_.gauge("yuzu_server_transport_active_streams").decrement();
+    }
+
+    void on_bytes_sent(std::string_view backend, std::size_t bytes) override {
+        metrics_.counter("yuzu_server_transport_bytes_total", {{"direction", "sent"}})
+            .increment(static_cast<double>(bytes));
+    }
+
+    void on_bytes_received(std::string_view backend, std::size_t bytes) override {
+        metrics_.counter("yuzu_server_transport_bytes_total", {{"direction", "received"}})
+            .increment(static_cast<double>(bytes));
+    }
+
+    void on_unexpected_dispatch_throw(std::string_view backend, std::string_view method,
+                                      std::string_view kind) override {
+        metrics_
+            .counter("yuzu_server_transport_dispatcher_throws_total", {{"kind", std::string{kind}}})
+            .increment();
+    }
+
+    void on_bidi_pool_size(std::string_view backend, std::uint32_t size) override {
+        metrics_.gauge("yuzu_server_transport_bidi_pool_size").set(static_cast<double>(size));
+    }
+
+    void on_bidi_pool_in_flight_delta(std::string_view backend, int delta) override {
+        if (delta > 0) {
+            metrics_.gauge("yuzu_server_transport_bidi_pool_in_flight").increment();
+        } else if (delta < 0) {
+            metrics_.gauge("yuzu_server_transport_bidi_pool_in_flight").decrement();
+        }
+    }
+
+    void on_bidi_pool_saturated(std::string_view backend, std::string_view method) override {
+        metrics_
+            .counter("yuzu_server_transport_bidi_pool_saturated_total",
+                     {{"method", std::string{method}}})
+            .increment();
+    }
+
+private:
+    ::yuzu::MetricsRegistry& metrics_;
+};
+
 // -- Platform-specific log path -----------------------------------------------
 
 [[nodiscard]] std::filesystem::path server_log_path() {
@@ -863,6 +981,14 @@ public:
         // pins the cap at the operator-specified value. Validated at
         // start() — the backend logs the resolved size.
         opts.bidi_dispatcher_pool_size = cfg_.bidi_dispatcher_pool_size;
+        // Wire the agent listener's per-call observability hooks into
+        // the server's MetricsRegistry (#905 / #912). Closes the gap
+        // where transport-layer streams / bytes / dispatcher-throws
+        // / pool-saturation events fired into nullptr; they now surface
+        // as Prometheus counters + gauges under
+        // `yuzu_server_transport_*`. The sink is held by shared_ptr
+        // because the listener takes shared ownership.
+        opts.metric_sink = std::make_shared<detail::ServerTransportMetricSink>(metrics_);
         auto agent_start = agent_listener_->start(*agent_bind_opt, agent_creds_t, opts);
         if (!agent_start.has_value()) {
             spdlog::error("Failed to start agent listener on {}: {}", cfg_.listen_address,

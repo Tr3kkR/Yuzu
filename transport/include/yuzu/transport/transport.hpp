@@ -642,6 +642,39 @@ struct TransportMetricSink {
     virtual void on_unexpected_dispatch_throw(std::string_view backend,
                                               std::string_view method,
                                               std::string_view kind) {}
+
+    // Bidi dispatcher pool observability (#912 / CMP-2 / OBS-1 / UP-111).
+    //
+    // The bounded bidi pool (#904) caps concurrency, but operators need
+    // alertable signals to distinguish "pool full → resize" from
+    // "internal failure → investigate" and to graph in-flight residency
+    // versus configured cap.
+    //
+    // `on_bidi_pool_size` fires once at listener start with the resolved
+    // pool cap, and again on shutdown with size = 0. Implementations
+    // typically expose this as a gauge.
+    //
+    // `on_bidi_pool_in_flight_delta(+1)` fires on enqueue (call accepted
+    // into the pool); `on_bidi_pool_in_flight_delta(-1)` fires on
+    // dequeue (worker picked the call up and is about to run the
+    // handler). Implementations typically expose the running sum as a
+    // gauge. Note: the residency gauge measures queue depth, not
+    // concurrent handler count — a worker running a long-lived bidi
+    // handler holds 0 in-flight units.
+    //
+    // `on_bidi_pool_saturated` fires on the saturation reject path —
+    // `bidi_dispatcher_pool_size` calls are already enqueued and a new
+    // call cannot be accepted. The peer sees `ResourceExhausted`.
+    // `method` is the bounded-cardinality method name (same contract as
+    // `on_unexpected_dispatch_throw`).
+    //
+    // All three callbacks MUST NOT throw.
+    virtual void on_bidi_pool_size(std::string_view backend,
+                                   std::uint32_t size) {}
+    virtual void on_bidi_pool_in_flight_delta(std::string_view backend,
+                                              int delta) {}
+    virtual void on_bidi_pool_saturated(std::string_view backend,
+                                        std::string_view method) {}
 };
 
 // =====================================================================
