@@ -400,6 +400,20 @@ gateway-safe wire payloads): same doc §24; PR ladder:
 
 For any test that creates a temp file or SQLite database, use `yuzu::test::unique_temp_path(prefix)` or `yuzu::test::TempDbFile` from `tests/unit/test_helpers.hpp`. The helper uses a process-local `mt19937_64`-seeded salt plus an atomic monotonic counter — **never** use `std::hash<std::thread::id>` or `std::chrono::steady_clock` as a uniqueness salt. That pattern produces silent collisions under Defender-induced I/O serialisation on the `yuzu-local-windows` runner (flake #473). The shared header was introduced in Guardian PR 2 hardening round 2 (H-8); see #482 for the residual adoption work across 5 test files.
 
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues at `Tr3kkR/Yuzu`, accessed via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical defaults — `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout — root-level `CONTEXT.md` (when authored) + ADRs at `docs/adrs/` (plural). See `docs/agents/domain.md`.
+
 ## CLAUDE.md updates
 
 Architectural decisions, new stores, new plugin patterns, churning subsystems, and cross-cutting concerns belong here so future Claude sessions read them before touching code. Stable reference material that an agent already loads belongs in `docs/` with a one-line pointer here. See memory `feedback_claude_md_scope.md` for the heuristic — Build / Release / Erlang stay resident because the work is unstable or foreign; mature areas can be split out.
