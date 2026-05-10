@@ -293,7 +293,9 @@ private:
         resp.set_output(std::move(combined));
 
         std::lock_guard lock(*write_mu);
-        ::yuzu::transport::write_pb(*stream, resp);
+        // Fire-and-forget: a dead stream surfaces on the next read
+        // iteration in the connection loop and triggers reconnect.
+        (void)::yuzu::transport::write_pb(*stream, resp);
     }
 };
 
@@ -1130,7 +1132,8 @@ public:
                             replay_resp.set_status(pb::CommandResponse::REJECTED);
                             replay_resp.set_output("command replay rejected: duplicate command_id");
                             std::lock_guard lock(stream_write_mu_);
-                            ::yuzu::transport::write_pb(*stream, replay_resp);
+                            // Fire-and-forget: dead-stream surfaces on next read iteration.
+                            (void)::yuzu::transport::write_pb(*stream, replay_resp);
                             continue;
                         }
                         // Double-buffer rotation: when current fills, discard previous,
@@ -1183,7 +1186,9 @@ public:
                                      {{"plugin", "__guard__"}})
                             .increment();
                         std::lock_guard lock(stream_write_mu_);
-                        ::yuzu::transport::write_pb(*stream, resp);
+                        // Fire-and-forget: dead-stream is detected on the
+                        // next read iteration in the connection loop.
+                        (void)::yuzu::transport::write_pb(*stream, resp);
                         continue;
                     }
 
@@ -1203,7 +1208,8 @@ public:
                         resp.set_status(pb::CommandResponse::REJECTED);
                         resp.set_output("plugin not found: " + cmd.plugin());
                         std::lock_guard lock(stream_write_mu_);
-                        ::yuzu::transport::write_pb(*stream, resp);
+                        // Fire-and-forget: see above.
+                        (void)::yuzu::transport::write_pb(*stream, resp);
                         continue;
                     }
 
@@ -1257,7 +1263,8 @@ public:
                                     expired_resp.mutable_sent_at()->set_millis_epoch(epoch);
 
                                     std::lock_guard lock(stream_write_mu_);
-                                    ::yuzu::transport::write_pb(*stream, expired_resp);
+                                    // Fire-and-forget: see above.
+                                    (void)::yuzu::transport::write_pb(*stream, expired_resp);
                                     return;
                                 }
                             }
@@ -1304,7 +1311,8 @@ public:
                             timing_resp.set_output("__timing__|exec_ms=" + std::to_string(exec_ms));
 
                             std::lock_guard lock(stream_write_mu_);
-                            ::yuzu::transport::write_pb(*stream, timing_resp);
+                            // Fire-and-forget: see above.
+                            (void)::yuzu::transport::write_pb(*stream, timing_resp);
                         }
 
                         // Send final status
@@ -1322,7 +1330,8 @@ public:
                             final_resp.mutable_sent_at()->set_millis_epoch(now_epoch);
 
                             std::lock_guard lock(stream_write_mu_);
-                            ::yuzu::transport::write_pb(*stream, final_resp);
+                            // Fire-and-forget: see above.
+                            (void)::yuzu::transport::write_pb(*stream, final_resp);
                         }
 
                         spdlog::info("Command {} finished (rc={}, exec={}ms)", cmd.command_id(), rc,
@@ -1337,7 +1346,8 @@ public:
                         reject_resp.set_status(pb::CommandResponse::REJECTED);
                         reject_resp.set_output("agent overloaded: command queue full");
                         std::lock_guard lock(stream_write_mu_);
-                        ::yuzu::transport::write_pb(*stream, reject_resp);
+                        // Fire-and-forget: see above.
+                        (void)::yuzu::transport::write_pb(*stream, reject_resp);
                     }
                 }
 

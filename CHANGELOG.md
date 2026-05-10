@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **`BidiStream::read` negative deadline contract clarified + `[[nodiscard]]`
+  on `read_pb`/`write_pb` (#915 / UP-110 / #929 cpp NICE).** Closet-clean
+  follow-ups from PR 1c-4 governance. Negative `deadline` values passed to
+  `BidiStream::read` are now contractually treated as zero (no deadline /
+  unbounded wait) rather than silently falling through to the unbounded
+  branch — defends against caller patterns like
+  `deadline = max(0ms, target - now())` underflowing to "wait forever"
+  (the worst-of-both surprise documented in arch-S1). Today's
+  implementation already routes negatives correctly via the existing
+  `> zero()` check; this change makes the contract explicit in
+  `transport.hpp` and adds inline pointers in `grpc_channel.cpp` +
+  `grpc_listener.cpp` plus a unit test. Companion change adds
+  `[[nodiscard]]` to the typed `read_pb` / `write_pb` template helpers
+  in `proto_adapter.hpp` so callers can't silently drop the success
+  bool; six fire-and-forget write sites in `agents/core/src/agent.cpp`
+  (the OutputCallback / command-dispatch worker pool, where a dead
+  stream is detected on the next read iteration) gained explicit
+  `(void)` casts to express intent. No public API or behavioural change.
 - **Legacy `grpc::Channel` + diagnostic block + keepalive args removed
   from agent (#376 PR 1c-4 commit (iii)).** Pure deletion; commit (ii)
   lifted Subscribe + DownloadUpdate onto `transport::Channel`, the

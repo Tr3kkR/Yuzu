@@ -570,6 +570,12 @@ public:
             const auto pred = [this] {
                 return read_done_.has_value() || cancelled_;
             };
+            // Negative deadline → treated as zero (unbounded). See the
+            // BidiStream contract block in transport.hpp. The `> zero()`
+            // check below routes negatives to the `else` branch, which
+            // is the unbounded wait — defensive against callers using
+            // `deadline = target - now()` patterns where the underflow
+            // would otherwise pin the stream forever (#915 / UP-110).
             if (deadline > std::chrono::milliseconds::zero()) {
                 // Idle-read timeout (#902 / UP-8). On expiry: mark
                 // deadline-exceeded for final_status() reporting, flip

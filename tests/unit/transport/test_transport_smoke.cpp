@@ -1547,6 +1547,71 @@ TEST_CASE("Bidi read deadline expires on client when server never writes",
     listener->shutdown();
 }
 
+TEST_CASE("Bidi read negative deadline is treated as zero (#915 / UP-110)",
+          "[transport][bidi][deadline]") {
+    using namespace std::chrono_literals;
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    // Server-side handler invokes read with a negative deadline. The
+    // contract (transport.hpp BidiStream::read block) is that negatives
+    // collapse to zero == "no deadline / unbounded wait", NOT "expire
+    // immediately". We prove this by writing a frame ~150ms after the
+    // server-side read begins; the read MUST observe the frame rather
+    // than firing a synthetic DeadlineExceeded immediately.
+    std::atomic<bool> handler_observed_frame{false};
+    std::atomic<bool> handler_returned_quickly{false};
+    auto handler = [&](const CallContext&, BidiStream& stream) -> Status {
+        StringMessage msg;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = stream.read(msg, std::chrono::milliseconds{-100});
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        // If the negative-deadline-= zero contract holds, the read
+        // blocked until the client wrote a frame — must take >= ~100ms.
+        // If the contract were "negative = immediate timeout", elapsed
+        // would be near-zero and ok would be false.
+        if (ok && elapsed >= 100ms) {
+            handler_observed_frame.store(true, std::memory_order_release);
+        }
+        if (elapsed < 50ms) {
+            handler_returned_quickly.store(true, std::memory_order_release);
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiNegDeadline", handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    REQUIRE(listener->start(bind, creds).has_value());
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch->wait_for_connected(2s));
+
+    CallContext ctx;
+    ctx.deadline = 5s;
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiNegDeadline", ctx);
+    REQUIRE(stream != nullptr);
+
+    // Write a frame ~150ms after the server began reading. The handler
+    // must observe it, not bail with a synthetic immediate timeout.
+    std::this_thread::sleep_for(150ms);
+    StringMessage payload("hello");
+    REQUIRE(stream->write(payload));
+    stream->writes_done();
+
+    // Drain to keep the client side tidy.
+    StringMessage drain;
+    (void)stream->read(drain);
+    Status final = stream->final_status();
+    REQUIRE(final.code == StatusCode::Ok);
+
+    REQUIRE(handler_observed_frame.load(std::memory_order_acquire));
+    REQUIRE_FALSE(handler_returned_quickly.load(std::memory_order_acquire));
+
+    listener->shutdown();
+}
+
 TEST_CASE("Bidi read deadline does not fire when frame arrives in time",
           "[transport][bidi][deadline]") {
     using namespace std::chrono_literals;

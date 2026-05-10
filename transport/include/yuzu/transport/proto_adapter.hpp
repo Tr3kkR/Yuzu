@@ -195,10 +195,15 @@ void register_unary_pb(ServerListener& listener, std::string method,
 // caps the per-call wait; on expiry the stream is cancelled and
 // `BidiStream::final_status()` reports `DeadlineExceeded`. See the
 // BidiStream contract block in transport.hpp for the full semantics.
+//
+// `[[nodiscard]]`: the bool return distinguishes peer half-close from
+// frame-arrived; silently dropping it is almost always a bug. Callers
+// that intentionally want fire-and-forget MUST use `(void)read_pb(...)`
+// to express intent.
 template <typename T>
-bool read_pb(BidiStream& stream, T& out,
-             std::chrono::milliseconds deadline =
-                 std::chrono::milliseconds::zero()) {
+[[nodiscard]] bool read_pb(BidiStream& stream, T& out,
+                           std::chrono::milliseconds deadline =
+                               std::chrono::milliseconds::zero()) {
     ProtoMessage<T> wrap(out);
     return stream.read(wrap, deadline);
 }
@@ -206,8 +211,14 @@ bool read_pb(BidiStream& stream, T& out,
 // Write a typed proto to the stream. Returns false on cancel /
 // already-finished / serialise overflow — same contract as
 // `BidiStream::write`.
+//
+// `[[nodiscard]]`: a false return signals the stream is dead; further
+// writes will also fail and the caller usually wants to bail. Sites
+// that intentionally fire-and-forget (e.g. the agent's command-output
+// pump where a dead stream is detected by the next read iteration)
+// MUST use `(void)write_pb(...)` to express intent.
 template <typename T>
-bool write_pb(BidiStream& stream, const T& msg) {
+[[nodiscard]] bool write_pb(BidiStream& stream, const T& msg) {
     auto wrap = as_proto(msg);  // overload const-casts internally; safe for serialize-only
     return stream.write(wrap);
 }

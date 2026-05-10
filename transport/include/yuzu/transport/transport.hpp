@@ -500,6 +500,15 @@ public:
     // bounds the bidi dispatcher pool slot residency for misbehaving
     // peers (#902 / UP-8).
     //
+    // **Negative deadlines are treated as zero** (no deadline / unbounded
+    // wait), matching the `CallContext::deadline = zero()` convention
+    // already in this header. This is defensive against caller patterns
+    // like `deadline = max(0ms, target_deadline - now())` where a missed
+    // target would otherwise underflow into a negative value; without
+    // the clamp the caller would pin the stream forever instead of
+    // expiring promptly. To express "expire immediately", pass
+    // `milliseconds(1)` (closes #915 / UP-110 / arch-S1).
+    //
     // The deadline applies ONLY to this specific read call, not to the
     // stream as a whole. A handler may call `read()` repeatedly with
     // different deadlines (or the same one) to enforce per-frame idle
