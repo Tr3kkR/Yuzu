@@ -475,3 +475,171 @@ TEST_CASE("DownloadUpdate lift: per-chunk read deadline expires when server stal
     Status final = stream->final_status();
     REQUIRE((final.code == StatusCode::DeadlineExceeded || final.code == StatusCode::Cancelled));
 }
+
+// =====================================================================
+// qe S-2 (#926) — Channel::bidi_stream returns nullptr after close()
+// =====================================================================
+//
+// The agent connection loop checks `if (!stream)` after `bidi_stream()`
+// and treats nullptr as a transient open-failure (increments reconnect
+// counter, sleeps, retries). The branch exists in agents/core/src/agent.cpp
+// but had no direct unit test before this case. We exercise it via
+// channel->close(): after the channel is closed, GrpcChannel::bidi_stream
+// returns nullptr (transport/src/grpc/grpc_channel.cpp:825) — the same
+// shape an agent observes during a transient transport-layer failure.
+TEST_CASE("Channel::bidi_stream returns nullptr after close (qe S-2 / #926)",
+          "[agent][subscribe][lift][nullptr]") {
+    using namespace std::chrono_literals;
+
+    BidiFixture fx{"yuzu.agent.v1.AgentService/Subscribe",
+                   [](const CallContext&, BidiStream& stream) -> Status {
+                       agent_pb::CommandResponse drop;
+                       (void)::yuzu::transport::read_pb(stream, drop);
+                       return Status{StatusCode::Ok, ""};
+                   }};
+
+    // Sanity: channel is healthy and bidi_stream succeeds before close.
+    CallContext ctx{};
+    ctx.deadline = std::chrono::seconds(5);
+    auto live = fx.channel->bidi_stream("yuzu.agent.v1.AgentService/Subscribe", ctx);
+    REQUIRE(live != nullptr);
+    live.reset(); // Close the live stream before closing the channel.
+
+    // Close the channel. The agent connection loop calls this on the
+    // shutdown path; we exercise the same code transition.
+    fx.channel->close();
+
+    // bidi_stream() now MUST return nullptr — the canonical "transport-
+    // layer transient failure" signal the agent's nullptr-branch handles.
+    auto dead = fx.channel->bidi_stream("yuzu.agent.v1.AgentService/Subscribe", ctx);
+    REQUIRE(dead == nullptr);
+
+    // Calling again is idempotent and still returns nullptr — no
+    // exceptions, no use-after-free.
+    auto dead2 = fx.channel->bidi_stream("yuzu.agent.v1.AgentService/Subscribe", ctx);
+    REQUIRE(dead2 == nullptr);
+}
+
+// =====================================================================
+// qe S-3 (#927) — concurrent-write through shared_ptr<BidiStream>
+// =====================================================================
+//
+// PR 1c-4 made the agent's Subscribe stream a `std::shared_ptr<BidiStream>`
+// shared across the OutputCallback worker pool + the connection loop;
+// concurrent `write()` calls are serialised externally via
+// `stream_write_mu_` (transport.hpp:446 — BidiStream is single-writer
+// thread-compatible, so callers MUST serialise). This test pins the
+// invariant: N writer threads × M frames each, all serialised through
+// one external mutex, produce no torn frames and no out-of-order
+// sequence numbers.
+//
+// Catch2 thread-safety note (#918): REQUIRE/CHECK from spawned threads
+// is unsafe. All cross-thread observations are collected into atomics
+// or main-thread-owned containers; assertions live on the main thread.
+TEST_CASE("Concurrent writes through shared BidiStream are torn-frame-free "
+          "(qe S-3 / #927)",
+          "[agent][subscribe][lift][concurrent]") {
+    using namespace std::chrono_literals;
+
+    constexpr int kWriters = 4;
+    constexpr int kFramesPerWriter = 200;
+    constexpr int kTotalFrames = kWriters * kFramesPerWriter;
+
+    // Server collects every received frame's command_id payload into
+    // a vector and exits when it has seen kTotalFrames.
+    std::mutex received_mu;
+    std::vector<std::string> received;
+    received.reserve(kTotalFrames);
+    std::atomic<int> received_count{0};
+
+    BidiFixture fx{"yuzu.agent.v1.AgentService/Subscribe",
+                   [&](const CallContext&, BidiStream& stream) -> Status {
+                       agent_pb::CommandResponse frame;
+                       while (::yuzu::transport::read_pb(stream, frame)) {
+                           {
+                               std::lock_guard lk(received_mu);
+                               received.push_back(frame.command_id());
+                           }
+                           if (received_count.fetch_add(1, std::memory_order_acq_rel) + 1 >=
+                               kTotalFrames) {
+                               break;
+                           }
+                       }
+                       return Status{StatusCode::Ok, ""};
+                   }};
+
+    CallContext ctx{};
+    ctx.deadline = std::chrono::seconds(30);
+    auto raw = fx.channel->bidi_stream("yuzu.agent.v1.AgentService/Subscribe", ctx);
+    REQUIRE(raw != nullptr);
+    std::shared_ptr<BidiStream> shared{std::move(raw)};
+
+    // External mutex matching agent.cpp::stream_write_mu_ semantics.
+    std::mutex stream_write_mu;
+
+    // Worker pool: each thread writes kFramesPerWriter frames whose
+    // command_id encodes the writer id + sequence number ("w<W>:s<N>")
+    // so the server can verify no torn frames (every received id is
+    // parseable + within the expected ranges).
+    std::vector<std::thread> writers;
+    writers.reserve(kWriters);
+    std::atomic<int> writer_failures{0};
+    for (int w = 0; w < kWriters; ++w) {
+        writers.emplace_back([w, shared, &stream_write_mu, &writer_failures] {
+            for (int s = 0; s < kFramesPerWriter; ++s) {
+                agent_pb::CommandResponse frame;
+                frame.set_command_id("w" + std::to_string(w) + ":s" + std::to_string(s));
+                std::lock_guard lk(stream_write_mu);
+                if (!::yuzu::transport::write_pb(*shared, frame)) {
+                    writer_failures.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+            }
+        });
+    }
+    for (auto& t : writers)
+        t.join();
+    shared->writes_done();
+
+    // Drain server-side reply (the handler exits once it sees
+    // kTotalFrames; the client side just observes peer half-close).
+    agent_pb::CommandResponse drain;
+    (void)::yuzu::transport::read_pb(*shared, drain);
+    Status final = shared->final_status();
+
+    REQUIRE(writer_failures.load(std::memory_order_acquire) == 0);
+    REQUIRE(received_count.load(std::memory_order_acquire) == kTotalFrames);
+    REQUIRE(final.code == StatusCode::Ok);
+
+    // Verify no torn frames: every received command_id is parseable as
+    // "w<W>:s<N>" with W in [0, kWriters) and N in [0, kFramesPerWriter).
+    // Per-writer sequence ordering is a secondary invariant: writes from
+    // a single thread MUST appear in s-ascending order on the wire (the
+    // mutex is the only ordering primitive between writers, so within
+    // one writer the program order is preserved).
+    std::vector<int> last_seen_per_writer(kWriters, -1);
+    int parse_failures = 0;
+    int order_violations = 0;
+    {
+        std::lock_guard lk(received_mu);
+        for (const auto& id : received) {
+            int w = -1;
+            int s = -1;
+            if (std::sscanf(id.c_str(), "w%d:s%d", &w, &s) != 2 || w < 0 || w >= kWriters ||
+                s < 0 || s >= kFramesPerWriter) {
+                ++parse_failures;
+                continue;
+            }
+            if (s <= last_seen_per_writer[w]) {
+                ++order_violations;
+            } else {
+                last_seen_per_writer[w] = s;
+            }
+        }
+    }
+    REQUIRE(parse_failures == 0);
+    REQUIRE(order_violations == 0);
+    for (int w = 0; w < kWriters; ++w) {
+        REQUIRE(last_seen_per_writer[w] == kFramesPerWriter - 1);
+    }
+}

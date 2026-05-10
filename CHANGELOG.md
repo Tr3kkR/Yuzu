@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **PR 1c-4 lift coverage: nullptr open_bidi + concurrent shared-stream
+  writes (#926 / #927).** Adds two test cases to
+  `tests/unit/test_agent_subscribe_lift.cpp`:
+  - `Channel::bidi_stream returns nullptr after close (qe S-2 / #926)`
+    — exercises the agent's `if (!stream)` branch (the canonical
+    transient-transport-failure signal in `agents/core/src/agent.cpp`).
+    Live channel → bidi_stream succeeds; close() → bidi_stream returns
+    nullptr; second call is idempotent. Previously untested.
+  - `Concurrent writes through shared BidiStream are torn-frame-free
+    (qe S-3 / #927)` — pins the OutputCallback worker-pool invariant:
+    4 writer threads × 200 frames each, all serialised through one
+    external mutex (matching `stream_write_mu_` in agent.cpp), produce
+    no torn frames and preserve per-writer sequence ordering on the
+    wire. Catch2 thread-safety #918 honoured: cross-thread observations
+    collected into atomics + main-thread-owned containers; assertions
+    live on the main thread only.
 - **`BidiStream::read` negative deadline contract clarified + `[[nodiscard]]`
   on `read_pb`/`write_pb` (#915 / UP-110 / #929 cpp NICE).** Closet-clean
   follow-ups from PR 1c-4 governance. Negative `deadline` values passed to
