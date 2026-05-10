@@ -1,4 +1,5 @@
-// Yuzu fleet visualization renderer (PR 5 + PR 6 of feat/viz-engine ladder).
+// Yuzu fleet visualization renderer (PR 5 + PR 6 + PR 7 of feat/viz-engine
+// ladder).
 //
 // Scene built by PR 5: scene + perspective camera + ambient + directional
 // light + ground grid + axes helper, with OrbitControls drag-rotate /
@@ -12,14 +13,30 @@
 // coloured by OS family, and labels them with a Sprite carrying the
 // hostname. Hover surfaces a fixed-position tooltip via a Raycaster.
 //
+// Process layer added by PR 7: each cube owns a child `THREE.Group`
+// (`yuzu-processes`) of small `SphereGeometry` dots, one per process,
+// laid out on an `hash(pid|ppid)`-mod-bucket interior 3D grid (deterministic
+// across reloads, jittered to break stripes) and coloured from the
+// six-category palette (system / browser / database / web / runtime /
+// other). The per-machine subgroup is the deliberate architecture pick
+// over a single sibling processGroup (gov R6 architect NICE-1) — it
+// makes per-cube localhost edges (PR 8) trivial, gives clearFleet's
+// existing `traverse(disposeNode)` walk free dispose for the new
+// subtree, and keeps per-machine LOD culling for PR 11 a one-liner.
+// Hover raycaster checks process meshes BEFORE cube meshes so an
+// operator hovering a dot through the translucent cube face sees the
+// process tooltip (otherwise the cube's outer face always wins by
+// distance and PR 7's whole point — drilling into processes — would
+// be visually unreachable).
+//
 // Mount contract: mount() runs idempotently on DOMContentLoaded and on
 // `htmx:afterSettle`. It locates `[data-yuzu-viz-url]` (set in viz_page_ui.cpp
 // on `#viz-root`) and bails early if already mounted (canvas survival
 // invariant — HTMX swaps of `#viz-overlay-panel` must not blow away the
 // WebGLRenderer's GPU context).
 //
-// PR 7+ fills in interior process nodes; PR 8/9 add intra- and inter-
-// machine edges; PR 10 adds the vulnerability overlay.
+// PR 8/9 add intra- and inter-machine edges; PR 10 adds the
+// vulnerability overlay; PR 11 polishes (LOD, instancing, scheduler).
 //
 // Load contract:
 //   <script type="importmap"> maps "three" -> /static/three.module.min.js
@@ -76,6 +93,26 @@ function pickOsColor(osName) {
   if (k.indexOf('darwin') >= 0 || k.indexOf('mac') >= 0) return OS_PALETTE.darwin;
   if (k.indexOf('windows') >= 0 || k.indexOf('win32') >= 0) return OS_PALETTE.windows;
   return OS_PALETTE.default;
+}
+
+// PR 7: per-category process-node palette. Keys exactly match the lowercase
+// strings emitted by category_to_string() in process_category.hpp; any
+// string not in the table falls through to `other`. Hex chosen for visual
+// contrast against the cube's translucent shell on the dark canvas. Pinned
+// in test_static_js_bundle.cpp — the palette is a UX contract; changing
+// a colour is deliberate, not incidental.
+const CATEGORY_PALETTE = {
+  system:   '#6e7681',
+  browser:  '#58a6ff',
+  database: '#d29922',
+  web:      '#56d364',
+  runtime:  '#bc8cff',
+  other:    '#8b949e'
+};
+function pickCategoryColor(category) {
+  if (!category) return CATEGORY_PALETTE.other;
+  const k = String(category).toLowerCase();
+  return CATEGORY_PALETTE[k] || CATEGORY_PALETTE.other;
 }
 
 // FNV-1a 32-bit hash of a string. Used to derive a stable per-agent
@@ -155,6 +192,84 @@ function buildCube(machine) {
   // without a parallel id->object map.
   cube.userData.yuzuMachine = machine;
   return cube;
+}
+
+// PR 7: lay N processes out on a 3D bucket grid INSIDE a cube's local
+// coordinate frame. Returns [{process, x, y, z}] in cube-local units, so
+// the caller attaches the dots to a Group that's a child of the cube and
+// the dots orbit/translate with the cube unchanged.
+//
+// Bucket count is `ceil(cbrt(max(N*1.5, 8)))` — the *1.5 slack reduces
+// hash-collision rates so processes with similar pids don't pile up; the
+// floor of 8 ensures even tiny machines (a handful of system procs) get
+// a roughly volumetric scatter rather than collapsing onto one cell.
+//
+// Layout key: `hash32(pid|ppid)` is the bucket index; a secondary
+// `hash32('j|pid')` provides per-process sub-cell jitter in [-0.35, 0.35]
+// of cell size, breaking the grid stripe pattern while preserving the
+// "same fleet renders identically across reloads" contract.
+//
+// Interior fraction is 0.78 — keeps every dot well inside the cube faces
+// (which are at ±CUBE_SIZE/2) so process dots never visually escape the
+// cube on rotation. Combined with PROCESS_DOT_RADIUS the worst-case dot
+// surface stays inside ~95% of the cube edge.
+const PROCESS_DOT_RADIUS = 0.22;
+const PROCESS_INTERIOR_FRACTION = 0.78;
+function placeProcessesInCube(processes, cubeSize) {
+  if (!processes || processes.length === 0) return [];
+  const N = processes.length;
+  // gov: process count from the server is bounded by tar.fleet_snapshot
+  // truncation (per machine), so N stays in low thousands worst-case.
+  const buckets = Math.max(2, Math.ceil(Math.cbrt(Math.max(N * 1.5, 8))));
+  const span = cubeSize * PROCESS_INTERIOR_FRACTION;
+  const cellSize = span / buckets;
+  const halfSpan = span / 2;
+  const out = [];
+  for (let i = 0; i < N; i++) {
+    const p = processes[i] || {};
+    const pidStr = String(p.pid != null ? p.pid : '0');
+    const ppidStr = String(p.ppid != null ? p.ppid : '0');
+    const h = hash32(pidStr + '|' + ppidStr);
+    const bx = h % buckets;
+    const by = Math.floor(h / buckets) % buckets;
+    const bz = Math.floor(h / (buckets * buckets)) % buckets;
+    const jh = hash32('j|' + pidStr);
+    // Each byte of the secondary hash gives a uniform-ish ±0.35 jitter.
+    const jx = ((jh & 0xff) / 255 - 0.5) * 0.7;
+    const jy = (((jh >> 8) & 0xff) / 255 - 0.5) * 0.7;
+    const jz = (((jh >> 16) & 0xff) / 255 - 0.5) * 0.7;
+    const x = (bx + 0.5 + jx) * cellSize - halfSpan;
+    const y = (by + 0.5 + jy) * cellSize - halfSpan;
+    const z = (bz + 0.5 + jz) * cellSize - halfSpan;
+    // gov R5 UP-7 mirror: NaN/Infinity from Math.cbrt or hash arithmetic
+    // would crash WebGL on render. Skip silently rather than emit a
+    // malformed mesh position.
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+    out.push({process: p, x: x, y: y, z: z});
+  }
+  return out;
+}
+
+// PR 7: build a small sphere mesh for one process. Per-process geometry +
+// material (matches the cube's per-instance pattern in buildCube) so
+// clearFleet's traverse(disposeNode) walk releases everything cleanly
+// without a shared-resource skip flag. Low-poly sphere (6×4 segments)
+// because each dot is ~0.22 units against a 8-unit cube — the polygon
+// silhouette difference vs higher segment counts is invisible at any
+// reasonable camera distance, and the triangle count savings matter
+// once a 100-machine fleet × 50 processes/machine = 5k spheres land on
+// the GPU. PR 11 polish moves to InstancedMesh.
+//
+// MeshBasicMaterial (not Phong/PBR) because lighting on a 0.22-unit
+// dot is invisible and the basic shader is materially cheaper per draw
+// call. The colour comes straight from the category palette.
+function buildProcessNode(process) {
+  const color = new THREE.Color(pickCategoryColor(process && process.category));
+  const geom = new THREE.SphereGeometry(PROCESS_DOT_RADIUS, 6, 4);
+  const mat = new THREE.MeshBasicMaterial({color: color});
+  const mesh = new THREE.Mesh(geom, mat);
+  mesh.userData.yuzuProcess = process;
+  return mesh;
 }
 
 function buildHostnameLabel(hostname) {
@@ -383,6 +498,12 @@ function mount() {
   // (cheaper + avoids hit-test on the outline material).
   const cubeMeshes = [];
 
+  // PR 7: process dots eligible for raycasting hit-tests. Maintained as a
+  // flat array (rather than walking the per-cube subgroups) so the
+  // raycaster does one Object3D.matrixWorld read per dot instead of
+  // recursing through each cube's child graph. cleared in clearFleet().
+  const processMeshes = [];
+
   // gov R6 happy-S1 / UP-20: cubes carry a wireframe LineSegments child
   // (added in buildCube). The straight `for child of fleetGroup.children`
   // walk only sees the cube — wireframe geometry + material would never
@@ -405,11 +526,16 @@ function mount() {
       const child = fleetGroup.children[0];
       fleetGroup.remove(child);
       // Recurse to release wireframe LineSegments + sprite-internal
-      // textures + any future per-machine sub-graph (PR 7 process
-      // nodes will land as children of cubes too).
+      // textures + the PR 7 per-machine processGroup subtree. Without
+      // recursion, every refill leaks N machines × M processes worth of
+      // SphereGeometry + MeshBasicMaterial into VRAM (PR 11 adds 60s
+      // background refresher; this would be cumulative).
       child.traverse(disposeNode);
     }
     cubeMeshes.length = 0;
+    // PR 7: traversal already disposed every dot inside each cube's
+    // processGroup; just drop the flat raycast index alongside cubeMeshes.
+    processMeshes.length = 0;
   }
 
   function addMachines(machines) {
@@ -424,6 +550,27 @@ function mount() {
       const label = buildHostnameLabel(p.machine.hostname);
       label.position.set(p.x, p.y + CUBE_SIZE * 0.85, p.z);
       fleetGroup.add(label);
+
+      // PR 7: per-machine process subgroup. Attached as a child of the
+      // cube (NOT as a sibling under fleetGroup) so the dots inherit
+      // every transform on the cube — no synchronisation required as
+      // the OrbitControls camera moves or as PR 11 toggles per-cube
+      // visibility for LOD culling. Layout coordinates are cube-local.
+      const procs = Array.isArray(p.machine && p.machine.processes)
+        ? p.machine.processes : [];
+      if (procs.length > 0) {
+        const processGroup = new THREE.Group();
+        processGroup.name = 'yuzu-processes';
+        cube.add(processGroup);
+        const procPlacements = placeProcessesInCube(procs, CUBE_SIZE);
+        for (let j = 0; j < procPlacements.length; j++) {
+          const pp = procPlacements[j];
+          const dot = buildProcessNode(pp.process);
+          dot.position.set(pp.x, pp.y, pp.z);
+          processGroup.add(dot);
+          processMeshes.push(dot);
+        }
+      }
     }
   }
 
@@ -477,6 +624,27 @@ function mount() {
     tip.style.top = (evt.clientY - rect.top + 12) + 'px';
     tip.style.display = 'block';
   }
+  // PR 7: process tooltip — pid / name / user / category. Same XSS
+  // hardening as the cube tooltip: name + user are agent-controlled
+  // strings, so every interpolated string field goes through escapeHtml,
+  // and pid is coerced through `Number(...) | 0` so an agent-controlled
+  // non-numeric pid collapses to 0 rather than getting concatenated raw.
+  // The shared #viz-tooltip element inherits the cube tooltip's
+  // max-width/max-height/word-break caps so a 100KB process name cannot
+  // DoS layout (gov R6 UP-3 mirror).
+  function showProcessTooltip(process, evt) {
+    const tip = ensureTooltip();
+    const pid = Number(process && process.pid) | 0;
+    tip.innerHTML =
+      '<div style="font-weight:600;margin-bottom:0.2rem">' +
+      'pid ' + pid + ': ' + escapeHtml((process && process.name) || '(unknown)') + '</div>' +
+      '<div>user: ' + escapeHtml((process && process.user) || '?') + '</div>' +
+      '<div>category: ' + escapeHtml((process && process.category) || 'other') + '</div>';
+    const rect = canvas.getBoundingClientRect();
+    tip.style.left = (evt.clientX - rect.left + 12) + 'px';
+    tip.style.top = (evt.clientY - rect.top + 12) + 'px';
+    tip.style.display = 'block';
+  }
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, function (c) {
       return c === '&' ? '&amp;' :
@@ -489,12 +657,28 @@ function mount() {
   const _ray = new THREE.Raycaster();
   const _ndc = new THREE.Vector2();
   function onMouseMove(evt) {
-    if (cubeMeshes.length === 0) { hideTooltip(); return; }
+    if (cubeMeshes.length === 0 && processMeshes.length === 0) {
+      hideTooltip();
+      return;
+    }
     const rect = canvas.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return;
     _ndc.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1;
     _ndc.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1;
     _ray.setFromCamera(_ndc, camera);
+    // PR 7: process raycast wins over cube raycast. Process dots live
+    // INSIDE the translucent cube; if we let intersectObjects pick the
+    // closest hit across both sets, the cube's outer face always wins
+    // by distance and the operator can never hover a process dot
+    // through the translucent shell. Raycast processMeshes first; only
+    // fall through to cubeMeshes when no process is intersected.
+    if (processMeshes.length > 0) {
+      const procHits = _ray.intersectObjects(processMeshes, false);
+      if (procHits.length > 0 && procHits[0].object.userData.yuzuProcess) {
+        showProcessTooltip(procHits[0].object.userData.yuzuProcess, evt);
+        return;
+      }
+    }
     const hits = _ray.intersectObjects(cubeMeshes, false);
     if (hits.length > 0 && hits[0].object.userData.yuzuMachine) {
       showTooltip(hits[0].object.userData.yuzuMachine, evt);
@@ -680,6 +864,7 @@ function mount() {
   dev.root = root;
   dev.fleetGroup = fleetGroup;
   dev.cubeMeshes = cubeMeshes;
+  dev.processMeshes = processMeshes;
   dev.addMachines = addMachines;
   dev.fetchAndRender = fetchAndRender;
 }

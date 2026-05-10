@@ -446,6 +446,129 @@ TEST_CASE("static_js_bundle: kYuzuVizJs guards camera position against NaN/Infin
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("controls.target.set"));
 }
 
+// ── PR 7: process layer (interior nodes coloured by category) ───────────────
+
+TEST_CASE("static_js_bundle: kYuzuVizJs declares CATEGORY_PALETTE for the six categories",
+          "[static-js][viz][pr7]") {
+    // PR 7 category palette. Each colour is a UX contract — it carries
+    // semantic meaning to the operator (browser=blue, db=amber, web=green
+    // etc.) so a stealth refactor that swaps a hex code is a deliberate
+    // UX decision worth surfacing in PR review. Pin both the palette
+    // constant name and every category=hex pair so a refactor that drops
+    // or recolours a category fails this test loud.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("CATEGORY_PALETTE"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("pickCategoryColor"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("system:   '#6e7681'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("browser:  '#58a6ff'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: '#d29922'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("web:      '#56d364'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("runtime:  '#bc8cff'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("other:    '#8b949e'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs lays processes out on hash(pid|ppid)-mod-bucket grid",
+          "[static-js][viz][pr7]") {
+    // Deterministic interior layout — same fleet renders identically
+    // across reloads (mirrors the cube-layout contract above). Pin the
+    // function name + the cbrt-derived bucket math + the dual-key hash
+    // (pid|ppid for placement, j|pid for jitter). A refactor that swaps
+    // to Math.random() breaks the determinism contract; pinning the
+    // hash composition catches it.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("placeProcessesInCube"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("Math.cbrt"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("hash32(pidStr + '|' + ppidStr)"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("hash32('j|' + pidStr)"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs builds process dots as low-poly spheres",
+          "[static-js][viz][pr7]") {
+    // Per-process SphereGeometry (6×4 segments) + per-process
+    // MeshBasicMaterial. Per-instance materials match the cube pattern
+    // so clearFleet's recursive disposeNode walk releases everything
+    // without a shared-resource skip flag. A refactor to an InstancedMesh
+    // would need its own dispose contract — pin the current pattern so
+    // the polish PR makes that decision deliberately.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("buildProcessNode"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("THREE.SphereGeometry(PROCESS_DOT_RADIUS, 6, 4)"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("THREE.MeshBasicMaterial"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs attaches processGroup as a child of each cube",
+          "[static-js][viz][pr7]") {
+    // gov R6 architect NICE-1 decision: per-machine subgroup, NOT a
+    // single sibling processGroup. Attaching the dots as cube children
+    // (a) makes PR 8 localhost edges trivial (per-cube lookup), (b)
+    // gives clearFleet's traverse() walk free dispose without an extra
+    // sweep pass, (c) makes per-cube LOD culling in PR 11 a one-liner.
+    // Pin both the named-group string and the cube.add(processGroup)
+    // call so a refactor to a sibling-group model fails loud.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("processGroup.name = 'yuzu-processes'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("cube.add(processGroup)"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs raycasts processMeshes BEFORE cubeMeshes",
+          "[static-js][viz][pr7]") {
+    // PR 7 hover-ordering invariant. Process dots are inside translucent
+    // cubes; if intersectObjects picks the closest hit across both sets
+    // the cube's outer face always wins by distance and the operator
+    // can never hover a dot to see process details. Pin the
+    // processMeshes-first raycast pattern so a refactor that combines
+    // both arrays (or flips the order) fails loud.
+    auto pos_proc = yuzu::server::kYuzuVizJs.find("intersectObjects(processMeshes, false)");
+    auto pos_cube = yuzu::server::kYuzuVizJs.find("intersectObjects(cubeMeshes, false)");
+    REQUIRE(pos_proc != std::string::npos);
+    REQUIRE(pos_cube != std::string::npos);
+    CHECK(pos_proc < pos_cube);
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs surfaces process tooltip with pid/name/user/category",
+          "[static-js][viz][pr7]") {
+    // Demo target for PR 7: hover a process and see pid/name/user/category.
+    // Pin the function name and every interpolated label so a refactor
+    // that drops a field (e.g. "user") fails loud.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("showProcessTooltip"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("'pid '"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("'<div>user: '"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("'<div>category: '"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs escapes HTML in process tooltip fields",
+          "[static-js][viz][pr7]") {
+    // Process name + user are agent-controlled. Without escapeHtml on
+    // every interpolated string an agent-controlled name like
+    // `<img onerror=alert()>` would execute on hover. The cube tooltip
+    // already pins escapeHtml; this test pins that the SAME helper is
+    // applied to the process tooltip's three interpolated string fields.
+    // We assert via the showProcessTooltip body presence (above) plus
+    // an `escapeHtml((process` substring — the unique pattern for the
+    // process tooltip's defensive null-coalesce-then-escape idiom.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("escapeHtml((process && process.name)"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("escapeHtml((process && process.user)"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("escapeHtml((process && process.category)"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs coerces process pid through Number(...) | 0",
+          "[static-js][viz][pr7]") {
+    // Mirror of the cube tooltip's pid coercion — agent-controlled pids
+    // could theoretically be strings; coerce to a 32-bit integer so the
+    // template never interpolates raw agent strings as numerics.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("Number(process && process.pid) | 0"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs maintains a flat processMeshes raycast index",
+          "[static-js][viz][pr7]") {
+    // The flat array (rather than walking the per-cube subgroups every
+    // frame) is the perf contract: raycaster does one matrixWorld read
+    // per dot instead of recursing into N machines × M children. Pin
+    // both the declaration AND the clearFleet reset so a refactor that
+    // drops the array but keeps the raycast call (or vice versa) fails.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("const processMeshes = []"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("processMeshes.length = 0"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("processMeshes.push(dot)"));
+}
+
 // ── Fleet viz page HTML scaffold ────────────────────────────────────────────
 
 TEST_CASE("viz page: contains the persistent canvas + viz-root structure", "[viz][page]") {
