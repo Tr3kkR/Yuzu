@@ -38,15 +38,23 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
     // describe here would silently overwrite the help text depending on
     // construction order (consistency B-1 / sre Q1 from PR 1c-4 closet
     // governance round 1). The label-set extension for `rate_limited_per_peer`
-    // and `chunk_write_deadline_exceeded` is documented at the canonical
+    // (#913), `chunk_write_deadline_exceeded` (#911), and
+    // `rate_limit_token_refunded` (#934) is documented at the canonical
     // site. Do not re-introduce a describe call here.
 }
 
 // -- admit_download_update (per-peer token bucket, #913) ----------------------
 
+namespace {
+// Bucket capacity is the same constant in both admit and refund paths;
+// hoisted to anonymous-namespace scope so a future change cannot drift
+// the two halves out of sync (admit caps the deduct path, refund caps
+// the credit path; mismatched caps would either over- or under-charge).
+constexpr double kBucketCapacity = 5.0;
+} // namespace
+
 bool AgentServiceImpl::admit_download_update(const std::string& peer) {
     using namespace std::chrono;
-    constexpr double kBucketCapacity = 5.0;
     // Refill rate ≈ 1 token per 90 minutes (= update_check_interval
     // default 6 h / 4). A normally-behaved agent checks for updates a
     // few times a day; the bucket is steady-state full. A misbehaving
@@ -80,6 +88,36 @@ bool AgentServiceImpl::admit_download_update(const std::string& peer) {
         return true;
     }
     return false;
+}
+
+void AgentServiceImpl::refund_download_update(const std::string& peer) {
+    // Empty-peer no-op: production always supplies a key (SAN identity
+    // or peer_uri). Tests may pass empty to exercise the defensive
+    // path; treat it as a no-op rather than synthesising a bucket.
+    if (peer.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(download_update_buckets_mu_);
+    auto it = download_update_buckets_.find(peer);
+    if (it == download_update_buckets_.end()) {
+        // Bucket was GC'd between admit and refund. The peer hasn't
+        // been seen for >= 24 h, so the next admission will create a
+        // fresh full bucket anyway — no quota was burned in practice.
+        return;
+    }
+    // Cap at capacity. Without the cap, a server that called refund
+    // more than admit (programmer error elsewhere, or a future caller
+    // that doesn't follow the admit-then-conditional-refund pattern)
+    // would let an attacker accumulate excess credit.
+    it->second.tokens = std::min(kBucketCapacity, it->second.tokens + 1.0);
+}
+
+void AgentServiceImpl::set_ota_chunk_write_deadline(std::chrono::seconds deadline) {
+    // Clamp non-positive values to the historical default so a
+    // misconfigured `--ota-chunk-write-deadline-secs 0` (or env-var
+    // typo coercing to 0) does not silently disable the deadline.
+    const int secs = deadline.count() > 0 ? static_cast<int>(deadline.count()) : 30;
+    ota_chunk_write_deadline_secs_.store(secs, std::memory_order_release);
 }
 
 // -- register_with ------------------------------------------------------------
@@ -1194,9 +1232,14 @@ AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& ctx,
     // cannot monopolise fleet-update capacity. Excess requests return
     // ResourceExhausted — same wire status as pool saturation, so
     // dashboards can group these together when alerting on noisy peers.
+    //
+    // The peer key is computed once here and reused below for the
+    // chunk-write-deadline refund path (#934 / UP-206) so a slow-link
+    // peer that fails at the chunk-write phase is NOT charged a
+    // bucket token (which would compound into a 7.5h lockout).
+    const std::string peer_key =
+        ctx.peer_san_identities.empty() ? ctx.peer_uri : ctx.peer_san_identities.front();
     {
-        const std::string peer_key =
-            ctx.peer_san_identities.empty() ? ctx.peer_uri : ctx.peer_san_identities.front();
         // Canonical production call site for `admit_download_update`
         // (the method is public-but-internal — see the doc block on
         // its declaration in `agent_service_impl.hpp`).
@@ -1271,17 +1314,23 @@ AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& ctx,
     std::vector<char> buffer(kChunkSize);
     int64_t offset = 0;
 
-    // Per-chunk write deadline (#911 / UP-101). Bounds the time a slow-
-    // write peer (zero TCP receive window, NAT/firewall holding the
-    // stream, HTTP/2 flow-control window collapse) can pin a bidi
-    // dispatcher pool slot during the chunk-streaming phase. Symmetric
-    // with kRequestReadDeadline above. 30 s is generous: at the 64 KiB
-    // chunk size + an absolute floor of 1 KiB/s sustained throughput
-    // (slow corp link), a chunk takes ~64 s to drain — but a healthy
-    // peer accepts the local TCP buffer in milliseconds, so a 30 s wait
-    // is overwhelmingly attributable to peer trouble. Operators can
-    // increase this if the deployment targets unusually slow links.
-    constexpr auto kChunkWriteDeadline = std::chrono::seconds(30);
+    // Per-chunk write deadline (#911 / UP-101 + #934 / UP-206). Bounds
+    // the time a slow-write peer (zero TCP receive window, NAT/firewall
+    // holding the stream, HTTP/2 flow-control window collapse) can pin
+    // a bidi dispatcher pool slot during the chunk-streaming phase.
+    // Symmetric with kRequestReadDeadline above. The default 30 s is
+    // generous: at the 64 KiB chunk size + an absolute floor of 1 KiB/s
+    // sustained throughput (slow corp link), a chunk takes ~64 s to
+    // drain — but a healthy peer accepts the local TCP buffer in
+    // milliseconds, so a 30 s wait is overwhelmingly attributable to
+    // peer trouble. Operators with deployments behind genuinely slow
+    // links (satellite, residential 4G/LTE, congested corp WAN) can
+    // raise this via `--ota-chunk-write-deadline-secs` /
+    // `YUZU_OTA_CHUNK_WRITE_DEADLINE_SECS` (#934). Snapshotted once
+    // before the loop so a mid-OTA reload of the deadline doesn't
+    // mid-flight reshape behaviour for an in-progress download.
+    const std::chrono::seconds chunk_write_deadline{
+        ota_chunk_write_deadline_secs_.load(std::memory_order_acquire)};
 
     while (file.read(buffer.data(), static_cast<std::streamsize>(kChunkSize)) ||
            file.gcount() > 0) {
@@ -1290,7 +1339,7 @@ AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& ctx,
         chunk.set_offset(offset);
         chunk.set_total_size(pkg->file_size);
 
-        if (!::yuzu::transport::write_pb(stream, chunk, kChunkWriteDeadline)) {
+        if (!::yuzu::transport::write_pb(stream, chunk, chunk_write_deadline)) {
             // Distinguish deadline expiry from peer disconnect / cancel
             // so the wire status is precise; the BidiStream contract
             // promotes final_status() to DeadlineExceeded only on the
@@ -1298,17 +1347,30 @@ AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& ctx,
             // deadline branch above.
             const auto why = stream.final_status();
             if (why.code == StatusCode::DeadlineExceeded) {
+                // Refund the per-peer rate-limit token consumed at
+                // admission (#934 / UP-206). The rate limit guards
+                // against fleet monopolisation by a fast-valid peer; a
+                // peer that hits the chunk-write deadline is failing,
+                // not monopolising, and would compound into a 7.5h
+                // lockout otherwise. The refund is recorded under a
+                // distinct status label so dashboards can split
+                // chunk-write-deadline failures into "charged" vs
+                // "refunded" — refunded is the steady-state expectation
+                // and a non-zero charged count signals a regression in
+                // the refund wiring.
+                refund_download_update(peer_key);
                 metrics_
                     .counter(
                         "yuzu_grpc_requests_total",
                         {{"method", "DownloadUpdate"}, {"status", "chunk_write_deadline_exceeded"}})
                     .increment();
-                const std::string peer = ctx.peer_san_identities.empty()
-                                             ? ctx.peer_uri
-                                             : ctx.peer_san_identities.front();
+                metrics_
+                    .counter("yuzu_grpc_requests_total", {{"method", "DownloadUpdate"},
+                                                          {"status", "rate_limit_token_refunded"}})
+                    .increment();
                 spdlog::warn("DownloadUpdate: chunk-write deadline expired for peer={} "
-                             "at offset {} (pool slot released)",
-                             peer, offset);
+                             "at offset {} (pool slot released; rate-limit token refunded)",
+                             peer_key, offset);
                 return Status{StatusCode::DeadlineExceeded, "chunk-write deadline exceeded"};
             }
             spdlog::warn("DownloadUpdate: client disconnected at offset {}", offset);

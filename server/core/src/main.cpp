@@ -218,6 +218,18 @@ int main(int argc, char* argv[]) {
     app.add_flag("--no-ota", "Disable OTA agent updates")->each([&cfg](const std::string&) {
         cfg.ota_enabled = false;
     });
+    // Slow-link compound-lockout escape hatch (#934 / UP-206). Raises the
+    // server-side per-chunk write deadline so genuinely slow peers
+    // (satellite, residential 4G/LTE, congested corp WAN) can finish OTA
+    // without hitting the chunk-write deadline + per-peer rate-limit
+    // compound. The matching mitigation on the rate-limit side (token
+    // refund on chunk-write-deadline failure) is unconditional — see
+    // docs/user-manual/server-admin.md "Per-chunk write deadline".
+    app.add_option("--ota-chunk-write-deadline-secs", cfg.ota_chunk_write_deadline_seconds,
+                   "Per-chunk write deadline for DownloadUpdate (default: 30). Raise for "
+                   "deployments with slow-link agents (satellite, 4G/LTE).")
+        ->default_val(30)
+        ->envname("YUZU_OTA_CHUNK_WRITE_DEADLINE_SECS");
 
     // HTTPS web dashboard options
     app.add_flag("--no-https", "Disable HTTPS (insecure, for development only)")

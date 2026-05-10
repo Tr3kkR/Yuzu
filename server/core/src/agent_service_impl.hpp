@@ -88,6 +88,28 @@ public:
     /// the trigger condition for that extraction).
     bool admit_download_update(const std::string& peer);
 
+    /// Refund a previously-consumed DownloadUpdate token (#934 /
+    /// UP-206). Called when a `DownloadUpdate` call admitted via
+    /// `admit_download_update` later fails for a reason that is NOT
+    /// fleet-monopolisation — specifically, the chunk-write deadline
+    /// (#911 / UP-101). A slow-link peer that hits the deadline is
+    /// failing, not monopolising, so consuming a token would compound
+    /// into the lockout described in #934. Refund cap is the bucket
+    /// capacity (5 tokens); over-refund is silently clamped so this is
+    /// safe to call defensively. Empty `peer` is a no-op (the
+    /// production path always supplies a key — SAN identity or
+    /// peer_uri — but tests may exercise the empty path). Thread-safe.
+    void refund_download_update(const std::string& peer);
+
+    /// Override the per-chunk write deadline applied during
+    /// `DownloadUpdate` (#911 / UP-101 + #934 / UP-206). Wired by
+    /// `ServerImpl` from `Config::ota_chunk_write_deadline_seconds`.
+    /// Values <= 0 are clamped to the default (30 s). Take care if
+    /// called after the listener has accepted streams: the new value
+    /// applies to the next call only — existing in-flight chunk writes
+    /// continue with the deadline observed at the start of their loop.
+    void set_ota_chunk_write_deadline(std::chrono::seconds deadline);
+
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
     void set_health_store(AgentHealthStore* store) { health_store_ = store; }
@@ -266,6 +288,15 @@ private:
     std::unordered_map<std::string, DownloadUpdateBucket> download_update_buckets_;
     std::chrono::steady_clock::time_point download_update_buckets_last_gc_ =
         std::chrono::steady_clock::now();
+
+    /// Per-chunk write deadline (#911 / UP-101 + #934 / UP-206 operator
+    /// tunable). Atomic so `DownloadUpdate` can read without the
+    /// `download_update_buckets_mu_` lock — the deadline lives on a
+    /// different concern from the rate-limit bucket. Set by
+    /// `set_ota_chunk_write_deadline` from `ServerImpl`'s constructor.
+    /// Stored in seconds; the call site widens to `std::chrono::seconds`
+    /// at use. Default 30 seconds matches the historical constexpr.
+    std::atomic<int> ota_chunk_write_deadline_secs_{30};
 
     /// Match a claimed agent_id against the verified peer identities the
     /// transport surfaced via `CallContext::peer_san_identities`. The

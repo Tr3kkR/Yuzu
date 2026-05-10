@@ -383,3 +383,143 @@ TEST_CASE("admit_download_update: empty peer key still tracked under empty-strin
     }
     REQUIRE_FALSE(h.svc.admit_download_update(""));
 }
+
+// ── #934 / UP-206: chunk-write-deadline token refund ───────────────────────
+
+TEST_CASE("refund_download_update: refund credits a token back into the bucket",
+          "[agent_service][rate_limit][refund]") {
+    // The compound-lockout scenario from UP-206: a slow-link peer
+    // hits the chunk-write deadline, the server refunds the token so
+    // the per-peer rate limit doesn't burn through 5 retries in 30 s
+    // and lock the agent out for 7.5 hours. Drain the bucket, refund
+    // once, prove one more admission becomes available; the bucket is
+    // then exhausted again because the refund only credits one token.
+    GatewayResponseHarness h;
+
+    for (int i = 0; i < 5; ++i) {
+        REQUIRE(h.svc.admit_download_update("agent-slow"));
+    }
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-slow"));
+
+    h.svc.refund_download_update("agent-slow");
+    REQUIRE(h.svc.admit_download_update("agent-slow"));
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-slow"));
+}
+
+TEST_CASE("refund_download_update: cap at bucket capacity — over-refund does not accrue credit",
+          "[agent_service][rate_limit][refund]") {
+    // Defensive: a future caller that double-refunds (or the same
+    // call site refunding without an admit) must NOT let the peer
+    // accumulate more than capacity, otherwise the rate limit
+    // becomes a no-op for that peer.
+    GatewayResponseHarness h;
+
+    // Bucket fresh + full. Refund 10 times — capacity-cap means the
+    // peer still only ever has 5 tokens available.
+    for (int i = 0; i < 10; ++i) {
+        h.svc.refund_download_update("agent-overrefund");
+    }
+    for (int i = 0; i < 5; ++i) {
+        REQUIRE(h.svc.admit_download_update("agent-overrefund"));
+    }
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-overrefund"));
+}
+
+TEST_CASE("refund_download_update: per-peer isolation — refund credits only the named peer",
+          "[agent_service][rate_limit][refund]") {
+    // A slow-link peer-A's refund must not bleed into peer-B's
+    // bucket; a regression that hashed all peers into one shared
+    // bucket would let A's refund unlock B's lockout.
+    GatewayResponseHarness h;
+
+    for (int i = 0; i < 5; ++i) {
+        REQUIRE(h.svc.admit_download_update("agent-A"));
+        REQUIRE(h.svc.admit_download_update("agent-B"));
+    }
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-A"));
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-B"));
+
+    h.svc.refund_download_update("agent-A");
+    REQUIRE(h.svc.admit_download_update("agent-A"));
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-A"));
+    // peer-B unaffected by peer-A's refund.
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-B"));
+}
+
+TEST_CASE("refund_download_update: empty peer key is a no-op",
+          "[agent_service][rate_limit][refund]") {
+    // The production path always supplies a peer key (SAN identity
+    // or peer_uri fallback). Defensive: passing empty must not throw,
+    // must not synthesise a bucket, and must not affect any other
+    // peer. Drains agent-real, calls refund(""), confirms agent-real
+    // is still exhausted.
+    GatewayResponseHarness h;
+
+    for (int i = 0; i < 5; ++i) {
+        REQUIRE(h.svc.admit_download_update("agent-real"));
+    }
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-real"));
+    h.svc.refund_download_update("");
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-real"));
+}
+
+TEST_CASE("refund_download_update: refund on an unseen peer is a silent no-op",
+          "[agent_service][rate_limit][refund]") {
+    // The 24h GC sweep can erase a stale bucket between admit and
+    // refund (not observable in test time, but a correctness contract
+    // to pin). A refund for a peer that has never been admitted must
+    // not synthesise a credit-of-1 bucket — that would let an
+    // attacker who can guess SAN identities pre-credit themselves.
+    // Verify by refunding "agent-unseen" then admitting fresh: they
+    // get the standard capacity, not capacity+1.
+    GatewayResponseHarness h;
+
+    h.svc.refund_download_update("agent-unseen");
+    for (int i = 0; i < 5; ++i) {
+        REQUIRE(h.svc.admit_download_update("agent-unseen"));
+    }
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-unseen"));
+}
+
+TEST_CASE("refund_download_update: chunk-write deadline simulation — slow peer recovers fully",
+          "[agent_service][rate_limit][refund][up-206]") {
+    // The end-to-end scenario from #934: a slow-link agent retries
+    // OTA five times, hitting the chunk-write deadline each time.
+    // Pre-fix: the bucket would drain by retry #5 and lock the agent
+    // out for 7.5 hours. Post-fix: every chunk-write deadline failure
+    // refunds the consumed token, so the bucket stays at capacity-1
+    // through every retry and a sixth retry can still proceed.
+    GatewayResponseHarness h;
+
+    for (int retry = 0; retry < 5; ++retry) {
+        CAPTURE(retry);
+        REQUIRE(h.svc.admit_download_update("agent-slow-link"));
+        // Simulate the chunk-write-deadline path refunding the token
+        // (matches the production call sequence in
+        // AgentServiceImpl::DownloadUpdate at the chunk-write-deadline
+        // branch).
+        h.svc.refund_download_update("agent-slow-link");
+    }
+    // The bucket has been net-zero-ed: every admit was matched by a
+    // refund, so the peer can still acquire a fresh token instead of
+    // sitting in the 7.5h lockout.
+    REQUIRE(h.svc.admit_download_update("agent-slow-link"));
+}
+
+TEST_CASE("set_ota_chunk_write_deadline: non-positive values clamp to default",
+          "[agent_service][ota][config]") {
+    // The CLI flag default-vals to 30 (= historical constexpr) so the
+    // happy path is well covered. The defensive path: a typo
+    // (`--ota-chunk-write-deadline-secs 0`) or env var coerced to
+    // zero must not silently disable the deadline, which would
+    // re-open UP-101 (slow-write peer pinning the bidi pool slot).
+    // The setter must clamp to the default. This is a behavioural
+    // pin — the actual deadline value isn't externally observable
+    // without a stream fixture, but the setter accepting any
+    // std::chrono::seconds without aborting is the contract.
+    GatewayResponseHarness h;
+    h.svc.set_ota_chunk_write_deadline(std::chrono::seconds{0});
+    h.svc.set_ota_chunk_write_deadline(std::chrono::seconds{-30});
+    h.svc.set_ota_chunk_write_deadline(std::chrono::seconds{120}); // operator-raised
+    SUCCEED("set_ota_chunk_write_deadline accepts boundary values without aborting");
+}

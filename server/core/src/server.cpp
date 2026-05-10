@@ -343,9 +343,12 @@ public:
                           "Total gRPC requests by method + status. Bounded status values: "
                           "received, completed, deadline_exceeded, "
                           "chunk_write_deadline_exceeded (#911), rate_limited_per_peer "
-                          "(#913). The terminal-status values (the last three) fire on "
-                          "the per-call denial path; received fires at handler entry; "
-                          "completed fires at successful handler return.",
+                          "(#913), rate_limit_token_refunded (#934 — fires when a "
+                          "chunk-write deadline triggers a per-peer token refund so the "
+                          "slow-link compound lockout described in UP-206 cannot accrue). "
+                          "The terminal-status values fire on the per-call denial path; "
+                          "received fires at handler entry; completed fires at successful "
+                          "handler return.",
                           "counter");
         metrics_.describe("yuzu_http_requests_total", "Total HTTP requests by path and status",
                           "counter");
@@ -570,6 +573,13 @@ public:
             update_registry_ = std::make_unique<UpdateRegistry>(update_db_path, update_dir);
             agent_service_.set_update_registry(update_registry_.get());
         }
+
+        // Wire operator-tunable OTA chunk-write deadline (#934 / UP-206).
+        // Called unconditionally — even with --no-ota the setter is cheap
+        // and the agent_service_ would otherwise pin the historical
+        // 30 s default. Setter clamps non-positive values to the default.
+        agent_service_.set_ota_chunk_write_deadline(
+            std::chrono::seconds{cfg_.ota_chunk_write_deadline_seconds});
 
         // Wire up cross-references for AgentServiceImpl
         // (done after stores are created below)

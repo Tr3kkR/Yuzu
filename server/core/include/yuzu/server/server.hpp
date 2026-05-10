@@ -62,6 +62,19 @@ struct Config {
         update_dir;         // Directory for agent binaries (default: <config_dir>/agent-updates/)
     bool ota_enabled{true}; // Master switch for OTA updates
 
+    /// Per-chunk write deadline applied to `DownloadUpdate` server-side
+    /// (#911 / UP-101 + #934 / UP-206). Bounds how long a slow-write peer
+    /// (zero TCP receive window, NAT/firewall holding the stream, HTTP/2
+    /// flow-control window collapse) can pin a bidi dispatcher pool slot
+    /// during the chunk-streaming phase. Default 30 s is comfortable for
+    /// healthy peers (chunk size 64 KiB drains in milliseconds locally).
+    /// Operators with deployments behind genuinely slow links (satellite,
+    /// residential 4G/LTE, congested corp WAN) can raise this — e.g. 120
+    /// — to keep slow agents inside the OTA window. Setting <= 0 falls
+    /// back to the default. See docs/user-manual/server-admin.md
+    /// "Per-chunk write deadline" subsection.
+    int ota_chunk_write_deadline_seconds{30};
+
     // HTTPS for web dashboard
     bool https_enabled{true};
     int https_port{8443};

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OTA chunk-write deadline operator-tunable + slow-link rate-limit
+  refund (#934 / UP-206).** Closes the compound lockout where a
+  legitimately-slow peer (satellite, residential 4G/LTE, congested
+  corp WAN) hits the per-chunk write deadline (#911) mid-OTA, retries
+  on the next heartbeat, and burns through the per-peer DownloadUpdate
+  rate-limit bucket (#913) within 5 cycles — refilling at 1 token per
+  90 minutes, this previously locked a slow but otherwise-healthy
+  agent out of OTA for 7.5 hours.
+  - **Operator escape hatch.** New `--ota-chunk-write-deadline-secs`
+    flag + `YUZU_OTA_CHUNK_WRITE_DEADLINE_SECS` env (default 30).
+    Operators with slow-link deployments can raise to 120 s or higher;
+    the deadline is the only thing freeing the bidi pool slot held by
+    a stalled write, so values too high re-open UP-101.
+    Threaded through `Config::ota_chunk_write_deadline_seconds` →
+    `AgentServiceImpl::set_ota_chunk_write_deadline()` →
+    `ota_chunk_write_deadline_secs_` atomic. Setter clamps non-positive
+    values to the default so a typo can't silently disable the
+    deadline. Snapshotted once per call so a mid-OTA reload doesn't
+    reshape an in-flight stream.
+  - **Token refund on chunk-write deadline.** `DownloadUpdate` now
+    calls a new `AgentServiceImpl::refund_download_update(peer)` when
+    the chunk-write deadline fires, crediting the consumed bucket
+    token back. Refund caps at bucket capacity (5 tokens) so a future
+    caller that double-refunds cannot accumulate excess credit; empty
+    peer key is a no-op; refund for an unseen peer is a silent no-op
+    (a GC'd bucket between admit and refund is harmless because the
+    next admit creates a fresh full bucket). Refunds are recorded
+    under a new metric label
+    `yuzu_grpc_requests_total{method="DownloadUpdate", status="rate_limit_token_refunded"}`
+    so dashboards can tell refunded chunk-write-deadline failures from
+    actual rate-limit rejects (`status="rate_limited_per_peer"`).
+    Threat model unchanged: a fast-valid monopoliser still drains the
+    bucket (their calls succeed, refund only fires on chunk-write
+    deadline); a slow legitimate peer no longer compounds into a 7.5h
+    lockout because every deadline-failed retry refunds.
+  - **Test coverage.** 7 new cases in `test_agent_service_impl.cpp`
+    covering refund credit, capacity cap, per-peer isolation,
+    empty-peer no-op, unseen-peer silent no-op, end-to-end UP-206
+    scenario (5 retries with refund leaves bucket recoverable), and
+    setter clamp on non-positive values. Validated on macOS arm64
+    (1491 cases, full server suite green).
+
 ### Internal
 
 - **Closet-clean governance Round-2 trivial bundle (#933 + #937 + #938
