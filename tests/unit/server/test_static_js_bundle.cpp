@@ -37,10 +37,15 @@ namespace yuzu::server {
 extern const std::string kEChartsJs;
 extern const std::string kThreeJs;
 extern const std::string kThreeOrbitJs;
+extern const std::string kYuzuVizJs;
 extern const std::string_view kInterVariableWoff2;
 extern const std::string kYuzuCss;
 extern const std::string kYuzuChartsJs;
 } // namespace yuzu::server
+
+// Page HTML constants (separate TUs at namespace scope -- not in
+// yuzu::server like the JS bundles).
+extern const char* const kVizFleetPageHtml;
 
 using Catch::Matchers::ContainsSubstring;
 
@@ -235,6 +240,84 @@ TEST_CASE("static_js_bundle: kThreeOrbitJs imports from 'three'", "[static-js][t
 
 TEST_CASE("static_js_bundle: kThreeOrbitJs has no embedded NULs", "[static-js][three]") {
     CHECK(yuzu::server::kThreeOrbitJs.find('\0') == std::string::npos);
+}
+
+// ── Yuzu fleet renderer (PR 5 of feat/viz-engine ladder) ────────────────────
+
+TEST_CASE("static_js_bundle: kYuzuVizJs is a non-empty ES module", "[static-js][viz]") {
+    REQUIRE(yuzu::server::kYuzuVizJs.size() >= 1000);
+    // ES module top-level imports are the load contract that the
+    // /viz/fleet page's importmap maps. Without these substrings the
+    // module wouldn't be loadable as a module at all.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("import * as THREE from 'three'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("import { OrbitControls } "
+                                 "from 'three/addons/controls/OrbitControls.js'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs registers htmx:afterSettle mount", "[static-js][viz]") {
+    // Mount-once on htmx:afterSettle is the canvas-survival contract --
+    // an HTMX swap of the overlay panel must not blow away the renderer.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("htmx:afterSettle"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs idempotency guard present", "[static-js][viz]") {
+    // The mount-once guard reads root.dataset.yuzuVizMounted; any future
+    // refactor that drops this leaves the door open for double-mount on
+    // HTMX swap (two WebGLRenderer instances on the same canvas).
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("yuzuVizMounted"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs disables OrbitControls panning", "[static-js][viz]") {
+    // OrbitControls.enablePan = false is the WASD-owns-translation
+    // contract. Built-in pan steals the mouse event from rotate; pin the
+    // disable.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("controls.enablePan = false"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs has no embedded NULs", "[static-js][viz]") {
+    CHECK(yuzu::server::kYuzuVizJs.find('\0') == std::string::npos);
+}
+
+// ── Fleet viz page HTML scaffold ────────────────────────────────────────────
+
+TEST_CASE("viz page: contains the persistent canvas + viz-root structure", "[viz][page]") {
+    REQUIRE(kVizFleetPageHtml != nullptr);
+    std::string html(kVizFleetPageHtml);
+    REQUIRE(html.size() >= 500);
+    // The yuzu-viz.js mount contract relies on these three exact
+    // attributes/ids; pinning them here means a future refactor that
+    // renames either side fails the test instead of producing a
+    // working-on-localhost-broken-on-server-restart silent regression.
+    CHECK_THAT(html, ContainsSubstring("data-yuzu-viz-url=\"/api/v1/viz/fleet/topology\""));
+    CHECK_THAT(html, ContainsSubstring("id=\"viz-root\""));
+    CHECK_THAT(html, ContainsSubstring("id=\"viz-canvas\""));
+    CHECK_THAT(html, ContainsSubstring("id=\"viz-overlay-panel\""));
+}
+
+TEST_CASE("viz page: declares importmap for three + addons", "[viz][page]") {
+    // Three.js (r150+) is ES-module-only upstream; the importmap resolves
+    // the bare `import 'three'` specifier in OrbitControls and yuzu-viz.js
+    // to the vendored bundle. Without this map, the module network request
+    // would 404 against the bare name.
+    std::string html(kVizFleetPageHtml);
+    CHECK_THAT(html, ContainsSubstring("type=\"importmap\""));
+    CHECK_THAT(html, ContainsSubstring("\"three\": \"/static/three.module.min.js\""));
+    CHECK_THAT(html, ContainsSubstring("/static/three-orbit-controls.js"));
+}
+
+TEST_CASE("viz page: loads yuzu-viz.js as type=module", "[viz][page]") {
+    // type="module" is required so the ES imports resolve. A
+    // type="text/javascript" (or omitted-type) tag would parse the file
+    // as a classic script and the `import` statements at the top would
+    // be SyntaxErrors at parse time.
+    std::string html(kVizFleetPageHtml);
+    CHECK_THAT(html, ContainsSubstring("<script type=\"module\" src=\"/static/yuzu-viz.js\">"));
+}
+
+TEST_CASE("viz page: nav highlights Fleet Viz when on the page", "[viz][page]") {
+    std::string html(kVizFleetPageHtml);
+    CHECK_THAT(html, ContainsSubstring("href=\"/viz/fleet\" class=\"nav-link active\""));
 }
 
 // ── Inter variable webfont (woff2 binary) ───────────────────────────────────

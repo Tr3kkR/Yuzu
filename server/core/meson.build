@@ -229,6 +229,8 @@ yuzu_server_core_lib = static_library(
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
     'src/viz_routes.cpp',
+    'src/viz_page_ui.cpp',
+    'src/yuzu_viz_js_bundle.cpp',
     'src/compliance_ui.cpp',
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',

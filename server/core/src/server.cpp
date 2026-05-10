@@ -156,6 +156,7 @@ extern const char* const kSettingsHtml;
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kTarPageHtml;
+extern const char* const kVizFleetPageHtml; // server/core/src/viz_page_ui.cpp (PR 5)
 extern const char* const kInstructionEditorHtml;
 extern const char* const kInstructionEditorDeniedHtml;
 
@@ -170,6 +171,8 @@ extern const std::string kEChartsJs; // server/core/vendor/echarts.min.js (Apach
 extern const std::string kThreeJs;   // server/core/vendor/three.module.min.js (MIT, three.js r168)
 extern const std::string
     kThreeOrbitJs; // server/core/vendor/three-orbit-controls.js (MIT, three.js r168)
+extern const std::string
+    kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
 extern const std::string_view
     kInterVariableWoff2; // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
 extern const std::vector<std::string>
@@ -2785,6 +2788,16 @@ private:
             res.set_header("Cache-Control", "public, max-age=86400");
             res.set_content(yuzu::server::kThreeOrbitJs, "application/javascript; charset=utf-8");
         });
+        // PR 5 of feat/viz-engine: yuzu-viz.js renderer module. Loaded as
+        // type="module" so it can resolve the `import 'three'` bare
+        // specifier through the importmap declared in viz_page_ui.cpp.
+        // Same Cache-Control as the other vendored bundles -- the body is
+        // content-addressed by server binary version.
+        web_server_->Get(
+            "/static/yuzu-viz.js", [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "public, max-age=86400");
+                res.set_content(yuzu::server::kYuzuVizJs, "application/javascript; charset=utf-8");
+            });
         // Inter variable webfont (SIL OFL) — the Yuzu design system's
         // default family. Single woff2 covers all weights via font-
         // variation-settings on the @font-face declaration in
@@ -3636,6 +3649,21 @@ private:
                 return;
             }
             res.set_content(kTarPageHtml, "text/html; charset=utf-8");
+        });
+
+        // PR 5 of feat/viz-engine: Fleet visualization page. Auth-gated
+        // (same posture as /tar) but the per-request RBAC check happens
+        // inside VizRoutes when the page's JS hits /api/v1/viz/fleet/topology.
+        // The page itself is just the renderer scaffold + nav chrome -- no
+        // per-machine data is rendered server-side; the JSON fetch on the
+        // client is what enforces Response.Read.
+        web_server_->Get("/viz/fleet", [this](const httplib::Request& req, httplib::Response& res) {
+            auto session = require_auth(req, res);
+            if (!session) {
+                res.set_redirect("/login");
+                return;
+            }
+            res.set_content(kVizFleetPageHtml, "text/html; charset=utf-8");
         });
 
         // -- Instruction management page --------------------------------------

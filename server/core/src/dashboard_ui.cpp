@@ -370,6 +370,7 @@ extern const char* const kDashboardIndexHtml =
     <a href="/instructions" class="nav-link">Instructions</a>
     <a href="/compliance" class="nav-link">Compliance</a>
     <a href="/tar" class="nav-link">TAR</a>
+    <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
     <span class="nav-spacer"></span>
     <span class="nav-user" id="nav-user"></span>

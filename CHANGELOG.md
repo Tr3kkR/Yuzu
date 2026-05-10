@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/viz/fleet` page scaffold + WASD/orbit/zoom camera controls (PR 5
+  of the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** New
+  page route `GET /viz/fleet` (auth-gated, same posture as `/tar`) that
+  serves an HTMX-style page shell with a persistent `<div id="viz-root"
+  data-yuzu-viz-url="/api/v1/viz/fleet/topology">` containing
+  `<canvas id="viz-canvas">` and a swappable `<div id="viz-overlay-panel">`
+  for future per-machine drill-in detail. The page declares an importmap
+  resolving `"three"` and `"three/addons/controls/OrbitControls.js"` to
+  the vendored bundles from PR 4. New static asset route
+  `GET /static/yuzu-viz.js` serves the renderer module (`kYuzuVizJs`,
+  hand-written ~6 KB ES module): mounts once on `DOMContentLoaded` and
+  on every `htmx:afterSettle` (idempotent — guarded by
+  `root.dataset.yuzuVizMounted` so HTMX swaps of the overlay panel
+  cannot blow away the WebGLRenderer's GPU context); builds scene +
+  perspective camera + ambient + directional light + ground grid (40
+  divisions) + axes helper; OrbitControls drives drag-rotate +
+  wheel-zoom with `enablePan = false` so a custom keyup/keydown WASD
+  listener owns translation in camera-screen-space (W=+screenY,
+  S=−screenY, A=−screenX, D=+screenX, requestAnimationFrame-throttled).
+  ResizeObserver on the canvas keeps the renderer + camera aspect in
+  sync without a window-resize listener. Empty `tick()` placeholder for
+  PR 6+ to fill in topology rendering. The Fleet Viz nav link is added
+  to all sibling page shells (dashboard / instructions / compliance /
+  TAR / settings / help) so navigation is consistent. (#viz-engine
+  ladder PR 5.)
+
 - **Vendored Three.js r168 + OrbitControls (PR 4 of the 11-PR
   `/viz/fleet` 3D fleet network-topology ladder).** Two new build-time
   embeds: `kThreeJs` (685 KB, three.js r168 minified ES module) and
