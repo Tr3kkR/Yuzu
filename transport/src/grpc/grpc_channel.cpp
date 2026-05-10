@@ -207,6 +207,36 @@ GrpcChannel::GrpcChannel(Endpoint target, Credentials creds,
                 clamp_ms_to_int(backoff_.initial_delay));
     // PR 1b: surface a jitter knob; gRPC's built-in is already jittered.
 
+    // HTTP/2 keepalive (#376 PR 1c-4 commit-(iii) prerequisite, closes
+    // SRE-1 from PR 1c-4 governance round 2).
+    //
+    // Pre-PR-1c-4 the agent built a legacy `grpc::Channel` for Subscribe +
+    // DownloadUpdate with these exact args at agent.cpp:643-647. PR 1c-4
+    // commit (ii) lifted both RPCs onto `transport::Channel`; commit (iii)
+    // will delete the legacy block. Without the args resident inside this
+    // backend, the post-(iii) state would have NO keepalive on any agent
+    // RPC — Heartbeat at 30 s is the next-coarsest liveness signal, which
+    // is too slow to detect a NAT/LB idle timer in the 15-30 s range
+    // common to corporate transparent proxies. SRE-1 surfaced this as a
+    // forward-looking blocker.
+    //
+    // Values match the legacy agent.cpp settings exactly so commit (iii)
+    // is a pure deletion with no behavioural change:
+    //   * KEEPALIVE_TIME_MS = 60000        — PING every 60 s of idle.
+    //   * KEEPALIVE_TIMEOUT_MS = 20000     — PING ack must arrive in 20 s.
+    //   * PERMIT_WITHOUT_CALLS = 1         — PING even when no active RPC.
+    //   * MAX_PINGS_WITHOUT_DATA = 0       — unlimited PINGs without data.
+    //
+    // PR 1c-4 design grilling Q6 chose to keep these inside the gRPC
+    // backend rather than expose them in the abstraction surface; msquic
+    // (PR 3) has its own keepalive primitives and will configure them
+    // independently. No public API change; values match historical agent
+    // behaviour 1:1.
+    args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
+    args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
+    args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+    args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+
     // SNI override is only meaningful on TLS channels — applying it to a
     // plaintext channel is implementation-defined and masks a config bug.
     // (governance UP-3)

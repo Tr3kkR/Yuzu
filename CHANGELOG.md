@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **HTTP/2 keepalive args wired into `transport::GrpcChannel` (#376 PR
+  1c-4 commit (iii) prerequisite, closes SRE-1).** Pre-PR-1c-4 the
+  agent built a legacy `grpc::Channel` for Subscribe + DownloadUpdate
+  with `GRPC_ARG_KEEPALIVE_TIME_MS=60000`,
+  `GRPC_ARG_KEEPALIVE_TIMEOUT_MS=20000`,
+  `GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS=1`, and
+  `GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA=0` at `agent.cpp:643-647`. PR
+  1c-4 commit (ii) lifted both RPCs onto `transport::Channel` but the
+  abstraction's gRPC backend (`transport/src/grpc/grpc_channel.cpp`)
+  set only the reconnect-backoff args. Commit (iii) deletes the legacy
+  block — without these keepalive args resident inside the gRPC
+  backend, post-(iii) state would have NO keepalive on any agent RPC,
+  with Heartbeat at 30 s as the next-coarsest liveness signal — too
+  slow to detect a NAT/LB idle timer in the 15-30 s range common to
+  corporate transparent proxies. SRE-1 from PR 1c-4 governance round 2
+  surfaced this as a forward-looking blocker. Values match the legacy
+  agent settings exactly so commit (iii) becomes a pure deletion with
+  no behavioural change. PR 1c-4 design grilling Q6 chose to keep
+  these inside the gRPC backend rather than expose them in the
+  abstraction surface; msquic (PR 3) has its own keepalive primitives
+  and will configure them independently. No public API change.
 - **Agent-side Subscribe + DownloadUpdate lifted onto `transport::Channel`
   (#376 PR 1c-4).** The agent's `Subscribe` (bidi) and `DownloadUpdate`
   (server-streaming-via-bidi) RPCs now travel through
