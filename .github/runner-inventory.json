@@ -18,10 +18,10 @@
     },
     {
       "name": "scw-eager-lumiere",
-      "host": "Scaleway cloud VM (bare-VM install, not Dockerfile.runner-linux)",
-      "labels": ["self-hosted", "X64", "Linux", "yuzu-cloud-builder"],
-      "role": "Additional Linux capacity — shares the self-hosted/Linux/X64 label set with yuzu-wsl2-linux, so ci.yml linux matrix jobs distribute across both. The yuzu-cloud-builder label is reserved for future cloud-only workloads (e.g. release builds that should not pin the local Shulgi box).",
-      "installed": "2026-05-05"
+      "host": "Scaleway VPS (Ubuntu 24.04, 4 vCPU, 7.7 GB RAM, ~45 GB disk)",
+      "labels": ["self-hosted", "Linux", "X64", "yuzu-cloud-builder"],
+      "role": "Cloud-side Linux capacity sharing the [self-hosted, Linux, X64] label set with yuzu-wsl2-linux. The yuzu-cloud-builder label exists for future opt-in pinning of jobs that should land here specifically. Disk is tighter than the WSL2 box — sanitizer-tests.yml's ≥30 GB preflight will fail-fast if a sanitizer dispatch lands on this runner; that is intentional and the dispatch will retry on yuzu-wsl2-linux.",
+      "installed": "2026-05-04"
     }
   ]
 }
