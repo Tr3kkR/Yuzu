@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **Per-peer `DownloadUpdate` rate limit (#913 / UP-116).** The bounded
+  bidi pool (#904) + idle-read deadline (#902) + chunk-write deadline
+  (#911) cap slot-seconds, but a fast-valid mTLS-authed insider can
+  still saturate the pool with legitimate-looking calls. New per-peer
+  token bucket in `AgentServiceImpl::DownloadUpdate`: capacity 5
+  tokens, refill at ~1 token per 90 minutes (= update_check_interval
+  default 6 h / 4) — a normally-behaved agent never hits the limit; a
+  hammering peer exhausts within seconds. Excess requests return
+  `ResourceExhausted` (same wire status as pool saturation, so
+  dashboards can group capacity rejects together) and increment
+  `yuzu_grpc_requests_total{method="DownloadUpdate",status="rate_limited_per_peer"}`.
+
+  Bucket state is process-local; restart resets to full — matches the
+  threat model (the limit is a fleet-monopolisation guard, not a
+  persistent quota). Opportunistic GC runs every 5 minutes, removing
+  buckets older than 24 h. Peer key is the verified SAN identity from
+  the mTLS handshake when available; falls back to `peer_uri` for
+  dev/UAT runs without mTLS.
+
+  Test coverage: 3 new cases in `tests/unit/server/test_agent_service_impl.cpp`
+  pin bucket-starts-full, per-peer isolation (one peer's exhaustion
+  does not block another), and empty-key handling.
 - **Bidi dispatcher pool saturation metric + ServerTransportMetricSink
   wiring + reconnect-reason label (#912 / #905 / SRE-3 / #925).** Three
   related observability changes that close the post-PR-1c-4 monitoring

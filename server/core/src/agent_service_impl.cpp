@@ -32,7 +32,56 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
                                    UpdateRegistry* update_registry)
     : registry_(registry), bus_(bus), auth_mgr_(auth_mgr), auto_approve_(auto_approve),
       metrics_(metrics), require_client_identity_(require_client_identity),
-      gateway_mode_(gateway_mode), update_registry_(update_registry) {}
+      gateway_mode_(gateway_mode), update_registry_(update_registry) {
+    // #913 / UP-116 saturation reject metric description.
+    metrics_.describe("yuzu_grpc_requests_total",
+                      "Total gRPC requests by method + status (status="
+                      "received|completed|chunk_write_deadline_exceeded|"
+                      "rate_limited_per_peer|deadline_exceeded). The "
+                      "rate_limited_per_peer status fires when DownloadUpdate's "
+                      "per-peer token bucket is exhausted (#913).",
+                      "counter");
+}
+
+// -- admit_download_update (per-peer token bucket, #913) ----------------------
+
+bool AgentServiceImpl::admit_download_update(const std::string& peer) {
+    using namespace std::chrono;
+    constexpr double kBucketCapacity = 5.0;
+    // Refill rate ≈ 1 token per 90 minutes (= update_check_interval
+    // default 6 h / 4). A normally-behaved agent checks for updates a
+    // few times a day; the bucket is steady-state full. A misbehaving
+    // peer hammering DownloadUpdate exhausts within seconds.
+    constexpr double kRefillTokensPerSecond = 1.0 / (90.0 * 60.0);
+    constexpr auto kStaleBucketAge = hours{24};
+
+    std::lock_guard<std::mutex> lock(download_update_buckets_mu_);
+    const auto now = steady_clock::now();
+
+    // Opportunistic GC: every 5 minutes, sweep buckets older than
+    // kStaleBucketAge. Bounded; runs at most once per request batch
+    // and only when the cadence trips.
+    if (now - download_update_buckets_last_gc_ > minutes{5}) {
+        download_update_buckets_last_gc_ = now;
+        for (auto it = download_update_buckets_.begin(); it != download_update_buckets_.end();) {
+            if (now - it->second.last_refill_at > kStaleBucketAge) {
+                it = download_update_buckets_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    auto& bucket = download_update_buckets_[peer];
+    const auto elapsed_s = duration_cast<duration<double>>(now - bucket.last_refill_at).count();
+    bucket.tokens = std::min(kBucketCapacity, bucket.tokens + elapsed_s * kRefillTokensPerSecond);
+    bucket.last_refill_at = now;
+    if (bucket.tokens >= 1.0) {
+        bucket.tokens -= 1.0;
+        return true;
+    }
+    return false;
+}
 
 // -- register_with ------------------------------------------------------------
 
@@ -1137,6 +1186,30 @@ AgentServiceImpl::DownloadUpdate(const ::yuzu::transport::CallContext& ctx,
     metrics_
         .counter("yuzu_grpc_requests_total", {{"method", "DownloadUpdate"}, {"status", "received"}})
         .increment();
+
+    // Per-peer rate limit (#913 / UP-116). The bounded bidi pool (#904)
+    // + idle-read deadline (#902) + chunk-write deadline (#911) cap
+    // slot-seconds, but a fast-valid client (mTLS-authed insider) can
+    // saturate the pool with legitimate-looking calls. The token bucket
+    // adds a per-peer-identity admission gate so one misbehaving client
+    // cannot monopolise fleet-update capacity. Excess requests return
+    // ResourceExhausted — same wire status as pool saturation, so
+    // dashboards can group these together when alerting on noisy peers.
+    {
+        const std::string peer_key =
+            ctx.peer_san_identities.empty() ? ctx.peer_uri : ctx.peer_san_identities.front();
+        if (!admit_download_update(peer_key)) {
+            metrics_
+                .counter("yuzu_grpc_requests_total",
+                         {{"method", "DownloadUpdate"}, {"status", "rate_limited_per_peer"}})
+                .increment();
+            spdlog::warn("DownloadUpdate: per-peer rate limit exhausted for peer={}; "
+                         "returning ResourceExhausted",
+                         peer_key);
+            return Status{StatusCode::ResourceExhausted,
+                          "per-peer DownloadUpdate rate limit exceeded"};
+        }
+    }
 
     // Server-streaming-via-bidi: client sends one request frame + writes_done(),
     // we stream N response chunks, then close. read_pb returns false if the

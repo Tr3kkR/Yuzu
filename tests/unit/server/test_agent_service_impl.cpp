@@ -332,3 +332,54 @@ TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
     REQUIRE(new_rows.size() == 1);
     CHECK(new_rows[0].status == static_cast<int>(apb::CommandResponse::SUCCESS));
 }
+
+// ── #913: per-peer DownloadUpdate token bucket ─────────────────────────────
+
+TEST_CASE("admit_download_update: bucket starts full and admits up to capacity",
+          "[agent_service][rate_limit][p913]") {
+    GatewayResponseHarness h;
+
+    // Default capacity is 5 tokens; the first 5 admissions for a fresh
+    // peer all succeed back-to-back.
+    for (int i = 0; i < 5; ++i) {
+        CAPTURE(i);
+        REQUIRE(h.svc.admit_download_update("agent-fresh"));
+    }
+    // 6th admission within the same instant exhausts the bucket — the
+    // refill rate is ~1 token / 90 minutes, so no replenish is observable
+    // in test time.
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-fresh"));
+}
+
+TEST_CASE("admit_download_update: per-peer isolation — one peer's exhaustion "
+          "does not block another",
+          "[agent_service][rate_limit][p913]") {
+    GatewayResponseHarness h;
+
+    // Drain peer-A.
+    for (int i = 0; i < 5; ++i) {
+        REQUIRE(h.svc.admit_download_update("agent-A"));
+    }
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-A"));
+
+    // Peer-B has its own bucket — full capacity available.
+    for (int i = 0; i < 5; ++i) {
+        REQUIRE(h.svc.admit_download_update("agent-B"));
+    }
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-B"));
+
+    // Peer-A still exhausted independently.
+    REQUIRE_FALSE(h.svc.admit_download_update("agent-A"));
+}
+
+TEST_CASE("admit_download_update: empty peer key still tracked under empty-string bucket",
+          "[agent_service][rate_limit][p913]") {
+    // No SAN identity AND no peer_uri (impossible in practice; defensive
+    // path). The empty-string key still gets a bucket; not special-cased.
+    GatewayResponseHarness h;
+
+    for (int i = 0; i < 5; ++i) {
+        REQUIRE(h.svc.admit_download_update(""));
+    }
+    REQUIRE_FALSE(h.svc.admit_download_update(""));
+}

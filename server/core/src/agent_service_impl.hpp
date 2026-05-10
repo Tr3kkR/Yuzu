@@ -63,6 +63,22 @@ public:
 
     void set_update_registry(UpdateRegistry* reg) { update_registry_ = reg; }
     void set_response_store(ResponseStore* store) { response_store_ = store; }
+
+    /// Per-peer DownloadUpdate token bucket admission check (#913 /
+    /// UP-116). Returns true if the request is admitted (a token was
+    /// deducted); false if the bucket is exhausted (caller MUST return
+    /// ResourceExhausted). Thread-safe under
+    /// `download_update_buckets_mu_`. The peer key is the verified SAN
+    /// identity when available (CallContext::peer_san_identities[0]),
+    /// falling back to peer_uri (host:port) — fallbacks only fire in
+    /// dev/UAT where mTLS is disabled. Internally also runs an
+    /// opportunistic GC pass on stale entries (last_refill_at older
+    /// than 24 h) so a long-lived server does not accumulate dead
+    /// buckets from short-lived peers. Public to allow direct unit
+    /// testing; the production caller is `DownloadUpdate` in the
+    /// implementation.
+    bool admit_download_update(const std::string& peer);
+
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
     void set_health_store(AgentHealthStore* store) { health_store_ = store; }
@@ -220,6 +236,27 @@ private:
     /// gateway-forward threads require the lock-free release/acquire
     /// pair instead of a plain raw pointer.
     std::atomic<ExecutionTracker*> execution_tracker_{nullptr};
+
+    /// Per-peer DownloadUpdate token bucket (#913 / UP-116). Keyed by
+    /// the peer's verified SAN identity (or peer_uri fallback when no
+    /// SAN is available — e.g., in dev). Bucket capacity is 5 tokens;
+    /// refill rate is one token per ~90 minutes (= update_check_interval
+    /// default 6 h / 4) so a normally-behaved agent never hits the
+    /// limit but a fast-valid attacker monopolising the pool does.
+    /// Excess requests return ResourceExhausted (same wire status as
+    /// pool saturation #904) so dashboards can group capacity rejects
+    /// and per-peer rejects together when alerting on noisy fleets.
+    /// Storage is process-local; restart resets buckets to full —
+    /// matches the threat model (the limit is a fleet-monopolisation
+    /// guard, not a persistent quota).
+    struct DownloadUpdateBucket {
+        double tokens = 5.0;
+        std::chrono::steady_clock::time_point last_refill_at = std::chrono::steady_clock::now();
+    };
+    mutable std::mutex download_update_buckets_mu_;
+    std::unordered_map<std::string, DownloadUpdateBucket> download_update_buckets_;
+    std::chrono::steady_clock::time_point download_update_buckets_last_gc_ =
+        std::chrono::steady_clock::now();
 
     /// Match a claimed agent_id against the verified peer identities the
     /// transport surfaced via `CallContext::peer_san_identities`. The
