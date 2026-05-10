@@ -74,6 +74,29 @@ bool parse_bool_param(const httplib::Request& req, std::string_view key, bool de
     return v == "1" || v == "true" || v == "yes" || v == "TRUE";
 }
 
+/// Replace any literal `</` in the serialised JSON with `<\/`. Required
+/// when embedding into `<script type="application/json">` because the
+/// HTML5 parser terminates the script element on the first `</script` it
+/// sees, regardless of context. nlohmann::json does NOT escape `<` by
+/// default (it's outside the JSON-mandatory escape set), so an
+/// agent-controlled hostname/cmdline string containing `</script>` would
+/// otherwise break out of the wrapper element. Backslash-solidus is
+/// spec-valid JSON ("\/" is an alternate escape for "/"). gov R3
+/// sec-M2/UP-16/CH-6 fix.
+///
+/// Re-running on already-escaped output (e.g., a `<\/` substring) does
+/// not double-escape because `find("</")` skips past the inserted
+/// backslash on each step: pos advances by 3 (the inserted len), past
+/// the `<\/` triple, so a subsequent `</` scan starts from a char
+/// after the previously-escaped slash.
+void escape_json_for_script(std::string& s) {
+    std::string::size_type pos = 0;
+    while ((pos = s.find("</", pos)) != std::string::npos) {
+        s.replace(pos, 2, "<\\/");
+        pos += 3; // skip past the inserted backslash
+    }
+}
+
 } // namespace
 
 void VizRoutes::register_routes(httplib::Server& svr, AuthFn /*auth_fn*/, PermFn perm_fn,
@@ -109,23 +132,6 @@ void VizRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn 
              [this](const httplib::Request& req, httplib::Response& res) {
                  handle_topology(req, res, /*as_fragment=*/true);
              });
-}
-
-/// Replace any literal `</` in the serialised JSON with `<\/`. Required
-/// when embedding into `<script type="application/json">` because the
-/// HTML5 parser terminates the script element on the first `</script` it
-/// sees, regardless of context. nlohmann::json does NOT escape `<` by
-/// default (it's outside the JSON-mandatory escape set), so an
-/// agent-controlled hostname/cmdline string containing `</script>` would
-/// otherwise break out of the wrapper element. Backslash-solidus is
-/// spec-valid JSON ("\/" is an alternate escape for "/"). gov R3
-/// sec-M2/UP-16/CH-6 fix.
-void escape_json_for_script(std::string& s) {
-    std::string::size_type pos = 0;
-    while ((pos = s.find("</", pos)) != std::string::npos) {
-        s.replace(pos, 2, "<\\/");
-        pos += 3; // skip past the inserted backslash
-    }
 }
 
 void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& res,
