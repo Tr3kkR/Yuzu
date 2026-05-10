@@ -2616,6 +2616,25 @@ Get infrastructure topology data. For full topology rendering, use the HTMX frag
 
 The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` document that the `/viz/fleet` 3D renderer consumes. The endpoint dispatches `tar.fleet_snapshot` to every connected agent on cache miss, aggregates per-agent snapshots into machine cubes + interior process nodes + connection edges, and applies a 60 s LRU-of-2 cache (keyed on `include_vuln`).
 
+#### `GET /viz/fleet`
+
+Browser-facing page that renders the 3D fleet topology. The page itself is auth-gated only; per-request RBAC enforcement happens when the page's JS hits `GET /api/v1/viz/fleet/topology` (see below).
+
+**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables only the API endpoint, not the page shell — the page continues to load and the `503` from the disabled API surfaces in the browser console.
+
+**Browser requirements:** importmap support is required (Chrome 89+, Firefox 108+, Safari 16.4+, Edge 89+). On unsupported browsers the page detects via `HTMLScriptElement.supports('importmap')` and surfaces a visible error overlay instead of a blank canvas.
+
+**Cache posture:** the response sets `Cache-Control: no-cache, no-store, must-revalidate`. Vendored static assets (Three.js, OrbitControls, yuzu-viz.js) cache for 24 hours; the page itself revalidates on every navigation so a server upgrade cannot leave operators with a stale page that references the new assets.
+
+**Deployment constraint:** the page hard-codes static asset paths (`/static/three.module.min.js`, `/static/three-orbit-controls.js`, `/static/yuzu-viz.js`) and the API path (`/api/v1/viz/fleet/topology`). Reverse-proxy deployments under a sub-path (e.g. `location /yuzu/`) are not currently supported — the absolute paths would 404 against the rewritten origin. Mount Yuzu at the root path of its host or fronting domain.
+
+**Controls:**
+- Drag — rotate camera around scene origin (OrbitControls)
+- Mouse wheel — dolly in/out (clamped to `[4, 400]` units)
+- `W`/`A`/`S`/`D` — pan the view in camera screen space (window-level listener; suppressed when a text-editable target has focus, so typing in a future overlay-panel input does not eat keystrokes)
+
+
+
 #### `GET /api/v1/viz/fleet/topology`
 
 Returns the full topology as JSON.

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`/viz/fleet` page response now sets `Cache-Control: no-cache, no-store,
+  must-revalidate`** (gov R4 UP-10 / DEP-1 / CHAOS-C3). The page references
+  vendored static assets that cache for 24 hours via `max-age=86400`. Without
+  page revalidation, a heuristically-cached stale page after a server upgrade
+  could pair with new asset bytes (or vice versa), producing a silent blank
+  canvas with a module-resolution console error and no operator-visible
+  diagnostic. The revalidation forces a server round-trip per navigation but
+  the body is ~7 KB; the overhead is negligible vs the failure mode.
+- **WASD pan listener now skips text-editable focus targets** (gov R4
+  sec-M1 / UP-6). The window-level keydown listener calls
+  `e.preventDefault()` on W/A/S/D; previously this would silently eat
+  keystrokes destined for any future overlay-panel `<input>` /
+  `<textarea>` / `contenteditable` element. The listener now bails early
+  when `e.target` is `INPUT`, `TEXTAREA`, `SELECT`, or `isContentEditable`.
+- **Fleet visualization page surfaces a visible error on importmap-
+  incapable browsers** (gov R4 UP-16 / ER-SHOULD-1). Previously, browsers
+  shipped before early 2023 (Chromium <89, Firefox <108, Safari <16.4)
+  would silently fail at module-evaluation time before the renderer
+  could mount, leaving a blank canvas with no diagnostic. The page now
+  detects via `HTMLScriptElement.supports('importmap')` in a classic
+  inline script that runs before the importmap declaration, and surfaces
+  a "Fleet visualization requires Chrome 89+, Firefox 108+, or Safari
+  16.4+" message via the `#viz-error` overlay if support is missing.
+- **WebGL context loss now produces an operator-visible error** (gov R4
+  UP-3 / CHAOS-2). The renderer registers `webglcontextlost` and
+  `webglcontextrestored` handlers on the canvas. On loss (GPU driver
+  crash, OS GPU reset, sleep/wake, dGPU↔iGPU switch), the rAF loop stops
+  rendering and `#viz-error` shows "WebGL context lost (GPU reset or
+  driver issue). Reload the page to recover." Three.js does not auto-
+  recover scene state, so manual reload is the cleanest path; a future
+  PR may add automatic re-mount on `webglcontextrestored`.
+
 ### Added
 
 - **`/viz/fleet` page scaffold + WASD/orbit/zoom camera controls (PR 5

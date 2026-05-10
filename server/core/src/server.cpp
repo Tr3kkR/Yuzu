@@ -3657,12 +3657,29 @@ private:
         // The page itself is just the renderer scaffold + nav chrome -- no
         // per-machine data is rendered server-side; the JSON fetch on the
         // client is what enforces Response.Read.
+        //
+        // Cache-Control: no-cache, no-store, must-revalidate forces the
+        // browser to revalidate the page HTML on every navigation. This
+        // closes the gov R4 UP-10 / DEP-1 / CHAOS-C3 "stale page + new
+        // bundle" skew window: the page references a hard-coded importmap
+        // for `/static/three.module.min.js` etc. that are themselves
+        // cached for 24 hours. Without revalidation, a heuristically-
+        // cached stale page after a server upgrade pairs with new asset
+        // bytes (or vice versa), producing a silent blank canvas with a
+        // module-resolution console error.
+        //
+        // Future-PR ordering note (gov R4 arch-S1): if a future PR
+        // introduces a regex route like `R"(/viz/([^/]+))"` for per-
+        // machine drill-in, register it AFTER this literal route or the
+        // first-match-wins routing in cpp-httplib would swallow `fleet`
+        // as a path parameter.
         web_server_->Get("/viz/fleet", [this](const httplib::Request& req, httplib::Response& res) {
             auto session = require_auth(req, res);
             if (!session) {
                 res.set_redirect("/login");
                 return;
             }
+            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
             res.set_content(kVizFleetPageHtml, "text/html; charset=utf-8");
         });
 

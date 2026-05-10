@@ -30,10 +30,33 @@ extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>
   <link rel="stylesheet" href="/static/yuzu.css">
   <script src="/static/htmx.js"></script>
 
+  <!-- gov R4 UP-16 / ER-SHOULD-1: browser-support detection. Runs as a
+       classic (non-module) script BEFORE the importmap and the type=
+       "module" loader. On browsers that don't support importmap (Chrome
+       <89, Firefox <108, Safari <16.4), the module loader silently fails
+       at module-eval time before mount() runs and the operator sees a
+       blank canvas with no diagnostic. Detect via the standardised
+       `HTMLScriptElement.supports('importmap')` static method (which is
+       itself only available on browsers that implement importmap
+       support detection -- defensive coding tests for the function
+       existence first). On unsupported browsers we set
+       window.__yuzuVizUnsupported and surface a message via the
+       inline-script DOMContentLoaded hook below. -->
+  <script>
+    (function () {
+      var supported = typeof HTMLScriptElement !== 'undefined' &&
+                      typeof HTMLScriptElement.supports === 'function' &&
+                      HTMLScriptElement.supports('importmap');
+      window.__yuzuVizImportmapSupported = !!supported;
+    })();
+  </script>
+
   <!-- Three.js r168 + OrbitControls (vendored, MIT). The OrbitControls
-       module imports `from 'three'` — the importmap below resolves the
+       module imports `from 'three'` -- the importmap below resolves the
        bare specifier to the vendored bundle so the runtime never tries
-       to fetch from a CDN. -->
+       to fetch from a CDN. importmap MUST be parsed before any
+       `<script type="module">` tag (HTML spec); the loader at the end
+       of <body> is the only such tag in this page. -->
   <script type="importmap">
   {
     "imports": {
@@ -194,6 +217,19 @@ document.body.addEventListener('showToast', function(e) {
   var d = e.detail || {};
   showToast(d.message || 'Done', d.level || 'success');
 });
+// gov R4 UP-16 / ER-SHOULD-1: surface importmap-not-supported as a
+// visible #viz-error message rather than letting the page sit blank.
+// Runs after DOMContentLoaded so #viz-error is in the DOM. The
+// detection itself ran inline in <head>.
+if (!window.__yuzuVizImportmapSupported) {
+  var err = document.getElementById('viz-error');
+  if (err) {
+    err.textContent =
+      'Fleet visualization requires a modern browser (Chrome 89+, ' +
+      'Firefox 108+, or Safari 16.4+). The page cannot render in this browser.';
+    err.classList.add('shown');
+  }
+}
 fetch('/api/me').then(function(r){return r.json()}).then(function(d){
   document.getElementById('nav-user').textContent = d.username;
   var role = d.rbac_role || d.role;

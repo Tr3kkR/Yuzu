@@ -117,6 +117,27 @@ function mount() {
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
 
+  // gov R4 UP-3 / CHAOS-2: WebGL context can be lost at runtime (GPU
+  // driver crash, OS GPU reset, sleep/wake, dGPU<->iGPU switch). Without
+  // a handler the rAF loop keeps calling renderer.render() on the dead
+  // context, spamming console errors and showing a frozen frame with no
+  // operator-visible signal. We surface the loss via #viz-error and stop
+  // the rAF loop; on restored we hide the error and let the operator
+  // refresh manually (Three.js does not auto-recover scene state, so a
+  // full reload is the cleanest path).
+  let _contextLost = false;
+  canvas.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault();
+    _contextLost = true;
+    showError(root, 'WebGL context lost (GPU reset or driver issue). ' +
+                    'Reload the page to recover.');
+  }, false);
+  canvas.addEventListener('webglcontextrestored', () => {
+    _contextLost = false;
+    const err = root.querySelector('#viz-error');
+    if (err) err.classList.remove('shown');
+  }, false);
+
   const scene = buildScene();
 
   const camera = new THREE.PerspectiveCamera(
@@ -140,8 +161,19 @@ function mount() {
   // Pan vector accumulates each frame from the keys-held set; rAF loop
   // applies it in camera screen space. This avoids the per-keydown jitter
   // of binding pan directly to the keydown event.
+  //
+  // gov R4 sec-M1 / UP-6: skip when a focused element is text-editable so
+  // typing W/A/S/D into a future overlay-panel <input> / <textarea> /
+  // contenteditable region doesn't have its keystrokes silently eaten.
   const heldKeys = new Set();
+  function isEditableTarget(t) {
+    if (!t) return false;
+    const tag = t.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    return t.isContentEditable === true;
+  }
   function onKey(e, down) {
+    if (isEditableTarget(e.target)) return;
     const k = e.key && e.key.toLowerCase();
     if (k !== 'w' && k !== 'a' && k !== 's' && k !== 'd') return;
     if (down) heldKeys.add(k); else heldKeys.delete(k);
@@ -151,10 +183,13 @@ function mount() {
   window.addEventListener('keyup',   (e) => onKey(e, false));
 
   // Reusable temporaries so the rAF loop doesn't allocate per frame.
-  const _right = new THREE.Vector3();
-  const _up    = new THREE.Vector3(0, 1, 0);
-  const _mvDir = new THREE.Vector3();
-  const _quat  = new THREE.Quaternion();
+  // gov R4 perf-S2 / HP-1: `_offset` was previously allocated fresh each
+  // frame WASD held; hoist alongside the other temporaries. Removed the
+  // dead `_quat` declaration that was never referenced.
+  const _right  = new THREE.Vector3();
+  const _up     = new THREE.Vector3(0, 1, 0);
+  const _mvDir  = new THREE.Vector3();
+  const _offset = new THREE.Vector3();
 
   function applyWasdPan() {
     if (heldKeys.size === 0) return;
@@ -170,12 +205,13 @@ function mount() {
     if (heldKeys.has('a')) dx -= STEP;
     if (heldKeys.has('d')) dx += STEP;
     if (dx === 0 && dy === 0) return;
-    // dx maps along camera right, dy along camera up.
-    const offset = new THREE.Vector3()
-      .addScaledVector(_right, dx)
-      .addScaledVector(_up, dy);
-    camera.position.add(offset);
-    controls.target.add(offset);
+    // dx maps along camera right, dy along camera up. Reset and reuse
+    // the hoisted _offset rather than allocating per frame.
+    _offset.set(0, 0, 0)
+           .addScaledVector(_right, dx)
+           .addScaledVector(_up,    dy);
+    camera.position.add(_offset);
+    controls.target.add(_offset);
   }
 
   // ── Resize handler ──────────────────────────────────────────────────────
@@ -198,9 +234,14 @@ function mount() {
   // PR 6 will wire `.fetchTopology()` -> add machine cubes; PR 11 may
   // throttle to requestAnimationFrame-on-input rather than continuous.
   function tick() {
-    applyWasdPan();
-    controls.update();
-    renderer.render(scene, camera);
+    // gov R4 UP-3: when the GL context is lost, skip render() to avoid
+    // spamming "context-lost" warnings. The handler above already
+    // surfaced #viz-error; the operator must reload to recover.
+    if (!_contextLost) {
+      applyWasdPan();
+      controls.update();
+      renderer.render(scene, camera);
+    }
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);

@@ -212,9 +212,18 @@ TEST_CASE("static_js_bundle: kThreeJs starts with the MIT license header", "[sta
 }
 
 TEST_CASE("static_js_bundle: kThreeJs is the expected vendored release", "[static-js][three]") {
-    // r168 minor is exposed as REVISION = '168' in the bundle. Pin so a
-    // silent vendor refresh fails loud.
-    CHECK_THAT(yuzu::server::kThreeJs, ContainsSubstring("168"));
+    // gov R4 QA-B1: pin the QUOTED form `"168"` rather than the bare
+    // substring `168`. Bare-digit search hits arbitrary numeric tokens
+    // throughout 685 KB of minified JS (a silent r169 swap would still
+    // contain `168` somewhere). The bundle exposes `REVISION = "168"`
+    // exactly once -- pin that.
+    CHECK_THAT(yuzu::server::kThreeJs, ContainsSubstring("\"168\""));
+    // Sanity: confirm exactly one occurrence so the assertion above
+    // remains discriminating across future minor refreshes that may
+    // happen to embed the digit pattern elsewhere.
+    auto pos = yuzu::server::kThreeJs.find("\"168\"");
+    REQUIRE(pos != std::string::npos);
+    CHECK(yuzu::server::kThreeJs.find("\"168\"", pos + 1) == std::string::npos);
 }
 
 TEST_CASE("static_js_bundle: kThreeJs has no embedded NULs", "[static-js][three]") {
@@ -265,7 +274,29 @@ TEST_CASE("static_js_bundle: kYuzuVizJs idempotency guard present", "[static-js]
     // The mount-once guard reads root.dataset.yuzuVizMounted; any future
     // refactor that drops this leaves the door open for double-mount on
     // HTMX swap (two WebGLRenderer instances on the same canvas).
-    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("yuzuVizMounted"));
+    // gov R4 QA-S2: pin BOTH sides of the sentinel so a regression that
+    // changes the assignment to `'true'` while the check stays `'1'`
+    // breaks idempotency silently. The bare-substring assertion alone
+    // would pass either way.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("yuzuVizMounted === '1'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("yuzuVizMounted = '1'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs registers webglcontextlost handler", "[static-js][viz]") {
+    // gov R4 UP-3 / CHAOS-2: WebGL context loss must be handled or the
+    // rAF loop spams "context-lost" warnings on every frame after a GPU
+    // sleep/wake. Pin both event-name listeners so a refactor that drops
+    // either fails the test instead of producing silent freezes.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("'webglcontextlost'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("'webglcontextrestored'"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs guards WASD against editable targets", "[static-js][viz]") {
+    // gov R4 sec-M1 / UP-6: WASD preventDefault MUST NOT fire when a
+    // text-editable element is focused, or typing W/A/S/D into a future
+    // overlay-panel <input> silently eats the keystroke.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("isEditableTarget"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("isContentEditable"));
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs disables OrbitControls panning", "[static-js][viz]") {
@@ -304,6 +335,62 @@ TEST_CASE("viz page: declares importmap for three + addons", "[viz][page]") {
     CHECK_THAT(html, ContainsSubstring("type=\"importmap\""));
     CHECK_THAT(html, ContainsSubstring("\"three\": \"/static/three.module.min.js\""));
     CHECK_THAT(html, ContainsSubstring("/static/three-orbit-controls.js"));
+}
+
+TEST_CASE("viz page: importmap appears EXACTLY ONCE", "[viz][page]") {
+    // gov R4 sec-L2 / QA-S3 / CHAOS-1: HTML spec allows only one
+    // importmap per document. A second declaration is silently ignored
+    // by the browser. Pin exactly-one occurrence so a future refactor
+    // that accidentally inserts a second importmap (e.g. a copy-paste
+    // into a sibling page shell) fails this test instead of breaking
+    // module resolution at runtime.
+    std::string html(kVizFleetPageHtml);
+    auto first = html.find("type=\"importmap\"");
+    REQUIRE(first != std::string::npos);
+    CHECK(html.find("type=\"importmap\"", first + 1) == std::string::npos);
+}
+
+TEST_CASE("viz page: yuzu-viz.js module loader appears EXACTLY ONCE", "[viz][page]") {
+    // Two `<script type="module" src="/static/yuzu-viz.js">` tags would
+    // load the renderer twice. The mount() guard absorbs double-mount
+    // for HTMX swaps but the duplicate load itself wastes 6 KB and
+    // duplicates the global `htmx:afterSettle` listener registration
+    // (UP-5 amplifier). Pin singleton.
+    std::string html(kVizFleetPageHtml);
+    auto needle = "<script type=\"module\" src=\"/static/yuzu-viz.js\">";
+    auto first = html.find(needle);
+    REQUIRE(first != std::string::npos);
+    CHECK(html.find(needle, first + 1) == std::string::npos);
+}
+
+TEST_CASE("viz page: importmap precedes the type=module loader", "[viz][page]") {
+    // gov R4 UP-1 / CHAOS-1: HTML spec requires the importmap to be
+    // parsed BEFORE any `<script type="module">` that depends on it.
+    // A future refactor that moves the importmap into <body>, or
+    // injects a module-script ahead of it, would silently break module
+    // resolution. Assert the position invariant directly.
+    std::string html(kVizFleetPageHtml);
+    auto importmap_pos = html.find("type=\"importmap\"");
+    auto module_pos = html.find("<script type=\"module\" src=\"/static/yuzu-viz.js\">");
+    REQUIRE(importmap_pos != std::string::npos);
+    REQUIRE(module_pos != std::string::npos);
+    CHECK(importmap_pos < module_pos);
+}
+
+TEST_CASE("viz page: importmap-support detection runs before importmap", "[viz][page]") {
+    // gov R4 UP-16 / ER-SHOULD-1: browsers without importmap support
+    // need a non-module fallback that surfaces a visible error rather
+    // than leaving a blank canvas. Detection uses
+    // HTMLScriptElement.supports('importmap'); pin the substring AND
+    // its position relative to the importmap so a refactor can't move
+    // it after.
+    std::string html(kVizFleetPageHtml);
+    auto detect_pos = html.find("HTMLScriptElement.supports");
+    auto importmap_pos = html.find("type=\"importmap\"");
+    REQUIRE(detect_pos != std::string::npos);
+    REQUIRE(importmap_pos != std::string::npos);
+    CHECK(detect_pos < importmap_pos);
+    CHECK_THAT(html, ContainsSubstring("__yuzuVizImportmapSupported"));
 }
 
 TEST_CASE("viz page: loads yuzu-viz.js as type=module", "[viz][page]") {
