@@ -489,3 +489,69 @@ jobs:
               });
               core.notice(`Opened nightly-broken issue #${created.data.number}`);
             }
+
+  # ── Close nightly-broken on full green ─────────────────────────────────
+  # Symmetric counterpart to the `alert:` job above. Closes any open
+  # `nightly-broken` issue when all three nightly jobs (asan, tsan, coverage)
+  # succeed, so the discipline rule "no merge to main while nightly-broken
+  # is open" naturally clears as soon as the next green nightly lands.
+  # Iterates over all matching open issues, not just the first, so a stale
+  # duplicate from any prior bug doesn't linger.
+  close-on-green:
+    name: "Close nightly-broken on green"
+    needs: [sanitize-asan, sanitize-tsan, coverage]
+    if: success()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Close any open nightly-broken issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        with:
+          script: |
+            const label = 'nightly-broken';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const sha = '${{ github.sha }}';
+            const refName = process.env.REF_NAME;
+            const body = [
+              `Nightly run on \`${refName}\` @ \`${sha.substring(0, 7)}\` is **fully green**.`,
+              ``,
+              `**Run:** ${runUrl}`,
+              ``,
+              `Closing this issue automatically. The "no merge to main" discipline rule clears.`,
+              ``,
+              `(auto-closed by .github/workflows/nightly.yml — re-opened automatically by the alert job if a future nightly fails.)`,
+            ].join('\n');
+
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: 'open',
+              per_page: 100,
+            });
+
+            if (open.data.length === 0) {
+              core.notice('No open nightly-broken issues to close.');
+              return;
+            }
+
+            for (const issue of open.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              core.notice(`Closed nightly-broken issue #${issue.number}`);
+            }
