@@ -40,8 +40,8 @@ extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>
        itself only available on browsers that implement importmap
        support detection -- defensive coding tests for the function
        existence first). On unsupported browsers we set
-       window.__yuzuVizUnsupported and surface a message via the
-       inline-script DOMContentLoaded hook below. -->
+       `window.__yuzuVizImportmapSupported = false` and surface a
+       visible error via the inline parse-time script below. -->
   <script>
     (function () {
       var supported = typeof HTMLScriptElement !== 'undefined' &&
@@ -219,8 +219,12 @@ document.body.addEventListener('showToast', function(e) {
 });
 // gov R4 UP-16 / ER-SHOULD-1: surface importmap-not-supported as a
 // visible #viz-error message rather than letting the page sit blank.
-// Runs after DOMContentLoaded so #viz-error is in the DOM. The
-// detection itself ran inline in <head>.
+// This script is parsed in body order, AFTER the #viz-error <div>, so
+// document.getElementById finds it without waiting for DOMContentLoaded.
+// The detection itself ran inline in <head> and stamped
+// window.__yuzuVizImportmapSupported. Future refactors that move this
+// script into <head> MUST wrap the body in a DOMContentLoaded listener
+// so #viz-error exists when the lookup runs.
 if (!window.__yuzuVizImportmapSupported) {
   var err = document.getElementById('viz-error');
   if (err) {
