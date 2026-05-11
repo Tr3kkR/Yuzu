@@ -311,29 +311,66 @@ cmd_start() {
   chmod 600 "$VIZ_UAT_DIR/cookies.txt" 2>/dev/null || true
   ok "Enrollment token issued (saved to $VIZ_UAT_DIR/enrollment-token)"
 
-  # Phase 3: agent(s)
-  info "Starting agent (scale=$VIZ_UAT_AGENTS)..."
-  YUZU_ENROLLMENT_TOKEN="$enroll_token" \
-    docker compose -f "$COMPOSE_FILE" up -d --scale "agent=$VIZ_UAT_AGENTS" agent
+  # Phase 3: agent(s) — gated on VIZ_UAT_AGENT_MODE
+  # Three modes:
+  #   container (default): spin up the dockerised yuzu-agent under the
+  #                        in-container-agent compose profile. Thin agent on a
+  #                        debian:trixie-slim base — almost no loopback chatter,
+  #                        useful as a smoke test for the registration path but
+  #                        weak for PR-8+ visual demos.
+  #   vm:                  do not start a containerised agent. Print the
+  #                        enrollment-token + gateway-host:port the operator
+  #                        will need to run yuzu-agent natively on an OrbStack
+  #                        VM (or bare-metal host) reachable via the bridge
+  #                        network. The host-exposed gateway port 50051 is the
+  #                        registration target.
+  #   none:                do not start an agent and do not block waiting for
+  #                        registration. Useful for renderer iteration with an
+  #                        empty fleet.
+  local mode="${VIZ_UAT_AGENT_MODE:-container}"
+  case "$mode" in
+    container)
+      info "Starting agent in container (scale=$VIZ_UAT_AGENTS)..."
+      YUZU_ENROLLMENT_TOKEN="$enroll_token" \
+        docker compose -f "$COMPOSE_FILE" --profile in-container-agent \
+          up -d --scale "agent=$VIZ_UAT_AGENTS" agent
 
-  # Wait for at least one agent to register
-  info "Waiting for agent registration..."
-  local waited=0 reg=0
-  while [ "$waited" -lt 60 ]; do
-    reg=$(curl -fsS "http://localhost:8080/metrics" 2>/dev/null \
-            | awk '/^yuzu_agents_registered_total /{print $2; exit}' || echo 0)
-    reg=${reg:-0}
-    if awk "BEGIN { exit !($reg >= 1) }"; then
-      break
-    fi
-    sleep 2
-    waited=$((waited + 2))
-  done
-  if ! awk "BEGIN { exit !($reg >= 1) }"; then
-    fail "No agents registered within 60s. Check 'bash scripts/start-viz-uat.sh status'"
-    exit 1
-  fi
-  ok "$reg agent(s) registered"
+      info "Waiting for agent registration..."
+      local waited=0 reg=0
+      while [ "$waited" -lt 60 ]; do
+        reg=$(curl -fsS "http://localhost:8080/metrics" 2>/dev/null \
+                | awk '/^yuzu_agents_registered_total /{print $2; exit}' || echo 0)
+        reg=${reg:-0}
+        if awk "BEGIN { exit !($reg >= 1) }"; then
+          break
+        fi
+        sleep 2
+        waited=$((waited + 2))
+      done
+      if ! awk "BEGIN { exit !($reg >= 1) }"; then
+        fail "No agents registered within 60s. Check 'bash scripts/start-viz-uat.sh status'"
+        exit 1
+      fi
+      ok "$reg agent(s) registered"
+      ;;
+    vm)
+      ok "Skipping in-container agent; VM-agent mode selected."
+      info "Bridge gateway IP for VM agent (typical OrbStack default):"
+      info "  enroll-token: $(cat "$VIZ_UAT_DIR/enrollment-token")"
+      info "  gateway addr: 192.168.139.1:50051   (host-exposed; confirm with: ip route show default | awk '/default/ {print \$3}' on the VM)"
+      info "  example:      yuzu-agent --server 192.168.139.1:50051 --no-tls \\"
+      info "                  --plugin-dir <path-to-plugins> \\"
+      info "                  --data-dir /var/lib/yuzu-agent \\"
+      info "                  --enrollment-token <token>"
+      ;;
+    none)
+      ok "Skipping agent startup; VIZ_UAT_AGENT_MODE=none"
+      ;;
+    *)
+      fail "Unknown VIZ_UAT_AGENT_MODE='$mode'. Allowed: container | vm | none"
+      exit 1
+      ;;
+  esac
 
   echo ""
   echo "╔══════════════════════════════════════════════════╗"

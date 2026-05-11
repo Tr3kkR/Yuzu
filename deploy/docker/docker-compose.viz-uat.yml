@@ -66,6 +66,17 @@ services:
       - "/etc/yuzu/yuzu-server.cfg"
       - "--data-dir"
       - "/var/lib/yuzu"
+    environment:
+      # OrbStack / Docker Desktop on macOS inject HTTP_PROXY=http://proxyproxy.orb.internal:8305
+      # (and equivalent http_proxy/HTTPS_PROXY/all_proxy) into containers via daemon-level
+      # default-env propagation. gRPC's HTTP/2 client honours these env vars and routes
+      # cross-container traffic — including gateway↔server upstream RPC — through the
+      # proxy, which returns 502 because it can't proxy gRPC bidi. Force NO_PROXY=*
+      # so EVERY destination bypasses the proxy. Inter-container DNS (the `gateway`
+      # / `server` compose service names) resolves on the user-defined bridge network
+      # and doesn't need a proxy.
+      NO_PROXY: "*"
+      no_proxy: "*"
     ports:
       - "8080:8080"   # Web dashboard + REST API (operator-facing)
       - "50055:50055" # Gateway upstream (debugging convenience)
@@ -95,9 +106,18 @@ services:
       dockerfile: deploy/docker/Dockerfile.gateway
     image: yuzu-gateway-viz-uat:latest
     container_name: yuzu-viz-gateway
+    environment:
+      # See server.environment — same proxy-bypass rationale.
+      NO_PROXY: "*"
+      no_proxy: "*"
     ports:
       - "8081:8081"   # Health/readiness (operator-visible)
       - "9568:9568"   # Prometheus metrics
+      - "50051:50051" # Agent-facing gRPC. Exposed so a yuzu-agent running OUTSIDE
+                      # the compose stack (e.g. on an OrbStack VM, on bare metal, on
+                      # the host) can register. In-container agent reaches gateway
+                      # via the `gateway` service hostname on the internal network
+                      # and doesn't need this binding.
     volumes:
       - ./gateway-sys.config:/opt/yuzu_gw/releases/0.2.0/sys.config:ro
     depends_on:
@@ -114,19 +134,28 @@ services:
       start_period: 5s
     restart: unless-stopped
 
-  # ── Yuzu Agent ──────────────────────────────────────────────────────────
-  # Connects to the gateway on :50051. The enrollment token is issued at
-  # stack startup by scripts/start-viz-uat.sh (curl POST to the server's
-  # /api/settings/enrollment-tokens) and passed in via the YUZU_ENROLLMENT_TOKEN
-  # env var. Compose's :- default makes `up agent` fail clearly if the script
-  # was bypassed.
+  # ── Yuzu Agent (container) ───────────────────────────────────────────────
+  # Optional. Gated behind the `in-container-agent` profile so the default
+  # compose-up brings only server + gateway. When you want the in-container
+  # agent (a thin, mostly idle host with no real loopback traffic), run:
+  #   docker compose --profile in-container-agent up agent
+  # For richer demos (real services chatting via loopback / Unix sockets),
+  # run a native yuzu-agent on an OrbStack VM or bare-metal host pointing
+  # at the host-exposed gateway port (gateway service exposes 50051 to the
+  # host for this purpose). See docs/plans/threat-graph-roadmap.md.
   agent:
+    profiles: ["in-container-agent"]
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.agent
     image: yuzu-agent-viz-uat:latest
     environment:
       YUZU_ENROLLMENT_TOKEN: "${YUZU_ENROLLMENT_TOKEN:?set YUZU_ENROLLMENT_TOKEN before bringing up agent}"
+      # See server.environment — same proxy-bypass rationale, even more
+      # important here because the agent's gRPC client is the one that
+      # originally tripped on the proxy injection.
+      NO_PROXY: "*"
+      no_proxy: "*"
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
