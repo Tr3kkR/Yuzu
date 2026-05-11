@@ -546,8 +546,17 @@ start_all() {
     # Test 3: Server metrics show registered agent
     tests_total=$((tests_total + 1))
     local reg_count
-    # awk replaces grep -oP '\K' (lookbehind) which BSD grep lacks.
-    reg_count=$(curl -s http://localhost:8080/metrics | awk '/^yuzu_agents_registered_total /{print $2; exit}')
+    # Read the full /metrics stream — DO NOT use `awk '...; exit'` because
+    # awk's early exit closes its stdin, the upstream curl gets SIGPIPE,
+    # and with the script's `set -euo pipefail` the whole pipeline returns
+    # non-zero and the surrounding command substitution aborts the script.
+    # The server metrics payload happens to be small enough that the buffer
+    # often fills before awk exits, so Test 3 historically worked by luck;
+    # the gateway payload is larger and Test 4 always tripped the SIGPIPE
+    # path. Both pipelines now consume the full stream (`!seen && /.../`
+    # latches first-match emission) for symmetric reliability. (#994)
+    reg_count=$(curl -s http://localhost:8080/metrics \
+        | awk '!seen && /^yuzu_agents_registered_total /{print $2; seen=1}')
     [ -z "$reg_count" ] && reg_count=0
     if [ "$reg_count" -ge 1 ]; then
         ok "Server sees $reg_count registered agent(s)"
@@ -559,7 +568,8 @@ start_all() {
     # Test 4: Gateway metrics show agent connection
     tests_total=$((tests_total + 1))
     local gw_agents
-    gw_agents=$(curl -s http://localhost:9568/metrics | awk '/^yuzu_gw_agents_connected_total\{/{print $2; exit}')
+    gw_agents=$(curl -s http://localhost:9568/metrics \
+        | awk '!seen && /^yuzu_gw_agents_connected_total\{/{print $2; seen=1}')
     [ -z "$gw_agents" ] && gw_agents=0
     if [ "$gw_agents" -ge 1 ]; then
         ok "Gateway shows $gw_agents connected agent(s)"
