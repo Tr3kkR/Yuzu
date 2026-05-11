@@ -541,6 +541,63 @@ TEST_CASE("Client/server unary round-trip with registered handler", "[transport]
     REQUIRE_FALSE(listener->is_serving());
 }
 
+TEST_CASE("Server dispatch tolerates a leading `/` in the method path "
+          "(cross-impl wire compatibility)",
+          "[transport][round-trip][dispatch]") {
+    // The Erlang gateway (grpcbox) and any spec-conformant gRPC client
+    // send the HTTP/2 `:path` header WITH a leading `/`
+    // (`/yuzu.gateway.v1.GatewayUpstream/ProxyRegister`). gRPC's
+    // `AsyncGenericService` then exposes the verbatim `:path` via
+    // `gctx.method()`. The yuzu Channel happens to omit the slash, so
+    // for years the in-process round-trip worked because both halves
+    // shared the same convention.
+    //
+    // The UAT round-trip exposed the gap: gateway sent `/X/Y`, server
+    // dispatch had `X/Y` in the registration map → "method not
+    // registered" 12/Unimplemented. The dispatch now strips an
+    // optional leading `/` before lookup; this test pins that
+    // behaviour.
+    auto listener = make_server_listener(Backend::Grpc);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, const SerializableMessage& req,
+                      SerializableMessage& resp) -> Status {
+        const auto& sreq = static_cast<const StringMessage&>(req);
+        auto& sresp = static_cast<StringMessage&>(resp);
+        sresp.set_data("slash-ok:" + sreq.data());
+        return Status{StatusCode::Ok, ""};
+    };
+    auto factory = []() -> std::unique_ptr<SerializableMessage> {
+        return std::make_unique<StringMessage>();
+    };
+    // Registered WITHOUT the leading slash (the established yuzu
+    // convention).
+    listener->register_unary("yuzu.test.v1.Echo/SlashTolerant", factory, factory, handler);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint bind{"127.0.0.1", 0};
+    auto start_r = listener->start(bind, creds);
+    REQUIRE(start_r.has_value());
+
+    auto ch = make_channel(Backend::Grpc, listener->bound_endpoint(), creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    StringMessage req("hello"), resp;
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    // Call WITH the leading slash — what grpcbox / curl-style clients
+    // send. The dispatch must strip it and find the same handler.
+    auto r = ch->unary("/yuzu.test.v1.Echo/SlashTolerant", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Ok);
+    REQUIRE(static_cast<const StringMessage&>(resp).data() == "slash-ok:hello");
+
+    ch->close();
+    listener->shutdown();
+}
+
 TEST_CASE("Client/server unary returns Unimplemented for unknown method",
           "[transport][round-trip]") {
     auto listener = make_server_listener(Backend::Grpc);

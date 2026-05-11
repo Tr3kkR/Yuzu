@@ -425,7 +425,20 @@ private:
     };
 
     void handle_request_arrived() {
-        const std::string& method = gctx_.method();
+        // gRPC's AsyncGenericService exposes the wire `:path` header
+        // verbatim via `gctx_.method()`. Spec-conformant gRPC clients
+        // (grpcbox, codegen-built stubs, curl-style senders) ship a
+        // leading `/` so the path matches the HTTP/2 contract; the yuzu
+        // Channel happens to omit the slash because it forwards the
+        // registered handler name unchanged. Registrations in
+        // `register_unary` / `register_bidi_stream` historically used
+        // the no-slash form. To preserve cross-impl wire compatibility
+        // we strip an optional leading `/` from the wire form before
+        // dispatch lookup so both spellings match the same handler.
+        // (Surfaced by the UAT round-trip when the Erlang gateway
+        // proxied an agent through the lifted GatewayUpstream service.)
+        std::string method = gctx_.method();
+        if (!method.empty() && method.front() == '/') method.erase(0, 1);
 
         bool unary_match = false;
         bool bidi_match = false;
@@ -453,7 +466,9 @@ private:
     }
 
     void dispatch_bidi() {
-        const std::string& method = gctx_.method();
+        // See `handle_request_arrived` for the leading-`/` rationale.
+        std::string method = gctx_.method();
+        if (!method.empty() && method.front() == '/') method.erase(0, 1);
 
         BidiStreamHandler handler;
         {
@@ -634,7 +649,9 @@ public:
 
 private:
     void dispatch_unary() {
-        const std::string& method = gctx_.method();
+        // See `handle_request_arrived` for the leading-`/` rationale.
+        std::string method = gctx_.method();
+        if (!method.empty() && method.front() == '/') method.erase(0, 1);
 
         std::function<std::unique_ptr<SerializableMessage>()> req_factory;
         std::function<std::unique_ptr<SerializableMessage>()> resp_factory;
