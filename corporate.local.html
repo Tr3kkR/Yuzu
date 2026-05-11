@@ -1,0 +1,657 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuzu — Corporate &amp;amp; Commercialisation Strategy</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">corporate.local.md</div>
+<h1 class="doc-title">Yuzu — Corporate &amp;amp; Commercialisation Strategy</h1>
+<nav class="doc-nav"><a href="README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="yuzu-corporate-commercialisation-strategy">Yuzu — Corporate &amp; Commercialisation Strategy</h1>
+<blockquote>
+<p>Local-only strategy notes (gitignored via <code>*.local.md</code>). Captures the
+commercialisation thinking as of 2026-04-21 so it doesn't live only in
+chat history. Update in place as decisions firm up.</p>
+</blockquote>
+<h2 id="the-model">The model</h2>
+<p><strong>Open-source code + paid support</strong>, not dual-license. Same bits ship to
+everyone; paid customers buy people, SLA, and sponsored development that
+lands back in OSS. RedHat / Canonical / HashiCorp-pre-BSL lineage, not
+the Sentry / MongoDB / Elastic dual-license / source-available lineage.</p>
+<h3 id="what-this-model-is-good-at">What this model is good at</h3>
+<ul>
+<li>Regulated / sovereign buyers (gov, defence, healthcare, finance, EU)
+  get full source audit rights <strong>and</strong> a throat to choke. That
+  combination is uniquely suited to Yuzu's endpoint-management
+  positioning — these buyers dislike black boxes running on every
+  endpoint they own.</li>
+<li>Engineering story is simpler. One codebase. No entitlement server. No
+  licence-key infra. No enterprise test matrix. No feature-gate
+  litigation over what goes where.</li>
+<li>Sponsored development is a legit additional revenue lane. Collabora,
+  Igalia, EDB survive on exactly that pattern. Governments in particular
+  buy sponsored development more easily than pure support contracts
+  because the line-item is legible to their procurement processes.</li>
+</ul>
+<h3 id="what-this-model-is-bad-at">What this model is bad at</h3>
+<ul>
+<li>Margins are thin. You sell labour, not bits. RedHat was the most
+  successful pure-support company ever and capped at ~$3B ARR before
+  IBM; most plays top out at $5–50M.</li>
+<li>No natural "upgrade to paid" moment mid-usage. Every deal is a full
+  top-of-funnel cycle, typically 3–9 months.</li>
+<li>Free-riders are the default. Conversion from users → paid is typically
+  &lt;1%.</li>
+<li>The moat is a named team. A well-capitalised fork ("Yuzu Pro", same
+  bits, someone else's support contract) erodes differentiation instantly
+  unless you are the canonical maintainer with public visibility.</li>
+</ul>
+<h2 id="consultancy-as-delivery-partner">Consultancy as delivery partner</h2>
+<p>Nathan holds 50% (largest share of four partners) in a 28-person
+consulting company. Currently profitable at ~£2k/day with two people on
+the bench. This materially changes the risk picture.</p>
+<h3 id="what-it-unblocks">What it unblocks</h3>
+<ul>
+<li>The "named team / single throat" objection collapses. Procurement sees
+  a 28-person delivery org, not a solo maintainer. Put the consultancy
+  on the customer assurance page as the support-delivery entity.</li>
+<li>SOC 2 funding (~£30–50k all-in for Type I) becomes non-blocking. Fund
+  from consulting margin as operational infrastructure, not from
+  speculative Yuzu revenue.</li>
+<li>Bench rotation covers the immediate ramp work (support ops buildout,
+  SOC 2 evidence collection, customer assurance docs, licensing /
+  pricing copy) without new hires. ~2 bench consultants for 6–8 weeks
+  gets through most of it.</li>
+<li>Contracts, invoicing, HR, legal, sales machinery already exist. Not
+  bootstrapping operations — grafting a product onto an existing
+  delivery org.</li>
+</ul>
+<h3 id="what-it-does-not-unblock">What it does not unblock</h3>
+<ul>
+<li>Licence choice is still a Nathan-hours-with-a-lawyer decision.</li>
+<li>Public positioning / Nathan-as-named-expert cannot be
+  consultancy-delegated. It's your face on the market.</li>
+<li>Product management is a different muscle than consulting delivery.
+  Bench rotation fills support-engineer and docs slots; it doesn't fill
+  the "who owns the roadmap" slot. That stays Nathan.</li>
+</ul>
+<h2 id="corporate-structure-decision">Corporate structure decision</h2>
+<p><strong>The single highest-leverage decision to make before rotating
+consultancy bench onto Yuzu work.</strong> Three patterns:</p>
+<ol>
+<li><strong>Yuzu lives inside the consultancy.</strong> Simplest short-term.
+   - Problem: conflates unit economics that shouldn't be conflated
+     (subscription vs T&amp;M consulting).
+   - Problem: friction if the other 3 partners don't want to subsidise
+     product R&amp;D from consulting margin.
+   - Problem: complicates any future Yuzu-specific capital raise or
+     exit.</li>
+<li><strong>Yuzu as separate entity (NewCo); consultancy is first
+   support-delivery partner.</strong> Most common pattern for this situation.
+   - NewCo owns IP, trademark, and subscription revenue.
+   - Consultancy is a named delivery partner on a Master Services
+     Agreement with margin sharing.
+   - Cleaner governance, cleaner capital raises, cleaner exit.
+   - Cost: ~£3–10k UK corporate legal + a few weeks of setup.</li>
+<li><strong>Yuzu owned by Nathan personally.</strong> Worst pattern unless the other
+   partners specifically want it.
+   - UK tax-hostile (personal income instead of corporation tax).
+   - Muddy on IP when consultancy engineers contribute under their
+     existing employment contracts.
+   - Weak investor optics.</li>
+</ol>
+<p><strong>Recommendation:</strong> Pattern 2. Make the call <strong>before</strong> rotating
+consultancy bench onto Yuzu. IP contributions made under ambiguous
+ownership get cleaned up later via assignment deeds, but the cleanup
+conversation gets friction-y once commercial momentum exists. Do it
+while it's still theoretical.</p>
+<h2 id="partner-alignment">Partner alignment</h2>
+<p>Parallel conversation with the other 3 consultancy partners:</p>
+<blockquote>
+<p><em>"I want the consultancy to become Yuzu's first support-delivery
+partner. Here's the structure, the margin arrangement, how bench
+allocation changes over 6–12 months, and what happens if Yuzu revenue
+grows past consulting revenue."</em></p>
+</blockquote>
+<p>50% + largest-share lets Nathan push through, but goodwill in a
+28-person partnership matters a lot. The partners may not have signed up
+to be a product company. Get them bought in explicitly, ideally before
+external legal structures are set up.</p>
+<h2 id="sponsored-development-as-a-product">Sponsored development as a product</h2>
+<p>Don't treat this as "you can pay us to build stuff." Publish an actual
+intake process:</p>
+<ul>
+<li>How to propose a feature.</li>
+<li>How it gets priced (T&amp;M vs fixed-scope).</li>
+<li>SLA on proposal turnaround.</li>
+<li>Commitment that the feature lands in OSS under the project licence.</li>
+<li>Which categories will be refused (proprietary lock-in features, things
+  that fork governance).</li>
+</ul>
+<p>Governments and regulated buyers read this more easily than support
+contracts because the line-item is legible to their procurement processes.</p>
+<h2 id="licence-defence-against-cloud-strip-mining">Licence defence against cloud strip-mining</h2>
+<p>Currently <strong>Apache 2.0</strong>, which means a well-capitalised cloud provider
+can take the code, repackage it as a managed service, and compete
+without contributing back. Historical examples: AWS → Elasticsearch,
+AWS → MongoDB, AWS → Redis.</p>
+<p>Realistic lesson from all three: a determined cloud provider <strong>will
+build a competing service regardless of licence</strong>. The licence choice
+only determines whether they have to re-implement (costly) or can fork
+directly (free). The <strong>trademark</strong> determines what they can call it. The
+<strong>community governance</strong> determines who the "canonical" project is.</p>
+<h3 id="options-ranked-for-a-support-revenue-model">Options, ranked for a support-revenue model</h3>
+<ol>
+<li>
+<p><strong>Apache 2.0 + CLA + registered trademark</strong> <em>(recommended starting
+   state)</em>
+   - Keep the maximally permissive licence for now; adoption matters
+     more than defence at current scale.
+   - Add a Contributor Licence Agreement (CLA) so relicensing stays an
+     option later. Without a CLA, every contributor has copyright on
+     their lines and you cannot unilaterally move to BSL / ELv2 / AGPL
+     later. With a CLA, you preserve the option. Do this <strong>before</strong>
+     external contributors exist — cost now is zero, cost later is
+     chasing signatures from people who have left the industry.
+   - Register "Yuzu" as a trademark (UK ~£200, EU ~€850, US ~$350).
+     Publish a trademark policy. Blocks "AWS Yuzu Service" naming even
+     if someone forks the code.
+   - Watch the market. Revisit if Yuzu crosses ~100 paying customers or
+     a cloud provider starts shadowing the roadmap.</p>
+</li>
+<li>
+<p><strong>AGPL-3.0</strong>
+   - Strongest still-OSI-approved defence. Forces any SaaS provider to
+     open-source their entire management plane if they run modified
+     Yuzu.
+   - Cost: meaningful percentage of enterprises have blanket policies
+     against AGPL internal use. Cuts adoption by ~20–40% depending on
+     vertical.
+   - Legal ambiguity on "linking" vs "using" has never been fully tested
+     in court. Procurement teams know this and sometimes treat it like
+     SSPL risk anyway.
+   - Fit: if sovereign/gov buyers dominate your pipeline and fortune 500
+     adoption doesn't matter, AGPL is the cleanest still-OSI answer.</p>
+</li>
+<li>
+<p><strong>BSL 1.1 with 4-year conversion to Apache 2</strong>
+   - HashiCorp's model. Fully prohibits commercial competing services;
+     each version converts to Apache 2 on its 4-year anniversary.
+   - <strong>Not OSI "open source"</strong> — the marketing claim "open source"
+     becomes contested. Procurement usually accepts "source available"
+     once they understand the terms, but the negotiation is longer.
+   - Fit: if you want an explicit anti-cloud clause but still want
+     eventual OSS status for old versions.</p>
+</li>
+<li>
+<p><strong>Elastic Licence v2 (ELv2)</strong>
+   - Simplest anti-cloud clause: three restrictions (no managed
+     service, no circumventing licence keys, no obscuring licensing).
+   - <strong>Not OSI.</strong> Used by Elastic, Sentry (before FSL), Redis.
+   - Fit: if you want the cloud protection without BSL's time-delay
+     complexity.</p>
+</li>
+<li>
+<p><strong>Functional Source Licence (FSL)</strong>
+   - 2023-ish, Sentry's replacement for ELv2. 2 years of restricted
+     use → converts to Apache 2 or MIT.
+   - Simpler than BSL; shorter conversion window.
+   - Less battle-tested in procurement conversations than BSL or ELv2.</p>
+</li>
+</ol>
+<h3 id="recommendation">Recommendation</h3>
+<p>Do <strong>option 1</strong> now, re-evaluate in 12–18 months:</p>
+<ul>
+<li><strong>CLA is the single highest-leverage move.</strong> Preserves the relicense
+  option. Without it, every future licence conversation gets harder
+  with every new contributor. Cheapest possible insurance against the
+  cloud-repackaging risk, regardless of which direction you eventually
+  take.</li>
+<li><strong>Trademark registration is cheap and fast.</strong> Blocks the brand-fork
+  vector even if the code-fork vector remains open.</li>
+<li><strong>Don't pre-emptively move to AGPL / BSL / ELv2.</strong> The cost is real
+  (adoption hit, procurement friction, signalling "this is a
+  defensively-licensed project"), and the defence is premature. AWS
+  doesn't repackage code that isn't already profitable. Elasticsearch
+  was $100M+ ARR when AWS forked it. Yuzu isn't at repackaging risk
+  until it's commercially successful — and by then, the CLA gives you
+  the option to relicense from a position of strength.</li>
+</ul>
+<h3 id="concrete-triggers-for-relicensing">Concrete triggers for relicensing</h3>
+<p>Revisit the licence decision (probably to ELv2 or BSL) when any of:</p>
+<ul>
+<li>A cloud provider starts shadowing the roadmap (PR, blog posts, launch
+  announcements).</li>
+<li>Yuzu crosses ~100 paying customers and the roadmap is publicly visible
+  enough to be a target.</li>
+<li>A specific customer asks for an "anti-cloud" clause in their contract
+  (this happens at the sovereign / gov tier).</li>
+<li>You raise Yuzu-specific capital and investors push for source-available
+  (common).</li>
+</ul>
+<h2 id="priority-order">Priority order</h2>
+<ol>
+<li><strong>Week 1:</strong> corporate structure decision + partner alignment
+   conversation (parallel).</li>
+<li><strong>Week 1:</strong> CLA + trademark registration kick-off.</li>
+<li><strong>Week 1–2:</strong> licence verification (done — Apache 2.0 confirmed) and
+   trademark application filed.</li>
+<li><strong>Week 2–4:</strong> engage SOC 2 auditor (Vanta or Drata + Prescient /
+   Johanson / A-LIGN); assign 1 bench consultant to support-ops
+   buildout (ticket system, KB, SLA tracking, runbooks); assign 1 bench
+   consultant to SOC 2 evidence collection.</li>
+<li><strong>Week 4–6:</strong> draft pricing page + customer assurance one-pager.</li>
+<li><strong>Week 6+:</strong> start the pilot conversations.</li>
+</ol>
+<h2 id="open-questions">Open questions</h2>
+<ul>
+<li>Which UK corporate counsel? Cost envelope ~£5–10k for NewCo
+  incorporation + IP assignment from consultancy/Nathan + MSA between
+  NewCo and consultancy + CLA template.</li>
+<li>Which CLA template? Apache Foundation iCLA is the gold standard;
+  alternatives are Harmony (permissive) and Google's CLA. DCO
+  (Developer Certificate of Origin) is a lighter-weight alternative that
+  does <strong>not</strong> preserve relicense rights — fine for adoption optics,
+  useless for the cloud-defence case. Pick iCLA or Harmony.</li>
+<li>Which SOC 2 tooling — Vanta vs Drata? Vanta is more mature for SaaS
+  controls; Drata is slightly cheaper and has better integration with
+  smaller auditor panels. Both will work.</li>
+<li>Trademark scope — UK only initially or file through Madrid Protocol
+  for international? Answer depends on expected first-customer
+  geography.</li>
+</ul>
+<h2 id="references">References</h2>
+<ul>
+<li><a href="docs/enterprise-readiness-soc2-first-customer.html" class="doc-ref"><code>docs/enterprise-readiness-soc2-first-customer.md</code></a> — the 7-workstream
+  plan that governance agents load.</li>
+<li><a href="SECURITY.html" class="doc-ref"><code>SECURITY.md</code></a> — current disclosure policy.</li>
+<li><a href="CONTRIBUTING.html" class="doc-ref"><code>CONTRIBUTING.md</code></a> — does <strong>not</strong> yet reference a CLA; update when CLA
+  is adopted.</li>
+<li><code>LICENSE</code> — Apache 2.0, confirmed.</li>
+</ul>
+</main>
+</body>
+</html>

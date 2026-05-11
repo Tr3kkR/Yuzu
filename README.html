@@ -1,0 +1,935 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuzu</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">README.md</div>
+<h1 class="doc-title">Yuzu</h1>
+<nav class="doc-nav"><a href="README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="yuzu">Yuzu</h1>
+<p><a href="https://scorecard.dev/viewer/?uri=github.com/Tr3kkR/Yuzu"><img alt="OpenSSF Scorecard" src="https://api.securityscorecards.dev/projects/github.com/Tr3kkR/Yuzu/badge"></a></p>
+<!-- OpenSSF Best Practices Badge: application in progress (issue #407). Once approved, replace <ID> with the project id from bestpractices.dev. -->
+<!-- [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/<ID>/badge)](https://www.bestpractices.dev/projects/<ID>) -->
+<p><a href="https://github.com/Tr3kkR/Yuzu/actions/workflows/zizmor.yml"><img alt="Zizmor" src="https://github.com/Tr3kkR/Yuzu/actions/workflows/zizmor.yml/badge.svg?branch=main"></a></p>
+<p><strong>Enterprise endpoint management platform.</strong> Real-time visibility, orchestration, and compliance across Windows, Linux, and macOS fleets — built from the ground up in modern C++23.</p>
+<p>Yuzu gives operations and security teams a single control plane to query, command, patch, and enforce policy on every managed endpoint in real time. Agents are lightweight, plugin-extensible, and report structured telemetry that is natively compatible with Prometheus, Grafana, ClickHouse, and Splunk.</p>
+<h2 id="what-yuzu-does">What Yuzu Does</h2>
+<ul>
+<li><strong>Real-time querying</strong> — Ask questions ("which machines are missing patch KB5034441?") and get streaming answers from thousands of endpoints in seconds.</li>
+<li><strong>Command orchestration</strong> — Dispatch actions (restart a service, kill a process, deploy a package) to one device or an entire fleet, with approval workflows and scheduling.</li>
+<li><strong>Continuous compliance</strong> — Define desired-state policies ("BitLocker must be enabled") that agents evaluate locally on triggers (file change, service crash, interval) and auto-remediate.</li>
+<li><strong>Security response</strong> — Quarantine compromised devices, check indicators of compromise, inventory certificates, and collect forensic data.</li>
+<li><strong>Plugin extensibility</strong> — A stable C ABI means plugins can be written in any language that produces a shared library. 44 plugins ship out of the box covering hardware, network, security, software, and more.</li>
+<li><strong>AI integration</strong> — An embedded MCP (Model Context Protocol) server exposes 23 tools for AI-driven fleet querying, compliance reporting, and supervised command execution.</li>
+</ul>
+<h2 id="instruction-engine">Instruction Engine</h2>
+<p>Every operation in Yuzu flows through the <strong>instruction engine</strong> — a governed lifecycle that transforms ad-hoc commands into reusable, versioned, auditable definitions.</p>
+<p><strong>Content model:</strong></p>
+<div class="highlight"><pre><span></span><code>ProductPack                    (signed distribution bundle)
+ └── InstructionSet            (permission boundary, grouping)
+      └── InstructionDefinition (reusable operation template)
+           ├── Parameter Schema (typed inputs with validation)
+           ├── Result Schema    (typed output columns)
+           └── Execution Spec   (plugin + action + defaults)
+</code></pre></div>
+<p><strong>How it works:</strong></p>
+<ol>
+<li><strong>Author</strong> an InstructionDefinition in YAML — declare the plugin, action, typed parameters, result columns, approval mode, and platform compatibility.</li>
+<li><strong>Import</strong> it via the dashboard or REST API. The server validates the schema and stores the YAML verbatim alongside denormalized columns for efficient queries.</li>
+<li><strong>Execute</strong> the definition against a scope expression (<code>ostype == "windows" AND tag:env == "production"</code>). The engine validates parameters, checks approvals, dispatches via gRPC, and tracks per-agent progress.</li>
+<li><strong>Analyze</strong> results using typed aggregation, filtering, and CSV/JSON export.</li>
+<li><strong>Schedule</strong> recurring executions with cron-style frequency and scope-based targeting.</li>
+</ol>
+<p>Definitions are <code>question</code> (read-only, auto-approved) or <code>action</code> (may modify state, approval-gated). Every execution is audited, every response is persisted, and every state-changing action can require approval.</p>
+<p>See <a href="docs/Instruction-Engine.html"><a href="docs/Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a></a> for the full architecture, <a href="docs/yaml-dsl-spec.html"><a href="docs/yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a></a> for the YAML specification, and <a href="docs/getting-started.html"><a href="docs/getting-started.html" class="doc-ref"><code>docs/getting-started.md</code></a></a> for a hands-on tutorial.</p>
+<h2 id="architecture">Architecture</h2>
+<div class="highlight"><pre><span></span><code>                        ┌──────────────────────────────────────────────────────────┐
+                        │                      Yuzu Server                          │
+                        │                                                          │
+  Operators ──────────► │  ┌────────────┐  ┌─────────────┐  ┌──────────────────┐  │
+  (Browser / API)       │  │  REST API  │  │  Instruction │  │  Policy Engine   │  │
+                        │  │  (v1)      │  │  Engine      │  │  (Guaranteed     │  │
+                        │  └────────────┘  └─────────────┘  │   State)         │  │
+                        │  ┌────────────┐  ┌─────────────┐  └──────────────────┘  │
+                        │  │  HTMX      │  │  Response    │  ┌──────────────────┐  │
+                        │  │  Dashboard │  │  Store       │  │  RBAC / Auth     │  │
+                        │  └────────────┘  │  (SQLite)    │  │  OIDC · API Keys │  │
+                        │  ┌────────────┐  └─────────────┘  └──────────────────┘  │
+                        │  │  Metrics   │  ┌─────────────┐  ┌──────────────────┐  │
+  Prometheus ◄───────── │  │  /metrics  │  │  Audit Log  │  │  Scheduler       │  │
+  Grafana               │  └────────────┘  └─────────────┘  └──────────────────┘  │
+                        │                                                          │
+                        └────────────────────────┬─────────────────────────────────┘
+                                                 │
+                              gRPC / Protobuf / mTLS (bidirectional streaming)
+                                                 │
+           ┌─────────────────────────────────────┼──────────────────────────────────┐
+           │                                     │                                  │
+   ┌───────┴───────┐                   ┌─────────┴────────┐             ┌───────────┴──────┐
+   │  Yuzu Agent   │                   │   Yuzu Agent     │             │   Yuzu Agent     │
+   │  (Windows)    │                   │   (Linux)        │             │   (macOS)        │
+   │               │                   │                  │             │                  │
+   │  Plugin Host  │                   │  Plugin Host     │             │  Plugin Host     │
+   │  Trigger Eng. │                   │  Trigger Eng.    │             │  Trigger Eng.    │
+   │  KV Storage   │                   │  KV Storage      │             │  KV Storage      │
+   │  Metrics      │                   │  Metrics         │             │  Metrics         │
+   └───────────────┘                   └──────────────────┘             └──────────────────┘
+</code></pre></div>
+<h3 id="optional-gateway-nodes">Optional: Gateway Nodes</h3>
+<p>For large or distributed deployments, gateway nodes sit between agents and the server to reduce WAN traffic, batch heartbeats, and provide local TLS termination.</p>
+<div class="highlight"><pre><span></span><code>  Agents ──► Gateway (branch office) ──► Server (datacenter)
+</code></pre></div>
+<h2 id="observability-and-integration">Observability and Integration</h2>
+<p>Yuzu is designed to be a first-class data source in modern observability stacks:</p>
+<table>
+<thead>
+<tr>
+<th>Integration</th>
+<th>How</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Prometheus</strong></td>
+<td><code>/metrics</code> endpoint on both server and agent. Counters, gauges, histograms with labels. Grafana-ready.</td>
+</tr>
+<tr>
+<td><strong>Grafana</strong></td>
+<td>Pre-built dashboard templates for fleet health, command throughput, policy compliance, and agent connectivity.</td>
+</tr>
+<tr>
+<td><strong>ClickHouse</strong></td>
+<td>Structured response data and inventory use columnar-friendly schemas (typed columns, timestamps, agent IDs). Feed via the REST API or response offloading webhooks.</td>
+</tr>
+<tr>
+<td><strong>Splunk</strong></td>
+<td>Audit logs and event subscriptions emit structured JSON. Agents can POST directly to Splunk HEC via the <code>http_client</code> plugin.</td>
+</tr>
+<tr>
+<td><strong>Webhooks</strong></td>
+<td>Event subscriptions push JSON payloads to any HTTP endpoint on agent lifecycle, policy compliance changes, and instruction completion.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="metrics-philosophy">Metrics Philosophy</h3>
+<p>Every metric follows the Prometheus naming convention (<code>yuzu_server_*</code>, <code>yuzu_agent_*</code>) with consistent labels (<code>agent_id</code>, <code>plugin</code>, <code>method</code>, <code>status</code>). This makes it trivial to build Grafana dashboards, set up alerting rules, or feed data into ClickHouse materialized views for long-term analysis.</p>
+<p>Response data is typed (bool, int32, int64, string, datetime, CLOB) and schematized per instruction definition, making it straightforward to map into ClickHouse tables or Splunk sourcetypes for correlation workflows.</p>
+<h2 id="key-design-decisions">Key Design Decisions</h2>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Choice</th>
+<th>Rationale</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Language</td>
+<td>C++23</td>
+<td><code>std::expected</code>, ranges, <code>std::format</code>. Low memory footprint for agents on constrained endpoints.</td>
+</tr>
+<tr>
+<td>Build</td>
+<td>Meson + vcpkg</td>
+<td>Fast builds, reproducible dependencies, cross-platform. CMake available as a dependency method only.</td>
+</tr>
+<tr>
+<td>Transport</td>
+<td>gRPC + Protobuf</td>
+<td>Bidirectional streaming, strongly typed, TLS built-in, language-neutral.</td>
+</tr>
+<tr>
+<td>Plugin ABI</td>
+<td>Stable C ABI</td>
+<td>Binary-stable across compiler versions. Language-agnostic. <code>dlopen</code>/<code>LoadLibrary</code> safe.</td>
+</tr>
+<tr>
+<td>Web UI</td>
+<td>HTMX + server-rendered HTML</td>
+<td>No JavaScript framework. Server renders fragments. Minimal client complexity.</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>SQLite (embedded)</td>
+<td>Zero-config, single-file, fast. Agent uses it for KV storage and identity. Server uses it for responses, audit, and config.</td>
+</tr>
+<tr>
+<td>Auth</td>
+<td>PBKDF2 + RBAC + OIDC</td>
+<td>Session cookies for browsers, API tokens for automation, OIDC for enterprise SSO.</td>
+</tr>
+<tr>
+<td>Platforms</td>
+<td>Windows, Linux, macOS (ARM64), ARM</td>
+<td>Enterprise + edge coverage. Cross-compiled from CI. macOS Intel (x64) is not currently built or tested — only Apple Silicon (ARM64) is supported.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="project-layout">Project Layout</h2>
+<div class="highlight"><pre><span></span><code>Yuzu/
+├── agents/core/              Agent daemon (gRPC client, plugin loader, trigger engine)
+├── agents/plugins/           44 plugins (hardware, network, security, filesystem, etc.)
+├── server/core/              Server daemon (sessions, auth, dashboard, REST API)
+├── gateway/                  Erlang/OTP gateway node (standalone rebar3 project)
+├── sdk/                      Public SDK — stable C ABI (plugin.h) + C++23 wrapper (plugin.hpp)
+├── proto/                    Protobuf definitions (source of truth for wire protocol)
+│   ├── yuzu/agent/v1/        AgentService: Register, Heartbeat, ExecuteCommand, Subscribe
+│   ├── yuzu/common/v1/       Shared types: Platform, Timestamp, ErrorDetail
+│   ├── yuzu/server/v1/       ManagementService: ListAgents, SendCommand, WatchEvents
+│   └── yuzu/gateway/v1/      GatewayUpstream — server-side RPCs the Erlang gateway calls into
+├── docs/                     Architecture and roadmap documentation
+├── meson/                    Cross-compilation and native files
+├── scripts/                  Build helpers (setup.sh, deploy_build_dlls.py)
+├── tests/unit/               Catch2 unit tests
+└── .github/workflows/        CI: Linux, Windows, macOS, ARM64 cross-compile
+</code></pre></div>
+<h2 id="install">Install</h2>
+<p>Prebuilt artifacts are published with every tagged release. If you just want to run Yuzu, start here — you do not need to build from source.</p>
+<ul>
+<li><strong>Release binaries &amp; installers</strong> (server/agent for Linux, Windows, macOS; Compose Wizard zip): <a href="https://github.com/Tr3kkR/Yuzu/releases">GitHub Releases</a>. Latest stable is v0.10.0; v0.11.0-rc1 is the most recent pre-release.</li>
+<li><strong>Container images</strong> (published to GHCR on every tag):</li>
+<li><code>ghcr.io/tr3kkr/yuzu-server:&lt;version&gt;</code></li>
+<li><code>ghcr.io/tr3kkr/yuzu-agent:&lt;version&gt;</code></li>
+<li><code>ghcr.io/tr3kkr/yuzu-gateway:&lt;version&gt;</code></li>
+<li><strong>Docker Compose</strong> quickstart: <a href="deploy/docker/docker-compose.yml"><code>deploy/docker/docker-compose.yml</code></a> stands up the full server + gateway + agent stack. Reference wiring for UAT is <a href="deploy/docker/docker-compose.reference.yml"><code>deploy/docker/docker-compose.reference.yml</code></a>.</li>
+</ul>
+<div class="highlight"><pre><span></span><code><span class="c1"># Pull and run the latest stable release via compose</span>
+curl<span class="w"> </span>-fsSL<span class="w"> </span>https://raw.githubusercontent.com/Tr3kkR/Yuzu/main/deploy/docker/docker-compose.yml<span class="w"> </span>-o<span class="w"> </span>docker-compose.yml
+<span class="nv">YUZU_VERSION</span><span class="o">=</span><span class="m">0</span>.10.0<span class="w"> </span>docker<span class="w"> </span>compose<span class="w"> </span>up<span class="w"> </span>-d
+</code></pre></div>
+<p>Open <code>http://localhost:8080</code> and sign in with the credentials set during first-run provisioning.</p>
+<h2 id="building">Building</h2>
+<h3 id="prerequisites">Prerequisites</h3>
+<ul>
+<li>Meson 1.9.2, Ninja</li>
+<li>CMake (required by Meson's cmake dependency method)</li>
+<li>C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+</li>
+<li><a href="https://github.com/microsoft/vcpkg">vcpkg</a> with <code>VCPKG_ROOT</code> set</li>
+<li>Python 3 with <strong>PyYAML</strong> (<code>pip install pyyaml</code>, or <code>pacman -S python-yaml</code>
+  on MSYS2). Required at <code>meson setup</code> for the build-time
+  <code>InstructionDefinition</code> content embed; meson configure fails fast
+  with a clear error if missing.</li>
+</ul>
+<h3 id="quick-start">Quick Start</h3>
+<div class="highlight"><pre><span></span><code>./scripts/setup.sh<span class="w">                              </span><span class="c1"># debug build</span>
+./scripts/setup.sh<span class="w"> </span>--buildtype<span class="w"> </span>release<span class="w"> </span>--lto<span class="w">    </span><span class="c1"># release + LTO</span>
+./scripts/setup.sh<span class="w"> </span>--tests<span class="w">                      </span><span class="c1"># enable unit tests</span>
+</code></pre></div>
+<h3 id="manual">Manual</h3>
+<div class="highlight"><pre><span></span><code>vcpkg<span class="w"> </span>install<span class="w"> </span>--triplet<span class="w"> </span>x64-linux<span class="w"> </span>--x-manifest-root<span class="o">=</span>.
+meson<span class="w"> </span>setup<span class="w"> </span>builddir<span class="w"> </span>--buildtype<span class="o">=</span>debug<span class="w"> </span>-Dcmake_prefix_path<span class="o">=</span><span class="nv">$VCPKG_ROOT</span>/installed/x64-linux
+meson<span class="w"> </span>compile<span class="w"> </span>-C<span class="w"> </span>builddir
+</code></pre></div>
+<h3 id="windows-msys2-bash">Windows (MSYS2 bash)</h3>
+<div class="highlight"><pre><span></span><code><span class="nb">source</span><span class="w"> </span>./setup_msvc_env.sh
+meson<span class="w"> </span>compile<span class="w"> </span>-C<span class="w"> </span>builddir
+</code></pre></div>
+<h3 id="build-options">Build Options</h3>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Default</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-Dbuild_agent</code></td>
+<td>true</td>
+<td>Agent daemon</td>
+</tr>
+<tr>
+<td><code>-Dbuild_server</code></td>
+<td>true</td>
+<td>Server daemon</td>
+</tr>
+<tr>
+<td><code>-Dbuild_tests</code></td>
+<td>false</td>
+<td>Catch2 test suite</td>
+</tr>
+<tr>
+<td><code>-Dbuild_examples</code></td>
+<td>true</td>
+<td>Example plugins</td>
+</tr>
+<tr>
+<td><code>-Db_lto</code></td>
+<td>false</td>
+<td>Link-time optimisation</td>
+</tr>
+<tr>
+<td><code>-Db_sanitize=address,undefined</code></td>
+<td>—</td>
+<td>ASan + UBSan</td>
+</tr>
+</tbody>
+</table>
+<h2 id="writing-a-plugin">Writing a Plugin</h2>
+<p>Plugins are shared libraries (<code>.dll</code>/<code>.so</code>) exporting a C ABI descriptor. See <a href="sdk/include/yuzu/plugin.h"><code>sdk/include/yuzu/plugin.h</code></a> and <a href="agents/plugins/example/"><code>agents/plugins/example/</code></a>.</p>
+<div class="highlight"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;yuzu/plugin.hpp&gt;</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MyPlugin</span><span class="w"> </span><span class="k">final</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="k">public</span><span class="w"> </span><span class="n">yuzu</span><span class="o">::</span><span class="n">Plugin</span><span class="w"> </span><span class="p">{</span>
+<span class="k">public</span><span class="o">:</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="w"> </span><span class="n">name</span><span class="p">()</span><span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="k">override</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="s">&quot;my-plugin&quot;</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="w"> </span><span class="n">version</span><span class="p">()</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="k">noexcept</span><span class="w"> </span><span class="k">override</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="s">&quot;1.0.0&quot;</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// implement execute() to handle actions...</span>
+<span class="p">};</span>
+
+<span class="n">YUZU_PLUGIN_EXPORT</span><span class="p">(</span><span class="n">MyPlugin</span><span class="p">)</span>
+</code></pre></div>
+<h2 id="running">Running</h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># Start the server</span>
+./builddir/server/core/yuzu-server<span class="w"> </span>--listen<span class="w"> </span><span class="m">0</span>.0.0.0:50051<span class="w"> </span>--web-port<span class="w"> </span><span class="m">8080</span>
+
+<span class="c1"># Start an agent (connects to server)</span>
+./builddir/agents/core/yuzu-agent<span class="w"> </span>--server<span class="w"> </span>localhost:50051<span class="w"> </span>--plugin-dir<span class="w"> </span>./builddir/agents/plugins
+</code></pre></div>
+<p>Open <code>http://localhost:8080</code> for the web dashboard.</p>
+<h2 id="roadmap">Roadmap</h2>
+<p>See <a href="docs/roadmap.html"><a href="docs/roadmap.html" class="doc-ref"><code>docs/roadmap.md</code></a></a> for the full development roadmap organized into 7 phases, from foundation completion through policy engine, security, and scale-out architecture.</p>
+<p>See <a href="docs/capability-map.html"><a href="docs/capability-map.html" class="doc-ref"><code>docs/capability-map.md</code></a></a> for the live capability inventory and progress.</p>
+<h2 id="contributing">Contributing</h2>
+<p>Pull requests welcome. Start with <a href="CONTRIBUTING.html">CONTRIBUTING.md</a> — it covers the build, branch naming (<code>feature/*</code>, <code>fix/*</code>), the governance-gated PR workflow, C++23 coding standards, observability conventions, and the plugin SDK. Architectural and release context lives in <a href="CLAUDE.md">CLAUDE.md</a>.</p>
+<p>Good first issues are labelled <a href="https://github.com/Tr3kkR/Yuzu/labels/good%20first%20issue"><code>good first issue</code></a>; broader backlogs are grouped by area (<code>enterprise-readiness</code>, <code>security</code>, <code>docs</code>, <code>compliance</code>).</p>
+<h2 id="reporting-issues">Reporting Issues</h2>
+<ul>
+<li><strong>Bugs</strong> — open a <a href="https://github.com/Tr3kkR/Yuzu/issues/new?template=bug_report.md">bug report</a>. Include version (<code>yuzu-server --version</code>), OS, and reproduction steps.</li>
+<li><strong>Feature requests</strong> — open a <a href="https://github.com/Tr3kkR/Yuzu/issues/new?template=feature_request.md">feature request</a>. Tie it to a use case so scope stays concrete.</li>
+<li><strong>Security vulnerabilities</strong> — do <strong>not</strong> file a public issue. Follow <a href="SECURITY.html">SECURITY.md</a> and submit via <a href="https://github.com/Tr3kkR/Yuzu/security/advisories/new">GitHub's private vulnerability reporting</a>. Acknowledgement within 48 hours.</li>
+<li><strong>Questions &amp; discussion</strong> — <a href="https://github.com/Tr3kkR/Yuzu/discussions">GitHub Discussions</a> for usage questions; use issues for anything actionable.</li>
+</ul>
+<h2 id="license">License</h2>
+<p>Yuzu is dual-licensed:</p>
+<ul>
+<li><strong>Community Edition</strong> — <a href="LICENSE">GNU Affero General Public License v3.0 or later</a> (AGPL-3.0-or-later). If you modify Yuzu and operate it as a network service, §13 requires you to offer the modified source to all users of that service. See <a href="NOTICE">NOTICE</a> for attribution.</li>
+<li><strong>Enterprise Edition</strong> — a commercial license covering premium features under <a href="enterprise/"><code>enterprise/</code></a>. See <a href="enterprise/LICENSE-ENTERPRISE.html"><a href="enterprise/LICENSE-ENTERPRISE.html" class="doc-ref"><code>enterprise/LICENSE-ENTERPRISE.md</code></a></a> for terms and contact details.</li>
+<li><strong>Plugin authors</strong> — the stable C ABI in <a href="sdk/"><code>sdk/</code></a> is covered by a linking exception documented in <a href="sdk/LICENSE-SDK.html"><a href="sdk/LICENSE-SDK.html" class="doc-ref"><code>sdk/LICENSE-SDK.md</code></a></a>; proprietary plugins that consume only the ABI remain permitted.</li>
+</ul>
+<p>Contributions require a signed <a href="CLA.html">Contributor License Agreement</a>; see <a href="CONTRIBUTING.html">CONTRIBUTING.md</a>.</p>
+<p>Releases tagged before the AGPL transition (≤ v0.11.x) remain available under their original Apache-2.0 grant to everyone who received them. Only releases cut after the transition are governed by AGPL.</p>
+<hr>
+<h2 id="document-index">Document index</h2>
+<p>Every Markdown document in this repository has a sibling <code>.html</code> rendered from the source. 158 documents are listed below, grouped by directory. <code>CLAUDE.md</code> is intentionally not converted.</p>
+<h3 id="idx-Root">Root-level documents</h3>
+<ul class="doc-index">
+<li><a href="CHANGELOG.html"><code>CHANGELOG.md</code></a></li>
+<li><a href="CLA.html"><code>CLA.md</code></a></li>
+<li><a href="CODEBASE_REVIEW.html"><code>CODEBASE_REVIEW.md</code></a></li>
+<li><a href="CODEX.html"><code>CODEX.md</code></a></li>
+<li><a href="CONTRIBUTING.html"><code>CONTRIBUTING.md</code></a></li>
+<li><a href="Instruction-Execution-History.local.html"><code>Instruction-Execution-History.local.md</code></a></li>
+<li><a href="SECURITY.html"><code>SECURITY.md</code></a></li>
+<li><a href="SECURITY_REVIEW.html"><code>SECURITY_REVIEW.md</code></a></li>
+<li><a href="corporate.local.html"><code>corporate.local.md</code></a></li>
+<li><a href="release-pipeline-accelerator.local.html"><code>release-pipeline-accelerator.local.md</code></a></li>
+<li><a href="status-3-18-26.html"><code>status-3-18-26.md</code></a></li>
+</ul>
+<h3 id="idx--claude-agents">.claude / agents</h3>
+<ul class="doc-index">
+<li><a href=".claude/agents/architect.html"><code>.claude/agents/architect.md</code></a></li>
+<li><a href=".claude/agents/authdb.html"><code>.claude/agents/authdb.md</code></a></li>
+<li><a href=".claude/agents/build-ci.html"><code>.claude/agents/build-ci.md</code></a></li>
+<li><a href=".claude/agents/chaos-injector.html"><code>.claude/agents/chaos-injector.md</code></a></li>
+<li><a href=".claude/agents/compliance-officer.html"><code>.claude/agents/compliance-officer.md</code></a></li>
+<li><a href=".claude/agents/consistency-auditor.html"><code>.claude/agents/consistency-auditor.md</code></a></li>
+<li><a href=".claude/agents/cpp-expert.html"><code>.claude/agents/cpp-expert.md</code></a></li>
+<li><a href=".claude/agents/cross-platform.html"><code>.claude/agents/cross-platform.md</code></a></li>
+<li><a href=".claude/agents/docs-writer.html"><code>.claude/agents/docs-writer.md</code></a></li>
+<li><a href=".claude/agents/dsl-engineer.html"><code>.claude/agents/dsl-engineer.md</code></a></li>
+<li><a href=".claude/agents/enterprise-readiness.html"><code>.claude/agents/enterprise-readiness.md</code></a></li>
+<li><a href=".claude/agents/gateway-erlang.html"><code>.claude/agents/gateway-erlang.md</code></a></li>
+<li><a href=".claude/agents/happy-path.html"><code>.claude/agents/happy-path.md</code></a></li>
+<li><a href=".claude/agents/mcp-uat-tester.html"><code>.claude/agents/mcp-uat-tester.md</code></a></li>
+<li><a href=".claude/agents/performance.html"><code>.claude/agents/performance.md</code></a></li>
+<li><a href=".claude/agents/plugin-developer.html"><code>.claude/agents/plugin-developer.md</code></a></li>
+<li><a href=".claude/agents/quality-engineer.html"><code>.claude/agents/quality-engineer.md</code></a></li>
+<li><a href=".claude/agents/release-deploy.html"><code>.claude/agents/release-deploy.md</code></a></li>
+<li><a href=".claude/agents/security-guardian.html"><code>.claude/agents/security-guardian.md</code></a></li>
+<li><a href=".claude/agents/sre.html"><code>.claude/agents/sre.md</code></a></li>
+<li><a href=".claude/agents/unhappy-path.html"><code>.claude/agents/unhappy-path.md</code></a></li>
+<li><a href=".claude/agents/workflow-orchestrator.html"><code>.claude/agents/workflow-orchestrator.md</code></a></li>
+</ul>
+<h3 id="idx--claude-skills">.claude / skills</h3>
+<ul class="doc-index">
+<li><a href=".claude/skills/auth-and-authz/SKILL.html"><code>.claude/skills/auth-and-authz/SKILL.md</code></a></li>
+<li><a href=".claude/skills/ci-cache/SKILL.html"><code>.claude/skills/ci-cache/SKILL.md</code></a></li>
+<li><a href=".claude/skills/gateway-dialyzer/SKILL.html"><code>.claude/skills/gateway-dialyzer/SKILL.md</code></a></li>
+<li><a href=".claude/skills/gateway-eunit/SKILL.html"><code>.claude/skills/gateway-eunit/SKILL.md</code></a></li>
+<li><a href=".claude/skills/governance/SKILL.html"><code>.claude/skills/governance/SKILL.md</code></a></li>
+<li><a href=".claude/skills/release/SKILL.html"><code>.claude/skills/release/SKILL.md</code></a></li>
+<li><a href=".claude/skills/test/SKILL.html"><code>.claude/skills/test/SKILL.md</code></a></li>
+</ul>
+<h3 id="idx--codex-skills">.codex / skills</h3>
+<ul class="doc-index">
+<li><a href=".codex/skills/yuzu-build/SKILL.html"><code>.codex/skills/yuzu-build/SKILL.md</code></a></li>
+<li><a href=".codex/skills/yuzu-meson/SKILL.html"><code>.codex/skills/yuzu-meson/SKILL.md</code></a></li>
+<li><a href=".codex/skills/yuzu-plugin-abi/SKILL.html"><code>.codex/skills/yuzu-plugin-abi/SKILL.md</code></a></li>
+<li><a href=".codex/skills/yuzu-proto/SKILL.html"><code>.codex/skills/yuzu-proto/SKILL.md</code></a></li>
+<li><a href=".codex/skills/yuzu-windows-msvc/SKILL.html"><code>.codex/skills/yuzu-windows-msvc/SKILL.md</code></a></li>
+</ul>
+<h3 id="idx--github">.github (templates)</h3>
+<ul class="doc-index">
+<li><a href=".github/ISSUE_TEMPLATE/bug_report.html"><code>.github/ISSUE_TEMPLATE/bug_report.md</code></a></li>
+<li><a href=".github/ISSUE_TEMPLATE/feature_request.html"><code>.github/ISSUE_TEMPLATE/feature_request.md</code></a></li>
+<li><a href=".github/pull_request_template.html"><code>.github/pull_request_template.md</code></a></li>
+</ul>
+<h3 id="idx-docs">docs/</h3>
+<ul class="doc-index">
+<li><a href="docs/Instruction-Engine.html"><code>docs/Instruction-Engine.md</code></a></li>
+<li><a href="docs/agent-privilege-model.html"><code>docs/agent-privilege-model.md</code></a></li>
+<li><a href="docs/agentic-first-principle.html"><code>docs/agentic-first-principle.md</code></a></li>
+<li><a href="docs/analytics-events.html"><code>docs/analytics-events.md</code></a></li>
+<li><a href="docs/architecture.html"><code>docs/architecture.md</code></a></li>
+<li><a href="docs/asset-tagging-guide.html"><code>docs/asset-tagging-guide.md</code></a></li>
+<li><a href="docs/auth-architecture.html"><code>docs/auth-architecture.md</code></a></li>
+<li><a href="docs/capability-agentic-audit-2026-05.html"><code>docs/capability-agentic-audit-2026-05.md</code></a></li>
+<li><a href="docs/capability-map.html"><code>docs/capability-map.md</code></a></li>
+<li><a href="docs/ci-architecture.html"><code>docs/ci-architecture.md</code></a></li>
+<li><a href="docs/ci-cpp23-troubleshooting.html"><code>docs/ci-cpp23-troubleshooting.md</code></a></li>
+<li><a href="docs/ci-troubleshooting.html"><code>docs/ci-troubleshooting.md</code></a></li>
+<li><a href="docs/clickhouse-setup.html"><code>docs/clickhouse-setup.md</code></a></li>
+<li><a href="docs/cpp-conventions.html"><code>docs/cpp-conventions.md</code></a></li>
+<li><a href="docs/darwin-compat.html"><code>docs/darwin-compat.md</code></a></li>
+<li><a href="docs/data-architecture.html"><code>docs/data-architecture.md</code></a></li>
+<li><a href="docs/dependency-rollout-2026-04-14.html"><code>docs/dependency-rollout-2026-04-14.md</code></a></li>
+<li><a href="docs/dependency-updates.html"><code>docs/dependency-updates.md</code></a></li>
+<li><a href="docs/enterprise-edition.html"><code>docs/enterprise-edition.md</code></a></li>
+<li><a href="docs/enterprise-parity-plan.html"><code>docs/enterprise-parity-plan.md</code></a></li>
+<li><a href="docs/enterprise-readiness-soc2-first-customer.html"><code>docs/enterprise-readiness-soc2-first-customer.md</code></a></li>
+<li><a href="docs/erlang-gateway-blueprint.html"><code>docs/erlang-gateway-blueprint.md</code></a></li>
+<li><a href="docs/erlang-gateway-review.html"><code>docs/erlang-gateway-review.md</code></a></li>
+<li><a href="docs/executions-history-ladder.html"><code>docs/executions-history-ladder.md</code></a></li>
+<li><a href="docs/getting-started.html"><code>docs/getting-started.md</code></a></li>
+<li><a href="docs/mcp-server.html"><code>docs/mcp-server.md</code></a></li>
+<li><a href="docs/observability-conventions.html"><code>docs/observability-conventions.md</code></a></li>
+<li><a href="docs/per-target-agent-build-pipeline-scope.html"><code>docs/per-target-agent-build-pipeline-scope.md</code></a></li>
+<li><a href="docs/perf-baseline-calibration-2026-05-03.html"><code>docs/perf-baseline-calibration-2026-05-03.md</code></a></li>
+<li><a href="docs/pr-1c-lift-plan.html"><code>docs/pr-1c-lift-plan.md</code></a></li>
+<li><a href="docs/roadmap.html"><code>docs/roadmap.md</code></a></li>
+<li><a href="docs/scope-walking-design.html"><code>docs/scope-walking-design.md</code></a></li>
+<li><a href="docs/tar-dashboard.html"><code>docs/tar-dashboard.md</code></a></li>
+<li><a href="docs/tar-implementer.html"><code>docs/tar-implementer.md</code></a></li>
+<li><a href="docs/tar-warehouse-plan.html"><code>docs/tar-warehouse-plan.md</code></a></li>
+<li><a href="docs/test-coverage.html"><code>docs/test-coverage.md</code></a></li>
+<li><a href="docs/windows-build.html"><code>docs/windows-build.md</code></a></li>
+<li><a href="docs/yaml-dsl-spec.html"><code>docs/yaml-dsl-spec.md</code></a></li>
+<li><a href="docs/yuzu-guardian-design-v1.1.html"><code>docs/yuzu-guardian-design-v1.1.md</code></a></li>
+<li><a href="docs/yuzu-guardian-windows-implementation-plan.html"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a></li>
+</ul>
+<h3 id="idx-docs-adrs">docs / adrs (architecture decision records)</h3>
+<ul class="doc-index">
+<li><a href="docs/adrs/0001-quic-transport-msquic-quicer.html"><code>docs/adrs/0001-quic-transport-msquic-quicer.md</code></a></li>
+<li><a href="docs/adrs/0002-gateway-scaling.html"><code>docs/adrs/0002-gateway-scaling.md</code></a></li>
+<li><a href="docs/adrs/README.html"><code>docs/adrs/README.md</code></a></li>
+</ul>
+<h3 id="idx-docs-grafana">docs / grafana</h3>
+<ul class="doc-index">
+<li><a href="docs/grafana/README.html"><code>docs/grafana/README.md</code></a></li>
+</ul>
+<h3 id="idx-docs-known-issues">docs / known-issues</h3>
+<ul class="doc-index">
+<li><a href="docs/known-issues/pr3-ladder-deferred.html"><code>docs/known-issues/pr3-ladder-deferred.md</code></a></li>
+</ul>
+<h3 id="idx-docs-operations">docs / operations</h3>
+<ul class="doc-index">
+<li><a href="docs/operations/capacity-planning.html"><code>docs/operations/capacity-planning.md</code></a></li>
+<li><a href="docs/operations/certificate-renewal.html"><code>docs/operations/certificate-renewal.md</code></a></li>
+<li><a href="docs/operations/disaster-recovery.html"><code>docs/operations/disaster-recovery.md</code></a></li>
+<li><a href="docs/operations/troubleshooting.html"><code>docs/operations/troubleshooting.md</code></a></li>
+</ul>
+<h3 id="idx-docs-ops-runbooks">docs / ops-runbooks</h3>
+<ul class="doc-index">
+<li><a href="docs/ops-runbooks/auth-db-recovery.html"><code>docs/ops-runbooks/auth-db-recovery.md</code></a></li>
+<li><a href="docs/ops-runbooks/transport-saturation.html"><code>docs/ops-runbooks/transport-saturation.md</code></a></li>
+</ul>
+<h3 id="idx-docs-plans">docs / plans</h3>
+<ul class="doc-index">
+<li><a href="docs/plans/capability-agentic-audit-plan-2026-05-01.html"><code>docs/plans/capability-agentic-audit-plan-2026-05-01.md</code></a></li>
+</ul>
+<h3 id="idx-docs-reviews">docs / reviews</h3>
+<ul class="doc-index">
+<li><a href="docs/reviews/code-review-agent-team-2026-03-20.html"><code>docs/reviews/code-review-agent-team-2026-03-20.md</code></a></li>
+</ul>
+<h3 id="idx-docs-security">docs / security</h3>
+<ul class="doc-index">
+<li><a href="docs/security/scorecard-token.html"><code>docs/security/scorecard-token.md</code></a></li>
+</ul>
+<h3 id="idx-docs-security-reviews">docs / security-reviews</h3>
+<ul class="doc-index">
+<li><a href="docs/security-reviews/authdb-2026-04-30.html"><code>docs/security-reviews/authdb-2026-04-30.md</code></a></li>
+</ul>
+<h3 id="idx-docs-spike-results">docs / spike-results</h3>
+<ul class="doc-index">
+<li><a href="docs/spike-results/0001-quic-transport/README.html"><code>docs/spike-results/0001-quic-transport/README.md</code></a></li>
+</ul>
+<h3 id="idx-docs-testing">docs / testing</h3>
+<ul class="doc-index">
+<li><a href="docs/testing/integration-tests.html"><code>docs/testing/integration-tests.md</code></a></li>
+</ul>
+<h3 id="idx-docs-user-manual">docs / user-manual</h3>
+<ul class="doc-index">
+<li><a href="docs/user-manual/README.html"><code>docs/user-manual/README.md</code></a></li>
+<li><a href="docs/user-manual/agent-plugins.html"><code>docs/user-manual/agent-plugins.md</code></a></li>
+<li><a href="docs/user-manual/audit-log.html"><code>docs/user-manual/audit-log.md</code></a></li>
+<li><a href="docs/user-manual/authentication.html"><code>docs/user-manual/authentication.md</code></a></li>
+<li><a href="docs/user-manual/cookbook.html"><code>docs/user-manual/cookbook.md</code></a></li>
+<li><a href="docs/user-manual/device-management.html"><code>docs/user-manual/device-management.md</code></a></li>
+<li><a href="docs/user-manual/gateway.html"><code>docs/user-manual/gateway.md</code></a></li>
+<li><a href="docs/user-manual/guaranteed-state.html"><code>docs/user-manual/guaranteed-state.md</code></a></li>
+<li><a href="docs/user-manual/instructions.html"><code>docs/user-manual/instructions.md</code></a></li>
+<li><a href="docs/user-manual/management-groups.html"><code>docs/user-manual/management-groups.md</code></a></li>
+<li><a href="docs/user-manual/mcp.html"><code>docs/user-manual/mcp.md</code></a></li>
+<li><a href="docs/user-manual/metrics.html"><code>docs/user-manual/metrics.md</code></a></li>
+<li><a href="docs/user-manual/policy-engine.html"><code>docs/user-manual/policy-engine.md</code></a></li>
+<li><a href="docs/user-manual/rbac.html"><code>docs/user-manual/rbac.md</code></a></li>
+<li><a href="docs/user-manual/release-verification.html"><code>docs/user-manual/release-verification.md</code></a></li>
+<li><a href="docs/user-manual/response-store.html"><code>docs/user-manual/response-store.md</code></a></li>
+<li><a href="docs/user-manual/rest-api.html"><code>docs/user-manual/rest-api.md</code></a></li>
+<li><a href="docs/user-manual/scope-engine.html"><code>docs/user-manual/scope-engine.md</code></a></li>
+<li><a href="docs/user-manual/security-hardening.html"><code>docs/user-manual/security-hardening.md</code></a></li>
+<li><a href="docs/user-manual/server-admin.html"><code>docs/user-manual/server-admin.md</code></a></li>
+<li><a href="docs/user-manual/tar.html"><code>docs/user-manual/tar.md</code></a></li>
+<li><a href="docs/user-manual/upgrading.html"><code>docs/user-manual/upgrading.md</code></a></li>
+</ul>
+<h3 id="idx-enterprise">enterprise/</h3>
+<ul class="doc-index">
+<li><a href="enterprise/LICENSE-ENTERPRISE.html"><code>enterprise/LICENSE-ENTERPRISE.md</code></a></li>
+<li><a href="enterprise/README.html"><code>enterprise/README.md</code></a></li>
+</ul>
+<h3 id="idx-gateway">gateway/</h3>
+<ul class="doc-index">
+<li><a href="gateway/ERLANG_CODE_QUALITY_REVIEW.html"><code>gateway/ERLANG_CODE_QUALITY_REVIEW.md</code></a></li>
+</ul>
+<h3 id="idx-github-issues">github-issues/</h3>
+<ul class="doc-index">
+<li><a href="github-issues/26-enterprise-storage-migration-plugin.html"><code>github-issues/26-enterprise-storage-migration-plugin.md</code></a></li>
+</ul>
+<h3 id="idx-scripts-issues">scripts / issues</h3>
+<ul class="doc-index">
+<li><a href="scripts/issues/01-agent-status.html"><code>scripts/issues/01-agent-status.md</code></a></li>
+<li><a href="scripts/issues/02-agent-diagnostics.html"><code>scripts/issues/02-agent-diagnostics.md</code></a></li>
+<li><a href="scripts/issues/03-agent-actions.html"><code>scripts/issues/03-agent-actions.md</code></a></li>
+<li><a href="scripts/issues/04-device-identity.html"><code>scripts/issues/04-device-identity.md</code></a></li>
+<li><a href="scripts/issues/05-hardware.html"><code>scripts/issues/05-hardware.md</code></a></li>
+<li><a href="scripts/issues/06-operating-system.html"><code>scripts/issues/06-operating-system.md</code></a></li>
+<li><a href="scripts/issues/07-users.html"><code>scripts/issues/07-users.md</code></a></li>
+<li><a href="scripts/issues/08-installed-apps.html"><code>scripts/issues/08-installed-apps.md</code></a></li>
+<li><a href="scripts/issues/09-msi-packages.html"><code>scripts/issues/09-msi-packages.md</code></a></li>
+<li><a href="scripts/issues/10-software-actions.html"><code>scripts/issues/10-software-actions.md</code></a></li>
+<li><a href="scripts/issues/11-processes.html"><code>scripts/issues/11-processes.md</code></a></li>
+<li><a href="scripts/issues/12-services.html"><code>scripts/issues/12-services.md</code></a></li>
+<li><a href="scripts/issues/13-filesystem.html"><code>scripts/issues/13-filesystem.md</code></a></li>
+<li><a href="scripts/issues/14-network-config.html"><code>scripts/issues/14-network-config.md</code></a></li>
+<li><a href="scripts/issues/15-network-diag.html"><code>scripts/issues/15-network-diag.md</code></a></li>
+<li><a href="scripts/issues/16-network-actions.html"><code>scripts/issues/16-network-actions.md</code></a></li>
+<li><a href="scripts/issues/17-firewall.html"><code>scripts/issues/17-firewall.md</code></a></li>
+<li><a href="scripts/issues/18-antivirus.html"><code>scripts/issues/18-antivirus.md</code></a></li>
+<li><a href="scripts/issues/19-bitlocker.html"><code>scripts/issues/19-bitlocker.md</code></a></li>
+<li><a href="scripts/issues/20-windows-updates.html"><code>scripts/issues/20-windows-updates.md</code></a></li>
+<li><a href="scripts/issues/21-event-logs.html"><code>scripts/issues/21-event-logs.md</code></a></li>
+<li><a href="scripts/issues/22-sccm.html"><code>scripts/issues/22-sccm.md</code></a></li>
+<li><a href="scripts/issues/23-script-execution.html"><code>scripts/issues/23-script-execution.md</code></a></li>
+</ul>
+<h3 id="idx-sdk">sdk/</h3>
+<ul class="doc-index">
+<li><a href="sdk/LICENSE-SDK.html"><code>sdk/LICENSE-SDK.md</code></a></li>
+<li><a href="sdk/README.html"><code>sdk/README.md</code></a></li>
+</ul>
+<h3 id="idx-spike">spike/</h3>
+<ul class="doc-index">
+<li><a href="spike/0001-quic-transport/README.html"><code>spike/0001-quic-transport/README.md</code></a></li>
+</ul>
+<h3 id="idx-tools">tools/</h3>
+<ul class="doc-index">
+<li><a href="tools/compose-wizard/README.html"><code>tools/compose-wizard/README.md</code></a></li>
+</ul>
+</main>
+</body>
+</html>

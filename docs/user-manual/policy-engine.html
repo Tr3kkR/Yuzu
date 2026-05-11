@@ -1,0 +1,947 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuzu Policy Engine</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/policy-engine.md</div>
+<h1 class="doc-title">Yuzu Policy Engine</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="yuzu-policy-engine">Yuzu Policy Engine</h1>
+<h2 id="table-of-contents">Table of Contents</h2>
+<ul>
+<li><a href="#overview">Overview</a></li>
+<li><a href="#policy-fragments">Policy Fragments</a></li>
+<li><a href="#policies">Policies</a></li>
+<li><a href="#compliance-tracking">Compliance Tracking</a></li>
+<li><a href="#fleet-compliance-summary">Fleet Compliance Summary</a></li>
+<li><a href="#cache-invalidation">Cache Invalidation</a></li>
+<li><a href="#cel-expressions">CEL Expressions</a></li>
+<li><a href="#rest-api-endpoints">REST API Endpoints</a></li>
+<li><a href="#yaml-schema-reference">YAML Schema Reference</a></li>
+</ul>
+<hr>
+<h2 id="overview">Overview</h2>
+<p>The policy engine provides <strong>Guaranteed State</strong> -- a desired-state enforcement
+system where the server declares what state endpoints should be in, and agents
+continuously evaluate and remediate drift.</p>
+<p>The system is built on two primitives:</p>
+<ol>
+<li><strong>PolicyFragment</strong> -- a single check/fix/postCheck pattern that tests one
+   condition and optionally remediates it.</li>
+<li><strong>Policy</strong> -- a named binding of a fragment to a set of devices via scope
+   expressions, triggers, management group bindings, and input parameters.</li>
+</ol>
+<p>Policies are defined in YAML using the <code>yuzu.io/v1alpha1</code> DSL (the same schema
+used for instruction definitions) and are managed through the REST API and the
+compliance dashboard.</p>
+<p>The implementation is backed by <code>PolicyStore</code> (SQLite WAL), which stores
+fragments, policies, triggers, group bindings, input parameters, and per-agent
+compliance status. A mutex protects the database handle for thread-safe access.</p>
+<hr>
+<h2 id="policy-fragments">Policy Fragments</h2>
+<p>A PolicyFragment is the atomic unit of compliance. It contains:</p>
+<ul>
+<li><strong>Check instruction</strong> -- an instruction definition that evaluates the current
+  state. The check compliance expression (CEL) determines pass/fail.</li>
+<li><strong>Fix instruction</strong> (optional) -- an instruction definition that remediates
+  drift when the check fails.</li>
+<li><strong>Post-check instruction</strong> (optional) -- a follow-up check to verify the fix
+  was successful.</li>
+</ul>
+<h3 id="fragment-structure">Fragment Structure</h3>
+<p>Each fragment stores:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id</code></td>
+<td>Auto-generated unique identifier</td>
+</tr>
+<tr>
+<td><code>name</code></td>
+<td>Human-readable fragment name</td>
+</tr>
+<tr>
+<td><code>description</code></td>
+<td>What this fragment checks and fixes</td>
+</tr>
+<tr>
+<td><code>yaml_source</code></td>
+<td>Verbatim YAML source (source of truth)</td>
+</tr>
+<tr>
+<td><code>check_instruction</code></td>
+<td>Instruction definition ID for the check step</td>
+</tr>
+<tr>
+<td><code>check_compliance</code></td>
+<td>CEL expression evaluated against check results</td>
+</tr>
+<tr>
+<td><code>check_parameters</code></td>
+<td>JSON parameter bindings for the check instruction</td>
+</tr>
+<tr>
+<td><code>fix_instruction</code></td>
+<td>Instruction definition ID for the fix step</td>
+</tr>
+<tr>
+<td><code>fix_parameters</code></td>
+<td>JSON parameter bindings for the fix instruction</td>
+</tr>
+<tr>
+<td><code>post_check_instruction</code></td>
+<td>Instruction definition ID for the post-check step</td>
+</tr>
+<tr>
+<td><code>post_check_compliance</code></td>
+<td>CEL expression for post-check evaluation</td>
+</tr>
+<tr>
+<td><code>post_check_parameters</code></td>
+<td>JSON parameter bindings for post-check</td>
+</tr>
+</tbody>
+</table>
+<h3 id="example-fragment-yaml">Example Fragment YAML</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PolicyFragment</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ensure-defender-enabled</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Verify Windows Defender real-time protection is active</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">check</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">security</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">defender-status</span>
+<span class="w">    </span><span class="nt">compliance</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;result.realtime_protection</span><span class="nv"> </span><span class="s">==</span><span class="nv"> </span><span class="s">true&quot;</span>
+<span class="w">  </span><span class="nt">fix</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">security</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enable-defender</span>
+<span class="w">  </span><span class="nt">postCheck</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">security</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">defender-status</span>
+<span class="w">    </span><span class="nt">compliance</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;result.realtime_protection</span><span class="nv"> </span><span class="s">==</span><span class="nv"> </span><span class="s">true&quot;</span>
+</code></pre></div>
+<hr>
+<h2 id="policies">Policies</h2>
+<p>A Policy binds a fragment to devices, defining when and where compliance
+checks run.</p>
+<h3 id="policy-structure">Policy Structure</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id</code></td>
+<td>Auto-generated unique identifier</td>
+</tr>
+<tr>
+<td><code>name</code></td>
+<td>Human-readable policy name</td>
+</tr>
+<tr>
+<td><code>description</code></td>
+<td>What this policy enforces</td>
+</tr>
+<tr>
+<td><code>yaml_source</code></td>
+<td>Verbatim YAML source (source of truth)</td>
+</tr>
+<tr>
+<td><code>fragment_id</code></td>
+<td>Reference to the PolicyFragment</td>
+</tr>
+<tr>
+<td><code>scope_expression</code></td>
+<td>Scope engine expression for device targeting</td>
+</tr>
+<tr>
+<td><code>enabled</code></td>
+<td>Whether the policy is active (can be toggled)</td>
+</tr>
+<tr>
+<td><code>inputs</code></td>
+<td>Key-value parameters passed to the fragment's instructions</td>
+</tr>
+<tr>
+<td><code>triggers</code></td>
+<td>When to evaluate (interval, file_change, event_log, etc.)</td>
+</tr>
+<tr>
+<td><code>management_groups</code></td>
+<td>Group IDs this policy is scoped to</td>
+</tr>
+</tbody>
+</table>
+<h3 id="trigger-configuration">Trigger Configuration</h3>
+<p>Triggers are stored per-policy with type-specific JSON configuration:</p>
+<table>
+<thead>
+<tr>
+<th>Trigger Type</th>
+<th>Config Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>interval</code></td>
+<td><code>{"interval_seconds": 300}</code></td>
+</tr>
+<tr>
+<td><code>file_change</code></td>
+<td><code>{"path": "/etc/hosts"}</code></td>
+</tr>
+<tr>
+<td><code>service_status</code></td>
+<td><code>{"service": "sshd"}</code></td>
+</tr>
+<tr>
+<td><code>event_log</code></td>
+<td><code>{"log": "Security", "event_id": 4625}</code></td>
+</tr>
+<tr>
+<td><code>registry</code></td>
+<td><code>{"hive": "HKLM", "key": "SOFTWARE\\..."}</code></td>
+</tr>
+<tr>
+<td><code>startup</code></td>
+<td><code>{}</code></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Trigger limit:</strong> The agent's trigger engine enforces a configurable maximum trigger count (default: 2000). Triggers beyond this limit are rejected with a warning log message. This prevents runaway policy deployments from exhausting agent resources. The limit can be configured via the agent API.</p>
+</blockquote>
+<h3 id="management-group-bindings">Management Group Bindings</h3>
+<p>Policies can be scoped to specific management groups. When a policy is bound
+to a group, only agents that are members of that group (or its descendant
+groups) are subject to the policy's compliance checks.</p>
+<h3 id="example-policy-yaml">Example Policy YAML</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Policy</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">baseline-security</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Enforce security baseline on production servers</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">fragment</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ensure-defender-enabled</span>
+<span class="w">  </span><span class="nt">scope</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;tag:environment</span><span class="nv"> </span><span class="s">=</span><span class="nv"> </span><span class="s">&#39;production&#39;&quot;</span>
+<span class="w">  </span><span class="nt">triggers</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">interval</span>
+<span class="w">      </span><span class="nt">interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">300</span>
+<span class="w">  </span><span class="nt">managementGroups</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">eu-production-servers</span>
+<span class="w">  </span><span class="nt">inputs</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">severity_threshold</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;high&quot;</span>
+</code></pre></div>
+<hr>
+<h2 id="compliance-tracking">Compliance Tracking</h2>
+<p>The policy engine tracks compliance status per agent per policy. Each
+<code>PolicyAgentStatus</code> record contains:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>policy_id</code></td>
+<td>The policy being tracked</td>
+</tr>
+<tr>
+<td><code>agent_id</code></td>
+<td>The agent being evaluated</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>Current compliance state</td>
+</tr>
+<tr>
+<td><code>last_check_at</code></td>
+<td>Unix timestamp of last check evaluation</td>
+</tr>
+<tr>
+<td><code>last_fix_at</code></td>
+<td>Unix timestamp of last fix execution</td>
+</tr>
+<tr>
+<td><code>check_result</code></td>
+<td>JSON output from the last check instruction</td>
+</tr>
+</tbody>
+</table>
+<h3 id="status-values">Status Values</h3>
+<table>
+<thead>
+<tr>
+<th>Status</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>compliant</code></td>
+<td>Check passed -- the endpoint is in the desired state</td>
+</tr>
+<tr>
+<td><code>non_compliant</code></td>
+<td>Check failed -- the endpoint is not in the desired state</td>
+</tr>
+<tr>
+<td><code>unknown</code></td>
+<td>Not yet evaluated or status invalidated</td>
+</tr>
+<tr>
+<td><code>fixing</code></td>
+<td>Fix instruction is currently running</td>
+</tr>
+<tr>
+<td><code>error</code></td>
+<td>Check or fix instruction failed to execute</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="fleet-compliance-summary">Fleet Compliance Summary</h2>
+<p>The <code>FleetCompliance</code> aggregate provides a fleet-wide view:</p>
+<ul>
+<li><strong>compliance_pct</strong> -- percentage of (policy, agent) pairs that are compliant</li>
+<li><strong>total_checks</strong> -- total number of tracked (policy, agent) pairs</li>
+<li>Breakdown by status: compliant, non_compliant, unknown, fixing, error</li>
+</ul>
+<p>Per-policy summaries (<code>ComplianceSummary</code>) provide the same breakdown scoped
+to a single policy.</p>
+<p>The compliance dashboard (accessible at the Policies page in the web UI)
+displays:</p>
+<ul>
+<li>Fleet compliance percentage with a color-coded bar</li>
+<li>Count of active policies</li>
+<li>Per-policy compliance percentage with drill-down to agent-level detail</li>
+<li>Per-agent status with last check time and check result</li>
+</ul>
+<hr>
+<h2 id="cache-invalidation">Cache Invalidation</h2>
+<p>When a policy's check instruction or compliance expression changes, agents
+need to re-evaluate. The policy engine supports:</p>
+<ul>
+<li><strong>Per-policy invalidation</strong> -- Reset all agent statuses to <code>pending</code> for a
+  specific policy, forcing re-evaluation on the next trigger.</li>
+<li><strong>Fleet-wide invalidation</strong> -- Reset all agent statuses across all policies.
+  Use sparingly, primarily after bulk configuration changes or server upgrades.</li>
+</ul>
+<p>Both operations are available via the REST API.</p>
+<hr>
+<h2 id="cel-expressions">CEL Expressions</h2>
+<p>Compliance expressions use <a href="https://github.com/google/cel-spec">Common Expression Language (CEL)</a>,
+a non-Turing-complete expression language designed for security policies. CEL
+provides strong typing, compile-time checks, and no side effects.</p>
+<p>Compliance expressions are stored in <code>check_compliance</code> and
+<code>post_check_compliance</code> fields. They are evaluated against the check
+instruction's result data to determine pass/fail.</p>
+<p>Example expressions:</p>
+<div class="highlight"><pre><span></span><code>result.realtime_protection == true
+result.value == &quot;expected&quot; &amp;&amp; result.type == &quot;REG_SZ&quot;
+result.signature_age &lt; duration(&#39;24h&#39;)
+</code></pre></div>
+<hr>
+<h2 id="rest-api-endpoints">REST API Endpoints</h2>
+<p>All policy engine endpoints are under <code>/api/</code> (legacy prefix). They require
+the <code>Policy:Read</code> or <code>Policy:Write</code> RBAC permission.</p>
+<h3 id="policy-fragments_1">Policy Fragments</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/policy-fragments</code></td>
+<td>List all fragments. Query params: <code>name</code>, <code>limit</code>.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/policy-fragments</code></td>
+<td>Create a fragment from YAML. Body must be a complete YAML document or a JSON envelope <code>{"yaml_source": "&lt;full YAML&gt;"}</code> — see worked example below.</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/policy-fragments/{id}</code></td>
+<td>Delete a fragment by ID.</td>
+</tr>
+</tbody>
+</table>
+<h4 id="worked-example-post-apipolicy-fragments">Worked example — <code>POST /api/policy-fragments</code></h4>
+<p>The <code>kind</code> is a <strong>YAML field</strong> inside the body, not an HTTP query
+parameter or top-level JSON key. The server checks <code>kind: PolicyFragment</code>
+on the parsed YAML; sending <code>?kind=PolicyFragment</code> in the URL or
+<code>{"kind":"PolicyFragment"}</code> outside <code>yaml_source</code> is silently ignored. If
+the YAML is missing the <code>kind:</code> line you'll get an HTTP 400 with the full
+expected schema in the error body.</p>
+<p><strong>JSON envelope (recommended for programmatic callers):</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/policy-fragments<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span>cookie<span class="w"> </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;yaml_source&quot;: &quot;apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nmetadata:\n  name: ssh-disabled\nspec:\n  check:\n    plugin: services\n    action: status\n    parameters: { name: sshd }\n    compliance: \&quot;result.state != \\\&quot;running\\\&quot;\&quot;\n&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p><strong>Raw YAML body (alternative — content-type other than <code>application/json</code>):</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/policy-fragments<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/yaml&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span>cookie<span class="w"> </span>--data-binary<span class="w"> </span>@-<span class="w"> </span><span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">apiVersion: yuzu.io/v1alpha1</span>
+<span class="s">kind: PolicyFragment</span>
+<span class="s">metadata:</span>
+<span class="s">  name: ssh-disabled</span>
+<span class="s">spec:</span>
+<span class="s">  check:</span>
+<span class="s">    plugin: services</span>
+<span class="s">    action: status</span>
+<span class="s">    parameters: { name: sshd }</span>
+<span class="s">    compliance: &#39;result.state != &quot;running&quot;&#39;</span>
+<span class="s">EOF</span>
+</code></pre></div>
+<p>Both forms produce a 201 with <code>{"id": "&lt;fragment-id&gt;", "status": "created"}</code>.</p>
+<h3 id="policies_1">Policies</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/policies</code></td>
+<td>List all policies. Query params: <code>name</code>, <code>fragment_id</code>, <code>enabled_only</code>, <code>limit</code>.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/policies</code></td>
+<td>Create a policy from YAML. Body: same shape as <code>POST /api/policy-fragments</code> — full YAML in <code>yaml_source</code>, with <code>kind: Policy</code>.</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/policies/{id}</code></td>
+<td>Get policy detail including compliance summary.</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/policies/{id}</code></td>
+<td>Delete a policy and its compliance data.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/policies/{id}/enable</code></td>
+<td>Enable a disabled policy.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/policies/{id}/disable</code></td>
+<td>Disable an active policy.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/policies/{id}/invalidate</code></td>
+<td>Invalidate agent-side cache for this policy.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/policies/invalidate-all</code></td>
+<td>Invalidate cache for all policies (fleet-wide).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="compliance">Compliance</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Path</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/compliance</code></td>
+<td>Fleet compliance summary (total, compliant, non_compliant, etc.).</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/compliance/{policy_id}</code></td>
+<td>Per-policy compliance detail with per-agent statuses.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="htmx-fragments">HTMX Fragments</h3>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/fragments/compliance/summary</code></td>
+<td>Compliance dashboard summary fragment</td>
+</tr>
+<tr>
+<td><code>/fragments/compliance/{policy_id}</code></td>
+<td>Per-policy compliance detail fragment</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="yaml-schema-reference">YAML Schema Reference</h2>
+<p>Both policy kinds use <code>apiVersion: yuzu.io/v1alpha1</code>. The full DSL
+specification is in <a href="../yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a>.</p>
+<h3 id="policyfragment">PolicyFragment</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PolicyFragment</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;unique-name&gt;</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;human-readable description&gt;</span>
+<span class="w">  </span><span class="nt">labels</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">category</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;security|compliance|performance|custom&gt;</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">check</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;plugin-name&gt;</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;action-name&gt;</span>
+<span class="w">    </span><span class="nt">compliance</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;CEL expression&gt;</span>
+<span class="w">    </span><span class="nt">parameters</span><span class="p">:</span><span class="w">             </span><span class="c1"># optional</span>
+<span class="w">      </span><span class="nt">&lt;key&gt;</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;value&gt;</span>
+<span class="w">  </span><span class="nt">fix</span><span class="p">:</span><span class="w">                      </span><span class="c1"># optional -- omit for check-only rules</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;plugin-name&gt;</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;action-name&gt;</span>
+<span class="w">    </span><span class="nt">parameters</span><span class="p">:</span><span class="w">             </span><span class="c1"># optional</span>
+<span class="w">      </span><span class="nt">&lt;key&gt;</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;value&gt;</span>
+<span class="w">  </span><span class="nt">postCheck</span><span class="p">:</span><span class="w">                </span><span class="c1"># optional -- verify fix was successful</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;plugin-name&gt;</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;action-name&gt;</span>
+<span class="w">    </span><span class="nt">compliance</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;CEL expression&gt;</span>
+<span class="w">    </span><span class="nt">parameters</span><span class="p">:</span><span class="w">             </span><span class="c1"># optional</span>
+<span class="w">      </span><span class="nt">&lt;key&gt;</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;value&gt;</span>
+</code></pre></div>
+<h3 id="policy">Policy</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Policy</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;unique-name&gt;</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;human-readable description&gt;</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">fragment</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;fragment-name-or-id&gt;</span>
+<span class="w">  </span><span class="nt">scope</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;scope-expression&gt;</span>
+<span class="w">  </span><span class="nt">triggers</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;interval|file_change|service_status|event_log|registry|startup&gt;</span>
+<span class="w">      </span><span class="nt">interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;seconds&gt;</span><span class="w">     </span><span class="c1"># for type: interval</span>
+<span class="w">      </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;file-path&gt;</span><span class="w">       </span><span class="c1"># for type: file_change</span>
+<span class="w">      </span><span class="nt">service</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;service-name&gt;</span><span class="w"> </span><span class="c1"># for type: service_status</span>
+<span class="w">  </span><span class="nt">managementGroups</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;group-name-or-id&gt;</span>
+<span class="w">  </span><span class="nt">inputs</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">&lt;key&gt;</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;value&gt;</span>
+</code></pre></div>
+</main>
+</body>
+</html>

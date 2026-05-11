@@ -1,0 +1,1162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MCP (Model Context Protocol) Server</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/mcp.md</div>
+<h1 class="doc-title">MCP (Model Context Protocol) Server</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="mcp-model-context-protocol-server">MCP (Model Context Protocol) Server</h1>
+<p>Yuzu embeds a Model Context Protocol (MCP) server that allows AI assistants --
+such as Claude Desktop, Cursor, or any MCP-compatible client -- to interact with
+your fleet management data through natural language. The MCP server exposes
+read-only and operational tools over a JSON-RPC 2.0 endpoint, enabling
+AI-driven fleet investigation, compliance reporting, and supervised command
+execution.</p>
+<hr>
+<h2 id="table-of-contents">Table of Contents</h2>
+<ul>
+<li><a href="#overview">Overview</a></li>
+<li><a href="#quick-start">Quick Start</a></li>
+<li><a href="#cli-flags">CLI Flags</a></li>
+<li><a href="#authorization-tiers">Authorization Tiers</a></li>
+<li><a href="#creating-mcp-tokens">Creating MCP Tokens</a></li>
+<li><a href="#available-tools">Available Tools</a></li>
+<li><a href="#resources">Resources</a></li>
+<li><a href="#prompts">Prompts</a></li>
+<li><a href="#approval-workflow">Approval Workflow</a></li>
+<li><a href="#security-considerations">Security Considerations</a></li>
+<li><a href="#troubleshooting">Troubleshooting</a></li>
+</ul>
+<hr>
+<h2 id="overview">Overview</h2>
+<p>The MCP server is <strong>enabled by default</strong> when the Yuzu server starts. It
+registers a single HTTP endpoint at <code>POST /mcp/v1/</code> that speaks the
+<a href="https://modelcontextprotocol.io/">Model Context Protocol</a> -- a JSON-RPC 2.0
+based protocol designed for AI tool use.</p>
+<p>Key characteristics:</p>
+<ul>
+<li><strong>Protocol</strong>: JSON-RPC 2.0 over HTTP POST.</li>
+<li><strong>Endpoint</strong>: <code>POST /mcp/v1/</code></li>
+<li><strong>Protocol version</strong>: <code>2025-03-26</code></li>
+<li><strong>Authentication</strong>: Same as all Yuzu API endpoints -- session cookie, Bearer
+  token, or <code>X-Yuzu-Token</code> header.</li>
+<li><strong>Authorization</strong>: Two layers -- MCP tier (checked first) then RBAC
+  (checked second). A token must pass both.</li>
+<li><strong>Audit</strong>: Every tool invocation is recorded in the audit log with an
+  <code>mcp.&lt;tool_name&gt;</code> action.</li>
+<li><strong>Capabilities</strong>: 23 tools, 3 resources, 4 prompts.</li>
+</ul>
+<p>The MCP server reuses the same authentication middleware, RBAC engine, and
+audit pipeline as the REST API. No separate ports or processes are required.</p>
+<hr>
+<h2 id="quick-start">Quick Start</h2>
+<h3 id="1-create-an-mcp-token">1. Create an MCP token</h3>
+<p>Use the REST API to create a token with an MCP tier. The <code>readonly</code> tier is
+the safest starting point.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>https://localhost:8080/api/v1/tokens<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;Claude Desktop - readonly&quot;,</span>
+<span class="s1">    &quot;mcp_tier&quot;: &quot;readonly&quot;,</span>
+<span class="s1">    &quot;expires_at&quot;: 1750000000</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>The response includes a <code>token</code> field (prefixed <code>yzt_</code>). Copy it immediately --
+it is shown exactly once.</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;token&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;yzt_a1b2c3d4e5f67890abcdef1234567890abcdef1234567890abcdef12345678&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Claude Desktop - readonly&quot;</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="2-configure-your-mcp-client">2. Configure your MCP client</h3>
+<p>In Claude Desktop, add the following to your MCP server configuration:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;mcpServers&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;yuzu&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://your-yuzu-server:8080/mcp/v1/&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;headers&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;Authorization&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Bearer yzt_a1b2c3d4e5f67890...&quot;</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>For other MCP clients, point the transport to the <code>POST /mcp/v1/</code> endpoint
+and include the Bearer token in the <code>Authorization</code> header.</p>
+<h3 id="3-start-using-natural-language">3. Start using natural language</h3>
+<p>Ask your AI assistant questions like:</p>
+<ul>
+<li>"How many agents are connected and what OS are they running?"</li>
+<li>"Show me the compliance status for the disk-encryption policy."</li>
+<li>"Which agents have the tag <code>environment=production</code>?"</li>
+<li>"What did the user <code>admin</code> do in the last 24 hours?"</li>
+</ul>
+<p>The assistant will call the appropriate Yuzu MCP tools and return structured
+results.</p>
+<hr>
+<h2 id="cli-flags">CLI Flags</h2>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Environment Variable</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--mcp-disable</code></td>
+<td><code>YUZU_MCP_DISABLE</code></td>
+<td><code>false</code></td>
+<td>Disable the MCP endpoint entirely. All requests to <code>/mcp/v1/</code> return an error.</td>
+</tr>
+<tr>
+<td><code>--mcp-read-only</code></td>
+<td><code>YUZU_MCP_READ_ONLY</code></td>
+<td><code>false</code></td>
+<td>Restrict MCP to read-only tools only. Write and execute operations are rejected regardless of the token's tier.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="examples">Examples</h3>
+<p>Disable MCP entirely (for air-gapped or high-security environments):</p>
+<div class="highlight"><pre><span></span><code>yuzu-server<span class="w"> </span>--mcp-disable
+</code></pre></div>
+<p>Or via environment variable:</p>
+<div class="highlight"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">YUZU_MCP_DISABLE</span><span class="o">=</span><span class="nb">true</span>
+yuzu-server
+</code></pre></div>
+<p>Allow MCP but restrict to read-only operations:</p>
+<div class="highlight"><pre><span></span><code>yuzu-server<span class="w"> </span>--mcp-read-only
+</code></pre></div>
+<hr>
+<h2 id="authorization-tiers">Authorization Tiers</h2>
+<p>MCP tokens use a <strong>tier</strong> system that restricts what operations are available,
+independent of the underlying RBAC role. The tier check runs <em>before</em> RBAC:
+even if the token creator has the Administrator role, a <code>readonly</code> tier blocks
+all writes.</p>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Read</th>
+<th>Tag Write/Delete</th>
+<th>Execute Instructions</th>
+<th>Policy/Security/Group Write</th>
+<th>Delete (any)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>readonly</code></td>
+<td>Yes</td>
+<td>No</td>
+<td>No</td>
+<td>No</td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>operator</code></td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes (auto-approved)</td>
+<td>No</td>
+<td>Tags only (via approval)</td>
+</tr>
+<tr>
+<td><code>supervised</code></td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes (via approval)</td>
+<td>Yes (via approval)</td>
+<td>Yes (via approval)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tier-details">Tier details</h3>
+<p><strong>readonly</strong> -- Safe for dashboards, reporting, and investigation. The AI
+assistant can list agents, query inventory, check compliance, read the audit
+log, and browse instruction definitions. It cannot make any changes.</p>
+<p><strong>operator</strong> -- Adds the ability to write and delete tags, and to execute
+instructions. Instruction executions are auto-approved (they run immediately
+without admin approval). Tag deletions still require approval. Suitable for
+day-to-day operational use.</p>
+<p><strong>supervised</strong> -- Full access to all operations, but destructive actions
+require admin approval before taking effect. This includes:</p>
+<ul>
+<li>Instruction executions</li>
+<li>Any delete operation</li>
+<li>Policy writes</li>
+<li>Security setting writes</li>
+<li>User management writes</li>
+<li>Management group writes</li>
+</ul>
+<p>Use the supervised tier for automation pipelines where an AI assistant proposes
+changes that a human reviews and approves.</p>
+<hr>
+<h2 id="creating-mcp-tokens">Creating MCP Tokens</h2>
+<p>MCP tokens are API tokens with an <code>mcp_tier</code> field. Create them through the
+standard <code>POST /api/v1/tokens</code> endpoint.</p>
+<h3 id="request">Request</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>https://localhost:8080/api/v1/tokens<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;AI Fleet Monitor&quot;,</span>
+<span class="s1">    &quot;mcp_tier&quot;: &quot;readonly&quot;,</span>
+<span class="s1">    &quot;expires_at&quot;: 1750000000</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>name</code></td>
+<td>string</td>
+<td>Yes</td>
+<td>Human-readable label for the token.</td>
+</tr>
+<tr>
+<td><code>mcp_tier</code></td>
+<td>string</td>
+<td>Yes (for MCP)</td>
+<td>One of <code>readonly</code>, <code>operator</code>, or <code>supervised</code>.</td>
+</tr>
+<tr>
+<td><code>expires_at</code></td>
+<td>integer</td>
+<td>Yes (for MCP)</td>
+<td>Unix epoch seconds. MCP tokens <strong>must</strong> have an expiration. Maximum 90 days from creation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="validation-rules">Validation rules</h3>
+<ul>
+<li><strong>Mandatory expiration</strong>: MCP tokens cannot be created without an
+  <code>expires_at</code> value. The server rejects the request with a <code>400</code> error if
+  the expiration is missing or zero.</li>
+<li><strong>Maximum 90 days</strong>: The expiration must be no more than 90 days in the
+  future. This ensures regular token rotation.</li>
+<li><strong>Valid tier</strong>: The <code>mcp_tier</code> must be one of <code>readonly</code>, <code>operator</code>, or
+  <code>supervised</code>. Any other value is rejected.</li>
+<li><strong>RBAC permission</strong>: The creating user must have <code>ApiToken:Write</code> permission.</li>
+</ul>
+<h3 id="token-format">Token format</h3>
+<p>MCP tokens use the same <code>yzt_</code> prefix as standard API tokens. They are
+authenticated the same way -- via <code>Authorization: Bearer &lt;token&gt;</code> or
+<code>X-Yuzu-Token: &lt;token&gt;</code> headers.</p>
+<h3 id="listing-and-revoking-tokens">Listing and revoking tokens</h3>
+<p>Use the standard token management endpoints:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># List all tokens (shows mcp_tier in the response)</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>https://localhost:8080/api/v1/tokens
+
+<span class="c1"># Revoke a token</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>DELETE<span class="w"> </span>https://localhost:8080/api/v1/tokens/a1b2c3d4
+</code></pre></div>
+<hr>
+<h2 id="available-tools">Available Tools</h2>
+<p>The MCP server exposes 23 tools. Each tool maps to a specific RBAC
+securable type and operation. The tier check and RBAC check both must pass
+for the tool to execute.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Tool</th>
+<th>Description</th>
+<th>RBAC Permission</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>list_agents</code></td>
+<td>List all connected agents with hostname, OS, architecture, and version.</td>
+<td><code>Infrastructure:Read</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>get_agent_details</code></td>
+<td>Get detailed info for a single agent including tags and inventory.</td>
+<td><code>Infrastructure:Read</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>query_audit_log</code></td>
+<td>Query the audit log with filters (principal, action, target, time range).</td>
+<td><code>AuditLog:Read</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>list_definitions</code></td>
+<td>List available instruction definitions (filterable by plugin, type, enabled).</td>
+<td><code>InstructionDefinition:Read</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>get_definition</code></td>
+<td>Get a single instruction definition with parameter and result schemas.</td>
+<td><code>InstructionDefinition:Read</code></td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>query_responses</code></td>
+<td>Query command response data with filters (requires instruction_id).</td>
+<td><code>Response:Read</code></td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>aggregate_responses</code></td>
+<td>Aggregate response data (COUNT, SUM, AVG, MIN, MAX) grouped by a column.</td>
+<td><code>Response:Read</code></td>
+</tr>
+<tr>
+<td>8</td>
+<td><code>query_inventory</code></td>
+<td>Query inventory data across agents (filterable by agent, plugin).</td>
+<td><code>Infrastructure:Read</code></td>
+</tr>
+<tr>
+<td>9</td>
+<td><code>list_inventory_tables</code></td>
+<td>List available inventory data types with agent counts.</td>
+<td><code>Infrastructure:Read</code></td>
+</tr>
+<tr>
+<td>10</td>
+<td><code>get_agent_inventory</code></td>
+<td>Get all inventory data for a specific agent.</td>
+<td><code>Infrastructure:Read</code></td>
+</tr>
+<tr>
+<td>11</td>
+<td><code>get_tags</code></td>
+<td>Get all tags for a specific agent.</td>
+<td><code>Tag:Read</code></td>
+</tr>
+<tr>
+<td>12</td>
+<td><code>search_agents_by_tag</code></td>
+<td>Find agents that have a specific tag key (and optionally value).</td>
+<td><code>Tag:Read</code></td>
+</tr>
+<tr>
+<td>13</td>
+<td><code>list_policies</code></td>
+<td>List compliance policies (filterable by enabled status).</td>
+<td><code>Policy:Read</code></td>
+</tr>
+<tr>
+<td>14</td>
+<td><code>get_compliance_summary</code></td>
+<td>Get per-policy compliance breakdown (compliant/non-compliant/unknown).</td>
+<td><code>Policy:Read</code></td>
+</tr>
+<tr>
+<td>15</td>
+<td><code>get_fleet_compliance</code></td>
+<td>Get fleet-wide compliance percentages across all policies.</td>
+<td><code>Policy:Read</code></td>
+</tr>
+<tr>
+<td>16</td>
+<td><code>list_management_groups</code></td>
+<td>List management groups (hierarchical device grouping).</td>
+<td><code>ManagementGroup:Read</code></td>
+</tr>
+<tr>
+<td>17</td>
+<td><code>get_execution_status</code></td>
+<td>Check status of a running or completed command execution.</td>
+<td><code>Execution:Read</code></td>
+</tr>
+<tr>
+<td>18</td>
+<td><code>list_executions</code></td>
+<td>List recent command executions (filterable by definition, status).</td>
+<td><code>Execution:Read</code></td>
+</tr>
+<tr>
+<td>19</td>
+<td><code>list_schedules</code></td>
+<td>List scheduled (recurring) instructions.</td>
+<td><code>Schedule:Read</code></td>
+</tr>
+<tr>
+<td>20</td>
+<td><code>validate_scope</code></td>
+<td>Validate a scope expression without executing it.</td>
+<td>(none -- always allowed)</td>
+</tr>
+<tr>
+<td>21</td>
+<td><code>preview_scope_targets</code></td>
+<td>Show which agents match a scope expression.</td>
+<td><code>Infrastructure:Read</code></td>
+</tr>
+<tr>
+<td>22</td>
+<td><code>list_pending_approvals</code></td>
+<td>List pending approval requests (filterable by status, submitter).</td>
+<td><code>Approval:Read</code></td>
+</tr>
+<tr>
+<td>23</td>
+<td><code>execute_instruction</code></td>
+<td>Execute a plugin action on agents. Returns a <code>command_id</code>; poll results with <code>query_responses</code>.</td>
+<td><code>Execution:Execute</code></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong><code>execute_instruction</code> tier behavior:</strong>
+- <code>readonly</code> tier: blocked.
+- <code>operator</code> tier: executes immediately (auto-approved). If neither <code>scope</code> nor <code>agent_ids</code> is provided, targets <strong>all</strong> connected agents.
+- <code>supervised</code> tier: not yet implemented (returns an error). Use the REST API or dashboard for supervised-tier execution until the approval re-dispatch path is built.</p>
+</blockquote>
+<h3 id="tool-parameters">Tool parameters</h3>
+<p>Tools accept parameters via the <code>arguments</code> object in the <code>tools/call</code> request.
+Required parameters are validated server-side; missing required fields return a
+<code>-32602 Invalid params</code> error.</p>
+<p><strong>Examples of key parameters:</strong></p>
+<ul>
+<li><code>agent_id</code> (string) -- required by <code>get_agent_details</code>, <code>get_agent_inventory</code>,
+  <code>get_tags</code>.</li>
+<li><code>instruction_id</code> (string) -- required by <code>query_responses</code>.</li>
+<li><code>expression</code> (string) -- required by <code>validate_scope</code> and
+  <code>preview_scope_targets</code>. Uses the Yuzu scope DSL (e.g.,
+  <code>os = "Windows" AND tag:environment = "production"</code>).</li>
+<li><code>limit</code> (integer) -- optional on most list/query tools. Capped server-side
+  (typically 500 or 1000).</li>
+</ul>
+<hr>
+<h2 id="resources">Resources</h2>
+<p>MCP resources provide static or semi-static data that clients can read without
+calling a tool. Resources are accessed via the <code>resources/read</code> method with a
+URI.</p>
+<table>
+<thead>
+<tr>
+<th>URI</th>
+<th>Name</th>
+<th>Description</th>
+<th>RBAC Permission</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu://server/health</code></td>
+<td>Server Health</td>
+<td>Server health status and count of connected agents.</td>
+<td>(none -- always allowed)</td>
+</tr>
+<tr>
+<td><code>yuzu://compliance/fleet</code></td>
+<td>Fleet Compliance</td>
+<td>Fleet-wide compliance overview (total checks, compliant, non-compliant, unknown, percentage).</td>
+<td><code>Policy:Read</code></td>
+</tr>
+<tr>
+<td><code>yuzu://audit/recent</code></td>
+<td>Recent Audit</td>
+<td>Last 50 audit events with timestamp, principal, action, target, and result.</td>
+<td><code>AuditLog:Read</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="example-reading-a-resource">Example: reading a resource</h3>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;jsonrpc&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2.0&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;method&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;resources/read&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;params&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;uri&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;yuzu://server/health&quot;</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;jsonrpc&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2.0&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;result&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;contents&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">      </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;uri&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;yuzu://server/health&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;mimeType&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;application/json&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;text&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;{\&quot;status\&quot;:\&quot;ok\&quot;,\&quot;agents_connected\&quot;:42}&quot;</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">]</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="p">}</span>
+</code></pre></div>
+<hr>
+<h2 id="prompts">Prompts</h2>
+<p>Prompts are pre-built instruction templates that guide the AI assistant toward
+common investigation workflows. Clients retrieve prompts via <code>prompts/list</code> and
+invoke them via <code>prompts/get</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Prompt</th>
+<th>Description</th>
+<th>Parameters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>fleet_overview</code></td>
+<td>Summarize the fleet: agent count, OS breakdown, compliance status.</td>
+<td>(none)</td>
+</tr>
+<tr>
+<td><code>investigate_agent</code></td>
+<td>Deep-dive on a specific agent: inventory, compliance, recent commands, tags.</td>
+<td><code>agent_id</code> (required)</td>
+</tr>
+<tr>
+<td><code>compliance_report</code></td>
+<td>Generate a compliance report for a specific policy or fleet-wide.</td>
+<td><code>policy_id</code> (optional -- omit for fleet-wide)</td>
+</tr>
+<tr>
+<td><code>audit_investigation</code></td>
+<td>Show all actions by a principal in a given timeframe.</td>
+<td><code>principal</code> (required), <code>hours</code> (optional, default 24)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="example-invoking-a-prompt">Example: invoking a prompt</h3>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;jsonrpc&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2.0&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;method&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;prompts/get&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;params&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;investigate_agent&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;agent_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;agent-web-prod-01&quot;</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The server returns a <code>messages</code> array containing the prompt text, which the AI
+assistant uses to guide its tool calls:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;jsonrpc&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2.0&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;result&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Investigate agent &#39;agent-web-prod-01&#39;: show its inventory, compliance status, recent command results, and tags. Use get_agent_details, get_agent_inventory, get_tags, and query_responses.&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;messages&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">      </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;role&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;user&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">          </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;text&quot;</span><span class="p">,</span>
+<span class="w">          </span><span class="nt">&quot;text&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Investigate agent &#39;agent-web-prod-01&#39;: ...&quot;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">]</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span>
+<span class="p">}</span>
+</code></pre></div>
+<hr>
+<h2 id="approval-workflow">Approval Workflow</h2>
+<p>Operations that modify fleet state are gated by the <strong>approval workflow</strong> when
+invoked through MCP. This ensures a human reviews every change an AI assistant
+proposes.</p>
+<h3 id="how-it-works">How it works</h3>
+<ol>
+<li>The AI assistant calls a tool that requires approval (e.g., executing an
+   instruction on the <code>supervised</code> tier).</li>
+<li>The MCP server creates an <strong>approval request</strong> with status <code>pending</code>.</li>
+<li>The server returns a JSON-RPC error with code <code>-32006</code> (<code>ApprovalRequired</code>)
+   containing the approval ID.</li>
+<li>The AI assistant can inform the operator that approval is needed.</li>
+<li>An administrator reviews the request via the dashboard or REST API
+   (<code>GET /api/approvals</code>, <code>POST /api/approvals/{id}/approve</code>,
+   <code>POST /api/approvals/{id}/reject</code>).</li>
+<li>Once approved, the operation can be retried.</li>
+</ol>
+<h3 id="what-requires-approval">What requires approval</h3>
+<p>The following table shows which operations require approval, by tier:</p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th><code>operator</code> tier</th>
+<th><code>supervised</code> tier</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Execute instruction</td>
+<td>No (auto-approved)</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Delete tag</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Delete (any resource)</td>
+<td>--</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Write policy</td>
+<td>--</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Write security settings</td>
+<td>--</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Write user management</td>
+<td>--</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Write management group</td>
+<td>--</td>
+<td>Yes</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>readonly</code> tier cannot perform any of these operations, so approval is
+never triggered.</p>
+<h3 id="monitoring-pending-approvals">Monitoring pending approvals</h3>
+<p>The <code>list_pending_approvals</code> tool allows the AI assistant to check the status
+of submitted approval requests:</p>
+<div class="highlight"><pre><span></span><code>&quot;List all pending approvals submitted by the MCP token.&quot;
+</code></pre></div>
+<p>Administrators can also see pending approvals in the Yuzu dashboard under the
+approval queue.</p>
+<hr>
+<h2 id="security-considerations">Security Considerations</h2>
+<h3 id="default-enabled-behavior">Default-enabled behavior</h3>
+<p>The MCP server is enabled by default when the Yuzu server starts. If you do
+not intend to use AI-assisted fleet management, disable it:</p>
+<div class="highlight"><pre><span></span><code>yuzu-server<span class="w"> </span>--mcp-disable
+</code></pre></div>
+<h3 id="air-gapped-and-high-security-environments">Air-gapped and high-security environments</h3>
+<p>For networks that do not permit AI assistant connections, disable MCP entirely
+using <code>--mcp-disable</code> or <code>YUZU_MCP_DISABLE=true</code>. When disabled, the
+<code>/mcp/v1/</code> endpoint rejects all requests with a <code>-32005</code> error code.</p>
+<h3 id="token-rotation">Token rotation</h3>
+<p>MCP tokens are enforced to have a maximum lifetime of 90 days. Establish a
+rotation schedule:</p>
+<ul>
+<li><strong>Recommended</strong>: Create new tokens every 30 days and revoke old ones.</li>
+<li><strong>Required</strong>: Tokens expire automatically at the <code>expires_at</code> time.</li>
+<li><strong>Best practice</strong>: Use descriptive names (e.g., <code>"Claude Desktop - prod readonly 2026-Q1"</code>) to track token purpose and lifecycle.</li>
+</ul>
+<h3 id="tier-selection-guidance">Tier selection guidance</h3>
+<table>
+<thead>
+<tr>
+<th>Use Case</th>
+<th>Recommended Tier</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Read-only dashboards, reporting, investigation</td>
+<td><code>readonly</code></td>
+</tr>
+<tr>
+<td>Day-to-day operations with AI assistance (tagging, auto-approved executions)</td>
+<td><code>operator</code></td>
+</tr>
+<tr>
+<td>Automation pipelines with human approval gates</td>
+<td><code>supervised</code></td>
+</tr>
+<tr>
+<td>Unattended, unsupervised AI access</td>
+<td>Not recommended. Use <code>readonly</code> at most.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="principle-of-least-privilege">Principle of least privilege</h3>
+<ul>
+<li>Start with <code>readonly</code> and only upgrade to <code>operator</code> or <code>supervised</code> when
+  operationally required.</li>
+<li>The token inherits the RBAC permissions of the user who created it. Create
+  MCP tokens from accounts with appropriate (not excessive) permissions.</li>
+<li>Use <code>--mcp-read-only</code> as a server-wide safety net if you want to allow
+  MCP connections but prevent any write operations regardless of token tier.</li>
+</ul>
+<h3 id="audit-trail">Audit trail</h3>
+<p>Every MCP tool invocation is logged in the audit trail with action
+<code>mcp.&lt;tool_name&gt;</code> (e.g., <code>mcp.list_agents</code>, <code>mcp.query_audit_log</code>). The acting
+operator (the token owner) is recorded in the <code>principal</code> field of each
+<code>mcp.*</code> event. Use the <code>query_audit_log</code> tool or the REST API to review MCP
+activity:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;https://localhost:8080/api/v1/audit?action=mcp.&amp;limit=100&#39;</span>
+</code></pre></div>
+<blockquote>
+<p><strong>Known issue in v0.9.0 (advisory YZA-2026-001):</strong> <code>mcp.*</code> audit rows in
+v0.9.0 had an empty <code>principal</code> field due to a bug in the audit-event
+construction path. Rows still recorded the action and target, but could not
+attribute the call to a specific token. Fixed forward in v0.10.0; pre-fix
+rows are not backfilled. See <a href="../../CHANGELOG.html" class="doc-ref"><code>CHANGELOG.md</code></a> for the full remediation note.</p>
+</blockquote>
+<hr>
+<h2 id="troubleshooting">Troubleshooting</h2>
+<h3 id="401-unauthorized">401 Unauthorized</h3>
+<p><strong>Symptom</strong>: All MCP requests return HTTP 401.</p>
+<p><strong>Causes</strong>:
+- The token is missing, expired, or revoked.
+- The <code>Authorization</code> header format is wrong. It must be <code>Bearer &lt;token&gt;</code> (with
+  a space, no colon).
+- The token was created with a session that has since expired. The token itself
+  is independent of the session -- verify the token's <code>expires_at</code> value.</p>
+<p><strong>Fix</strong>: Create a new token via <code>POST /api/v1/tokens</code> and update your MCP
+client configuration.</p>
+<h3 id="-32005-mcp-disabled">-32005: MCP disabled</h3>
+<p><strong>Symptom</strong>: Requests to <code>/mcp/v1/</code> return error code <code>-32005</code>.</p>
+<p><strong>Cause</strong>: The server was started with <code>--mcp-disable</code> or
+<code>YUZU_MCP_DISABLE=true</code>.</p>
+<p><strong>Fix</strong>: Remove the flag or unset the environment variable and restart the
+server.</p>
+<h3 id="-32004-mcp-tier-does-not-allow-this-operation">-32004: MCP tier does not allow this operation</h3>
+<p><strong>Symptom</strong>: A tool call returns error code <code>-32004</code>.</p>
+<p><strong>Cause</strong>: The token's MCP tier does not permit the requested operation. For
+example, a <code>readonly</code> token attempting to execute an instruction.</p>
+<p><strong>Fix</strong>: Create a new token with a higher tier (<code>operator</code> or <code>supervised</code>),
+or use a different tool that is within the current tier's permissions.</p>
+<h3 id="-32006-approval-required">-32006: Approval required</h3>
+<p><strong>Symptom</strong>: A tool call returns error code <code>-32006</code> with an approval ID.</p>
+<p><strong>Cause</strong>: The operation requires admin approval before it can proceed. This
+is expected behavior for destructive operations on <code>supervised</code> tier tokens,
+and for tag deletions on <code>operator</code> tier tokens. Note that <code>operator</code> tier
+executions are auto-approved and do not trigger this error.</p>
+<p><strong>Fix</strong>: An administrator must approve the request via the dashboard or REST
+API. After approval, retry the operation.</p>
+<h3 id="-32003-permission-denied-rbac">-32003: Permission denied (RBAC)</h3>
+<p><strong>Symptom</strong>: A tool call returns error code <code>-32003</code>.</p>
+<p><strong>Cause</strong>: The token passes the MCP tier check but fails the RBAC permission
+check. The user who created the token does not have the required RBAC
+permission for the securable type.</p>
+<p><strong>Fix</strong>: Grant the appropriate RBAC permission to the token creator's
+principal, or create a new token from an account with the required permissions.</p>
+<h3 id="-32602-invalid-params">-32602: Invalid params</h3>
+<p><strong>Symptom</strong>: A tool call returns error code <code>-32602</code>.</p>
+<p><strong>Cause</strong>: A required parameter is missing or invalid. For example, calling
+<code>get_agent_details</code> without <code>agent_id</code>, or calling <code>query_responses</code> without
+<code>instruction_id</code>.</p>
+<p><strong>Fix</strong>: Include all required parameters in the <code>arguments</code> object. See the
+<a href="#available-tools">Available Tools</a> section for parameter requirements.</p>
+<h3 id="mcp-client-cannot-connect">MCP client cannot connect</h3>
+<p><strong>Symptom</strong>: The MCP client reports connection errors.</p>
+<p><strong>Causes</strong>:
+- The server is not reachable from the client machine.
+- HTTPS certificate validation fails (self-signed cert). Add the CA cert to
+  your system trust store or configure the client to trust it.
+- The URL is wrong. The endpoint is <code>POST /mcp/v1/</code> (with trailing slash).</p>
+<p><strong>Fix</strong>: Verify network connectivity, TLS configuration, and the endpoint URL.
+Test with curl:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>https://your-server:8080/mcp/v1/<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer yzt_...&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;method&quot;:&quot;ping&quot;,&quot;id&quot;:1}&#39;</span>
+</code></pre></div>
+<p>A successful response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;jsonrpc&quot;</span><span class="p">:</span><span class="s2">&quot;2.0&quot;</span><span class="p">,</span><span class="nt">&quot;result&quot;</span><span class="p">:{},</span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="mi">1</span><span class="p">}</span>
+</code></pre></div>
+</main>
+</body>
+</html>

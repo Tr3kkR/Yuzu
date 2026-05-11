@@ -1,0 +1,825 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timeline Activity Record (TAR)</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/tar.md</div>
+<h1 class="doc-title">Timeline Activity Record (TAR)</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="timeline-activity-record-tar">Timeline Activity Record (TAR)</h1>
+<p>The TAR plugin continuously captures system state snapshots and records changes as timestamped events in a local SQLite database on each endpoint. It enables retrospective investigation of "what happened on this machine" without requiring pre-configured logging or SIEM integration.</p>
+<blockquote>
+<p>Engineers maintaining or extending TAR should also read <a href="../tar-implementer.html"><a href="../tar-implementer.html" class="doc-ref"><code>docs/tar-implementer.md</code></a></a> — it covers the on-disk format, persistence semantics across upgrade/uninstall/reinstall, the post-restart double-capture caveat, and device-impact expectations.</p>
+</blockquote>
+<h2 id="what-tar-captures">What TAR captures</h2>
+<p>TAR monitors four categories of system activity:</p>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Collection interval</th>
+<th>Events detected</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Processes</strong></td>
+<td>60 seconds (fast)</td>
+<td>Process started, process stopped</td>
+</tr>
+<tr>
+<td><strong>Network connections</strong></td>
+<td>60 seconds (fast)</td>
+<td>Connection opened, connection closed</td>
+</tr>
+<tr>
+<td><strong>Services</strong></td>
+<td>300 seconds (slow)</td>
+<td>Service started, stopped, state changed</td>
+</tr>
+<tr>
+<td><strong>User sessions</strong></td>
+<td>300 seconds (slow)</td>
+<td>User login, user logout</td>
+</tr>
+</tbody>
+</table>
+<p>Each collection cycle takes a snapshot of the current state, compares it to the previous snapshot, and records only the differences as events. This keeps the database compact while providing full visibility into system changes.</p>
+<h2 id="querying-tar-data">Querying TAR data</h2>
+<h3 id="from-the-yuzu-dashboard">From the Yuzu dashboard</h3>
+<p>Use the <strong>TAR Query</strong> instruction to search events by time range and type.</p>
+<h3 id="from-the-rest-api">From the REST API</h3>
+<div class="highlight"><pre><span></span><code>POST /api/v1/instructions/execute
+{
+  &quot;plugin&quot;: &quot;tar&quot;,
+  &quot;action&quot;: &quot;query&quot;,
+  &quot;parameters&quot;: {
+    &quot;from&quot;: &quot;1711000000&quot;,
+    &quot;to&quot;: &quot;1711100000&quot;,
+    &quot;type&quot;: &quot;process&quot;,
+    &quot;limit&quot;: &quot;500&quot;
+  }
+}
+</code></pre></div>
+<h3 id="query-parameters">Query parameters</h3>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Required</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>from</code></td>
+<td>No</td>
+<td>0</td>
+<td>Start of time range (Unix epoch seconds)</td>
+</tr>
+<tr>
+<td><code>to</code></td>
+<td>No</td>
+<td>now</td>
+<td>End of time range (Unix epoch seconds)</td>
+</tr>
+<tr>
+<td><code>type</code></td>
+<td>No</td>
+<td>all</td>
+<td>Filter: <code>process</code>, <code>network</code>, <code>service</code>, or <code>user</code></td>
+</tr>
+<tr>
+<td><code>limit</code></td>
+<td>No</td>
+<td>1000</td>
+<td>Maximum results (max 10000)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="output-format">Output format</h3>
+<p>Each event is output as a pipe-delimited line:</p>
+<div class="highlight"><pre><span></span><code>timestamp|event_type|event_action|snapshot_id|detail_json
+</code></pre></div>
+<p>Example:</p>
+<div class="highlight"><pre><span></span><code>1711050123|process|started|1711050123001|{&quot;pid&quot;:1234,&quot;ppid&quot;:1,&quot;name&quot;:&quot;nginx&quot;,&quot;cmdline&quot;:&quot;nginx -g daemon off;&quot;,&quot;user&quot;:&quot;www-data&quot;}
+1711050123|network|connected|1711050123001|{&quot;proto&quot;:&quot;tcp&quot;,&quot;local_addr&quot;:&quot;0.0.0.0&quot;,&quot;local_port&quot;:80,&quot;remote_addr&quot;:&quot;10.0.0.5&quot;,&quot;remote_port&quot;:54321,&quot;state&quot;:&quot;ESTABLISHED&quot;,&quot;pid&quot;:1234}
+1711050423|service|state_changed|1711050423002|{&quot;name&quot;:&quot;sshd&quot;,&quot;display_name&quot;:&quot;OpenSSH&quot;,&quot;status&quot;:&quot;stopped&quot;,&quot;prev_status&quot;:&quot;running&quot;,&quot;startup_type&quot;:&quot;automatic&quot;,&quot;prev_startup_type&quot;:&quot;automatic&quot;}
+1711050423|user|login|1711050423002|{&quot;user&quot;:&quot;admin&quot;,&quot;domain&quot;:&quot;CORP&quot;,&quot;logon_type&quot;:&quot;remote&quot;,&quot;session_id&quot;:&quot;pts/0&quot;}
+</code></pre></div>
+<h3 id="json-export">JSON export</h3>
+<p>Use the <code>export</code> action for JSON output suitable for integration with Splunk, ClickHouse, or ELK:</p>
+<div class="highlight"><pre><span></span><code>POST /api/v1/instructions/execute
+{
+  &quot;plugin&quot;: &quot;tar&quot;,
+  &quot;action&quot;: &quot;export&quot;,
+  &quot;parameters&quot;: { &quot;type&quot;: &quot;process&quot;, &quot;limit&quot;: &quot;100&quot; }
+}
+</code></pre></div>
+<h2 id="configuration">Configuration</h2>
+<p>Use the <code>configure</code> action to adjust TAR behavior.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Valid range</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>retention_days</code></td>
+<td>1-365</td>
+<td>7</td>
+<td>Days to keep events before automatic purge</td>
+</tr>
+<tr>
+<td><code>fast_interval</code></td>
+<td>10-3600</td>
+<td>60</td>
+<td>Seconds between process/network collections</td>
+</tr>
+<tr>
+<td><code>slow_interval</code></td>
+<td>30-7200</td>
+<td>300</td>
+<td>Seconds between service/user collections</td>
+</tr>
+<tr>
+<td><code>redaction_patterns</code></td>
+<td>JSON array</td>
+<td>See below</td>
+<td>Patterns for command-line redaction (case-insensitive)</td>
+</tr>
+<tr>
+<td><code>process_enabled</code></td>
+<td><code>true</code> / <code>false</code></td>
+<td><code>true</code></td>
+<td>Toggle the process collector on this host</td>
+</tr>
+<tr>
+<td><code>tcp_enabled</code></td>
+<td><code>true</code> / <code>false</code></td>
+<td><code>true</code></td>
+<td>Toggle the network collector on this host</td>
+</tr>
+<tr>
+<td><code>service_enabled</code></td>
+<td><code>true</code> / <code>false</code></td>
+<td><code>true</code></td>
+<td>Toggle the service collector on this host</td>
+</tr>
+<tr>
+<td><code>user_enabled</code></td>
+<td><code>true</code> / <code>false</code></td>
+<td><code>true</code></td>
+<td>Toggle the user-session collector on this host</td>
+</tr>
+<tr>
+<td><code>network_capture_method</code></td>
+<td><code>polling</code> plus the values returned by <code>accepted_capture_methods("tcp")</code> (<code>iphlpapi</code>, <code>procfs</code>, <code>proc_pidfdinfo</code>, plus any <code>kPlanned</code> rows once added)</td>
+<td><code>polling</code></td>
+<td>Network capture mechanism. <code>polling</code> is the platform default — the only mechanism actually wired today. Other values are accepted for pre-staging when the corresponding kernel-event collector lands; the agent emits a <code>warn</code> line and continues polling.</td>
+</tr>
+<tr>
+<td><code>process_stabilization_exclusions</code></td>
+<td>JSON array</td>
+<td><code>[]</code></td>
+<td>Process-name glob patterns to drop before diffing. Useful for noisy short-lived helpers (CI runners, IDE indexers) that dwarf real activity. <strong>Trade-off: forensic completeness is reduced — anything matching these patterns is invisible to TAR.</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Validation rules:</strong></p>
+<ul>
+<li>When both <code>fast_interval</code> and <code>slow_interval</code> are provided, <code>fast_interval</code> must be less than <code>slow_interval</code>.</li>
+<li><code>redaction_patterns</code> and <code>process_stabilization_exclusions</code> must each be a JSON array of non-empty strings.</li>
+<li><code>process_stabilization_exclusions</code> matching is <strong>case-insensitive substring</strong>, not real glob. Leading and trailing <code>*</code> are stripped; <code>?</code> and <code>[abc]</code> are treated as literals. A pattern like <code>"a"</code> will match every process whose name contains the letter <code>a</code> (most of them) — use length-3+ patterns or anchor with explicit substrings (<code>"-helper"</code>, <code>"chrome-helper"</code>).</li>
+<li><code>network_capture_method</code> is accepted unconditionally for the literal value <code>polling</code> (the platform default). Any other value must appear in the accept-list returned by <code>accepted_capture_methods("tcp")</code> (currently <code>iphlpapi</code>, <code>procfs</code>, <code>proc_pidfdinfo</code>); else the configure call is rejected.</li>
+<li>Disabling a collector (<code>&lt;source&gt;_enabled=false</code>) short-circuits new captures but leaves existing rows queryable. Re-enabling later starts from a clean baseline rather than diffing against a stale snapshot.</li>
+</ul>
+<p>Example:</p>
+<div class="highlight"><pre><span></span><code>POST /api/v1/instructions/execute
+{
+  &quot;plugin&quot;: &quot;tar&quot;,
+  &quot;action&quot;: &quot;configure&quot;,
+  &quot;parameters&quot;: {
+    &quot;retention_days&quot;: &quot;14&quot;,
+    &quot;fast_interval&quot;: &quot;30&quot;,
+    &quot;user_enabled&quot;: &quot;false&quot;,
+    &quot;process_stabilization_exclusions&quot;: &quot;[\&quot;*-helper*\&quot;,\&quot;*ide-language-server*\&quot;]&quot;
+  }
+}
+</code></pre></div>
+<h2 id="os-compatibility-matrix">OS compatibility matrix</h2>
+<p>TAR runs on Windows, Linux, and macOS, but each capture source has platform-specific constraints. Run the <code>compatibility</code> action to print the live matrix from the agent itself; the table below is a snapshot for documentation purposes.</p>
+<table>
+<thead>
+<tr>
+<th>Source</th>
+<th>Windows</th>
+<th>Linux</th>
+<th>macOS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>process</strong></td>
+<td>supported (<code>toolhelp32</code>) — full pid/ppid/name/cmdline. Cmdline retrieval requires <code>PROCESS_QUERY_LIMITED_INFORMATION</code>.</td>
+<td>supported (<code>procfs</code>) — <code>/proc/&lt;pid&gt;/status</code> and <code>/proc/&lt;pid&gt;/cmdline</code>.</td>
+<td>constrained (<code>sysctl</code>) — <code>KERN_PROC_ALL</code>. Cmdline empty for hardened-runtime processes the agent cannot inspect.</td>
+</tr>
+<tr>
+<td><strong>tcp</strong></td>
+<td>supported (<code>iphlpapi</code>) — <code>GetExtendedTcpTable</code> polled at <code>fast_interval</code>. ETW (<code>Microsoft-Windows-Kernel-Network</code>) is <strong>planned</strong> for sub-second fidelity; not yet wired.</td>
+<td>supported (<code>procfs</code>) — <code>/proc/net/{tcp,tcp6,udp,udp6}</code>. Connection lifetime below <code>fast_interval</code> may be missed.</td>
+<td>constrained (<code>proc_pidfdinfo</code>) — <code>proc_listallpids</code> + <code>proc_pidfdinfo(PROC_PIDFDSOCKETINFO)</code> via <code>libproc</code>. Inherent TOCTOU between pid enumeration and per-fd query — short-lived sockets that close before the per-fd query may produce empty rows. Endpoint Security framework is the planned replacement.</td>
+</tr>
+<tr>
+<td><strong>service</strong></td>
+<td>supported (<code>scm</code>) — <code>EnumServicesStatusEx</code> / <code>QueryServiceConfig</code>; full status + startup_type.</td>
+<td>constrained (<code>systemctl</code>) — <code>systemctl list-units</code>; <code>startup_type</code> reported as <code>unknown</code>. Hosts without systemd (Alpine sysvinit, OpenRC) are unsupported.</td>
+<td>constrained (<code>launchctl</code>) — <code>launchctl list</code>; no startup_type, status binary running/stopped only.</td>
+</tr>
+<tr>
+<td><strong>user</strong></td>
+<td>supported (<code>wts</code>) — <code>WTSEnumerateSessionsW</code> + <code>WTSQuerySessionInformationW</code>; interactive, RDP, console. Server Core 2008 R2 minimal installs lack Terminal Services.</td>
+<td>constrained (<code>utmp</code>) — <code>getutent</code>. Containers without <code>/var/run/utmp</code> produce no events. <code>logon_type</code> inferred from tty (<code>pts/*</code> → remote).</td>
+<td>constrained (<code>utmpx</code>) — <code>getutxent</code>. GUI logins are not always reflected.</td>
+</tr>
+</tbody>
+</table>
+<p>Status values:</p>
+<ul>
+<li><strong>supported</strong> — fully wired and exercised in CI.</li>
+<li><strong>constrained</strong> — works but with a documented limitation.</li>
+<li><strong>planned</strong> — not yet implemented; <code>network_capture_method</code> accepts the value so you can pre-stage configuration.</li>
+<li><strong>unsupported</strong> — platform cannot supply the data at all (e.g., <code>service</code> on a kernel without a service manager).</li>
+</ul>
+<p>To get the matrix at runtime (returns one <code>row|...</code> line per source/OS pair):</p>
+<div class="highlight"><pre><span></span><code>POST /api/v1/instructions/execute
+{
+  &quot;plugin&quot;: &quot;tar&quot;,
+  &quot;action&quot;: &quot;compatibility&quot;
+}
+</code></pre></div>
+<h2 id="security-command-line-redaction">Security: command-line redaction</h2>
+<p>TAR automatically redacts sensitive command-line arguments before storing process events. Any command line matching a redaction pattern has its <code>cmdline</code> field replaced with <code>[REDACTED by TAR]</code>.</p>
+<p>Default redaction patterns:</p>
+<div class="highlight"><pre><span></span><code><span class="p">[</span><span class="s2">&quot;*password*&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;*secret*&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;*token*&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;*api_key*&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;*credential*&quot;</span><span class="p">]</span>
+</code></pre></div>
+<p>Patterns use case-insensitive substring matching. The <code>*</code> characters at the start and end indicate substring semantics (e.g., <code>*password*</code> matches any command line containing "password" in any case).</p>
+<p>To customize:</p>
+<div class="highlight"><pre><span></span><code>POST /api/v1/instructions/execute
+{
+  &quot;plugin&quot;: &quot;tar&quot;,
+  &quot;action&quot;: &quot;configure&quot;,
+  &quot;parameters&quot;: {
+    &quot;redaction_patterns&quot;: &quot;[\&quot;*password*\&quot;,\&quot;*secret*\&quot;,\&quot;*token*\&quot;,\&quot;*private_key*\&quot;]&quot;
+  }
+}
+</code></pre></div>
+<h2 id="checking-tar-status">Checking TAR status</h2>
+<p>The <code>status</code> action returns database health information:</p>
+<div class="highlight"><pre><span></span><code>record_count|15234
+oldest_timestamp|1710950000
+newest_timestamp|1711050423
+db_size_bytes|2097152
+retention_days|7
+config|process_enabled|true
+config|process_paused_at|0
+config|process_live_rows|18402
+config|process_oldest_ts|1710950000
+config|tcp_enabled|true
+config|tcp_paused_at|0
+config|tcp_live_rows|4193
+config|tcp_oldest_ts|1710955000
+config|service_enabled|true
+config|service_paused_at|0
+config|service_live_rows|812
+config|service_oldest_ts|1710901000
+config|user_enabled|true
+config|user_paused_at|0
+config|user_live_rows|97
+config|user_oldest_ts|1710900100
+config|network_capture_method|polling
+</code></pre></div>
+<p>The four <code>&lt;source&gt;_*</code> blocks are emitted per capture source. <code>&lt;source&gt;_paused_at</code> is <code>0</code> when the source has never been disabled and the wall-clock UTC seconds when it was last transitioned <code>enabled → disabled</code>. The reverse transition resets it to <code>0</code>. <code>&lt;source&gt;_live_rows</code> and <code>&lt;source&gt;_oldest_ts</code> are the count and minimum timestamp of the per-source <code>*_live</code> table at the moment of the status call. Agents older than v0.12.0 do not emit the per-source <code>paused_at</code> / <code>live_rows</code> / <code>oldest_ts</code> lines; the dashboard renders <code>—</code> in their absence.</p>
+<h2 id="tar-dashboard-page">TAR dashboard page</h2>
+<p>The Yuzu dashboard includes a dedicated TAR page at <code>/tar</code>, reachable from the <strong>TAR</strong> entry in the main navigation bar (visible after authentication). The page is the central operator surface for TAR across the fleet. Phase 15.A delivers the retention-paused source list as the first frame; the scope-walking-aware SQL frame and the process tree viewer drop into placeholder slots in subsequent phases.</p>
+<h3 id="retention-paused-source-list">Retention-paused source list</h3>
+<p>The first frame surfaces every device × source pair where the collector has been disabled (<code>&lt;source&gt;_enabled=false</code>). Rows are sorted paused-longest-first so devices accumulating non-aging data the longest float to the top of the list.</p>
+<p><strong>Columns:</strong> device hostname, source pill, paused since (UTC), paused for (coarse age), live rows count, oldest data age.</p>
+<p><strong>Workflow:</strong></p>
+<ol>
+<li>Click <strong>Scan fleet</strong> to dispatch a <code>tar.status</code> command to the agents in your management-group scope. The scan-provenance header above the table reports how many agents were dispatched to, how many have responded so far, and how many have all sources collecting normally.</li>
+<li>Review the table. A row with a high <code>live_rows</code> count or a long pause duration may indicate forensic data accumulating without being queried.</li>
+<li>Click <strong>Re-enable</strong> on a row to dispatch <code>tar.configure</code> with <code>&lt;source&gt;_enabled=true</code> to that single device. The row drops optimistically; click <strong>Refresh</strong> to reconcile against a fresh scan.</li>
+</ol>
+<p><strong>Permissions:</strong></p>
+<ul>
+<li>Viewing the page and the retention-paused list requires <code>Infrastructure:Read</code>.</li>
+<li><strong>Scan fleet</strong> requires <code>Execution:Execute</code> (it dispatches a fleet-wide command).</li>
+<li><strong>Re-enable</strong> requires <code>Execution:Execute</code> (it dispatches a configure command to a single device).</li>
+<li>Both Scan dispatch and the rendered list are scoped to your management-group visibility — agents outside your scope are neither queried nor rendered, and the Re-enable endpoint rejects out-of-scope <code>device_id</code> values with the same 404 response as a not-connected agent (no enumeration oracle).</li>
+</ul>
+<p><strong>State persistence:</strong> Scan results are held in the server's memory keyed by your username. Restarting the server clears the last-scan reference; click <strong>Scan fleet</strong> again after a restart. Persistence across restarts and multi-server coordination are planned for Phase 15.G operational hardening.</p>
+<p><strong>Audit trail:</strong> Every Scan emits a <code>tar.status.scan</code> audit event. Every Re-enable emits <code>tar.source.reenable</code> (with <code>result=success</code> and <code>detail</code> carrying <code>device_id</code> and <code>source</code> on success, or <code>result=failure</code> with <code>detail</code> carrying the real reason — <code>scope_violation</code> or <code>agent_not_connected</code> — on rejected attempts). See <a href="audit-log.html" class="doc-ref"><code>docs/user-manual/audit-log.md</code></a> for the full schema.</p>
+<h2 id="forcing-an-immediate-snapshot">Forcing an immediate snapshot</h2>
+<p>The <code>snapshot</code> action triggers an immediate full collection of all four categories, useful before a maintenance window or at the start of an investigation:</p>
+<div class="highlight"><pre><span></span><code>POST /api/v1/instructions/execute
+{
+  &quot;plugin&quot;: &quot;tar&quot;,
+  &quot;action&quot;: &quot;snapshot&quot;
+}
+</code></pre></div>
+<h2 id="performance-impact">Performance impact</h2>
+<p>TAR is designed for minimal performance overhead:</p>
+<ul>
+<li><strong>Fast collection</strong> (processes + network): typically completes in under 100ms</li>
+<li><strong>Slow collection</strong> (services + users): typically completes in under 200ms</li>
+<li><strong>Database size</strong>: varies by system activity; a typical endpoint generates 1-5 MB per day</li>
+<li><strong>CPU</strong>: negligible between collection cycles; brief spike during snapshot + diff</li>
+<li><strong>Automatic purge</strong>: old events are removed hourly based on the retention setting</li>
+<li><strong>WAL mode</strong>: SQLite Write-Ahead Logging ensures reads never block writes</li>
+</ul>
+<h2 id="warehouse-query-system">Warehouse Query System</h2>
+<p>TAR includes a typed data warehouse that replaces the legacy flat <code>tar_events</code> table with structured, tiered tables optimized for different query time horizons.</p>
+<h3 id="warehouse-tables">Warehouse tables</h3>
+<p>Table names use <code>$</code>-prefixed identifiers (e.g., <code>$Process_Live</code>) which the agent translates to real SQLite table names at execution time. There are four capture sources, each with multiple granularity tiers:</p>
+<table>
+<thead>
+<tr>
+<th>Source</th>
+<th style="text-align: center;">Live</th>
+<th style="text-align: center;">Hourly</th>
+<th style="text-align: center;">Daily</th>
+<th style="text-align: center;">Monthly</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Process</strong></td>
+<td style="text-align: center;"><code>$Process_Live</code> (5000 rows)</td>
+<td style="text-align: center;"><code>$Process_Hourly</code> (24h)</td>
+<td style="text-align: center;"><code>$Process_Daily</code> (31d)</td>
+<td style="text-align: center;"><code>$Process_Monthly</code> (12mo)</td>
+</tr>
+<tr>
+<td><strong>TCP</strong></td>
+<td style="text-align: center;"><code>$TCP_Live</code> (5000 rows)</td>
+<td style="text-align: center;"><code>$TCP_Hourly</code> (24h)</td>
+<td style="text-align: center;"><code>$TCP_Daily</code> (31d)</td>
+<td style="text-align: center;"><code>$TCP_Monthly</code> (12mo)</td>
+</tr>
+<tr>
+<td><strong>Service</strong></td>
+<td style="text-align: center;"><code>$Service_Live</code> (5000 rows)</td>
+<td style="text-align: center;"><code>$Service_Hourly</code> (24h)</td>
+<td style="text-align: center;">--</td>
+<td style="text-align: center;">--</td>
+</tr>
+<tr>
+<td><strong>User</strong></td>
+<td style="text-align: center;"><code>$User_Live</code> (5000 rows)</td>
+<td style="text-align: center;">--</td>
+<td style="text-align: center;"><code>$User_Daily</code> (31d)</td>
+<td style="text-align: center;">--</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>Live</strong> tables hold the most recent raw events with a 5000-row cap (oldest rows are evicted).</li>
+<li><strong>Hourly</strong> tables aggregate counts and summaries per hour, retained for 24 hours.</li>
+<li><strong>Daily</strong> tables aggregate per day, retained for 31 days.</li>
+<li><strong>Monthly</strong> tables aggregate per month, retained for 12 months.</li>
+<li>Service only has live and hourly tiers. User only has live and daily tiers.</li>
+</ul>
+<h3 id="key-columns-by-table-type">Key columns by table type</h3>
+<p><strong>Process tables:</strong> <code>ts</code>, <code>name</code>, <code>pid</code>, <code>ppid</code>, <code>cmdline</code>, <code>user</code>, <code>action</code> (started/stopped). Aggregated tiers add <code>start_count</code>, <code>stop_count</code>.</p>
+<p><strong>TCP tables:</strong> <code>ts</code>, <code>process_name</code>, <code>pid</code>, <code>remote_addr</code>, <code>remote_port</code>, <code>local_port</code>, <code>proto</code>, <code>state</code>. Aggregated tiers add <code>connect_count</code>.</p>
+<p><strong>Service tables:</strong> <code>ts</code>, <code>name</code>, <code>status</code>, <code>prev_status</code>, <code>action</code> (started/stopped/state_changed). Hourly tier adds <code>change_count</code>.</p>
+<p><strong>User tables:</strong> <code>ts</code>, <code>user</code>, <code>domain</code>, <code>logon_type</code>, <code>action</code> (login/logout). Daily tier adds <code>login_count</code>.</p>
+<h3 id="querying-with-sql">Querying with SQL</h3>
+<p>Use the <code>tar.sql</code> action to execute SELECT queries against warehouse tables:</p>
+<div class="highlight"><pre><span></span><code>POST /api/v1/instructions/execute
+{
+  &quot;plugin&quot;: &quot;tar&quot;,
+  &quot;action&quot;: &quot;sql&quot;,
+  &quot;parameters&quot;: {
+    &quot;sql&quot;: &quot;SELECT name, pid, cmdline FROM $Process_Live ORDER BY ts DESC LIMIT 50&quot;
+  }
+}
+</code></pre></div>
+<p>Pre-built queries are available in <code>content/definitions/tar_warehouse.yaml</code>, covering common use cases like recent processes, TCP connections by process, listening ports, hourly summaries, service state changes, user sessions, and process trees.</p>
+<h3 id="rollup-aggregation">Rollup aggregation</h3>
+<p>The warehouse automatically runs a rollup aggregation cycle every 15 minutes. Each cycle:</p>
+<ol>
+<li>Aggregates live-tier data into hourly summaries</li>
+<li>Aggregates hourly data into daily summaries</li>
+<li>Aggregates daily data into monthly summaries</li>
+<li>Enforces retention limits on each tier</li>
+</ol>
+<p>To force an immediate rollup, use the <code>tar.rollup</code> action.</p>
+<h3 id="safety-controls">Safety controls</h3>
+<p>SQL queries are validated at multiple levels:</p>
+<ul>
+<li><strong>Server-side:</strong> Only SELECT statements are permitted. A keyword blocklist rejects INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, ATTACH, DETACH, PRAGMA, VACUUM, and REINDEX.</li>
+<li><strong>Agent-side:</strong> Table names must use the <code>$</code>-prefixed whitelist (<code>$Process_Live</code>, <code>$TCP_Hourly</code>, etc.). Only a single SQL statement is allowed. Queries exceeding 4KB are rejected.</li>
+</ul>
+<h2 id="data-storage">Data storage</h2>
+<p>TAR events are stored in <code>{data_dir}/tar.db</code> (SQLite), where <code>data_dir</code> is the agent's configured data directory. The database uses:</p>
+<ul>
+<li>WAL journal mode for concurrent performance</li>
+<li><code>busy_timeout=5000</code> for thread safety</li>
+<li><code>secure_delete=ON</code> to zero deleted data</li>
+<li>Indexes on <code>timestamp</code>, <code>(event_type, timestamp)</code>, and <code>snapshot_id</code></li>
+</ul>
+</main>
+</body>
+</html>

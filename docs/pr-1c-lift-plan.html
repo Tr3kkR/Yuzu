@@ -1,0 +1,902 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PR 1c — lift production call sites onto yuzu::transport</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/pr-1c-lift-plan.md</div>
+<h1 class="doc-title">PR 1c — lift production call sites onto yuzu::transport</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="pr-1c-lift-production-call-sites-onto-yuzutransport">PR 1c — lift production call sites onto <code>yuzu::transport</code></h1>
+<p>Tracking: #376 PR 1c row of <a href="adrs/0001-quic-transport-msquic-quicer.html" class="doc-ref"><code>docs/adrs/0001-quic-transport-msquic-quicer.md</code></a>.</p>
+<h2 id="goal">Goal</h2>
+<p>Replace direct <code>grpc::*</code> use in production call sites with the abstraction
+landed in PR 1a/1b. Once this lands the gRPC backend becomes plug-replaceable
+by the msquic backend (PR 3) without touching <code>agent.cpp</code>, <code>server.cpp</code>,
+<code>agent_service_impl.cpp</code>, <code>agent_registry.cpp</code>, or <code>gateway_service_impl.cpp</code>.</p>
+<p>The refactor is wire-equivalent — no behaviour change, no protocol change,
+no operator-visible flag change. CI must remain green at every sub-PR
+merge; the existing UAT (<code>scripts/start-UAT.sh</code>) is the integration ledger.</p>
+<h2 id="scope-inventory">Scope inventory</h2>
+<h3 id="rpcs-to-lift-16-total">RPCs to lift (16 total)</h3>
+<table>
+<thead>
+<tr>
+<th>Service</th>
+<th>RPC</th>
+<th>Kind</th>
+<th>Direction</th>
+<th>Touches</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu.agent.v1.AgentService</code></td>
+<td>Register</td>
+<td>unary</td>
+<td>agent → server</td>
+<td>agent.cpp client; agent_service_impl.cpp server</td>
+</tr>
+<tr>
+<td></td>
+<td>Heartbeat</td>
+<td>unary</td>
+<td>agent → server</td>
+<td>agent.cpp; agent_service_impl</td>
+</tr>
+<tr>
+<td></td>
+<td>ExecuteCommand</td>
+<td>server-stream</td>
+<td>mgmt → server (AgentService)</td>
+<td>server.cpp callout (rare); agent_service_impl</td>
+</tr>
+<tr>
+<td></td>
+<td>Subscribe</td>
+<td>bidi</td>
+<td>agent ↔ server</td>
+<td>agent.cpp (PRIMARY); agent_service_impl</td>
+</tr>
+<tr>
+<td></td>
+<td>ReportInventory</td>
+<td>unary</td>
+<td>agent → server</td>
+<td>agent.cpp; agent_service_impl</td>
+</tr>
+<tr>
+<td></td>
+<td>CheckForUpdate</td>
+<td>unary</td>
+<td>agent → server</td>
+<td>agent.cpp; agent_service_impl</td>
+</tr>
+<tr>
+<td></td>
+<td>DownloadUpdate</td>
+<td>server-stream</td>
+<td>agent → server</td>
+<td>agent.cpp; agent_service_impl</td>
+</tr>
+<tr>
+<td><code>yuzu.server.v1.ManagementService</code></td>
+<td>ListAgents</td>
+<td>unary</td>
+<td>mgmt client → server</td>
+<td>server.cpp impl</td>
+</tr>
+<tr>
+<td></td>
+<td>GetAgent</td>
+<td>unary</td>
+<td>mgmt</td>
+<td>server.cpp impl</td>
+</tr>
+<tr>
+<td></td>
+<td>SendCommand</td>
+<td>server-stream</td>
+<td>mgmt → server (fanout to agents)</td>
+<td>server.cpp; agent_registry forwarder</td>
+</tr>
+<tr>
+<td></td>
+<td>WatchEvents</td>
+<td>server-stream</td>
+<td>mgmt</td>
+<td>server.cpp</td>
+</tr>
+<tr>
+<td></td>
+<td>QueryInventory</td>
+<td>unary</td>
+<td>mgmt</td>
+<td>server.cpp</td>
+</tr>
+<tr>
+<td><code>yuzu.gateway.v1.GatewayUpstream</code></td>
+<td>ProxyRegister</td>
+<td>unary</td>
+<td>gateway → server</td>
+<td>gateway_service_impl</td>
+</tr>
+<tr>
+<td></td>
+<td>BatchHeartbeat</td>
+<td>unary</td>
+<td>gateway → server</td>
+<td>gateway_service_impl</td>
+</tr>
+<tr>
+<td></td>
+<td>ProxyInventory</td>
+<td>unary</td>
+<td>gateway → server</td>
+<td>gateway_service_impl</td>
+</tr>
+<tr>
+<td></td>
+<td>NotifyStreamStatus</td>
+<td>unary</td>
+<td>gateway → server</td>
+<td>gateway_service_impl</td>
+</tr>
+</tbody>
+</table>
+<p>Server-streaming RPCs use <code>BidiStream</code> with the read-half disabled by an
+immediate <code>writes_done()</code> from the client — <code>transport.hpp</code> describes this
+pattern explicitly.</p>
+<h3 id="direct-grpc-use-to-remove">Direct gRPC use to remove</h3>
+<ul>
+<li><code>agents/core/src/agent.cpp</code> — <code>grpc::ChannelArguments</code>, <code>grpc::ChannelCredentials</code>,
+  <code>grpc::CreateCustomChannel</code>, <code>pb::AgentService::Stub</code>, <code>grpc::ClientContext</code>,
+  <code>grpc::ClientReaderWriter</code> (Subscribe), reconnect loop wired around <code>grpc::Channel::WaitForConnected</code>.</li>
+<li><code>server/core/src/server.cpp</code> — <code>grpc::EnableDefaultHealthCheckService</code>,
+  <code>grpc::ServerCredentials</code>, <code>grpc::SslServerCredentialsOptions</code>,
+  <code>grpc::ServerBuilder</code>, <code>grpc::Server</code> (×2: agent_server_, mgmt_server_),
+  <code>gw_mgmt_channel_</code> (gateway forwarding).</li>
+<li><code>server/core/src/agent_service_impl.{hpp,cpp}</code> — <code>pb::AgentService::Service</code> inheritance;
+  every method takes <code>grpc::ServerContext*</code> + grpc::Status. Replace with
+  free-standing handler functions registered as transport handlers.</li>
+<li><code>server/core/src/agent_registry.cpp</code> — <code>gw_mgmt_stub_-&gt;SendCommand()</code> for gateway
+  forwarding; <code>subscribe_streams_</code> map of <code>grpc::ServerReaderWriter</code>.</li>
+<li><code>server/core/src/gateway_service_impl.{hpp,cpp}</code> — <code>gw::GatewayUpstream::Service</code></li>
+<li><code>::yuzu::server::v1::ManagementService::Service</code> inheritance.</li>
+</ul>
+<h2 id="sub-pr-ladder">Sub-PR ladder</h2>
+<p>Each sub-PR is independently mergeable, leaves CI green, and keeps the rest
+of the codebase on the existing path. No long-lived feature branch within
+the branch — land one, rebase the next.</p>
+<h3 id="pr-1c-1-adapter-shim-protomessage-codegen-helpers">PR 1c-1 — Adapter shim + ProtoMessage codegen helpers</h3>
+<blockquote>
+<p><strong>Merged 2026-05-08.</strong> Adapter helpers shipped in
+<code>transport/include/yuzu/transport/proto_adapter.hpp</code>
+(<code>register_unary_pb&lt;Req,Resp&gt;</code>, <code>OwnedProtoMessage&lt;T&gt;</code>, <code>read_pb</code>/
+<code>write_pb</code>), not the originally-planned per-side
+<code>server/core/src/transport_adapters.{hpp,cpp}</code> /
+<code>agents/core/src/transport_adapters.{hpp,cpp}</code> files. The per-side
+files were not needed because the typed-proto wrap was generic
+enough to live alongside the abstraction.</p>
+</blockquote>
+<ul>
+<li>Add <code>server/core/src/transport_adapters.{hpp,cpp}</code> (and matching
+  <code>agents/core/src/transport_adapters.{hpp,cpp}</code>) that wrap the
+  per-RPC pb message-pair construction so handler bodies stay tidy:
+  <div class="highlight"><pre><span></span><code><span class="k">template</span><span class="w"> </span><span class="o">&lt;</span><span class="k">typename</span><span class="w"> </span><span class="nc">Req</span><span class="p">,</span><span class="w"> </span><span class="k">typename</span><span class="w"> </span><span class="nc">Resp</span><span class="p">,</span><span class="w"> </span><span class="k">typename</span><span class="w"> </span><span class="nc">Fn</span><span class="o">&gt;</span>
+<span class="n">UnaryHandler</span><span class="w"> </span><span class="n">make_unary_handler</span><span class="p">(</span><span class="n">Fn</span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">f</span><span class="p">);</span><span class="w">  </span><span class="c1">// f: (CallContext, Req&amp;, Resp&amp;) -&gt; Status</span>
+</code></pre></div></li>
+<li>Define helpers for <code>register_unary_pb&lt;RegisterRequest, RegisterResponse&gt;(listener, "yuzu.agent.v1.AgentService/Register", f)</code>.</li>
+<li>No call-site changes yet. Tests: round-trip a no-op handler through
+  the adapter to prove the templates compile + dispatch correctly.</li>
+<li>Risk: low. Pure addition.</li>
+</ul>
+<h3 id="pr-1c-2-server-side-lift-agent_service_impl-agent-facing-service">PR 1c-2 — Server-side: lift <code>agent_service_impl</code> (agent-facing service)</h3>
+<blockquote>
+<p><strong>Merged 2026-05-08</strong> (commits d19680b + f8b944d). Plan/actual
+divergences worth noting:
+* <strong>YUZU_ALLOW_INSECURE_TLS gate</strong> stayed at the CLI layer (<code>main.cpp</code>)
+  — <code>cfg_.allow_one_way_tls</code> is passed as a bool argument to the new
+  <code>build_transport_credentials()</code>. The transport layer never reads
+  the env-var directly; the abstraction boundary is honoured.
+* <strong><code>grpc::EnableDefaultHealthCheckService(true)</code> deletion</strong>: confirmed
+  removed. Yuzu does not consume gRPC health checks; readiness is HTTP
+  <code>/readyz</code> (which now also gates on <code>agent_listener_-&gt;is_serving()</code>
+  per gov round 7 SRE OBS-1).
+* <strong>Mgmt + gateway-upstream services</strong> stayed on <code>grpc::ServerBuilder</code>
+  bound to their own ports — PR 1c-5 lifts those next. Two listener
+  objects with parallel shutdown until 1c-5 unifies them.</p>
+</blockquote>
+<ul>
+<li>Drop <code>pb::AgentService::Service</code> inheritance from <code>AgentServiceImpl</code>.
+  Keep the class as a stateful holder of dependencies (response_store,
+  rbac, audit, scope_engine, agent_registry, etc.).</li>
+<li>Replace <code>grpc::Status Register(grpc::ServerContext*, const RegisterRequest*, RegisterResponse*)</code>
+  with <code>transport::Status Register(const CallContext&amp;, const RegisterRequest&amp;, RegisterResponse&amp;)</code>,
+  and so on for every method. Internals unchanged.</li>
+<li>Add a <code>register_with(transport::ServerListener&amp; listener)</code> method that
+  calls <code>listener.register_unary</code> / <code>listener.register_bidi_stream</code> for
+  each RPC, wrapping the methods in lambdas that pull the typed proto out
+  of the <code>SerializableMessage</code> adapter.</li>
+<li>Delete <code>grpc::EnableDefaultHealthCheckService(true)</code> — emulate via a
+  no-op (Yuzu does not currently use gRPC health checks; readiness lives
+  on the HTTP side via /readyz).</li>
+<li><code>server.cpp</code>: replace <code>grpc::ServerBuilder</code> for <code>agent_server_</code> with a
+  <code>transport::make_server_listener(Backend::Grpc)</code> + <code>agent_listener_-&gt;start(...)</code>.
+  mTLS material flows through <code>transport::Credentials</code>.</li>
+<li><code>Subscribe</code> (bidi): the agent_registry's <code>subscribe_streams_</code> becomes a
+  map of <code>BidiStream*</code> (handler argument); handlers are pure C++ — no
+  more <code>grpc::ServerReaderWriter</code> references.</li>
+<li>peer_san_identities: populate from gRPC's auth_context inside the
+  GrpcServerListener (governance round 5 deferred). For PR 1c add a
+  hook in <code>transport::CallContext</code> and have the gRPC backend fill it from
+  <code>grpc::AuthContext::FindPropertyValues("x509_subject_alternative_name")</code>.</li>
+<li>YUZU_ALLOW_INSECURE_TLS gate: read inside transport per ADR row.
+  Move the existing <code>server/core/src/insecure_tls_gate.hpp</code> consult into
+  <code>Credentials</code> validation.</li>
+<li>Tests: extend integration tests to exercise Register + Heartbeat through
+  the new path. UAT must round-trip.</li>
+<li>Risk: moderate. Touches the server's primary RPC handlers but leaves
+  agent.cpp untouched (still on raw gRPC stub against the same wire).</li>
+</ul>
+<h3 id="pr-1c-3-agent-side-lift-agentcpp-register-heartbeat-reportinventory-checkforupdate">PR 1c-3 — Agent-side: lift <code>agent.cpp</code> (Register, Heartbeat, ReportInventory, CheckForUpdate)</h3>
+<ul>
+<li>Replace <code>grpc::CreateCustomChannel</code> with <code>transport::make_channel(Backend::Grpc, ...)</code>.</li>
+<li><code>pb::AgentService::Stub</code> goes away; calls become
+  <code>channel-&gt;unary("yuzu.agent.v1.AgentService/Heartbeat", ctx, req, resp)</code>.</li>
+<li>Reconnect loop pivots from the existing exponential-backoff loop onto
+  <code>BackoffPolicy</code> + <code>Channel::wait_for_connected()</code>.</li>
+<li>Cancel paths (<code>subscribe_ctx_.TryCancel()</code> / <code>heartbeat_ctx_.TryCancel()</code>)
+  pivot onto <code>std::stop_source</code> threaded into <code>CallContext::cancel</code>.</li>
+<li>Defer Subscribe to the next sub-PR.</li>
+<li>Tests: add agent-side integration test that drives Heartbeat through
+  a stub server using the abstraction; UAT.</li>
+<li>Risk: moderate.</li>
+</ul>
+<h3 id="pr-1c-4-agent-side-lift-subscribe-bidi-downloadupdate-server-stream">PR 1c-4 — Agent-side: lift Subscribe bidi + DownloadUpdate server-stream</h3>
+<ul>
+<li>Replace <code>grpc::ClientReaderWriter</code> with <code>BidiStream</code>.</li>
+<li>Subscribe is the most critical path on this whole branch — every
+  command dispatch flows through it. Round-trip tests must include
+  multi-frame fan-out, peer-FIN handling, replay timing window
+  (existing logic), and graceful reconnect.</li>
+<li>DownloadUpdate adapts naturally — agent calls <code>bidi_stream(...)</code>, then
+  <code>writes_done()</code> and reads chunks until peer half-close.</li>
+<li>Risk: high — the Subscribe migration is the canonical bug-prone point.
+  Land with the dual-stack <code>--transport=grpc</code> flag still defaulting to
+  grpc backend, and the equivalent server side already on transport
+  abstraction (PR 1c-2 is a hard predecessor).</li>
+<li><strong>Status</strong>: PR 1c-4 COMPLETE as of 2026-05-10. Commits: (i) <code>0b5f89c</code>
+  #916 contract softening, (ii) <code>7269ba7</code> Subscribe + DownloadUpdate lift,
+  hardening rounds <code>98f25f9</code> + <code>3e14517</code>, keepalive migration <code>1c05ce7</code>
+  (closes SRE-1), (iii) cleanup. Tests at
+  <code>tests/unit/test_agent_subscribe_lift.cpp</code> (5 cases / 102 assertions).</li>
+<li><strong>Hard predecessors</strong> (all closed as of 2026-05-09):</li>
+<li>✅ <strong>UP-14</strong> (per-call dispatcher-thread fanout) — closed by <strong>#904</strong>
+    bounded dispatcher pool (2026-05-09). Subscribe lift no longer
+    spawns a per-stream OS thread on the server; pool size is operator-
+    controlled via <code>ListenerOptions::bidi_dispatcher_pool_size</code>.</li>
+<li>✅ <strong>#902</strong> (UP-8) — DownloadUpdate idle-read deadline at the
+    transport layer. Closed 2026-05-09 by adding an optional
+    <code>std::chrono::milliseconds deadline</code> parameter to
+    <code>BidiStream::read</code> (default zero = no deadline) and arming
+    <code>DownloadUpdate</code>'s request-frame read with 30 s. Pool slots
+    release after the idle deadline so legitimate concurrent calls
+    are no longer starved by stalled peers. Tests at
+    <code>tests/unit/transport/test_transport_smoke.cpp</code> <code>[transport][bidi][deadline]</code>:
+    server-side timeout, client-side timeout, happy-path no-fire.
+    Wire-status caveat on the gRPC backend documented in the
+    <code>BidiStream</code> contract block in
+    <code>transport/include/yuzu/transport/transport.hpp</code>: <code>TryCancel</code>
+    forces peer-observed status to <code>Cancelled</code> regardless of the
+    handler-supplied final status; the local <code>DeadlineExceeded</code>
+    signal via <code>final_status()</code> is what frees the pool slot.</li>
+<li>✅ <code>parse_target_address</code> agent-side test coverage — closed
+    2026-05-09 by <code>1af8ab5</code> (<code>tests/unit/test_parse_target_address.cpp</code>,
+    22 cases / 44 assertions; rejection-path matrix + IPv6 happy
+    paths + <code>static_assert(noexcept(...))</code> contract pin).</li>
+<li>✅ Heartbeat per-cycle <code>stop_source</code> round-trip test — closed
+    2026-05-09 by <code>tests/unit/test_heartbeat_cancel_pattern.cpp</code>
+    (3 tests, 24 assertions, tag <code>[agent][heartbeat][cancel]</code>). The
+    suite pins the three production invariants the agent.cpp
+    connection loop relies on: (a) <code>std::optional&lt;std::stop_source&gt;::emplace</code>
+    REPLACES on each cycle so the new heartbeat thread observes a
+    fresh, not-stop_requested token; (b) an in-flight unary
+    threading its <code>CallContext::cancel</code> from the per-cycle source
+    returns <code>Cancelled</code> promptly when <code>request_stop()</code> fires (via
+    <code>GrpcChannel::unary</code>'s <code>stop_callback</code> → <code>gctx_.TryCancel()</code>
+    chain); (c) cycle-1's <code>request_stop</code> does not leak into a real
+    cycle-2 unary dispatched with the freshly-<code>emplace</code>d source.
+    The suite documents that the gRPC backend's
+    <code>populate_call_context_from_grpc</code> does not currently wire a
+    server-side stop_token; the <code>transport.hpp</code> contract has been
+    softened to backend-best-effort (#916) so this gap is intentional
+    rather than a deviation. Server handlers detect peer disconnect via
+    <code>BidiStream::read()</code> returning false, which is the canonical
+    cross-backend pattern.</li>
+</ul>
+<h4 id="pr-1c-4-governance-follow-ups-shipped-2026-05-10">PR 1c-4 governance follow-ups (shipped 2026-05-10)</h4>
+<p>After PR 1c-4 merged, a closet-clean session shipped 6 follow-up
+commits closing the deferred governance backlog (range <code>62bf9d2..06cf8d5</code>),
+followed by <code>/governance</code> Round-1 hardening (<code>7cf8126</code>) which closed
+the BLOCKING items the closet-clean session itself produced.</p>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Commit</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>#915 (P1)</td>
+<td><code>4fb435c</code></td>
+<td>Negative-deadline contract clarified to clamp-to-zero (UP-110 / arch-S1)</td>
+</tr>
+<tr>
+<td>#929 (P2)</td>
+<td><code>4fb435c</code></td>
+<td><code>[[nodiscard]]</code> on <code>read_pb</code> / <code>write_pb</code></td>
+</tr>
+<tr>
+<td>#926 (P2)</td>
+<td><code>4f1d2c5</code></td>
+<td>qe S-2 nullptr open_bidi unit test</td>
+</tr>
+<tr>
+<td>#927 (P2)</td>
+<td><code>4f1d2c5</code></td>
+<td>qe S-3 concurrent shared-stream writes unit test</td>
+</tr>
+<tr>
+<td>#914 (P1)</td>
+<td><code>0143cee</code></td>
+<td>NTP-step sanity log on unary DeadlineExceeded + MSVC chrono doc</td>
+</tr>
+<tr>
+<td>#911 (P0)</td>
+<td><code>d34a091</code></td>
+<td><code>BidiStream::write</code> per-frame deadline; server <code>DownloadUpdate</code> 30 s chunk-write deadline; agent <code>Updater</code> 5 s request-frame write deadline</td>
+</tr>
+<tr>
+<td>#924 (SRE-2)</td>
+<td><code>d34a091</code></td>
+<td>Agent OTA chunk-deadline counter (<code>yuzu_agent_ota_chunk_deadline_total{phase}</code>)</td>
+</tr>
+<tr>
+<td>#912 (P0)</td>
+<td><code>edcea4b</code></td>
+<td><code>TransportMetricSink</code> saturation hooks + <code>bidi_pool_size</code>/<code>in_flight</code>/<code>saturated_total</code> metrics</td>
+</tr>
+<tr>
+<td>#905</td>
+<td><code>edcea4b</code></td>
+<td><code>ServerTransportMetricSink</code> wiring at agent-listener creation</td>
+</tr>
+<tr>
+<td>#925 (SRE-3)</td>
+<td><code>edcea4b</code> + <code>7cf8126</code></td>
+<td>Reconnect-reason label split (channel_fault / peer_halfclose / stream_open_failed / enrollment_pending) + 3 Grafana alerts</td>
+</tr>
+<tr>
+<td>#913 (P0)</td>
+<td><code>06cf8d5</code></td>
+<td>Per-peer DownloadUpdate token bucket rate limit (UP-116)</td>
+</tr>
+<tr>
+<td>#916</td>
+<td><code>0b5f89c</code></td>
+<td>Server-side <code>CallContext::cancel</code> contract softened to backend-best-effort — closed on GitHub manually</td>
+</tr>
+</tbody>
+</table>
+<p>Round-1 hardening (<code>7cf8126</code>) closed all BLOCKING governance items
+(4 docs + 1 metric describe dedup + 1 test-coverage drift) and folded
+in the load-bearing SHOULDs (in_flight contract drift, enrollment_pending
+4th label, alert annotation language). Remaining SHOULD/NICE items
+filed as <strong>#932-#938</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>#932</td>
+<td>UP-209 final_status wedge on dead server (P1)</td>
+</tr>
+<tr>
+<td>#933</td>
+<td>architect S-1 admit_download_update public surface (P2)</td>
+</tr>
+<tr>
+<td>#934</td>
+<td>UP-206 slow-link compound lockout — operator-tunable deadline + don't-consume-token-on-deadline (P1)</td>
+</tr>
+<tr>
+<td>#935</td>
+<td>sec MEDIUM-1 + UP-201/2/3/5 + sre Q10 — bucket cap + size metric + multi-server HA gap (P1)</td>
+</tr>
+<tr>
+<td>#936</td>
+<td>qe Q4/Q5/Q6 — ServerTransportMetricSink + OTA counter + reason-label test coverage (P2)</td>
+</tr>
+<tr>
+<td>#937</td>
+<td>doc SHOULD-FIX backlog (P2)</td>
+</tr>
+<tr>
+<td>#938</td>
+<td>code SHOULD/NICE backlog (P2)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="pr-1c-5-server-side-lift-gateway_service_impl-managementserviceimpl-gw_mgmt_channel_">PR 1c-5 — Server-side: lift <code>gateway_service_impl</code> + <code>ManagementServiceImpl</code> + gw_mgmt_channel_</h3>
+<ul>
+<li>Same pattern as 1c-2 for the management + gateway-upstream services.</li>
+<li><code>agent_registry::gw_mgmt_stub_</code> becomes a <code>transport::Channel</code> for the
+  gateway's <code>ManagementService::SendCommand</code> server-stream.</li>
+<li>Forwarding pumping (<code>forward_gateway_pending</code>) becomes a <code>BidiStream</code>
+  read-loop with writes_done() on the client side.</li>
+<li>Risk: moderate. Gateway-mode only; UAT covers it.</li>
+</ul>
+<h3 id="pr-1c-6-cleanup-896-readiness-probe-897-trailing-metadata-scrub">PR 1c-6 — Cleanup + #896 readiness probe + #897 trailing-metadata scrub</h3>
+<ul>
+<li>
+<h1 id="896-wire-is_serving-bound_endpointport-0-into-readyz">896: wire <code>is_serving() &amp;&amp; bound_endpoint().port != 0</code> into /readyz.</h1>
+  Today's /readyz signal predates the abstraction; align it.</li>
+<li>
+<h1 id="897-extend-the-inbound-scrub-helper-to-trailing-metadata-matching">897: extend the inbound-scrub helper to trailing metadata (matching</h1>
+<code>Status::detail</code> policy) once the gRPC server-side delivers it through
+  the abstraction in PR 1c-2.</li>
+<li>Delete dead helpers: any remaining <code>grpc::*</code> includes in lifted files.</li>
+<li>Risk: low.</li>
+</ul>
+<h2 id="acceptance-criteria-per-sub-pr">Acceptance criteria per sub-PR</h2>
+<ul>
+<li><code>meson compile -C build-&lt;os&gt;</code> clean on Linux, macOS, Windows.</li>
+<li><code>meson test -C build-&lt;os&gt; --suite server --suite agent --suite transport</code> all green.</li>
+<li><code>bash scripts/start-UAT.sh</code> round-trips: register, heartbeat, command
+  fanout, gateway path, inventory.</li>
+<li>Governance pipeline (<code>/governance &lt;range&gt;</code>) green — no CRITICAL/HIGH
+  findings.</li>
+</ul>
+<h2 id="order-of-operations-branch-topology">Order of operations + branch topology</h2>
+<p>The branch is <code>feat/quic-transport</code>. Each sub-PR is a commit (or commit
+chain) on this branch. We <strong>do not</strong> open separate PRs against <code>main</code>
+during the lift — the whole branch lands in a single grand merge after
+PR 9.</p>
+<p>Ordering is hard-sequential because of cross-side dependencies:
+1. 1c-1 (adapter helpers)
+2. 1c-2 (server-side lift) — must precede 1c-3/1c-4 (agent-side lift sees the same wire)
+3. 1c-3 (agent unary lift)
+4. 1c-4 (agent Subscribe lift) — server-side for Subscribe lives in 1c-2
+5. 1c-5 (gateway / management lift)
+6. 1c-6 (readiness probe + cleanup)</p>
+<h2 id="constraints-carried-in-from-earlier-sub-prs">Constraints carried in from earlier sub-PRs</h2>
+<p>These come from the standing transport contracts and must be honoured by
+every sub-PR that adds a new call site:</p>
+<ul>
+<li><strong>Status::detail symmetric scrub</strong> — both backends route through
+  <code>yuzu::transport::sanitise_status_detail</code>. Every new handler that emits
+  a Status MUST have its detail go through the helper or hit the round-5
+  cons-G4-1 audit footprint.</li>
+<li><strong><code>bound_endpoint()</code> requires <code>is_serving()</code> cross-check</strong> — readiness
+  callers gate on the conjunction (governance UP-40 / SRE-O2). #896
+  closes the production readiness wiring in 1c-6.</li>
+<li><strong><code>on_unexpected_dispatch_throw(backend, method, kind)</code></strong> —
+  <code>TransportMetricSink</code> integration is required so the operator-visible
+  dispatcher-throw signal works for production traffic, not just tests.
+  Sub-PR 1c-2 wires the server's <code>prometheus-cpp</code> registry into a sink
+  that fans out to existing <code>yuzu_server_transport_*</code> counters.</li>
+</ul>
+<h2 id="open-questions">Open questions</h2>
+<ol>
+<li><strong>Backoff policy</strong>: agent.cpp's existing reconnect uses 2^n with a
+   5-minute cap. <code>BackoffPolicy</code> defaults to multiplier 1.6, max 30 s.
+   Decide in 1c-3 whether to bump <code>BackoffPolicy</code> defaults or keep the
+   agent-side wrapper. Bias: bump defaults — gateway also wants longer
+   max delays.</li>
+<li><strong>gRPC channel args</strong> (<code>GRPC_ARG_KEEPALIVE_*</code>): not exposed in the
+   abstraction. Either widen <code>BackoffPolicy</code> / add a <code>KeepaliveOptions</code>
+   struct, OR keep the args inside the gRPC backend with sensible defaults
+   that match agent.cpp:614-618. Bias: latter — msquic has different
+   keepalive primitives; abstracting now is premature.</li>
+<li><strong>Health check service</strong>: gRPC's default health-check is currently
+   enabled. Yuzu does not consume it (we have HTTP /readyz). Confirm in
+   1c-2 we can drop it without breaking any out-of-tree tooling.</li>
+</ol>
+<h2 id="memory-tracking">Memory + tracking</h2>
+<p>When a sub-PR lands, update both:
+* <a href="adrs/0001-quic-transport-msquic-quicer.html" class="doc-ref"><code>docs/adrs/0001-quic-transport-msquic-quicer.md</code></a> — PR 1c row sub-bullets
+* <code>~/.claude/projects/-Users-nathan-Yuzu/memory/project_quic_transport_branch_2026-05-08.md</code>
+  — branch state + next concrete step</p>
+</main>
+</body>
+</html>

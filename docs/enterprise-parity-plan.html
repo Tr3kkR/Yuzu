@@ -1,0 +1,1760 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enterprise Endpoint Management Parity Plan</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/enterprise-parity-plan.md</div>
+<h1 class="doc-title">Enterprise Endpoint Management Parity Plan</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="enterprise-endpoint-management-parity-plan">Enterprise Endpoint Management Parity Plan</h1>
+<p><strong>Version:</strong> 1.0 | <strong>Date:</strong> 2026-03-30 | <strong>Status:</strong> Draft</p>
+<p>This document analyzes the capabilities of leading commercial endpoint-management platforms against Yuzu's current state (v0.7.0, 165/184 capabilities done) and defines a phased implementation plan to achieve feature parity.</p>
+<hr>
+<h2 id="part-1-architectural-comparison">Part 1: Architectural Comparison</h2>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>Leading commercial peer</th>
+<th>Yuzu v0.7.0</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Language</strong></td>
+<td>C# / .NET (server), proprietary scripting language (agent)</td>
+<td>C++23 (server+agent), Erlang/OTP (gateway)</td>
+</tr>
+<tr>
+<td><strong>Agent Instruction Model</strong></td>
+<td>proprietary scripting language (SQL + control flow)</td>
+<td>Plugin ABI (C/C++ shared libraries)</td>
+</tr>
+<tr>
+<td><strong>Wire Protocol</strong></td>
+<td>WebSocket Secure (TCP 4000)</td>
+<td>gRPC/Protobuf with mTLS</td>
+</tr>
+<tr>
+<td><strong>Server Database</strong></td>
+<td>SQL Server (multiple DBs)</td>
+<td>SQLite (embedded, WAL mode)</td>
+</tr>
+<tr>
+<td><strong>Scaling Architecture</strong></td>
+<td>Switches (50K devices each, 5 per stack)</td>
+<td>Erlang/OTP gateway (10K+ tested)</td>
+</tr>
+<tr>
+<td><strong>Content Definition</strong></td>
+<td>XML with XSD schema, digital signing</td>
+<td>YAML with <code>yuzu.io/v1alpha1</code> DSL, Ed25519 signing</td>
+</tr>
+<tr>
+<td><strong>Auth Model</strong></td>
+<td>Windows AD (Kerberos), 2FA email</td>
+<td>PBKDF2 sessions, OIDC/PKCE, API tokens, mTLS</td>
+</tr>
+<tr>
+<td><strong>Content Delivery</strong></td>
+<td>Background Channel (HTTPS) + Nomad P2P</td>
+<td>HTTP content staging + execution</td>
+</tr>
+<tr>
+<td><strong>Policy Engine — Server side</strong></td>
+<td>Guaranteed State (proprietary-script check/fix)</td>
+<td>PolicyStore with CEL expressions + triggers</td>
+</tr>
+<tr>
+<td><strong>Policy Engine — Real-time agent-side enforcement</strong></td>
+<td>Guaranteed State (kernel-event-driven enforcement, pre-login activation, offline-capable)</td>
+<td><strong>System Guardian</strong> — agent-side guard engine using kernel-backed user-mode APIs (RegNotifyChangeKeyValue, ETW, WFP, SCM on Windows; inotify/netlink/D-Bus on Linux; Endpoint Security on macOS). PRs 1-2 shipped (proto, server store, agent scaffolding); PR 3+ in flight per <a href="yuzu-guardian-windows-implementation-plan.html" class="doc-ref"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a>. Phase 16 of the roadmap.</td>
+</tr>
+<tr>
+<td><strong>API</strong></td>
+<td>Consumer API (.NET SDK)</td>
+<td>REST API v1 (70+ endpoints) + gRPC + MCP</td>
+</tr>
+<tr>
+<td><strong>Dashboard</strong></td>
+<td>ASP.NET web portal</td>
+<td>HTMX server-rendered + SSE</td>
+</tr>
+<tr>
+<td><strong>DMZ Support</strong></td>
+<td>Dedicated DMZ Server (Response Stack)</td>
+<td>Gateway node (Erlang, can be DMZ-deployed)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="key-architectural-differences">Key Architectural Differences</h3>
+<p><strong>Yuzu's advantages over commercial peers:</strong>
+- <strong>No SQL Server dependency</strong> — SQLite is embedded, zero-ops
+- <strong>Cross-platform from day one</strong> — C++23 compiles on Win/Linux/macOS/ARM64
+- <strong>gRPC/Protobuf</strong> — strongly typed, bidirectional streaming, native mTLS
+- <strong>MCP server</strong> — AI-native fleet management (commercial peers have no equivalent)
+- <strong>Modern auth</strong> — OIDC/PKCE, API tokens, session cookies (vs AD-only)
+- <strong>CEL for policy</strong> — industry-standard expression language (vs proprietary peer scripting)
+- <strong>Plugin ABI</strong> — compiled native plugins are faster than an interpreted peer language
+- <strong>Erlang gateway</strong> — OTP supervision trees, hot code upgrade, fault isolation</p>
+<p><strong>Commercial peers' advantages over Yuzu (gaps to close):</strong>
+- <strong>Proprietary peer scripting</strong> — composable agent-side scripting with SQL, tables, control flow
+- <strong>Connector framework</strong> — 12 bidirectional integrations (SCCM, Intune, ServiceNow, etc.)
+- <strong>Response visualization</strong> — chart types, custom processors, server-side rendering
+- <strong>Software catalog</strong> — normalized vendor/title/version with AI auto-curation
+- <strong>Nomad P2P</strong> — peer-to-peer content distribution with bandwidth optimization
+- <strong>Consumer model</strong> — formal third-party application integration framework
+- <strong>Inventory consolidation</strong> — multi-source dedup, normalization, repositories
+- <strong>2FA for approvals</strong> — email/token-based second factor
+- <strong>Survey/DND</strong> — multi-question surveys, do-not-disturb suppression
+- <strong>PowerShell toolkit</strong> — cmdlet library for scripted administration</p>
+<hr>
+<h2 id="part-2-detailed-gap-analysis">Part 2: Detailed Gap Analysis</h2>
+<h3 id="already-equivalent-or-superior-no-action-needed">Already Equivalent or Superior (No Action Needed)</h3>
+<p>These commercial-peer features have functional equivalents in Yuzu that are as good or better:</p>
+<table>
+<thead>
+<tr>
+<th>Commercial Peer Feature</th>
+<th>Yuzu Equivalent</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent registration</td>
+<td>3-tier enrollment (manual, token, platform trust)</td>
+</tr>
+<tr>
+<td>Heartbeat / keepalive</td>
+<td>gRPC Heartbeat RPC with status_tags</td>
+</tr>
+<tr>
+<td>Agent diagnostics</td>
+<td><code>diagnostics</code> plugin + <code>agent_logging</code> + <code>connection_info</code></td>
+</tr>
+<tr>
+<td>Agent updates</td>
+<td>OTA via <code>CheckForUpdate</code>/<code>DownloadUpdate</code> RPCs</td>
+</tr>
+<tr>
+<td>Plugin extensibility</td>
+<td>44 plugins, C ABI + C++ CRTP wrapper</td>
+</tr>
+<tr>
+<td>Instruction definitions</td>
+<td>YAML DSL with typed parameters + result schemas</td>
+</tr>
+<tr>
+<td>Instruction sets</td>
+<td>InstructionStore with RBAC-scoped sets</td>
+</tr>
+<tr>
+<td>Instruction scheduling</td>
+<td>ScheduleEngine (daily/weekly/monthly/interval)</td>
+</tr>
+<tr>
+<td>Instruction approval</td>
+<td>ApprovalManager (auto/role-gated/always)</td>
+</tr>
+<tr>
+<td>Instruction progress</td>
+<td>ExecutionTracker per-agent status tracking</td>
+</tr>
+<tr>
+<td>Rerun/cancel</td>
+<td>ExecutionTracker rerun + cancel with user attribution</td>
+</tr>
+<tr>
+<td>Scope expressions</td>
+<td>ScopeEngine (10 operators, AND/OR/NOT, regex)</td>
+</tr>
+<tr>
+<td>Target estimation</td>
+<td><code>/api/scope/estimate</code> preview</td>
+</tr>
+<tr>
+<td>Response persistence</td>
+<td>ResponseStore (SQLite, TTL cleanup)</td>
+</tr>
+<tr>
+<td>Response aggregation</td>
+<td>COUNT/SUM/AVG/MIN/MAX with GROUP BY</td>
+</tr>
+<tr>
+<td>Response export</td>
+<td>CSV/JSON export endpoints</td>
+</tr>
+<tr>
+<td>RBAC</td>
+<td>6 roles, 14 securable types, deny-override</td>
+</tr>
+<tr>
+<td>Management groups</td>
+<td>Hierarchical, static + dynamic membership</td>
+</tr>
+<tr>
+<td>Audit trail</td>
+<td>AuditStore (365-day retention, structured events)</td>
+</tr>
+<tr>
+<td>Device tagging</td>
+<td>TagStore + agent-side tags plugin</td>
+</tr>
+<tr>
+<td>Custom properties</td>
+<td>CustomPropertiesStore (typed, schema-validated)</td>
+</tr>
+<tr>
+<td>Quarantine</td>
+<td><code>quarantine</code> plugin + QuarantineStore</td>
+</tr>
+<tr>
+<td>IOC checking</td>
+<td><code>ioc</code> plugin (IPs, domains, hashes, ports)</td>
+</tr>
+<tr>
+<td>Certificate mgmt</td>
+<td><code>certificates</code> plugin (list/details/delete)</td>
+</tr>
+<tr>
+<td>Device discovery</td>
+<td><code>discovery</code> plugin + DiscoveryStore</td>
+</tr>
+<tr>
+<td>Content staging</td>
+<td><code>content_dist</code> plugin (stage + execute)</td>
+</tr>
+<tr>
+<td>HTTP client</td>
+<td><code>http_client</code> plugin (GET/POST/HEAD + download)</td>
+</tr>
+<tr>
+<td>Script execution</td>
+<td><code>script_exec</code> plugin (PowerShell + bash)</td>
+</tr>
+<tr>
+<td>File operations</td>
+<td><code>filesystem</code> plugin (17 actions)</td>
+</tr>
+<tr>
+<td>Registry</td>
+<td><code>registry</code> plugin (CRUD + per-user)</td>
+</tr>
+<tr>
+<td>WMI</td>
+<td><code>wmi</code> plugin (query + instance)</td>
+</tr>
+<tr>
+<td>Policy engine — server-side compliance</td>
+<td>PolicyStore + CEL + 6 trigger types (poll-based desired-state evaluation; this is the <em>server</em> half of guaranteed state — see "Major Gaps" G14 for the agent-side real-time half delivered by System Guardian)</td>
+</tr>
+<tr>
+<td>Compliance dashboard</td>
+<td>Fleet/policy/agent drill-down</td>
+</tr>
+<tr>
+<td>Agent-side storage</td>
+<td><code>storage</code> plugin (SQLite KV)</td>
+</tr>
+<tr>
+<td>Triggers</td>
+<td>7 types (interval, file, dir, service, eventlog, registry, startup)</td>
+</tr>
+<tr>
+<td>User interaction</td>
+<td><code>interaction</code> plugin (notify, message_box, input)</td>
+</tr>
+<tr>
+<td>Product packs</td>
+<td>ProductPackStore with Ed25519 signing</td>
+</tr>
+<tr>
+<td>Webhooks</td>
+<td>WebhookStore with HMAC-SHA256 signing</td>
+</tr>
+<tr>
+<td>Notifications</td>
+<td>NotificationStore (info/warn/error/success)</td>
+</tr>
+<tr>
+<td>System health</td>
+<td><code>/livez</code>, <code>/readyz</code>, ProcessHealthSampler, Prometheus</td>
+</tr>
+<tr>
+<td>License mgmt</td>
+<td>LicenseStore (seats, editions, feature flags)</td>
+</tr>
+<tr>
+<td>Gateway/DMZ</td>
+<td>Erlang/OTP gateway with circuit breaker</td>
+</tr>
+<tr>
+<td>OIDC SSO</td>
+<td>OidcProvider with PKCE, Entra ID discovery</td>
+</tr>
+<tr>
+<td>AD/Entra sync</td>
+<td>DirectorySync via Microsoft Graph</td>
+</tr>
+<tr>
+<td>API tokens</td>
+<td>ApiTokenStore + MCP tiers</td>
+</tr>
+<tr>
+<td>Software deployment</td>
+<td>SoftwareDeploymentStore (stage/deploy/rollback)</td>
+</tr>
+<tr>
+<td>Patch management</td>
+<td>PatchManager (scan/download/install/verify/reboot)</td>
+</tr>
+<tr>
+<td>Vulnerability scanning</td>
+<td><code>vuln_scan</code> plugin + NVD sync</td>
+</tr>
+<tr>
+<td>Workflows</td>
+<td>WorkflowEngine (if/foreach/retry/parallel)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="gaps-not-started-in-capability-map-19-items">Gaps: Not Started in Capability Map (19 items)</h3>
+<p>These are already tracked as "Not Started" T3 items:</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Capability</th>
+<th>Commercial Peer Equivalent</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3.8</td>
+<td>Mapped Drive History</td>
+<td>Device.GetInbound/OutboundMappedDriveHistory</td>
+</tr>
+<tr>
+<td>3.9</td>
+<td>Printer Inventory</td>
+<td>Device.GetInbound/OutboundPrinters</td>
+</tr>
+<tr>
+<td>4.9</td>
+<td>NetBIOS Lookup</td>
+<td>Discovery.LookupNetBiosNames</td>
+</tr>
+<tr>
+<td>4.11</td>
+<td>Port Scanning</td>
+<td>Discovery.ScanPortsOnDevices</td>
+</tr>
+<tr>
+<td>5.5</td>
+<td>Open Windows Enumeration</td>
+<td>OperatingSystem.GetRunningApps</td>
+</tr>
+<tr>
+<td>8.9</td>
+<td>Patch Inventory Event Generation</td>
+<td>Patch.GenerateFullInventoryEvents</td>
+</tr>
+<tr>
+<td>9.10</td>
+<td>Application Whitelisting</td>
+<td>Security.ModifyQuarantineWhitelist (partial)</td>
+</tr>
+<tr>
+<td>10.11</td>
+<td>Directory Hash</td>
+<td>FileSystem.GetDirectoryHash</td>
+</tr>
+<tr>
+<td>13.5</td>
+<td>P2P Content Distribution</td>
+<td>Nomad (full P2P suite)</td>
+</tr>
+<tr>
+<td>14.4</td>
+<td>Survey Dialog</td>
+<td>Interaction.ShowSurvey</td>
+</tr>
+<tr>
+<td>14.5</td>
+<td>Do-Not-Disturb Mode</td>
+<td>Interaction.SetDoNotDisturb</td>
+</tr>
+<tr>
+<td>14.6</td>
+<td>Active Response Tracking</td>
+<td>Interaction.GetActiveResponses</td>
+</tr>
+<tr>
+<td>15.5</td>
+<td>Inventory Replication</td>
+<td>Inventory.GetLocalReplica</td>
+</tr>
+<tr>
+<td>20.6</td>
+<td>Response Templates</td>
+<td>Custom response definitions</td>
+</tr>
+<tr>
+<td>20.7</td>
+<td>Response Offloading</td>
+<td>Consumer offloading</td>
+</tr>
+<tr>
+<td>21.5</td>
+<td>Event Source Management</td>
+<td>Event subscription configuration</td>
+</tr>
+<tr>
+<td>22.7</td>
+<td>Binary Resource Distribution</td>
+<td>Background Channel resources</td>
+</tr>
+<tr>
+<td>24.4</td>
+<td>Consumer Registration</td>
+<td>Consumer application model</td>
+</tr>
+<tr>
+<td>24.7</td>
+<td>SDK Libraries</td>
+<td>.NET Consumer SDK</td>
+</tr>
+</tbody>
+</table>
+<h3 id="gaps-major-features-commercial-peers-have-that-yuzu-lacks-entirely">Gaps: Major Features Commercial Peers Have That Yuzu Lacks Entirely</h3>
+<p>These are significant capability areas not represented in Yuzu's capability map at all:</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Feature</th>
+<th>Description</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>G1</td>
+<td><strong>Connector Framework</strong></td>
+<td>Bidirectional data sync with SCCM, Intune, BigFix, ServiceNow, vCenter, WSUS, Oracle LMS, OpenLM, O365</td>
+<td>HIGH — core enterprise integration</td>
+</tr>
+<tr>
+<td>G2</td>
+<td><strong>Response Visualization Engine</strong></td>
+<td>Chart types (Pie, Bar, Column, Line, Area, SmartBar), built-in + custom processors, server-side rendering</td>
+<td>MEDIUM — dashboard richness</td>
+</tr>
+<tr>
+<td>G3</td>
+<td><strong>Software Catalog &amp; Normalization</strong></td>
+<td>Vendor/Title/Version/Edition normalization, AI auto-curation, third-party software-catalog integration</td>
+<td>HIGH — license compliance</td>
+</tr>
+<tr>
+<td>G4</td>
+<td><strong>Inventory Repositories</strong></td>
+<td>Multiple named repositories per type, connector-based population, consolidation/dedup/normalization</td>
+<td>HIGH — multi-source inventory</td>
+</tr>
+<tr>
+<td>G5</td>
+<td><strong>Software Usage Tracking</strong></td>
+<td>Application usage categorization (Used/Rarely Used/Unused), metering data from agents</td>
+<td>MEDIUM — license optimization</td>
+</tr>
+<tr>
+<td>G6</td>
+<td><strong>Consumer Application Model</strong></td>
+<td>Formal registration of third-party consumers with rate limits, offloading, custom data</td>
+<td>MEDIUM — platform extensibility</td>
+</tr>
+<tr>
+<td>G7</td>
+<td><strong>2FA for Approvals</strong></td>
+<td>Email/token-based second factor on instruction approval</td>
+<td>LOW — security hardening</td>
+</tr>
+<tr>
+<td>G8</td>
+<td><strong>Composable Instruction Chains</strong></td>
+<td>Agent-side scripting with SQL, @tables, FOREACH, IF/ELSE, chained method calls</td>
+<td>MEDIUM — instruction flexibility</td>
+</tr>
+<tr>
+<td>G9</td>
+<td><strong>Data Offloading</strong></td>
+<td>Route response data to external HTTP endpoints in real time</td>
+<td>MEDIUM — analytics integration</td>
+</tr>
+<tr>
+<td>G10</td>
+<td><strong>PowerShell Toolkit</strong></td>
+<td>Cmdlet library wrapping the management API</td>
+<td>LOW — admin convenience</td>
+</tr>
+<tr>
+<td>G11</td>
+<td><strong>Branding / White-Label</strong></td>
+<td>Custom logos, colors, names in dashboard</td>
+<td>LOW — enterprise customization</td>
+</tr>
+<tr>
+<td>G12</td>
+<td><strong>Process/Provider/Sync Logging</strong></td>
+<td>Separate log views for sync jobs, provider operations, infrastructure</td>
+<td>LOW — operational visibility</td>
+</tr>
+<tr>
+<td>G13</td>
+<td><strong>Multi-Database Architecture</strong></td>
+<td>Separate databases for responses, catalog, inventory, SLA, BI</td>
+<td>MEDIUM — scale separation</td>
+</tr>
+<tr>
+<td>G14</td>
+<td><strong>System Guardian — Real-Time Agent-Side Guaranteed State</strong></td>
+<td>the category leader's flagship: kernel-event-driven enforcement on Windows (RegNotifyChangeKeyValue, ETW, WFP, SCM), Linux (inotify, netlink, D-Bus, sysctl, audit), macOS (Endpoint Security, fseventsd, launchd). Pre-login activation. Fully offline-capable. Millisecond-level enforcement for event-driven rules. Auditable journal of every detection and remediation. <strong>In flight</strong> — PRs 1-2 shipped (proto, <code>guaranteed_state_store</code>, agent <code>GuardianEngine</code> scaffolding, <code>__guard__</code> dispatch hook); PR 3+ pending per <a href="yuzu-guardian-windows-implementation-plan.html" class="doc-ref"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a>. PolicyStore alone does <em>not</em> deliver this — its 5-minute poll cycle is unacceptable for "this setting must never be in a non-compliant state" use cases (firewall ports, registry-backed security settings, EDR process always-running). Guardian is the agent-side primitive that closes that gap.</td>
+<td><strong>CRITICAL</strong> — this is the headline parity feature for enterprise endpoint management</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="part-3-implementation-plan">Part 3: Implementation Plan</h2>
+<h3 id="prioritization-criteria">Prioritization Criteria</h3>
+<ol>
+<li><strong>Enterprise value</strong> — Features most commonly required in RFP/RFI responses</li>
+<li><strong>Competitive differentiation</strong> — What makes Yuzu credibly replace incumbent commercial platforms</li>
+<li><strong>Build complexity</strong> — Estimated effort and architectural impact</li>
+<li><strong>Dependencies</strong> — What must exist before other things can be built</li>
+</ol>
+<h3 id="phase-8-visualization-response-experience">Phase 8: Visualization &amp; Response Experience</h3>
+<p><em>Make collected data actionable with charts, templates, and processing pipelines.</em></p>
+<p><strong>Duration estimate: 1 sprint</strong></p>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Title</th>
+<th>Scope</th>
+<th>Depends On</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>8.1</td>
+<td>Response Visualization Engine</td>
+<td>Server</td>
+<td>—</td>
+</tr>
+<tr>
+<td>8.2</td>
+<td>Response Templates</td>
+<td>Server</td>
+<td>8.1</td>
+</tr>
+<tr>
+<td>8.3</td>
+<td>Response Offloading (Data Export Streams)</td>
+<td>Server</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p><strong>8.1 — Response Visualization Engine</strong>
+- Add chart rendering to instruction response views
+- Server-side data transformation (equivalent to comparable platforms' post-processors)
+- Built-in processors: SingleSeries, MultiSeries, DateTimeSeries
+- Chart types: Pie, Bar, Column, Line, Area (rendered via lightweight JS chart library in HTMX)
+- Configuration via <code>spec.visualization</code> in InstructionDefinition YAML:
+  <div class="highlight"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">visualization</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">charts</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pie</span>
+<span class="w">        </span><span class="nt">title</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;OS</span><span class="nv"> </span><span class="s">Distribution&quot;</span>
+<span class="w">        </span><span class="nt">x</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">os_name</span>
+<span class="w">        </span><span class="nt">y</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">count</span>
+<span class="w">        </span><span class="nt">processor</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">single_series</span>
+</code></pre></div>
+- REST endpoint: <code>GET /api/v1/executions/{id}/visualization</code>
+- Dashboard: embedded chart cards in execution detail view</p>
+<p><strong>8.2 — Response Templates</strong>
+- Named response view configurations (column selection, sort, filter presets)
+- Stored per InstructionDefinition in <code>spec.responseTemplates</code>
+- Default template auto-generated from result schema
+- Template CRUD via REST API</p>
+<p><strong>8.3 — Response Offloading</strong>
+- Configure external HTTP endpoints to receive response data in real time
+- <code>OffloadTarget</code> model: URL, auth (bearer/basic/HMAC), event filter, batch size
+- Fire-and-forget delivery on background thread (reuse WebhookStore pattern)
+- REST: <code>GET/POST/DELETE /api/v1/offload-targets</code>
+- Per-instruction override: <code>spec.offload.target</code> in YAML</p>
+<hr>
+<h3 id="phase-9-connector-framework-multi-source-inventory">Phase 9: Connector Framework &amp; Multi-Source Inventory</h3>
+<p><em>Federate inventory data from external systems. This is the single biggest gap vs. commercial peers.</em></p>
+<p><strong>Duration estimate: 2 sprints</strong></p>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Title</th>
+<th>Scope</th>
+<th>Depends On</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>9.1</td>
+<td>Connector Framework (Core)</td>
+<td>Server</td>
+<td>—</td>
+</tr>
+<tr>
+<td>9.2</td>
+<td>Inventory Repository Model</td>
+<td>Server</td>
+<td>9.1</td>
+</tr>
+<tr>
+<td>9.3</td>
+<td>SCCM / ConfigMgr Connector</td>
+<td>Server</td>
+<td>9.1</td>
+</tr>
+<tr>
+<td>9.4</td>
+<td>Intune Connector</td>
+<td>Server</td>
+<td>9.1</td>
+</tr>
+<tr>
+<td>9.5</td>
+<td>ServiceNow Connector</td>
+<td>Server</td>
+<td>9.1</td>
+</tr>
+<tr>
+<td>9.6</td>
+<td>WSUS Connector</td>
+<td>Server</td>
+<td>9.1</td>
+</tr>
+<tr>
+<td>9.7</td>
+<td>CSV/File Upload Connector</td>
+<td>Server</td>
+<td>9.1</td>
+</tr>
+<tr>
+<td>9.8</td>
+<td>Inventory Consolidation &amp; Normalization</td>
+<td>Server</td>
+<td>9.2</td>
+</tr>
+</tbody>
+</table>
+<p><strong>9.1 — Connector Framework (Core)</strong>
+- <code>ConnectorStore</code> (SQLite): connector type, name, config (encrypted credentials), schedule, status
+- <code>ConnectorEngine</code>: background sync with pluggable connector implementations
+- Connector interface:
+  <div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">Connector</span><span class="w"> </span><span class="p">{</span>
+<span class="k">public</span><span class="o">:</span>
+<span class="w">    </span><span class="k">virtual</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">type</span><span class="p">()</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="k">virtual</span><span class="w"> </span><span class="n">SyncResult</span><span class="w"> </span><span class="nf">sync</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">ConnectorConfig</span><span class="o">&amp;</span><span class="w"> </span><span class="n">config</span><span class="p">,</span><span class="w"> </span><span class="n">InventoryRepository</span><span class="o">&amp;</span><span class="w"> </span><span class="n">repo</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="k">virtual</span><span class="w"> </span><span class="n">ConnectionTestResult</span><span class="w"> </span><span class="nf">test</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">ConnectorConfig</span><span class="o">&amp;</span><span class="w"> </span><span class="n">config</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">};</span>
+</code></pre></div>
+- Sync lifecycle: NotStarted → Pending → InProgress → Completed/Failed/Cancelled
+- REST: <code>GET/POST/PUT/DELETE /api/v1/connectors</code>, <code>POST /api/v1/connectors/{id}/sync</code>, <code>POST /api/v1/connectors/{id}/test</code>
+- Dashboard: Connectors page in Settings with add/edit/delete/test/sync</p>
+<p><strong>9.2 — Inventory Repository Model</strong>
+- <code>RepositoryStore</code> (SQLite): named repositories per type (inventory, compliance, entitlement)
+- Default repository created on first boot (cannot be deleted)
+- Connectors bound to repositories
+- Consolidation, deduplication, normalization pipeline
+- REST: <code>GET/POST/PUT/DELETE /api/v1/repositories</code>
+- Repository types: Inventory, Compliance, Entitlement (extensible)</p>
+<p><strong>9.3 through 9.7 — Individual Connectors</strong>
+Each connector is a self-contained class implementing the Connector interface:
+- <strong>SCCM</strong>: SQL query against ConfigMgr database (hardware, software, users, patches)
+- <strong>Intune</strong>: Microsoft Graph API (<code>/deviceManagement/managedDevices</code>)
+- <strong>ServiceNow</strong>: REST API (CMDB CI records, incidents, change requests)
+- <strong>WSUS</strong>: SQL query against WSUS database (update status, compliance)
+- <strong>CSV/File Upload</strong>: Parse TSV/CSV with column mapping</p>
+<p><strong>9.8 — Inventory Consolidation &amp; Normalization</strong>
+- Deduplication by device identity (hostname + MAC + serial)
+- Software normalization: vendor/title/version canonicalization
+- Hardware normalization: processor model mapping, VM detection
+- Consolidation reports: matched vs. unmatched, normalization coverage</p>
+<hr>
+<h3 id="phase-10-software-catalog-license-compliance">Phase 10: Software Catalog &amp; License Compliance</h3>
+<p><em>Normalized software identification for license management and compliance.</em></p>
+<p><strong>Duration estimate: 1 sprint</strong></p>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Title</th>
+<th>Scope</th>
+<th>Depends On</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>10.1</td>
+<td>Software Catalog Store</td>
+<td>Server</td>
+<td>9.8</td>
+</tr>
+<tr>
+<td>10.2</td>
+<td>Software Usage Tracking</td>
+<td>Agent + Server</td>
+<td>10.1</td>
+</tr>
+<tr>
+<td>10.3</td>
+<td>License Entitlements &amp; Compliance</td>
+<td>Server</td>
+<td>10.1</td>
+</tr>
+<tr>
+<td>10.4</td>
+<td>Software Tags</td>
+<td>Server</td>
+<td>10.1</td>
+</tr>
+</tbody>
+</table>
+<p><strong>10.1 — Software Catalog Store</strong>
+- <code>CatalogStore</code> (SQLite): normalized software entries (vendor, title, version, edition, platform)
+- Catalog import from CSV/JSON
+- Manual curation UI: merge duplicates, set canonical names
+- REST: <code>GET/POST/PUT /api/v1/catalog/software</code></p>
+<p><strong>10.2 — Software Usage Tracking</strong>
+- New <code>software_usage</code> agent plugin
+- Track application launches, run time, last-used timestamp
+- Categorize: Used (30d), Rarely Used (90d), Unused (&gt;90d), Unreported
+- Report via ReportInventory RPC
+- Server-side aggregation: per-title usage across fleet</p>
+<p><strong>10.3 — License Entitlements &amp; Compliance</strong>
+- Entitlement records: product, purchased_seats, license_type (per-device/per-user/site/enterprise)
+- Compliance calculation: installed_count vs. entitled_count
+- Over/under-licensed reporting
+- REST: <code>GET/POST /api/v1/entitlements</code>
+- Dashboard: license compliance summary</p>
+<p><strong>10.4 — Software Tags</strong>
+- Server-side tags on software catalog entries (not device tags)
+- Used for Management Group rules ("devices with software tagged X")
+- REST: <code>GET/POST/DELETE /api/v1/catalog/software/{id}/tags</code></p>
+<hr>
+<h3 id="phase-11-consumer-model-platform-extensibility">Phase 11: Consumer Model &amp; Platform Extensibility</h3>
+<p><em>Formalize third-party integration as a first-class concept.</em></p>
+<p><strong>Duration estimate: 1 sprint</strong></p>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Title</th>
+<th>Scope</th>
+<th>Depends On</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>11.1</td>
+<td>Consumer Application Registration</td>
+<td>Server</td>
+<td>—</td>
+</tr>
+<tr>
+<td>11.2</td>
+<td>Event Source Management</td>
+<td>Server</td>
+<td>11.1</td>
+</tr>
+<tr>
+<td>11.3</td>
+<td>PowerShell Module</td>
+<td>External</td>
+<td>—</td>
+</tr>
+<tr>
+<td>11.4</td>
+<td>Python SDK</td>
+<td>External</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p><strong>11.1 — Consumer Application Registration</strong>
+- <code>ConsumerStore</code> (SQLite): name, URL, max_concurrent_instructions, offload_target, enabled
+- Consumers get scoped API tokens with rate limits
+- Custom data field for consumer-specific metadata
+- REST: <code>GET/POST/PUT/DELETE /api/v1/consumers</code>
+- Dashboard: Consumers page in Settings</p>
+<p><strong>11.2 — Event Source Management</strong>
+- Configure which system events generate notifications and webhook deliveries
+- Event source categories: agent_lifecycle, execution, compliance, security, system
+- Per-category enable/disable with severity threshold
+- REST: <code>GET/PUT /api/v1/event-sources</code></p>
+<p><strong>11.3 — PowerShell Module</strong>
+- <code>Yuzu.Management</code> PowerShell module wrapping REST API v1
+- Cmdlets: <code>Get-YuzuAgent</code>, <code>Send-YuzuInstruction</code>, <code>Get-YuzuCompliance</code>, etc.
+- Authentication: API token via <code>Connect-YuzuServer</code>
+- Published to PowerShell Gallery</p>
+<p><strong>11.4 — Python SDK</strong>
+- <code>yuzu-sdk</code> Python package wrapping REST API v1
+- Async support via httpx
+- Published to PyPI</p>
+<hr>
+<h3 id="phase-12-remaining-agent-capabilities">Phase 12: Remaining Agent Capabilities</h3>
+<p><em>Close the 19 "Not Started" items from the capability map plus commercial-peer-specific agent features.</em></p>
+<p><strong>Duration estimate: 1 sprint</strong></p>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Title</th>
+<th>Capability</th>
+<th>Scope</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>12.1</td>
+<td>Mapped Drive History</td>
+<td>3.8</td>
+<td>Agent Plugin</td>
+</tr>
+<tr>
+<td>12.2</td>
+<td>Printer Inventory</td>
+<td>3.9</td>
+<td>Agent Plugin</td>
+</tr>
+<tr>
+<td>12.3</td>
+<td>Port Scanning</td>
+<td>4.11</td>
+<td>Agent Plugin</td>
+</tr>
+<tr>
+<td>12.4</td>
+<td>NetBIOS Lookup</td>
+<td>4.9</td>
+<td>Agent Plugin</td>
+</tr>
+<tr>
+<td>12.5</td>
+<td>Open Windows Enumeration</td>
+<td>5.5</td>
+<td>Agent Plugin</td>
+</tr>
+<tr>
+<td>12.6</td>
+<td>Directory Hash (Recursive)</td>
+<td>10.11</td>
+<td>Agent Plugin</td>
+</tr>
+<tr>
+<td>12.7</td>
+<td>Survey Dialog</td>
+<td>14.4</td>
+<td>Agent Plugin</td>
+</tr>
+<tr>
+<td>12.8</td>
+<td>Do-Not-Disturb Mode</td>
+<td>14.5</td>
+<td>Agent Plugin</td>
+</tr>
+<tr>
+<td>12.9</td>
+<td>Active Response Tracking</td>
+<td>14.6</td>
+<td>Agent Plugin</td>
+</tr>
+<tr>
+<td>12.10</td>
+<td>Patch Inventory Event Generation</td>
+<td>8.9</td>
+<td>Agent Plugin</td>
+</tr>
+<tr>
+<td>12.11</td>
+<td>Application Whitelisting</td>
+<td>9.10</td>
+<td>Agent Plugin</td>
+</tr>
+<tr>
+<td>12.12</td>
+<td>Inventory Replication (Delta Sync)</td>
+<td>15.5</td>
+<td>Agent + Server</td>
+</tr>
+<tr>
+<td>12.13</td>
+<td>Binary Resource Distribution</td>
+<td>22.7</td>
+<td>Server</td>
+</tr>
+</tbody>
+</table>
+<p><strong>12.1 — Mapped Drive History</strong> (Windows)
+- New actions in <code>users</code> plugin: <code>mapped_drives</code>, <code>mapped_drive_history</code>
+- Query WMI <code>Win32_MappedLogicalDisk</code> + Event Log 4624/4634 for historical connections
+- Returns: drive_letter, remote_path, username, timestamp, direction (inbound/outbound)</p>
+<p><strong>12.2 — Printer Inventory</strong> (Cross-platform)
+- New action in <code>hardware</code> plugin: <code>printers</code>
+- Windows: <code>EnumPrinters</code> API. Linux: CUPS <code>lpstat</code>. macOS: <code>lpstat</code>
+- Returns: name, driver, port, status, shared, default, network/local</p>
+<p><strong>12.3 — Port Scanning</strong>
+- New action in <code>discovery</code> plugin: <code>scan_ports</code>
+- Parameters: target_ips (comma-separated), ports (range notation: "22,80,443,8000-8100")
+- Non-blocking connect with configurable timeout (default 2s)
+- Returns: ip, port, status (open/closed/filtered), service_guess</p>
+<p><strong>12.4 — NetBIOS Lookup</strong>
+- New action in <code>discovery</code> plugin: <code>netbios_lookup</code>
+- Parameters: ip_addresses (comma-separated)
+- Send NetBIOS Name Query (UDP 137) and parse response
+- Returns: ip, netbios_name, domain, mac_address</p>
+<p><strong>12.5 — Open Windows Enumeration</strong> (Windows)
+- New action in <code>interaction</code> plugin: <code>list_windows</code>
+- <code>EnumWindows</code> + <code>GetWindowText</code> + <code>GetWindowThreadProcessId</code>
+- Returns: hwnd, title, process_name, pid, visible, minimized</p>
+<p><strong>12.6 — Directory Hash</strong>
+- New action in <code>filesystem</code> plugin: <code>hash_directory</code>
+- Recursive SHA-256 of all file contents, sorted by relative path
+- Returns: directory_hash, file_count, total_bytes, elapsed_ms</p>
+<p><strong>12.7 — Survey Dialog</strong> (Windows, Linux)
+- Extend <code>interaction</code> plugin: <code>survey</code> action
+- Multi-question form: text, single-choice, multi-choice, rating scale
+- Windows: WinForms-style dialog. Linux: zenity --forms
+- Returns: structured JSON response with question_id → answer mapping</p>
+<p><strong>12.8 — Do-Not-Disturb Mode</strong>
+- Extend <code>interaction</code> plugin: <code>set_dnd</code> action
+- Suppress all notifications/dialogs for configurable duration
+- Persisted in agent KV storage
+- <code>get_dnd_status</code> action returns current state + expiry</p>
+<p><strong>12.9 — Active Response Tracking</strong>
+- Extend <code>interaction</code> plugin: <code>list_pending</code> action
+- Returns all outstanding surveys/questions awaiting user input
+- Includes interaction_id, type, prompt, issued_at, timeout_at</p>
+<p><strong>12.10 — Patch Inventory Event Generation</strong>
+- Extend <code>windows_updates</code> plugin: <code>generate_inventory_events</code> action
+- Emit structured events for each installed/missing patch
+- Feed into AnalyticsEventStore for SIEM/compliance integration</p>
+<p><strong>12.11 — Application Whitelisting</strong>
+- New <code>app_control</code> plugin
+- Windows: AppLocker policy query/modification via WMI or PowerShell
+- Linux: fapolicyd rules (if available)
+- Actions: <code>get_policy</code>, <code>add_rule</code>, <code>remove_rule</code>, <code>get_blocked_events</code></p>
+<p><strong>12.12 — Inventory Replication</strong>
+- Agent-side inventory cache in SQLite KV store
+- Delta sync: only send changed inventory since last sync
+- Server tracks per-agent sync state (last_sync_at, hash)
+- Reduces inventory bandwidth for large fleets</p>
+<p><strong>12.13 — Binary Resource Distribution</strong>
+- Server-side resource registry (versioned binary blobs)
+- Agents pull resources by name + version with hash verification
+- Used by instructions that need supporting files (scripts, configs, tools)
+- REST: <code>GET/POST/DELETE /api/v1/resources</code></p>
+<hr>
+<h3 id="phase-13-security-hardening-operational-polish">Phase 13: Security Hardening &amp; Operational Polish</h3>
+<p><em>Close remaining security and operational gaps.</em></p>
+<p><strong>Duration estimate: 1 sprint</strong></p>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Title</th>
+<th>Scope</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>13.1</td>
+<td>2FA for Instruction Approval</td>
+<td>Server</td>
+</tr>
+<tr>
+<td>13.2</td>
+<td>Composable Instruction Chains</td>
+<td>Agent + Server</td>
+</tr>
+<tr>
+<td>13.3</td>
+<td>Process / Sync Logging UI</td>
+<td>Server</td>
+</tr>
+<tr>
+<td>13.4</td>
+<td>Dashboard Branding</td>
+<td>Server</td>
+</tr>
+<tr>
+<td>13.5</td>
+<td>MCP Phase 2 (Write Tools)</td>
+<td>Server</td>
+</tr>
+</tbody>
+</table>
+<p><strong>13.1 — 2FA for Instruction Approval</strong>
+- TOTP (RFC 6238) second factor for approval workflow
+- Per-user TOTP secret stored encrypted in auth store
+- QR code enrollment via Settings UI
+- Approval endpoint requires <code>totp_code</code> parameter when 2FA is enabled
+- Fallback: email-based one-time code (requires SMTP config)</p>
+<p><strong>13.2 — Composable Instruction Chains</strong>
+This is the closest Yuzu can get to the category leader's proprietary scripting language without building an interpreter. The approach: server-side multi-step instruction composition using the existing WorkflowEngine.</p>
+<ul>
+<li>Workflow definitions in YAML with step chaining:
+  <div class="highlight"><pre><span></span><code><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Workflow</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">steps</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">instruction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">os_info.get_summary</span>
+<span class="w">      </span><span class="nt">output_as</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">os_data</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">instruction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows_updates.installed</span>
+<span class="w">      </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;os_data.os_type</span><span class="nv"> </span><span class="s">==</span><span class="nv"> </span><span class="s">&#39;windows&#39;&quot;</span>
+<span class="w">      </span><span class="nt">output_as</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">patches</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">instruction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">script_exec.run_text</span>
+<span class="w">      </span><span class="nt">parameters</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">language</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PowerShell</span>
+<span class="w">        </span><span class="nt">script_text</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">          </span><span class="no">$patches = ConvertFrom-Json &#39;${patches.output}&#39;</span>
+<span class="w">          </span><span class="no"># ... process patches</span>
+</code></pre></div></li>
+<li>Variables from previous steps available via <code>${step_name.field}</code> interpolation</li>
+<li>CEL conditions for conditional execution</li>
+<li>This provides equivalent composability without a new scripting language</li>
+</ul>
+<p><strong>13.3 — Process / Sync Logging UI</strong>
+- Dashboard page: <code>/monitoring</code>
+- Tabs: Connector Sync Log, Scheduled Executions, Infrastructure Log
+- Reuse existing AuditStore with category filtering
+- HTMX fragments with 30s auto-refresh</p>
+<p><strong>13.4 — Dashboard Branding</strong>
+- <code>BrandingConfig</code>: logo_url, product_name, primary_color, accent_color
+- Stored in RuntimeConfigStore
+- Settings UI: branding section with preview
+- CSS variables for theme customization</p>
+<p><strong>13.5 — MCP Phase 2 (Write Tools)</strong>
+- 6 write/execute tools: <code>set_tag</code>, <code>delete_tag</code>, <code>execute_instruction</code>, <code>approve_request</code>, <code>reject_request</code>, <code>quarantine_device</code>
+- Approval workflow integration for destructive operations
+- SSE streaming for execution progress</p>
+<hr>
+<h3 id="phase-14-scale-enterprise-readiness">Phase 14: Scale &amp; Enterprise Readiness</h3>
+<p><em>Features needed for very large deployments (&gt;100K devices).</em></p>
+<p><strong>Duration estimate: 2 sprints</strong></p>
+<table>
+<thead>
+<tr>
+<th>Issue</th>
+<th>Title</th>
+<th>Scope</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>14.1</td>
+<td>P2P Content Distribution</td>
+<td>Agent</td>
+</tr>
+<tr>
+<td>14.2</td>
+<td>Multi-Gateway Topology</td>
+<td>Gateway + Server</td>
+</tr>
+<tr>
+<td>14.3</td>
+<td>Database Sharding (Response Partitioning)</td>
+<td>Server</td>
+</tr>
+<tr>
+<td>14.4</td>
+<td>vCenter Connector</td>
+<td>Server</td>
+</tr>
+<tr>
+<td>14.5</td>
+<td>Additional Connectors (BigFix, O365, Oracle)</td>
+<td>Server</td>
+</tr>
+<tr>
+<td>14.6</td>
+<td>High Availability (Active-Passive)</td>
+<td>Server</td>
+</tr>
+</tbody>
+</table>
+<p><strong>14.1 — P2P Content Distribution</strong>
+- Agent mesh for peer content sharing within subnet
+- Leader election via mDNS/broadcast
+- Content announce/request protocol over UDP
+- Cache management: LRU eviction, configurable max size
+- Falls back to server download when no peers have content
+- Bandwidth throttling to avoid network saturation</p>
+<p><strong>14.2 — Multi-Gateway Topology</strong>
+- Server supports multiple gateway registrations
+- Gateway affinity: agents assigned to nearest gateway via latency probing
+- Gateway failover: agents reconnect to alternate gateway on failure
+- Topology view shows all gateways with agent counts</p>
+<p><strong>14.3 — Database Sharding</strong>
+- Response data partitioned by time (monthly SQLite files)
+- Automatic file rotation and TTL cleanup
+- Query router spans partitions transparently
+- Reduces WAL contention for high-throughput response collection</p>
+<p><strong>14.4 — vCenter Connector</strong>
+- VMware vSphere API integration
+- Sync: VMs, ESXi hosts, datastores, clusters, resource pools
+- VM-to-agent correlation via hostname or UUID
+- Virtual summary reporting (physical hosts, guest count, density)</p>
+<p><strong>14.5 — Additional Connectors</strong>
+- BigFix: REST API integration for inventory sync
+- Office 365: Microsoft Graph for license/usage data
+- Oracle LMS: Database query for Oracle deployment facts</p>
+<p><strong>14.6 — High Availability</strong>
+- Active-passive with shared SQLite over network filesystem (NFS/SMB)
+- Heartbeat between primary and standby servers
+- Automatic failover on primary health check failure
+- Gateway re-registration on failover</p>
+<hr>
+<h2 id="part-4-priority-matrix">Part 4: Priority Matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Priority</th>
+<th>Effort</th>
+<th>Enterprise Value</th>
+<th>Parity Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>8: Visualization</strong></td>
+<td>HIGH</td>
+<td>Small</td>
+<td>HIGH</td>
+<td>Closes visible UX gap</td>
+</tr>
+<tr>
+<td><strong>9: Connectors</strong></td>
+<td>CRITICAL</td>
+<td>Large</td>
+<td>CRITICAL</td>
+<td>#1 gap — every enterprise RFP asks for this</td>
+</tr>
+<tr>
+<td><strong>10: Catalog</strong></td>
+<td>HIGH</td>
+<td>Medium</td>
+<td>HIGH</td>
+<td>License compliance is a primary use case</td>
+</tr>
+<tr>
+<td><strong>11: Consumer</strong></td>
+<td>MEDIUM</td>
+<td>Medium</td>
+<td>MEDIUM</td>
+<td>Platform extensibility</td>
+</tr>
+<tr>
+<td><strong>12: Agent Caps</strong></td>
+<td>MEDIUM</td>
+<td>Medium</td>
+<td>LOW-MEDIUM</td>
+<td>Completes capability map to 184/184</td>
+</tr>
+<tr>
+<td><strong>13: Polish</strong></td>
+<td>MEDIUM</td>
+<td>Medium</td>
+<td>MEDIUM</td>
+<td>Security + operational maturity</td>
+</tr>
+<tr>
+<td><strong>14: Scale</strong></td>
+<td>LOW</td>
+<td>Large</td>
+<td>HIGH (at scale)</td>
+<td>Only needed for 100K+ deployments</td>
+</tr>
+<tr>
+<td><strong>15: TAR Dashboard &amp; Scope Walking</strong></td>
+<td>HIGH</td>
+<td>Medium</td>
+<td>HIGH</td>
+<td>Composable scope is Yuzu's product differentiator; commercial peers have no equivalent — TAR page also unifies retention awareness and process-tree forensics</td>
+</tr>
+<tr>
+<td><strong>16: System Guardian</strong></td>
+<td><strong>CRITICAL</strong></td>
+<td>Large</td>
+<td><strong>CRITICAL</strong></td>
+<td><strong>The headline parity feature</strong> — real-time agent-side guaranteed state. Without this, "policy engine equivalent" is an overclaim. PR ladder defined; first 2 PRs shipped.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="recommended-execution-order">Recommended Execution Order</h3>
+<div class="highlight"><pre><span></span><code>Phase 8 (Visualization) ──── 1 sprint ──── Immediate visual impact
+    │
+Phase 9 (Connectors) ─────── 2 sprints ─── Biggest enterprise gap
+    │
+Phase 10 (Catalog) ────────── 1 sprint ──── Builds on 9.8 normalization
+    │
+Phase 12 (Agent Caps) ─────── 1 sprint ──── Close capability map to 100%
+    │ (parallel)
+Phase 11 (Consumer) ────────── 1 sprint ──── Platform extensibility
+    │
+Phase 13 (Polish) ──────────── 1 sprint ──── Security + UX
+    │
+Phase 14 (Scale) ───────────── 2 sprints ─── Large deployment readiness
+    │
+Phase 15 (TAR + Scope Walking) ─ 2 sprints ─ Product differentiator (composable scope)
+    │
+Phase 16 (System Guardian) ──── 4-6 sprints ─ THE headline parity feature; PRs 1-2 done, PRs 3-17 in ladder
+</code></pre></div>
+<p><strong>Total estimated effort: ~15-17 sprints (Phases 8-16). Phase 16 is the longest single phase because real-time agent-side enforcement spans three OS platform-specific delivery tracks (Windows-first per <a href="yuzu-guardian-windows-implementation-plan.html" class="doc-ref"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a>, then Linux, then macOS) and each kernel-event API integration is independently load-bearing.</strong></p>
+<hr>
+<h2 id="part-5-new-capability-map-entries">Part 5: New Capability Map Entries</h2>
+<p>After all phases complete, the capability map would grow from 184 to ~225 capabilities:</p>
+<table>
+<thead>
+<tr>
+<th>New Domain</th>
+<th>Capabilities</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>25. Connector Framework</td>
+<td>Connector CRUD, Sync Engine, Connection Testing, Sync Scheduling, Sync Logging</td>
+</tr>
+<tr>
+<td>26. Inventory Repositories</td>
+<td>Repository CRUD, Consolidation, Deduplication, Normalization, Multi-Source Merge</td>
+</tr>
+<tr>
+<td>27. Software Catalog</td>
+<td>Catalog Store, Software Normalization, AI Curation (stub), Usage Tracking, License Entitlements</td>
+</tr>
+<tr>
+<td>28. Response Visualization</td>
+<td>Chart Rendering, Built-in Processors, Custom Processors, Template Management, <strong>TAR Dashboard Page</strong> (Phase 15.A — Partial), <strong>TAR Process Tree Viewer</strong> (Phase 15.H), <strong>Retention Awareness Surface</strong> (Phase 15.A)</td>
+</tr>
+<tr>
+<td>29. Consumer Applications</td>
+<td>Consumer Registration, Rate Limiting, Data Offloading, Custom Data</td>
+</tr>
+<tr>
+<td><strong>30. Scope Walking &amp; Result Sets</strong></td>
+<td>Result Set Persistence and Lineage (15.B), Composable Scope from Previous Query (15.C), YAML DSL <code>fromResultSet:</code> (15.E), Operational Hardening (15.G)</td>
+</tr>
+<tr>
+<td><strong>31. System Guardian — Real-Time Agent-Side Guaranteed State</strong></td>
+<td>Kernel-event-driven enforcement primitives, event guards (Registry / SCM / WFP / ETW / inotify / netlink / D-Bus / Endpoint Security), condition guards (process / software / compliance / WMI), pre-login activation, offline-capable cached policy, audit journal, dashboard, push protocol, signing, quarantine integration</td>
+</tr>
+</tbody>
+</table>
+<p>Plus the 19 existing "Not Started" items moved to "Done" = <strong>~225 total, all done</strong>.</p>
+<hr>
+<h2 id="part-6-what-we-will-not-build">Part 6: What We Will NOT Build</h2>
+<p>Some commercial-peer features are not worth replicating because Yuzu has superior alternatives:</p>
+<table>
+<thead>
+<tr>
+<th>Commercial Peer Feature</th>
+<th>Why Not</th>
+<th>Yuzu Alternative</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Proprietary-script language interpreter</td>
+<td>Massive effort, proprietary lock-in</td>
+<td>WorkflowEngine + script_exec + plugin ABI</td>
+</tr>
+<tr>
+<td>XML instruction definitions</td>
+<td>Legacy format</td>
+<td>YAML DSL (cleaner, more readable)</td>
+</tr>
+<tr>
+<td>Windows-only authentication</td>
+<td>Limits platform reach</td>
+<td>OIDC/PKCE (universal)</td>
+</tr>
+<tr>
+<td>SQL Server dependency</td>
+<td>Ops burden, licensing cost</td>
+<td>SQLite (embedded, zero-ops)</td>
+</tr>
+<tr>
+<td>.NET Consumer SDK</td>
+<td>Platform-specific</td>
+<td>REST API + Python SDK + PowerShell module</td>
+</tr>
+<tr>
+<td>Vendor-specific desktop IDE</td>
+<td>Desktop app maintenance burden</td>
+<td>Web-based YAML editor (CodeMirror)</td>
+</tr>
+<tr>
+<td>Nomad (full P2P suite)</td>
+<td>Years of engineering</td>
+<td>Simpler P2P mesh (Phase 14.1)</td>
+</tr>
+<tr>
+<td>AI Auto-Curation</td>
+<td>Requires ML training data</td>
+<td>Manual curation + LLM-assisted (via MCP)</td>
+</tr>
+<tr>
+<td>Shopping / Self-Service Portal</td>
+<td>Full separate product</td>
+<td>SoftwareDeploymentStore + approval workflow</td>
+</tr>
+<tr>
+<td>Experience Analytics</td>
+<td>Separate product</td>
+<td>Prometheus metrics + Grafana</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="appendix-file-counts-for-reference">Appendix: File Counts for Reference</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th style="text-align: center;">Current Files</th>
+<th style="text-align: center;">Current LOC (est.)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Server core src/</td>
+<td style="text-align: center;">174 files</td>
+<td style="text-align: center;">~45,000</td>
+</tr>
+<tr>
+<td>Agent plugins/</td>
+<td style="text-align: center;">44 plugins</td>
+<td style="text-align: center;">~25,000</td>
+</tr>
+<tr>
+<td>Proto definitions</td>
+<td style="text-align: center;">4 .proto files</td>
+<td style="text-align: center;">~500</td>
+</tr>
+<tr>
+<td>Gateway (Erlang)</td>
+<td style="text-align: center;">~40 files</td>
+<td style="text-align: center;">~8,000</td>
+</tr>
+<tr>
+<td>Tests</td>
+<td style="text-align: center;">44 test files</td>
+<td style="text-align: center;">~15,000</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td style="text-align: center;"><strong>~300 files</strong></td>
+<td style="text-align: center;"><strong>~93,500</strong></td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

@@ -1,0 +1,752 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TAR Dashboard — Operator Page Design</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/tar-dashboard.md</div>
+<h1 class="doc-title">TAR Dashboard — Operator Page Design</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="tar-dashboard-operator-page-design">TAR Dashboard — Operator Page Design</h1>
+<p><strong>Status:</strong> Design (PR-A.A shipped 2026-04-26: page shell + retention-paused list + Scan / Re-enable; purge action and persistence deferred. See <a href="roadmap.html" class="doc-ref"><code>docs/roadmap.md</code></a> Phase 15.)
+<strong>Audience:</strong> Server engineers, dashboard UI engineers, TAR plugin maintainers
+<strong>Owners:</strong> <code>architect</code> (page architecture), <code>plugin-developer</code> (TAR action surface), <code>security-guardian</code> (SQL execution surface), <code>docs-writer</code> (DSL + REST docs)
+<strong>Related:</strong> <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> (the cross-cutting result-set primitive this page consumes), <a href="yuzu-guardian-design-v1.1.html" class="doc-ref"><code>docs/yuzu-guardian-design-v1.1.md</code></a> (the agent tamper-resistance pillar that the process tree viewer's data quality depends on), <code>agents/plugins/tar/</code> (the data plane).</p>
+<hr>
+<h2 id="1-why-a-dedicated-tar-page">1. Why a dedicated TAR page</h2>
+<p>The Timeline Activity Record (TAR) plugin is one of the <strong>highest-leverage operator surfaces</strong> in Yuzu — it answers the "what happened on this machine" question that drives forensics, compliance, and reactive IR. Today it is reachable only via the generic instruction-launch flow and the <code>/fragments/tar-sql</code> HTMX fragment embedded in another page; the surface area is large but the affordances are scattered. Operators repeatedly asked "where do I go to <em>do TAR</em>" — the answer needs to be a single dashboard page.</p>
+<p>The page is also the home for two new affordances that did not have anywhere to live:</p>
+<ol>
+<li><strong>Retention-paused source list</strong> — the operator-facing view of <code>&lt;source&gt;_enabled=false</code> per device, born from issue #539. Without it, an operator who disabled <code>process_enabled</code> on a device for forensic preservation has no aggregate view of which boxes are accumulating non-aging data.</li>
+<li><strong>Process tree viewer</strong> — reconstructed from <code>process_live</code> plus a seed snapshot taken at agent install / first start (see §6). Forensic timeline of every process born under a parent, walked back to PID 1.</li>
+</ol>
+<p>The page is also the surface where <strong>scope walking</strong> (per <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a>) becomes most visibly useful — the TAR SQL frame is the canonical iterative-narrowing tool, and result-set chips on this page are the operator's reasoning chain made visible.</p>
+<h2 id="2-information-architecture">2. Information architecture</h2>
+<div class="highlight"><pre><span></span><code>Dashboard ──────────────────────────────────────────────────────────────────
+│
+├─ Devices       (existing)
+├─ Inventory     (existing)
+├─ Instructions  (existing)
+├─ Policies      (existing)
+├─ TAR           (new — this page) ─────────────────────────────────────────┐
+│                                                                            │
+│  /tar                                                            │
+│  ┌────────────────────────────────────────────────────────────────────┐    │
+│  │  [Scope chip ▼]  windows-chrome-suspects · 2,798 devices · pinned │    │
+│  │  ─── lineage breadcrumb (per scope-walking §8.2) ────────────────  │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│  ┌─ Retention-paused sources (PR-A) ─────────────────────────────────┐    │
+│  │   device              source     paused since   live rows  oldest │    │
+│  │   prod-eu-1 (Linux)   process    2026-04-25      18,402   31d 4h  │    │
+│  │   prod-eu-1 (Linux)   tcp        2026-04-25       4,193   31d 4h  │    │
+│  │   ...                                                              │    │
+│  │   [Re-enable]  [Purge data]  [Export CSV]                          │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│  ┌─ TAR SQL (PR-D, scope-walking-aware) ──────────────────────────────┐   │
+│  │   $TAR  &gt; SELECT name, COUNT(*) FROM process_hourly GROUP BY name  │   │
+│  │   [Run scoped to: windows-chrome-suspects]                         │   │
+│  │                                                                     │   │
+│  │   results... (streamed)                                             │   │
+│  │   [Save as result set ▼ &quot;chrome-procs&quot;]                             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│  ┌─ Process tree viewer (PR-H) ──────────────────────────────────────┐    │
+│  │   device: [pick from scope ▼]                                     │    │
+│  │                                                                    │    │
+│  │   1   systemd                                                      │    │
+│  │   ├── 234   sshd                                                   │    │
+│  │   │   └── 1402  bash (user=alice)                                  │    │
+│  │   │       └── 1419  python3 train.py  ← still running              │    │
+│  │   ├── 412   docker                                                 │    │
+│  │   │   ├── 998   containerd                                         │    │
+│  │   │   └── ...                                                      │    │
+│  │   ├── 814   yuzu-agent  (★ self)                                   │    │
+│  │   ...                                                              │    │
+│  │   Tree as observed since 2026-04-12 09:14 UTC (agent install)      │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                            │
+├─ Settings      (existing)                                                  │
+└────────────────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+<p>URL structure:</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Purpose</th>
+<th>Required permission</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/tar</code></td>
+<td>The page</td>
+<td><code>Infrastructure:Read</code></td>
+</tr>
+<tr>
+<td><code>/fragments/tar/retention-paused</code></td>
+<td>HTMX fragment for the paused-sources table</td>
+<td><code>Infrastructure:Read</code></td>
+</tr>
+<tr>
+<td><code>/fragments/tar/sql</code></td>
+<td>(existing, relocated) HTMX fragment for the SQL frame</td>
+<td><code>Infrastructure:Read</code> + dispatch</td>
+</tr>
+<tr>
+<td><code>/fragments/tar/process-tree</code></td>
+<td>HTMX fragment for the tree viewer</td>
+<td><code>Infrastructure:Read</code></td>
+</tr>
+<tr>
+<td><code>/api/v1/tar/retention-status</code></td>
+<td>JSON: per-device per-source enabled/disabled</td>
+<td><code>Infrastructure:Read</code></td>
+</tr>
+<tr>
+<td><code>/api/v1/tar/process-tree/{device_id}</code></td>
+<td>JSON: reconstructed tree for one device</td>
+<td><code>Infrastructure:Read</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="3-pr-a-retention-paused-source-list">3. PR-A — Retention-paused source list</h2>
+<p><strong>Goal:</strong> every device × source pair where <code>&lt;source&gt;_enabled=false</code>, surfaced in a sortable, filterable, exportable table, with one-click re-enable and an explicit "purge data" action gated behind a confirmation modal.</p>
+<h3 id="31-data-flow">3.1 Data flow</h3>
+<p>The source of truth is the agent's <code>tar_config</code> table — the <code>&lt;source&gt;_enabled</code> keys, set by the <code>tar.configure</code> action. The server does not currently maintain a centralised "TAR config" mirror; the data path is <strong>request-driven</strong>:</p>
+<ol>
+<li>Page load fans out <code>tar.status</code> (extended in PR-A to emit the four <code>&lt;source&gt;_enabled</code> values + the <code>&lt;source&gt;_live_rows</code> count + <code>&lt;source&gt;_oldest_ts</code> per source) to every device the page's scope resolves to. Scope is the active scope chip (default <code>__all__</code> for fresh page load).</li>
+<li>Responses stream back via the standard agent-streaming pipeline.</li>
+<li>Server collates into a transient in-memory table; renders as HTMX OOB swaps.</li>
+<li>Empty rows (<code>enabled=true</code> for all four sources) are dropped — the table only shows the <em>paused</em> state, not the entire fleet.</li>
+</ol>
+<p>This avoids a new persistent server-side mirror, which would have to be reconciled with agent state on every config change. The trade-off is a 5-15s page-load cost on a large fleet; mitigated by:
+- Scope-restricted queries (the operator usually narrows first via a result set)
+- Manual <strong>Refresh</strong> button for ad-hoc re-fan-out (automatic background refresh is planned for Phase 15.G operational hardening)
+- Manual "Refresh" button for ad-hoc re-fan-out</p>
+<h3 id="32-extending-tarstatus">3.2 Extending <code>tar.status</code></h3>
+<p>The action's response gains four lines per source (so 16 new lines total for the 4 sources):</p>
+<div class="highlight"><pre><span></span><code>config|process_enabled|true
+config|process_live_rows|18402
+config|process_oldest_ts|1730000000
+config|process_paused_at|0           # 0 = never; otherwise the ts when last set to false
+config|tcp_enabled|false
+config|tcp_live_rows|4193
+config|tcp_oldest_ts|1733000000
+config|tcp_paused_at|1735689600
+...
+</code></pre></div>
+<p><code>config|&lt;source&gt;_paused_at|...</code> is <strong>new</strong> — it requires the <code>do_configure</code> handler in <code>tar_plugin.cpp</code> to write this timestamp whenever it transitions a source from enabled to disabled (and clear it on the reverse). This is the operator-facing "paused since" column and is only meaningful at the server's wall-clock. Backwards-compatible — if the field is absent, the dashboard renders <code>—</code> and falls back to "unknown."</p>
+<h3 id="33-re-enable-action">3.3 Re-enable action</h3>
+<p>Single-row "Re-enable" button → confirm modal → server dispatches <code>tar.configure</code> with the appropriate <code>&lt;source&gt;_enabled=true</code> to the named device. On success, the row drops out of the table on the next refresh; on failure the row turns yellow with the error tooltip.</p>
+<p>Per-source independence (the #539 invariant) means re-enabling one source on a device does not touch the other three — the dispatched parameter is per-source.</p>
+<h3 id="34-purge-action">3.4 Purge action</h3>
+<p>The "Purge data" button on a row is more dangerous than re-enable — it tells the agent to drop every row from <code>&lt;source&gt;_live</code>, <code>&lt;source&gt;_hourly</code>, <code>&lt;source&gt;_daily</code>, <code>&lt;source&gt;_monthly</code> for that source, <em>without</em> re-enabling the collector. The use case is "we paused process collection 8 weeks ago for forensic preservation; we have what we need, the disk is filling up, drop the rows but keep the collector paused."</p>
+<p>Server dispatches a new agent action <code>tar.purge_source</code> with <code>{source: &lt;name&gt;}</code>. The action is gated behind a typed-confirmation modal ("type the device hostname to confirm purge of <code>process</code> data"), per the destructive-action discipline in the project root <code>CLAUDE.md</code>. Audit row: <code>action: tar.purge_source, principal: &lt;session&gt;, result: success|failure, detail_json: {device_id, source, rows_deleted}</code>.</p>
+<h3 id="35-permissions-and-safety">3.5 Permissions and safety</h3>
+<ul>
+<li>View-only access requires <code>Infrastructure:Read</code>.</li>
+<li><strong>Scan fleet</strong> requires <code>Execution:Execute</code> (it dispatches a fleet-wide command — same tier as <code>run-instruction</code> and <code>tar-execute</code> siblings).</li>
+<li><strong>Re-enable</strong> requires <code>Execution:Execute</code> and the operator's RBAC visibility on the target device. Out-of-scope <code>device_id</code> values collapse to the same 404 response as not-connected agents (no enumeration oracle); the audit log records the real reason server-side.</li>
+<li>Purge requires <code>Infrastructure:Delete</code> on the target device, <strong>and</strong> the device must currently report <code>&lt;source&gt;_enabled=false</code> (rejected at the server with <code>400 SOURCE_NOT_PAUSED</code> if the live status disagrees — prevents a stale row from triggering accidental purge of an actively-collecting source).</li>
+</ul>
+<h3 id="36-tests">3.6 Tests</h3>
+<ul>
+<li>Server-side: unit tests for the aggregation/render path against synthetic <code>tar.status</code> responses (paused-only, all-paused, none-paused, partial response).</li>
+<li>Agent-side: extends <code>tests/unit/test_tar_aggregator.cpp</code> (the suite added for #539) with a config-roundtrip test for <code>&lt;source&gt;_paused_at</code> write-on-disable / clear-on-enable.</li>
+<li>Integration: stand up the UAT stack, disable a source on a synthetic agent, confirm the row appears in the page within one refresh tick, click re-enable, confirm the row drops.</li>
+</ul>
+<h2 id="4-pr-d-tar-sql-frame-scope-walking-aware">4. PR-D — TAR SQL frame, scope-walking-aware</h2>
+<p>The frame body is largely the existing <code>/fragments/tar-sql</code> route (<code>server/core/src/dashboard_routes.cpp:500</code>). PR-D moves it onto the new page and wires it into the result-set primitive (<a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a>):</p>
+<ol>
+<li><strong>Scope chip</strong> in the frame header — operator picks an active result set (or a standard scope) before submitting. The dispatch resolves <code>from_result_set:&lt;id&gt;</code> to the device-ID set per <a href="scope-walking-design.html" class="doc-ref"><code>scope-walking-design.md</code></a> §4.</li>
+<li><strong>"Save as result set" button</strong> on the results pane — after a query returns, operator clicks "Save as result set," names it, and the server creates a new result set (<code>source_kind=tar_query</code>) with member IDs equal to the union of agents that returned ≥1 row. Default name is <code>tar-&lt;first-five-chars-of-sql-hash&gt;</code> so the operator can save without typing.</li>
+<li><strong>Lineage breadcrumb</strong> above the frame mirrors the active scope chip's lineage (<a href="scope-walking-design.html" class="doc-ref"><code>scope-walking-design.md</code></a> §8.2).</li>
+</ol>
+<p>No changes to the <code>tar.sql</code> agent action; the change is purely server-side scope resolution + result-set persistence.</p>
+<h2 id="5-pr-h-process-tree-viewer">5. PR-H — Process tree viewer</h2>
+<h3 id="51-reconstruction-model">5.1 Reconstruction model</h3>
+<p>Per the architectural direction set in the parent conversation:</p>
+<ul>
+<li>The agent runs from boot or first install, hardened against tampering (a separate roadmap track — see <a href="yuzu-guardian-windows-implementation-plan.html" class="doc-ref"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a> and the open Guardian PR ladder).</li>
+<li>On first start, the agent runs <code>tar.process_tree</code> to produce a <strong>seed snapshot</strong> — every PID currently running, with PPID, name, cmdline, user, start_time. Walks <code>/proc</code> (Linux), <code>CreateToolhelp32Snapshot</code> + <code>Process32FirstW</code>/<code>NextW</code> (Windows), <code>proc_listallpids</code> + <code>proc_pidinfo(PROC_PIDTBSDINFO|PIDPATHINFO)</code> (macOS). Stored in <code>process_live</code> with a tagged <code>action='seed'</code> row per PID.</li>
+<li>From the seed onward, regular <code>collect_fast</code> cycles emit <code>action='started'</code> / <code>action='stopped'</code> events. These are appended to <code>process_live</code> and are the canonical mutation stream for the tree.</li>
+<li>At render time, the server queries <code>process_live</code> for one device's full history (or a time-bounded slice), replays the seed + events, and produces a tree JSON.</li>
+</ul>
+<p><strong>Honesty in framing.</strong> The tree shows "as observed since <code>&lt;seed_ts&gt;</code>" — usually the agent install timestamp. Parents that died before the seed cannot be recovered; their orphan children appear reparented to PID 1 (Linux) / <code>launchd</code> (macOS) / <code>System</code> (Windows) just as they would be in a live <code>ps</code>. The dashboard renders the seed timestamp prominently:</p>
+<div class="highlight"><pre><span></span><code>Tree as observed since 2026-04-12 09:14 UTC (agent install)
+1,402 processes seen · 89 currently running
+</code></pre></div>
+<h3 id="52-idempotency-of-tarprocess_tree">5.2 Idempotency of <code>tar.process_tree</code></h3>
+<p>The action is invoked:
+- <strong>Automatically</strong> on every agent start (idempotent — re-running just appends a fresh <code>seed</code> row set, marked with the new start's snapshot ID; the dashboard always uses the most recent seed when reconstructing).
+- <strong>On demand</strong> via the dashboard "Re-seed" button, useful when the operator suspects the process_live event stream has drifted (e.g., long network partition, rollup race).</p>
+<h3 id="53-wire-surface">5.3 Wire surface</h3>
+<p><code>tar.process_tree</code> action emits one <code>process|seed|&lt;pid&gt;|&lt;ppid&gt;|&lt;name&gt;|&lt;user&gt;|&lt;start_ts&gt;|&lt;cmdline&gt;</code> line per running PID at invocation time. Server-side parser writes them as a single batch into <code>process_live</code> via the typed insert path.</p>
+<h3 id="54-renderer">5.4 Renderer</h3>
+<p>Two server-side paths:</p>
+<ul>
+<li><code>GET /api/v1/tar/process-tree/{device_id}</code> returns <code>{seed_ts, observation_window_seconds, tree: { pid: 1, children: [ ... ] }}</code> — the reconstructed tree.</li>
+<li><code>GET /fragments/tar/process-tree?device=...</code> returns HTMX-friendly nested <code>&lt;details&gt;</code>/<code>&lt;summary&gt;</code> markup — no graph library required for v1.</li>
+</ul>
+<p>Time slicing (<code>?as_of=&lt;ts&gt;</code> query param) replays events only up to <code>as_of</code> — used for "show me the tree at the moment of incident X." Default is "now."</p>
+<h3 id="55-performance-and-memory">5.5 Performance and memory</h3>
+<p>Seed size on a typical Windows server: 200-400 PIDs. Linux server: 200-1,500 PIDs. macOS desktop: 300-600 PIDs. Event volume per device per day: 10K-200K (a noisy CI box can do 500K+).</p>
+<p>The reconstruction is O(events_in_window) per device. For a 30-day window on a 200K-events/day box, that's 6M events — too slow to replay at every page load. Mitigations:</p>
+<ul>
+<li>Server-side per-device LRU cache of the most recent reconstruction (5-min TTL).</li>
+<li>Time-bucketed checkpoints in <code>process_live</code> — a periodic background task writes a <code>__checkpoint__</code> row with the live tree state every 24h, so a query for "now" only replays since the most recent checkpoint.</li>
+<li>Hard limit on the rendered tree: 50K nodes, then truncate with "Tree exceeds render limit; narrow with <code>?as_of</code> or <code>?root_pid</code>."</li>
+</ul>
+<h3 id="56-permissions">5.6 Permissions</h3>
+<p><code>Infrastructure:Read</code> to view. The tree exposes per-process cmdline which can carry secrets (passwords on the command line, API tokens in env vars rendered into cmdline). The renderer applies the <strong>same redaction patterns</strong> the TAR plugin already uses (<code>agents/plugins/tar/src/tar_plugin.cpp</code> <code>load_redaction_patterns</code>) before serialisation. Audit row on every fetch: <code>action: tar.process_tree.read, detail_json: {device_id, as_of, node_count}</code>.</p>
+<h2 id="6-permissions-matrix">6. Permissions matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Required</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/tar</code> page load</td>
+<td><code>Infrastructure:Read</code></td>
+<td>Same as Devices/Inventory pages</td>
+</tr>
+<tr>
+<td>Retention-paused list view</td>
+<td><code>Infrastructure:Read</code></td>
+<td></td>
+</tr>
+<tr>
+<td>Scan fleet (Phase 15.A)</td>
+<td><code>Execution:Execute</code></td>
+<td>Dispatches <code>tar.status</code> fleet-wide; same tier as run-instruction/tar-execute</td>
+</tr>
+<tr>
+<td>Re-enable</td>
+<td><code>Execution:Execute</code></td>
+<td>Per-device RBAC visibility check; out-of-scope collapses to same 404 as not-connected (no enumeration oracle)</td>
+</tr>
+<tr>
+<td>Purge</td>
+<td><code>Infrastructure:Delete</code></td>
+<td>Per-device check + typed confirmation modal</td>
+</tr>
+<tr>
+<td>TAR SQL submit</td>
+<td><code>Infrastructure:Read</code> (today) → may tighten later</td>
+<td>The current grant is read-only because TAR SQL is bounded to the agent's own DB and is parameter-checked SELECT-only</td>
+</tr>
+<tr>
+<td>Save SQL result as result set</td>
+<td><code>Infrastructure:Read</code> + result-set creation quota</td>
+<td>Per scope-walking-design §3.3</td>
+</tr>
+<tr>
+<td>Process tree view</td>
+<td><code>Infrastructure:Read</code></td>
+<td>With redaction pass</td>
+</tr>
+<tr>
+<td>Re-seed process tree</td>
+<td><code>Infrastructure:Update</code></td>
+<td>Dispatches <code>tar.process_tree</code> to one device</td>
+</tr>
+</tbody>
+</table>
+<h2 id="7-observability">7. Observability</h2>
+<p>Per <a href="observability-conventions.html" class="doc-ref"><code>docs/observability-conventions.md</code></a>:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Type</th>
+<th>Labels</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu_tar_dashboard_view_total</code></td>
+<td>counter</td>
+<td><code>frame</code> (retention/sql/tree), <code>result</code></td>
+</tr>
+<tr>
+<td><code>yuzu_tar_retention_paused_devices</code></td>
+<td>gauge</td>
+<td><code>source</code></td>
+</tr>
+<tr>
+<td><code>yuzu_tar_purge_total</code></td>
+<td>counter</td>
+<td><code>source</code>, <code>result</code></td>
+</tr>
+<tr>
+<td><code>yuzu_tar_process_tree_render_seconds</code></td>
+<td>histogram</td>
+<td><code>node_count_bucket</code></td>
+</tr>
+<tr>
+<td><code>yuzu_tar_process_tree_seed_age_seconds</code></td>
+<td>gauge</td>
+<td><code>device_id</code> (only top-N noisiest)</td>
+</tr>
+</tbody>
+</table>
+<p>Audit actions: <code>tar.status.scan</code> (operator-triggered Scan fleet — emitted by PR-A.A), <code>tar.source.reenable</code> (operator-triggered Re-enable on a row — emitted by PR-A.A), <code>tar.source.purge</code> (operator-triggered purge — Phase 15.A.next), <code>tar.process_tree.read</code> (Phase 15.H), <code>tar.process_tree.reseed</code> (Phase 15.H). All carry <code>device_id</code> and <code>source</code> in <code>detail</code> where applicable.</p>
+<h2 id="8-cross-references">8. Cross-references</h2>
+<ul>
+<li><a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> — the result-set primitive consumed throughout this page</li>
+<li><a href="yuzu-guardian-design-v1.1.html" class="doc-ref"><code>docs/yuzu-guardian-design-v1.1.md</code></a> — agent tamper-resistance, foundational to the process tree's data quality claim</li>
+<li><a href="yuzu-guardian-windows-implementation-plan.html" class="doc-ref"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a> — Windows-first hardening PR ladder</li>
+<li><code>agents/plugins/tar/src/tar_aggregator.cpp</code> — the #539 retention pause that the retention-paused list surfaces</li>
+<li><code>agents/plugins/tar/src/tar_plugin.cpp</code> — the action surface (<code>tar.status</code>, <code>tar.configure</code>, future <code>tar.process_tree</code>, <code>tar.purge_source</code>)</li>
+<li><code>server/core/src/dashboard_routes.cpp</code> — the existing TAR SQL fragment to be relocated and extended</li>
+<li><a href="data-architecture.html" class="doc-ref"><code>docs/data-architecture.md</code></a> — error code taxonomy, audit envelope conventions</li>
+<li><a href="yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a> — DSL surface (gains <code>fromResultSet:</code> per scope-walking-design §7)</li>
+</ul>
+<h2 id="9-sequencing">9. Sequencing</h2>
+<table>
+<thead>
+<tr>
+<th>PR</th>
+<th>Scope</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PR-A</td>
+<td>Page shell + retention-paused list (this doc §3)</td>
+<td><strong>Shipped</strong> PR-A.A (paused_at extension + dashboard page + retention-paused list). Purge action (§3.4) deferred.</td>
+</tr>
+<tr>
+<td>PR-B</td>
+<td>Result-set store + REST API (<a href="scope-walking-design.html" class="doc-ref"><code>scope-walking-design.md</code></a> PR-B)</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR-C</td>
+<td>Scope chip + sidebar + breadcrumb (<a href="scope-walking-design.html" class="doc-ref"><code>scope-walking-design.md</code></a> PR-C)</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR-D</td>
+<td>TAR SQL frame migrated and scope-walking-aware (this doc §4)</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR-E</td>
+<td>DSL <code>fromResultSet:</code> (<a href="scope-walking-design.html" class="doc-ref"><code>scope-walking-design.md</code></a> PR-E)</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR-F</td>
+<td>Reference IR walkthrough integration test (<a href="scope-walking-design.html" class="doc-ref"><code>scope-walking-design.md</code></a> PR-F)</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR-G</td>
+<td>Operational hardening (live re-eval, GC, metrics)</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR-H</td>
+<td>Process tree viewer (this doc §5)</td>
+<td>Pending — waits on agent service-install hardening readiness</td>
+</tr>
+</tbody>
+</table>
+<h2 id="10-open-questions">10. Open questions</h2>
+<ul>
+<li>Should the retention-paused list also surface <code>&lt;source&gt;_enabled=true</code> devices that have <em>zero</em> recent rows (silent collector failure)? Useful for SRE but visually noisy in IR; defer to PR-G.</li>
+<li>The "Purge data" action should ideally be replaced by an "Export then purge" flow that puts the rows into a signed evidence bundle before deletion — a SOC 2 CC7.2 evidence requirement. Defer to a follow-up issue once the retention-paused list ships.</li>
+<li>Multi-device re-enable (select-many in the table, single click "Re-enable selected") is an obvious affordance once the table has rows; ship in PR-A only if the single-row path is solid.</li>
+</ul>
+</main>
+</body>
+</html>

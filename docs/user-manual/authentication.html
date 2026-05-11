@@ -1,0 +1,955 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Authentication</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/authentication.md</div>
+<h1 class="doc-title">Authentication</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="authentication">Authentication</h1>
+<p>Yuzu supports multiple authentication methods: local password auth with session cookies, OIDC single sign-on, and API tokens for automation. All methods funnel into the same RBAC system once a principal is identified.</p>
+<h2 id="local-password-authentication">Local Password Authentication</h2>
+<h3 id="first-run-setup">First-Run Setup</h3>
+<p>On first launch, the server prompts interactively for admin credentials. These are stored in <code>yuzu-server.cfg</code> with PBKDF2-hashed passwords.</p>
+<div class="highlight"><pre><span></span><code>$ ./yuzu-server
+No admin account found. Let&#39;s create one.
+Username: admin
+Password: ********
+Confirm:  ********
+Admin account created.
+</code></pre></div>
+<h3 id="login">Login</h3>
+<p>Authenticate by posting credentials to <code>/login</code>. The server returns a <code>yuzu_session</code> cookie.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-c<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/login<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s2">&quot;username=admin&amp;password=s3cret&quot;</span>
+</code></pre></div>
+<p>On success the response is a <code>200 OK</code> with a JSON body <code>{"status":"ok"}</code> and a <code>Set-Cookie</code> header containing the <code>yuzu_session</code> token. The <code>cookies.txt</code> file now contains the session cookie. Use it on subsequent requests:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/v1/me
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;username&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;admin&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;role&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;admin&quot;</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>All REST API v1 responses are wrapped in this envelope. The <code>data</code> key holds the payload, and <code>meta</code> contains the API version. List endpoints also include a <code>pagination</code> key.</p>
+<h3 id="logout">Logout</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/logout
+</code></pre></div>
+<p>Returns <code>200 OK</code> with <code>{"status":"ok"}</code>. The session is invalidated server-side and the <code>yuzu_session</code> cookie is cleared via <code>Set-Cookie</code> with <code>Max-Age=0</code>.</p>
+<h3 id="auth-middleware-behavior">Auth Middleware Behavior</h3>
+<table>
+<thead>
+<tr>
+<th>Client type</th>
+<th>Unauthenticated behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Page request (path does not start with <code>/api/</code> or <code>/events</code>)</td>
+<td>302 redirect to <code>/login</code></td>
+</tr>
+<tr>
+<td>API request (path starts with <code>/api/</code> or is <code>/events</code>)</td>
+<td><code>401 Unauthorized</code> with JSON error body <code>{"error":"unauthorized"}</code></td>
+</tr>
+</tbody>
+</table>
+<p>The middleware distinguishes browser from API by request path, not by the <code>Accept</code> header.</p>
+<h2 id="https">HTTPS</h2>
+<p>Enable TLS for the dashboard and REST API with CLI flags:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--https</code></td>
+<td>off</td>
+<td>Enable HTTPS listener</td>
+</tr>
+<tr>
+<td><code>--https-port</code></td>
+<td><code>8443</code></td>
+<td>HTTPS listen port</td>
+</tr>
+<tr>
+<td><code>--https-cert</code></td>
+<td>(required)</td>
+<td>Path to PEM certificate file</td>
+</tr>
+<tr>
+<td><code>--https-key</code></td>
+<td>(required)</td>
+<td>Path to PEM private key file</td>
+</tr>
+<tr>
+<td><code>--no-https-redirect</code></td>
+<td>off</td>
+<td>Disable automatic HTTP-to-HTTPS redirect</td>
+</tr>
+</tbody>
+</table>
+<p>Example:</p>
+<div class="highlight"><pre><span></span><code>./yuzu-server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-port<span class="w"> </span><span class="m">8443</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-cert<span class="w"> </span>/etc/yuzu/server.crt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-key<span class="w"> </span>/etc/yuzu/server.key
+</code></pre></div>
+<p>When <code>--https</code> is enabled, plain HTTP requests are redirected to HTTPS by default. Pass <code>--no-https-redirect</code> to serve both protocols independently.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Verify HTTPS is working</span>
+curl<span class="w"> </span>-s<span class="w"> </span>--cacert<span class="w"> </span>/etc/yuzu/ca.crt<span class="w"> </span>https://localhost:8443/api/v1/me<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span>cookies.txt
+</code></pre></div>
+<h2 id="oidc-single-sign-on">OIDC Single Sign-On</h2>
+<p>Yuzu supports OpenID Connect with PKCE for browser-based SSO. This has been tested with Microsoft Entra ID (Azure AD) and should work with any compliant OIDC provider.</p>
+<h3 id="server-configuration">Server Configuration</h3>
+<p>OIDC can be configured in two ways:</p>
+<p><strong>Option 1: Dashboard Settings (recommended)</strong></p>
+<p>Navigate to <strong>Settings &gt; Directory Integration / OIDC SSO</strong> in the dashboard. Enter the issuer URL, client ID, client secret, and admin group ID. Click "Test Connection" to verify discovery, then "Save OIDC Configuration". Changes take effect immediately — no server restart required.</p>
+<p><strong>Option 2: CLI flags</strong></p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--oidc-issuer</code></td>
+<td>Issuer URL (e.g., <code>https://login.microsoftonline.com/{tenant}/v2.0</code>)</td>
+</tr>
+<tr>
+<td><code>--oidc-client-id</code></td>
+<td>Application (client) ID from the IdP</td>
+</tr>
+<tr>
+<td><code>--oidc-client-secret</code></td>
+<td>Client secret (required for Entra/Azure AD web apps)</td>
+</tr>
+<tr>
+<td><code>--oidc-redirect-uri</code></td>
+<td>Callback URL (auto-computed from the request <code>Host</code> header if omitted; must match IdP registration if set explicitly)</td>
+</tr>
+<tr>
+<td><code>--oidc-admin-group</code></td>
+<td>Entra group object ID that maps to the admin role</td>
+</tr>
+<tr>
+<td><code>--oidc-skip-tls-verify</code></td>
+<td>Disable TLS cert verification for OIDC endpoints (insecure, dev only)</td>
+</tr>
+</tbody>
+</table>
+<p>Example startup:</p>
+<div class="highlight"><pre><span></span><code>./yuzu-server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https<span class="w"> </span>--https-port<span class="w"> </span><span class="m">8443</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-cert<span class="w"> </span>/etc/yuzu/server.crt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-key<span class="w"> </span>/etc/yuzu/server.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--oidc-issuer<span class="w"> </span><span class="s2">&quot;https://login.microsoftonline.com/abcd1234-.../v2.0&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--oidc-client-id<span class="w"> </span><span class="s2">&quot;11111111-2222-3333-4444-555555555555&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--oidc-client-secret<span class="w"> </span><span class="s2">&quot;your-client-secret&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--oidc-redirect-uri<span class="w"> </span><span class="s2">&quot;https://yuzu.example.com:8443/auth/callback&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--oidc-admin-group<span class="w"> </span><span class="s2">&quot;a1b2c3d4-e5f6-7890-abcd-ef1234567890&quot;</span>
+</code></pre></div>
+<h3 id="oidc-login-flow">OIDC Login Flow</h3>
+<ol>
+<li>User clicks "Sign in with SSO" on the login page.</li>
+<li>Browser is redirected to <code>GET /auth/oidc/start</code>, which generates a PKCE challenge and redirects to the IdP's authorization endpoint.</li>
+<li>User authenticates at the IdP.</li>
+<li>IdP redirects back to <code>GET /auth/callback</code> with an authorization code.</li>
+<li>Server exchanges the code for tokens, validates the ID token, extracts claims, and creates a local session.</li>
+</ol>
+<div class="highlight"><pre><span></span><code>Browser           Yuzu Server               IdP (Entra ID)
+  |                    |                          |
+  |-- GET /auth/oidc/start --&gt;                    |
+  |                    |-- 302 authorize?... ----&gt;|
+  |                    |                          |
+  |                    |          (user authenticates)
+  |                    |                          |
+  |                    |&lt;--- 302 /auth/callback --|
+  |&lt;-- Set-Cookie -----|                          |
+</code></pre></div>
+<h3 id="group-to-role-mapping">Group-to-Role Mapping</h3>
+<p>When the IdP includes group claims (e.g., Entra ID <code>groups</code> claim), Yuzu checks whether the user belongs to the admin group specified by <code>--oidc-admin-group</code>. If the user's group list contains that group ID, they receive the <code>admin</code> role. Otherwise they receive the default <code>user</code> role.</p>
+<p>If the OIDC user's email or display name matches a local admin account, they are also granted admin regardless of group membership.</p>
+<blockquote>
+<p><strong>Note:</strong> Only a single admin group mapping is currently supported via the <code>--oidc-admin-group</code> CLI flag. Multi-role group mapping (e.g., mapping different groups to ITServiceOwner or Operator) is planned for a future release and will use the RBAC store's group-scoped role assignments.</p>
+</blockquote>
+<h3 id="entra-id-setup-checklist">Entra ID Setup Checklist</h3>
+<ol>
+<li>Register an application in Entra ID (Azure Portal &gt; App registrations).</li>
+<li>Set the redirect URI to <code>https://yuzu.example.com:8443/auth/callback</code> (type: Web).</li>
+<li>Create a client secret under Certificates &amp; secrets.</li>
+<li>Under Token configuration, add the <code>groups</code> optional claim to the ID token.</li>
+<li>Grant <code>openid</code>, <code>profile</code>, and <code>email</code> API permissions.</li>
+<li>Pass the tenant-specific issuer URL, client ID, secret, and admin group ID to the Yuzu server flags (<code>--oidc-issuer</code>, <code>--oidc-client-id</code>, <code>--oidc-client-secret</code>, <code>--oidc-admin-group</code>).</li>
+</ol>
+<h2 id="api-tokens">API Tokens</h2>
+<p>API tokens provide non-interactive authentication for scripts, CI/CD pipelines, and integrations. Tokens are passed as Bearer tokens and bypass the session/cookie mechanism.</p>
+<h3 id="creating-a-token">Creating a Token</h3>
+<p>Requires <code>ApiToken:Write</code> RBAC permission.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/tokens<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;ci-pipeline&quot;,</span>
+<span class="s1">    &quot;expires_at&quot;: 1750185000</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>The <code>expires_at</code> field is a Unix epoch timestamp in seconds. Pass <code>0</code> or omit it for a non-expiring token.</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;token&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;yuzu_Ab3xK9m2...&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ci-pipeline&quot;</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The <code>token</code> field (prefixed <code>yuzu_</code>) is returned only at creation time. Store it securely.</p>
+<h3 id="using-a-token">Using a Token</h3>
+<p>Pass the token in the <code>Authorization</code> header:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer yuzu_Ab3xK9m2...&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/me
+</code></pre></div>
+<p>Alternatively, use the <code>X-Yuzu-Token</code> header:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;X-Yuzu-Token: yuzu_Ab3xK9m2...&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/me
+</code></pre></div>
+<p>API tokens are always granted full admin-level access. RBAC scoping for API tokens is planned for a future release.</p>
+<h3 id="listing-tokens">Listing Tokens</h3>
+<p>Requires <code>ApiToken:Read</code> RBAC permission. Returns tokens owned by the authenticated user.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/v1/tokens
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;token_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;a1b2c3d4e5f6&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ci-pipeline&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;principal_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;admin&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742383800</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;expires_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1750185000</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;last_used_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742397720</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;revoked&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;pagination&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;start&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;page_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Timestamps are Unix epoch seconds. The plaintext token value is never returned after creation.</p>
+<h3 id="token-length-limits">Token Length Limits</h3>
+<p>For DoS protection, Yuzu enforces maximum token lengths:</p>
+<table>
+<thead>
+<tr>
+<th>Token type</th>
+<th>Max length</th>
+<th>Behavior on exceed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Session tokens (<code>yuzu_session</code> cookie)</td>
+<td>64 hex chars</td>
+<td>401 Unauthorized</td>
+</tr>
+<tr>
+<td>API tokens (Bearer or X-Yuzu-Token)</td>
+<td>256 chars</td>
+<td>401 Unauthorized</td>
+</tr>
+</tbody>
+</table>
+<p>Tokens exceeding these limits are rejected before any cryptographic operations, preventing resource exhaustion attacks.</p>
+<h3 id="service-scoped-tokens">Service-Scoped Tokens</h3>
+<p>Service-scoped tokens are API tokens with an additional <code>scope_service</code> field that restricts the token holder to operations within a specific service boundary. These tokens cannot access admin routes and require RBAC to be enabled.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/tokens<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;finance-svc-token&quot;,</span>
+<span class="s1">    &quot;scope_service&quot;: &quot;finance&quot;,</span>
+<span class="s1">    &quot;expires_at&quot;: 1750185000</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Service-scoped tokens:
+- Cannot access any <code>/api/v1/admin/*</code> routes (403 Forbidden)
+- Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
+- Must have <code>ITServiceOwner</code> role permission for the target operation
+- Are scoped to agents tagged with the matching <code>service</code> tag</p>
+<h3 id="revoking-a-token">Revoking a Token</h3>
+<p>Requires <code>ApiToken:Delete</code> RBAC permission. This performs a soft revoke (the token record remains but is marked revoked).</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>DELETE<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/tokens/a1b2c3d4e5f6
+</code></pre></div>
+<p>Returns <code>200 OK</code> with:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;revoked&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Returns <code>404</code> if the token ID is not found.</p>
+<h2 id="mcp-tokens">MCP Tokens</h2>
+<p>MCP (Model Context Protocol) tokens are API tokens with an additional <code>mcp_tier</code> field that controls what the token holder can do through the MCP endpoint (<code>POST /mcp/v1/</code>). MCP tokens enable AI models and automation tools to interact with Yuzu's fleet management capabilities via JSON-RPC 2.0.</p>
+<h3 id="authorization-tiers">Authorization Tiers</h3>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Access</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>readonly</code></td>
+<td>Read-only tools only (list agents, query audit log, check compliance, etc.)</td>
+</tr>
+<tr>
+<td><code>operator</code></td>
+<td>Read-only tools + tag writes + auto-approved instruction executions</td>
+</tr>
+<tr>
+<td><code>supervised</code></td>
+<td>All operations, but destructive actions require admin approval via the approval workflow</td>
+</tr>
+</tbody>
+</table>
+<p>Tier enforcement happens <em>before</em> RBAC checks. A tier can block an operation even when RBAC would permit it; conversely, if the tier permits but RBAC denies, the request is still blocked. Both layers must allow.</p>
+<p>The <code>supervised</code> tier marks destructive operations as approval-gated. Until the Phase 2 approval re-dispatch path lands, supervised-tier writes are blocked on every transport (MCP JSON-RPC and REST API) with <code>auth.approval_required</code> audit; only Reads and trivially-allowed operations succeed.</p>
+<h3 id="creating-an-mcp-token">Creating an MCP Token</h3>
+<p>MCP tokens are created via the same <code>POST /api/v1/tokens</code> endpoint as regular API tokens, with the addition of the <code>mcp_tier</code> field. MCP tokens <strong>require</strong> an expiration date, with a maximum lifetime of 90 days.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/tokens<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;claude-desktop-readonly&quot;,</span>
+<span class="s1">    &quot;mcp_tier&quot;: &quot;readonly&quot;,</span>
+<span class="s1">    &quot;expires_at&quot;: 1750185000</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+
+<span class="err">###</span><span class="w"> </span><span class="err">MCP</span><span class="w"> </span><span class="err">Toke</span><span class="kc">n</span><span class="w"> </span><span class="err">Res</span><span class="kc">tr</span><span class="err">ic</span><span class="kc">t</span><span class="err">io</span><span class="kc">ns</span>
+
+<span class="err">MCP</span><span class="w"> </span><span class="kc">t</span><span class="err">oke</span><span class="kc">ns</span><span class="w"> </span><span class="err">have</span><span class="w"> </span><span class="kc">t</span><span class="err">he</span><span class="w"> </span><span class="kc">f</span><span class="err">ollowi</span><span class="kc">n</span><span class="err">g</span><span class="w"> </span><span class="err">res</span><span class="kc">tr</span><span class="err">ic</span><span class="kc">t</span><span class="err">io</span><span class="kc">ns</span><span class="p">:</span>
+
+<span class="mi">-</span><span class="w"> </span><span class="err">Ca</span><span class="kc">nn</span><span class="err">o</span><span class="kc">t</span><span class="w"> </span><span class="err">access</span><span class="w"> </span><span class="err">admi</span><span class="kc">n</span><span class="mi">-</span><span class="err">o</span><span class="kc">nl</span><span class="err">y</span><span class="w"> </span><span class="err">rou</span><span class="kc">tes</span><span class="w"> </span><span class="err">(user</span><span class="w"> </span><span class="err">ma</span><span class="kc">na</span><span class="err">geme</span><span class="kc">nt</span><span class="p">,</span><span class="w"> </span><span class="err">se</span><span class="kc">tt</span><span class="err">i</span><span class="kc">n</span><span class="err">gs)</span><span class="w"> </span><span class="err">—</span><span class="w"> </span><span class="mi">403</span><span class="w"> </span><span class="err">Forbidde</span><span class="kc">n</span><span class="w"> </span><span class="err">regardless</span><span class="w"> </span><span class="err">o</span><span class="kc">f</span><span class="w"> </span><span class="err">crea</span><span class="kc">t</span><span class="err">or&#39;s</span><span class="w"> </span><span class="err">role</span>
+<span class="mi">-</span><span class="w"> </span><span class="err">The</span><span class="w"> </span><span class="kc">t</span><span class="err">ier</span><span class="w"> </span><span class="err">res</span><span class="kc">tr</span><span class="err">ic</span><span class="kc">ts</span><span class="w"> </span><span class="err">which</span><span class="w"> </span><span class="err">opera</span><span class="kc">t</span><span class="err">io</span><span class="kc">ns</span><span class="w"> </span><span class="err">are</span><span class="w"> </span><span class="err">permi</span><span class="kc">tte</span><span class="err">d</span><span class="w"> </span><span class="err">(`reado</span><span class="kc">nl</span><span class="err">y`</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">read</span><span class="w"> </span><span class="err">o</span><span class="kc">nl</span><span class="err">y;</span><span class="w"> </span><span class="err">`opera</span><span class="kc">t</span><span class="err">or`</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">read</span><span class="w"> </span><span class="err">+</span><span class="w"> </span><span class="kc">ta</span><span class="err">g</span><span class="w"> </span><span class="err">wri</span><span class="kc">tes</span><span class="w"> </span><span class="err">+</span><span class="w"> </span><span class="err">execu</span><span class="kc">te</span><span class="err">;</span><span class="w"> </span><span class="err">`supervised`</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">all</span><span class="w"> </span><span class="err">ops</span><span class="w"> </span><span class="err">wi</span><span class="kc">t</span><span class="err">h</span><span class="w"> </span><span class="err">approval</span><span class="w"> </span><span class="err">work</span><span class="kc">fl</span><span class="err">ow)</span>
+<span class="mi">-</span><span class="w"> </span><span class="err">I</span><span class="kc">f</span><span class="w"> </span><span class="err">RBAC</span><span class="w"> </span><span class="err">is</span><span class="w"> </span><span class="err">e</span><span class="kc">na</span><span class="err">bled</span><span class="p">,</span><span class="w"> </span><span class="kc">t</span><span class="err">he</span><span class="w"> </span><span class="err">crea</span><span class="kc">t</span><span class="err">or&#39;s</span><span class="w"> </span><span class="err">ac</span><span class="kc">tual</span><span class="w"> </span><span class="err">RBAC</span><span class="w"> </span><span class="err">role</span><span class="w"> </span><span class="err">applies</span><span class="w"> </span><span class="err">a</span><span class="kc">fter</span><span class="w"> </span><span class="kc">t</span><span class="err">he</span><span class="w"> </span><span class="kc">t</span><span class="err">ier</span><span class="w"> </span><span class="err">check</span>
+<span class="mi">-</span><span class="w"> </span><span class="err">I</span><span class="kc">f</span><span class="w"> </span><span class="err">RBAC</span><span class="w"> </span><span class="err">is</span><span class="w"> </span><span class="err">disabled</span><span class="p">,</span><span class="w"> </span><span class="kc">t</span><span class="err">he</span><span class="w"> </span><span class="err">crea</span><span class="kc">t</span><span class="err">or&#39;s</span><span class="w"> </span><span class="err">legacy</span><span class="w"> </span><span class="err">role</span><span class="w"> </span><span class="err">(user/admi</span><span class="kc">n</span><span class="err">)</span><span class="w"> </span><span class="err">applies</span><span class="w"> </span><span class="err">a</span><span class="kc">fter</span><span class="w"> </span><span class="kc">t</span><span class="err">he</span><span class="w"> </span><span class="kc">t</span><span class="err">ier</span><span class="w"> </span><span class="err">check</span>
+
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;token&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;yuzu_Ab3xK9m2...&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;claude-desktop-readonly&quot;</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The <code>mcp_tier</code> field accepts <code>"readonly"</code>, <code>"operator"</code>, or <code>"supervised"</code>. If <code>expires_at</code> is omitted or set to <code>0</code> for an MCP token, the server rejects the request. Maximum expiration is 90 days from creation.</p>
+<p>MCP tokens can also be created via the Settings UI under the API Tokens section, which provides an MCP tier dropdown when creating a new token.</p>
+<h3 id="using-an-mcp-token">Using an MCP Token</h3>
+<p>Pass the token in the <code>Authorization</code> header when making JSON-RPC 2.0 requests to the MCP endpoint:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/mcp/v1/<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer yuzu_Ab3xK9m2...&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;jsonrpc&quot;: &quot;2.0&quot;,</span>
+<span class="s1">    &quot;method&quot;: &quot;tools/call&quot;,</span>
+<span class="s1">    &quot;params&quot;: { &quot;name&quot;: &quot;list_agents&quot;, &quot;arguments&quot;: {} },</span>
+<span class="s1">    &quot;id&quot;: 1</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<h3 id="server-side-kill-switches">Server-Side Kill Switches</h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--mcp-disable</code></td>
+<td>Reject all requests to <code>/mcp/v1/</code> with an error response</td>
+</tr>
+<tr>
+<td><code>--mcp-read-only</code></td>
+<td>Allow only read-only MCP tools regardless of the token's tier</td>
+</tr>
+</tbody>
+</table>
+<h3 id="audit">Audit</h3>
+<p>Every MCP tool invocation is logged as an audit event with <code>action: "mcp.&lt;tool_name&gt;"</code> and includes the <code>mcp_tool</code> field on the <code>AuditEvent</code> record.</p>
+<h3 id="audit-log-actions">Audit Log Actions</h3>
+<p>The following audit actions are emitted for authentication and authorization events:</p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Result</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>auth.admin_required</code></td>
+<td><code>denied</code></td>
+<td>Token blocked from admin route (service-scoped, MCP, or non-admin)</td>
+</tr>
+<tr>
+<td><code>auth.permission_required</code></td>
+<td><code>denied</code></td>
+<td>Token blocked from permission-gated operation</td>
+</tr>
+<tr>
+<td><code>auth.scoped_permission_required</code></td>
+<td><code>denied</code></td>
+<td>Token blocked from agent-scoped operation</td>
+</tr>
+<tr>
+<td><code>auth.approval_required</code></td>
+<td><code>denied</code></td>
+<td>Supervised-tier MCP token blocked from approval-gated operation (Phase 2 re-dispatch not yet implemented)</td>
+</tr>
+<tr>
+<td><code>auth.login</code></td>
+<td><code>success</code></td>
+<td>Successful local password login</td>
+</tr>
+<tr>
+<td><code>auth.login_failed</code></td>
+<td><code>failure</code></td>
+<td>Failed login attempt</td>
+</tr>
+<tr>
+<td><code>auth.logout</code></td>
+<td><code>success</code></td>
+<td>User-initiated logout</td>
+</tr>
+<tr>
+<td><code>auth.oidc_login</code></td>
+<td><code>success</code></td>
+<td>Successful OIDC SSO login</td>
+</tr>
+<tr>
+<td><code>auth.oidc_login_failed</code></td>
+<td><code>failure</code></td>
+<td>Failed OIDC login attempt</td>
+</tr>
+</tbody>
+</table>
+<p>All <code>denied</code> results include a <code>detail</code> field explaining the reason. Examples per action:
+- <code>auth.admin_required</code> → <code>"MCP token blocked from admin route"</code>, <code>"service-scoped token blocked from admin route"</code>, <code>"non-admin user blocked from admin route"</code>
+- <code>auth.permission_required</code> → <code>"MCP token tier 'readonly' does not allow Execution:Execute"</code>, <code>"RBAC denied Execution:Execute"</code>
+- <code>auth.scoped_permission_required</code> → <code>"agent service 'X' does not match token scope 'Y'"</code>, <code>"MCP token tier 'readonly' does not allow Tag:Write"</code>
+- <code>auth.approval_required</code> → <code>"MCP token tier 'supervised' requires approval for Execution:Execute (Phase 2 not implemented)"</code></p>
+<h3 id="json-error-envelope">JSON Error Envelope</h3>
+<p>All authentication and authorization errors use the standard JSON envelope:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;error&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;code&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">403</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;message&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;service-scoped token does not grant Agent:Execute (ITServiceOwner permission required)&quot;</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>HTTP status codes:
+- <code>401 Unauthorized</code> — No valid authentication provided (missing/invalid token)
+- <code>403 Forbidden</code> — Authentication valid but operation not permitted (scope/tier/role restriction)
+- <code>503 Service Unavailable</code> — Required backend (e.g., TagStore) unavailable for scope verification</p>
+<h2 id="api-reference-summary">API Reference Summary</h2>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Endpoint</th>
+<th>Auth required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST</code></td>
+<td><code>/login</code></td>
+<td>No</td>
+<td>Authenticate with username/password; returns JSON <code>{"status":"ok"}</code> + session cookie</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/logout</code></td>
+<td>Session</td>
+<td>Invalidate current session; returns JSON <code>{"status":"ok"}</code></td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/auth/oidc/start</code></td>
+<td>No</td>
+<td>Begin OIDC PKCE login flow (302 redirect to IdP)</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/auth/callback</code></td>
+<td>No</td>
+<td>OIDC callback (IdP redirects here; creates session, 302 to <code>/</code>)</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/v1/me</code></td>
+<td>Any (session, Bearer, or X-Yuzu-Token)</td>
+<td>Current user info and role</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/v1/tokens</code></td>
+<td>RBAC <code>ApiToken:Write</code></td>
+<td>Create a new API token</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/v1/tokens</code></td>
+<td>RBAC <code>ApiToken:Read</code></td>
+<td>List tokens owned by the authenticated user</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/v1/tokens/{id}</code></td>
+<td>RBAC <code>ApiToken:Delete</code></td>
+<td>Revoke (soft-delete) an API token</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/mcp/v1/</code></td>
+<td>Bearer token with MCP tier</td>
+<td>MCP JSON-RPC 2.0 endpoint (22 read-only tools, 3 resources, 4 prompts)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="planned-features">Planned Features</h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Phase</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AD/Entra directory sync (LDAP user/group import)</td>
+<td>7.5</td>
+<td>Stub</td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

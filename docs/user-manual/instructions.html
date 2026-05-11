@@ -1,0 +1,2163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Instruction Engine</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/instructions.md</div>
+<h1 class="doc-title">Instruction Engine</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="instruction-engine">Instruction Engine</h1>
+<p>The instruction engine is the core of Yuzu's content plane. Every ad-hoc query, scheduled task, policy check, and remediation action flows through the same pipeline: a YAML-defined <strong>InstructionDefinition</strong> is dispatched to agents via the existing gRPC wire protocol, tracked by the <strong>ExecutionTracker</strong>, stored by the <strong>ResponseStore</strong>, and audited by the <strong>AuditStore</strong>.</p>
+<p>This guide covers everything an operator needs to author, manage, execute, schedule, and govern instructions.</p>
+<hr>
+<h2 id="table-of-contents">Table of Contents</h2>
+<ol>
+<li><a href="#1-core-concepts">Core Concepts</a></li>
+<li><a href="#2-yaml-authoring">YAML Authoring</a></li>
+<li><a href="#3-instructiondefinition-reference">InstructionDefinition Reference</a></li>
+<li><a href="#4-instructionsets">InstructionSets</a></li>
+<li><a href="#5-parameter-type-system">Parameter Type System</a></li>
+<li><a href="#6-result-schema-and-aggregation">Result Schema and Aggregation</a></li>
+<li><a href="#7-approval-workflows">Approval Workflows</a></li>
+<li><a href="#8-concurrency-model">Concurrency Model</a></li>
+<li><a href="#9-scheduling">Scheduling</a></li>
+<li><a href="#10-execution-lifecycle">Execution Lifecycle</a></li>
+<li><a href="#11-error-codes">Error Codes</a></li>
+<li><a href="#12-rest-api-reference">REST API Reference</a></li>
+<li><a href="#13-dashboard-ui">Dashboard UI</a></li>
+<li><a href="#14-planned-features">Planned Features</a></li>
+</ol>
+<hr>
+<h2 id="1-core-concepts">1. Core Concepts</h2>
+<h3 id="content-hierarchy">Content Hierarchy</h3>
+<div class="highlight"><pre><span></span><code>ProductPack          (distribution boundary — Phase 7)
+ └── InstructionSet  (permission boundary)
+      └── InstructionDefinition  (the atomic unit)
+           ├── Parameter Schema   (typed inputs)
+           ├── Result Schema      (typed outputs)
+           └── Execution Spec     (plugin + action + concurrency)
+</code></pre></div>
+<p>A definition can exist standalone (without a set or pack). Sets group definitions and enforce shared permissions. Packs bundle everything for signed distribution.</p>
+<h3 id="design-principles">Design Principles</h3>
+<ul>
+<li><strong>Substrate, not scripts.</strong> Definitions target stable plugin primitives. OS-specific syscalls stay inside the plugin layer. Content authors never write shell commands.</li>
+<li><strong>Everything is an InstructionDefinition.</strong> Ad-hoc commands, scheduled tasks, policy checks, and remediation actions all use the same definition-to-execution-to-response pipeline.</li>
+<li><strong>Typed end-to-end.</strong> Parameter schemas validate input before dispatch. Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export).</li>
+<li><strong>Governed execution.</strong> Every state-changing action can require approval. Every execution is audited. Every response is persisted.</li>
+</ul>
+<h3 id="two-definition-types">Two Definition Types</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Purpose</th>
+<th>Default Approval</th>
+<th>Dashboard Treatment</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>question</code></td>
+<td>Read-only query (inventory, status checks)</td>
+<td><code>auto</code></td>
+<td>No confirmation prompt</td>
+</tr>
+<tr>
+<td><code>action</code></td>
+<td>State-changing operation (restart, install, delete)</td>
+<td><code>role-gated</code></td>
+<td>Confirmation required</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="2-yaml-authoring">2. YAML Authoring</h2>
+<p>All instruction content is authored as YAML documents with <code>apiVersion: yuzu.io/v1alpha1</code>. The server stores the verbatim YAML as the source of truth (<code>yaml_source</code> column) alongside denormalized columns for efficient queries.</p>
+<h3 id="minimal-definition">Minimal Definition</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionDefinition</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.process.list</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">List Running Processes</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">question</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">windows</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">linux</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">darwin</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">processes</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">list</span>
+</code></pre></div>
+<h3 id="saving-yaml-via-api">Saving YAML via API</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Save a definition from a YAML file</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instructions/yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/x-yaml&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--data-binary<span class="w"> </span>@definitions/process-list.yaml
+
+<span class="c1"># Validate YAML without saving</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instructions/validate-yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/x-yaml&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--data-binary<span class="w"> </span>@definitions/process-list.yaml
+</code></pre></div>
+<h3 id="dashboard-yaml-editor">Dashboard YAML Editor</h3>
+<p>The Instruction Management page provides two authoring modes:</p>
+<ul>
+<li><strong>Form mode</strong> -- fill in fields through structured inputs with dropdowns and validation.</li>
+<li><strong>Code mode</strong> -- a CodeMirror editor with YAML syntax highlighting, live validation, and auto-complete for known plugin/action pairs.</li>
+</ul>
+<p>Both modes are served as HTMX fragments.</p>
+<hr>
+<h2 id="3-instructiondefinition-reference">3. InstructionDefinition Reference</h2>
+<h3 id="full-example">Full Example</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionDefinition</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.inspect</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Inspect Service Status</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.2.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;-</span>
+<span class="w">    </span><span class="no">Returns the current state, startup type, and PID of a named service</span>
+<span class="w">    </span><span class="no">across Windows (SCM), Linux (systemd), and macOS (launchd).</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">operations</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">question</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">linux</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">darwin</span>
+
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">inspect</span>
+<span class="w">    </span><span class="nt">concurrency</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">per-device</span>
+<span class="w">    </span><span class="nt">stagger</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">maxDelaySeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0</span>
+<span class="w">      </span><span class="nt">fixedDelaySeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0</span>
+<span class="w">    </span><span class="nt">minSuccessPercent</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">100</span>
+
+<span class="w">  </span><span class="nt">parameters</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">    </span><span class="nt">required</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serviceName</span>
+<span class="w">    </span><span class="nt">properties</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">serviceName</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">        </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service Name</span>
+<span class="w">        </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">The name of the service to inspect.</span>
+<span class="w">        </span><span class="nt">validation</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">maxLength</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
+<span class="w">      </span><span class="nt">verbose</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">boolean</span>
+<span class="w">        </span><span class="nt">default</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+
+<span class="w">  </span><span class="nt">result</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">columns</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serviceName</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">state</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">startupType</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pid</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">int32</span>
+<span class="w">    </span><span class="nt">aggregation</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">groupBy</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">state</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">operations</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">count</span><span class="p p-Indicator">]</span>
+
+<span class="w">  </span><span class="nt">readablePayload</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Inspect</span><span class="nv"> </span><span class="s">service</span><span class="nv"> </span><span class="s">&#39;${serviceName}&#39;&quot;</span>
+
+<span class="w">  </span><span class="nt">gather</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">ttlSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">300</span>
+
+<span class="w">  </span><span class="nt">response</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">retentionDays</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">90</span>
+
+<span class="w">  </span><span class="nt">approval</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">auto</span>
+
+<span class="w">  </span><span class="nt">permissions</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">executeRoles</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-operator</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-admin</span>
+<span class="w">    </span><span class="nt">authorRoles</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">content-author</span>
+
+<span class="w">  </span><span class="nt">compatibility</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">minAgentVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.9.0</span>
+<span class="w">    </span><span class="nt">requiredPlugins</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span>
+
+<span class="w">  </span><span class="nt">legacy_shim</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+</code></pre></div>
+<h3 id="metadata-fields">Metadata Fields</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id</code></td>
+<td>string</td>
+<td>Yes</td>
+<td>Globally unique ID. Convention: <code>&lt;scope&gt;.&lt;domain&gt;.&lt;action&gt;</code> (e.g. <code>crossplatform.service.inspect</code>).</td>
+</tr>
+<tr>
+<td><code>displayName</code></td>
+<td>string</td>
+<td>Yes</td>
+<td>Human-readable name shown in the dashboard.</td>
+</tr>
+<tr>
+<td><code>version</code></td>
+<td>string</td>
+<td>Yes</td>
+<td>Semantic version (e.g. <code>1.2.0</code>). Used for compatibility checks.</td>
+</tr>
+<tr>
+<td><code>description</code></td>
+<td>string</td>
+<td>No</td>
+<td>Detailed description of what this definition does.</td>
+</tr>
+<tr>
+<td><code>tags</code></td>
+<td>list</td>
+<td>No</td>
+<td>Freeform tags for categorization and search.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="spec-fields">Spec Fields</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Required</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>type</code></td>
+<td>string</td>
+<td>Yes</td>
+<td>--</td>
+<td><code>question</code> (read-only) or <code>action</code> (may modify state).</td>
+</tr>
+<tr>
+<td><code>platforms</code></td>
+<td>list</td>
+<td>Yes</td>
+<td>--</td>
+<td>Target platforms: <code>windows</code>, <code>linux</code>, <code>darwin</code>.</td>
+</tr>
+<tr>
+<td><code>execution</code></td>
+<td>object</td>
+<td>Yes</td>
+<td>--</td>
+<td>Plugin, action, concurrency, stagger. See <a href="#8-concurrency-model">Section 8</a>.</td>
+</tr>
+<tr>
+<td><code>parameters</code></td>
+<td>object</td>
+<td>No</td>
+<td><code>{}</code></td>
+<td>Input parameter schema. See <a href="#5-parameter-type-system">Section 5</a>.</td>
+</tr>
+<tr>
+<td><code>result</code></td>
+<td>object</td>
+<td>No</td>
+<td><code>{}</code></td>
+<td>Output column schema. See <a href="#6-result-schema-and-aggregation">Section 6</a>.</td>
+</tr>
+<tr>
+<td><code>readablePayload</code></td>
+<td>string</td>
+<td>No</td>
+<td><code>""</code></td>
+<td>Template for audit display. Supports <code>${paramName}</code> interpolation.</td>
+</tr>
+<tr>
+<td><code>gather</code></td>
+<td>object</td>
+<td>No</td>
+<td>--</td>
+<td><code>ttlSeconds</code>: agent response window (default 300).</td>
+</tr>
+<tr>
+<td><code>response</code></td>
+<td>object</td>
+<td>No</td>
+<td>--</td>
+<td><code>retentionDays</code>: how long to keep response data (default 90).</td>
+</tr>
+<tr>
+<td><code>approval</code></td>
+<td>object</td>
+<td>No</td>
+<td>--</td>
+<td><code>mode</code>: <code>auto</code>, <code>role-gated</code>, or <code>always</code>. See <a href="#7-approval-workflows">Section 7</a>.</td>
+</tr>
+<tr>
+<td><code>permissions</code></td>
+<td>object</td>
+<td>No</td>
+<td>--</td>
+<td><code>executeRoles</code> and <code>authorRoles</code> arrays.</td>
+</tr>
+<tr>
+<td><code>compatibility</code></td>
+<td>object</td>
+<td>No</td>
+<td>--</td>
+<td><code>minAgentVersion</code> and <code>requiredPlugins</code>.</td>
+</tr>
+<tr>
+<td><code>legacy_shim</code></td>
+<td>object</td>
+<td>No</td>
+<td>--</td>
+<td><code>enabled: true</code> for auto-generated definitions from plugin descriptors.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="execution-spec">Execution Spec</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>plugin</code></td>
+<td>string</td>
+<td>--</td>
+<td>Plugin identifier (must match a registered plugin's <code>name</code>).</td>
+</tr>
+<tr>
+<td><code>action</code></td>
+<td>string</td>
+<td>--</td>
+<td>Action name (must exist in the plugin's <code>actions[]</code> array). Case-insensitive; normalized to lowercase at creation time and at dispatch.</td>
+</tr>
+<tr>
+<td><code>concurrency</code></td>
+<td>string</td>
+<td><code>per-device</code></td>
+<td>One of: <code>per-device</code>, <code>per-definition</code>, <code>per-set</code>, <code>global:&lt;N&gt;</code>, <code>unlimited</code>.</td>
+</tr>
+<tr>
+<td><code>stagger.maxDelaySeconds</code></td>
+<td>int</td>
+<td><code>0</code></td>
+<td>Max random delay per agent before execution. <code>0</code> = no stagger.</td>
+</tr>
+<tr>
+<td><code>stagger.fixedDelaySeconds</code></td>
+<td>int</td>
+<td><code>0</code></td>
+<td>Fixed delay per agent before execution, added before the random stagger. <code>0</code> = no fixed delay. Total wait = <code>fixedDelaySeconds</code> + random(<code>0</code>, <code>maxDelaySeconds</code>).</td>
+</tr>
+<tr>
+<td><code>minSuccessPercent</code></td>
+<td>int</td>
+<td><code>100</code></td>
+<td>Minimum success percentage. <code>0</code> = best-effort.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="compatibility">Compatibility</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>minAgentVersion</code></td>
+<td>Agents below this version are skipped during dispatch (error <code>4003</code>).</td>
+</tr>
+<tr>
+<td><code>requiredPlugins</code></td>
+<td>Agents missing any listed plugin are skipped (error <code>4001</code>).</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="4-instructionsets">4. InstructionSets</h2>
+<p>An InstructionSet groups definitions under a shared permission boundary. Sets control who can execute, author, and approve definitions within them.</p>
+<h3 id="full-example_1">Full Example</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionSet</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">core.crossplatform.services</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Cross-Platform Service Management</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Inspect, start, stop, and restart services across all platforms.</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">linux</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">darwin</span>
+<span class="w">  </span><span class="nt">permissions</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">executeRoles</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-operator</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-admin</span>
+<span class="w">    </span><span class="nt">authorRoles</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">content-author</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-admin</span>
+<span class="w">    </span><span class="nt">approveRoles</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-admin</span>
+<span class="w">  </span><span class="nt">contents</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">instructionDefinitions</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.inspect</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.start</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.stop</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.restart</span>
+<span class="w">    </span><span class="nt">policyFragments</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[]</span>
+<span class="w">    </span><span class="nt">workflowTemplates</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[]</span>
+<span class="w">  </span><span class="nt">defaults</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">approvalMode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">role-gated</span>
+<span class="w">    </span><span class="nt">responseRetentionDays</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">30</span>
+<span class="w">    </span><span class="nt">targetEstimationRequiredAbove</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">500</span>
+<span class="w">  </span><span class="nt">publishing</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">signed</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">    </span><span class="nt">visibility</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">org</span>
+</code></pre></div>
+<h3 id="set-level-permissions">Set-Level Permissions</h3>
+<table>
+<thead>
+<tr>
+<th>Role Type</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>executeRoles</code></td>
+<td>Roles permitted to run definitions in this set.</td>
+</tr>
+<tr>
+<td><code>authorRoles</code></td>
+<td>Roles permitted to create or modify definitions in this set.</td>
+</tr>
+<tr>
+<td><code>approveRoles</code></td>
+<td>Roles permitted to approve executions in this set.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="set-defaults">Set Defaults</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>approvalMode</code></td>
+<td><code>auto</code></td>
+<td>Default approval mode for definitions that do not specify their own.</td>
+</tr>
+<tr>
+<td><code>responseRetentionDays</code></td>
+<td><code>90</code></td>
+<td>Default retention period for response data.</td>
+</tr>
+<tr>
+<td><code>targetEstimationRequiredAbove</code></td>
+<td>--</td>
+<td>When estimated target count exceeds this, the UI requires confirmation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="managing-sets-via-api">Managing Sets via API</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Create an instruction set</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instruction-sets<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;Core Service Operations&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Service inspect, start, stop, restart&quot;</span>
+<span class="s1">  }&#39;</span>
+
+<span class="c1"># Delete a set (cascades to contained definitions)</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>DELETE<span class="w"> </span>http://localhost:8080/api/instruction-sets/abc123
+</code></pre></div>
+<hr>
+<h2 id="5-parameter-type-system">5. Parameter Type System</h2>
+<p>Parameters use a JSON Schema subset. The root object describes the input shape; each property declares a typed parameter with optional validation.</p>
+<h3 id="supported-types">Supported Types</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Description</th>
+<th>Wire Format</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>string</code></td>
+<td>UTF-8 text</td>
+<td>String</td>
+<td><code>"Spooler"</code></td>
+</tr>
+<tr>
+<td><code>boolean</code></td>
+<td>Boolean flag</td>
+<td><code>true</code> / <code>false</code></td>
+<td><code>true</code></td>
+</tr>
+<tr>
+<td><code>int32</code></td>
+<td>32-bit signed integer</td>
+<td>Numeric string</td>
+<td><code>"42"</code></td>
+</tr>
+<tr>
+<td><code>int64</code></td>
+<td>64-bit signed integer</td>
+<td>Numeric string</td>
+<td><code>"9223372036854775807"</code></td>
+</tr>
+<tr>
+<td><code>datetime</code></td>
+<td>ISO 8601 timestamp</td>
+<td>String</td>
+<td><code>"2026-03-17T18:20:00Z"</code></td>
+</tr>
+<tr>
+<td><code>guid</code></td>
+<td>UUID / GUID</td>
+<td>String</td>
+<td><code>"550e8400-e29b-41d4-a716-446655440000"</code></td>
+</tr>
+</tbody>
+</table>
+<p>Parameters are transmitted as <code>map&lt;string, string&gt;</code> in the <code>CommandRequest</code> protobuf message. The server validates values against declared types and constraints before dispatch.</p>
+<h3 id="validation-constraints">Validation Constraints</h3>
+<table>
+<thead>
+<tr>
+<th>Constraint</th>
+<th>Applicable Types</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>maxLength</code></td>
+<td><code>string</code></td>
+<td>Maximum character count.</td>
+</tr>
+<tr>
+<td><code>minLength</code></td>
+<td><code>string</code></td>
+<td>Minimum character count.</td>
+</tr>
+<tr>
+<td><code>pattern</code></td>
+<td><code>string</code></td>
+<td>Regex the value must match.</td>
+</tr>
+<tr>
+<td><code>enum</code></td>
+<td><code>string</code></td>
+<td>List of allowed values.</td>
+</tr>
+<tr>
+<td><code>minimum</code></td>
+<td><code>int32</code>, <code>int64</code></td>
+<td>Minimum value (inclusive).</td>
+</tr>
+<tr>
+<td><code>maximum</code></td>
+<td><code>int32</code>, <code>int64</code></td>
+<td>Maximum value (inclusive).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="yaml-example">YAML Example</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">parameters</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">  </span><span class="nt">required</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serviceName</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">action</span>
+<span class="w">  </span><span class="nt">properties</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">serviceName</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service Name</span>
+<span class="w">      </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">The system service name (not display name).</span>
+<span class="w">      </span><span class="nt">validation</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">maxLength</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
+<span class="w">        </span><span class="nt">pattern</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^[a-zA-Z0-9_.-]+$&quot;</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Action</span>
+<span class="w">      </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">What to do with the service.</span>
+<span class="w">      </span><span class="nt">validation</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">enum</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">start</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">stop</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">restart</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">timeout</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">int32</span>
+<span class="w">      </span><span class="nt">default</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">30</span>
+<span class="w">      </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Seconds to wait for the operation.</span>
+<span class="w">      </span><span class="nt">validation</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">minimum</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5</span>
+<span class="w">        </span><span class="nt">maximum</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">300</span>
+<span class="w">    </span><span class="nt">verbose</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">boolean</span>
+<span class="w">      </span><span class="nt">default</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+</code></pre></div>
+<hr>
+<h2 id="6-result-schema-and-aggregation">6. Result Schema and Aggregation</h2>
+<p>Result schemas declare typed columns for structured output. These types enable downstream consumption by ClickHouse, Splunk, CSV export, and the dashboard aggregation engine.</p>
+<h3 id="result-column-types">Result Column Types</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Description</th>
+<th>Example Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bool</code></td>
+<td>Boolean</td>
+<td><code>true</code>, <code>false</code></td>
+</tr>
+<tr>
+<td><code>int32</code></td>
+<td>32-bit signed integer</td>
+<td><code>4592</code></td>
+</tr>
+<tr>
+<td><code>int64</code></td>
+<td>64-bit signed integer</td>
+<td><code>1710700800000</code></td>
+</tr>
+<tr>
+<td><code>string</code></td>
+<td>UTF-8 text</td>
+<td><code>"running"</code></td>
+</tr>
+<tr>
+<td><code>datetime</code></td>
+<td>ISO 8601 timestamp</td>
+<td><code>"2026-03-17T18:20:00Z"</code></td>
+</tr>
+<tr>
+<td><code>guid</code></td>
+<td>UUID / GUID</td>
+<td><code>"550e8400-e29b-41d4-..."</code></td>
+</tr>
+<tr>
+<td><code>clob</code></td>
+<td>Character large object</td>
+<td>Multi-line log output, stack traces</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>clob</code> type indicates a potentially large text field. The server may apply configurable truncation to limit storage.</p>
+<h3 id="server-side-aggregation">Server-Side Aggregation</h3>
+<p>The ResponseStore supports aggregation across agent responses using GROUP BY and aggregate functions.</p>
+<div class="highlight"><pre><span></span><code><span class="nt">result</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">columns</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serviceName</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">state</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pid</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">int32</span>
+<span class="w">  </span><span class="nt">aggregation</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">groupBy</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">state</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">operations</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">count</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">min</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">max</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">sum</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">avg</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>count</code></td>
+<td>Number of rows per group.</td>
+</tr>
+<tr>
+<td><code>sum</code></td>
+<td>Sum of numeric column values.</td>
+</tr>
+<tr>
+<td><code>avg</code></td>
+<td>Average of numeric column values.</td>
+</tr>
+<tr>
+<td><code>min</code></td>
+<td>Minimum value per group.</td>
+</tr>
+<tr>
+<td><code>max</code></td>
+<td>Maximum value per group.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="7-approval-workflows">7. Approval Workflows</h2>
+<p>Yuzu supports three approval modes that control whether an execution requires human sign-off before dispatch.</p>
+<h3 id="approval-modes">Approval Modes</h3>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>auto</code></td>
+<td>No approval required. Execution dispatches immediately.</td>
+</tr>
+<tr>
+<td><code>role-gated</code></td>
+<td>Non-admin users must submit for approval. Admins and users with <code>approveRoles</code> can execute directly.</td>
+</tr>
+<tr>
+<td><code>always</code></td>
+<td>Every execution requires explicit approval, regardless of the user's role.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="rules">Rules</h3>
+<ul>
+<li><strong>Submitter cannot approve.</strong> The user who submits an execution request cannot be the one to approve it. A different user with the appropriate role must review it.</li>
+<li><strong>Comments are supported.</strong> Both approve and reject actions accept an optional comment for the audit trail.</li>
+<li><strong>Pending count.</strong> The API provides a pending approval count for dashboard badges and automation polling.</li>
+</ul>
+<h3 id="yaml-configuration">YAML Configuration</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">approval</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">role-gated</span><span class="w">    </span><span class="c1"># auto | role-gated | always</span>
+</code></pre></div>
+<h3 id="executor-side-behavior">Executor-Side Behavior</h3>
+<p>When a user (or MCP tool) executes an instruction that requires approval:</p>
+<ol>
+<li><strong>HTTP 202 response.</strong> The server returns <code>{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}</code> instead of dispatching immediately. The execution is queued, not dropped.</li>
+<li><strong>Dashboard toast notification.</strong> A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.</li>
+<li><strong>Approvals tab.</strong> The pending request is visible in the <strong>Approvals</strong> tab of the dashboard. The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab and the execution either proceeds or is discarded.</li>
+</ol>
+<p>The submitter cannot approve their own request. A different user with the appropriate role must review it.</p>
+<h3 id="approval-api">Approval API</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Check pending approval count</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/approvals/pending/count
+
+<span class="c1"># Approve an execution request</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/approvals/REQ-001/approve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;comment&quot;: &quot;Reviewed — safe to proceed.&quot;}&#39;</span>
+
+<span class="c1"># Reject an execution request</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/approvals/REQ-001/reject<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;comment&quot;: &quot;Not approved for production during change freeze.&quot;}&#39;</span>
+</code></pre></div>
+<hr>
+<h2 id="8-concurrency-model">8. Concurrency Model</h2>
+<p>Five concurrency modes control parallel execution. The default (<code>per-device</code>) requires zero server coordination and scales to any fleet size.</p>
+<h3 id="modes">Modes</h3>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Enforcement</th>
+<th>Scope</th>
+<th>Use Case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>per-device</code></td>
+<td>Agent-side</td>
+<td>One execution of this definition per device at a time</td>
+<td>Default. Prevents conflicting operations on the same device.</td>
+</tr>
+<tr>
+<td><code>per-definition</code></td>
+<td>Server-side</td>
+<td>One fleet-wide execution of this definition at a time</td>
+<td>Dangerous global operations (schema migration, bulk delete).</td>
+</tr>
+<tr>
+<td><code>per-set</code></td>
+<td>Agent-side</td>
+<td>One execution of any definition in the same set, per device</td>
+<td>Set-level mutual exclusion (e.g. all patch operations).</td>
+</tr>
+<tr>
+<td><code>global:&lt;N&gt;</code></td>
+<td>Server-side</td>
+<td>At most N concurrent executions fleet-wide</td>
+<td>Patch rollouts, license-limited operations.</td>
+</tr>
+<tr>
+<td><code>unlimited</code></td>
+<td>None</td>
+<td>No limits</td>
+<td>Read-only queries, diagnostic gathering.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="how-enforcement-works">How Enforcement Works</h3>
+<p><strong>Agent-side</strong> (<code>per-device</code>, <code>per-set</code>): The agent maintains an in-memory set of active definition IDs (or set IDs). If a slot is occupied when a <code>CommandRequest</code> arrives, the agent returns <code>REJECTED</code> with error code <code>3003</code>. No server round-trip is needed.</p>
+<p><strong>Server-side</strong> (<code>per-definition</code>, <code>global:N</code>): The server checks a <code>concurrency_locks</code> table in SQLite before dispatch. If the lock is held (or the semaphore is at the limit), the execution enters a wait queue. The lock is released when the execution completes or times out.</p>
+<h3 id="yaml-syntax">YAML Syntax</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">concurrency</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">per-device</span><span class="w">          </span><span class="c1"># default</span>
+<span class="w">    </span><span class="c1"># concurrency: per-definition    # one fleet-wide at a time</span>
+<span class="w">    </span><span class="c1"># concurrency: per-set           # one per set per device</span>
+<span class="w">    </span><span class="c1"># concurrency: global:50         # at most 50 concurrent across fleet</span>
+<span class="w">    </span><span class="c1"># concurrency: unlimited         # no limits</span>
+</code></pre></div>
+<h3 id="stagger">Stagger</h3>
+<p>For large-fleet dispatch, stagger introduces a per-agent delay before execution to avoid thundering herd problems. Each agent calculates: <strong>total wait = <code>fixedDelaySeconds</code> + random(<code>0</code>, <code>maxDelaySeconds</code>)</strong>.</p>
+<div class="highlight"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">stagger</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">maxDelaySeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">60</span><span class="w">       </span><span class="c1"># each agent delays 0-60s randomly</span>
+<span class="w">      </span><span class="nt">fixedDelaySeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5</span><span class="w">      </span><span class="c1"># plus a fixed 5s base delay</span>
+</code></pre></div>
+<p>If the command has an expiration (<code>expires_at</code>) and the total delay causes it to expire, the agent sends a <code>REJECTED</code> response and skips execution.</p>
+<p>The REST API also supports stagger/delay via the <code>stagger</code> and <code>delay</code> integer fields on <code>POST /api/command</code>:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://server:8080/api/command<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;plugin&quot;:&quot;hardware&quot;,&quot;action&quot;:&quot;cpu-info&quot;,&quot;stagger&quot;:30,&quot;delay&quot;:5}&#39;</span>
+</code></pre></div>
+<hr>
+<h2 id="9-scheduling">9. Scheduling</h2>
+<p>The ScheduleEngine supports recurring instruction executions with four frequency types. The scope expression is evaluated at dispatch time, so newly enrolled devices are automatically included.</p>
+<h3 id="frequency-types">Frequency Types</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Fields Used</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>daily</code></td>
+<td><code>time_of_day</code></td>
+<td>Runs once per day at the specified time.</td>
+</tr>
+<tr>
+<td><code>weekly</code></td>
+<td><code>time_of_day</code>, <code>day_of_week</code></td>
+<td>Runs once per week. <code>day_of_week</code>: 0=Sunday through 6=Saturday.</td>
+</tr>
+<tr>
+<td><code>monthly</code></td>
+<td><code>time_of_day</code>, <code>day_of_month</code></td>
+<td>Runs once per month. <code>day_of_month</code>: 1-28 (no 29/30/31 to avoid month-length issues).</td>
+</tr>
+<tr>
+<td><code>interval</code></td>
+<td><code>interval_minutes</code></td>
+<td>Runs every N minutes. Minimum: 1 minute.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="schedule-properties">Schedule Properties</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>name</code></td>
+<td>string</td>
+<td>Human-readable schedule name.</td>
+</tr>
+<tr>
+<td><code>definition_id</code></td>
+<td>string</td>
+<td>The instruction definition to execute.</td>
+</tr>
+<tr>
+<td><code>frequency_type</code></td>
+<td>string</td>
+<td><code>daily</code>, <code>weekly</code>, <code>monthly</code>, or <code>interval</code>.</td>
+</tr>
+<tr>
+<td><code>interval_minutes</code></td>
+<td>int</td>
+<td>Minutes between executions (for <code>interval</code> type).</td>
+</tr>
+<tr>
+<td><code>time_of_day</code></td>
+<td>string</td>
+<td>HH:MM format (for <code>daily</code>, <code>weekly</code>, <code>monthly</code>).</td>
+</tr>
+<tr>
+<td><code>day_of_week</code></td>
+<td>int</td>
+<td>0-6 (for <code>weekly</code>).</td>
+</tr>
+<tr>
+<td><code>day_of_month</code></td>
+<td>int</td>
+<td>1-28 (for <code>monthly</code>).</td>
+</tr>
+<tr>
+<td><code>scope_expression</code></td>
+<td>string</td>
+<td>Scope DSL expression evaluated at dispatch time.</td>
+</tr>
+<tr>
+<td><code>requires_approval</code></td>
+<td>bool</td>
+<td>If <code>true</code>, each scheduled run goes through the approval workflow.</td>
+</tr>
+<tr>
+<td><code>enabled</code></td>
+<td>bool</td>
+<td>Toggle the schedule on or off without deleting it.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="schedule-api">Schedule API</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Create a schedule — daily service check at 06:00</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/schedules<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;Daily Service Health Check&quot;,</span>
+<span class="s1">    &quot;definition_id&quot;: &quot;crossplatform.service.inspect&quot;,</span>
+<span class="s1">    &quot;frequency_type&quot;: &quot;daily&quot;,</span>
+<span class="s1">    &quot;time_of_day&quot;: &quot;06:00&quot;,</span>
+<span class="s1">    &quot;scope_expression&quot;: &quot;ostype == \&quot;windows\&quot; AND tag:environment == \&quot;Production\&quot;&quot;,</span>
+<span class="s1">    &quot;requires_approval&quot;: false,</span>
+<span class="s1">    &quot;enabled&quot;: true</span>
+<span class="s1">  }&#39;</span>
+
+<span class="c1"># Create a schedule — every 30 minutes</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/schedules<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;Process inventory sweep&quot;,</span>
+<span class="s1">    &quot;definition_id&quot;: &quot;crossplatform.process.list&quot;,</span>
+<span class="s1">    &quot;frequency_type&quot;: &quot;interval&quot;,</span>
+<span class="s1">    &quot;interval_minutes&quot;: 30,</span>
+<span class="s1">    &quot;scope_expression&quot;: &quot;ostype IN [\&quot;windows\&quot;, \&quot;linux\&quot;]&quot;,</span>
+<span class="s1">    &quot;enabled&quot;: true</span>
+<span class="s1">  }&#39;</span>
+
+<span class="c1"># Enable or disable a schedule</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/schedules/SCHED-001/enable<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;enabled&quot;: false}&#39;</span>
+
+<span class="c1"># Delete a schedule</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>DELETE<span class="w"> </span>http://localhost:8080/api/schedules/SCHED-001
+</code></pre></div>
+<h3 id="execution-tracking-for-schedules">Execution Tracking for Schedules</h3>
+<p>Each scheduled dispatch creates a normal <code>Execution</code> record. The schedule tracks:
+- <code>next_execution_at</code> -- when the next run is due.
+- <code>last_executed_at</code> -- when the last run fired.
+- <code>execution_count</code> -- total number of completed runs.</p>
+<hr>
+<h2 id="10-execution-lifecycle">10. Execution Lifecycle</h2>
+<h3 id="states">States</h3>
+<p>An execution progresses through these states:</p>
+<div class="highlight"><pre><span></span><code>pending → dispatching → gathering → completed
+                                  → failed
+                                  → cancelled
+</code></pre></div>
+<h3 id="per-agent-tracking">Per-Agent Tracking</h3>
+<p>Each agent targeted by an execution has its own status record:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agent_id</code></td>
+<td>The targeted agent.</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td><code>pending</code>, <code>dispatched</code>, <code>running</code>, <code>success</code>, <code>failure</code>, <code>timeout</code>, <code>rejected</code>.</td>
+</tr>
+<tr>
+<td><code>dispatched_at</code></td>
+<td>When the command was sent to the agent.</td>
+</tr>
+<tr>
+<td><code>first_response_at</code></td>
+<td>When the agent first responded (streaming).</td>
+</tr>
+<tr>
+<td><code>completed_at</code></td>
+<td>When the agent finished.</td>
+</tr>
+<tr>
+<td><code>exit_code</code></td>
+<td>Plugin exit code.</td>
+</tr>
+<tr>
+<td><code>error_detail</code></td>
+<td>Error message if the agent reported failure.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="aggregate-counters">Aggregate Counters</h3>
+<p>The execution record maintains real-time counters:</p>
+<table>
+<thead>
+<tr>
+<th>Counter</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agents_targeted</code></td>
+<td>Total agents in scope at dispatch time.</td>
+</tr>
+<tr>
+<td><code>agents_responded</code></td>
+<td>Agents that have sent at least one response.</td>
+</tr>
+<tr>
+<td><code>agents_success</code></td>
+<td>Agents that completed successfully.</td>
+</tr>
+<tr>
+<td><code>agents_failure</code></td>
+<td>Agents that reported failure.</td>
+</tr>
+<tr>
+<td><code>progress_pct</code></td>
+<td><code>(agents_responded / agents_targeted) * 100</code>.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="rerun">Rerun</h3>
+<p>Rerun creates a new execution linked to the original via <code>rerun_of</code>. Two modes:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Rerun all agents</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/executions/EXEC-001/rerun<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;scope&quot;: &quot;all&quot;}&#39;</span>
+
+<span class="c1"># Rerun only failed agents</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/executions/EXEC-001/rerun<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;scope&quot;: &quot;failed_only&quot;}&#39;</span>
+</code></pre></div>
+<p>The <code>scope</code> field controls which agents are included. Set <code>"scope": "failed_only"</code> to target only agents that reported failure; any other value (or omitting the field) reruns all agents.</p>
+<h3 id="cancel">Cancel</h3>
+<p>Cancellation records the requesting user for audit:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/executions/EXEC-001/cancel
+</code></pre></div>
+<h3 id="parentchild-executions">Parent/Child Executions</h3>
+<p>Executions can form hierarchies using the <code>parent_id</code> field. This supports:
+- <strong>Follow-up instructions</strong> -- a remediation execution that references the original diagnostic.
+- <strong>Multi-step workflows</strong> -- a chain of executions where each step references the previous.</p>
+<hr>
+<h2 id="11-error-codes">11. Error Codes</h2>
+<p>Errors are categorized into four domains with non-overlapping numeric ranges.</p>
+<h3 id="1xxx-plugin-errors">1xxx -- Plugin Errors</h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Name</th>
+<th>Description</th>
+<th>Retryable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1001</td>
+<td><code>PLUGIN_ACTION_NOT_FOUND</code></td>
+<td>Plugin does not support the requested action</td>
+<td>No</td>
+</tr>
+<tr>
+<td>1002</td>
+<td><code>PLUGIN_PARAM_INVALID</code></td>
+<td>Parameter validation failed</td>
+<td>No</td>
+</tr>
+<tr>
+<td>1003</td>
+<td><code>PLUGIN_PERMISSION_DENIED</code></td>
+<td>OS-level permission denied (e.g. non-admin)</td>
+<td>No</td>
+</tr>
+<tr>
+<td>1004</td>
+<td><code>PLUGIN_RESOURCE_MISSING</code></td>
+<td>Target resource does not exist</td>
+<td>No</td>
+</tr>
+<tr>
+<td>1005</td>
+<td><code>PLUGIN_OPERATION_FAILED</code></td>
+<td>Action executed but failed</td>
+<td>Transient</td>
+</tr>
+<tr>
+<td>1006</td>
+<td><code>PLUGIN_CRASH</code></td>
+<td>Plugin segfaulted or threw unhandled exception</td>
+<td>No</td>
+</tr>
+<tr>
+<td>1007</td>
+<td><code>PLUGIN_TIMEOUT</code></td>
+<td>Plugin did not complete within gather TTL</td>
+<td>Once</td>
+</tr>
+</tbody>
+</table>
+<h3 id="2xxx-transport-errors">2xxx -- Transport Errors</h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Name</th>
+<th>Description</th>
+<th>Retryable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2001</td>
+<td><code>TRANSPORT_DISCONNECTED</code></td>
+<td>Agent lost connection during execution</td>
+<td>Always</td>
+</tr>
+<tr>
+<td>2002</td>
+<td><code>TRANSPORT_STREAM_ERROR</code></td>
+<td>gRPC stream broken mid-response</td>
+<td>Always</td>
+</tr>
+<tr>
+<td>2003</td>
+<td><code>TRANSPORT_RESPONSE_TOO_LARGE</code></td>
+<td>Response exceeds max message size</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<h3 id="3xxx-orchestration-errors">3xxx -- Orchestration Errors</h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Name</th>
+<th>Description</th>
+<th>Retryable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3001</td>
+<td><code>ORCH_EXPIRED</code></td>
+<td>Instruction passed its <code>expires_at</code> before dispatch</td>
+<td>No</td>
+</tr>
+<tr>
+<td>3002</td>
+<td><code>ORCH_AGENT_MISSING</code></td>
+<td>Target agent not connected at dispatch time</td>
+<td>On reconnect</td>
+</tr>
+<tr>
+<td>3003</td>
+<td><code>ORCH_CONCURRENCY_LIMIT</code></td>
+<td>Concurrency mode blocked execution</td>
+<td>After slot frees</td>
+</tr>
+<tr>
+<td>3004</td>
+<td><code>ORCH_APPROVAL_REQUIRED</code></td>
+<td>Execution blocked pending approval</td>
+<td>Awaits human</td>
+</tr>
+<tr>
+<td>3005</td>
+<td><code>ORCH_CANCELLED</code></td>
+<td>Execution cancelled by operator</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<h3 id="4xxx-agent-errors">4xxx -- Agent Errors</h3>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Name</th>
+<th>Description</th>
+<th>Retryable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4001</td>
+<td><code>AGENT_PLUGIN_NOT_LOADED</code></td>
+<td>Required plugin not available on agent</td>
+<td>No</td>
+</tr>
+<tr>
+<td>4002</td>
+<td><code>AGENT_SHUTTING_DOWN</code></td>
+<td>Agent is in shutdown sequence</td>
+<td>On reconnect</td>
+</tr>
+<tr>
+<td>4003</td>
+<td><code>AGENT_VERSION_INCOMPATIBLE</code></td>
+<td>Agent version below <code>minAgentVersion</code></td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<h3 id="retry-semantics">Retry Semantics</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Default Retry</th>
+<th>Max Attempts</th>
+<th>Backoff</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transport (2xxx)</td>
+<td>Always</td>
+<td>3</td>
+<td>Exponential (1s, 2s, 4s)</td>
+</tr>
+<tr>
+<td>Transient plugin (1005, 1007)</td>
+<td>If <code>retryable: true</code></td>
+<td>2</td>
+<td>Linear (5s)</td>
+</tr>
+<tr>
+<td>Deterministic plugin (1001-1004, 1006)</td>
+<td>Never</td>
+<td>0</td>
+<td>--</td>
+</tr>
+<tr>
+<td>Agent (4001-4003)</td>
+<td>Never (except 4002)</td>
+<td>1</td>
+<td>--</td>
+</tr>
+<tr>
+<td>Orchestration (3001-3005)</td>
+<td>Per-code as noted</td>
+<td>--</td>
+<td>--</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="12-rest-api-reference">12. REST API Reference</h2>
+<p>All API endpoints require session-cookie authentication. Obtain a session by posting to <code>/login</code> first.</p>
+<p>There are two API surface areas with different response envelopes:</p>
+<p><strong><code>/api/*</code> endpoints</strong> (instruction engine, registered in <code>server.cpp</code>) use domain-keyed responses:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;definitions&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w"> </span><span class="err">...</span><span class="w"> </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">42</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The key name varies by resource type (<code>"definitions"</code>, <code>"executions"</code>, <code>"schedules"</code>, <code>"approvals"</code>, <code>"sets"</code>, <code>"agents"</code>, <code>"children"</code>). Error responses use <code>{"error": "message"}</code>.</p>
+<p><strong><code>/api/v1/*</code> endpoints</strong> (versioned REST API, registered in <code>rest_api_v1.cpp</code>) use a standard envelope with metadata:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="err">...</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>List endpoints on <code>/api/v1/*</code> include pagination:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w"> </span><span class="err">...</span><span class="w"> </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;pagination&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">42</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;start&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;page_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">50</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Error responses on <code>/api/v1/*</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;error&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;descriptive message&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;code&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1002</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="definitions">Definitions</h3>
+<h4 id="list-definitions">List definitions</h4>
+<div class="highlight"><pre><span></span><code>GET /api/instructions
+</code></pre></div>
+<p>Query parameters: <code>name</code>, <code>plugin</code>, <code>type</code>, <code>set_id</code>, <code>enabled_only</code>, <code>limit</code>.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># List all definitions</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/instructions
+
+<span class="c1"># Filter by plugin</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/instructions?plugin=services&quot;</span>
+
+<span class="c1"># Filter by type</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/instructions?type=question&quot;</span>
+</code></pre></div>
+<h4 id="get-a-single-definition">Get a single definition</h4>
+<div class="highlight"><pre><span></span><code>GET /api/instructions/{id}
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/instructions/crossplatform.service.inspect
+</code></pre></div>
+<h4 id="create-a-definition-json">Create a definition (JSON)</h4>
+<div class="highlight"><pre><span></span><code>POST /api/instructions
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instructions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;id&quot;: &quot;crossplatform.service.inspect&quot;,</span>
+<span class="s1">    &quot;name&quot;: &quot;Inspect Service Status&quot;,</span>
+<span class="s1">    &quot;version&quot;: &quot;1.2.0&quot;,</span>
+<span class="s1">    &quot;type&quot;: &quot;question&quot;,</span>
+<span class="s1">    &quot;plugin&quot;: &quot;services&quot;,</span>
+<span class="s1">    &quot;action&quot;: &quot;inspect&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Returns current state of a named service.&quot;,</span>
+<span class="s1">    &quot;platforms&quot;: &quot;windows,linux,darwin&quot;,</span>
+<span class="s1">    &quot;approval_mode&quot;: &quot;auto&quot;,</span>
+<span class="s1">    &quot;concurrency_mode&quot;: &quot;per-device&quot;,</span>
+<span class="s1">    &quot;parameter_schema&quot;: &quot;{\&quot;type\&quot;:\&quot;object\&quot;,\&quot;required\&quot;:[\&quot;serviceName\&quot;],\&quot;properties\&quot;:{\&quot;serviceName\&quot;:{\&quot;type\&quot;:\&quot;string\&quot;}}}&quot;,</span>
+<span class="s1">    &quot;result_schema&quot;: &quot;[{\&quot;name\&quot;:\&quot;state\&quot;,\&quot;type\&quot;:\&quot;string\&quot;},{\&quot;name\&quot;:\&quot;pid\&quot;,\&quot;type\&quot;:\&quot;int32\&quot;}]&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<h4 id="update-a-definition">Update a definition</h4>
+<div class="highlight"><pre><span></span><code>PUT /api/instructions/{id}
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>PUT<span class="w"> </span>http://localhost:8080/api/instructions/crossplatform.service.inspect<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;Inspect Service Status&quot;,</span>
+<span class="s1">    &quot;version&quot;: &quot;1.3.0&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Updated description with new fields.&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<h4 id="delete-a-definition">Delete a definition</h4>
+<div class="highlight"><pre><span></span><code>DELETE /api/instructions/{id}
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>DELETE<span class="w"> </span>http://localhost:8080/api/instructions/crossplatform.service.inspect
+</code></pre></div>
+<h4 id="save-from-yaml">Save from YAML</h4>
+<div class="highlight"><pre><span></span><code>POST /api/instructions/yaml
+</code></pre></div>
+<p>Accepts <code>Content-Type: application/x-yaml</code>. Parses the YAML, extracts metadata and spec fields, and creates or updates the definition. The verbatim YAML is stored as <code>yaml_source</code>.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instructions/yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/x-yaml&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--data-binary<span class="w"> </span>@my-definition.yaml
+</code></pre></div>
+<h4 id="validate-yaml-dry-run">Validate YAML (dry run)</h4>
+<div class="highlight"><pre><span></span><code>POST /api/instructions/validate-yaml
+</code></pre></div>
+<p>Returns validation errors without saving.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instructions/validate-yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/x-yaml&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--data-binary<span class="w"> </span>@my-definition.yaml
+</code></pre></div>
+<h4 id="import-from-json">Import from JSON</h4>
+<div class="highlight"><pre><span></span><code>POST /api/instructions/import
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instructions/import<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span>@exported-definition.json
+</code></pre></div>
+<h4 id="export-to-json">Export to JSON</h4>
+<div class="highlight"><pre><span></span><code>GET /api/instructions/{id}/export
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/instructions/crossplatform.service.inspect/export<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-o<span class="w"> </span>exported-definition.json
+</code></pre></div>
+<h4 id="execute-an-instruction-definition">Execute an instruction definition</h4>
+<div class="highlight"><pre><span></span><code>POST /api/instructions/{id}/execute
+</code></pre></div>
+<p>Dispatches the instruction definition to agents. Requires <code>Execution:Execute</code> permission.</p>
+<p><strong>Request body:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;agent_ids&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;agent-uuid-1&quot;</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;scope&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;params&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;path&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;C:\\Windows\\System32\\notepad.exe&quot;</span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<ul>
+<li><code>agent_ids</code> — optional array of specific agent IDs to target.</li>
+<li><code>scope</code> — optional scope expression (e.g., <code>group:servers</code>, <code>os:windows AND tag:prod</code>). Empty string with empty <code>agent_ids</code> broadcasts to all connected agents.</li>
+<li><code>params</code> — key-value parameters to pass to the plugin action. Keys should match the definition's <code>parameter_schema</code>.</li>
+</ul>
+<p><strong>Response (200):</strong></p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;command_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;filesystem-a1b2c3&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;agents_reached&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;definition_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;filesystem.exists&quot;</span>
+<span class="p">}</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instructions/filesystem.exists/execute<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;params&quot;:{&quot;path&quot;:&quot;C:\\Windows&quot;},&quot;scope&quot;:&quot;&quot;}&#39;</span>
+</code></pre></div>
+<blockquote>
+<p><strong>Approval gate:</strong> The response varies based on the definition's <code>approval_mode</code>. Definitions with <code>approval_mode: auto</code> return HTTP 200 with an immediate execution result. Definitions with <code>approval_mode: role-gated</code> or <code>always</code> return HTTP 202 with a <code>pending_approval</code> status and an <code>approval_id</code> when the caller requires approval. See <a href="#7-approval-workflows">Section 7</a> for details.</p>
+</blockquote>
+<h4 id="list-definitions-v1-endpoint">List definitions (v1 endpoint)</h4>
+<div class="highlight"><pre><span></span><code>GET /api/v1/definitions
+</code></pre></div>
+<p>The versioned v1 endpoint. Returns all definitions with the <code>{"data": [...], "pagination": {...}, "meta": {...}}</code> envelope. Note: this endpoint does not currently accept query parameters for filtering -- it returns all definitions. Use <code>/api/instructions</code> with query parameters (<code>name</code>, <code>plugin</code>, <code>type</code>, <code>set_id</code>, <code>enabled_only</code>, <code>limit</code>) if filtering is needed.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/v1/definitions
+</code></pre></div>
+<h3 id="instruction-sets">Instruction Sets</h3>
+<h4 id="list-instruction-sets">List instruction sets</h4>
+<div class="highlight"><pre><span></span><code>GET /api/instruction-sets
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/instruction-sets
+</code></pre></div>
+<h4 id="create-a-set">Create a set</h4>
+<div class="highlight"><pre><span></span><code>POST /api/instruction-sets
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instruction-sets<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;Service Operations&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;All service management definitions&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<h4 id="delete-a-set">Delete a set</h4>
+<div class="highlight"><pre><span></span><code>DELETE /api/instruction-sets/{id}
+</code></pre></div>
+<p>Cascade-deletes all definitions in the set.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>DELETE<span class="w"> </span>http://localhost:8080/api/instruction-sets/SET-001
+</code></pre></div>
+<h3 id="schedules">Schedules</h3>
+<h4 id="list-schedules">List schedules</h4>
+<div class="highlight"><pre><span></span><code>GET /api/schedules
+</code></pre></div>
+<p>Query parameters: <code>definition_id</code>, <code>enabled_only</code>.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># List all schedules</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/schedules
+
+<span class="c1"># List only enabled schedules</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/schedules?enabled_only=true&quot;</span>
+</code></pre></div>
+<h4 id="create-a-schedule">Create a schedule</h4>
+<div class="highlight"><pre><span></span><code>POST /api/schedules
+</code></pre></div>
+<p>See <a href="#9-scheduling">Section 9</a> for the full field reference and examples.</p>
+<h4 id="delete-a-schedule">Delete a schedule</h4>
+<div class="highlight"><pre><span></span><code>DELETE /api/schedules/{id}
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>DELETE<span class="w"> </span>http://localhost:8080/api/schedules/SCHED-001
+</code></pre></div>
+<h4 id="enabledisable-a-schedule">Enable/disable a schedule</h4>
+<div class="highlight"><pre><span></span><code>POST /api/schedules/{id}/enable
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/schedules/SCHED-001/enable<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;enabled&quot;: true}&#39;</span>
+</code></pre></div>
+<h3 id="approvals">Approvals</h3>
+<h4 id="list-approvals">List approvals</h4>
+<div class="highlight"><pre><span></span><code>GET /api/approvals
+</code></pre></div>
+<p>Query parameters: <code>status</code>, <code>submitted_by</code>.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># List all approvals</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/approvals
+
+<span class="c1"># List pending approvals</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/approvals?status=pending&quot;</span>
+</code></pre></div>
+<h4 id="pending-approval-count">Pending approval count</h4>
+<div class="highlight"><pre><span></span><code>GET /api/approvals/pending/count
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/approvals/pending/count
+</code></pre></div>
+<h4 id="approve">Approve</h4>
+<div class="highlight"><pre><span></span><code>POST /api/approvals/{id}/approve
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/approvals/REQ-001/approve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;comment&quot;: &quot;Approved.&quot;}&#39;</span>
+</code></pre></div>
+<h4 id="reject">Reject</h4>
+<div class="highlight"><pre><span></span><code>POST /api/approvals/{id}/reject
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/approvals/REQ-001/reject<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;comment&quot;: &quot;Denied — change freeze in effect.&quot;}&#39;</span>
+</code></pre></div>
+<h3 id="executions">Executions</h3>
+<h4 id="list-executions">List executions</h4>
+<div class="highlight"><pre><span></span><code>GET /api/executions
+</code></pre></div>
+<p>Query parameters: <code>definition_id</code>, <code>status</code>, <code>limit</code>.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># List all executions</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/executions
+
+<span class="c1"># Filter by definition</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/executions?definition_id=crossplatform.service.inspect&quot;</span>
+
+<span class="c1"># Filter by status</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/executions?status=completed&quot;</span>
+</code></pre></div>
+<h4 id="get-a-single-execution">Get a single execution</h4>
+<div class="highlight"><pre><span></span><code>GET /api/executions/{id}
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/executions/EXEC-001
+</code></pre></div>
+<h4 id="get-execution-summary">Get execution summary</h4>
+<div class="highlight"><pre><span></span><code>GET /api/executions/{id}/summary
+</code></pre></div>
+<p>Returns aggregate counters including <code>progress_pct</code>.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/executions/EXEC-001/summary
+</code></pre></div>
+<h4 id="get-per-agent-statuses">Get per-agent statuses</h4>
+<div class="highlight"><pre><span></span><code>GET /api/executions/{id}/agents
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/executions/EXEC-001/agents
+</code></pre></div>
+<h4 id="get-child-executions">Get child executions</h4>
+<div class="highlight"><pre><span></span><code>GET /api/executions/{id}/children
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/executions/EXEC-001/children
+</code></pre></div>
+<h4 id="rerun_1">Rerun</h4>
+<div class="highlight"><pre><span></span><code>POST /api/executions/{id}/rerun
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># Rerun failed agents only</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/executions/EXEC-001/rerun<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;scope&quot;: &quot;failed_only&quot;}&#39;</span>
+</code></pre></div>
+<h4 id="cancel_1">Cancel</h4>
+<div class="highlight"><pre><span></span><code>POST /api/executions/{id}/cancel
+</code></pre></div>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/executions/EXEC-001/cancel
+</code></pre></div>
+<hr>
+<h2 id="13-dashboard-ui">13. Dashboard UI</h2>
+<p>The Instruction Management page is accessible from the main dashboard. It uses HTMX to load content fragments without full page reloads.</p>
+<h3 id="tabs">Tabs</h3>
+<table>
+<thead>
+<tr>
+<th>Tab</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Definitions</strong></td>
+<td>Browse, search, create, edit, and delete instruction definitions. Supports both form mode and CodeMirror YAML editor.</td>
+</tr>
+<tr>
+<td><strong>Executions</strong></td>
+<td>Execute instructions and view results. The top section provides an execution form: select a definition from the dropdown (grouped by plugin), fill in parameters (auto-populated from the definition's schema), choose a scope (all agents, a group, or an individual agent), and click Execute. Below the form, the execution history table shows each run with a 4-segment status sparkbar (succeeded / failed / running / pending — length encodes count, hue encodes status), the resolved definition name, the wall-clock dispatch time in the operator's local timezone (<code>HH:MM:SS.mmm &lt;TZ&gt;</code>, e.g. <code>12:22:33.251 BST</code>; full ISO-8601 UTC on hover), and — on failed rows — an 80-character preview of the most recent agent error. The "Fan-out" cell shows succeeded / failed / targeted counts that update in real time as agents respond. Click any row to expand an inline drawer that <strong>live-updates via SSE as responses arrive</strong> — no page reload required. The drawer shows a KPI strip (Total / Succeeded / Failed / p50 / p95 duration), a small-multiples agent grid colored by status (decile-bucketed when the execution targets more than 1024 agents), a per-agent table sorted failed-first with inline duration bars, and a responses table with a <strong>Time</strong> column showing the server-side response arrival time at millisecond precision (same wall-clock format as above). The drawer is keyboard-reachable via Tab and Enter/Space. Pass <code>?definition_id=&lt;id&gt;</code> in the page URL to pre-filter the list to one definition.</td>
+</tr>
+<tr>
+<td><strong>Schedules</strong></td>
+<td>Create, enable/disable, and delete recurring schedules. Shows next and last execution times.</td>
+</tr>
+<tr>
+<td><strong>Approvals</strong></td>
+<td>Review pending approval requests. Approve or reject with comments. Badge shows pending count.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="yaml-editor">YAML Editor</h3>
+<p>The definition editor supports two modes:</p>
+<ul>
+<li><strong>Form mode</strong>: Structured inputs with dropdowns for type, platform, concurrency mode, and approval mode. Validation feedback inline.</li>
+<li><strong>Code mode</strong>: Full CodeMirror editor with YAML syntax highlighting. Paste or write YAML directly. A "Validate" button checks syntax without saving.</li>
+</ul>
+<p>Both modes save through the same <code>/api/instructions/yaml</code> endpoint.</p>
+<h3 id="inline-parameters-cli-style">Inline Parameters (CLI-style)</h3>
+<p>The dashboard instruction bar supports CLI-style inline parameters using <code>key=value</code> syntax:</p>
+<div class="highlight"><pre><span></span><code>filesystem exists path=C:\Windows\System32\notepad.exe
+registry get_value hive=HKLM key=SOFTWARE\Microsoft\Windows value=ProductName
+</code></pre></div>
+<p><strong>Syntax rules:</strong>
+- Tokens containing <code>=</code> are parsed as <code>key=value</code> parameters
+- Tokens without <code>=</code> form the command text (plugin + action)
+- Quoted values are supported: <code>key="value with spaces"</code>
+- Keys are lowercased; values preserve original case
+- Parameters are passed to the plugin as a <code>map&lt;string, string&gt;</code></p>
+<p>This differs from YAML-parameterised instructions where parameters are defined in the <code>parameter_schema</code> of an <code>InstructionDefinition</code>. Inline parameters are ad-hoc and bypass schema validation — they are sent directly to the plugin action. YAML-defined parameters provide type constraints, descriptions, default values, and validation.</p>
+<h3 id="response-visualization-chart-deck">Response Visualization (chart deck)</h3>
+<p>When the dispatched (plugin, action) reverse-resolves to an enabled <code>InstructionDefinition</code> that declares <code>spec.visualization</code> or <code>spec.visualizations</code>, a chart deck auto-renders above the results table — no operator action required. The dashboard:</p>
+<ol>
+<li>Resolves <code>(plugin, action)</code> to the first enabled definition with a configured visualization. The reverse-lookup is gated on <code>InstructionDefinition:Read</code> in addition to <code>Execution:Execute</code>; an operator without <code>InstructionDefinition:Read</code> sees the dispatch succeed but no chart appears.</li>
+<li>Emits an OOB <code>&lt;div id="chart-deck-host"&gt;</code> with a 2-second deferred load trigger so responses have time to arrive.</li>
+<li>Fetches <code>/fragments/results?...&amp;definition_id=&lt;id&gt;</code> which returns one chart-card placeholder per configured chart in a <code>&lt;div class="yuzu-chart-deck"&gt;</code> container.</li>
+<li>The Yuzu chart adapter (<code>/static/yuzu-charts.js</code>) — built on Apache ECharts 5 (<code>/static/echarts.min.js</code>) and themed from Yuzu design tokens — populates each placeholder from <code>GET /api/v1/executions/{id}/visualization?definition_id=&lt;id&gt;&amp;index=&lt;N&gt;</code>.</li>
+</ol>
+<p><strong>Limitations operators should expect:</strong></p>
+<ul>
+<li><strong>First-match arbitrariness.</strong> When multiple enabled definitions share <code>(plugin, action)</code> and more than one declares a visualization, the alphabetically-first definition wins. Authors should ensure at most one chart-bearing definition per <code>(plugin, action)</code> — or dispatch via the Instructions tab (which carries <code>definition_id</code> explicitly).</li>
+<li><strong>F5 mid-dispatch.</strong> Reloading the dashboard within the 2-second window cancels the deferred chart load. Re-dispatch to recover.</li>
+<li><strong>Row cap.</strong> Each chart's underlying response read is capped at 10 000 rows. When the cap is hit, the payload includes <code>rows_capped: true</code>; the dashboard renders the chart from the truncated set and the <code>command.dispatch</code> audit detail records the truncation.</li>
+<li><strong>No definition? No chart.</strong> Free-form <code>(plugin, action)</code> dispatches that don't correspond to any enabled definition with <code>spec.visualization</code> produce only the standard tabular results — the dashboard does not render an empty chart card.</li>
+<li><strong>Dashboard YAML editor strips <code>spec.visualization</code>.</strong> The dashboard's CodeMirror editor (<code>POST /api/instructions/yaml</code>) saves the YAML source verbatim into <code>yaml_source</code> but its lightweight line-scanner does not extract <code>spec.visualization</code> into the indexed <code>visualization_spec</code> column. Result: editing a chart-bearing definition in the dashboard editor and saving silently disables its chart until the definition is re-imported via <code>POST /api/v1/definitions/import</code> (JSON envelope, full visualization extraction) or via a server restart that triggers the bundled-content auto-import. Author chart-bearing definitions through <code>POST /api/v1/definitions/import</code> rather than the editor save. Tracked as a known gap pending yaml-cpp Windows MSVC resolution (#625).</li>
+</ul>
+<p>See <a href="../yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a> § <code>spec.visualization</code> for the chart configuration schema and <a href="rest-api.html" class="doc-ref"><code>docs/user-manual/rest-api.md</code></a> § Execution Visualization for the underlying REST API.</p>
+<p><strong>Worked examples (default-shipped).</strong> Six chart-bearing definitions ship in the in-tree content library as the default demo set:</p>
+<table>
+<thead>
+<tr>
+<th>Definition</th>
+<th>Chart</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>security.vuln_scan.summary</code></td>
+<td>pie — vulnerabilities by severity</td>
+</tr>
+<tr>
+<td><code>security.antivirus.defender_status</code></td>
+<td>pie — Defender real-time protection</td>
+</tr>
+<tr>
+<td><code>security.encryption.state</code></td>
+<td>pie — volume protection (BitLocker / LUKS / FileVault)</td>
+</tr>
+<tr>
+<td><code>security.firewall.state</code></td>
+<td>column (multi-series) — firewall state per profile</td>
+</tr>
+<tr>
+<td><code>security.certificates.list</code></td>
+<td>pie — certificates by issuer (top-N + Other)</td>
+</tr>
+<tr>
+<td><code>device.os_info.os_name</code></td>
+<td>pie — OS distribution across the fleet</td>
+</tr>
+</tbody>
+</table>
+<p>They are bundled as <code>InstructionSet demo.visualization.fleet-posture</code> (<code>content/definitions/visualization_demo_set.yaml</code>) and as <code>ProductPack pack.demo.visualization</code> (<code>content/packs/visualization-demo-pack.yaml</code>) and are <strong>auto-imported on server startup</strong> — no manual import step is required on a fresh install. The 217 InstructionDefinitions and 10 InstructionSets under <code>content/</code> are converted to JSON envelopes at build time by <code>server/core/scripts/embed_content.py</code> (PyYAML), embedded in the server binary as <code>kBundledDefinitions</code> / <code>kBundledSets</code>, and upserted on every startup via <code>import_definition_json</code> / <code>create_set</code>. Conflicts on already-existing IDs are silently skipped — operator-customised definitions are never overwritten by the auto-import. Each successful or errored import emits an <code>audit_events.action="content.bundled_import"</code> row with <code>principal=system</code> for SOC 2 traceability.</p>
+<p>On upgrade from a release prior to the build-time content embed, definitions an operator previously DELETED will reappear after restart. To permanently suppress a shipped definition, set <code>enabled: false</code> via the dashboard or <code>PATCH /api/v1/definitions/{id}</code> rather than deleting the row.</p>
+<p>To force-install on an existing deployment via the operator UI (e.g. for a custom InstructionSet not in the in-tree library), still use the dashboard YAML import view or:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>--data-binary<span class="w"> </span>@content/packs/visualization-demo-pack.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>https://yuzu.example/api/v1/product-packs
+</code></pre></div>
+<p>Then dispatch any of the six from the dashboard "Send" panel — the chart deck auto-renders above the results table.</p>
+<h3 id="response-templates-saved-views">Response Templates (saved views)</h3>
+<p>A response template is a named bundle of <em>column subset + sort order + filter presets</em> attached to an <code>InstructionDefinition</code>. When the operator opens the execution results view for a definition, the filter bar's <strong>View</strong> dropdown lists every available template; selecting one re-renders the table with the chosen columns visible, the chosen sort applied, and any equals-op filters auto-populated.</p>
+<p><strong>Synthesised default.</strong> Every definition has at least one template — the engine synthesises a <code>__default__</code> view from <code>spec.result.columns</code> (or, when omitted, from the plugin's hard-coded column schema) so the dropdown is never empty. The synthesised default lists all columns, applies no sort, and applies no filters — i.e. it matches the legacy "show everything" behaviour.</p>
+<p><strong>Authoring.</strong> Operators can author additional templates either by including a <code>spec.responseTemplates</code> array in the YAML definition (see <a href="../yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a> § <code>spec.responseTemplates</code>) or via the REST CRUD surface:</p>
+<table>
+<thead>
+<tr>
+<th>Verb</th>
+<th>Path</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/v1/definitions/{id}/response-templates</code></td>
+<td>List, with the synthesised default auto-prepended when no operator default is set</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/v1/definitions/{id}/response-templates/{tid}</code></td>
+<td>Fetch one</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/v1/definitions/{id}/response-templates</code></td>
+<td>Create (auto-assigns id when absent)</td>
+</tr>
+<tr>
+<td><code>PUT</code></td>
+<td><code>/api/v1/definitions/{id}/response-templates/{tid}</code></td>
+<td>Replace in place</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/v1/definitions/{id}/response-templates/{tid}</code></td>
+<td>Remove. Rejects <code>__default__</code></td>
+</tr>
+</tbody>
+</table>
+<p>Reads are gated on <code>InstructionDefinition:Read</code>, mutations on <code>InstructionDefinition:Write</code>.</p>
+<p><strong>Limitations operators should expect:</strong></p>
+<ul>
+<li><strong>Equals-op only in dashboard auto-apply.</strong> The dashboard's filter map is exact-match; <code>contains</code>/<code>starts_with</code>/<code>ends_with</code> filters in a template are stored and returned by REST but the dashboard only auto-applies the <code>equals</code> clauses. Operators can still use the column-by-column filter controls to narrow the view further once the template is loaded.</li>
+<li><strong>Detail drawer ignores the column subset.</strong> The expandable per-row detail drawer always shows every parsed field — hiding values there would defeat its "expand for full record" purpose.</li>
+<li><strong>Dashboard YAML editor strips <code>spec.responseTemplates</code>.</strong> Same caveat as <code>spec.visualization</code>. Author through <code>POST /api/v1/definitions/import</code> (JSON envelope) or the REST template endpoints.</li>
+</ul>
+<hr>
+<h2 id="14-planned-features">14. Planned Features</h2>
+<p>The following instruction engine capabilities are on the roadmap but not yet implemented.</p>
+<h3 id="workflow-primitives-phase-714">Workflow Primitives (Phase 7.14)</h3>
+<p>Conditional logic, iteration, and retry within instruction execution:</p>
+<ul>
+<li><code>if</code> / <code>else</code> -- branch execution based on result data from a previous step.</li>
+<li><code>foreach</code> -- iterate over a list of values (e.g. services, files) and execute a definition for each.</li>
+<li><code>retry</code> -- automatically retry a failed step with configurable backoff.</li>
+</ul>
+<p>These will be expressed as additional YAML DSL constructs within an InstructionDefinition's <code>spec.workflow</code> block.</p>
+<h3 id="product-packs-phase-79">Product Packs (Phase 7.9)</h3>
+<p>Signed distribution bundles containing instruction sets, definitions, policy fragments, and documentation. Product packs will use Ed25519 signatures with a trust chain anchored to an organization root key. Import will support staged review before activation.</p>
+</main>
+</body>
+</html>

@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>governance</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">.claude/skills/governance/SKILL.md</div>
+<h1 class="doc-title">governance</h1>
+<nav class="doc-nav"><a href="../../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<details open class="frontmatter"><summary>Frontmatter</summary><pre><code>name: governance
+description: Run the Yuzu full governance pipeline on a commit range. Produces Gate 1 Change Summary, then orchestrates Gates 2-6 as parallel agent fan-outs with pre-written prompt preambles. Use when the user says &quot;/governance &lt;range&gt;&quot; or &quot;full governance&quot; or asks to run the multi-gate review pipeline on a PR/commit set.</code></pre></details>
+<h1 id="governance">governance</h1>
+<p>Runbook for the full Yuzu governance pipeline defined in CLAUDE.md. This skill is a prompt-writing shortcut — it does not fully automate the run because Claude still has to make judgment calls (which Gate 3 domain agents are triggered, whether Gate 5 runs, how to consolidate findings, when to iterate). What it does is cut the per-run prompt-writing overhead by pre-composing the preambles and output contracts each agent needs.</p>
+<h2 id="usage">Usage</h2>
+<div class="highlight"><pre><span></span><code>/governance &lt;commit-range&gt;
+</code></pre></div>
+<p>Examples:
+- <code>/governance HEAD~4..HEAD</code> — last four commits
+- <code>/governance dev..HEAD</code> — everything on this branch not yet in dev (feature branch workflow)
+- <code>/governance origin/dev..HEAD</code> — commits on local dev not yet pushed (direct-to-dev workflow)
+- <code>/governance 82f7eb8..9c50bce</code> — a specific PR range
+- <code>/governance HEAD</code> — single-commit review (shorthand, treated as <code>HEAD~1..HEAD</code>)</p>
+<p>If no range is provided, default to <code>dev..HEAD</code>. Yuzu's main working branch is <code>dev</code> (not <code>main</code>), so governance runs normally review "what's new on this branch relative to dev" before merging or pushing. If the current branch IS <code>dev</code>, <code>dev..HEAD</code> is empty — in that case prompt the operator with <code>origin/dev..HEAD</code> (commits ahead of the remote) as the likely intent, or ask them to specify.</p>
+<h2 id="workflow-summary">Workflow summary</h2>
+<div class="highlight"><pre><span></span><code>Gate 1 — Change Summary (YOU write this from git diff/log)
+Gate 2 — security-guardian + docs-writer           (parallel, mandatory)
+Gate 3 — domain-triggered agents                   (parallel, decision matrix below)
+Gate 4 — happy-path + unhappy-path + consistency   (parallel, mandatory)
+Gate 5 — chaos-injector                            (conditional on Gate 4)
+Gate 6 — compliance + sre + enterprise-readiness   (parallel, mandatory)
+Gate 7 — address BLOCKING findings, iterate until clean
+</code></pre></div>
+<p>Per CLAUDE.md: CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed. Iterate until the team gives a clean bill. No commit until governance passes.</p>
+<hr>
+<h2 id="step-0-before-you-launch-anything">Step 0 — Before you launch anything</h2>
+<p>Run these in parallel to size the change and pick domain agents:</p>
+<div class="highlight"><pre><span></span><code>git<span class="w"> </span>log<span class="w"> </span>--oneline<span class="w"> </span>&lt;range&gt;
+git<span class="w"> </span>diff<span class="w"> </span>--stat<span class="w"> </span>&lt;range&gt;
+git<span class="w"> </span>diff<span class="w"> </span>&lt;range&gt;<span class="w"> </span>--<span class="w"> </span><span class="s1">&#39;*.cpp&#39;</span><span class="w"> </span><span class="s1">&#39;*.hpp&#39;</span><span class="w"> </span><span class="s1">&#39;*.h&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>wc<span class="w"> </span>-l
+git<span class="w"> </span>diff<span class="w"> </span>&lt;range&gt;<span class="w"> </span>--<span class="w"> </span><span class="s1">&#39;proto/&#39;</span><span class="w"> </span><span class="s1">&#39;meson.build&#39;</span><span class="w"> </span><span class="s1">&#39;.github/workflows/&#39;</span><span class="w"> </span><span class="s1">&#39;tests/&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                     </span><span class="s1">&#39;gateway/&#39;</span><span class="w"> </span><span class="s1">&#39;docs/&#39;</span><span class="w"> </span><span class="s1">&#39;scripts/&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>wc<span class="w"> </span>-l
+</code></pre></div>
+<p>Check existing memory that might apply — at minimum:
+- <code>feedback_governance_run.md</code> — prior-run learnings
+- <code>feedback_test_quality.md</code> — fixture leaks, test code standards
+- <code>feedback_claude_md_scope.md</code> — which areas are cipher to you / still churning</p>
+<hr>
+<h2 id="gate-1-change-summary">Gate 1 — Change Summary</h2>
+<p>You write this yourself, from <code>git show</code> and <code>git diff --stat</code>. Structure:</p>
+<ul>
+<li><strong>Commits in scope</strong> — table with sha, subject, push state</li>
+<li><strong>Files touched</strong> — table with path, delta description</li>
+<li><strong>Interfaces affected</strong> — public API changes, store contracts, REST behavior, proto, plugin ABI, CI gates</li>
+<li><strong>Security surface</strong> — what's closed, what's opened, net-neutral explanation</li>
+<li><strong>User-facing impact</strong> — behavior changes, breaking changes, new flags</li>
+<li><strong>Prior validation performed</strong> — compile, tests, script runs with exit codes</li>
+<li><strong>Governance domains triggered</strong> — which Gate 3 agents apply (see matrix below)</li>
+</ul>
+<p>Write this in your own response before invoking any agents. All downstream agents reference it, so skimping here wastes the whole run.</p>
+<hr>
+<h2 id="gate-2-mandatory-security-docs-review">Gate 2 — Mandatory security + docs review</h2>
+<p>Launch both agents in a <strong>single message with two tool calls</strong> so they run in parallel.</p>
+<h3 id="security-guardian-preamble-template">security-guardian preamble template</h3>
+<div class="highlight"><pre><span></span><code>Full governance Gate 2 review of &lt;N&gt; commits on branch &lt;branch&gt; at
+/mnt/c/Users/natha/Yuzu: &lt;sha1&gt;, &lt;sha2&gt;, ...
+
+Use `git show &lt;sha&gt;` to view each commit. The working tree is clean;
+what you see in &lt;range&gt; is the full scope.
+
+## Your job
+
+You are the mandatory security reviewer for Gate 2. Read every
+modified file top to bottom (CLAUDE.md requires it) and assess:
+
+&lt;finding-specific questions — fill in based on the actual change&gt;
+
+## Sibling-handler check (LOAD-BEARING)
+
+This has caught 2/3 of the highest-severity findings in prior runs.
+For every handler, endpoint, or store method this PR modifies, find
+every OTHER handler/endpoint/store method in the codebase that
+implements the same semantic (e.g. &quot;revoke token&quot;, &quot;update group&quot;,
+&quot;fetch inventory&quot;) and verify that:
+  (a) it has the same authorization check, and
+  (b) it has the same validation/ownership pattern.
+
+Explicit &quot;grep for sibling paths and compare&quot; is the invariant — not
+&quot;trust that other paths are fine.&quot;
+
+## New-error-branch audit
+
+If this PR adds any new 4xx/5xx error-response branch in a handler,
+audit every response-body construction in the branch for information
+disclosure. A denied/not-found fragment that echoes the caller&#39;s
+permitted view is NOT safe if the rendering function itself queries
+unfiltered data — this is how UP-11 shipped in the #222 hardening
+round.
+
+## Output format
+
+Findings table with severity (CRITICAL / HIGH / MEDIUM / LOW / INFO),
+file:line, description, recommended fix. CRITICAL and HIGH block
+merge. Also note any invariants the changes *strengthen* that should
+be preserved against future regression.
+
+Report in under 800 words.
+</code></pre></div>
+<h3 id="docs-writer-preamble-template">docs-writer preamble template</h3>
+<div class="highlight"><pre><span></span><code>Full governance Gate 2 docs review of &lt;N&gt; commits on branch &lt;branch&gt;
+at /mnt/c/Users/natha/Yuzu: &lt;sha1&gt;, &lt;sha2&gt;, ...
+
+Use `git show &lt;sha&gt;` and `git diff &lt;range&gt;` to see the full scope.
+
+## Your job
+
+You are the mandatory docs reviewer for Gate 2. Read every modified
+file and the related user-facing documentation. Per CLAUDE.md
+&quot;Documentation requirements&quot;: user-facing behavior changes without
+doc updates are BLOCKING.
+
+Specifically verify:
+1. REST API docs (`docs/user-manual/rest-api.md`) — endpoint signature,
+   request/response body, error paths, permissions
+2. User manual feature sections (`docs/user-manual/*.md`) — operator
+   workflow changes, new CLI flags, new env vars, upgrade notes
+3. CHANGELOG.md — the `[Unreleased]` section for Fixed/Added/Changed/
+   Breaking entries; reverse-chronological order invariant
+4. CLAUDE.md — new architectural invariants, new stores, new ABI
+   patterns, new release gates
+5. Any audit action table, permission table, or error-code table
+   that the REST/store/plugin API contract touches
+
+## Output format
+
+BLOCKING = user-facing behavior changed and no doc reflects it.
+SHOULD-FIX = doc drift that would confuse an operator.
+NICE-TO-HAVE = style/precision improvements.
+
+For each, quote current doc text (or &quot;missing from X&quot;) and propose
+replacement. Report in under 600 words.
+</code></pre></div>
+<p>Launch:</p>
+<div class="highlight"><pre><span></span><code>Agent (security-guardian): [above preamble + change-specific questions]
+Agent (docs-writer): [above preamble + change-specific questions]
+</code></pre></div>
+<hr>
+<h2 id="gate-3-domain-triggered-parallel-review">Gate 3 — Domain-triggered parallel review</h2>
+<p>Use the decision matrix below to pick agents. Launch <strong>all picked agents in a single message</strong> so they run in parallel. Always pass the Gate 2 preamble structure, plus the agent-specific focus.</p>
+<h3 id="decision-matrix">Decision matrix</h3>
+<table>
+<thead>
+<tr>
+<th>Files touched</th>
+<th>Agents to launch</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>proto/</code>, schema changes, plugin ABI headers</td>
+<td><strong>architect</strong></td>
+</tr>
+<tr>
+<td><code>server/core/src/</code>, cross-module refactor</td>
+<td><strong>architect</strong></td>
+</tr>
+<tr>
+<td><code>tests/</code>, new fixtures, coverage gaps</td>
+<td><strong>quality-engineer</strong></td>
+</tr>
+<tr>
+<td><code>meson.build</code>, <code>vcpkg.json</code>, <code>.github/workflows/</code>, release tooling</td>
+<td><strong>build-ci</strong></td>
+</tr>
+<tr>
+<td><code>agents/plugins/</code>, plugin YAML defs</td>
+<td><strong>plugin-developer</strong></td>
+</tr>
+<tr>
+<td><code>gateway/</code> (Erlang)</td>
+<td><strong>gateway-erlang</strong></td>
+</tr>
+<tr>
+<td>CEL expressions, scope DSL, trigger templates, YAML DSL spec</td>
+<td><strong>dsl-engineer</strong></td>
+</tr>
+<tr>
+<td>Windows-only / macOS-only code, cross-platform helpers</td>
+<td><strong>cross-platform</strong></td>
+</tr>
+<tr>
+<td>SQLite query paths, BFS/graph, hot authz paths</td>
+<td><strong>performance</strong></td>
+</tr>
+<tr>
+<td>Packaging, systemd units, Dockerfiles, installer scripts</td>
+<td><strong>release-deploy</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Always include architect</strong> when any public store contract or REST API surface changes — the duplicate-validation and error-mapping drift patterns recur.</p>
+<p><strong>Always include quality-engineer</strong> when new features or fixes land — it's the only agent that flags fixture races, bad error-string substring asserts, and REST-handler-untested-through-store-tests, which are the three highest-ROI test gaps.</p>
+<p><strong>Always include performance</strong> for anything that touches <code>get_*_ids</code>, SQLite BFS, or per-authz hot paths.</p>
+<h3 id="gate-3-agent-preamble">Gate 3 agent preamble</h3>
+<p>Each Gate 3 agent gets the same structural preamble, varying in the "Your job" stanza:</p>
+<div class="highlight"><pre><span></span><code>Full governance Gate 3 &lt;agent-type&gt; review of &lt;N&gt; commits on branch
+&lt;branch&gt; at /mnt/c/Users/natha/Yuzu: &lt;sha1&gt;, &lt;sha2&gt;, ...
+
+Read `git show &lt;range&gt;` for the full diff.
+
+## Context
+
+&lt;paste Gate 1 Change Summary here verbatim so the agent doesn&#39;t
+ re-derive what&#39;s in scope&gt;
+
+&lt;paste any already-completed Gate 2 findings as &quot;for your context only,
+ do not duplicate&quot;&gt;
+
+## Your job — &lt;agent-specific focus&gt;
+
+&lt;agent-specific questions, 5-10 numbered items&gt;
+
+## Output format
+
+Findings with severity (BLOCKING / SHOULD / NICE / INFO), file:line,
+description, recommendation. Report in under &lt;N&gt; words.
+</code></pre></div>
+<p><strong>Pass prior gate findings as context</strong> — the governance policy in CLAUDE.md requires this to avoid duplicated effort. Extract each prior finding ID (sec-H1, doc-B3, etc.) and summarize one line per finding.</p>
+<hr>
+<h2 id="gate-4-correctness-resilience-mandatory-parallel">Gate 4 — Correctness &amp; resilience (mandatory, parallel)</h2>
+<p>Always run all three: <strong>happy-path</strong>, <strong>unhappy-path</strong>, <strong>consistency-auditor</strong>. Launch in one message.</p>
+<p>These three are the highest-value reviewers in the Yuzu pipeline. Prior runs confirm:
+- <strong>unhappy-path</strong> catches compound failure modes that no single-agent review finds (concurrent + corrupt DB, TOCTOU + I/O error).
+- <strong>consistency-auditor</strong> catches cross-component drift: REST+store duplicate-validation divergence, audit field-order regression, 404-vs-403 oracle mismatch between sibling handlers, test assertion substring laxness.
+- <strong>happy-path</strong> catches the "my new fix breaks the no-op PUT" and "my retry returns 404 instead of idempotent 200" kinds of mundane correctness.</p>
+<h3 id="happy-path-preamble">happy-path preamble</h3>
+<div class="highlight"><pre><span></span><code>Full governance Gate 4 happy-path review. &lt;N&gt; commits on branch &lt;branch&gt;
+at /mnt/c/Users/natha/Yuzu: &lt;sha1&gt;..&lt;shaN&gt;.
+
+`git show &lt;range&gt;` covers the full scope.
+
+## Context — prior gate findings (for your context only, do not duplicate)
+
+&lt;one-line summary per Gate 2/3 finding&gt;
+
+## Your job — normal-path logic completeness
+
+Trace every happy path through the changed code and verify the logic
+is complete and correct:
+
+1. For each new or modified endpoint, trace request -&gt; auth -&gt; perm -&gt;
+   store lookup -&gt; store write -&gt; audit -&gt; response. Every step.
+2. For each new store method, trace the non-error path end-to-end on
+   representative inputs.
+3. For new CLI flags / env vars, trace parse -&gt; validate -&gt; apply -&gt;
+   log-at-startup -&gt; effect-on-runtime.
+4. Compare the new success-path to the pre-commit success-path. What
+   did the commit change that is visible to a normal-case caller?
+
+Call out idempotency semantics explicitly — new error-handling that
+changes a retry from 2xx-on-duplicate to 4xx-on-duplicate is a
+breaking API contract even if the initial call still succeeds.
+
+## Output format
+
+Pass / Findings list. Severity: BLOCKING / SHOULD / NICE.
+Under 600 words.
+</code></pre></div>
+<h3 id="unhappy-path-preamble">unhappy-path preamble</h3>
+<div class="highlight"><pre><span></span><code>Full governance Gate 4 unhappy-path review. &lt;N&gt; commits on branch
+&lt;branch&gt;: &lt;sha1&gt;..&lt;shaN&gt;.
+
+`git show &lt;range&gt;` for the full scope.
+
+## Context
+
+&lt;Gate 1 Change Summary verbatim&gt;
+&lt;Gate 2/3 findings as &quot;already covered, do not duplicate&quot;&gt;
+
+## Your job — failure-mode interrogation
+
+You are the unhappy-path reviewer. Your mandate is to imagine every
+way these changes could fail in production and produce a risk register
+for Gate 5 chaos-injector. Don&#39;t propose fixes for things that are
+working — propose failure scenarios and the observable symptoms.
+
+Focus on compound failures where two or more risks interact:
+- concurrent writers + partial SQLite failure
+- TOCTOU between get-then-check and the write
+- empty/whitespace/NUL-byte input that bypasses validation
+- pre-existing corrupt DB state that the fix assumes is clean
+- retry storms / idempotency under connection reset
+- storage-layer failure masked as &quot;not found&quot;
+- audit detail unescaped -&gt; stored XSS on dashboard render
+- MCP token scope confusion vs principal match
+
+## Output format
+
+Risk register with entries shaped as:
+- **ID** (UP-N)
+- **Risk** — one-sentence description
+- **Trigger** — how it happens
+- **Symptom** — what the operator/user observes
+- **Severity** — BLOCKING / SHOULD / NICE
+- **Chaos scenario** — suggested chaos-injector test, or &quot;N/A&quot;
+
+Aim for 12-20 entries. Under 900 words.
+</code></pre></div>
+<h3 id="consistency-auditor-preamble">consistency-auditor preamble</h3>
+<div class="highlight"><pre><span></span><code>Full governance Gate 4 consistency review. &lt;N&gt; commits on branch
+&lt;branch&gt;: &lt;sha1&gt;..&lt;shaN&gt;.
+
+Read `git show &lt;range&gt;` for the full diff.
+
+## Context
+
+&lt;Gate 1 Change Summary verbatim&gt;
+&lt;Gate 2/3 findings as &quot;already covered, do not duplicate&quot;&gt;
+
+## Your job — cross-component consistency
+
+You are the consistency auditor. Your mandate is cross-component
+state, schema, and contract consistency. Check:
+
+1. **Sibling-handler parity** — if the PR modifies handler X, find
+   every OTHER handler that performs the same semantic operation and
+   verify they apply the same auth/validation/audit pattern.
+
+2. **Error message string parity** — store-layer error strings vs REST
+   error envelope vs docs vs test assertions. Any drift = a rename
+   will silently break docs while tests still pass.
+
+3. **Audit field order / naming parity** — any new `.log({...})`
+   emission site must match the AuditEvent struct declaration order
+   and the field names used elsewhere. `principal_role` must match
+   the session&#39;s actual role, not a hardcoded string.
+
+4. **Auth role constant parity** — `auth::Role::admin` vs RBAC vs
+   `is_global_admin` — one convention across the codebase.
+
+5. **Schema / protobuf / wire-contract untouched?** — if yes, verify
+   no downstream consumer breaks; if no, flag for architect.
+
+6. **Test fixture pattern parity** — new test files should match the
+   existing `unique_temp_path` helper or equivalent; shared hardcoded
+   paths are a parallel-test race.
+
+7. **CHANGELOG reverse-chronological order invariant** preserved?
+
+## Output format
+
+Findings with severity (BLOCKING / SHOULD / NICE), file:line,
+description, recommended action. Under 700 words.
+</code></pre></div>
+<hr>
+<h2 id="gate-5-chaos-analysis-conditional">Gate 5 — Chaos analysis (conditional)</h2>
+<p><strong>Skip Gate 5 if neither unhappy-path nor consistency-auditor produced findings.</strong> If either did, run chaos-injector with the full risk register as input.</p>
+<p>Chaos is a test-design producer, not a runtime executor. It synthesizes the unhappy-path findings into prioritized chaos scenarios with success criteria and rollback procedures. Use the output to:
+1. File P0 scenarios as issues with "must run before release" labels
+2. File P1/P2 scenarios as tracked hardening backlog
+3. Note any scenarios that are "verify by code read" — resolve them yourself without filing</p>
+<h3 id="chaos-injector-preamble">chaos-injector preamble</h3>
+<div class="highlight"><pre><span></span><code>Gate 5 chaos analysis. &lt;N&gt; commits on branch &lt;branch&gt;: &lt;sha1&gt;..&lt;shaN&gt;.
+
+Your input is the unhappy-path risk register and consistency-auditor
+findings. Your job is to synthesize them into executable chaos
+scenarios with success criteria and rollback procedures — NOT to run
+the chaos yourself, but to produce the test design document that a
+future chaos run would execute.
+
+## Unhappy-path risk register
+
+&lt;paste all UP-N entries verbatim from Gate 4 unhappy-path output&gt;
+
+## Consistency-auditor findings
+
+&lt;paste all C-N entries verbatim&gt;
+
+## Superseded
+
+&lt;list any UP-N / C-N entries that are CLOSED in working tree fixes,
+ so chaos doesn&#39;t author scenarios for things already resolved&gt;
+
+## Your job
+
+Produce a chaos test design with these entries. For each scenario:
+1. **ID** (CH-N)
+2. **Hypothesis** — invariant we want to verify under fault injection
+3. **Injection** — specific fault, tool, parameters (VFS shim, sqlite
+   pragma, kill signal, breakpoint sleep)
+4. **Setup** — pre-condition DB/fixture state
+5. **Trigger** — the action(s) that expose the fault
+6. **Success criteria** — observable post-conditions proving invariant
+7. **Rollback** — how to restore safe state (git reset? DB restore?)
+8. **Severity / phase** — P0 block-merge, P1 pre-release, P2 nightly
+
+Focus on scenarios where two or more unhappy-path risks compound —
+individual fault injection in isolation often misses the real
+production failure mode.
+
+Also produce a short &quot;scope decision&quot; recommendation: which of P0/P1
+scenarios should block the current PR&#39;s push-to-origin, vs which to
+file as follow-up issues for the next release gate.
+
+Report under 1000 words. Do not run any code — this is a planning doc.
+</code></pre></div>
+<hr>
+<h2 id="gate-6-operational-review-mandatory-parallel">Gate 6 — Operational review (mandatory, parallel)</h2>
+<p>Launch all three in one message: <strong>compliance-officer</strong>, <strong>sre</strong>, <strong>enterprise-readiness</strong>.</p>
+<p>Each agent gets the same Gate 1-5 context and focuses on a different aspect:
+- <strong>compliance-officer</strong> — SOC 2 control alignment, evidence chain, audit traceability
+- <strong>sre</strong> — observability (metrics, alerts), recovery paths, health probes, capacity
+- <strong>enterprise-readiness</strong> — customer-facing assurance, pilot-visible rough edges, upgrade notes, breaking changes doc coverage</p>
+<p>Use the same structural preamble as Gate 4 agents, vary the "Your job" stanza to the agent's domain.</p>
+<p><strong>Watch for:</strong> sre routinely catches pre-existing readiness-probe gaps that become BLOCKING because the PR makes an existing store more load-bearing. The HC-1 pattern (store missing from <code>/readyz</code>) reappears — always verify the new store(s) in scope are in the probe conjunction.</p>
+<p><strong>Watch for:</strong> enterprise-readiness flags breaking-changes-without-upgrade-note more reliably than other agents. If the PR changes non-admin behavior, a CHANGELOG "Breaking" section + <a href="../../../docs/user-manual/server-admin.html" class="doc-ref"><code>docs/user-manual/server-admin.md</code></a> upgrade note is almost always required.</p>
+<hr>
+<h2 id="gate-7-iterate">Gate 7 — Iterate</h2>
+<p><strong>BLOCKING</strong> = CRITICAL / HIGH security, BLOCKING from any Gate 4-6 agent, or any finding that explicitly says "blocks merge".</p>
+<p>Strategy:
+1. <strong>Fold compatible fixes into one commit.</strong> If sec flags H1, docs flags B3, QA flags B5, and they all touch related files, fix as a single "hardening round" commit rather than three small ones.
+2. <strong>Re-run Gate 2 security on the hardening round.</strong> Prior runs have caught HIGH regressions introduced by the fix commit itself. Always re-review.
+3. <strong>After re-review passes</strong>, proceed to Gate 4 + Gate 5 + Gate 6 on the final baseline (only re-run the gates whose findings would be affected by the fix — if the fix was docs-only, Gate 4 happy-path doesn't need a re-run).
+4. <strong>Don't commit until governance passes.</strong> Per CLAUDE.md.</p>
+<h2 id="known-patterns-from-prior-runs">Known patterns from prior runs</h2>
+<p><strong>Pattern A: sibling IDOR.</strong> When fixing an authorization gap on endpoint X, grep for every other endpoint in the same file/semantic and verify they have the same check. #222 closed the REST path but left the HTMX dashboard path open. The governance security-guardian caught it only when explicitly told to look for siblings.</p>
+<p><strong>Pattern B: cycle-safe here but not there.</strong> When adding <code>visited</code> sets / cap checks to one traversal (<code>get_descendant_ids</code>), always check the sibling traversal (<code>get_ancestor_ids</code>) for the same class of bug. The fix pattern is symmetric; the bug pattern usually is too.</p>
+<p><strong>Pattern C: pre-existing bug made worse by hardening round.</strong> A latent bug that was dormant under previous call patterns can become hazardous when you add a new call site. UP-11 / C1: my #222 fix added a new denied-branch that called <code>render_api_tokens_fragment()</code>, which has always leaked all tokens via <code>list_tokens()</code>-with-no-filter — but no prior code path exercised that leak in a denied-response body sent to a non-owner. My "close the oracle" fix shipped a new info leak worse than the IDOR it closed. Watch for this pattern in every new error-branch.</p>
+<p><strong>Pattern D: 404 vs 403 enumeration oracle.</strong> When adding owner-check rejection to an endpoint, return the same status and same body as "not found" so non-owners cannot distinguish "doesn't exist" from "exists but not yours". Audit log server-side with the real reason.</p>
+<p><strong>Pattern E: readiness probe coverage regression.</strong> Gate 6 SRE reliably catches any new or newly-load-bearing store missing from <code>/readyz</code>. Verify <code>server.cpp</code>'s <code>stores_ok</code> conjunction covers every store the PR changed or newly relies on.</p>
+<h2 id="cost-roi">Cost / ROI</h2>
+<p>One full governance run on a non-trivial commit range is ~6-9 parallel agent calls plus the consolidation writeup. On the #222/#224 hardening round (5 commits, 2 hardening rounds), it caught 3 BLOCKING items I introduced myself, 2 of which would have shipped a worse vulnerability than the one I was fixing. The run takes 30-60 min of wall clock and produces a permanent artifact trail in commit messages + CHANGELOG that satisfies SOC 2 Workstream F change-management evidence.</p>
+<p>Skipping Gate 4 or Gate 5 to save time is rarely worth it. Skipping Gate 3 domain agents is sometimes fine if the change is genuinely small in scope (one file, no public API change); use the decision matrix to judge.</p>
+<h2 id="post-run-follow-ups">Post-run follow-ups</h2>
+<p>After the run passes and the commits push, governance typically produces 8-15 deferred follow-up items that should be filed as GitHub issues (SHOULD findings that were scoped out of the PR). See prior examples in issues #340..#353. Group by domain (tech-debt, chaos, observability, devops) and include full-context bodies so a future session can pick them up cold.</p>
+</main>
+</body>
+</html>

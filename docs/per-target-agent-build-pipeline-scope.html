@@ -1,0 +1,961 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Per-target agent build pipeline — scope</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/per-target-agent-build-pipeline-scope.md</div>
+<h1 class="doc-title">Per-target agent build pipeline — scope</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="per-target-agent-build-pipeline-scope">Per-target agent build pipeline — scope</h1>
+<p><strong>Status</strong>: deferred. Phase 1 ready to execute; Phase 2 gated on #376
+(Conan + QUIC migration) landing first.</p>
+<p><strong>History</strong>: scoped 2026-05-07. Decision to gate on #376 captured in
+"Decisions captured from the user" §4 and "Resolved: out-of-scope work
+this plan depends on" at the bottom.</p>
+<h2 id="context">Context</h2>
+<p>Yuzu currently ships exactly one Linux agent build: amd64, glibc 2.39 (Ubuntu
+24.04 base), produced by <code>deploy/docker/Dockerfile.agent</code> and the
+<code>build-linux-x64</code> job in <code>.github/workflows/release.yml</code> (lines 36–234). That
+single artifact does not run on the four other targets we just stood up:</p>
+<table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Why current artifact won't run</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OrbStack <code>yuzu</code> (Ubuntu 25.10 arm64)</td>
+<td>Wrong arch; needs aarch64 binary</td>
+</tr>
+<tr>
+<td>Debian bookworm-slim amd64</td>
+<td>glibc 2.36 &lt; linker baseline 2.39 (<code>GLIBC_2.38</code>/<code>GLIBC_2.39</code> symbols)</td>
+</tr>
+<tr>
+<td>Alpine 3.23.4 amd64</td>
+<td>musl ABI ≠ glibc; gcompat path proven dead by canary (see below)</td>
+</tr>
+<tr>
+<td>Alpine 3.23.4 arm64</td>
+<td>musl + arch flip</td>
+</tr>
+</tbody>
+</table>
+<p>Goal: a build pipeline that produces an agent-only artifact for each of the
+four targets. "Agent-only" means <code>yuzu-agent</code> + <code>libyuzu_agent_core.so</code> + the
+44 plugin <code>.so</code>s — <strong>without</strong> the server, gateway, or test surface.</p>
+<p>Pipeline runs locally on OrbStack first, with a clear migration path to
+<code>release.yml</code> once each target is green.</p>
+<h2 id="strategic-dependency-376-conan-quic-migration">Strategic dependency: #376 (Conan + QUIC migration)</h2>
+<p>There is a <strong>planned migration off vcpkg → Conan and off gRPC → QUIC</strong> with
+<strong>protobuf retained</strong> (issue #376; <code>.claude/agents/build-ci.md:181-183</code>).
+Currently deferred behind customer commitments but planned. This migration
+materially changes the Alpine scope:</p>
+<p><strong>What goes away</strong>: <code>gRPC</code> and its transitive deps <code>abseil</code>, <code>re2</code>,
+<code>c-ares</code>, <code>upb</code>. These are exactly the ports with the worst musl story in
+vcpkg today — the entire Phase 2.0 dry-run risk gate is them.</p>
+<p><strong>What stays</strong>: <code>protobuf</code>, <code>openssl</code>, <code>sqlite3</code>, <code>spdlog</code>, <code>nlohmann-json</code>,
+<code>cli11</code>, <code>cpp-httplib</code>. All of these have first-class musl support in both
+vcpkg and Conan.</p>
+<p><strong>What's added</strong>: a QUIC implementation (likely MsQuic per build-ci.md:183;
+or quiche/lsquic/ngtcp2). MsQuic supports Linux x86_64 musl natively and
+publishes Alpine packages.</p>
+<p><strong>Conan's musl story</strong>: Conan profiles natively express
+<code>compiler.libc=musl</code>, recipes for the post-#376 dep set are well-tested on
+musl, and Conan's cross-build story is more mature than vcpkg's. Combined
+with the gRPC/abseil/re2 amputation, this collapses the Alpine risk from
+"high — port debugging is the largest unknown in the plan" to "low —
+straightforward Conan profile + musl build inside Alpine."</p>
+<p><strong>Sequencing implication</strong>: doing Alpine on the current vcpkg+grpc stack
+means doing throwaway musl ports of abseil and grpc that #376 deletes.
+Recommend Phase 2 (Alpine) be <strong>gated on #376 landing</strong>. Phase 1 (glibc
+targets) is unaffected — bookworm and Ubuntu-arm64 build cleanly on the
+current stack today.</p>
+<p>If #376 cannot move forward in a useful timeframe and Alpine is needed
+sooner, the original musl-on-vcpkg plan below remains executable but
+should be understood as <strong>a one-time use binary that gets thrown away
+when #376 lands</strong>.</p>
+<h2 id="decisions-captured-from-the-user">Decisions captured from the user</h2>
+<ol>
+<li><strong>Alpine path: musl-native rebuild.</strong> gcompat-first was the original ask;
+   a canary against the v0.11.0 release binary disproved it (see "Alpine
+   canary" below). gcompat does not provide the glibc-2.38 / libstdc++-14
+   symbols the binary references, and patching gcompat is not in scope.</li>
+<li><strong>Artifacts</strong>: OCI image per target + <code>.apk</code> for the two Alpine targets.
+   No tarballs. No <code>.deb</code> in v1.</li>
+<li><strong>CI timing</strong>: <code>release.yml</code> integration deferred to Phase 3, after Phase
+   1+2 are locally smoke-tested.</li>
+<li><strong>Alpine sequencing vs #376</strong>: <strong>Pull #376 forward first, then do Alpine.</strong>
+   #376 is treated as a hard prerequisite to Phase 2, not as a parallel
+   workstream. Scoping #376 itself is OUT OF SCOPE for this plan — it is a
+   multi-week cross-cutting migration touching agent/server/gateway/SDK and
+   needs its own scoping exercise (see <a href="dependency-rollout-2026-04-14.html" class="doc-ref"><code>docs/dependency-rollout-2026-04-14.md</code></a>,
+   <code>.claude/agents/build-ci.md:181-183</code>). This plan only describes how Phase
+   2 (Alpine) executes ASSUMING #376 has landed.</li>
+</ol>
+<h2 id="alpine-canary-evidence-for-the-musl-native-decision">Alpine canary (evidence for the musl-native decision)</h2>
+<p>Pulled v0.11.0 <code>yuzu-linux-x64.tar.gz</code> from the GitHub release. Inside an
+<code>alpine:3.23.4</code> container with <code>gcompat libstdc++ openssl</code> installed, ran
+<code>yuzu-agent --version</code>. Failure. Salient missing symbols when
+<code>libyuzu_agent_core.so</code> was loaded:</p>
+<ul>
+<li><strong>glibc 2.38+ C23 wrappers</strong>: <code>__isoc23_strtoul</code>, <code>__isoc23_strtoll</code>,
+  <code>__isoc23_strtol</code>, <code>__isoc23_strtoull</code>, <code>__isoc23_sscanf</code>. These are
+  emitted by <code>gcc-13</code>'s <code>&lt;stdlib.h&gt;</code> when compiled against glibc 2.38+
+  headers; gcompat does not provide them.</li>
+<li><strong>glibc-specific syscall wrappers</strong>: <code>fcntl64</code>. Musl uses unsuffixed
+  <code>fcntl</code>.</li>
+<li><strong>glibc-specific RNG</strong>: <code>arc4random_buf</code>. Musl 1.2+ ships this, but the
+  binary references it via glibc symbol versioning that gcompat doesn't
+  expose.</li>
+<li><strong>libstdc++ <code>__float128</code> <code>to_chars</code></strong>: <code>_ZSt8to_charsPcS_DF128_*</code>. The
+  Alpine libstdc++ does not export these on x86_64 because Alpine builds
+  gcc without <code>__float128</code> support.</li>
+</ul>
+<p><code>scanelf -n</code> confirmed every plugin <code>.so</code> and the agent binary all reference
+<code>libc.so.6 libstdc++.so.6 libgcc_s.so.1 libm.so.6 ld-linux-x86-64.so.2</code> plus
+<code>libyuzu_agent_core.so</code> — i.e. they share the same glibc/libstdc++ symbol
+surface that the canary just rejected. Patching one library doesn't help;
+the whole stack needs musl-native rebuilds.</p>
+<hr>
+<h2 id="whats-already-wired-up-reusable">What's already wired up (reusable)</h2>
+<table>
+<thead>
+<tr>
+<th>Asset</th>
+<th>Path</th>
+<th>Coverage</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cross file for aarch64 glibc</td>
+<td><code>meson/cross/aarch64-linux-gnu.ini</code></td>
+<td>Reusable as-is</td>
+</tr>
+<tr>
+<td>Triplet inference</td>
+<td><code>scripts/setup.sh:75-81</code> (maps <code>*aarch64*</code> → <code>arm64-linux</code>)</td>
+<td>Reusable; expects a triplet file we still need to create</td>
+</tr>
+<tr>
+<td>Build-only-the-agent flag</td>
+<td><code>meson.build:80-83</code> (<code>-Dbuild_server=false</code>)</td>
+<td>Reusable</td>
+</tr>
+<tr>
+<td>Dynamic linkage default triplet</td>
+<td><code>triplets/x64-linux-asan.cmake</code>, <code>triplets/x64-linux-static.cmake</code></td>
+<td>Pattern to copy for <code>arm64-linux</code></td>
+</tr>
+<tr>
+<td>Plugin loader portability</td>
+<td><code>agents/core/src/plugin_loader.cpp:8-27</code> (<code>dlopen</code> + <code>.so</code> on Unix)</td>
+<td>Works on musl; portable</td>
+</tr>
+<tr>
+<td>OpenSSL dependency</td>
+<td>unconditional in <code>vcpkg.json:20</code></td>
+<td>Must satisfy on every target; vcpkg openssl supports musl</td>
+</tr>
+<tr>
+<td>Docker buildx multi-arch</td>
+<td>OrbStack's <code>default</code> and <code>orbstack</code> builders advertise <code>linux/amd64</code>+<code>linux/arm64</code>+<code>linux/arm/v7</code></td>
+<td>Avoids needing a separate ARM64 runner for local builds</td>
+</tr>
+<tr>
+<td>Existing <code>Dockerfile.agent</code> template</td>
+<td><code>deploy/docker/Dockerfile.agent:1-53</code></td>
+<td>Direct template for the bookworm and Ubuntu-arm64 Dockerfiles</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="whats-missing-net-new-work">What's missing (net-new work)</h2>
+<ol>
+<li>
+<p><strong>One vcpkg triplet</strong> (Phase 1 only — vcpkg goes away in #376):
+   - <code>triplets/arm64-linux.cmake</code> — referenced by <code>scripts/setup.sh</code> but no file in <code>triplets/</code>.</p>
+</li>
+<li>
+<p><strong>Conan profiles</strong> (Phase 2, post-#376):
+   - <code>conan/profiles/linux-musl-x86_64</code>
+   - <code>conan/profiles/linux-musl-aarch64</code>
+   - (And whatever profiles #376 establishes for the existing glibc/Windows/macOS targets — those land in #376, not here.)</p>
+</li>
+<li>
+<p><strong>Three Dockerfiles</strong>:
+   - <code>deploy/docker/Dockerfile.agent-debian-bookworm</code> (amd64) — Phase 1
+   - <code>deploy/docker/Dockerfile.agent-ubuntu-arm64</code> (Ubuntu 24.04, arm64) — Phase 1
+   - <code>deploy/docker/Dockerfile.agent-alpine</code> (Alpine 3.23.4 builder + runtime, parameterised by <code>--platform</code>) — Phase 2</p>
+</li>
+<li>
+<p><strong>Dep posture post-#376</strong> (Phase 2 risk register):
+   - <code>openssl</code>, <code>sqlite3</code>, <code>spdlog</code>, <code>nlohmann-json</code>, <code>cli11</code>, <code>cpp-httplib</code>, <code>protobuf</code> — all build cleanly on musl via Conan recipes.
+   - QUIC library — pick depends on #376; MsQuic and ngtcp2 both have published musl support.
+   - <code>abseil</code>, <code>grpc</code>, <code>re2</code>, <code>c-ares</code>, <code>upb</code> — <strong>gone</strong>. The historical Phase 2 risk evaporates.</p>
+</li>
+<li>
+<p><strong><code>.apk</code> packaging for Alpine</strong> (Phase 2):
+   - <code>deploy/packaging/alpine/APKBUILD</code> template
+   - <code>deploy/packaging/alpine/build-apk.sh</code> (mirrors <code>deploy/packaging/debian/build-deb.sh:1-152</code>)
+   - OpenRC service file <code>deploy/packaging/alpine/yuzu-agent.initd</code> (modeled on <code>deploy/systemd/yuzu-agent.service:1-28</code>)</p>
+</li>
+<li>
+<p><strong><code>install-agent-user.sh</code> Alpine branch</strong> (Phase 2):
+   - Currently rejects any <code>uname -s</code> that isn't <code>Darwin</code> or <code>Linux</code> (lines 120–157). The Linux branch assumes systemd, <code>/etc/sudoers.d/</code>, <code>systemd-journal</code> group.
+   - Add distro detection via <code>/etc/os-release</code> and a parallel Alpine path: no <code>systemd-journal</code> group; OpenRC unit instead of systemd; <code>setcap</code> still works (Alpine has <code>libcap</code>).
+   - Bookworm and Ubuntu-arm64 do NOT need any change — they use the existing Linux/systemd path.</p>
+</li>
+<li>
+<p><strong>Plugin runtime survey on Alpine</strong> (test-time, not build-time):
+   - <code>agents/plugins/quarantine</code> — uses <code>/usr/sbin/iptables</code> (works on Alpine if <code>iptables</code> apk installed).
+   - <code>agents/plugins/services</code> — uses <code>systemctl</code> (broken on Alpine; no-op on this image, log and continue).
+   - <code>agents/plugins/firewall</code> — runtime-detects iptables/pfctl (works).
+   - <code>agents/plugins/network_actions</code> — needs spot-check (Phase 2 task).
+   - <strong>v1 policy: ship the full plugin set; plugins that need systemd no-op on Alpine.</strong> Document in the Dockerfile header. OpenRC ports are backlog work.</p>
+</li>
+</ol>
+<hr>
+<h2 id="recommended-architecture">Recommended architecture</h2>
+<p><strong>One Dockerfile per target, multi-stage, build-inside-the-target.</strong> Same
+pattern as the existing <code>Dockerfile.agent</code> but with the base image swapped.
+For the two glibc targets this is straightforward. For Alpine, both stages
+run on Alpine — Conan, gcc, meson, and the agent itself all build natively
+against musl.</p>
+<h3 id="build-matrix">Build matrix</h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Target</th>
+<th>Builder base</th>
+<th>Runtime base</th>
+<th>Build deps tooling</th>
+<th>Buildx platform</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Ubuntu 24.04 arm64</td>
+<td><code>ubuntu:24.04</code> (arm64)</td>
+<td><code>ubuntu:24.04</code> (arm64)</td>
+<td>vcpkg, triplet <code>arm64-linux</code> (NEW)</td>
+<td><code>linux/arm64</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>Debian bookworm amd64</td>
+<td><code>debian:bookworm-slim</code></td>
+<td><code>debian:bookworm-slim</code></td>
+<td>vcpkg, triplet <code>x64-linux</code> (gcc-13 from <code>bookworm-backports</code>)</td>
+<td><code>linux/amd64</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td>Alpine 3.23.4 amd64</td>
+<td><code>alpine:3.23.4</code> (amd64)</td>
+<td><code>alpine:3.23.4</code> (amd64)</td>
+<td>Conan, profile <code>linux-musl-x86_64</code> (post-#376)</td>
+<td><code>linux/amd64</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>Alpine 3.23.4 arm64</td>
+<td><code>alpine:3.23.4</code> (arm64)</td>
+<td><code>alpine:3.23.4</code> (arm64)</td>
+<td>Conan, profile <code>linux-musl-aarch64</code> (post-#376)</td>
+<td><code>linux/arm64</code></td>
+</tr>
+</tbody>
+</table>
+<p>For #1, <code>--platform linux/arm64</code> makes the build happen as if on arm64 (qemu
+emulation under buildx, native on Apple Silicon). The toolchain inside
+<code>ubuntu:24.04</code> arm64 builds for arm64 naturally. No cross file needed.</p>
+<p>For #2, bookworm ships gcc-12 by default; gcc-13 lives in
+<code>bookworm-backports</code>. The Dockerfile must enable that source. Acceptable;
+documented inline.</p>
+<p>For #3 and #4, the build runs entirely inside Alpine using the Conan
+toolchain that #376 establishes. <code>apk add build-base gcc g++ cmake ninja
+meson python3 git pkgconfig openssl-dev linux-headers</code> plus <code>pip install
+conan</code> gives us the toolchain; Conan resolves deps against the musl
+profile. Plugin <code>.so</code>s, <code>libyuzu_agent_core.so</code>, and <code>yuzu-agent</code> are all
+musl-linked ELF.</p>
+<h3 id="output-artifacts-per-target">Output artifacts (per target)</h3>
+<p>For each target we produce <strong>one OCI image</strong>:</p>
+<ul>
+<li><code>yuzu-agent:ubuntu-24.04-arm64</code></li>
+<li><code>yuzu-agent:debian-bookworm-amd64</code></li>
+<li><code>yuzu-agent:alpine-3.23.4-amd64</code></li>
+<li><code>yuzu-agent:alpine-3.23.4-arm64</code></li>
+</ul>
+<p>Plus, for the two Alpine targets only, an <strong><code>.apk</code> package</strong>:</p>
+<ul>
+<li><code>dist/yuzu-agent-&lt;version&gt;-r0.x86_64.apk</code></li>
+<li><code>dist/yuzu-agent-&lt;version&gt;-r0.aarch64.apk</code></li>
+</ul>
+<p>The <code>.apk</code> ships the same files the OCI image holds in <code>/usr/local/bin</code> and
+<code>/usr/lib/yuzu/plugins</code>, plus the OpenRC init script at
+<code>/etc/init.d/yuzu-agent</code>. Built via <code>abuild</code> inside the Alpine OCI image.</p>
+<h3 id="driver-script">Driver script</h3>
+<p>A single <code>scripts/build-agent-target.sh &lt;target&gt;</code> that:</p>
+<ol>
+<li>Resolves <code>&lt;target&gt;</code> → (Dockerfile, build context, platform, image tag).</li>
+<li>Runs <code>docker buildx build --platform &lt;platform&gt; --load -t &lt;tag&gt; -f &lt;Dockerfile&gt; .</code>.</li>
+<li>For Alpine targets, additionally runs <code>abuild</code> inside the resulting
+   image, then <code>docker cp</code> the produced <code>.apk</code> out to <code>dist/</code>.</li>
+<li>Echoes the resulting image tag, size, and (for Alpine) <code>.apk</code> path.</li>
+</ol>
+<p>Targets list lives in a small associative array at the top of the script —
+adding a 5th target later is editing one block.</p>
+<hr>
+<h2 id="phasing">Phasing</h2>
+<p><strong>Phase 1 — Glibc targets (low risk, ~½ day)</strong></p>
+<ul>
+<li>Add <code>triplets/arm64-linux.cmake</code> (clone <code>triplets/x64-linux-static.cmake</code>, set <code>VCPKG_TARGET_ARCHITECTURE arm64</code>, dynamic linkage).</li>
+<li>Write <code>Dockerfile.agent-ubuntu-arm64</code> (clone of <code>Dockerfile.agent</code> with <code>--platform linux/arm64</code> discipline; vcpkg triplet=<code>arm64-linux</code>).</li>
+<li>Write <code>Dockerfile.agent-debian-bookworm</code> (swap base to <code>debian:bookworm-slim</code>, add <code>bookworm-backports</code> for gcc-13, vcpkg triplet=<code>x64-linux</code>).</li>
+<li>Write <code>scripts/build-agent-target.sh</code> with these two targets initially.</li>
+<li>Smoke test: <code>--version</code>, plugin <code>.so</code> count = 44, <code>ldd</code> shows no missing symbols, agent registers against the existing UAT server.</li>
+</ul>
+<p><strong>Phase Interlude — #376 (Conan + QUIC migration)</strong></p>
+<p>Hard prerequisite to Phase 2. Not scoped here. Scope this in a separate
+plan; expected shape:</p>
+<ul>
+<li>vcpkg → Conan migration (every target, not just Alpine)</li>
+<li>gRPC → QUIC (likely MsQuic) migration touching agent, server, gateway, SDK</li>
+<li>protobuf retained</li>
+<li>abseil, re2, c-ares, upb deleted from dep graph</li>
+<li>New transport implementation, mTLS preserved</li>
+<li>Multi-week effort per <code>.claude/agents/build-ci.md:183</code></li>
+</ul>
+<p>This plan resumes at Phase 2 once #376 closes.</p>
+<p><strong>Phase 2 — Alpine via Conan musl-native (~1 day after #376)</strong></p>
+<p>With abseil/grpc/re2/c-ares deleted from the dep graph and a Conan musl
+profile available, Phase 2 collapses to "set the profile, build, smoke
+test."</p>
+<ul>
+<li><strong>2.0</strong> Author a Conan musl profile per arch (<code>profiles/linux-musl-x86_64</code>, <code>profiles/linux-musl-aarch64</code>). Verify <code>protobuf openssl sqlite3 spdlog nlohmann-json cli11 cpp-httplib &lt;quic-lib&gt;</code> install cleanly inside Alpine 3.23.4 against each profile.</li>
+<li><strong>2.1</strong> Write <code>Dockerfile.agent-alpine</code> (Alpine builder + runtime, both stages musl-native). Build amd64 first.</li>
+<li><strong>2.2</strong> Smoke test: <code>--version</code> succeeds, plugin <code>.so</code> count = 44, <code>scanelf -n yuzu-agent</code> shows <code>ld-musl-*.so.1</code> and NOT <code>libc.so.6</code>, agent registers against UAT.</li>
+<li><strong>2.3</strong> Add arm64 (second Conan profile, second buildx target).</li>
+<li><strong>2.4</strong> <code>.apk</code> packaging: <code>deploy/packaging/alpine/APKBUILD</code>, <code>build-apk.sh</code>, <code>yuzu-agent.initd</code> (OpenRC). Wire into driver script. Smoke test: <code>apk add ./yuzu-agent-*.apk</code> inside a fresh Alpine container, <code>rc-service yuzu-agent start</code>, verify the agent talks to UAT.</li>
+<li><strong>2.5</strong> Edit <code>scripts/install-agent-user.sh</code> to add an Alpine branch (distro detection via <code>/etc/os-release</code>, OpenRC unit install, no <code>systemd-journal</code> group).</li>
+</ul>
+<p><strong>Phase 3 — CI integration (separate scope, deferred)</strong></p>
+<ul>
+<li>Unsuspend the Linux ARM64 job in <code>release.yml:236-243</code>.</li>
+<li>Add Debian bookworm and Alpine matrix entries.</li>
+<li>Update <code>scripts/check-compose-versions.sh:37-44</code> if any compose file
+  starts referencing the new images.</li>
+<li>Decide on <code>ghcr.io/tr3kkr/yuzu-agent:*</code> tagging convention for
+  per-target images (e.g. <code>:0.10.0-debian-bookworm</code>).</li>
+<li>Out of scope until Phase 1 and Phase 2 binaries are smoke-tested locally.</li>
+</ul>
+<hr>
+<h2 id="critical-files">Critical files</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Action</th>
+<th>Phase</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>triplets/arm64-linux.cmake</code></td>
+<td>NEW — clone of <code>triplets/x64-linux-static.cmake</code>; arch=arm64; linkage=dynamic</td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>deploy/docker/Dockerfile.agent-ubuntu-arm64</code></td>
+<td>NEW — clone of <code>deploy/docker/Dockerfile.agent</code> with arm64 wiring</td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>deploy/docker/Dockerfile.agent-debian-bookworm</code></td>
+<td>NEW — bookworm-slim base, gcc-13 from backports</td>
+<td>1</td>
+</tr>
+<tr>
+<td><code>scripts/build-agent-target.sh</code></td>
+<td>NEW — driver, extended each phase</td>
+<td>1, 2</td>
+</tr>
+<tr>
+<td><code>conan/profiles/linux-musl-x86_64</code></td>
+<td>NEW (Phase 2; assumes #376's Conan layout exists)</td>
+<td>2</td>
+</tr>
+<tr>
+<td><code>conan/profiles/linux-musl-aarch64</code></td>
+<td>NEW</td>
+<td>2</td>
+</tr>
+<tr>
+<td><code>deploy/docker/Dockerfile.agent-alpine</code></td>
+<td>NEW — Alpine builder + runtime, parameterised by <code>--platform</code></td>
+<td>2</td>
+</tr>
+<tr>
+<td><code>deploy/packaging/alpine/APKBUILD</code></td>
+<td>NEW</td>
+<td>2</td>
+</tr>
+<tr>
+<td><code>deploy/packaging/alpine/build-apk.sh</code></td>
+<td>NEW — mirrors <code>deploy/packaging/debian/build-deb.sh:1-152</code></td>
+<td>2</td>
+</tr>
+<tr>
+<td><code>deploy/packaging/alpine/yuzu-agent.initd</code></td>
+<td>NEW — OpenRC, modeled on <code>deploy/systemd/yuzu-agent.service:1-28</code></td>
+<td>2</td>
+</tr>
+<tr>
+<td><code>scripts/install-agent-user.sh</code></td>
+<td>EDIT — add Alpine branch in the <code>case "$OS"</code> block at lines 120–157, distro detection via <code>/etc/os-release</code></td>
+<td>2</td>
+</tr>
+</tbody>
+</table>
+<p>No edits required in any phase to: <code>meson.build</code>, <code>vcpkg.json</code>,
+<code>agents/core/</code>, any plugin source, the existing <code>Dockerfile.agent</code>. The
+<code>-Dbuild_server=false</code> flag and existing portable code do all the work.</p>
+<hr>
+<h2 id="verification">Verification</h2>
+<p><strong>Phase 1 smoke tests</strong> (each new image):</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. Build</span>
+bash<span class="w"> </span>scripts/build-agent-target.sh<span class="w"> </span>ubuntu-24.04-arm64
+bash<span class="w"> </span>scripts/build-agent-target.sh<span class="w"> </span>debian-bookworm-amd64
+
+<span class="c1"># 2. Binary launches</span>
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>--platform<span class="w"> </span>linux/arm64<span class="w"> </span>yuzu-agent:ubuntu-24.04-arm64<span class="w"> </span>--version
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>--platform<span class="w"> </span>linux/amd64<span class="w"> </span>yuzu-agent:debian-bookworm-amd64<span class="w"> </span>--version
+
+<span class="c1"># 3. Plugin .so files are present and openable</span>
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>yuzu-agent:debian-bookworm-amd64<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>sh<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;ls /usr/lib/yuzu/plugins/ | wc -l&#39;</span><span class="w">   </span><span class="c1"># expect 44</span>
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>yuzu-agent:debian-bookworm-amd64<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>sh<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;for p in /usr/lib/yuzu/plugins/*.so; do</span>
+<span class="s1">             ldd &quot;$p&quot; 2&gt;&amp;1 | grep -q &quot;not found&quot; &amp;&amp; echo MISS:$p</span>
+<span class="s1">           done&#39;</span><span class="w">                                  </span><span class="c1"># expect no output</span>
+
+<span class="c1"># 4. End-to-end: agent registers with the existing UAT server</span>
+bash<span class="w"> </span>scripts/start-UAT.sh<span class="w">                         </span><span class="c1"># bring up server+gateway</span>
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>--network<span class="w"> </span>host<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>yuzu-agent:debian-bookworm-amd64<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--server<span class="w"> </span>localhost:50051<span class="w"> </span>--no-tls
+<span class="c1"># observe Register + heartbeat in server log</span>
+</code></pre></div>
+<p><strong>Phase 2 dry-run gate (assumes #376 Conan recipes are merged)</strong>:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--platform<span class="w"> </span>linux/amd64<span class="w"> </span>alpine:3.23.4<span class="w"> </span>sh<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;</span>
+<span class="s1">  apk add --no-cache build-base cmake ninja meson python3 py3-pip git \</span>
+<span class="s1">    pkgconfig openssl-dev linux-headers &amp;&amp; \</span>
+<span class="s1">  pip install --break-system-packages conan &amp;&amp; \</span>
+<span class="s1">  cd /yuzu &amp;&amp; conan install . \</span>
+<span class="s1">    --profile=conan/profiles/linux-musl-x86_64 \</span>
+<span class="s1">    --build=missing</span>
+<span class="s1">&#39;</span>
+<span class="c1"># Success → Phase 2.1+. Failure → an unexpected post-#376 dep regression; surface and pause.</span>
+</code></pre></div>
+<p><strong>Phase 2 smoke tests</strong> (each Alpine image):</p>
+<ul>
+<li>Same <code>--version</code> / plugin-load / register sequence.</li>
+<li><code>scanelf -n yuzu-agent</code> should NOT show <code>libc.so.6</code> — only <code>ld-musl-*.so.1</code>.</li>
+<li><code>apk add ./yuzu-agent-*.apk</code> install round-trip:
+  <div class="highlight"><pre><span></span><code>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-v<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">/dist:/dist&quot;</span><span class="w"> </span>alpine:3.23.4<span class="w"> </span>sh<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;</span>
+<span class="s1">  apk update &amp;&amp; apk add openrc &amp;&amp; \</span>
+<span class="s1">  apk add --allow-untrusted /dist/yuzu-agent-*.apk &amp;&amp; \</span>
+<span class="s1">  rc-service yuzu-agent start &amp;&amp; \</span>
+<span class="s1">  sleep 2 &amp;&amp; rc-service yuzu-agent status</span>
+<span class="s1">&#39;</span>
+</code></pre></div></li>
+</ul>
+<p><strong>Pipeline self-test</strong> (after Phase 2):</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span>t<span class="w"> </span><span class="k">in</span><span class="w"> </span>ubuntu-24.04-arm64<span class="w"> </span>debian-bookworm-amd64<span class="w"> </span>alpine-3.23.4-amd64<span class="w"> </span>alpine-3.23.4-arm64<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span>bash<span class="w"> </span>scripts/build-agent-target.sh<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$t</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;FAIL: </span><span class="nv">$t</span><span class="s2">&quot;</span>
+<span class="k">done</span>
+docker<span class="w"> </span>images<span class="w"> </span>--format<span class="w"> </span><span class="s1">&#39;{{.Repository}}:{{.Tag}}\t{{.Size}}&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>yuzu-agent<span class="w"> </span><span class="p">|</span><span class="w"> </span>sort
+ls<span class="w"> </span>-la<span class="w"> </span>dist/*.apk
+</code></pre></div>
+<hr>
+<h2 id="risks">Risks</h2>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Likelihood</th>
+<th>Impact</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>#376 stalls indefinitely → Alpine blocked</strong></td>
+<td>Low-Medium</td>
+<td>Medium</td>
+<td>Fallback: redo this scope on the current vcpkg+grpc stack with musl ports of abseil/grpc/re2; treat as one-time-use binary that gets thrown away when #376 eventually lands</td>
+</tr>
+<tr>
+<td><strong>#376 lands but its Conan recipes don't include musl profiles</strong></td>
+<td>Low</td>
+<td>Medium</td>
+<td>Phase 2.0 dry-run gate catches this; scope's Phase 2 then expands to author the missing Conan musl profiles</td>
+</tr>
+<tr>
+<td>Bookworm gcc-13 not available without enabling <code>bookworm-backports</code></td>
+<td>High</td>
+<td>Low</td>
+<td>Document the apt source in the Dockerfile; alternative: clang-16 from bookworm main</td>
+</tr>
+<tr>
+<td>musl <code>arc4random_buf</code> semantics differ from glibc's</td>
+<td>Low</td>
+<td>Low</td>
+<td>musl 1.2.0+ provides it; Alpine 3.23.4 ships musl 1.2.5+. No code changes needed</td>
+</tr>
+<tr>
+<td><code>services</code> plugin no-ops on Alpine (no systemd)</td>
+<td>High</td>
+<td>Low</td>
+<td>Document in Dockerfile header; OpenRC port is backlog</td>
+</tr>
+<tr>
+<td><code>arm64</code> build via buildx emulation is slow on Intel macOS</td>
+<td>N/A here (Apple Silicon)</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>release.yml</code> ARM64 job unsuspend exposes infra dep on a runner</td>
+<td>Medium</td>
+<td>Medium</td>
+<td>Phase 3 only; not on critical path for local dev</td>
+</tr>
+<tr>
+<td>musl libstdc++ ABI surprises in plugin <code>dlopen</code></td>
+<td>Medium</td>
+<td>Medium</td>
+<td>All plugins built in same musl pipeline as core, so ABI is consistent. Risk is from third-party plugins post-launch — out of scope here</td>
+</tr>
+<tr>
+<td><code>abuild</code> build inside our own image needs a non-root abuilder user</td>
+<td>Medium</td>
+<td>Low</td>
+<td>Standard Alpine packaging pattern; documented in <code>deploy/packaging/alpine/build-apk.sh</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="resolved-out-of-scope-work-this-plan-depends-on">Resolved: out-of-scope work this plan depends on</h2>
+<p><strong>#376 (Conan + QUIC migration)</strong> is a hard prerequisite to Phase 2 and is
+explicitly not scoped here. It needs its own scoping document covering:</p>
+<ul>
+<li>Conan recipe authoring or migration for every existing dep (protobuf,
+  openssl, sqlite3, spdlog, nlohmann-json, cli11, cpp-httplib).</li>
+<li>QUIC library selection (MsQuic vs ngtcp2 vs quiche vs lsquic), with
+  Linux/macOS/Windows + glibc/musl support matrix.</li>
+<li>Transport rewrite in <code>proto/</code>, <code>agents/core/</code>, <code>server/core/</code>, <code>gateway/</code>,
+  <code>sdk/</code> — replacing gRPC bidirectional streams (Subscribe, Register,
+  GatewayUpstream, ManagementService) with QUIC primitives.</li>
+<li>mTLS preservation across the new transport.</li>
+<li>vcpkg → Conan cutover for CI runners (Linux self-hosted, Windows local,
+  macos-15) including cache strategy migration.</li>
+<li>Removal of the <code>triplets/x64-windows.cmake</code> static-link override and the
+  <code>meson.build</code> Windows-specific <code>cxx.find_library()</code> block (#375 option D
+  becomes obsolete; that's much of the value).</li>
+<li>Removal of the #501 absl-DLL-seed mismatch test workarounds.</li>
+</ul>
+<p>When #376 closes, this plan's Phase 2 picks up.</p>
+</main>
+</body>
+</html>

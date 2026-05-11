@@ -1,0 +1,782 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security Hardening Guide</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/security-hardening.md</div>
+<h1 class="doc-title">Security Hardening Guide</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="security-hardening-guide">Security Hardening Guide</h1>
+<p>This guide covers hardening Yuzu for production enterprise deployments.</p>
+<h2 id="mtls-setup">mTLS Setup</h2>
+<p>All agent-to-server communication should use mutual TLS. Create a private CA, server certificate, and per-agent certificates.</p>
+<h3 id="1-create-certificate-authority">1. Create Certificate Authority</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Generate CA key and certificate (valid 10 years)</span>
+openssl<span class="w"> </span>genrsa<span class="w"> </span>-out<span class="w"> </span>ca.key<span class="w"> </span><span class="m">4096</span>
+openssl<span class="w"> </span>req<span class="w"> </span>-new<span class="w"> </span>-x509<span class="w"> </span>-key<span class="w"> </span>ca.key<span class="w"> </span>-sha256<span class="w"> </span>-days<span class="w"> </span><span class="m">3650</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-out<span class="w"> </span>ca.crt<span class="w"> </span>-subj<span class="w"> </span><span class="s2">&quot;/CN=Yuzu CA/O=Your Org&quot;</span>
+</code></pre></div>
+<h3 id="2-server-certificate">2. Server Certificate</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Generate server key and CSR</span>
+openssl<span class="w"> </span>genrsa<span class="w"> </span>-out<span class="w"> </span>server.key<span class="w"> </span><span class="m">2048</span>
+openssl<span class="w"> </span>req<span class="w"> </span>-new<span class="w"> </span>-key<span class="w"> </span>server.key<span class="w"> </span>-out<span class="w"> </span>server.csr<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-subj<span class="w"> </span><span class="s2">&quot;/CN=yuzu-server/O=Your Org&quot;</span>
+
+<span class="c1"># Sign with CA (include SAN for gRPC)</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>server-ext.cnf<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
+<span class="s">subjectAltName = DNS:yuzu-server,DNS:localhost,IP:127.0.0.1</span>
+<span class="s">EOF</span>
+openssl<span class="w"> </span>x509<span class="w"> </span>-req<span class="w"> </span>-in<span class="w"> </span>server.csr<span class="w"> </span>-CA<span class="w"> </span>ca.crt<span class="w"> </span>-CAkey<span class="w"> </span>ca.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-CAcreateserial<span class="w"> </span>-out<span class="w"> </span>server.crt<span class="w"> </span>-days<span class="w"> </span><span class="m">365</span><span class="w"> </span>-sha256<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-extfile<span class="w"> </span>server-ext.cnf
+</code></pre></div>
+<h3 id="3-agent-certificates">3. Agent Certificates</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Per-agent certificate (CN should match agent ID)</span>
+<span class="nv">AGENT_ID</span><span class="o">=</span><span class="s2">&quot;agent-001&quot;</span>
+openssl<span class="w"> </span>genrsa<span class="w"> </span>-out<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">AGENT_ID</span><span class="si">}</span><span class="s2">.key&quot;</span><span class="w"> </span><span class="m">2048</span>
+openssl<span class="w"> </span>req<span class="w"> </span>-new<span class="w"> </span>-key<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">AGENT_ID</span><span class="si">}</span><span class="s2">.key&quot;</span><span class="w"> </span>-out<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">AGENT_ID</span><span class="si">}</span><span class="s2">.csr&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-subj<span class="w"> </span><span class="s2">&quot;/CN=</span><span class="si">${</span><span class="nv">AGENT_ID</span><span class="si">}</span><span class="s2">/O=Your Org&quot;</span>
+openssl<span class="w"> </span>x509<span class="w"> </span>-req<span class="w"> </span>-in<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">AGENT_ID</span><span class="si">}</span><span class="s2">.csr&quot;</span><span class="w"> </span>-CA<span class="w"> </span>ca.crt<span class="w"> </span>-CAkey<span class="w"> </span>ca.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-CAcreateserial<span class="w"> </span>-out<span class="w"> </span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">AGENT_ID</span><span class="si">}</span><span class="s2">.crt&quot;</span><span class="w"> </span>-days<span class="w"> </span><span class="m">365</span><span class="w"> </span>-sha256
+</code></pre></div>
+<h3 id="4-configure">4. Configure</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Server</span>
+yuzu-server<span class="w"> </span>--cert<span class="w"> </span>server.crt<span class="w"> </span>--key<span class="w"> </span>server.key<span class="w"> </span>--ca-cert<span class="w"> </span>ca.crt
+
+<span class="c1"># Agent</span>
+yuzu-agent<span class="w"> </span>--client-cert<span class="w"> </span>agent-001.crt<span class="w"> </span>--client-key<span class="w"> </span>agent-001.key<span class="w"> </span>--ca-cert<span class="w"> </span>ca.crt
+</code></pre></div>
+<p>On Windows, agents can use the certificate store instead of PEM files:
+<div class="highlight"><pre><span></span><code>yuzu-agent<span class="w"> </span>--cert-store<span class="w"> </span>MY<span class="w"> </span>--cert-subject<span class="w"> </span><span class="s2">&quot;agent-001&quot;</span>
+</code></pre></div></p>
+<h2 id="firewall-rules">Firewall Rules</h2>
+<table>
+<thead>
+<tr>
+<th>Port</th>
+<th>Protocol</th>
+<th>Direction</th>
+<th>Purpose</th>
+<th>Restrict To</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>8080</td>
+<td>TCP</td>
+<td>Inbound</td>
+<td>Web dashboard + REST API</td>
+<td>Admin network</td>
+</tr>
+<tr>
+<td>8443</td>
+<td>TCP</td>
+<td>Inbound</td>
+<td>HTTPS dashboard</td>
+<td>Admin network</td>
+</tr>
+<tr>
+<td>50051</td>
+<td>TCP</td>
+<td>Inbound</td>
+<td>Agent gRPC</td>
+<td>Agent network</td>
+</tr>
+<tr>
+<td>50052</td>
+<td>TCP</td>
+<td>Inbound</td>
+<td>Management gRPC</td>
+<td>Admin network</td>
+</tr>
+<tr>
+<td>50055</td>
+<td>TCP</td>
+<td>Inbound</td>
+<td>Gateway upstream</td>
+<td>Gateway hosts only</td>
+</tr>
+<tr>
+<td>9568</td>
+<td>TCP</td>
+<td>Inbound</td>
+<td>Gateway Prometheus</td>
+<td>Monitoring network</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Recommendations:</strong>
+- Bind the web dashboard to an internal interface: <code>--web-address 10.0.0.1</code>
+- Never expose gRPC ports (50051/50052) to the internet
+- Use a reverse proxy (nginx, Caddy) for TLS termination on the dashboard</p>
+<blockquote>
+<p><strong>Coming in #376 — QUIC transport migration.</strong> PR 5 of the QUIC
+migration adds a <code>--transport=grpc|quic|auto</code> flag and dual-stack
+support; once the agent default flips (PR 6), the agent and gateway
+will additionally need outbound UDP reachability on the same numeric
+ports above. This table will be updated when PR 5 lands. Customers in
+Zscaler / Netskope / Bluecoat environments should anticipate
+validating UDP egress; tracking under #892 (pilot-customer hand-test
+gate).</p>
+</blockquote>
+<h2 id="least-privilege-deployment">Least-Privilege Deployment</h2>
+<p>The systemd service units include security hardening:</p>
+<div class="highlight"><pre><span></span><code><span class="na">NoNewPrivileges</span><span class="o">=</span><span class="s">true</span>
+<span class="na">ProtectSystem</span><span class="o">=</span><span class="s">strict</span>
+<span class="na">ProtectHome</span><span class="o">=</span><span class="s">true</span>
+<span class="na">PrivateTmp</span><span class="o">=</span><span class="s">true</span>
+<span class="na">ReadOnlyDirectories</span><span class="o">=</span><span class="s">/</span>
+<span class="na">ReadWritePaths</span><span class="o">=</span><span class="s">/var/lib/yuzu /var/log/yuzu /etc/yuzu</span>
+</code></pre></div>
+<p>Run each component under its own system user:
+- <code>yuzu</code> — server process
+- <code>yuzu-agent</code> — agent process
+- <code>yuzu-gw</code> — gateway process</p>
+<h2 id="secret-management">Secret Management</h2>
+<p><strong>Never pass secrets via CLI flags</strong> — they are visible in <code>ps aux</code>.</p>
+<p>Use environment variables instead:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># systemd EnvironmentFile</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;YUZU_OIDC_CLIENT_SECRET=your-secret&#39;</span><span class="w"> </span>&gt;<span class="w"> </span>/etc/yuzu/secrets.env
+chmod<span class="w"> </span><span class="m">600</span><span class="w"> </span>/etc/yuzu/secrets.env
+
+<span class="c1"># Add to systemd unit</span>
+<span class="c1"># [Service]</span>
+<span class="c1"># EnvironmentFile=/etc/yuzu/secrets.env</span>
+</code></pre></div>
+<p>Sensitive environment variables:
+- <code>YUZU_OIDC_CLIENT_SECRET</code> — OIDC client secret
+- <code>YUZU_CLICKHOUSE_PASSWORD</code> — ClickHouse password
+- <code>YUZU_NVD_API_KEY</code> — NVD API key</p>
+<p>For HashiCorp Vault integration, use a wrapper script that fetches secrets at startup:
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">YUZU_OIDC_CLIENT_SECRET</span><span class="o">=</span><span class="k">$(</span>vault<span class="w"> </span>kv<span class="w"> </span>get<span class="w"> </span>-field<span class="o">=</span>secret<span class="w"> </span>secret/yuzu/oidc<span class="k">)</span>
+<span class="nb">exec</span><span class="w"> </span>/usr/local/bin/yuzu-server<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$@</span><span class="s2">&quot;</span>
+</code></pre></div></p>
+<h2 id="rate-limiting">Rate Limiting</h2>
+<p>Configure API and login rate limits:</p>
+<div class="highlight"><pre><span></span><code>yuzu-server<span class="w"> </span>--rate-limit<span class="w"> </span><span class="m">100</span><span class="w"> </span>--login-rate-limit<span class="w"> </span><span class="m">10</span>
+</code></pre></div>
+<ul>
+<li><code>--rate-limit</code> — Maximum API requests per second per IP (default: 100)</li>
+<li><code>--login-rate-limit</code> — Maximum login attempts per second per IP (default: 10)</li>
+</ul>
+<p>Clients exceeding the limit receive <code>429 Too Many Requests</code> with a <code>Retry-After: 1</code> header.</p>
+<p>For additional protection, deploy a reverse proxy with rate limiting:
+<div class="highlight"><pre><span></span><code><span class="k">limit_req_zone</span><span class="w"> </span><span class="nv">$binary_remote_addr</span><span class="w"> </span><span class="s">zone=yuzu_api:10m</span><span class="w"> </span><span class="s">rate=50r/s</span><span class="p">;</span>
+<span class="k">location</span><span class="w"> </span><span class="s">/api/</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kn">limit_req</span><span class="w"> </span><span class="s">zone=yuzu_api</span><span class="w"> </span><span class="s">burst=20</span><span class="w"> </span><span class="s">nodelay</span><span class="p">;</span>
+<span class="w">    </span><span class="kn">proxy_pass</span><span class="w"> </span><span class="s">http://127.0.0.1:8080</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div></p>
+<h2 id="http-security-response-headers">HTTP Security Response Headers</h2>
+<p>Yuzu sets six standard security response headers on every HTTP response from the server (dashboard, REST API, MCP, metrics, health probes, error pages). No configuration is required to enable them.</p>
+<table>
+<thead>
+<tr>
+<th>Header</th>
+<th>Value</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Content-Security-Policy</code></td>
+<td><code>default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'[; upgrade-insecure-requests]</code></td>
+<td>Restricts which sources can be loaded by the dashboard. Defends against XSS, clickjacking, and content injection. <code>upgrade-insecure-requests</code> is appended only when HTTPS is enabled. The CSP is fully <code>'self'</code>-only — no external CDN allowance — because the HTMX runtime is embedded in the server binary and served from <code>/static/htmx.js</code> (see below).</td>
+</tr>
+<tr>
+<td><code>X-Frame-Options</code></td>
+<td><code>DENY</code></td>
+<td>Blocks the dashboard from being embedded in any <code>&lt;iframe&gt;</code>. Defense-in-depth alongside CSP <code>frame-ancestors 'none'</code>.</td>
+</tr>
+<tr>
+<td><code>X-Content-Type-Options</code></td>
+<td><code>nosniff</code></td>
+<td>Prevents MIME-type sniffing attacks. Browsers must respect the declared <code>Content-Type</code>.</td>
+</tr>
+<tr>
+<td><code>Referrer-Policy</code></td>
+<td><code>strict-origin-when-cross-origin</code></td>
+<td>Sends only the origin (not the full URL with query strings) when navigating cross-origin. Defends against URL-based secret leakage to third-party sites.</td>
+</tr>
+<tr>
+<td><code>Permissions-Policy</code></td>
+<td><code>accelerometer=(), autoplay=(), camera=(), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-get=(), screen-wake-lock=(), sync-xhr=(), usb=(), web-share=(), xr-spatial-tracking=()</code></td>
+<td>Deny-all baseline for browser feature APIs the dashboard never uses. <code>fullscreen=(self)</code> is permitted for same-origin chart libraries.</td>
+</tr>
+<tr>
+<td><code>Strict-Transport-Security</code></td>
+<td><code>max-age=31536000; includeSubDomains</code></td>
+<td>(HTTPS only) Tells browsers to always use HTTPS for this origin for one year. Defends against TLS downgrade attacks. Only sent when <code>https_enabled</code> is true, per RFC 6797 §7.2.</td>
+</tr>
+</tbody>
+</table>
+<p>At server startup, the resolved header bundle is logged at INFO level so operators can confirm activation:</p>
+<div class="highlight"><pre><span></span><code>[info] Security headers active: CSP=277 bytes, HSTS=on, Referrer-Policy=&quot;strict-origin-when-cross-origin&quot;, Permissions-Policy=315 bytes
+</code></pre></div>
+<h3 id="why-unsafe-inline-for-scripts-and-styles">Why <code>'unsafe-inline'</code> for scripts and styles</h3>
+<p>The HTMX dashboard uses inline <code>&lt;script&gt;</code> blocks, inline <code>onclick=</code> event handlers, and inline <code>&lt;style&gt;</code> blocks. Tightening to a strict nonce-based CSP would require refactoring all event handlers to <code>addEventListener</code> and threading per-request nonces through every HTML render path. This work is tracked separately. The current CSP is restrictive enough to block external script injection while keeping the dashboard functional.</p>
+<h3 id="embedded-htmx-runtime-no-external-cdn">Embedded HTMX runtime — no external CDN</h3>
+<p>The HTMX 2.0.4 runtime and the <code>htmx-ext-sse</code> extension are compiled into the server binary as static C++ string literals (<code>server/core/src/static_js_bundle.cpp</code>) and served from same-origin paths:</p>
+<ul>
+<li><code>GET /static/htmx.js</code> — HTMX core (~51 KB)</li>
+<li><code>GET /static/sse.js</code> — Server-Sent Events extension (~9 KB)</li>
+</ul>
+<p>Both responses set <code>Cache-Control: public, max-age=86400</code>. The dashboard's <code>&lt;head&gt;</code> references them as <code>&lt;script src="/static/htmx.js"&gt;</code> and <code>&lt;script src="/static/sse.js"&gt;</code>, so the CSP <code>script-src</code> only needs <code>'self'</code> — there is no external CDN allowance and <strong>no internet connectivity required</strong> for the dashboard to load. This makes the server suitable for air-gapped deployments out of the box.</p>
+<p>If you need to update HTMX, replace the payloads in <code>server/core/src/static_js_bundle.cpp</code> and rebuild. The file is split into 14 KB chunks because MSVC's raw string literal limit is 16380 bytes (error C2026) — keep that constraint in mind when re-vendoring.</p>
+<h3 id="extending-csp-for-customer-environments">Extending CSP for customer environments</h3>
+<p>Some deployments need to reach additional origins from the dashboard — a customer-hosted CDN, a monitoring beacon (e.g. New Relic, Sentry), an analytics endpoint, or a custom favicon host. Use <code>--csp-extra-sources</code> to append additional source-list entries to the <code>script-src</code>, <code>style-src</code>, <code>connect-src</code>, and <code>img-src</code> directives:</p>
+<div class="highlight"><pre><span></span><code>yuzu-server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--csp-extra-sources<span class="w"> </span><span class="s2">&quot;https://cdn.example.com https://beacon.example.com&quot;</span>
+</code></pre></div>
+<p>The argument is a single space-separated string. Each entry is appended to all four directives. To set this via environment variable:</p>
+<div class="highlight"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">YUZU_CSP_EXTRA_SOURCES</span><span class="o">=</span><span class="s2">&quot;https://cdn.example.com https://beacon.example.com&quot;</span>
+yuzu-server
+</code></pre></div>
+<h4 id="validation">Validation</h4>
+<p>The flag is validated at startup. The server will refuse to start with a clear error message if the value contains:</p>
+<ul>
+<li>Control bytes (0x00–0x1F except SP/HTAB, plus 0x7F) — these would cause cpp-httplib's header validation to silently drop the entire CSP header.</li>
+<li>Semicolons (<code>;</code>) or commas (<code>,</code>) — these would inject additional CSP directives.</li>
+<li>Quoted CSP keywords other than the safe allow-list <code>'self'</code>, <code>'none'</code>, or <code>'sha256-...'</code>/<code>'sha384-...'</code>/<code>'sha512-...'</code>/<code>'nonce-...'</code> hash and nonce expressions. Notably <code>'unsafe-eval'</code> and <code>'strict-dynamic'</code> are <strong>rejected</strong> — operators who genuinely need them must extend the server build and accept the security trade-off.</li>
+<li>Unquoted tokens with stray single quotes (malformed sources).</li>
+</ul>
+<p>For example:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Rejected at startup with: csp_extra_sources contains forbidden control byte 0x0d at position 18</span>
+yuzu-server<span class="w"> </span>--csp-extra-sources<span class="w"> </span><span class="s1">$&#39;https://ok.example\rInjected&#39;</span>
+
+<span class="c1"># Rejected at startup with: csp_extra_sources token &quot;&#39;unsafe-eval&#39;&quot; is not a valid CSP source expression</span>
+yuzu-server<span class="w"> </span>--csp-extra-sources<span class="w"> </span><span class="s2">&quot;&#39;unsafe-eval&#39;&quot;</span>
+</code></pre></div>
+<h3 id="behind-a-reverse-proxy">Behind a reverse proxy</h3>
+<p>If you deploy Yuzu behind a reverse proxy (nginx, HAProxy, Caddy, Cloudflare) that <strong>also</strong> sets a <code>Content-Security-Policy</code> header, the browser will see two CSP headers and apply the <strong>intersection</strong> of both policies — the strictest combined policy wins. This can be confusing when debugging "why is my extra source blocked?" — check both layers. If your proxy sets its own CSP, either:</p>
+<ul>
+<li>Disable the proxy's CSP and let Yuzu's CSP apply, or</li>
+<li>Disable Yuzu's CSP via the proxy's <code>proxy_hide_header Content-Security-Policy;</code> directive, or</li>
+<li>Match both policies so the intersection allows what you need.</li>
+</ul>
+<p>The same applies to all other security headers — if both layers set them, browsers honor the strictest.</p>
+<h3 id="verifying-headers">Verifying headers</h3>
+<p>Run the dashboard and inspect the response headers in your browser's developer tools (Network tab → click any request → Response Headers), or with <code>curl</code>:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-sk<span class="w"> </span>-i<span class="w"> </span>https://yuzu.example.com:8443/livez<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;^(Content-Security|X-Frame|X-Content|Referrer-Policy|Permissions-Policy|Strict-Transport)&#39;</span>
+</code></pre></div>
+<p>You should see all six headers present on HTTPS responses (and the first five on HTTP responses).</p>
+<h3 id="bandwidth-note">Bandwidth note</h3>
+<p>The six security headers add roughly 700–900 bytes per HTTP response depending on whether <code>--csp-extra-sources</code> is set. For a fleet that pulls heavily from the REST API (e.g. an analytics pipeline polling <code>/api/v1/responses</code> thousands of times per hour), this is a non-trivial increase in egress on metered connections. Plan capacity accordingly. The headers cannot be disabled.</p>
+<h2 id="audit-log-forwarding">Audit Log Forwarding</h2>
+<p>Configure webhooks to forward audit events to your SIEM:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Create a webhook subscription for audit events</span>
+curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/webhooks<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;url&quot;:&quot;https://splunk-hec.example.com:8088/services/collector&quot;,</span>
+<span class="s1">       &quot;events&quot;:[&quot;audit.*&quot;],</span>
+<span class="s1">       &quot;headers&quot;:{&quot;Authorization&quot;:&quot;Splunk YOUR-HEC-TOKEN&quot;}}&#39;</span>
+</code></pre></div>
+<p>Audit events include: <code>timestamp</code>, <code>principal</code>, <code>action</code>, <code>target_type</code>, <code>target_id</code>, <code>detail</code>, <code>source_ip</code>.</p>
+<h2 id="database-security">Database Security</h2>
+<ul>
+<li>SQLite databases use WAL mode for concurrent access</li>
+<li>The TAR database uses <code>PRAGMA secure_delete = ON</code> to zero deleted pages</li>
+<li>Protect database files with filesystem permissions: <code>chmod 600 *.db</code></li>
+<li>For encryption at rest, use filesystem-level encryption:</li>
+<li>Linux: LUKS on the data partition</li>
+<li>Windows: BitLocker on the data volume</li>
+<li>Docker: encrypted volumes</li>
+</ul>
+<h2 id="plugin-allowlist">Plugin Allowlist</h2>
+<p>In production, verify plugin binaries against a SHA-256 allowlist to prevent loading of tampered or unauthorized code:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Generate allowlist from verified builds</span>
+sha256sum<span class="w"> </span>/opt/yuzu/plugins/*.so<span class="w"> </span>&gt;<span class="w"> </span>/etc/yuzu/plugin-allowlist.txt
+chmod<span class="w"> </span><span class="m">600</span><span class="w"> </span>/etc/yuzu/plugin-allowlist.txt
+
+<span class="c1"># Start agent with allowlist enforcement</span>
+yuzu-agent<span class="w"> </span>--plugin-allowlist<span class="w"> </span>/etc/yuzu/plugin-allowlist.txt
+</code></pre></div>
+<p>Plugins not listed or with a hash mismatch are rejected before any code executes. See <a href="agent-plugins.html#plugin-allowlist">Plugin Allowlist</a> for details.</p>
+<h2 id="command-replay-protection">Command Replay Protection</h2>
+<p>The agent tracks recently-executed <code>command_id</code> values per connection and rejects duplicates. This prevents replay attacks where a captured command is retransmitted to re-execute actions.</p>
+<ul>
+<li>The dedup set is reset on each reconnect (new Subscribe stream).</li>
+<li>Uses a double-buffer strategy with 5,000 entries per buffer (10,000 total). When the current buffer fills, the previous buffer is discarded and the current becomes the previous — recently-seen IDs are always protected.</li>
+<li>Replayed commands receive a <code>REJECTED</code> response with reason <code>"command replay rejected: duplicate command_id"</code>.</li>
+<li>The server generates unique <code>command_id</code> values per invocation, so legitimate commands are never affected.</li>
+</ul>
+<p>No additional configuration is required — replay protection is always active.</p>
+<h2 id="device-quarantine">Device Quarantine</h2>
+<p>The <code>quarantine</code> agent plugin isolates compromised or suspicious devices by blocking all network traffic except the Yuzu server connection. This allows continued management while preventing lateral movement.</p>
+<h3 id="quarantining-a-device">Quarantining a Device</h3>
+<p>Execute the <code>quarantine</code> action from the <code>quarantine</code> plugin:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/executions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;definition_id&quot;: &quot;quarantine.quarantine&quot;,</span>
+<span class="s1">    &quot;scope&quot;: &quot;agent_id == \&quot;compromised-agent-id\&quot;&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>The plugin blocks all network traffic except communication with the Yuzu server using platform-native firewalling: <code>netsh</code> on Windows, <code>iptables</code>/<code>nftables</code> on Linux, and <code>pfctl</code> on macOS.</p>
+<h3 id="checking-quarantine-status">Checking Quarantine Status</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Execute quarantine.status to check if an agent is isolated</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/executions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;definition_id&quot;: &quot;quarantine.status&quot;,</span>
+<span class="s1">    &quot;scope&quot;: &quot;agent_id == \&quot;agent-id\&quot;&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<h3 id="releasing-a-device">Releasing a Device</h3>
+<p>Execute the <code>unquarantine</code> action to remove quarantine rules and restore normal network access. You can also use <code>whitelist</code> to add exceptions (IP or CIDR range) to the quarantine rules before releasing.</p>
+<h2 id="ioc-checking">IOC Checking</h2>
+<p>The <code>ioc</code> plugin supports Indicator of Compromise checking for threat hunting. Execute the <code>check</code> action with one or more indicator types to scan an endpoint for signs of compromise.</p>
+<h3 id="supported-indicator-types">Supported Indicator Types</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ip_addresses</code></td>
+<td>Check active TCP/UDP connections against known-bad IPs</td>
+</tr>
+<tr>
+<td><code>domains</code></td>
+<td>Check DNS cache and hosts file against known-bad domains</td>
+</tr>
+<tr>
+<td><code>file_hashes</code></td>
+<td>Scan specified paths for files matching known-bad SHA-256 hashes</td>
+</tr>
+<tr>
+<td><code>file_paths</code></td>
+<td>Check for the existence of specific suspicious file paths</td>
+</tr>
+<tr>
+<td><code>ports</code></td>
+<td>Check for processes listening on suspicious ports</td>
+</tr>
+</tbody>
+</table>
+<h3 id="running-an-ioc-check">Running an IOC Check</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/executions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;definition_id&quot;: &quot;ioc.check&quot;,</span>
+<span class="s1">    &quot;parameters&quot;: {</span>
+<span class="s1">      &quot;ip_addresses&quot;: [&quot;203.0.113.50&quot;, &quot;198.51.100.23&quot;],</span>
+<span class="s1">      &quot;file_hashes&quot;: [&quot;e3b0c44298fc1c149afbf4c8996fb924...&quot;],</span>
+<span class="s1">      &quot;ports&quot;: [&quot;4444&quot;, &quot;5555&quot;]</span>
+<span class="s1">    },</span>
+<span class="s1">    &quot;scope&quot;: &quot;tag:env == \&quot;production\&quot;&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>IOC checks run locally on each endpoint, querying active connections (Windows: <code>GetExtendedTcpTable</code>, Linux: <code>/proc/net/tcp</code>, macOS: <code>lsof</code>), DNS cache, and filesystem state. Results include matched indicators and the source of the match.</p>
+<h2 id="certificate-inventory">Certificate Inventory</h2>
+<p>The <code>certificates</code> plugin enumerates certificates in system stores for compliance auditing, expiration monitoring, and security review.</p>
+<h3 id="listing-certificates">Listing Certificates</h3>
+<p>Execute the <code>certificates.list</code> action to get all certificates with subject, issuer, thumbprint, and expiry date. Use <code>certificates.details</code> with a thumbprint parameter for full certificate details including key usage, serial number, and chain information.</p>
+<h3 id="certificate-deletion">Certificate Deletion</h3>
+<p>Execute the <code>certificates.delete</code> action with a thumbprint parameter to remove a certificate from the system store. This is useful for revoking compromised certificates or cleaning up expired entries.</p>
+<p>Platform implementations:
+- <strong>Windows:</strong> CryptoAPI (<code>CertOpenStore</code>, <code>CertEnumCertificatesInStore</code>)
+- <strong>Linux:</strong> PEM files in <code>/etc/ssl/certs/</code>
+- <strong>macOS:</strong> <code>security find-certificate</code> CLI</p>
+<h2 id="oidc-hardening">OIDC Hardening</h2>
+<p>When using OIDC/Entra ID:
+- Set <code>--oidc-admin-group</code> to restrict admin access to a specific group
+- Use <code>--session-timeout</code> to limit session duration
+- Configure the OIDC provider to require MFA
+- Restrict the app registration to your tenant (single-tenant)
+- Rotate the client secret regularly</p>
+</main>
+</body>
+</html>

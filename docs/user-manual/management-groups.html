@@ -1,0 +1,929 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Management Groups</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/management-groups.md</div>
+<h1 class="doc-title">Management Groups</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="management-groups">Management Groups</h1>
+<p>Management groups organize devices into a hierarchy for scoped access control and targeted operations. They support both static membership (manually assigned) and dynamic membership (auto-populated by a scope expression).</p>
+<h2 id="concepts">Concepts</h2>
+<table>
+<thead>
+<tr>
+<th>Concept</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Management group</strong></td>
+<td>A named container for devices, with optional parent/child relationships.</td>
+</tr>
+<tr>
+<td><strong>Root group</strong></td>
+<td>The built-in "All Devices" group (ID <code>000000000000</code>) is auto-created on server startup. It cannot be deleted or re-parented. Every newly enrolled agent is automatically added to this group.</td>
+</tr>
+<tr>
+<td><strong>Static membership</strong></td>
+<td>Agents are explicitly added to or removed from the group by an operator.</td>
+</tr>
+<tr>
+<td><strong>Dynamic membership</strong></td>
+<td>A scope expression (e.g., <code>os = "Windows" AND tag:department = "Finance"</code>) determines membership. Matching agents are included automatically.</td>
+</tr>
+<tr>
+<td><strong>Hierarchy</strong></td>
+<td>Groups form a tree with a maximum depth of 5 levels below the root (root + 5 child levels). Role assignments on a parent group cascade to all children.</td>
+</tr>
+<tr>
+<td><strong>Service groups</strong></td>
+<td>When a <code>service</code> tag is set on an agent, Yuzu auto-creates a <code>Service: {name}</code> management group containing all agents with that tag.</td>
+</tr>
+<tr>
+<td><strong>Visibility filtering</strong></td>
+<td>Non-admin users only see agents that belong to management groups where they hold a role assignment. Global administrators see all agents regardless of group membership.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="root-group">Root Group</h2>
+<p>The root "All Devices" group is special:</p>
+<ul>
+<li><strong>Auto-created on startup</strong> -- if the group does not exist when the server starts, it is created automatically with ID <code>000000000000</code>, membership type <code>dynamic</code>, and scope expression <code>*</code>.</li>
+<li><strong>Auto-enrollment</strong> -- when a new agent completes registration (whether via manual approval, enrollment token, or platform trust), it is automatically added to the root group.</li>
+<li><strong>Cannot be deleted</strong> -- <code>DELETE /api/v1/management-groups/000000000000</code> returns <code>403 Forbidden</code>.</li>
+<li><strong>Cannot be re-parented</strong> -- <code>PUT /api/v1/management-groups/000000000000</code> with a <code>parent_id</code> returns <code>400 Bad Request</code>.</li>
+<li><strong>Can be renamed</strong> -- you may update the root group's name or description via the PUT endpoint.</li>
+</ul>
+<h2 id="hierarchy-example">Hierarchy Example</h2>
+<div class="highlight"><pre><span></span><code>All Devices (root, auto-created)
+  |-- London Office
+  |     |-- London Desktops
+  |     |-- London Servers
+  |-- New York Office
+  |     |-- New York Desktops
+  |-- Service: SAP
+  |-- Service: Exchange
+</code></pre></div>
+<p>A role assignment on "London Office" applies to both "London Desktops" and "London Servers". This avoids duplicating role assignments at every level.</p>
+<h2 id="visibility-filtering">Visibility Filtering</h2>
+<p>When RBAC is enabled, the agent list shown in the dashboard and returned by the agent API is filtered based on management group role assignments:</p>
+<ul>
+<li><strong>Global administrators</strong> (users with the <code>Infrastructure:Read</code> permission) see all agents.</li>
+<li><strong>Non-admin users</strong> only see agents that belong to management groups where they have at least one role assignment (Operator, Viewer, or ITServiceOwner).</li>
+<li>This applies to the dashboard view, the <code>/api/agents</code> endpoint, and any UI page that lists devices.</li>
+</ul>
+<p>For example, if <code>jane.ops</code> holds the Operator role on the "London Office" group, she sees only agents that are members of "London Office" or its child groups ("London Desktops", "London Servers").</p>
+<h2 id="rest-api">REST API</h2>
+<p>All endpoints require authentication (session cookie or API token). Management group operations require appropriate RBAC permissions on the <code>ManagementGroup</code> securable type.</p>
+<h3 id="list-all-groups">List All Groups</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/v1/management-groups
+</code></pre></div>
+<p>All list endpoints return a paginated envelope:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;mg_all_devices&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;All Devices&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Root group containing all enrolled agents&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;membership_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;dynamic&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;scope_expression&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;*&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;system&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742360400</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;updated_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742360400</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;mg_london&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;London Office&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Agents in the London office&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;parent_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;mg_all_devices&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;membership_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;static&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;scope_expression&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;admin&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742360400</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;updated_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742360400</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;pagination&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;start&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;page_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">50</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="create-a-group">Create a Group</h3>
+<h4 id="static-membership">Static Membership</h4>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/management-groups<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;London Servers&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Production servers in the London data center&quot;,</span>
+<span class="s1">    &quot;parent_id&quot;: &quot;mg_london&quot;,</span>
+<span class="s1">    &quot;membership_type&quot;: &quot;static&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>The <code>created_by</code> field is set automatically from the authenticated session.</p>
+<p>Returns <code>201 Created</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;a1b2c3d4e5f6&quot;</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h4 id="dynamic-membership">Dynamic Membership</h4>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/management-groups<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;All Windows Endpoints&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Auto-populated with all Windows agents&quot;,</span>
+<span class="s1">    &quot;parent_id&quot;: &quot;mg_all_devices&quot;,</span>
+<span class="s1">    &quot;membership_type&quot;: &quot;dynamic&quot;,</span>
+<span class="s1">    &quot;scope_expression&quot;: &quot;os = \&quot;Windows\&quot;&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>The <code>scope_expression</code> uses the same syntax as the scope engine. Common operators:</p>
+<table>
+<thead>
+<tr>
+<th>Expression</th>
+<th>Matches</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>os = "Windows"</code></td>
+<td>All Windows agents</td>
+</tr>
+<tr>
+<td><code>os = "Linux" AND tag:environment = "production"</code></td>
+<td>Linux agents tagged as production</td>
+</tr>
+<tr>
+<td><code>tag:department = "Finance" OR tag:department = "Legal"</code></td>
+<td>Agents in Finance or Legal</td>
+</tr>
+<tr>
+<td><code>NOT tag:decommissioned EXISTS</code></td>
+<td>Agents without a decommissioned tag</td>
+</tr>
+</tbody>
+</table>
+<h3 id="get-group-details">Get Group Details</h3>
+<p>Returns the group metadata plus its current member list.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;a1b2c3d4e5f6&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;London Servers&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Production servers in the London data center&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;parent_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;mg_london&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;membership_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;static&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;scope_expression&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;created_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;admin&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742360400</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;updated_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742360400</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;members&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">      </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;agent_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;agent_lon_srv_01&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;source&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;static&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;added_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742360700</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;agent_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;agent_lon_srv_02&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;source&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;static&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;added_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742360700</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">]</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Note: The <code>members</code> array contains <code>agent_id</code>, <code>source</code> (either <code>"static"</code> or <code>"dynamic"</code>), and <code>added_at</code> (Unix epoch seconds). It does not include hostname or OS -- use the agent details endpoint for that information.</p>
+<h3 id="update-a-group">Update a Group</h3>
+<p>Use <code>PUT</code> to rename a group, change its description, re-parent it, or switch between static and dynamic membership. Only the fields you include in the request body are changed; omitted fields keep their current values.</p>
+<h4 id="rename-a-group">Rename a Group</h4>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>PUT<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;London Production Servers&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Renamed from London Servers&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<h4 id="re-parent-a-group">Re-parent a Group</h4>
+<p>Move a group under a different parent:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>PUT<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;parent_id&quot;: &quot;mg_new_york&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p><strong>Cycle detection:</strong> If the new parent is a descendant of the group being updated, the server returns <code>400 Bad Request</code> with <code>"re-parenting would create a cycle"</code>. For example, you cannot move "London Office" under "London Desktops" because "London Desktops" is already a child of "London Office".</p>
+<p><strong>Root group restriction:</strong> The root "All Devices" group cannot be re-parented. Attempting to set <code>parent_id</code> on the root group returns <code>400 Bad Request</code>.</p>
+<p><strong>Depth limit:</strong> Re-parenting must not push the group beyond the maximum hierarchy depth of 5 levels below root. Returns <code>400</code> if exceeded.</p>
+<h4 id="convert-to-dynamic-membership">Convert to Dynamic Membership</h4>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>PUT<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;membership_type&quot;: &quot;dynamic&quot;,</span>
+<span class="s1">    &quot;scope_expression&quot;: &quot;os = \&quot;Linux\&quot; AND tag:environment = \&quot;production\&quot;&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Returns <code>200 OK</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;updated&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="delete-a-group">Delete a Group</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>DELETE<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6
+</code></pre></div>
+<p>Returns <code>200 OK</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;deleted&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The root "All Devices" group (ID <code>000000000000</code>) cannot be deleted. Attempting to do so returns <code>403 Forbidden</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;error&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;cannot delete root group&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><strong>Warning:</strong> Deleting a group cascade-deletes all child groups, their membership records, and their role assignments (enforced by foreign key constraints). Member agents themselves are not deleted -- only their group associations are removed. Reassign child groups to a new parent before deleting if you want to preserve them.</p>
+<h3 id="add-a-member">Add a Member</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6/members<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;agent_id&quot;: &quot;agent_lon_srv_03&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Returns <code>201 Created</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;added&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>This endpoint is intended for static membership groups. For dynamic groups, membership is controlled by the scope expression and refreshed via <code>refresh_dynamic_membership</code>.</p>
+<h3 id="remove-a-member">Remove a Member</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>DELETE<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/a1b2c3d4e5f6/members/agent_lon_srv_03
+</code></pre></div>
+<p>Returns <code>200 OK</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;removed&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Only removes static membership records. Dynamic membership entries (added by scope expression evaluation) are not removed by this endpoint.</p>
+<h2 id="role-delegation">Role Delegation</h2>
+<p>Management groups serve as the scoping boundary for RBAC. You can assign roles to principals within the context of a specific group, so the permissions only apply to devices in that group (and its children).</p>
+<h3 id="list-role-assignments-for-a-group">List Role Assignments for a Group</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/mg_london/roles
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;group_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;mg_london&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;principal_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;user&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;principal_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;jane.doe&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;role_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Operator&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;group_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;mg_london&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;principal_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;group&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;principal_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;london-desktop-team&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;role_name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Viewer&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="add-a-role-assignment">Add a Role Assignment</h3>
+<p>Only <code>Operator</code> and <code>Viewer</code> roles can be delegated via this endpoint. Assigning other roles (e.g., <code>ITServiceOwner</code>) returns <code>403 Forbidden</code>. The caller must be a global Administrator or hold <code>ITServiceOwner</code> on the target group.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/mg_london/roles<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;principal_type&quot;: &quot;user&quot;,</span>
+<span class="s1">    &quot;principal_id&quot;: &quot;jane.doe&quot;,</span>
+<span class="s1">    &quot;role_name&quot;: &quot;Operator&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Returns <code>201 Created</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;assigned&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Jane now has Operator permissions for all devices in "London Office" and its child groups ("London Desktops", "London Servers").</p>
+<h3 id="remove-a-role-assignment">Remove a Role Assignment</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>DELETE<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/mg_london/roles<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;principal_type&quot;: &quot;user&quot;,</span>
+<span class="s1">    &quot;principal_id&quot;: &quot;jane.doe&quot;,</span>
+<span class="s1">    &quot;role_name&quot;: &quot;Operator&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Returns <code>200 OK</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;unassigned&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The caller must be a global Administrator or hold <code>ITServiceOwner</code> on the target group.</p>
+<h2 id="service-groups">Service Groups</h2>
+<p>When an agent's <code>service</code> tag is set (e.g., via the asset tagging API), Yuzu auto-creates a management group named <code>Service: {value}</code>. All agents sharing that service tag are automatically included.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Tag an agent with a service</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/tags<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;agent_id&quot;: &quot;agent_lon_srv_01&quot;,</span>
+<span class="s1">    &quot;key&quot;: &quot;service&quot;,</span>
+<span class="s1">    &quot;value&quot;: &quot;SAP&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>This creates (or updates) the group <code>Service: SAP</code> with <code>agent_lon_srv_01</code> as a member. The group uses dynamic membership internally with scope expression <code>tag:service == "SAP"</code> -- any agent tagged with <code>service = "SAP"</code> is included.</p>
+<h2 id="practical-example-regional-delegation">Practical Example: Regional Delegation</h2>
+<p>Set up a structure where each regional team manages their own devices:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. Create regional groups (created_by is set from the authenticated session)</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/management-groups<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;name&quot;: &quot;EMEA&quot;, &quot;description&quot;: &quot;Europe, Middle East, Africa&quot;, &quot;membership_type&quot;: &quot;static&quot;}&#39;</span>
+
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/management-groups<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;name&quot;: &quot;APAC&quot;, &quot;description&quot;: &quot;Asia-Pacific&quot;, &quot;membership_type&quot;: &quot;static&quot;}&#39;</span>
+
+<span class="c1"># 2. Add agents to EMEA (use the id returned by the create call)</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/&lt;emea_group_id&gt;/members<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;agent_id&quot;: &quot;agent_london_01&quot;}&#39;</span>
+
+<span class="c1"># 3. Delegate Operator to the EMEA team lead</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/&lt;emea_group_id&gt;/roles<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;principal_type&quot;: &quot;user&quot;, &quot;principal_id&quot;: &quot;emea.lead&quot;, &quot;role_name&quot;: &quot;Operator&quot;}&#39;</span>
+
+<span class="c1"># 4. Delegate Viewer to the EMEA helpdesk group</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/&lt;emea_group_id&gt;/roles<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;principal_type&quot;: &quot;group&quot;, &quot;principal_id&quot;: &quot;emea-helpdesk&quot;, &quot;role_name&quot;: &quot;Viewer&quot;}&#39;</span>
+</code></pre></div>
+<p>Now <code>emea.lead</code> can manage all devices in EMEA, and members of the <code>emea-helpdesk</code> group can view those devices -- but neither has access to APAC devices.</p>
+<h2 id="dashboard-management">Dashboard Management</h2>
+<p>Management groups are managed through the <strong>Settings</strong> page in the HTMX dashboard. The Settings page displays all groups in a tree view with indentation reflecting the hierarchy. The root "All Devices" group is always displayed first.</p>
+<p>From the Settings page, administrators can:</p>
+<ul>
+<li><strong>Create groups</strong> -- specify name, description, parent, and membership type.</li>
+<li><strong>View member counts</strong> -- each group row shows the number of member agents.</li>
+<li><strong>Delete groups</strong> -- a delete button appears on every group except the root group.</li>
+</ul>
+<p>Group updates (rename, re-parent, membership type changes) are performed via the REST API <code>PUT</code> endpoint.</p>
+<h2 id="prometheus-metrics">Prometheus Metrics</h2>
+<p>Two gauges are exposed on the <code>/metrics</code> endpoint, refreshed on every scrape:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu_server_management_groups_total</code></td>
+<td>gauge</td>
+<td>Total number of management groups</td>
+</tr>
+<tr>
+<td><code>yuzu_server_group_members_total</code></td>
+<td>gauge</td>
+<td>Total membership records across all groups</td>
+</tr>
+</tbody>
+</table>
+<h2 id="api-endpoint-summary">API Endpoint Summary</h2>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Endpoint</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/v1/management-groups</code></td>
+<td>List all management groups</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/v1/management-groups</code></td>
+<td>Create a management group</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/v1/management-groups/{id}</code></td>
+<td>Get group details and members</td>
+</tr>
+<tr>
+<td><code>PUT</code></td>
+<td><code>/api/v1/management-groups/{id}</code></td>
+<td>Update a group (rename, re-parent, change membership type)</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/v1/management-groups/{id}</code></td>
+<td>Delete a management group (root group returns 403)</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/v1/management-groups/{id}/members</code></td>
+<td>Add an agent to a static group</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/v1/management-groups/{id}/members/{agent_id}</code></td>
+<td>Remove an agent from a group</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/v1/management-groups/{id}/roles</code></td>
+<td>List role assignments for a group</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/v1/management-groups/{id}/roles</code></td>
+<td>Add a role assignment to a group</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/v1/management-groups/{id}/roles</code></td>
+<td>Remove a role assignment from a group</td>
+</tr>
+</tbody>
+</table>
+<h2 id="constraints">Constraints</h2>
+<table>
+<thead>
+<tr>
+<th>Constraint</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Root group ID</td>
+<td><code>000000000000</code> -- auto-created on startup, cannot be deleted or re-parented</td>
+</tr>
+<tr>
+<td>Maximum hierarchy depth</td>
+<td>5 levels below root (root + 5 child levels)</td>
+</tr>
+<tr>
+<td>Cycle detection</td>
+<td>Re-parenting a group under one of its own descendants is rejected</td>
+</tr>
+<tr>
+<td>Membership types</td>
+<td><code>static</code>, <code>dynamic</code></td>
+</tr>
+<tr>
+<td>Delegatable roles</td>
+<td>Only <code>Operator</code> and <code>Viewer</code> can be delegated via the roles API</td>
+</tr>
+<tr>
+<td>Cascade delete</td>
+<td>Deleting a group cascade-deletes all children, memberships, and role assignments</td>
+</tr>
+<tr>
+<td>Dynamic scope syntax</td>
+<td>Same as the scope engine (see <a href="../yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a> section on scope expressions)</td>
+</tr>
+<tr>
+<td>Visibility filtering</td>
+<td>Non-admin users see only agents in groups where they hold a role assignment</td>
+</tr>
+</tbody>
+</table>
+<h2 id="planned-features">Planned Features</h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Phase</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Policy assignment to management groups</td>
+<td>5</td>
+<td>Stub</td>
+</tr>
+<tr>
+<td>Dynamic membership auto-refresh on schedule</td>
+<td>3</td>
+<td>Stub</td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

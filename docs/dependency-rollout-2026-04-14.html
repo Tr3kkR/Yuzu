@@ -1,0 +1,1277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dependabot Rollout — April 2026</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/dependency-rollout-2026-04-14.md</div>
+<h1 class="doc-title">Dependabot Rollout — April 2026</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="dependabot-rollout-april-2026">Dependabot Rollout — April 2026</h1>
+<p><strong>Status:</strong> in progress
+<strong>Started:</strong> 2026-04-14
+<strong>Owner:</strong> TBD per tier (see Resume Pointer)
+<strong>Closes:</strong> #363 (rollout completion), #366 follow-up (CODEOWNERS)
+<strong>Driver PR (foundation):</strong> #372 (merged 2026-04-14)</p>
+<h2 id="why-this-doc-exists">Why this doc exists</h2>
+<p>This is a long, multi-tier rollout with expected breakages — primarily
+node20 → node24 runner-version interactions on self-hosted hosts. Yuzu's
+context window will not survive the entire rollout in one session, so
+this file is the <strong>durable state of record</strong>. Every Claude session
+working on this rollout should:</p>
+<ol>
+<li>Read this file end-to-end before doing anything.</li>
+<li>Update the <strong>Resume Pointer</strong> before context handoff.</li>
+<li>Append to the <strong>Event Log</strong> at the bottom on every state change.</li>
+<li>Cross-link tasks via the in-session TaskList (<code>TaskList</code> tool) and the
+   GitHub PR numbers in the <strong>Tier Table</strong>.</li>
+</ol>
+<p>When this rollout closes, the doc converts to a brief lessons-learned
+addendum and the live tracking sections collapse.</p>
+<h2 id="background">Background</h2>
+<p>Yuzu had 7 open Dependabot PRs targeting <code>main</code> against a stale base
+that lacked the <code>0fe5eac</code> LNK2038 Windows debug fix (still on <code>dev</code> as
+of 2026-04-14, awaiting the next dev→main reconcile). All 7 had failing
+or stale CI for that reason. Four are major Node 24 action bumps
+(<code>actions/cache@v5</code>, <code>actions/upload-artifact@v7</code>,
+<code>actions/download-artifact@v8</code>, <code>actions/github-script@v8</code>,
+<code>codecov/codecov-action@v6</code>) that require GitHub Actions Runner
+≥ 2.327.1 on every host that executes them — including the self-hosted
+<code>yuzu-wsl2-linux</code> and <code>yuzu-local-windows</code> runners.</p>
+<h1 id="372-merged-2026-04-14-added-target-branch-dev-to-every">372 (merged 2026-04-14) added <code>target-branch: dev</code> to every</h1>
+<p>Dependabot ecosystem entry so future PRs route correctly, plus the
+<code>pip</code> ecosystem + scheduled vcpkg baseline workflow that closed the
+automation gap from #363. The 7 existing PRs still target <code>main</code> until
+they are explicitly recreated.</p>
+<h2 id="tier-table">Tier Table</h2>
+<p>PR numbers in <strong>bold</strong> are the <em>original</em> PRs against <code>main</code>. After
+recreate, the new PR numbers go in the <strong>Recreated As</strong> column.</p>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Task</th>
+<th>Original PR</th>
+<th>Recreated As</th>
+<th>Action / Bump</th>
+<th>Risk</th>
+<th>Self-hosted?</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0a</td>
+<td>#1</td>
+<td>—</td>
+<td>—</td>
+<td>Verify runners ≥ 2.327.1</td>
+<td>Gate</td>
+<td>Yes</td>
+<td><strong>done</strong> (both 2.333.1)</td>
+</tr>
+<tr>
+<td>0b</td>
+<td>n/a</td>
+<td>—</td>
+<td>—</td>
+<td>Migrate ci.yml Windows MSVC → yuzu-local-windows (#374)</td>
+<td>Gate</td>
+<td><strong>Yes</strong></td>
+<td><strong>done</strong> (commit <code>3960f46</code>)</td>
+</tr>
+<tr>
+<td>0bb</td>
+<td>#14</td>
+<td>—</td>
+<td>—</td>
+<td>Fix Windows MSVC LNK2038 (#375) — option D static-link triplet + parallel-compile race</td>
+<td><strong>Gate (P0)</strong></td>
+<td>Yes</td>
+<td><strong>done</strong> (PR #373 merged as <code>bf95d3b</code>)</td>
+</tr>
+<tr>
+<td>0c</td>
+<td>#2</td>
+<td>—</td>
+<td>—</td>
+<td><code>@dependabot recreate</code> × 7</td>
+<td>Gate</td>
+<td>n/a</td>
+<td><strong>done</strong> — all 8 open PRs <code>base=dev</code></td>
+</tr>
+<tr>
+<td>0d</td>
+<td>n/a</td>
+<td>n/a</td>
+<td><strong>#385</strong></td>
+<td><code>meson</code> 1.9.2 → 1.11.0 (new pip ecosystem from #372)</td>
+<td>Gate (build graph)</td>
+<td>n/a</td>
+<td><strong>done</strong> (<code>fed97bb</code>, 2026-04-15 17:15 UTC)</td>
+</tr>
+<tr>
+<td>1</td>
+<td>#3</td>
+<td><strong>#335</strong></td>
+<td>#335 (in place)</td>
+<td><code>ubuntu</code> digest 186072b → 84e77de</td>
+<td>Low</td>
+<td>No</td>
+<td><strong>done</strong> (<code>5bb8c42</code>, 2026-04-15 17:16 UTC)</td>
+</tr>
+<tr>
+<td>1</td>
+<td>#4</td>
+<td><strong>#248</strong></td>
+<td>#248 (in place)</td>
+<td><code>alpine</code> 3.22 → 3.23 (gateway)</td>
+<td>Low</td>
+<td>No</td>
+<td><strong>done</strong> (<code>c70bb57</code>, 2026-04-15 17:16 UTC; <code>18899a5</code> follow-up comment fix)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>#5</td>
+<td><strong>#300</strong></td>
+<td>#300 (in place)</td>
+<td><code>codecov-action</code> 5 → 6</td>
+<td>Med (node24 but github-hosted)</td>
+<td>No</td>
+<td><strong>done</strong> (<code>320a9e5</code>, 2026-04-15 17:20 UTC; coverage scripts hardened in <code>54e5bc3</code> + <code>bcc17df</code>)</td>
+</tr>
+<tr>
+<td>3</td>
+<td>#6</td>
+<td><strong>#243</strong></td>
+<td><strong>#386</strong> (now 7→9)</td>
+<td><code>actions/github-script</code> 7 → <strong>9</strong></td>
+<td>Med-High</td>
+<td><strong>Yes</strong></td>
+<td><strong>done</strong> (<code>e85c3f1</code>, 2026-04-16 04:55 UTC)</td>
+</tr>
+<tr>
+<td>3</td>
+<td>#7</td>
+<td><strong>#241</strong></td>
+<td>#241 (in place)</td>
+<td><code>actions/cache</code> 4 → 5</td>
+<td>High (19 sites)</td>
+<td><strong>Yes</strong></td>
+<td><strong>done</strong> (<code>577530b</code>, 2026-04-16 07:25 UTC)</td>
+</tr>
+<tr>
+<td>4</td>
+<td>#8</td>
+<td><strong>#242</strong></td>
+<td>#242 (in place)</td>
+<td><code>actions/upload-artifact</code> 4 → 7</td>
+<td>High</td>
+<td><strong>Yes</strong></td>
+<td><strong>done</strong> (<code>90af2d7</code>, 2026-04-16 11:44 UTC)</td>
+</tr>
+<tr>
+<td>4</td>
+<td>#9</td>
+<td><strong>#250</strong></td>
+<td>#250 (in place)</td>
+<td><code>actions/download-artifact</code> 4 → 8</td>
+<td><strong>Highest</strong> (digest=error)</td>
+<td><strong>Yes</strong></td>
+<td><strong>done</strong> (<code>c246d66</code>, 2026-04-16 07:25 UTC)</td>
+</tr>
+<tr>
+<td>5</td>
+<td>#11</td>
+<td>n/a</td>
+<td>—</td>
+<td>Centralize Dockerfile meson pins</td>
+<td>Low</td>
+<td>n/a</td>
+<td><strong>next — Track A done; this is Tier 5 close-out</strong></td>
+</tr>
+<tr>
+<td>—</td>
+<td>#10</td>
+<td>n/a</td>
+<td>—</td>
+<td>Standing breakage triage</td>
+<td>n/a</td>
+<td>n/a</td>
+<td>pending</td>
+</tr>
+</tbody>
+</table>
+<p>Task IDs (<code>#N</code>) refer to the in-session <code>TaskList</code>, <strong>not</strong> GitHub
+issues. <code>gh issue view &lt;number&gt;</code> and <code>gh pr view &lt;number&gt;</code> are
+unambiguous because they share the same numeric space — task IDs are
+always single or double-digit and namespaced to the rollout doc.</p>
+<h2 id="phase-0-gates">Phase 0 — Gates</h2>
+<h3 id="0a-verify-self-hosted-runner-versions-task-1">0a · Verify self-hosted runner versions (Task #1)</h3>
+<p><strong>Goal:</strong> confirm both <code>yuzu-wsl2-linux</code> and <code>yuzu-local-windows</code>
+runners are at ≥ 2.327.1 (Node 24 minimum). The GitHub API does not
+expose runner binary version, so this requires a shell on each box.</p>
+<p><strong>Commands (run by operator):</strong>
+<div class="highlight"><pre><span></span><code><span class="c1"># yuzu-wsl2-linux (WSL2 on Shulgi 5950X)</span>
+<span class="nb">cd</span><span class="w"> </span>~/actions-runner<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>./config.sh<span class="w"> </span>--version
+
+<span class="c1"># yuzu-local-windows (native Windows on Shulgi 5950X)</span>
+<span class="nb">cd</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$HOME</span><span class="s2">/actions-runner&quot;</span><span class="w"> </span><span class="p">;</span><span class="w"> </span>./config.cmd<span class="w"> </span>--version<span class="w">  </span><span class="c1"># PowerShell</span>
+<span class="c1"># or in MSYS2 bash:</span>
+<span class="nb">cd</span><span class="w"> </span>~/actions-runner<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>./config.sh<span class="w"> </span>--version
+</code></pre></div></p>
+<p><strong>If either is &lt; 2.327.1:</strong>
+1. Verify the runner is idle: <code>gh api repos/Tr3kkR/Yuzu/actions/runners</code>
+   → <code>busy:false</code>. <strong>Do not upgrade while busy</strong> — a mid-job
+   reinstall corrupts the workdir and any in-flight CI.
+2. Stop the runner service.
+3. Download the latest runner package from
+   <a href="https://github.com/actions/runner/releases">https://github.com/actions/runner/releases</a>.
+4. Re-bootstrap with the same registration token (no
+   <code>./config.sh remove</code> needed for in-place upgrades — see runner docs).
+5. Restart the service and confirm with <code>./config.sh --version</code>.
+6. Capture the before/after versions in the Event Log.</p>
+<p><strong>Blocks:</strong> Tasks #6, #7, #8, #9 (Tier 3 + Tier 4).</p>
+<h3 id="0b-recreate-dependabot-prs-against-dev-task-2">0b · Recreate Dependabot PRs against dev (Task #2)</h3>
+<p><strong>Goal:</strong> retarget the 7 existing PRs at <code>dev</code> so they pick up the
+LNK2038 fix and any other pending dev-only changes on rebase.</p>
+<p><strong>Commands:</strong>
+<div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span>n<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="m">241</span><span class="w"> </span><span class="m">242</span><span class="w"> </span><span class="m">243</span><span class="w"> </span><span class="m">248</span><span class="w"> </span><span class="m">250</span><span class="w"> </span><span class="m">300</span><span class="w"> </span><span class="m">335</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span>gh<span class="w"> </span>pr<span class="w"> </span>comment<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$n</span><span class="s2">&quot;</span><span class="w"> </span>--body<span class="w"> </span><span class="s2">&quot;@dependabot recreate&quot;</span>
+<span class="k">done</span>
+</code></pre></div></p>
+<p><strong>Expected outcome:</strong> Dependabot closes each PR within ~5 min and
+opens a new PR against <code>dev</code>. The new PR numbers go in the
+<strong>Recreated As</strong> column above and feed into the per-tier merge tasks.</p>
+<p><strong>Blocks:</strong> Tasks #3 through #9.</p>
+<h2 id="phase-1-docker-base-bumps-tasks-3-4">Phase 1 — Docker base bumps (Tasks #3, #4)</h2>
+<p>Lowest-risk tier. Both bumps are docker-only, no Node 24 exposure.
+Independent — can merge in either order once green.</p>
+<ul>
+<li><strong>#3 (was #335)</strong> — <code>ubuntu:24.04</code> digest bump for Dockerfile.agent +
+  Dockerfile.server. Risk: apt package version drift on the new digest.</li>
+<li><strong>#4 (was #248)</strong> — <code>alpine 3.22 → 3.23</code> for Dockerfile.gateway
+  runtime stage. Risk: musl/openssl/libstdc++ minor version bump that
+  the gateway release links against. Local sanity: <code>docker build -f
+  deploy/docker/Dockerfile.gateway -t yuzu-gw-test .</code>.</li>
+</ul>
+<p><strong>Validation gate before merging:</strong> the recreated PR's CI run on the
+<code>dev</code> base must be fully green (Linux, Windows, macOS). If any platform
+fails, that's the breakage — file under Task #10 and triage before
+merging.</p>
+<h2 id="phase-2-single-site-github-hosted-node-24-task-5">Phase 2 — Single-site github-hosted Node 24 (Task #5)</h2>
+<ul>
+<li><strong>#5 (was #300)</strong> — <code>codecov-action 5 → 6</code>. Single call site at
+  <code>ci.yml:607</code> in the Coverage (GCC 13) job, runs on <code>ubuntu-24.04</code>
+  (github-hosted, auto-updated runner — Node 24 already supported).
+  No self-hosted exposure. The recreate against <code>dev</code> should turn
+  the historical "all 4 jobs FAIL" into clean green.</li>
+</ul>
+<p><strong>Why this tier exists separately:</strong> it lets the rollout build
+confidence on a real Node 24 action without yet exposing self-hosted
+runners. If codecov@v6 surfaces an unexpected secret/input rename, that
+breakage is github-hosted-only and easy to revert.</p>
+<h2 id="phase-3-multi-site-node-24-tasks-6-7">Phase 3 — Multi-site Node 24 (Tasks #6, #7)</h2>
+<p>This is where self-hosted runner exposure begins. <strong>Task #1 must
+complete before either of these merges.</strong></p>
+<h3 id="6-was-243-actionsgithub-script-7-8">#6 (was #243) — actions/github-script 7 → 8</h3>
+<ul>
+<li>11 call sites: ci.yml (6 github-hosted), codeql.yml (1, <strong>matrix
+  including self-hosted Windows</strong>), release.yml (4, self-hosted Linux × 3 +
+  github-hosted Windows × 1).</li>
+<li>Post-merge validation:
+  <div class="highlight"><pre><span></span><code>gh<span class="w"> </span>workflow<span class="w"> </span>run<span class="w"> </span>codeql.yml<span class="w"> </span>--ref<span class="w"> </span>dev
+gh<span class="w"> </span>run<span class="w"> </span>watch<span class="w">  </span><span class="c1"># follow the most recent run</span>
+</code></pre></div>
+  Watch the self-hosted Windows matrix slot — that's the canary for the
+  runner-version gate. Expected fail mode: <code>Error: This action requires
+  a GitHub Actions runner of version 2.327.1 or higher</code>. If that fires,
+  immediately <code>gh pr revert &lt;new-num&gt; --base dev</code>, file the breakage
+  under Task #10, and reopen Task #1 to upgrade the runner.</li>
+<li>release.yml self-hosted exposure won't be exercised until the next
+  release tag — flag a follow-up watch in the Event Log.</li>
+</ul>
+<h3 id="7-was-241-actionscache-4-5">#7 (was #241) — actions/cache 4 → 5</h3>
+<ul>
+<li>19 call sites — highest blast radius of the cache-class actions.</li>
+<li>Same self-hosted exposure pattern as #6 plus an additional cache-key
+  compatibility concern. cache@v5 should be backward-compat on cache
+  reads but watch for unexplained cache-miss surges in the next CI run
+  (signal that key derivation changed).</li>
+<li>Post-merge validation: dispatch codeql.yml again. By this point the
+  runner-version gate should be settled.</li>
+</ul>
+<h2 id="phase-4-artifact-actions-tasks-8-9">Phase 4 — Artifact actions (Tasks #8, #9)</h2>
+<p>Highest-impact tier. These touch the release path.</p>
+<h3 id="8-was-242-actionsupload-artifact-4-7">#8 (was #242) — actions/upload-artifact 4 → 7</h3>
+<ul>
+<li>18 call sites: ci.yml × 1, pre-release.yml × 7, release.yml × 8,
+  <strong>sanitizer-tests.yml × 2 (self-hosted yuzu-wsl2-linux)</strong>.</li>
+<li>v6 = Node 24, v7 = ESM module + opt-in <code>archive: false</code> direct upload
+  (we don't use it).</li>
+<li>Post-merge validation:
+  <div class="highlight"><pre><span></span><code>gh<span class="w"> </span>workflow<span class="w"> </span>run<span class="w"> </span>sanitizer-tests.yml<span class="w"> </span>--ref<span class="w"> </span>dev<span class="w"> </span>-f<span class="w"> </span><span class="nv">suite</span><span class="o">=</span>both
+gh<span class="w"> </span>run<span class="w"> </span>watch
+</code></pre></div>
+  Watch the artifact upload step on both ASan and TSan jobs — that
+  exercises upload-artifact@v7 against the self-hosted Linux runner.
+  Failure mode: ESM resolution errors on the runner's bundled node, or
+  the same runner-version error.</li>
+</ul>
+<h3 id="9-was-250-actionsdownload-artifact-4-8">#9 (was #250) — actions/download-artifact 4 → 8</h3>
+<ul>
+<li>6 call sites, all in release path: pre-release.yml × 5, release.yml × 1.</li>
+<li><strong>v8 changes <code>digest-mismatch</code> default from warning to error.</strong> Any
+  artifact whose hash doesn't match the server's recorded hash will now
+  fail the job hard. Previously this was silently logged.</li>
+<li>Post-merge validation: the next pre-release run is the canary. If any
+  artifact fails with "digest mismatch" that is a real artifact
+  corruption signal that was previously masked — <strong>do not just downgrade
+  to warning</strong>, investigate root cause (network truncation, upload
+  retry race, etc.). If no pre-release is queued, manually dispatch:
+  <div class="highlight"><pre><span></span><code>gh<span class="w"> </span>workflow<span class="w"> </span>run<span class="w"> </span>pre-release.yml<span class="w"> </span>--ref<span class="w"> </span>dev
+</code></pre></div></li>
+</ul>
+<h2 id="phase-5-cleanup-task-11">Phase 5 — Cleanup (Task #11)</h2>
+<p>After all tiers merge, centralize the 5 Dockerfile meson pins
+(<code>deploy/docker/Dockerfile.{agent,server,ci,ci-linux,runner-linux}</code>)
+on <code>requirements-ci.txt</code> so future Dependabot meson bumps propagate
+without manual sync. Also remove the <code>ARG MESON_VERSION=1.9.2</code>
+declarations from <code>Dockerfile.ci-linux</code> and <code>Dockerfile.runner-linux</code>,
+and add <code>requirements-ci.txt</code> to the <code>ci-runner-image.yml</code> paths
+trigger.</p>
+<h2 id="standing-breakage-triage-task-10">Standing — Breakage triage (Task #10)</h2>
+<p>For every breakage encountered during any tier:
+1. File a GitHub issue with title <code>[deps-rollout] &lt;action&gt;: &lt;symptom&gt;</code>.
+2. Tag with <code>regression</code>, <code>dependencies</code>, and the relevant tier label.
+3. Capture: workflow + job, error message, surface area, proposed fix,
+   whether the breakage was in the action itself or in an interaction
+   with our setup.
+4. Cross-reference the issue from this doc's Event Log.
+5. Decide: hotfix-and-continue, revert-and-defer, or accept-as-known.</p>
+<h2 id="resume-pointer">Resume Pointer</h2>
+<blockquote>
+<p><strong>Session refresh 2026-04-16 ~11:55 UTC.</strong> <strong>Track A is COMPLETE
+— 10 of 10 dependabot PRs merged.</strong> #242 (Tier 4 first half,
+upload-artifact 4 → 7) squash-merged as <code>90af2d7</code> at 2026-04-16
+11:44 UTC closes the rollout. The full Track A merge sequence
+spanned 2026-04-15 17:15 UTC → 2026-04-16 11:44 UTC (rough
+19-hour window) in three batches: Tier 0d + 1 + 2 (<code>fed97bb</code> meson
+1.11.0 → <code>5bb8c42</code> ubuntu → <code>c70bb57</code> alpine + <code>18899a5</code> comment
+fix → <code>320a9e5</code> codecov; 17:15-17:20 UTC), Tier 3 first half
+(<code>e85c3f1</code> github-script 7→9; 04:55 UTC next morning), Tier 3 +
+Tier 4 second half (<code>577530b</code> cache 4→5 + <code>c246d66</code> download-
+artifact 4→8; 07:25 UTC), then Tier 4 first half (<code>90af2d7</code>
+upload-artifact 4→7; 11:44 UTC). Two operational follow-ups
+landed in the same window — <code>54e5bc3</code> (gcov negative-hit parse
+error) and <code>bcc17df</code> (coverage HTML report + build-linux dir
+convention) — hardening the codecov action's input pipeline after</p>
+<h1 id="300-landed">300 landed.</h1>
+<p><strong>⚠ Standing dev-HEAD CI failure — <code>Linux clang-19 debug</code> Test
+step times out.</strong> Two consecutive completed push runs on dev
+(<code>24473577716</code> on <code>54e5bc3</code>, <code>24497677392</code> on <code>c246d66</code>) failed
+the <code>Linux clang-19 debug</code> job at the Test step. Diagnosis on
+2026-04-16 ~11:00 UTC: clang-19 debug binary execution is genuinely
+slower than gcc-13 debug for the same workload (~7 min job vs ~5
+min), and two Catch2 binaries blow past their meson per-suite
+timeouts under that slowness:</p>
+<ul>
+<li><code>yuzu_tar_tests</code> (30s timeout) — first test
+  <code>TarDatabase: warehouse tables created on open</code> SIGTERMed at 30s.
+  Schema-v2 migration alone took 23s on this build (<code>TarDatabase
+  opened</code> log to <code>migrated to schema version 2</code> log delta). 1 of 9
+  test cases reached.</li>
+<li><code>yuzu_agent_tests</code> (120s timeout) — failed at
+  <code>tests/unit/test_trigger_engine.cpp:378</code> "TriggerEngine: interval
+  trigger registered, start/stop no crash". Log shows the trigger
+  engine drain pattern (5s graceful worker-thread shutdown per
+  stop, sequentially executed across many tests) chaining past 120s.
+  337 of 338 cases passed before SIGTERM.</li>
+</ul>
+<p><strong>This is NOT caused by Track A</strong> — both #241 (cache) and #250
+(download-artifact) merged in the same 07:25 UTC batch are
+CI-config-only. Same clang-19 debug Test failure existed on
+<code>54e5bc3</code> (push run <code>24473577716</code>) before #241/#250 were merged.
+The 17:30 UTC 2026-04-15 "WSL2 VM false positive" diagnosis below
+covered a different signature (Post Cache ccache stuck mid-cleanup,
+33-min gap to next runner pickup). The current failure is at the
+Test step itself with clean post-Test step transitions — genuine
+per-suite timeout, not runner death.</p>
+<p><strong>Track A merge decision for #242 — resolved.</strong> Decision was
+<strong>option 1</strong> (merge anyway, file the clang-19 perf cliff as Track B,
+let the timeout band-aid be a deliberate follow-up). Executed in
+three artifacts:</p>
+<ul>
+<li><strong>PR #412</strong> (<code>ci/clang19-debug-timeouts</code>, open at this refresh)
+  carries the band-aid (<code>tests/meson.build</code> tar 30→90s, agent
+  120→240s) plus this doc's reconciliation. PR-time CI green on
+  PR-event matrix; awaiting Windows MSVC and merge.</li>
+<li><strong>#242 squash-merged</strong> as <code>90af2d7</code> ahead of #412 — the dev push
+  run on <code>90af2d7</code> will fail clang-19 debug exactly as today
+  (band-aid not on dev yet). Acceptable known burn (~7 min runner
+  time on the failed job); the next push run after #412 lands will
+  be green.</li>
+<li><strong>Issue #413</strong> (<code>bug,reliability,devops,P2</code>) carries the proper
+  investigation: why is <code>TarDatabase</code> schema-v2 migration 23s on
+  clang-19 debug vs presumably &lt;5s on gcc-13 debug? Why does the
+  trigger engine 5s graceful drain accumulate so much more on
+  clang-19 debug that 337/338 cases don't fit in 120s? Hypotheses
+  in the issue: libstdc++ debug iterators, <code>-O0</code> vs gcc's <code>-Og</code>,
+  sqlite3 lib build flags differing by compiler.</li>
+</ul>
+<p><strong>Next actions — Tier 5 + Track A close-out housekeeping.</strong></p>
+<ol>
+<li><strong>Land PR #412.</strong> Once Windows MSVC completes green, squash-
+   merge to dev. The post-merge dev push run will exercise the
+   full clang-19 debug path with the band-aid in place — should
+   reach <code>Complete job</code> SUCCESS for the first time on dev since
+   <code>54e5bc3</code>.</li>
+<li><strong>Tier 5 (Task #11) — Dockerfile meson pin centralization.</strong>
+   Five Dockerfiles still carry hardcoded <code>meson==1.9.2</code>:
+   <code>deploy/docker/Dockerfile.{agent,server,ci,ci-linux,runner-linux}</code>.
+   Centralize on <code>COPY requirements-ci.txt</code> so future Dependabot
+   meson bumps propagate without manual sync, drop the
+   <code>ARG MESON_VERSION=...</code> lines from <code>Dockerfile.ci-linux</code> and
+   <code>Dockerfile.runner-linux</code>, and add <code>requirements-ci.txt</code> to the
+   <code>ci-runner-image.yml</code> paths trigger. Note: the Dockerfiles
+   pin <strong>the old</strong> <code>1.9.2</code> while the live env (CI workflows,
+   <code>requirements-ci.txt</code>, dev boxes) is at <strong><code>1.11.0</code></strong> post-#385.
+   Centralization is also a forward-port to 1.11.0 across the
+   image surface.</li>
+<li><strong>Watch #413 (clang-19 perf cliff).</strong> Resolution either retires
+   the band-aid (proper fix lands in <code>tests/meson.build</code>) or
+   documents the band-aid as the permanent fix in
+   <a href="ci-troubleshooting.html" class="doc-ref"><code>docs/ci-troubleshooting.md</code></a>.</li>
+</ol>
+<p><strong>Doc lifecycle.</strong> Per the doc's own preamble, when this rollout
+closes, the doc converts to a brief lessons-learned addendum and
+the live tracking sections collapse. Track A close-out (after
+Tier 5 lands) is the trigger for that conversion. Until Tier 5
+lands, this doc remains the live state of record.</p>
+<p>Tasks #1, #2, #14 done. Tasks #3-#9 <strong>all done</strong> (10 of 10 PRs
+merged). Task #11 (Tier 5) is the next active item. Tasks #12-#13
+unblocked. Task #15 (hex.pm hardening) on hold. Task #16 (move off
+gRPC) deferred per P1 #376. Track B carries #413 (clang-19 debug
+perf cliff investigation).</p>
+</blockquote>
+<h2 id="sub-agent-delegation-pattern">Sub-agent delegation pattern</h2>
+<p>Each tier merge is a self-contained unit of work that fits the
+<code>build-ci</code> agent's domain. The pattern for delegating a tier to a
+sub-agent:</p>
+<ol>
+<li>Read this doc (the agent inherits no session memory).</li>
+<li>Pick the tier task by ID and re-read the relevant Phase section.</li>
+<li>Execute the validation gate + merge + post-merge validation.</li>
+<li>Append a structured event-log entry.</li>
+<li>Update the Tier Table status column.</li>
+<li>Return a ≤ 200-word summary to the parent session.</li>
+</ol>
+<p>A typical delegation prompt skeleton:</p>
+<div class="highlight"><pre><span></span><code>Read docs/dependency-rollout-2026-04-14.md end-to-end, then execute
+Tier &lt;N&gt; Task #&lt;id&gt; for &lt;action&gt;. Validation gate is &lt;X&gt;; merge if
+green; post-merge validation is &lt;Y&gt;. If any step fails, do NOT
+attempt to fix it — instead, append a breakage entry to the Event Log,
+file the triage issue per Task #10, and return.
+</code></pre></div>
+<p>Use the <code>build-ci</code> agent for action bumps and Dockerfile work; use the
+<code>cross-platform</code> agent for Dockerfile changes that affect the agent or
+gateway runtime; use the <code>general-purpose</code> agent if neither fits.</p>
+<h2 id="event-log">Event Log</h2>
+<p>Append-only. Newest entries at the top. Format:
+<code>YYYY-MM-DD HH:MM UTC · &lt;actor&gt; · &lt;event&gt;</code>.</p>
+<ul>
+<li><strong>2026-04-16 ~11:55 UTC</strong> · Claude session · <strong>Track A complete:
+  #242 squash-merged as <code>90af2d7</code>, #413 filed for the underlying
+  clang-19 perf cliff.</strong> Final dependabot PR (<code>actions/upload-
+  artifact 4 → 7</code>) landed via <code>gh pr merge 242 --squash --delete-
+  branch</code>. PR was CLEAN/MERGEABLE with all 4 PR-time CI jobs SUCCESS;
+  Tier 4's higher-risk sibling #250 (download-artifact, digest=error)
+  had already validated the artifact-action class against the self-
+  hosted Linux runner. <strong>Known burn:</strong> post-merge dev push run on
+  <code>90af2d7</code> will fail <code>Linux clang-19 debug</code> at the Test step
+  exactly as the prior two pushes (<code>54e5bc3</code>, <code>c246d66</code>) — the band-
+  aid in PR #412 isn't on dev yet. Acceptable cost (~7 min runner
+  time on the failed job) given the user's stated priority of
+  closing Track A today. The next dev push run after #412 lands
+  will be green for clang-19 debug for the first time since the
+  perf cliff appeared. <strong>Issue #413 filed</strong> (<code>bug,reliability,
+  devops,P2</code>) carrying the proper investigation: full symptom
+  trace, comparison table (gcc-13 debug 308s vs clang-19 debug 422s
+  for the same commit <code>c246d66</code>), four hypotheses (libstdc++ debug
+  iterators, <code>-O0</code> vs <code>-Og</code>, sqlite3 build flags, condvar accumulation),
+  investigation steps, and acceptance criteria. Tier Table updated
+  to mark Tier 4 #242 done with <code>90af2d7</code> + 11:44 UTC; Tier 5
+  promoted to <code>next</code> status; Resume Pointer wholesale-replaced to
+  reflect Track A complete + Tier 5 close-out as the next active
+  item. <strong>Doc lifecycle note:</strong> per the doc preamble, this doc
+  converts to a brief lessons-learned addendum once the rollout
+  closes — Tier 5 landing is the trigger for that conversion.</li>
+<li><strong>2026-04-16 ~11:30 UTC</strong> · Claude session · <strong>Doc reconciled +
+  clang-19 debug Test timeout diagnosed and patched.</strong> Doc Resume
+  Pointer was last refreshed at 2026-04-15 17:00 UTC saying "start
+  Tier 1"; in the intervening 19 hours the operator (Tr3kkR)
+  squash-merged 9 of the 10 Track A PRs without updating the doc.
+  Reconciled: Tier Table status column now reflects the 9 merges
+  with merge SHAs and timestamps; Resume Pointer wholesale-replaced
+  to point at #242 as the only remaining Track A PR and Tier 5
+  (Task #11 — Dockerfile meson pin centralization) as the
+  next-after-#242 step. The 9 merges spanned 2026-04-15 17:15 UTC
+  → 2026-04-16 07:25 UTC in three batches: Tier 0d + 1 + 2 (<code>fed97bb</code>
+  meson 1.11.0 → <code>5bb8c42</code> ubuntu → <code>c70bb57</code> alpine + <code>18899a5</code>
+  comment fix → <code>320a9e5</code> codecov; 17:15-17:20 UTC), Tier 3 first
+  half (<code>e85c3f1</code> github-script 7→9; 04:55 UTC next morning), then
+  Tier 3 second + Tier 4 second (<code>577530b</code> cache 4→5 + <code>c246d66</code>
+  download-artifact 4→8; 07:25 UTC). Two operational follow-ups
+  landed in the same window — <code>54e5bc3</code> (gcov negative-hit parse
+  error) and <code>bcc17df</code> (coverage HTML report + build-linux dir
+  convention) — hardening the codecov action's input pipeline after
+  #300 landed. <strong>Standing dev-HEAD CI failure diagnosed:</strong> two
+  consecutive completed push runs (<code>24473577716</code> on <code>54e5bc3</code>,
+  <code>24497677392</code> on <code>c246d66</code>) failed <code>Linux clang-19 debug</code> at the
+  Test step. clang-19 debug binary execution is genuinely slower
+  than gcc-13 debug on the same workload (~7 min job vs ~5 min) and
+  two Catch2 binaries blow past their meson per-suite timeouts
+  under that slowness: <code>yuzu_tar_tests</code> (30s default — schema-v2
+  migration alone took 23s, single test couldn't fit in the
+  remaining 7s window) and <code>yuzu_agent_tests</code> (120s — 337 of 338
+  cases passed before SIGTERM, trigger engine 5s graceful drain
+  pattern chained past the limit). Same job code path passed in
+  4m 53s on gcc-13 debug for the same commit, so this is a
+  compiler-flavor slowness, not a code regression. <strong>Patched as a
+  band-aid:</strong> <code>tests/meson.build</code> <code>tar</code> suite now <code>timeout: 90</code>,
+  <code>agent</code> suite <code>timeout: 120 → 240</code>. Proper fix (investigate why
+  schema migration is 23s on clang-19 debug and why trigger drain
+  is heavier) deferred to a Track B Item to be filed separately —
+  this band-aid restores green dev CI without papering over the
+  underlying perf cliff. <strong>#242 squash merge unblocked</strong> — the
+  failure is unrelated to dependabot and the timeout fix is in the
+  same commit as this Event Log update, so the next push run on
+  dev should be green.</li>
+<li><strong>2026-04-15 ~17:30 UTC</strong> · Claude session · <strong>Diagnosis: the
+  clang-19 debug "regression" on run <code>24450261405</code> job
+  <code>71437121999</code> was a WSL2 utility VM cycling false positive, not
+  a clang-19 code regression.</strong> Pulled the failed job's step trace
+  via <code>gh api repos/Tr3kkR/Yuzu/actions/jobs/71437121999</code>. Steps
+  1-13 (Setup → Install packages → Cache ccache → Setup vcpkg →
+  Install vcpkg → Configure Meson → <strong>Build</strong> → <strong>Test</strong> → ccache
+  stats) and step 24 (Post Cache vcpkg) all completed SUCCESS.
+  Step 25 <code>Post Cache ccache</code> is <code>in_progress</code> with conclusion
+  <code>null</code> (never finished), step 26 <code>Post Run actions/checkout</code> is
+  <code>pending</code> (never started). Job marked failure at 11:34:10Z after
+  40m 54s wall time. Cross-checked against the runner timeline:
+  <code>gh api repos/Tr3kkR/Yuzu/actions/runs/24450261405/jobs</code> shows
+  the next <code>yuzu-wsl2-linux</code> job (<code>Linux clang-19 release</code> job
+  <code>71437122003</code>) didn't pick up until 12:07:33Z — a <strong>33-minute
+  gap</strong> vs. the seconds-to-minutes normal pickup, signature of
+  the runner agent dying with the host VM. This matches the
+  WSL2 utility VM idle-reaper failure mode documented as entry #1
+  of <a href="ci-troubleshooting.html" class="doc-ref"><code>docs/ci-troubleshooting.md</code></a> (commit <code>819568b</code>). <strong>Validated</strong>
+  on the very next CI run, <code>24455027178</code> (workflow_dispatch on
+  <code>675d636</code>, fired at 12:40:57Z, after the WSL2 keep-alive fix
+  was in place): the same <code>Linux clang-19 debug</code> code path on job
+  <code>71453384876</code> completed all 27 steps SUCCESS in 4m 53s including
+  <code>Post Cache ccache</code> and <code>Complete job</code>. Verified the two-part
+  fix is <strong>actually deployed</strong>: <code>cat /mnt/c/Users/natha/.wslconfig</code>
+  shows <code>vmIdleTimeout=-1</code> (with the explanatory comment block) and
+  <code>loginctl show-user dornbrn</code> returns <code>Linger=yes</code>. Resume Pointer
+  refreshed: removed the "Standing caveat — clang-19 regression on
+  dev" paragraph that was added in the 17:00 UTC refresh, replaced
+  with a "Resolved" entry holding the diagnosis. <strong>Memory pointer
+  <code>project_session_handover_2026-04-15b.md</code> should also be updated
+  to mark item #2 of "Open work / pickup points" (Diagnose Linux
+  clang-19 debug regression) as done; that update is part of this
+  same diagnostic batch.</strong> <strong>One follow-up surfaced</strong> that does
+  NOT block the dependabot rollout: <code>Linux gcc-13 debug</code> job
+  <code>71453384781</code> on the same validation run <code>24455027178</code> failed
+  mid-Test step (Build SUCCESS at step 11, Test step 12 interrupted
+  at 15m 11s wall, steps 13-26 all <code>null</code>). Different signature
+  from <code>71437121999</code> — failure point is Test, not Post Cache
+  ccache — so it is either a second WSL2 VM cycling event with a
+  shorter wall-clock, a Test-step timeout, or an actual test
+  failure. Separate diagnostic owed to Track B; do not conflate
+  with the resolved clang-19 case.</li>
+<li><strong>2026-04-15 ~17:00 UTC</strong> · Claude session · <strong>Phase 0 fully clear,
+  Tier 1 unblocked. Resume Pointer refreshed.</strong> Status check after
+  the WSL2 keep-alive + CI troubleshooting runbook commits landed.
+  Confirmed via <code>gh pr list --author app/dependabot --state open</code></li>
+<li><code>gh pr view &lt;n&gt; --json statusCheckRollup,mergeable,baseRefName</code>:
+  (1) PR #373 was merged as <code>bf95d3b</code>, which closed #375 and
+  unblocked Phase 0. (2) The <code>@dependabot recreate</code> cycle dispatched
+  by the previous session resulted in <strong>one true recreation</strong>
+  (#243 → <strong>#386</strong> — v9 dropped during the pause window so the bump
+  widened from 7→8 to 7→<strong>9</strong>) plus <strong>six in-place rebases</strong> that
+  kept their original PR numbers (#335, #248, #300, #241, #242,
+  #250). (3) <strong>One new pip-ecosystem PR not in the original Tier
+  Table — #385</strong> meson 1.9.2 → 1.11.0, dropped because #372 added
+  the pip ecosystem to <code>.github/dependabot.yml</code> after the table was
+  written. Slotted as Tier 0d before Tier 1 because meson governs
+  the entire build graph and is pinned in five Dockerfiles. (4) All
+  8 open PRs report <code>base=dev</code>, <code>mergeable=MERGEABLE</code>, and the
+  standard 4-success / 3-skipped PR-time CI rollup (<code>Proto
+  backward-compat</code>, <code>Linux gcc-13 debug</code>, <code>Windows MSVC debug</code>,
+  <code>macOS debug</code> SUCCESS; <code>Sanitizers ASan+UBSan</code>, <code>Sanitizers TSan</code>,
+  <code>Coverage GCC 13</code> SKIPPED). Resume Pointer wholesale-replaced —
+  the prior 156-line #375 narrative was preserved in the
+  2026-04-14 ~22:00 UTC and 2026-04-15 ~12:00 UTC entries below
+  (no information loss). Documented in this refresh: the PR-time
+  CI matrix in <code>.github/workflows/ci.yml</code> lines 91-97 deliberately
+  excludes <code>clang-19</code> and <code>release</code> build_type via <code>matrix.exclude</code>
+  on <code>pull_request</code> events as a self-hosted runner cost
+  optimization (Linux runner is single-process, 4-way matrix
+  serializes), so "PR green" does <strong>not</strong> mean "clang-19 green"
+  until the post-merge push run on <code>dev</code> lands. Standing caveat
+  recorded: <code>dev</code> carries an unresolved clang-19 debug regression
+  from CI run <code>24450261405</code> job <code>71437121999</code> that is independent
+  of this rollout but visible on every post-merge push run.
+  <strong>Next action:</strong> dispatch Tier 1 (#335 + #248) once the operator
+  decides whether to slot #385 as Tier 0d or close-and-defer it
+  until Tier 5 centralizes the meson pins.</li>
+<li><strong>2026-04-15 ~12:00 UTC</strong> · Claude session · <strong>Push run Windows green
+  on <code>5b2996c</code>; PR run hit vcpkg grpc applocal flake and was rerun.</strong>
+  The <code>f0b84c7</code> parallel-race fix is <strong>validated</strong> on Windows: push CI
+  run <code>24426124422</code> (Windows MSVC debug + release both on the same
+  SHA <code>5b2996c</code>) completed with <code>gateway eunit OK 58.58s</code> and
+  <code>gateway ct OK 78.39s</code> — the first fully green gateway suite pair
+  on Windows MSVC in this fix chain. Linux gcc-13/clang-19 and macOS
+  debug/release were all green on both the push and PR runs.
+  However, PR run <code>24426126324</code> on the same commit hit a <strong>distinct,
+  unrelated</strong> failure: vcpkg's grpc build step failed inside
+  <code>vcpkg_copy_tool_dependencies</code> invoking <code>applocal.ps1</code> against
+  <code>grpc_csharp_plugin.exe</code>, with vcpkg reporting
+  <code>error: building grpc:x64-windows failed with: BUILD_FAILED</code>
+  after a full 9.8-minute fresh grpc rebuild. This is a known
+  grpc-on-vcpkg Windows flake class and is orthogonal to any code in
+  this PR — the push run on the same SHA did not hit it because it
+  had a warm vcpkg binary cache, the PR run apparently got a cache
+  miss (push run was <code>cancelled</code> at workflow level before its cache
+  write step ran, so the PR run rebuilt from scratch and rolled the
+  dice on the flake). Job
+  <code>71360390333</code> rerun dispatched via <code>gh run rerun 24426126324
+  --failed</code>. Expected outcome: either a cache-hit short path (if the
+  push run did write some cache layer after all) or a second fresh
+  grpc build that hopefully doesn't roll the flake this time. No
+  code changes. If a second rerun also hits the vcpkg grpc flake,
+  the next escalation is to push a vcpkg binary-cache warmup commit
+  (empty <code>[ci skip]</code>-style no-op) so the cache is populated without
+  gating merge on flake-probability.</li>
+<li><strong>2026-04-14 ~22:00 UTC</strong> · Claude session · <strong>Parallel-compile
+  race between gateway eunit and gateway ct fixed in <code>f0b84c7</code>.</strong>
+  Push CI run <code>24419434652</code> on <code>fea3702</code> (the <code>6d8aa5a</code> pre-fetch
+  drop + docs handoff) confirmed the cover-race fix: gateway
+  <strong>eunit</strong> now passes on Windows MSVC debug (30.75s, 148 tests).
+  But it exposed a SECOND distinct Windows-only failure — the two
+  gateway test suites race each other on <code>_build/test/lib/&lt;dep&gt;/</code>
+  because meson schedules them in parallel by default. Whichever
+  rebar3 process loses the race fails fast (~5-9s) in <code>proper</code>'s
+  compile with
+  <code>failed to rename proper_orddict.bea# to proper_orddict.beam:
+   no such file or directory</code>,
+  while the winning suite finishes cleanly at ~30-55s. The failing
+  suite flipped between eunit and ct across the three Windows
+  variants — release ran eunit fast-fail + ct green, debug ran ct
+  fast-fail + eunit green, PR debug ran eunit fast-fail + ct green.
+  Root cause is Windows file-system semantics — POSIX atomic
+  rename on Linux/macOS survives the race, Windows <code>MoveFileEx</code>
+  can fail if another process already consumed the temp file.
+  Fix in <code>f0b84c7</code>: set a distinct <code>REBAR_BASE_DIR</code> per suite in
+  <code>meson.build</code> (<code>_build_eunit</code> vs <code>_build_ct</code>), <code>test_gateway.py</code>
+  honors the env var when computing its ebin wipe path, and
+  <code>.gitignore</code> gets the two new dirs. Two disjoint <code>_build/</code> trees
+  cannot race. Local Linux repro with
+  <code>REBAR_BASE_DIR=.../gateway/_build_eunit</code>: 148/148 PASS in 24s,
+  identical to the default base-dir runtime. Fallback if <code>f0b84c7</code>
+  still fails: add <code>is_parallel: false</code> to both gateway test()
+  entries in meson.build (strict serialization, ~30s extra test
+  time). Push + PR CI on <code>f0b84c7</code> head queued at handoff — the
+  Windows runner cycle takes ~90 minutes for all three Windows
+  jobs to drain through the one self-hosted runner.</li>
+<li><strong>2026-04-14 ~18:25 UTC</strong> · Claude session · <strong><code>b33f1df</code> pre-fetch
+  regression diagnosed and fixed in <code>6d8aa5a</code>.</strong> Push CI run
+  <code>24412646165</code> on <code>b33f1df</code> failed BOTH Windows MSVC variants on
+  gateway tests at the ~10s mark: release hit the failure on eunit
+  (4/7 FAIL), debug hit it on ct (4/7 FAIL). Same cover-tool error
+  stack in both cases —
+  <code>{cover,get_abstract_code,2,...,{file_error,".../gateway_pb.beam",enoent}}</code>.
+  Diagnosis: the <code>b33f1df</code> pre-fetch step (<code>rebar3 as test compile
+  --deps_only</code>) left <code>_build/test/lib/yuzu_gw/</code> in a state where
+  the subsequent <code>rebar3 as test eunit</code> incremental compile raced
+  cover's <code>pmap_spawn</code> scan. On Linux/macOS this is harmless
+  because <code>_build/test/lib/yuzu_gw/src/</code> is a symlink to the source
+  tree and cover sees a consistent view of ebin at all times; on
+  Windows (symlinks unavailable, rebar3 copies files instead) the
+  race fires and cover errors before the parallel compile worker
+  finishes writing <code>gateway_pb.beam</code>. Pre-fetch was redundant on
+  the persistent <code>yuzu-local-windows</code> runner (hex cache already
+  warm) so the fix is to drop the pre-fetch entirely. <code>6d8aa5a</code>
+  removes the pre-fetch step, bumps <code>run_with_retry(max_attempts=2
+  → 4)</code> on the actual test invocation for hex.pm flake protection,
+  and preserves the <code>run_with_retry</code> helper unchanged. Linux repro
+  of the edited script: 148/148 tests pass in 24s. PR #373 debug
+  run <code>24413181387</code> was cancelled at 18:20 UTC to free the Windows
+  runner for the new <code>6d8aa5a</code> cycle. Session handoff written
+  at the same time. Strategic escape P1 #376 (QUIC migration)
+  still deferred; the goal is to close #375 with this simpler
+  test-script fix rather than revisit the transport-layer rewrite.</li>
+<li><strong>2026-04-14 ~16:30 UTC</strong> · Claude session · <strong>Session handoff. Option D
+  fully validated on commit <code>220e7bd</code> for both Windows MSVC debug and
+  release.</strong> End state: every C++ target links cleanly on both variants
+  (no LNK2038, no LNK2005, no LNK2019), every C++ test passes
+  (<code>yuzu:agent unit tests</code>, <code>yuzu:server unit tests</code>, <code>yuzu:gateway ct</code>).
+  The only remaining failure is <code>yuzu:gateway eunit</code> failing on
+  intermittent hex.pm fetch flake (rebar3 fails to fetch meck or
+  proper from hexpm — varies per run, classic transient flake).
+  Commit <code>b33f1df</code> adds a pre-fetch + retry wrapper to
+  <code>scripts/test_gateway.py</code> (4-attempt exponential backoff on hex.pm
+  failures, populates rebar3's user cache before the actual test runs)
+  to close the hex.pm gap. CI for <code>b33f1df</code> is queued at handoff —
+  push run <code>24412646165</code>, PR run <code>24412648443</code>. Next session picks up
+  by watching that cycle, then merging #373 and dispatching Task #2
+  if green. The full option D iteration history (12e40ae → a61a787 →
+  713ae8c → 46ea61f → 220e7bd → b33f1df) demonstrates the pattern
+  for adding new transitive libs to option D's <code>cxx.find_library()</code>
+  list — see <a href="../.claude/agents/build-ci.html" class="doc-ref"><code>.claude/agents/build-ci.md</code></a> "Windows MSVC static-link
+  history and #375" for the long form. P1 #376 (move off gRPC to
+  QUIC) remains the strategic escape but is deferred until customer
+  commitments ship.</li>
+<li><strong>2026-04-14 ~12:40 UTC</strong> · Claude session · <strong>Option H failed on release
+  with LNK2005, switching to option D.</strong> The option H push CI run on
+  <code>d3c0b80</code> completed with a mixed result the PR CI run hadn't shown:
+  Windows MSVC debug passed (6/7 tests green, only gateway CT failed on
+  hex.pm flake), but Windows MSVC release failed with dozens of
+  LNK2005 duplicate symbol errors — <code>grpc.lib(*.cc.obj)</code> and
+  <code>grpc++.lib(*.cc.obj)</code> defining <code>absl::lts_20260107::Mutex::Dtor</code>
+  "already defined in abseil_dll.lib(abseil_dll.dll)". Root cause:
+  vcpkg's grpc port forces static linkage regardless of
+  <code>VCPKG_LIBRARY_LINKAGE</code> (it logs <code>-- Note: grpc only supports static
+  library linkage</code>), and abseil's inlined template symbols get embedded
+  directly into grpc.lib's object files at grpc's compile time. When
+  the linker pulls in both <code>grpc.lib</code> (with embedded absl symbols) and
+  <code>abseil_dll.lib</code> (re-exporting them from the DLL), LNK2005 fires.
+  The historical "abseil DLL symbol conflicts" warning in the original
+  triplet comment was <strong>accurate and still current</strong> for abseil
+  <code>20260107.1</code> — modern abseil does NOT resolve the conflict for
+  vcpkg's grpc port static-build case. Why debug tolerated the
+  collision and release with LTO did not is unclear; we did not
+  investigate further because (a) academic curiosity wasn't worth
+  another CI cycle against a known-failing approach, and (b) even if
+  debug-with-LTO-off happened to work it would be a "limping
+  production build" customers should not ship. <strong>Option H reverted
+  in <code>895336e</code>, then the doc correction + option D planning landed in
+  <code>ceb7690</code> + <code>2916947</code>.</strong>
+  <strong>Option D</strong> — restore the static-linkage override on the
+  <code>x64-windows</code> triplet AND bypass meson's cmake dep method on Windows
+  for protobuf/grpc by declaring the deps manually via
+  <code>cxx.find_library()</code> with build-type-conditional search dirs. This
+  threads both failure modes simultaneously: static linkage avoids the
+  LNK2005 abseil-DLL-vs-grpc-embedded-absl conflict (no DLL in the
+  install tree → no cross-boundary duplicate symbol), and the
+  hand-rolled find_library avoids LNK2038 (meson is told exactly which
+  .lib to link for each build type, so the cmake-dep translator's
+  release-path bias doesn't get to choose). Linux/macOS continue to
+  use <code>dependency('protobuf', method: 'cmake', ...)</code> unchanged because
+  gcc/clang don't have MSVC's runtime-library variant ABI. The
+  transitive absl closure is enumerated at configure time via
+  <code>run_command(python3 -c 'import glob; ...' )</code> so a vcpkg abseil
+  bump doesn't require a parallel meson.build edit. <strong>Strategic escape
+  tracked as P1 issue #376</strong> — migrate transport off gRPC to QUIC,
+  deferred until customer commitments ship.</li>
+<li><strong>2026-04-14 ~11:55 UTC</strong> · Claude session · <strong>Option B failed the same
+  way, switching to option H.</strong> The option B CI cycle (commit <code>1445cdb</code>)
+  confirmed the root cause is a <strong>meson cmake-dep translation limitation</strong>,
+  not anything wrong with vcpkg or CMake. Direct filesystem inspection of
+  <code>vcpkg_installed/x64-windows/share/protobuf/</code> via the runner-side bash
+  script showed the install tree is correct and complete:</li>
+<li><code>protobuf-targets.cmake</code> uses the standard <code>foreach(include)</code> glob
+    to load both per-config files</li>
+<li><code>protobuf-targets-debug.cmake</code> correctly sets
+    <code>IMPORTED_LOCATION_DEBUG "${_IMPORT_PREFIX}/debug/lib/libprotobufd.lib"</code>
+    and appends <code>DEBUG</code> to <code>IMPORTED_CONFIGURATIONS</code></li>
+<li><code>protobuf-targets-release.cmake</code> correctly sets
+    <code>IMPORTED_LOCATION_RELEASE "${_IMPORT_PREFIX}/lib/libprotobuf.lib"</code>
+    and appends <code>RELEASE</code> to <code>IMPORTED_CONFIGURATIONS</code></li>
+<li>Both <code>libprotobuf.lib</code> (release, <code>/lib/</code>) and <code>libprotobufd.lib</code>
+    (debug with <code>d</code> suffix, <code>/debug/lib/</code>) exist on disk
+  A normal cmake build with <code>CMAKE_BUILD_TYPE=Debug</code> would resolve
+  <code>protobuf::libprotobuf</code> to <code>IMPORTED_LOCATION_DEBUG</code> via generator
+  expression at configure time. Meson's cmake dep probe does NOT —
+  it reads one <code>IMPORTED_LOCATION_*</code> property (the release variant)
+  and bakes that path into its meson dependency representation
+  regardless of the active build type. <code>-DCMAKE_BUILD_TYPE=Debug</code>
+  (option B) makes <code>find_package</code> succeed (which it now does — the
+  Configure step is green) but doesn't influence meson's translation
+  of imported target locations. Known meson limitation.
+  <strong>Option H</strong> — drop the <code>PORT MATCHES "^(abseil|grpc|protobuf|upb|
+  re2|c-ares|utf8-range)$"</code> static-linkage override from
+  <code>triplets/x64-windows.cmake</code> entirely. With dynamic linkage, vcpkg
+  builds these as DLLs + import libs. Import libs don't carry CRT
+  variant info — they're symbol stubs pointing at DLL entries — so
+  debug user code can link against a release-CRT DLL without LNK2038.
+  DLL itself embeds its own CRT via <code>vcruntime*.dll</code> side-by-side at
+  runtime. Known risk: the original override was there to prevent
+  "abseil DLL symbol conflicts"; if modern abseil (in vcpkg as
+  <code>20260107.1</code>) reintroduces that, we fall back to option D (explicit
+  <code>cxx.find_library()</code> with build-type-conditional dirs) — documented
+  in the triplet comment so the next reader doesn't re-litigate.</li>
+<li><strong>2026-04-14 ~10:45 UTC</strong> · Claude session · <strong>Per-build-type triplets
+  reverted; switching to option B.</strong> Commit <code>413a281</code> (per-build-type
+  <code>x64-windows-debug</code> / <code>x64-windows-release</code> triplets) reverted via
+  <code>git revert</code> (commit <code>895336e</code>) after the canary CI cycle exposed
+  two independent vcpkg-side problems:
+  (1) The <code>catch2</code> port's <code>portfile.cmake</code> is not <code>VCPKG_BUILD_TYPE=debug</code>
+  safe — it calls <code>vcpkg_replace_string</code> on a release-side pkgconfig
+  file that doesn't exist in a debug-only install tree, failing BUILD
+  at catch2 install time for <code>x64-windows-debug</code>. This is a vcpkg port
+  bug; fixing it upstream is out of scope for the rollout.
+  (2) The <code>x64-windows-release</code> install got far enough for <code>protobuf</code>
+  and <code>grpc</code> to install successfully, but meson's cmake dep probe
+  rejected the install with <code>gRPC could not be found because dependency
+  Protobuf could not be found</code>. Filesystem inspection via
+  <code>/mnt/c/Users/natha/inspect-vcpkg.sh</code> confirmed the debug tree was
+  wiped by <code>actions/checkout</code> on the subsequent debug job before I
+  could diagnose the release-side state in detail, but the cmake trace
+  pattern (version file loads, but no <code>protobuf-config.cmake</code> follows)
+  is consistent with a version-file compatibility-check rejection in
+  the single-variant install — possibly meson's cmake TryCompile-style
+  probe not setting <code>CMAKE_SIZEOF_VOID_P</code> and the version file's arch
+  check flipping <code>PACKAGE_VERSION_UNSUITABLE=TRUE</code>. Either way, the
+  per-build-type approach is fighting vcpkg's manifest-mode behavior
+  on two fronts.
+  <strong>Course correction — option B.</strong> New commit adds explicit
+  <code>cmake_args: ['-DCMAKE_BUILD_TYPE=Debug'|'Release']</code> to
+  <code>meson.build</code>'s <code>dependency('protobuf', method: 'cmake', ...)</code> and
+  <code>dependency('gRPC', method: 'cmake', ...)</code> calls, Windows only.
+  This forces meson's cmake probe to explicitly request the matching
+  config, so vcpkg's imported targets select
+  <code>IMPORTED_LOCATION_{DEBUG,RELEASE}</code> to match the user code's
+  <code>/MDd</code> vs <code>/MD</code> CRT variant. The shared <code>triplets/x64-windows.cmake</code>
+  (which builds both variants) stays as-is — the option B fix is a
+  meson.build change only. New tier 0bb replaces the prior 0bb in the
+  Tier Table. Task #14 re-scoped to track the option B canary.</li>
+<li><strong>2026-04-14 ~08:40 UTC</strong> · Claude session · <strong>Rollout PAUSED on P0 #375.</strong>
+  The Phase 0b runner migration canary (commit <code>3960f46</code> on dev,
+  in PR #373) succeeded on every plumbing step — toolchain assertion,
+  45 GB disk check, force-fresh-vcpkg, vcpkg install, meson configure,
+  379 of 380 ninja steps. Then <code>tests/yuzu_server_tests.exe</code> linking
+  failed with LNK2038 release/debug variant mismatches against
+  <code>libprotobuf.lib</code>. The <code>0fe5eac</code> LNK2038 fix was triplet-only and
+  incomplete. Initially attempted per-build-type triplets (#375 option
+  A) as the fix — see the newer 10:45 UTC entry above for why that
+  approach was abandoned and option B took over.</li>
+<li><strong>2026-04-14 ~06:50 UTC</strong> · Claude session · <strong>Sequencing correction.</strong>
+  Operator caught that the runner-migration work (issue #374) is a
+  force-multiplier for the rest of the rollout, not a follow-up: each
+  of the 7 Dependabot PRs needs a Windows MSVC debug cycle, and on the
+  github-hosted 4-vCPU <code>windows-2022</code> runner gRPC alone takes ~90 min;
+  on the 32-core / 48 GB self-hosted host the same compile finishes in
+  a fraction of the time. The original "let #373 finish first" plan was
+  sunk-cost reasoning. Course-corrected: cancelled #373's in-flight CI
+  on <code>cd190f2</code>, folded the ci.yml Windows MSVC migration to
+  <code>[self-hosted, Windows, X64]</code> into the reconcile (drop pip+choco
+  install, add toolchain assertion + 45 GB disk check, drop ccache and
+  vcpkg_installed actions/cache, add Force-fresh-vcpkg-on-triplet-drift
+  step, MSYS2 bash shell, build dir → <code>build-windows-ci/</code>). New tier
+  <strong>0b</strong> added between 0a and the recreate cycle. pre-release.yml
+  Windows installer smoke test deferred to a follow-up because the
+  install/uninstall side effects need an isolated install path on the
+  persistent host before it can move.</li>
+<li><strong>2026-04-14 ~05:30 UTC</strong> · Claude session · Task #1 (runner version
+  gate) <strong>completed without operator action</strong>. Both <code>yuzu-wsl2-linux</code>
+  and <code>yuzu-local-windows</code> confirmed on runner version <code>2.333.1</code> —
+  well above the 2.327.1 floor required by Node 24 actions. Evidence:
+  codeql.yml run <code>24380031360</code> (dev branch) — both matrix jobs logged
+  <code>Current runner version: '2.333.1'</code> at "Set up job" step on
+  2026-04-14T03:52:23Z. Memory <code>project_github_runners.md</code> had this
+  for the Linux box from 2026-04-10; the in-progress codeql run
+  confirmed Windows is matched. Tasks #6, #7, #8, #9 are now blocked
+  only on #2 (recreate cycle), not on the runner gate.</li>
+<li><strong>2026-04-14 ~05:00 UTC</strong> · Claude session · Rollout doc created. Phase 0
+  not yet started. Tasks #1–#11 created in TaskList. PR #372 (the
+  foundation that added <code>target-branch: dev</code> and the <code>pip</code> ecosystem)
+  is the only completed work.</li>
+</ul>
+</main>
+</body>
+</html>

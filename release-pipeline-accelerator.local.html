@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Release Pipeline Accelerator</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">release-pipeline-accelerator.local.md</div>
+<h1 class="doc-title">Release Pipeline Accelerator</h1>
+<nav class="doc-nav"><a href="README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="release-pipeline-accelerator">Release Pipeline Accelerator</h1>
+<h2 id="problem-statement">Problem Statement</h2>
+<p>The v0.8.0-rc0 release took ~15 hours across two days. Every failure was discovered sequentially: push tag, wait 30+ min, read logs, fix, re-tag. The goal is <strong>bug fix to release in minutes, not days</strong>.</p>
+<h2 id="failures-catalogue-v080-rc0">Failures Catalogue (v0.8.0-rc0)</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Failure</th>
+<th>Root Cause</th>
+<th>Time Lost</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>680 files with CRLF in working tree, scripts fail with <code>\r</code> in shebang</td>
+<td>Windows git autocrlf + no <code>.gitattributes</code></td>
+<td>~1 hr</td>
+<td><code>.gitattributes</code> with <code>eol=lf</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>ccache: command not found</code> (exit 127)</td>
+<td>Runner reconfigured, ccache not installed</td>
+<td>~30 min</td>
+<td>Runner provisioning playbook</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>sudo: a password is required</code></td>
+<td>Workflow used <code>sudo apt-get install</code> on self-hosted runner</td>
+<td>~30 min</td>
+<td>Verify-don't-install pattern</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>meson</code>/<code>vcpkg</code> not found by runner</td>
+<td>Tools in dornbrn's home, not in runner PATH</td>
+<td>~30 min</td>
+<td>System-wide installs + runner .path</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>VCPKG_ROOT</code> not set</td>
+<td>Runner .env missing</td>
+<td>~20 min</td>
+<td>Runner .env configuration</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>try_take_exclusive_file_lock: Permission denied</code></td>
+<td>vcpkg dir not writable by github-runner</td>
+<td>~30 min</td>
+<td>chgrp docker + g+w</td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>Operation not permitted</code> on vcpkg buildtrees</td>
+<td>Stale build artifacts owned by different user</td>
+<td>~30 min</td>
+<td>chgrp -R docker + setgid</td>
+</tr>
+<tr>
+<td>8</td>
+<td>vcpkg builds debug+release variants</td>
+<td>No <code>VCPKG_BUILD_TYPE</code> in triplet files</td>
+<td>~15 min wasted per run</td>
+<td><code>set(VCPKG_BUILD_TYPE release)</code></td>
+</tr>
+<tr>
+<td>9</td>
+<td>Erlang eunit "modules not found"</td>
+<td>rebar3 doesn't auto-discover umbrella test dir</td>
+<td>~1 hr</td>
+<td><code>--dir apps/yuzu_gw/test</code></td>
+</tr>
+<tr>
+<td>10</td>
+<td>Changelog extraction fails for RC tags</td>
+<td>Extractor looked for <code>## [0.8.0-rc0]</code> not <code>## [0.8.0]</code></td>
+<td>~20 min</td>
+<td><code>BASE_VERSION="${VERSION%%-*}"</code></td>
+</tr>
+<tr>
+<td>11</td>
+<td>meck <code>already_started</code> cancels fixtures, exit 1</td>
+<td>Test isolation bug, rebar3 treats cancellation as failure</td>
+<td>~30 min</td>
+<td>Parse output for <code>Failed: 0</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Total time lost to sequential discovery: ~6 hours</strong></p>
+<h2 id="what-mature-projects-do">What Mature Projects Do</h2>
+<h3 id="dependency-management">Dependency Management</h3>
+<ul>
+<li><strong>Rust/Go:</strong> Language toolchains cross-compile natively; no vcpkg-style dependency builds</li>
+<li><strong>Kubernetes:</strong> Uses <code>goreleaser</code> for cross-compilation in one step</li>
+<li><strong>Grafana:</strong> Pre-built Docker images with all dependencies; runner is just a Docker host</li>
+</ul>
+<h3 id="build-acceleration">Build Acceleration</h3>
+<ul>
+<li><strong>sccache</strong> (Mozilla): Drop-in ccache replacement, supports MSVC/GCC/Clang, S3/local disk backend, shares cache between CI and local dev</li>
+<li><strong>vcpkg binary caching</strong>: <code>VCPKG_BINARY_SOURCES="clear;files,/path,readwrite"</code> — content-addressed cache by triplet+port hash</li>
+<li><strong>ccache</strong>: Already in use, but cold on reconfigured runner</li>
+</ul>
+<h3 id="local-validation">Local Validation</h3>
+<ul>
+<li><strong>Kubernetes:</strong> <code>make verify</code> mirrors CI checks locally</li>
+<li><strong>Grafana:</strong> <code>make release-test</code> simulates release pipeline</li>
+<li><strong>Common pattern:</strong> CI workflow calls a script; developers call the same script locally</li>
+</ul>
+<h3 id="runner-management">Runner Management</h3>
+<ul>
+<li><strong>Nix flakes:</strong> <code>nix develop</code> gives identical environment everywhere</li>
+<li><strong>Ansible:</strong> Playbook declares packages, paths, permissions</li>
+<li><strong>Docker-based runners:</strong> Container built from Dockerfile with everything pre-installed</li>
+</ul>
+<h2 id="recommendations-priority-order">Recommendations (Priority Order)</h2>
+<h3 id="p0-gitattributes-15-min-prevents-crlf-class-entirely">P0: <code>.gitattributes</code> (15 min, prevents CRLF class entirely)</h3>
+<div class="highlight"><pre><span></span><code>* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.erl text eol=lf
+*.hrl text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.sln text eol=crlf
+*.vcxproj text eol=crlf
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+</code></pre></div>
+<h3 id="p1-runner-provisioning-script-2-3-hrs">P1: Runner Provisioning Script (2-3 hrs)</h3>
+<p>Create <code>scripts/provision-runner.sh</code> that:
+1. Verifies all required tools are installed and in PATH
+2. Verifies VCPKG_ROOT is set and writable
+3. Verifies vcpkg binary cache is warm
+4. Verifies group ownership (docker group) on shared dirs
+5. Optionally installs missing tools (with sudo)</p>
+<p>Create companion Ansible playbook <code>infra/runner-provision.yml</code> for full provisioning.</p>
+<p>Run the verify-only mode as the first step of every CI workflow.</p>
+<h3 id="p2-vcpkg-binary-cache-on-self-hosted-runners-30-min">P2: vcpkg Binary Cache on Self-Hosted Runners (30 min)</h3>
+<p>Add to runner <code>.env</code>:
+<div class="highlight"><pre><span></span><code>VCPKG_BINARY_SOURCES=clear;files,/var/cache/vcpkg,readwrite
+</code></pre></div></p>
+<p>Create the cache dir with docker group ownership. The self-hosted runner keeps the cache permanently (no GHA cache eviction). After first build, vcpkg install becomes a ~10s cache restore.</p>
+<h3 id="p3-vcpkg_build_typerelease-on-all-triplets-done">P3: <code>VCPKG_BUILD_TYPE=release</code> on All Triplets (done)</h3>
+<p>Already applied to <code>x64-linux-static.cmake</code> and <code>x64-windows.cmake</code>. Halves vcpkg build time by skipping debug variants.</p>
+<h3 id="p4-release-preflight-script-2-3-hrs">P4: Release Preflight Script (2-3 hrs)</h3>
+<p>Create <code>scripts/release-preflight.sh</code>:
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env bash</span>
+<span class="nb">set</span><span class="w"> </span>-euo<span class="w"> </span>pipefail
+<span class="nv">TAG</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">1</span><span class="p">:?Usage: release-preflight.sh v0.8.0-rc0</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="nv">VERSION</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">TAG</span><span class="p">#v</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="nv">BASE_VERSION</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">VERSION</span><span class="p">%%-*</span><span class="si">}</span><span class="s2">&quot;</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== Preflight for </span><span class="nv">$TAG</span><span class="s2"> ===&quot;</span>
+
+<span class="c1"># 1. CRLF check</span>
+<span class="nb">echo</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;CRLF in scripts... &quot;</span>
+<span class="k">if</span><span class="w"> </span>grep<span class="w"> </span>-rPl<span class="w"> </span><span class="s1">&#39;\r$&#39;</span><span class="w"> </span>scripts/<span class="w"> </span>gateway/*.sh<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">  </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;FAIL&quot;</span><span class="p">;</span><span class="w"> </span><span class="nb">exit</span><span class="w"> </span><span class="m">1</span>
+<span class="k">fi</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;ok&quot;</span>
+
+<span class="c1"># 2. Changelog</span>
+<span class="nb">echo</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;CHANGELOG has ## [</span><span class="nv">$BASE_VERSION</span><span class="s2">]... &quot;</span>
+grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">&quot;## \[</span><span class="si">${</span><span class="nv">BASE_VERSION</span><span class="si">}</span><span class="s2">\]&quot;</span><span class="w"> </span>CHANGELOG.md<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="o">{</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;FAIL&quot;</span><span class="p">;</span><span class="w"> </span><span class="nb">exit</span><span class="w"> </span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="o">}</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;ok&quot;</span>
+
+<span class="c1"># 3. Version in meson.build</span>
+<span class="nb">echo</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;meson.build version matches... &quot;</span>
+grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">&quot;version: &#39;</span><span class="si">${</span><span class="nv">BASE_VERSION</span><span class="si">}</span><span class="s2">&#39;&quot;</span><span class="w"> </span>meson.build<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="o">{</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;FAIL&quot;</span><span class="p">;</span><span class="w"> </span><span class="nb">exit</span><span class="w"> </span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="o">}</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;ok&quot;</span>
+
+<span class="c1"># 4. Compile</span>
+<span class="nb">echo</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;C++ compile... &quot;</span>
+meson<span class="w"> </span>compile<span class="w"> </span>-C<span class="w"> </span>builddir<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-1
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;ok&quot;</span>
+
+<span class="c1"># 5. Erlang</span>
+<span class="nb">echo</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;Erlang compile + dialyzer... &quot;</span>
+<span class="o">(</span><span class="nb">cd</span><span class="w"> </span>gateway<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>rebar3<span class="w"> </span>compile<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>rebar3<span class="w"> </span>dialyzer<span class="o">)</span><span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-1
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;ok&quot;</span>
+
+<span class="c1"># 6. Simulate changelog extraction</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== Changelog preview ===&quot;</span>
+awk<span class="w"> </span><span class="s2">&quot;/^## \[</span><span class="si">${</span><span class="nv">BASE_VERSION</span><span class="si">}</span><span class="s2">\]/{found=1;next} /^## \[/{if(found) exit} found{print}&quot;</span><span class="w"> </span>CHANGELOG.md
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;=== Preflight PASSED for </span><span class="nv">$TAG</span><span class="s2"> ===&quot;</span>
+</code></pre></div></p>
+<h3 id="p5-sccache-for-c-compilation-2-hrs">P5: sccache for C++ Compilation (2 hrs)</h3>
+<p>Install sccache on all runners. Configure:
+<div class="highlight"><pre><span></span><code>CC=&quot;sccache gcc-13&quot;
+CXX=&quot;sccache g++-13&quot;
+SCCACHE_DIR=/var/cache/sccache
+SCCACHE_CACHE_SIZE=10G
+</code></pre></div></p>
+<p>On warm cache, a 3-file bug fix recompiles 3 files. Full rebuild: ~2 min instead of ~8 min.</p>
+<h3 id="p6-local-artifact-cache-on-self-hosted-runners">P6: Local Artifact Cache on Self-Hosted Runners</h3>
+<p>Keep a local copy of every release artifact on the runner so that:
+1. Re-runs don't need to rebuild just to re-upload
+2. Artifacts survive GitHub's artifact storage cleanup (90-day expiry)
+3. Slow uploads to GitHub don't block the pipeline — publish locally first, upload async</p>
+<div class="highlight"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Cache artifacts locally</span>
+<span class="w">  </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">    </span><span class="no">LOCAL_CACHE=&quot;/var/cache/yuzu-releases/${GITHUB_REF_NAME}&quot;</span>
+<span class="w">    </span><span class="no">mkdir -p &quot;$LOCAL_CACHE&quot;</span>
+<span class="w">    </span><span class="no">cp *.tar.gz *.deb *.rpm &quot;$LOCAL_CACHE/&quot; 2&gt;/dev/null || true</span>
+<span class="w">    </span><span class="no">echo &quot;Artifacts cached at $LOCAL_CACHE&quot;</span>
+</code></pre></div>
+<p>Create <code>/var/cache/yuzu-releases/</code> with docker group ownership. Old releases can be pruned with a simple <code>find -mtime +30 -delete</code> cron.</p>
+<h3 id="p7-workflow-orchestrator-as-release-guardian">P7: Workflow-Orchestrator as Release Guardian</h3>
+<p>The workflow-orchestrator agent should own the release process end-to-end:</p>
+<ol>
+<li><strong>Pre-tag:</strong> Run preflight checks, validate runner health, simulate changelog extraction, verify <code>.gitattributes</code></li>
+<li><strong>Tag:</strong> Only create and push tag after all preflight checks pass</li>
+<li><strong>Monitor:</strong> Watch the release workflow, surface failures immediately with root cause</li>
+<li><strong>Post-release:</strong> Verify artifacts published, Docker images pullable, GitHub Release created</li>
+</ol>
+<p>This replaces the current manual cycle of push-wait-read-fix-retag.</p>
+<h3 id="p8-proactive-cache-pruning">P8: Proactive Cache Pruning</h3>
+<p>GitHub Actions has a 10 GB cache limit per repo. Stale caches accumulate (52 caches, 10.4 GB at time of writing) and when the limit is hit, GitHub evicts LRU — which may be the warm vcpkg cache you actually need.</p>
+<p>Add a post-job step or scheduled workflow that prunes stale caches:
+- Only the most recent cache per prefix matters (e.g. <code>ccache-linux-gcc-13-*</code>)
+- Delete all older entries for the same prefix after a successful build
+- Use <code>gh api -X DELETE repos/{owner}/{repo}/actions/caches/{id}</code></p>
+<p>Criteria for staleness: same prefix, older than current run's key. Prune immediately, don't wait for the 10 GB limit to bite.</p>
+<h2 id="target-pipeline-warm-cache">Target Pipeline (Warm Cache)</h2>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Time</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Local preflight</td>
+<td>30s</td>
+<td>Catches CRLF, changelog, version, compile</td>
+</tr>
+<tr>
+<td>Tag push</td>
+<td>5s</td>
+<td></td>
+</tr>
+<tr>
+<td>Runner verify</td>
+<td>15s</td>
+<td>provision-runner.sh --verify</td>
+</tr>
+<tr>
+<td>vcpkg restore</td>
+<td>10s</td>
+<td>Binary cache hit</td>
+</tr>
+<tr>
+<td>Linux build (sccache warm)</td>
+<td>3-4 min</td>
+<td>Only changed files recompile</td>
+</tr>
+<tr>
+<td>Windows build (parallel)</td>
+<td>5-6 min</td>
+<td></td>
+</tr>
+<tr>
+<td>macOS build (parallel)</td>
+<td>4-5 min</td>
+<td></td>
+</tr>
+<tr>
+<td>Gateway build + test</td>
+<td>2 min</td>
+<td></td>
+</tr>
+<tr>
+<td>Package (.tar.gz, .deb, .rpm)</td>
+<td>1 min</td>
+<td></td>
+</tr>
+<tr>
+<td>Docker build + push</td>
+<td>1-2 min</td>
+<td>Layer cache</td>
+</tr>
+<tr>
+<td>GitHub Release</td>
+<td>30s</td>
+<td></td>
+</tr>
+<tr>
+<td><strong>Total wall-clock</strong></td>
+<td><strong>8-12 min</strong></td>
+<td>Down from hours per attempt</td>
+</tr>
+</tbody>
+</table>
+<h2 id="failure-prevention-matrix">Failure Prevention Matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Failure Class</th>
+<th>Prevention Mechanism</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CRLF corruption</td>
+<td><code>.gitattributes</code> with <code>eol=lf</code></td>
+</tr>
+<tr>
+<td>Missing tools on runner</td>
+<td>Ansible playbook + verify step</td>
+</tr>
+<tr>
+<td>Permissions issues</td>
+<td>Provisioning script sets docker group + setgid</td>
+</tr>
+<tr>
+<td>vcpkg cold cache</td>
+<td>Persistent binary cache on self-hosted runner</td>
+</tr>
+<tr>
+<td>vcpkg debug builds</td>
+<td><code>VCPKG_BUILD_TYPE=release</code> in triplets</td>
+</tr>
+<tr>
+<td>Erlang test discovery</td>
+<td>Preflight runs same eunit command as CI</td>
+</tr>
+<tr>
+<td>Changelog extraction</td>
+<td>Preflight simulates extraction</td>
+</tr>
+<tr>
+<td>Tag churn</td>
+<td>Preflight catches everything before tag is created</td>
+</tr>
+<tr>
+<td>No local validation</td>
+<td>Preflight script + <code>act</code> for workflow YAML</td>
+</tr>
+</tbody>
+</table>
+<h2 id="implementation-timeline">Implementation Timeline</h2>
+<table>
+<thead>
+<tr>
+<th>Week</th>
+<th>Work</th>
+<th>Hours</th>
+<th>Impact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Now</td>
+<td><code>.gitattributes</code>, <code>VCPKG_BUILD_TYPE</code> (done)</td>
+<td>1</td>
+<td>Prevents CRLF, halves vcpkg</td>
+</tr>
+<tr>
+<td>This week</td>
+<td>Runner provisioning script + Ansible</td>
+<td>3</td>
+<td>Eliminates sequential discovery</td>
+</tr>
+<tr>
+<td>This week</td>
+<td>vcpkg binary cache config</td>
+<td>1</td>
+<td>Near-instant dependency restore</td>
+</tr>
+<tr>
+<td>Next week</td>
+<td>Release preflight script</td>
+<td>3</td>
+<td>Eliminates tag churn</td>
+</tr>
+<tr>
+<td>Next week</td>
+<td>sccache setup</td>
+<td>2</td>
+<td>3-file fix = 30s compile</td>
+</tr>
+<tr>
+<td>Following</td>
+<td>Workflow-orchestrator integration</td>
+<td>3</td>
+<td>Automated release guardian</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td></td>
+<td><strong>~13 hrs</strong></td>
+<td><strong>Pays back on first release</strong></td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

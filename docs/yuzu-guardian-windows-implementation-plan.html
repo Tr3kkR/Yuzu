@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan — Wire up Yuzu Guardian on Windows (Phase 1 skeleton)</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/yuzu-guardian-windows-implementation-plan.md</div>
+<h1 class="doc-title">Plan — Wire up Yuzu Guardian on Windows (Phase 1 skeleton)</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="plan-wire-up-yuzu-guardian-on-windows-phase-1-skeleton">Plan — Wire up Yuzu Guardian on Windows (Phase 1 skeleton)</h1>
+<h2 id="context">Context</h2>
+<p><a href="yuzu-guardian-design-v1.1.html" class="doc-ref"><code>docs/yuzu-guardian-design-v1.1.md</code></a> specifies a new agent-side Guardian engine for real-time policy enforcement on Windows, Linux, and macOS. Windows is the stated top priority. The design is complete and decided — this plan scopes a <strong>Windows-first delivery</strong> as a series of reviewable PRs that stand up the skeleton (dispatch, proto, one event guard, remediation, audit, server store, minimal dashboard) before the long tail of guard types and hardening.</p>
+<p>The exploration found that the agent already has everything Guardian needs to graft onto: service install with <code>SERVICE_AUTO_START</code> + <code>FailureActions</code> (<code>main.cpp:136–200</code>), a clean pre-network vs post-network split in <code>AgentImpl::run()</code> (<code>agent.cpp:407–1117</code>), a plugin dispatch loop at <code>agent.cpp:975–993</code> with no reserved names yet, a thread-safe plugin-namespaced <code>KvStore</code>, an existing <code>RegNotifyChangeKeyValue</code> watcher pattern in <code>trigger_engine.cpp:365–463</code>, <code>wintrust</code>/<code>wbemuuid</code>/<code>ole32</code> already linked, and a generic <code>ApprovalManager</code> whose <code>definition_id</code> field can key off <code>guaranteed_state_*</code> without code changes. On the server side, <code>MigrationRunner</code>, <code>RestApiV1</code> (sink + <code>JObj</code>/<code>JArr</code> pattern), <code>DashboardRoutes</code>, and <code>kTools[]</code>/<code>kToolSecurity</code> arrays in <code>mcp_server.cpp</code> all have clear slot-in points.</p>
+<p>Gaps: no ETW consumer, no WFP subscriber, no <code>INetFwPolicy2</code> usage, no <code>CredWrite</code> — all Windows-link additions (<code>tdh</code>, <code>fwpuclnt</code>, <code>rpcrt4</code>, <code>hnetcfg</code>) and net-new code. Agent-side there is no policy evaluator today, so Guardian is additive.</p>
+<p>Goal of this plan: land PRs 1–4 below to get <strong>one end-to-end Windows rule working</strong> (Registry Guard → state evaluator → registry-write remediation → audit journal → server store → push to agent → dashboard list). Everything else (ETW/WFP/SCM guards, condition guards, resilience strategies, quarantine, MCP tools, HTMX rule editor) is scoped as PRs 5+.</p>
+<h2 id="delivery-sequence">Delivery sequence</h2>
+<h3 id="pr-1-proto-wire-skeleton-server-store-stub">PR 1 — Proto + wire skeleton + server store stub</h3>
+<p>Land the wire contract and empty server store first so later PRs have something to push/receive.</p>
+<ul>
+<li><code>proto/yuzu/guardian/v1/guaranteed_state.proto</code> — new file with the five messages from §7.1 (<code>GuaranteedStateRule</code>, <code>GuaranteedStatePush</code>, <code>GuaranteedStateEvent</code>, <code>GuaranteedStateStatus</code>, <code>GuaranteedStateRuleStatus</code>). Extend <code>GuaranteedStateRuleStatus</code> with three fields not in the design doc — <code>bool guard_healthy = 8;</code>, <code>google.protobuf.Timestamp last_notification = 9;</code>, <code>uint64 notifications_total = 10;</code> — to carry the kernel-wiring health signal surfaced in PR 3.</li>
+<li><code>proto/meson.build</code> — append the new <code>.proto</code> to the <code>custom_target</code> <code>input:</code> array and update <code>output:</code>/<code>gen_srcs</code>/<code>gen_hdrs</code> (follow the agent.proto / management.proto pattern exactly).</li>
+<li><code>server/core/src/guaranteed_state_store.hpp/.cpp</code> — new store following <code>audit_store.*</code> shape. Tables from §9.1 (<code>guaranteed_state_rules</code>, <code>guaranteed_state_events</code> + indexes). Declares a static <code>kMigrations</code> vector and calls <code>MigrationRunner::run(db_, "guaranteed_state_store", kMigrations)</code> inside <code>create_tables()</code>. CRUD: <code>create_rule</code>, <code>list_rules</code>, <code>get_rule</code>, <code>update_rule</code>, <code>delete_rule</code>, <code>insert_event</code>, <code>query_events</code>.</li>
+<li><code>server/core/src/server.cpp</code> — instantiate the store at startup next to the other stores.</li>
+<li><code>server/core/meson.build</code> — add the new sources.</li>
+</ul>
+<p>Verification: <code>meson compile -C build-linux</code> + <code>build-windows</code> both clean; <code>meson test -C build-* --suite server</code> green; new <code>test_guaranteed_state_store.cpp</code> covers the migration path and CRUD round-trip.</p>
+<h3 id="pr-2-rest-v1-__guard__-dispatch-hook-empty-guardianengine">PR 2 — REST v1 + <code>__guard__</code> dispatch hook + empty GuardianEngine</h3>
+<p>Stand up the control-plane surface and the agent-side scaffolding without yet starting any real guard.</p>
+<ul>
+<li><code>server/core/src/rest_api_v1.cpp/.hpp</code> — add the endpoints from §9.2 using the existing <code>perm_fn</code>/<code>audit_fn</code>/<code>JObj</code>/<code>JArr</code> pattern. RBAC: securable type <code>"GuaranteedState"</code> with operations <code>"Create" | "Read" | "Update" | "Delete" | "Push"</code>.</li>
+<li><code>agents/core/src/guardian_engine.hpp/.cpp</code> — <code>GuardianEngine</code> class per §8.2 with <code>start_local()</code> / <code>sync_with_server(CommsLayer&amp;)</code> / <code>stop()</code> / <code>apply_rules(push)</code> / <code>get_status()</code>. In this PR these are stubs that persist rules into the shared <code>KvStore</code> under plugin namespace <code>"__guardian__"</code> (§3 of the Explore 1 report — option A, no second SQLite file) but don't spawn any guards yet.</li>
+<li><code>agents/core/src/agent.cpp</code> — two edits:
+  1. After <code>KvStore::open</code> succeeds (around line 447) call <code>guardian_.start_local()</code> — before the Register RPC so Guardian is enforcing before the network comes up (§4 of the design).
+  2. Immediately before the plugin-match loop at line 975, intercept <code>cmd.plugin() == "__guard__"</code> and route to <code>GuardianEngine::handle_command(cmd, stream, &amp;stream_write_mu_)</code>. Actions: <code>push_rules</code>, <code>get_status</code>. Response written under <code>stream_write_mu_</code> using the same pattern as the existing final-response write at <code>agent.cpp:1089–1102</code>.
+  3. After <code>Register()</code> succeeds (around line 803) call <code>guardian_.sync_with_server(comms)</code>.</li>
+<li><code>agents/core/meson.build</code> — add <code>src/guardian_engine.cpp</code> unconditionally (engine itself is portable; only the guard implementations are platform-gated — follow the existing <code>cert_discovery.cpp</code> placement).</li>
+</ul>
+<p>Verification: <code>meson test --suite agent</code> green; new <code>test_guardian_engine.cpp</code> fakes a <code>GuaranteedStatePush</code> and asserts rules land in <code>KvStore</code> under <code>__guardian__</code>. Server integration: <code>curl -X POST /api/v1/guaranteed-state/rules</code> → <code>GET /rules</code> shows it → <code>POST /push</code> → agent has it in KV.</p>
+<h3 id="pr-3-registry-guard-stateevaluator-remediationengine-registry-write-auditjournal-the-end-to-end-windows-vertical-slice">PR 3 — Registry Guard + StateEvaluator + RemediationEngine (registry-write) + AuditJournal — the end-to-end Windows vertical slice</h3>
+<p>This is the PR where a real rule actually fires on Windows. Keep it narrowly focused on one guard type and one remediation method so the whole loop can be proven.</p>
+<ul>
+<li><code>agents/core/src/guard_base.hpp</code> — abstract <code>GuardBase</code> per §8.2 (<code>start/stop/type/rule_id/category/read_current_state</code>).</li>
+<li><code>agents/core/src/guard_manager.hpp/.cpp</code> — instantiates guards per active rule, owns their threads, routes fired events into <code>StateEvaluator</code>. Implements the ETW-session and SCM-handle pooling placeholders from §8.3 (pooling logic itself arrives with the ETW/SCM guard PRs — for now a plain per-rule map is fine).</li>
+<li><code>agents/core/src/guard_registry.hpp/.cpp</code> — <strong>Windows only.</strong> <code>RegNotifyChangeKeyValue</code> watch loop per §5.1.1 using <code>WaitForMultipleObjects</code> against the notify event + a stop event. Re-read state on fire; hand <code>StateSnapshot</code> to evaluator. Thread created with <code>_beginthreadex</code> at 64 KB stack (§8.3). <strong>Reuse the existing pattern at <code>trigger_engine.cpp:365–463</code></strong> — don't reinvent it. 10–50 ms debounce support per §6.5 (input debounce only; remediation + audit debounce arrive in PR 4).</li>
+<li><code>agents/core/src/state_evaluator.hpp/.cpp</code> — assertion registry from §6.3 with only two entries landed in this PR: <code>registry-value-equals</code> and <code>registry-value-absent</code>. Returns <code>compliant | drift | exempt</code>.</li>
+<li><code>agents/core/src/remediation_engine.hpp/.cpp</code> — Windows methods from §14.1 limited to <code>registry-write</code> + <code>registry-delete</code> + <code>method: auto</code> for the two above assertion types (§6.4). <code>RegSetValueExW</code> / <code>RegDeleteValueW</code> / <code>RegDeleteKeyExW</code>. <strong>No <code>reg.exe</code> shell-out (§14).</strong> Re-entrancy flag from §8.4 (per-rule <code>remediating_</code> atomic + 5 ms suppression window).</li>
+<li><code>agents/core/src/guard_audit.hpp/.cpp</code> — MPSC queue + dedicated writer thread per §8.3. Writes <code>GuaranteedStateEvent</code> rows to a local SQLite journal (new table inside <code>kv_store.db</code> is fine; keyed by monotonically increasing <code>event_seq</code>). Drained by <code>GuardianEngine::sync_with_server</code> into <code>CommandResponse { plugin: "__guard__", action: "event" }</code>.</li>
+<li><code>agents/core/src/assertion_types.hpp/.cpp</code> — two-entry registry to start; extension is just <code>register()</code> calls.</li>
+<li><strong>Kernel-wiring self-test on start + per-guard health metric</strong> (added to this PR so we don't ship blind):</li>
+<li><code>GuardBase::self_test()</code> default implementation, overridden per guard. For <code>RegistryGuard</code>: on <code>start()</code>, after the watch is armed, the guard writes a sentinel DWORD under its own namespace key (e.g. <code>HKLM\SOFTWARE\Yuzu\Guardian\Probe\&lt;rule_id&gt;</code>), waits up to 500 ms for its own notification to round-trip, then deletes the sentinel. If the round-trip fails the guard marks itself <code>UNHEALTHY</code> and emits a <code>guard.unhealthy</code> audit event; <code>GuardianEngine::start_local()</code> continues (one dead guard must not block the rest) but <code>GuaranteedStateRuleStatus.status</code> for that rule reports <code>errored</code>.</li>
+<li>Add fields to <code>GuardBase</code>: <code>std::atomic&lt;steady_clock::time_point&gt; last_notification_at_</code>, <code>std::atomic&lt;uint64_t&gt; notifications_total_</code>, <code>std::atomic&lt;Health&gt; health_</code> (<code>Healthy | Unhealthy | Unknown</code>). Updated by the watch loop; exposed on <code>get_status</code>.</li>
+<li>Extend <code>GuaranteedStateRuleStatus</code> proto (§7.1) with <code>bool guard_healthy = 8; google.protobuf.Timestamp last_notification = 9; uint64 notifications_total = 10;</code> so the server/dashboard can tell the difference between "compliant because nothing's happening" and "deaf because the subscription silently went nowhere." This is a proto edit that goes back to <strong>PR 1</strong>; list it there now that we know we need it.</li>
+<li><code>agents/core/meson.build</code>:
+  <div class="highlight"><pre><span></span><code><span class="n">guardian_sources</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">files</span><span class="p">(</span><span class="s">&#39;src/guard_base.hpp&#39;</span><span class="p">,</span><span class="w"> </span><span class="s">&#39;src/guard_manager.cpp&#39;</span><span class="p">,</span>
+<span class="w">                         </span><span class="s">&#39;src/state_evaluator.cpp&#39;</span><span class="p">,</span>
+<span class="w">                         </span><span class="s">&#39;src/remediation_engine.cpp&#39;</span><span class="p">,</span>
+<span class="w">                         </span><span class="s">&#39;src/guard_audit.cpp&#39;</span><span class="p">,</span>
+<span class="w">                         </span><span class="s">&#39;src/assertion_types.cpp&#39;</span><span class="p">)</span>
+<span class="k">if</span><span class="w"> </span><span class="vm">host_machine</span><span class="p">.</span><span class="n">system</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s">&#39;windows&#39;</span>
+<span class="w">  </span><span class="n">guardian_sources</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="nb">files</span><span class="p">(</span><span class="s">&#39;src/guard_registry.cpp&#39;</span><span class="p">)</span>
+<span class="w">  </span><span class="c"># advapi32 already linked; no new libs yet this PR</span>
+<span class="k">endif</span>
+</code></pre></div></li>
+<li>Server: <code>server/core/src/guaranteed_state_store.cpp</code> — <code>insert_event</code> wired into the <code>__guard__</code> action: "event" path in the server's command-response handler so that journal rows from the agent land in <code>guaranteed_state_events</code>.</li>
+</ul>
+<p>Verification: new <code>tests/unit/test_guard_registry.cpp</code> Windows-only — opens a test HKCU key, starts a <code>RegistryGuard</code>, flips the value, asserts evaluator fires and <code>remediation_engine</code> writes it back. <strong>Plus a dedicated self-test test</strong>: start <code>RegistryGuard</code> against a known-good path, assert <code>health_ == Healthy</code> and <code>notifications_total_ &gt;= 1</code> within 500 ms of <code>start()</code> returning; then start a second guard against an intentionally broken path (no <code>KEY_NOTIFY</code> access) and assert it transitions to <code>Unhealthy</code> and emits <code>guard.unhealthy</code>. Manual UAT: author a <code>block-registry-example</code> rule via REST, push it, flip the key on a Windows box (WSL doesn't cut it for this one — needs native Windows), confirm <code>events</code> table shows a remediated drift <strong>and</strong> the dashboard's rule row shows the guard as healthy with a recent <code>last_notification</code> timestamp.</p>
+<h3 id="pr-4-resilience-strategies-re-arm-on-boot-guaranteed-state-dashboard-list-page">PR 4 — Resilience strategies + re-arm on boot + <code>/guaranteed-state</code> dashboard list page</h3>
+<p>Wrap the vertical slice with the operational surface and the two safety-critical pieces the design calls out as "always on": reconciliation and resilience.</p>
+<ul>
+<li><code>agents/core/src/resilience_strategy.hpp/.cpp</code> — <code>Fixed</code>, <code>Backoff</code>, <code>Escalation</code> per §8.5 + §6.6 YAML examples. <code>RaceDetector</code> per §8.5 (sliding-window drifts/second).</li>
+<li><code>agents/core/src/guard_reconciliation.hpp/.cpp</code> — periodic full-state check calling every active guard's <code>read_current_state()</code> (every guard must implement this per §8.2). Runs once at startup (the "catch drift from while the agent was off" sweep from §4) and on a configurable interval (default 60 s).</li>
+<li><code>server/core/src/dashboard_guaranteed_state.hpp/.cpp</code> — main page at <code>/guaranteed-state</code> and fragments <code>summary</code>, <code>rules</code>, <code>events</code> from §10.3. Follow <code>dashboard_routes.cpp</code> style — no HTMX rule editor yet, just list + detail reads. No approval flow yet.</li>
+<li><code>server/core/src/server.cpp</code> — register the new dashboard routes next to <code>DashboardRoutes</code> around line 4202.</li>
+</ul>
+<p>Verification: <code>test_resilience_strategy.cpp</code> covers the three strategies and race detector; integration test: agent with a rule that has <code>resilience: { strategy: backoff, initial_delay: 50ms, multiplier: 2, max_delay: 5s }</code> against a flaky remediation stub confirms the delay sequence; dashboard page renders rule list + event timeline.</p>
+<h3 id="prs-5-scoped-not-in-this-plans-detail">PRs 5+ (scoped, not in this plan's detail)</h3>
+<p>Tracking list, in the order the design doc suggests and sized roughly one-PR-per-row:</p>
+<ul>
+<li><strong>PR 5</strong> — Service-control remediation + <code>service-running/stopped/disabled</code> assertions + SCM Guard (<code>NotifyServiceStatusChange</code>).</li>
+<li><strong>PR 6</strong> — Firewall: <code>firewall-port-blocked</code> assertion + <code>INetFwPolicy2</code> (COM; needs <code>hnetcfg.lib</code>) + Registry Guard on the <code>FirewallRules</code> subtree (design §5.1.3 says that's the practical primary).</li>
+<li><strong>PR 7</strong> — ETW Guard + session pooling per §8.3 (<code>tdh.lib</code>). Implement as a separate ETW session manager that multiplexes to rule evaluators.</li>
+<li><strong>PR 8</strong> — Process Guard (hybrid — ETW <code>Microsoft-Windows-Kernel-Process</code> primary + <code>CreateToolhelp32Snapshot</code> backup) + <code>process-running/not-running</code> + <code>WinVerifyTrust</code> for <code>verify_signature</code> (<code>wintrust.lib</code> already linked).</li>
+<li><strong>PR 9</strong> — WMI Guard + Compliance Guard + Software Guard (reuse existing <code>IWbemServices</code> usage from <code>hardware_plugin.cpp</code> / <code>wmi_plugin.cpp</code>). COM init: worker threads in the condition-guard pool must <code>CoInitializeEx(nullptr, COINIT_MULTITHREADED)</code> per §8.3.</li>
+<li><strong>PR 10</strong> — WFP Guard (<code>fwpuclnt.lib</code> + <code>rpcrt4.lib</code>) as defence-in-depth.</li>
+<li><strong>PR 11</strong> — Approval workflow: reuse <code>ApprovalManager</code> with <code>definition_id = "guaranteed_state_rule_*"</code>; add <code>/api/v1/guaranteed-state/approvals*</code> endpoints; dashboard pending-approvals pane from §10.1. No ApprovalManager code changes required (already generic).</li>
+<li><strong>PR 12</strong> — HMAC rule signing (HKDF per §11.2) + <code>CredWrite</code>/<code>CredRead</code> key storage on Windows (<code>advapi32</code> already linked) + agent-side signature validation before activating a rule.</li>
+<li><strong>PR 13</strong> — MCP read-only tools: <code>list_guaranteed_state_rules</code>, <code>get_guaranteed_state_rule</code>, <code>get_guaranteed_state_alerts</code>. Append to <code>kTools[]</code> + <code>kToolSecurity</code> + <code>build_handler()</code> switch — pattern from <code>list_policies</code> at <code>mcp_server.cpp:991–1017</code>.</li>
+<li><strong>PR 14</strong> — HTMX rule editor (create/update/delete) + YAML validation + conflict detection (§11.8).</li>
+<li><strong>PR 15</strong> — Quarantine (§11.7): WFP block-all filter at weight 65535, instruction handlers <code>quarantine.add_exception | remove_exception | lift</code>, server-side DNS resolution, resilience reset on lift.</li>
+<li><strong>PR 16</strong> — Linux Phase N–R (inotify / netlink / D-Bus / sysctl / audit / package guards) — Windows should be fully soaked before Linux work begins.</li>
+<li><strong>PR 17</strong> — macOS Phase S–X — after Linux, contingent on Endpoint Security entitlement availability.</li>
+</ul>
+<h2 id="critical-files-to-touch-for-prs-14">Critical files to touch for PRs 1–4</h2>
+<p>Net-new:</p>
+<div class="highlight"><pre><span></span><code>proto/yuzu/guardian/v1/guaranteed_state.proto
+server/core/src/guaranteed_state_store.{hpp,cpp}
+server/core/src/dashboard_guaranteed_state.{hpp,cpp}
+agents/core/src/guardian_engine.{hpp,cpp}
+agents/core/src/guard_base.hpp
+agents/core/src/guard_manager.{hpp,cpp}
+agents/core/src/guard_registry.{hpp,cpp}        (Windows-only)
+agents/core/src/guard_reconciliation.{hpp,cpp}
+agents/core/src/state_evaluator.{hpp,cpp}
+agents/core/src/remediation_engine.{hpp,cpp}
+agents/core/src/guard_audit.{hpp,cpp}
+agents/core/src/assertion_types.{hpp,cpp}
+agents/core/src/resilience_strategy.{hpp,cpp}
+agents/core/src/race_detector.{hpp,cpp}
+tests/unit/test_guard_registry.cpp               (Windows-only)
+tests/unit/test_guardian_engine.cpp
+tests/unit/test_state_evaluator.cpp
+tests/unit/test_resilience_strategy.cpp
+tests/unit/test_guaranteed_state_store.cpp
+</code></pre></div>
+<p>Modified:</p>
+<div class="highlight"><pre><span></span><code>proto/meson.build                 — append new .proto + outputs
+agents/core/src/agent.cpp         — 3 edits at ~L447, ~L803, ~L975
+agents/core/meson.build           — add Guardian sources incl. host_machine == &#39;windows&#39; block
+server/core/src/rest_api_v1.{hpp,cpp}  — new endpoints
+server/core/src/server.cpp        — store init + dashboard route registration
+server/core/meson.build           — add new sources
+tests/unit/meson.build            — register new tests (Windows gating for guard_registry test)
+docs/yaml-dsl-spec.md             — add `kind: GuaranteedStateRule` (done with PR 1)
+</code></pre></div>
+<h2 id="patterns-and-existing-code-to-reuse-dont-reinvent">Patterns and existing code to reuse (don't reinvent)</h2>
+<ul>
+<li><strong>Registry watcher</strong>: <code>agents/core/src/trigger_engine.cpp:365–463</code> already has a working <code>RegNotifyChangeKeyValue</code> + <code>WaitForMultipleObjects</code> loop. Lift the wait/re-arm/stop-event structure into <code>RegistryGuard</code>.</li>
+<li><strong>Windows service registration</strong>: <code>main.cpp:136–200</code> already does <code>SERVICE_AUTO_START</code> + <code>FailureActions</code>. Guardian gets pre-login activation for free — no service-config changes needed.</li>
+<li><strong>Plugin-namespaced KV</strong>: <code>agents/core/include/yuzu/agent/kv_store.hpp</code> — Guardian uses namespace <code>"__guardian__"</code>, no second DB file.</li>
+<li><strong>Store + MigrationRunner</strong>: <code>server/core/src/audit_store.{hpp,cpp}</code> is the cleanest template; <code>server/core/src/migration_runner.hpp</code> drives schema versions.</li>
+<li><strong>REST endpoint shape</strong>: <code>server/core/src/rest_api_v1.cpp</code> <code>JObj</code>/<code>JArr</code> builders and <code>perm_fn("securable", "op")</code> callback — mirror exactly.</li>
+<li><strong>MCP tool registration</strong> (PR 13): <code>kTools[]</code> + <code>kToolSecurity</code> + the <code>list_policies</code> dispatch at <code>mcp_server.cpp:991–1017</code>.</li>
+<li><strong>ApprovalManager</strong> (PR 11): <code>approval_manager.{hpp,cpp}</code> — <code>definition_id</code> is a free-form string, Guardian plugs in via <code>"guaranteed_state_rule_create"</code> / <code>"guaranteed_state_rule_update"</code> — no manager code changes.</li>
+<li><strong>COM init</strong> (PR 9): <code>hardware_plugin.cpp</code> / <code>wmi_plugin.cpp</code> already use <code>IWbemServices</code>; the condition-guard thread pool must call <code>CoInitializeEx(nullptr, COINIT_MULTITHREADED)</code> per §8.3 — a detail currently implicit in the existing plugins.</li>
+<li><strong>Meson <code>host_machine.system() == 'windows'</code> conditional</strong>: <code>agents/plugins/hardware/meson.build:3–7</code> (WMI libs) and <code>agents/plugins/filesystem/meson.build:2–5</code> (version.lib) are the models.</li>
+</ul>
+<h2 id="risks-open-questions-surfaced-during-exploration">Risks / open questions surfaced during exploration</h2>
+<ol>
+<li><strong>Existing <code>sc.exe binPath</code> bug in the Inno Setup installer</strong> (<code>deploy/packaging/windows/yuzu-agent.iss:130</code>) — stuffs the full command line into <code>binPath</code>. Unrelated to Guardian directly but Guardian's pre-login enforcement claim relies on this service config being correct. <strong>Action</strong>: file the issue (it's already known per user memory <code>project_session_handover_2026-04-18.md</code>) and fix in a <strong>separate small PR before PR 3</strong>, so the Windows UAT in PR 3 isn't fighting a service-launch bug.</li>
+<li><strong>The stale-DB / session-auth bug</strong> listed in <code>CLAUDE.md</code> ("Known bug: stale DB breaks session auth on restart") will also surface in Guardian UAT since <code>guardian.sync_with_server</code> happens after Register. Not new, but worth flagging in the PR 3 test plan.</li>
+<li><strong>ETW session cap</strong> (64 system-wide, shared with Defender/EDR) — the pooling design (§8.3) is non-optional on boxes with EDR installed. PR 7 (ETW Guard) must ship the pooling manager or it will fail on customer machines that already have EDR. Don't land ETW without pooling.</li>
+<li><strong><code>RegNotifyChangeKeyValue</code> re-arm gap</strong> (§5.1.1) — the design accepts reconciliation as the backstop. PR 4's reconciliation guard is load-bearing for this; don't ship PR 3 without at least a minimum-viable reconciliation sweep, even if full <code>RaceDetector</code> is deferred.</li>
+</ol>
+<h2 id="end-to-end-verification-for-prs-14-windows">End-to-end verification for PRs 1–4 (Windows)</h2>
+<ol>
+<li><strong>Unit</strong>: <code>meson test -C build-linux --suite server</code> + <code>meson test -C build-windows --suite agent</code> all green (the Registry Guard test is <code>#ifdef _WIN32</code> and only runs on native Windows).</li>
+<li><strong>Integration (Windows, native)</strong>:
+   - Install agent service fresh (<code>yuzu-agent.exe --install-service</code>).
+   - Reboot, confirm service runs.
+   - From the dashboard / REST: <code>POST /api/v1/guaranteed-state/rules</code> with a YAML rule asserting <code>registry-value-equals</code> on <code>HKCU\Software\YuzuTest\Flag = 1</code>.
+   - <code>POST /api/v1/guaranteed-state/push</code> → scope includes the agent.
+   - On the Windows box, <code>reg add HKCU\Software\YuzuTest /v Flag /t REG_DWORD /d 0 /f</code>.
+   - Within &lt;100 ms Guardian should rewrite the value to 1 and emit a <code>drift.remediated</code> event.
+   - Confirm the event lands at <code>GET /api/v1/guaranteed-state/events</code> and on the <code>/guaranteed-state</code> dashboard page.</li>
+<li><strong>Offline</strong>: stop the server, repeat step 2.3 — enforcement must still work from cached policy. Restart server, confirm queued events flush.</li>
+<li><strong>Pre-login</strong>: reboot the Windows box, sign in; <code>events</code> table should show Guardian's startup reconciliation event before any user-session event — proves §4's pre-login activation.</li>
+<li><strong>Kernel-wiring proof</strong>: immediately after service start, the dashboard rule row must show <code>guard_healthy = true</code> with a <code>last_notification</code> timestamp &lt;1 s old (the self-test probe). Then manually deny <code>KEY_NOTIFY</code> on the watched path (e.g. via <code>icacls</code> on an HKLM subkey owned by SYSTEM) and restart the agent — the same rule must flip to <code>errored</code> with a <code>guard.unhealthy</code> event. This confirms we can tell "plugged into the kernel" from "silently deaf."</li>
+</ol>
+</main>
+</body>
+</html>

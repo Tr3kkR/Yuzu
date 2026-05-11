@@ -1,0 +1,838 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upgrading Yuzu</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/upgrading.md</div>
+<h1 class="doc-title">Upgrading Yuzu</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="upgrading-yuzu">Upgrading Yuzu</h1>
+<p>This guide covers upgrading Yuzu components (server, agent, gateway) between versions.</p>
+<h2 id="version-compatibility">Version Compatibility</h2>
+<table>
+<thead>
+<tr>
+<th>Server Version</th>
+<th>Min Agent Version</th>
+<th>Min Gateway Version</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0.1.x</td>
+<td>0.1.0</td>
+<td>0.1.0</td>
+<td>Initial release family</td>
+</tr>
+<tr>
+<td>0.5.x</td>
+<td>0.5.0</td>
+<td>0.5.0</td>
+<td>Compiler hardening flags (<code>-fstack-protector-strong</code>, <code>_FORTIFY_SOURCE=2</code>, full RELRO), config file permission enforcement (<code>0600</code> on Unix), SRI integrity attributes on CDN scripts, configurable trigger limit (default 2000), git-derived version strings, chargen instruction definitions.</td>
+</tr>
+<tr>
+<td>0.6.x – 0.9.x</td>
+<td>same as 0.5.x</td>
+<td>same as 0.5.x</td>
+<td>No on-disk format changes from 0.5.x; upgrade directly to 0.10.x.</td>
+</tr>
+<tr>
+<td>0.10.x</td>
+<td>0.10.0</td>
+<td>0.10.0</td>
+<td>Server-side schema migration runner wired into every SQLite store. Upgrading from 0.9.x or earlier is data-preserving: the first 0.10.x startup stamps each database at schema v1 and runs a one-time legacy compatibility shim for stores that historically added columns via silent <code>ALTER TABLE</code> (<code>api_token_store</code>, <code>instruction_store</code>, <code>patch_manager</code>, <code>policy_store</code>, <code>product_pack_store</code>, <code>response_store</code>). Failed migrations close the affected store's DB handle and are reported via <code>/readyz</code> with the failed store name — <strong>check <code>/readyz</code>, not <code>/livez</code>, to confirm upgrade success</strong>.</td>
+</tr>
+<tr>
+<td>0.12.x (next)</td>
+<td>0.12.0</td>
+<td>0.12.0</td>
+<td><strong>Build-time content auto-import.</strong> All YAML files in <code>content/definitions/</code> (217 InstructionDefinitions) and <code>content/packs/</code> (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. <strong>Behaviour change for upgrades:</strong> definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set <code>enabled: false</code> via the dashboard or <code>PATCH /api/v1/definitions/{id}</code> rather than DELETE-ing the row. Each auto-import write emits an <code>audit_events.action="content.bundled_import"</code> row with <code>principal=system</code> so operators can audit which definitions were inserted at boot. <strong>Yuzu dark navy palette + Inter webfont</strong> (visual change every operator sees) and <strong>Apache ECharts chart renderer</strong> (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. <strong>Agent transport consolidation (#376 PR 1c-4):</strong> all five agent RPCs (Register, Heartbeat, CheckForUpdate, Subscribe, DownloadUpdate) now share a single HTTP/2-multiplexed TLS session per agent instead of two independent channels. Wire protocol is unchanged and no operator migration is required, but expect approximately half the per-agent kernel socket count visible in network monitoring tools post-upgrade. The agent additionally enforces a 30-second per-chunk idle deadline on <code>DownloadUpdate</code> reads as a symmetric guard against stalled servers; the agent retries on the next heartbeat cycle if it fires (no operator action required). <strong>OTA hardening (#911 / #913 / #934 / SRE-3):</strong> the server now also enforces a per-chunk <strong>write</strong> deadline on <code>DownloadUpdate</code> (default 30 s; <strong>operator-tunable via <code>--ota-chunk-write-deadline-secs</code> / <code>YUZU_OTA_CHUNK_WRITE_DEADLINE_SECS</code></strong> since #934 — raise for satellite / 4G/LTE fleets that need more headroom, but stay well below half the heartbeat deadline of 30 s to avoid starving Subscribe/heartbeat traffic) and a per-peer token-bucket rate limit (5 tokens / ~90 min refill — automation that hammers OTA checks may see <code>ResourceExhausted</code> after 5 attempts; the limit resets on server restart). <strong>Slow-link agents that hit the chunk-write deadline have the consumed token refunded</strong> (#934 / UP-206), so a legitimately-slow peer cannot compound deadline failures into a 7.5h lockout — the new metric label <code>yuzu_grpc_requests_total{method="DownloadUpdate",status="rate_limit_token_refunded"}</code> should track <code>chunk_write_deadline_exceeded</code> 1:1. The <code>yuzu_agent_reconnections_total</code> metric gains a <code>reason</code> label (channel_fault / peer_halfclose / stream_open_failed / enrollment_pending) — existing bare-counter PromQL continues to work with no migration; queries with the label require 0.12.x agent. Three new Grafana alerts ship (<code>YuzuBidiPoolSaturationRejects</code>, <code>YuzuBidiPoolNearSaturation</code>, <code>YuzuAgentChannelFaultRate</code>); operators upgrading should silence pre-deploy or accept first-day noise — see <a href="../ops-runbooks/transport-saturation.html" class="doc-ref"><code>docs/ops-runbooks/transport-saturation.md</code></a> for the runbook. New metric families <code>yuzu_server_transport_*</code> (8) and <code>yuzu_agent_ota_chunk_deadline_total{phase}</code> are documented in <a href="metrics.html" class="doc-ref"><code>docs/user-manual/metrics.md</code></a>.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Rule of thumb:</strong> agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.</p>
+<h2 id="upgrade-order">Upgrade Order</h2>
+<p>Always upgrade in this order:</p>
+<ol>
+<li><strong>Server</strong> -- new server versions accept connections from older agents</li>
+<li><strong>Gateway</strong> -- updated to match server protocol changes</li>
+<li><strong>Agents</strong> -- can be upgraded via OTA or manually, in batches</li>
+</ol>
+<p>Never upgrade agents before the server -- the server must understand the agent's protocol version.</p>
+<h2 id="pre-upgrade-checklist">Pre-Upgrade Checklist</h2>
+<p>Before upgrading any component:</p>
+<ul class="task-list">
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Back up all data (see <a href="server-administration.md">Server Administration</a>)</li>
+<li><code>yuzu-server.cfg</code>, <code>enrollment-tokens.cfg</code>, <code>pending-agents.cfg</code></li>
+<li>All <code>.db</code> files (response store, audit, policies, <strong>auth.db</strong>, etc.) — use <code>sqlite3 &lt;path&gt; ".backup ..."</code> rather than <code>cp</code> against live WAL databases</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Check the <a href="../../CHANGELOG.html">CHANGELOG</a> for breaking changes</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Verify disk space (at least 500 MB free for migration)</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Note current version: <code>yuzu-server --version</code> / <code>yuzu-agent --version</code></li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Plan a maintenance window (upgrades take &lt; 5 minutes per component)</li>
+</ul>
+<h2 id="upgrading-the-server">Upgrading the Server</h2>
+<h3 id="linux-systemd">Linux (systemd)</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. Stop the server</span>
+sudo<span class="w"> </span>systemctl<span class="w"> </span>stop<span class="w"> </span>yuzu-server
+
+<span class="c1"># 2. Back up data</span>
+sudo<span class="w"> </span>cp<span class="w"> </span>/var/lib/yuzu/*.db<span class="w"> </span>/var/lib/yuzu/backup/
+sudo<span class="w"> </span>cp<span class="w"> </span>/etc/yuzu/*.cfg<span class="w"> </span>/var/lib/yuzu/backup/
+
+<span class="c1"># 3. Replace the binary</span>
+sudo<span class="w"> </span>cp<span class="w"> </span>yuzu-server<span class="w"> </span>/usr/local/bin/yuzu-server
+sudo<span class="w"> </span>chmod<span class="w"> </span>+x<span class="w"> </span>/usr/local/bin/yuzu-server
+
+<span class="c1"># 4. Start the server (schema migrations run automatically)</span>
+sudo<span class="w"> </span>systemctl<span class="w"> </span>start<span class="w"> </span>yuzu-server
+
+<span class="c1"># 5. Verify</span>
+sudo<span class="w"> </span>systemctl<span class="w"> </span>status<span class="w"> </span>yuzu-server
+curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/livez
+</code></pre></div>
+<h3 id="docker">Docker</h3>
+<p>The reference deployment template lives at <code>deploy/docker/docker-compose.reference.yml</code> — copy it into your deployment directory next to a <code>.env</code> file, set <code>YUZU_VERSION</code>, and harden per the inline TLS checklist in the file header <strong>before</strong> exposing the stack to any untrusted network. The compose file declares a named volume (<code>server-data</code>) that survives container replacement and holds every piece of mutable state: <code>yuzu-server.cfg</code>, all SQLite databases, <code>enrollment-tokens.cfg</code>, <code>pending-agents.cfg</code>, <code>auto-approve.cfg</code>, and OTA binaries.</p>
+<p>An upgrade is a pull-and-restart:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. Back up first (see below) — the old data is the only recovery path</span>
+<span class="c1">#    if a migration fails on your specific DB.</span>
+
+<span class="c1"># 2. Pick the new release tag (use an .env file or export)</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">YUZU_VERSION</span><span class="o">=</span><span class="m">0</span>.10.1
+
+<span class="c1"># 3. Pull the new image and recreate the container</span>
+docker<span class="w"> </span>compose<span class="w"> </span>-f<span class="w"> </span>docker-compose.reference.yml<span class="w"> </span>pull<span class="w"> </span>server
+docker<span class="w"> </span>compose<span class="w"> </span>-f<span class="w"> </span>docker-compose.reference.yml<span class="w"> </span>up<span class="w"> </span>-d<span class="w"> </span>server
+
+<span class="c1"># 4. Verify the new version came up and schema migrations ran</span>
+docker<span class="w"> </span>compose<span class="w"> </span>-f<span class="w"> </span>docker-compose.reference.yml<span class="w"> </span>logs<span class="w"> </span>server<span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-40
+docker<span class="w"> </span>compose<span class="w"> </span>-f<span class="w"> </span>docker-compose.reference.yml<span class="w"> </span>ps<span class="w"> </span>server<span class="w">    </span><span class="c1"># should be &quot;healthy&quot;</span>
+</code></pre></div>
+<p>Schema migrations execute automatically during the first <code>up</code> with the new image — look for <code>MigrationRunner: &lt;store&gt; migrated to v&lt;N&gt;</code> lines in the log (one per store on first upgrade, silent on subsequent restarts). The healthcheck used by <code>depends_on: service_healthy</code> probes <code>/readyz</code>, which returns 200 only after every store in the readiness conjunction has successfully migrated — so a healthy server container genuinely reflects migration success, not just liveness.</p>
+<p><strong>Back up before upgrading</strong> (run from a dedicated backup directory so <code>$PWD</code> is predictable):</p>
+<div class="highlight"><pre><span></span><code>mkdir<span class="w"> </span>-p<span class="w"> </span>~/yuzu-backups<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>~/yuzu-backups
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-v<span class="w"> </span>server-data:/data<span class="w"> </span>-v<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">&quot;</span>:/backup<span class="w"> </span>alpine<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>tar<span class="w"> </span>czf<span class="w"> </span><span class="s2">&quot;/backup/yuzu-data-</span><span class="k">$(</span>date<span class="w"> </span>+%F<span class="k">)</span><span class="s2">.tar.gz&quot;</span><span class="w"> </span>-C<span class="w"> </span>/data<span class="w"> </span>.
+</code></pre></div>
+<blockquote>
+<p><strong>Note:</strong> this recipe is a cold-ish backup — SQLite is running in WAL mode and a filesystem-level <code>tar</code> of a live database may capture a torn snapshot. For strong consistency, <code>docker compose -f docker-compose.reference.yml stop server</code> before backup (seconds of downtime) and <code>start</code> after. A fully hot backup via SQLite's online-backup API is tracked in the roadmap.</p>
+</blockquote>
+<p><strong>Rollback if a migration fails</strong> (Docker):</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. Stop the new server (KEEPING the named volume — do NOT use -v)</span>
+docker<span class="w"> </span>compose<span class="w"> </span>-f<span class="w"> </span>docker-compose.reference.yml<span class="w"> </span>down<span class="w"> </span>server
+
+<span class="c1"># 2. Restore the previous backup over the existing volume</span>
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-v<span class="w"> </span>server-data:/data<span class="w"> </span>-v<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">&quot;</span>:/backup<span class="w"> </span>alpine<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>sh<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;rm -rf /data/* &amp;&amp; tar xzf /backup/yuzu-data-YYYY-MM-DD.tar.gz -C /data&#39;</span>
+
+<span class="c1"># 3. Pin the previous release</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">YUZU_VERSION</span><span class="o">=</span><span class="m">0</span>.9.0
+
+<span class="c1"># 4. Start the previous version</span>
+docker<span class="w"> </span>compose<span class="w"> </span>-f<span class="w"> </span>docker-compose.reference.yml<span class="w"> </span>up<span class="w"> </span>-d<span class="w"> </span>server
+</code></pre></div>
+<p><strong>Never</strong> run <code>docker compose down -v</code> unless you intend to delete <code>server-data</code> and every bit of server state. <code>down</code> alone is safe; the <code>-v</code> flag removes named volumes.</p>
+<h3 id="windows">Windows</h3>
+<div class="highlight"><pre><span></span><code><span class="c"># 1. Stop the service (if running as service) or kill the process</span>
+<span class="nb">Stop-Service</span> <span class="n">yuzu-server</span>  <span class="c"># or: taskkill /IM yuzu-server.exe /F</span>
+
+<span class="c"># 2. Back up data</span>
+<span class="nb">Copy-Item</span> <span class="n">C</span><span class="p">:\</span><span class="n">ProgramData</span><span class="p">\</span><span class="n">Yuzu</span><span class="p">\*.</span><span class="n">db</span> <span class="n">C</span><span class="p">:\</span><span class="n">ProgramData</span><span class="p">\</span><span class="n">Yuzu</span><span class="p">\</span><span class="n">backup</span><span class="p">\</span>
+<span class="nb">Copy-Item</span> <span class="n">C</span><span class="p">:\</span><span class="n">ProgramData</span><span class="p">\</span><span class="n">Yuzu</span><span class="p">\*.</span><span class="n">cfg</span> <span class="n">C</span><span class="p">:\</span><span class="n">ProgramData</span><span class="p">\</span><span class="n">Yuzu</span><span class="p">\</span><span class="n">backup</span><span class="p">\</span>
+
+<span class="c"># 3. Replace the binary</span>
+<span class="nb">Copy-Item</span> <span class="n">yuzu-server</span><span class="p">.</span><span class="n">exe</span> <span class="s2">&quot;C:\Program Files\Yuzu\yuzu-server.exe&quot;</span>
+
+<span class="c"># 4. Start</span>
+<span class="nb">Start-Service</span> <span class="n">yuzu-server</span>  <span class="c"># or start manually</span>
+</code></pre></div>
+<h2 id="upgrading-the-gateway">Upgrading the Gateway</h2>
+<h3 id="linux-systemd_1">Linux (systemd)</h3>
+<div class="highlight"><pre><span></span><code>sudo<span class="w"> </span>systemctl<span class="w"> </span>stop<span class="w"> </span>yuzu-gateway
+<span class="c1"># Replace the release directory</span>
+sudo<span class="w"> </span>rm<span class="w"> </span>-rf<span class="w"> </span>/opt/yuzu_gw
+sudo<span class="w"> </span>tar<span class="w"> </span>xzf<span class="w"> </span>yuzu-gateway-linux-x64.tar.gz<span class="w"> </span>-C<span class="w"> </span>/opt/
+sudo<span class="w"> </span>systemctl<span class="w"> </span>start<span class="w"> </span>yuzu-gateway
+</code></pre></div>
+<h3 id="docker_1">Docker</h3>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span>pull<span class="w"> </span>ghcr.io/&lt;owner&gt;/yuzu-gateway:v0.1.1
+docker<span class="w"> </span>compose<span class="w"> </span>up<span class="w"> </span>-d<span class="w"> </span>yuzu-gateway
+</code></pre></div>
+<h2 id="upgrading-agents">Upgrading Agents</h2>
+<h3 id="ota-recommended">OTA (Recommended)</h3>
+<p>If the server has OTA updates enabled (<code>--update-dir</code>):</p>
+<ol>
+<li>Place the new agent binary in the server's update directory</li>
+<li>Agents will check for updates on their configured interval (default: 6 hours)</li>
+<li>Monitor the fleet dashboard for version rollout progress</li>
+</ol>
+<h3 id="manual">Manual</h3>
+<p>Follow the same stop/replace/start pattern as the server, per platform.</p>
+<h3 id="batch-rollout">Batch Rollout</h3>
+<p>For large fleets, upgrade in stages:
+1. Upgrade a pilot group (5-10 agents) first
+2. Monitor for 24 hours
+3. Roll out to remaining agents in batches of 10-20%</p>
+<h2 id="plugin-code-signing-vnext-80">Plugin Code Signing (vNEXT, #80)</h2>
+<p>A new operator-managed plugin trust bundle ships in this release. <strong>Default behaviour is unchanged</strong>: agents that don't pass <code>--plugin-trust-bundle</code> and operators that don't upload a bundle through Settings → Plugin Code Signing see identical behaviour to prior releases.</p>
+<p>If you turn the feature on, three things change:</p>
+<ol>
+<li>
+<p><strong>New on-disk artifact at <code>&lt;cert-dir&gt;/plugin-trust-bundle.pem</code>.</strong> Linux/macOS: <code>/etc/yuzu/certs/plugin-trust-bundle.pem</code>; Windows: <code>C:\ProgramData\Yuzu\certs\plugin-trust-bundle.pem</code>. <strong>Add this path to your backup procedure</strong> alongside the SQLite databases. A backup that captures the DBs but not the cert dir restores <code>plugin_signing_required=true</code> (in <code>runtime_config</code>) without the bundle, and require-mode agents reject every plugin until the bundle is restored. The Docker reference <code>docker-compose.reference.yml</code> mounts only <code>server-data</code>; if your cert dir is outside that volume you must add a separate bind-mount or named volume and include it in the backup script.</p>
+</li>
+<li>
+<p><strong>Cert-dir filename collision check.</strong> The server now treats <code>plugin-trust-bundle.pem</code> in the cert dir as authoritative. The filename was unused in prior releases, but if any deployment placed an unrelated PEM at that exact path for another purpose, it will be interpreted as the plugin trust bundle on first read after upgrade. Run <code>ls &lt;cert-dir&gt;/plugin-trust-bundle.pem</code> on every server host before upgrading and rename any pre-existing file.</p>
+</li>
+<li>
+<p><strong>DO NOT enable "Require signed plugins" yet.</strong> The Yuzu release pipeline does not currently sign the 44 in-tree plugins under <code>agents/plugins/</code>. Enabling Require with an operator-only trust bundle will reject every Yuzu-shipped plugin on next agent restart — fleet-wide outage. Use the transitional mode (bundle uploaded, Require off) until you have signed every plugin your fleet uses, including the in-tree ones. The Settings card displays this warning inline.</p>
+</li>
+</ol>
+<p>The new audit actions (<code>plugin_signing.bundle.uploaded</code> / <code>.cleared</code> / <code>.require.changed</code>) and metric labels on <code>yuzu_agent_plugin_rejected_total</code> (<code>signature_missing</code> / <code>signature_invalid</code> / <code>signature_untrusted_chain</code>) are documented in <a href="audit-log.html" class="doc-ref"><code>audit-log.md</code></a> and <a href="metrics.html" class="doc-ref"><code>metrics.md</code></a> respectively. SIEM and alert rules already filtering on the existing <code>success</code>/<code>failure</code>/<code>denied</code> audit vocabulary pick these up unchanged — no new vocabulary tokens were introduced.</p>
+<h2 id="schema-migrations">Schema Migrations</h2>
+<p>Starting with <strong>v0.10.0</strong>, every server-side SQLite store is wired through a single <code>MigrationRunner</code> that tracks schema version per store and applies pending migrations in a transaction. Prior releases relied on <code>CREATE TABLE IF NOT EXISTS</code> plus silent <code>ALTER TABLE ADD COLUMN</code> statements, which made rollbacks opaque and left no audit trail of what had been applied.</p>
+<p>How it works:</p>
+<ul>
+<li>Each store declares an ordered <code>std::vector&lt;Migration&gt;</code> where each entry is <code>{version, sql}</code>.</li>
+<li>On startup, the runner creates the <code>schema_meta</code> table if missing, reads the current version for the store, and runs any migration with a higher version number inside a <code>BEGIN IMMEDIATE</code> / <code>COMMIT</code> transaction.</li>
+<li>If a migration SQL statement fails, the transaction rolls back and the store stays at its previous version — the server logs <code>MigrationRunner: migration v&lt;N&gt; failed for &lt;store&gt;: &lt;sqlite error&gt;</code> and the corresponding store constructor logs <code>&lt;Store&gt;: schema migration failed</code>.</li>
+<li>Already-applied migrations are skipped; running the same server binary twice against the same database is a no-op.</li>
+<li>Multiple stores share one database connection but keep independent version counters.</li>
+</ul>
+<p><strong>Upgrading from v0.9.x or earlier</strong> is data-preserving: the first 0.10.x startup stamps every database at schema v1. A small set of stores (<code>api_token_store</code>, <code>instruction_store</code>, <code>patch_manager</code>, <code>policy_store</code>, <code>product_pack_store</code>, <code>response_store</code>) also runs a one-time legacy compatibility shim that re-applies the historical <code>ALTER TABLE</code> statements before stamping, so databases from very old releases that never received those columns still converge to the latest schema. These shims are kept in code for one release cycle and can be removed after v0.11.</p>
+<p><strong>No manual migration steps are required.</strong> Just replace the binary (or pull the new image and <code>up -d</code>) and start the server. Migration progress is logged at <code>info</code> level as:</p>
+<div class="highlight"><pre><span></span><code>[info] MigrationRunner: audit_store migrated to v1
+[info] MigrationRunner: rbac_store migrated to v1
+...
+</code></pre></div>
+<p><strong>Expect a log burst on first startup after upgrade.</strong> 30+ <code>MigrationRunner: &lt;store&gt; migrated to v1</code> info lines appear on the first run against a pre-v0.10 database — one per store. On every subsequent restart the runner is silent at info level. If your log-shipping pipeline has per-second rate limits, widen them for the upgrade window or filter this single line pattern.</p>
+<p><strong>Verifying migration state after startup</strong>, query the per-store audit trail directly:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-i<span class="w"> </span>yuzu-server<span class="w"> </span>sqlite3<span class="w"> </span>/var/lib/yuzu/audit.db<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;SELECT store, version, datetime(upgraded_at, &#39;unixepoch&#39;) FROM schema_meta ORDER BY upgraded_at;&quot;</span>
+</code></pre></div>
+<p>Every store that has ever run through the migration runner has a row here with its current version and the wall-clock timestamp of the last stamp. This is the operator-side audit trail for schema evolution.</p>
+<p>If a migration fails:</p>
+<ol>
+<li>Check the log for <code>MigrationRunner: migration v&lt;N&gt; failed for &lt;store&gt;: &lt;sqlite error&gt;</code> and note both the store name and the SQLite error.</li>
+<li>The server will have <strong>closed the failing store's database handle</strong>, so <code>/readyz</code> returns 503 with the failed store name in the <code>failed_stores</code> body field — the probe accurately reflects degraded state. Don't rely on <code>/livez</code> for readiness; it only checks process liveness, not schema integrity.</li>
+<li>Stop the server and restore the <strong>affected</strong> database file from backup — not the whole data directory. Restoring all databases to fix one broken store wipes in-flight approvals, pending agents, and enrollment tokens.</li>
+<li>Start the previous server version against the restored data.</li>
+<li>Open an issue with the full error line, the source/target version numbers, and the output of the <code>schema_meta</code> query above.</li>
+</ol>
+<h2 id="upgrade-notes-by-release">Upgrade notes by release</h2>
+<h3 id="executions-history-pr-2-responsesexecution_id-exact-correlation">Executions-history PR 2 — <code>responses.execution_id</code> exact correlation</h3>
+<p>PR 2 of the executions-history ladder closes a forensic-data correctness
+gap (UP-8) where two concurrent executions of the same definition to
+overlapping agent sets could show each other's responses in the
+Instructions → Executions detail drawer. Operators upgrading to a
+release that includes PR 2 should expect the following:</p>
+<p><strong>Schema migration v2 on <code>response_store</code>.</strong> The migration adds an
+<code>execution_id TEXT NOT NULL DEFAULT ''</code> column to the <code>responses</code> table
+plus a partial index <code>idx_resp_execution_ts ON responses(execution_id,
+timestamp) WHERE execution_id != ''</code>. The migration is automatic and
+data-preserving — <code>MigrationRunner::run</code> wraps the ALTER + CREATE INDEX
+in a single transaction. Pre-upgrade rows are NOT deleted; they receive
+the empty-string sentinel value <code>''</code>. The migration is idempotent: a
+pre-stamp probe at startup detects an already-altered DB and skips the
+duplicate ALTER (mirrors the precedent at <code>instruction_store.cpp</code> v2).</p>
+<p>Observable after upgrade:</p>
+<div class="highlight"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">execution_id</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">responses</span><span class="w"> </span><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">execution_id</span><span class="p">;</span>
+</code></pre></div>
+<p>will show ALL pre-upgrade rows under the empty string <code>''</code>. This is
+expected — there's no way to retroactively attribute pre-upgrade
+responses to executions because the dispatch path didn't record the
+linkage. The Executions drawer detects empty-<code>execution_id</code> rows and
+falls back to the legacy timestamp-window-plus-agent-set join so they
+render correctly without operator action. <strong>No operator action
+required</strong> for the migration itself.</p>
+<p><strong>Dispatch-path coverage gap (PR 2.x follow-ups).</strong> Only executions
+dispatched via <code>POST /api/instructions/:id/execute</code> (the dashboard's
+Execute Instruction form goes through this path) get exact correlation
+in PR 2. Three dispatch surfaces continue to write rows with
+<code>execution_id=''</code> until follow-up PRs close them:</p>
+<ul>
+<li><strong>MCP <code>execute_instruction</code></strong> — agent dispatches issued through the
+  MCP protocol.</li>
+<li><strong>Workflow steps</strong> (<code>POST /api/workflows/:id/execute</code> step dispatch
+  via <code>cmd_dispatch</code> callback) — multi-step workflows.</li>
+<li><strong>Scheduled / approval-triggered dispatches</strong> — the dispatch path
+  inside <code>schedule_engine</code> / approval-fired execution.</li>
+<li><strong>Reruns</strong> (<code>/api/executions/:id/rerun</code>) — <code>create_rerun</code> creates
+  the execution row but does not dispatch; the operator-triggered
+  follow-up dispatch will be wired in PR 2.x.</li>
+</ul>
+<p>For runs from these surfaces, the drawer's responses section uses the
+legacy timestamp-window join. Cross-execution contamination (UP-8) is
+still possible if two such runs overlap on the same definition + agent
+set. Track via the executions-history follow-up issues.</p>
+<p><strong>Mixed-mode detail drawer behaviour.</strong> During an upgrade transition
+window (executions in flight at restart time, or in-progress executions
+that started pre-upgrade and finished post-upgrade), some responses for
+a single execution may carry <code>execution_id=''</code> while others are
+correctly tagged. The drawer prefers exact-correlation rows when they
+exist and only falls back to the legacy join when zero exact rows are
+returned — this means <strong>mixed-mode runs may show only the
+post-upgrade subset of their responses</strong> in the drawer. Pre-upgrade
+responses for those runs remain in the database and are queryable via
+SQL; the upcoming admin backfill CLI (PR 2.1) will stamp them with
+their correct execution_id once it ships.</p>
+<p><strong>Server restart caveat.</strong> The dispatch-time <code>command_id → execution_id</code>
+mapping is held in memory inside <code>AgentServiceImpl</code>. If the server is
+restarted while a command is in flight, the mapping is lost and any
+agent responses arriving post-restart will be tagged <code>execution_id=''</code>
+and use the legacy fallback. Avoid restarting the server during active
+executions where possible, or accept that the affected runs will use
+legacy correlation.</p>
+<p><strong>Admin backfill (planned in PR 2.1, not in this release).</strong> A
+<code>yuzu-server admin backfill-responses</code> CLI is filed as a follow-up. It
+will walk the executions table cross-store and stamp pre-upgrade
+responses with their best-effort execution_id (timestamp + agent set
+heuristic). Until it ships, pre-upgrade rows remain queryable via the
+legacy fallback in the drawer; no operator action is required.</p>
+<p><strong>Verifying the migration.</strong> After upgrade, the server log should
+contain <code>MigrationRunner: response_store migrated to v2</code>. To verify the
+column directly:</p>
+<div class="highlight"><pre><span></span><code>sqlite3<span class="w"> </span>/var/lib/yuzu/responses.db<span class="w"> </span><span class="s2">&quot;.schema responses&quot;</span>
+<span class="c1"># Expected: execution_id TEXT NOT NULL DEFAULT &#39;&#39;</span>
+sqlite3<span class="w"> </span>/var/lib/yuzu/responses.db<span class="w"> </span><span class="s2">&quot;.schema idx_resp_execution_ts&quot;</span>
+<span class="c1"># Expected: CREATE INDEX idx_resp_execution_ts ON responses(...) WHERE execution_id != &#39;&#39;</span>
+</code></pre></div>
+<h3 id="v0120-authdb-persistent-authentication-618">v0.12.0 — AuthDB persistent authentication (#618)</h3>
+<p>v0.12.0 replaces the in-memory + on-config-flush authentication model
+with a SQLite-backed <code>auth.db</code> that holds user accounts, sessions, and
+enrollment tokens.</p>
+<p><strong>First boot after upgrade:</strong></p>
+<ul>
+<li>The server probes <code>--data-dir</code> for <code>auth.db</code>. If absent, it creates
+  the file with mode <code>0600</code> (Linux) or restricted ACL (Windows), runs
+  the initial schema migration via <code>MigrationRunner</code>, then seeds users
+  from <code>yuzu-server.cfg</code>. Subsequent boots read from <code>auth.db</code>
+  directly; the config file is no longer the live source of truth.</li>
+<li>The seed is one-shot. Editing <code>yuzu-server.cfg</code> after first boot
+  does NOT re-seed users into <code>auth.db</code> — use the dashboard or
+  <code>POST /api/settings/users</code> instead.</li>
+<li>Existing in-flight sessions are NOT preserved across the upgrade
+  (sessions live in memory before this release; <code>auth.db</code> starts fresh
+  on first boot). Operators must log in again.</li>
+</ul>
+<p><strong><code>role</code> parameter ignored on <code>POST /api/settings/users</code>.</strong> New users
+are always created as <code>user</code> (security finding C1). To assign or
+change a role, use the dedicated <code>POST
+/api/settings/users/{username}/role</code> endpoint introduced in v0.12.0
+(see <a href="rest-api.html#settings--user-management">REST API → Settings → User Management</a>).
+The dashboard exposes a <strong>Change Role</strong> button on each user row that
+calls the new endpoint.</p>
+<p><strong>Live drawer updates via SSE.</strong> The Executions tab opens an
+<code>EventSource</code> to <code>/sse/executions/{id}</code> for in-progress runs. Reverse
+proxies in the request path must NOT buffer SSE — the server emits
+<code>X-Accel-Buffering: no</code> and <code>Cache-Control: no-cache</code> but a poorly-
+configured proxy can still chunk the stream. Verify with
+<code>curl -N https://&lt;server&gt;/sse/executions/&lt;id&gt;</code> from inside your
+network if the drawer freezes mid-execution.</p>
+<p><strong><code>LimitNOFILE=65536</code> on systemd units.</strong> v0.12.0 raises the systemd
+file-descriptor limit from the default 1024 to 65536. SSE
+connections + agent gRPC streams + SQLite WAL handles can saturate
+the default soft limit on busy fleets. The new value matches Docker
+compose's <code>ulimits.nofile</code> so containerised and bare-metal deployments
+behave identically.</p>
+<p><strong>Restart-loop guard.</strong> <code>StartLimitIntervalSec=60</code> +
+<code>StartLimitBurst=3</code> in the systemd <code>[Unit]</code> section so a corrupt
+<code>auth.db</code> failing the integrity check at startup puts the unit
+cleanly into <code>failed</code> instead of spinning. Recovery procedure:
+<a href="../ops-runbooks/auth-db-recovery.html"><a href="../ops-runbooks/auth-db-recovery.html" class="doc-ref"><code>docs/ops-runbooks/auth-db-recovery.md</code></a></a>.</p>
+<p><strong>Rollback to a pre-AuthDB release</strong> (only if you have not yet
+written user state via the new dashboard):</p>
+<ol>
+<li>Stop the v0.12.0 server.</li>
+<li>Move <code>auth.db</code> aside (<code>mv auth.db auth.db.v0.12.0</code>).</li>
+<li>Restore <code>yuzu-server.cfg</code> from your pre-upgrade backup.</li>
+<li>Reinstall the prior release binary.</li>
+<li>Start the server. It reads <code>yuzu-server.cfg</code> as before.</li>
+</ol>
+<p>If you HAVE written user state via v0.12.0's dashboard, that state
+is in <code>auth.db</code> only — rolling back loses it. Export users via
+<code>GET /api/v1/settings/users</code> first if rollback is required.</p>
+<h3 id="v0120-guardian-pr-2">v0.12.0 — Guardian PR 2</h3>
+<p>Guardian PR 2 ships the Guaranteed State control plane + agent skeleton. Two items require operator awareness on upgrade:</p>
+<p><strong>Stale <code>*:Push</code> RBAC grants on deployments that ran pre-hardening Guardian PR 2 code.</strong> Between commits <code>7c83911</code> and <code>1f39401</code>, the RBAC seed granted the <code>Push</code> operation to <code>Administrator</code> and <code>ITServiceOwner</code> on <strong>every</strong> securable type, not just <code>GuaranteedState</code>. The H-4 fix (commit <code>21c0ba4</code>, hardening round 2) restricted the seed to <code>GuaranteedState</code> only going forward — but because <code>seed_defaults()</code> uses <code>INSERT OR IGNORE</code>, the stale cross-type grants already written to <code>role_permissions</code> are not removed on upgrade. These grants are semantically inert today (only the Guardian REST handlers consult <code>Push</code>), but become a latent privilege for any future release that adds a non-Guardian handler checking <code>perm_fn(..., "Push")</code>.</p>
+<p>Manual remediation until the auto-migration in issue #485 lands. <strong>Run each step in order:</strong></p>
+<ol>
+<li><strong>Back up the RBAC database first.</strong> Destructive SQL with no rollback.</li>
+</ol>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>yuzu-server<span class="w"> </span>cp<span class="w"> </span>/var/lib/yuzu/rbac.db<span class="w"> </span>/var/lib/yuzu/rbac.db.bak.<span class="k">$(</span>date<span class="w"> </span>+%Y%m%d<span class="k">)</span>
+<span class="c1"># or for a systemd install:</span>
+cp<span class="w"> </span>/var/lib/yuzu/rbac.db<span class="w"> </span>/var/lib/yuzu/rbac.db.bak.<span class="k">$(</span>date<span class="w"> </span>+%Y%m%d<span class="k">)</span>
+</code></pre></div>
+<ol start="2">
+<li><strong>Preview the rows that will be deleted.</strong> This should return only <code>Administrator</code> and <code>ITServiceOwner</code> rows on a fresh Guardian PR 2 upgrade. If it returns rows for any other principal_id, you have custom RBAC grants that the bulk <code>DELETE</code> below would silently wipe — in that case stop and prune by hand.</li>
+</ol>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-i<span class="w"> </span>yuzu-server<span class="w"> </span>sqlite3<span class="w"> </span>/var/lib/yuzu/rbac.db<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;SELECT principal_id, securable_type FROM role_permissions \</span>
+<span class="s2">    WHERE operation = &#39;Push&#39; AND securable_type != &#39;GuaranteedState&#39; \</span>
+<span class="s2">    ORDER BY principal_id, securable_type;&quot;</span>
+</code></pre></div>
+<ol start="3">
+<li><strong>Delete the stale grants.</strong> Scoped to the two seeded roles so custom grants are left alone:</li>
+</ol>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-i<span class="w"> </span>yuzu-server<span class="w"> </span>sqlite3<span class="w"> </span>/var/lib/yuzu/rbac.db<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;DELETE FROM role_permissions \</span>
+<span class="s2">    WHERE operation = &#39;Push&#39; \</span>
+<span class="s2">      AND securable_type != &#39;GuaranteedState&#39; \</span>
+<span class="s2">      AND principal_id IN (&#39;Administrator&#39;, &#39;ITServiceOwner&#39;);&quot;</span>
+</code></pre></div>
+<ol start="4">
+<li><strong>Confirm cleanup:</strong> re-run the preview query from step 2 — zero rows expected.</li>
+</ol>
+<p>Safe on fresh installs (no matching rows). If you are upgrading <strong>from</strong> a v0.11.x release directly <strong>to</strong> v0.12.0 or later, skip this entire sub-section — your RBAC database never carried the stale grants.</p>
+<p><strong>Retention changes take effect on restart, not on runtime PUT.</strong> BL-2 wired <code>--guardian-event-retention-days</code> (default 30) through <code>RuntimeConfigStore</code> + <code>PUT /api/v1/config/guardian_event_retention_days</code>, matching the existing <code>response_retention_days</code> and <code>audit_retention_days</code> pattern. However, all three retention-bearing stores (<code>AuditStore</code>, <code>ResponseStore</code>, <code>GuaranteedStateStore</code>) capture their retention value at construction time and never re-read it — the runtime PUT mutates <code>cfg_</code> and <code>RuntimeConfigStore</code> but the running reaper continues using the startup value. An operator who PUTs a new retention value sees <code>200 {"applied": true}</code> but the store behaviour does not change until the next server restart. This is a systemic limitation shared across all three stores, not a Guardian-specific bug; it is tracked as issue #483.</p>
+<p><strong>Runtime config PUT now rejects non-numeric and negative integer values with HTTP 400.</strong> Hardening round 4 (UP-R5) added <code>std::from_chars</code> validation to <code>PUT /api/v1/config/&lt;key&gt;</code> for <code>heartbeat_timeout</code>, <code>response_retention_days</code>, <code>audit_retention_days</code>, and <code>guardian_event_retention_days</code>. The previous handler silently wrote invalid strings to <code>RuntimeConfigStore</code> and swallowed the <code>stoi</code> error, leaving <code>cfg_</code> unchanged. If your automation relied on setting retention to a <strong>negative</strong> value (e.g., <code>"-1"</code>) to disable retention — which the store then treated as "never reap" via the <code>&lt;= 0</code> sentinel — that automation will now receive <code>400 {"error":{"code":400,"message":"value must be a non-negative integer"}}</code>. Use <code>"0"</code> instead; it preserves the same disable-retention semantic and passes validation. Automation that previously set non-numeric strings (anything other than a base-10 integer) was silently a no-op before this release — the 400 now surfaces the configuration error that had been hidden.</p>
+<h3 id="v0120-a3-ux-ladder-620-622-624">v0.12.0 — A3 UX ladder (#620, #622, #624)</h3>
+<p>Three operator-visible behaviour changes ship in the v0.12.0 A3 ladder. None require code changes on the operator side, but two of them require <strong>action if you maintain a local compose override</strong>:</p>
+<p><strong>1. Container healthchecks now pass (#622).</strong> The shipped <code>docker-compose.uat.yml</code> healthcheck blocks were updated to use tools available in each runtime image (<code>bash</code> + <code>/dev/tcp</code> for the server; busybox <code>wget --spider</code> for the gateway). After upgrade, <code>docker compose ps</code> reports <code>(healthy)</code> instead of <code>(unhealthy)</code>.</p>
+<blockquote>
+<p><strong>If you maintain a local copy of the compose file</strong> (e.g. <code>docker-compose.local.yml</code> or a pinned vendored copy), your override still uses the broken pre-fix healthcheck pattern and will continue showing <code>(unhealthy)</code> until you sync the change. Replace your server-service healthcheck stanza with:</p>
+<div class="highlight"><pre><span></span><code><span class="w">    </span><span class="nt">healthcheck</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">test</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;CMD&quot;</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;bash&quot;</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;-c&quot;</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&quot;exec</span><span class="nv"> </span><span class="s">3&lt;&gt;/dev/tcp/localhost/8080</span><span class="nv"> </span><span class="s">&amp;&amp;</span><span class="nv"> </span><span class="s">printf</span><span class="nv"> </span><span class="s">&#39;GET</span><span class="nv"> </span><span class="s">/livez</span><span class="nv"> </span><span class="s">HTTP/1.0\\r\\nHost:</span><span class="nv"> </span><span class="s">localhost\\r\\n\\r\\n&#39;</span><span class="nv"> </span><span class="s">&gt;&amp;3</span><span class="nv"> </span><span class="s">&amp;&amp;</span><span class="nv"> </span><span class="s">grep</span><span class="nv"> </span><span class="s">-q</span><span class="nv"> </span><span class="s">&#39;200</span><span class="nv"> </span><span class="s">OK&#39;</span><span class="nv"> </span><span class="s">&lt;&amp;3</span><span class="nv"> </span><span class="s">;</span><span class="nv"> </span><span class="s">rc=$?</span><span class="nv"> </span><span class="s">;</span><span class="nv"> </span><span class="s">exec</span><span class="nv"> </span><span class="s">3&gt;&amp;-</span><span class="nv"> </span><span class="s">;</span><span class="nv"> </span><span class="s">exit</span><span class="nv"> </span><span class="s">$rc&quot;</span>
+</code></pre></div>
+<p>And the gateway-service healthcheck stanza with:</p>
+<div class="highlight"><pre><span></span><code><span class="w">    </span><span class="nt">healthcheck</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">test</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;CMD&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;wget&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;--spider&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;-q&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;http://localhost:8081/healthz&quot;</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+</blockquote>
+<p><strong>2. <code>/api/health</code> is restored as an alias of <code>/health</code> (#620).</strong> The pre-#401 endpoint path is back. Monitoring integrations that point at <code>/api/health</code> work without reconfiguration; both URLs serve identical JSON. Both are exempt from rate limiting (a follow-up hardening over the bare <code>/health</code> behaviour). For load-balancer probes that should drain in-flight traffic before stopping, continue using <code>/readyz</code> — <code>/health</code> and <code>/api/health</code> are intentionally not draining-aware (Kubernetes pattern: liveness/health probes are not draining-aware).</p>
+<p><strong>3. File-logger boot messages are now quieter (#624).</strong> The previous <code>WARN: Could not create log directory /var/log/yuzu</code> + <code>ERROR: file logger setup failed</code> pair on every container boot is replaced by a single INFO-level line when the default path cannot be created. The Docker server image now pre-creates <code>/var/log/yuzu</code> (mode 0750, owned by <code>yuzu</code>) so the path is writable out of the box. <strong>If your monitoring previously alerted on the WARN/ERROR lines as a misconfig signal, those signals will no longer fire</strong> — the failure mode is now a single INFO line. Operators who require explicit on-disk logs should pass <code>--log-file &lt;path&gt;</code>; explicit-path failures still log at ERROR and are not silently degraded.</p>
+<h2 id="rollback">Rollback</h2>
+<p>If an upgrade causes issues:</p>
+<ol>
+<li>Stop the new version</li>
+<li>Restore the backed-up <code>.db</code> and <code>.cfg</code> files</li>
+<li>Start the previous version binary</li>
+</ol>
+<p><strong>Important:</strong> Rolling back after a schema migration requires restoring the database files from backup. The old binary cannot read the new schema.</p>
+<h2 id="troubleshooting">Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Server won't start after upgrade</td>
+<td>Schema migration failure</td>
+<td>Check logs, restore backup, report issue</td>
+</tr>
+<tr>
+<td>Agents can't connect</td>
+<td>Protocol version mismatch</td>
+<td>Ensure server was upgraded first</td>
+</tr>
+<tr>
+<td>Dashboard shows errors</td>
+<td>Browser cache</td>
+<td>Clear browser cache, hard refresh</td>
+</tr>
+<tr>
+<td>Gateway disconnects</td>
+<td>Version mismatch with server</td>
+<td>Upgrade gateway to match server version</td>
+</tr>
+<tr>
+<td>Slow startup</td>
+<td>Large database migration</td>
+<td>Normal for first start; wait for migration to complete</td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

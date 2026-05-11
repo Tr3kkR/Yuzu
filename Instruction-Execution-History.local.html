@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan: Fix Instruction Execution History — clickable rows + per-execution detail</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">Instruction-Execution-History.local.md</div>
+<h1 class="doc-title">Plan: Fix Instruction Execution History — clickable rows + per-execution detail</h1>
+<nav class="doc-nav"><a href="README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="plan-fix-instruction-execution-history-clickable-rows-per-execution-detail">Plan: Fix Instruction Execution History — clickable rows + per-execution detail</h1>
+<h2 id="context">Context</h2>
+<p>Today the <strong>Instructions → Executions</strong> tab in the dashboard renders a list of recent executions via <code>GET /fragments/executions</code>, but the rows are static text — there is no way to drill into one and see what happened: which agents ran it, who succeeded vs failed, and what each agent returned. The user's intent is to make this a real history table where clicking an execution reveals the historic results for that run.</p>
+<p>The data is already captured by <code>ExecutionTracker</code> (executions + per-agent status) and <code>ResponseStore</code> (per-agent stdout/stderr/output), but the UI never joins them together.</p>
+<h2 id="decisions-confirmed-with-user">Decisions confirmed with user</h2>
+<ul>
+<li><strong>Detail UX</strong>: inline expanding drawer beneath the clicked row (matches the existing <code>toggleDetail</code> pattern in the results browser).</li>
+<li><strong>Scope of the tab</strong>: stays global by default; gains an optional <code>?definition_id=X</code> filter so a future link from the Definitions list can scope it. One handler covers both modes.</li>
+</ul>
+<h2 id="what-is-currently-in-place">What is currently in place</h2>
+<ul>
+<li><strong>UI</strong>: <code>server/core/src/instruction_ui.cpp:163-167</code> — Executions tab loads <code>/fragments/executions</code> on <code>revealed</code>.</li>
+<li><strong>List handler</strong>: <code>server/core/src/workflow_routes.cpp:35-82</code> — emits a flat <code>&lt;table&gt;</code> with id (truncated), status, progress bar, dispatched_by, dispatched_at. No row click target. Ignores any <code>definition_id</code> query string even though <code>ExecutionQuery::definition_id</code> is supported.</li>
+<li><strong>Stores</strong>:</li>
+<li><code>ExecutionTracker</code> (<code>execution_tracker.hpp</code>) — <code>query_executions(ExecutionQuery)</code>, <code>get_execution(id)</code>, <code>get_summary(id)</code>, <code>get_agent_statuses(execution_id)</code> are all available and tested.</li>
+<li><code>ResponseStore</code> (<code>response_store.hpp</code>) — <code>query(instruction_id, ResponseQuery{since,until,agent_id,limit})</code> supports timestamp-window + agent filtering.</li>
+<li><strong>Linkage gap</strong>: <code>responses</code> has <strong>no <code>execution_id</code> column</strong>; we correlate via <code>instruction_id = execution.definition_id</code> plus the <code>[dispatched_at, completed_at]</code> timestamp window plus <code>agent_id IN (per-agent statuses for this execution)</code>. Good enough for sequential dispatches of the same definition — non-invasive path. A schema migration to add <code>execution_id</code> is out of scope here and tracked as a follow-up.</li>
+<li><strong>Existing patterns to reuse</strong>:</li>
+<li>Inline expanding-row drawer with <code>toggleDetail(this)</code> from results browser (<code>dashboard_routes.cpp:1335-1357</code>, <code>dashboard_ui.cpp:602-616</code>).</li>
+<li>HTMX fragment route convention (<code>/fragments/&lt;entity&gt;</code> returning a partial).</li>
+<li>Cisco Momentum tokens — <code>--mds-color-state-hover</code>, <code>--mds-color-bg-success-tinted</code>, <code>--mds-color-bg-error-tinted</code>, <code>--mds-color-theme-text-tertiary</code>, <code>--mds-color-theme-indicator-error</code>.</li>
+<li>Existing CSS classes: <code>.status-badge</code>, <code>.status-completed/.status-failed/.status-running/.status-pending</code>, <code>.progress-bar</code>, <code>.progress-fill</code>.</li>
+</ul>
+<h2 id="approach">Approach</h2>
+<p>Two server-side changes plus minimal HTML/JS wiring on the existing tab. No store / proto / migration changes.</p>
+<h3 id="1-make-the-existing-list-richer-and-clickable">1. Make the existing list richer and clickable</h3>
+<p><strong>File</strong>: <code>server/core/src/workflow_routes.cpp</code> — handler at line 36.</p>
+<ul>
+<li>Read optional <code>definition_id</code> query param; pass to <code>ExecutionQuery</code> so the tab can be filtered per-instruction without a second handler.</li>
+<li>Render each row with:</li>
+<li><strong>Definition column</strong> (new): resolve <code>e.definition_id</code> → human name via <code>instruction_store-&gt;get(definition_id)</code> (already injected on this lambda's parameter list). Fall back to id-prefix if missing.</li>
+<li><strong>Time column</strong>: format <code>dispatched_at</code> as ISO-8601 UTC instead of raw epoch (use existing <code>format_iso_utc</code> helper if present in <code>web_utils.hpp</code>; otherwise add a small inline helper).</li>
+<li><strong>Click target</strong>: wrap row in <code>&lt;tr class="exec-row" onclick="toggleExecDetail(this)" hx-get="/fragments/executions/{id}/detail" hx-target="next .exec-detail-content" hx-trigger="click once" hx-swap="innerHTML"&gt;</code> so the detail loads lazily on first click and is just shown/hidden on subsequent clicks.</li>
+<li><strong>Detail row</strong> (new): empty <code>&lt;tr class="exec-detail"&gt;&lt;td colspan="6"&gt;&lt;div class="exec-detail-content"&gt;&lt;div class="empty-state"&gt;Loading…&lt;/div&gt;&lt;/div&gt;&lt;/td&gt;&lt;/tr&gt;</code> beneath each row.</li>
+</ul>
+<h3 id="2-new-detail-fragment-route">2. New detail fragment route</h3>
+<p><strong>File</strong>: <code>server/core/src/workflow_routes.cpp</code> (add right after the list handler).</p>
+<div class="highlight"><pre><span></span><code>GET /fragments/executions/{id}/detail
+</code></pre></div>
+<p>Auth via existing <code>auth_fn</code>; require <code>Read</code> on the <code>Execution</code> securable (use the same permission predicate the existing list path uses — confirm during implementation). Return <code>text/html</code> containing three sections inside a <code>&lt;div class="exec-detail-grid"&gt;</code>:</p>
+<ol>
+<li><strong>Metadata block</strong>: definition name + id, status badge, dispatched_by, dispatched_at + completed_at (ISO-8601), parameters (pretty-printed JSON in <code>&lt;pre&gt;</code>), scope expression in <code>&lt;code&gt;</code>.</li>
+<li><strong>Per-agent table</strong> (from <code>execution_tracker-&gt;get_agent_statuses(id)</code>):
+   columns = agent_id (link to agent page if route exists), status badge, exit_code, dispatched_at→completed_at duration, error_detail (truncated, full text in <code>title=</code>).</li>
+<li><strong>Responses table</strong> (from <code>response_store-&gt;query(execution.definition_id, ResponseQuery{since=execution.dispatched_at, until=(execution.completed_at&gt;0 ? completed_at : now()), limit=500})</code>, then drop rows whose <code>agent_id</code> is not in the per-agent set):
+   columns = agent_id, timestamp (ISO-8601), status, output (collapsed <code>&lt;details&gt;&lt;summary&gt;</code> for long output), error_detail.
+   Empty state if the response store is unavailable or the query returns 0 rows.</li>
+</ol>
+<h3 id="3-tab-wiring-js">3. Tab wiring + JS</h3>
+<p><strong>File</strong>: <code>server/core/src/instruction_ui.cpp</code> — same file as the existing tab markup.</p>
+<ul>
+<li>Add a tiny <code>toggleExecDetail(row)</code> helper modeled on the existing <code>toggleDetail(row)</code> (search for it in the JS string in the same file or in <code>dashboard_ui.cpp</code>). It must collapse any other open detail row first so only one is expanded at a time.</li>
+<li>Add CSS in the same <code>&lt;style&gt;</code> block (or wherever <code>.status-badge</code> lives):
+  <div class="highlight"><pre><span></span><code><span class="p">.</span><span class="nc">exec-row</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">cursor</span><span class="p">:</span><span class="w"> </span><span class="kc">pointer</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">.</span><span class="nc">exec-row</span><span class="p">:</span><span class="nd">hover</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">background</span><span class="p">:</span><span class="w"> </span><span class="nf">var</span><span class="p">(</span><span class="nv">--mds-color-state-hover</span><span class="p">);</span><span class="w"> </span><span class="p">}</span>
+<span class="p">.</span><span class="nc">exec-row</span><span class="p">.</span><span class="nc">expanded</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">background</span><span class="p">:</span><span class="w"> </span><span class="nf">var</span><span class="p">(</span><span class="nv">--mds-color-state-selected</span><span class="p">);</span><span class="w"> </span><span class="p">}</span>
+<span class="p">.</span><span class="nc">exec-detail</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">display</span><span class="p">:</span><span class="w"> </span><span class="kc">none</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">.</span><span class="nc">exec-detail</span><span class="p">.</span><span class="nc">open</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">display</span><span class="p">:</span><span class="w"> </span><span class="kc">table-row</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">.</span><span class="nc">exec-detail</span><span class="w"> </span><span class="nt">td</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">padding</span><span class="p">:</span><span class="w"> </span><span class="mf">0.75</span><span class="kt">rem</span><span class="p">;</span><span class="w"> </span><span class="k">background</span><span class="p">:</span><span class="w"> </span><span class="nf">var</span><span class="p">(</span><span class="nv">--mds-color-theme-bg-secondary</span><span class="p">,</span><span class="w"> </span><span class="nf">var</span><span class="p">(</span><span class="nv">--bg</span><span class="p">));</span><span class="w"> </span><span class="p">}</span>
+<span class="p">.</span><span class="nc">exec-detail-grid</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">display</span><span class="p">:</span><span class="w"> </span><span class="k">grid</span><span class="p">;</span><span class="w"> </span><span class="k">gap</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="kt">rem</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">.</span><span class="nc">exec-detail-grid</span><span class="w"> </span><span class="nt">h4</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">margin</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="k">font-size</span><span class="p">:</span><span class="w"> </span><span class="mf">0.8</span><span class="kt">rem</span><span class="p">;</span><span class="w"> </span><span class="k">color</span><span class="p">:</span><span class="w"> </span><span class="nf">var</span><span class="p">(</span><span class="nv">--mds-color-theme-text-tertiary</span><span class="p">);</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div></li>
+</ul>
+<h2 id="critical-files-to-modify">Critical files to modify</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Change</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>server/core/src/workflow_routes.cpp</code></td>
+<td>Enrich <code>/fragments/executions</code> list handler; add <code>/fragments/executions/{id}/detail</code> handler.</td>
+</tr>
+<tr>
+<td><code>server/core/src/instruction_ui.cpp</code></td>
+<td>Add <code>toggleExecDetail</code> JS + CSS for <code>.exec-row</code> / <code>.exec-detail</code>.</td>
+</tr>
+<tr>
+<td><code>server/core/src/web_utils.hpp</code> (or <code>.cpp</code>)</td>
+<td>Add <code>format_iso_utc(int64_t epoch_seconds)</code> helper if not already present. (Search first — agent_ui.cpp / dashboard_routes.cpp likely already have one.)</td>
+</tr>
+<tr>
+<td><code>tests/unit/server/test_workflow_routes.cpp</code> (or nearest existing fixture)</td>
+<td>Add Catch2 cases: list renders with <code>definition_id</code> filter, detail returns 404 for unknown id, detail joins per-agent + responses correctly.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="functions-helpers-to-reuse-do-not-reimplement">Functions / helpers to reuse (do NOT reimplement)</h2>
+<ul>
+<li><code>yuzu::server::html_escape</code> — already used throughout <code>workflow_routes.cpp</code>.</li>
+<li><code>ExecutionTracker::query_executions / get_execution / get_agent_statuses</code> — <code>execution_tracker.hpp:104-107</code>.</li>
+<li><code>ResponseStore::query</code> with <code>ResponseQuery{since, until, agent_id, limit}</code> — <code>response_store.hpp:75</code>.</li>
+<li><code>InstructionStore::get(definition_id)</code> — already injected into <code>WorkflowRoutes::register_routes</code> (parameter <code>instruction_store</code>); use for resolving definition name.</li>
+<li><code>toggleDetail</code> JS pattern at <code>dashboard_ui.cpp:602-616</code> — copy/adapt.</li>
+<li>Existing CSS classes <code>.status-badge .status-{completed,failed,running,pending}</code>, <code>.progress-bar</code>, <code>.progress-fill</code>, <code>.empty-state</code>.</li>
+</ul>
+<h2 id="verification">Verification</h2>
+<ol>
+<li><strong>Build</strong>: <code>bash scripts/setup.sh --tests &amp;&amp; meson compile -C build-linux</code>.</li>
+<li><strong>Unit tests</strong>: <code>meson test -C build-linux --suite server --print-errorlogs</code>.</li>
+<li><strong>End-to-end via UAT</strong>:
+   <div class="highlight"><pre><span></span><code>bash<span class="w"> </span>scripts/linux-start-UAT.sh
+</code></pre></div>
+   Then in a browser at <code>http://localhost:8080</code>:</li>
+<li>Log in as <code>admin</code>/<code>adminpassword1</code>.</li>
+<li>Open Instructions → Executions tab.</li>
+<li>Confirm the list shows recent executions with definition names (not just IDs) and ISO timestamps.</li>
+<li>Click any row — confirm an inline drawer expands beneath it showing metadata, per-agent table, and responses.</li>
+<li>Click the same row again — drawer collapses.</li>
+<li>Click a different row — first drawer collapses, new one opens.</li>
+<li>Open browser devtools Network tab — confirm the detail fragment is fetched exactly once per row (HTMX <code>hx-trigger="click once"</code>).</li>
+<li><strong>Targeted Catch2 run</strong>:
+   <div class="highlight"><pre><span></span><code>tests-build-server-linux_x64/yuzu_server_tests<span class="w"> </span><span class="s2">&quot;[workflow][executions]&quot;</span>
+</code></pre></div></li>
+<li><strong>Lint check</strong>: <code>python3 scripts/check-style.py</code> if it exists, otherwise spot-check warning level on the touched TUs.</li>
+</ol>
+<h2 id="out-of-scope-file-as-follow-ups-do-not-block-this-pr">Out of scope (file as follow-ups, do not block this PR)</h2>
+<ul>
+<li>Adding <code>execution_id</code> column to <code>responses</code> for exact correlation. Today's timestamp+agent join is good enough for sequential dispatches of the same definition; concurrent dispatches of the same definition to overlapping agent sets will show the union of their responses in both detail views. File as a separate issue with the migration design.</li>
+<li>Streaming live updates while an execution is <code>running</code> (would need SSE or HTMX poll). Today the detail snapshots at fragment-load time; user can re-click to refresh.</li>
+<li>Pagination of the executions list beyond the existing <code>limit=50</code>. The current cap is fine for v1.</li>
+</ul>
+</main>
+</body>
+</html>

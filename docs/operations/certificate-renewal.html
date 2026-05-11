@@ -1,0 +1,496 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Certificate Renewal</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/operations/certificate-renewal.md</div>
+<h1 class="doc-title">Certificate Renewal</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="certificate-renewal">Certificate Renewal</h1>
+<h2 id="monitoring-certificate-expiry">Monitoring Certificate Expiry</h2>
+<h3 id="manual-check">Manual Check</h3>
+<div class="highlight"><pre><span></span><code>openssl<span class="w"> </span>x509<span class="w"> </span>-enddate<span class="w"> </span>-noout<span class="w"> </span>-in<span class="w"> </span>/etc/yuzu/certs/server.crt
+<span class="c1"># Output: notAfter=Mar 21 00:00:00 2027 GMT</span>
+</code></pre></div>
+<h3 id="prometheus-alert-rule">Prometheus Alert Rule</h3>
+<p>Add to your Prometheus alert configuration:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">groups</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu-tls</span>
+<span class="w">    </span><span class="nt">rules</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">alert</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">YuzuCertExpiringSoon</span>
+<span class="w">        </span><span class="nt">expr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">probe_ssl_earliest_cert_expiry - time() &lt; 30 * 24 * 3600</span>
+<span class="w">        </span><span class="nt">for</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1h</span>
+<span class="w">        </span><span class="nt">labels</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">severity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">warning</span>
+<span class="w">        </span><span class="nt">annotations</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">summary</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Yuzu</span><span class="nv"> </span><span class="s">TLS</span><span class="nv"> </span><span class="s">certificate</span><span class="nv"> </span><span class="s">expires</span><span class="nv"> </span><span class="s">in</span><span class="nv"> </span><span class="s">less</span><span class="nv"> </span><span class="s">than</span><span class="nv"> </span><span class="s">30</span><span class="nv"> </span><span class="s">days&quot;</span>
+</code></pre></div>
+<h3 id="pre-flight-script">Pre-flight Script</h3>
+<div class="highlight"><pre><span></span><code>./scripts/yuzu-preflight.sh<span class="w"> </span>--cert-dir<span class="w"> </span>/etc/yuzu/certs
+</code></pre></div>
+<h2 id="server-certificate-renewal">Server Certificate Renewal</h2>
+<h3 id="https-certificate-zero-downtime">HTTPS Certificate (zero-downtime)</h3>
+<p>The server automatically detects when HTTPS cert/key files change on disk and hot-reloads the SSL context. <strong>No restart is needed</strong> for HTTPS certificate rotation.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. Generate new CSR with the same key (or generate a new key)</span>
+openssl<span class="w"> </span>req<span class="w"> </span>-new<span class="w"> </span>-key<span class="w"> </span>server.key<span class="w"> </span>-out<span class="w"> </span>server-new.csr<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-subj<span class="w"> </span><span class="s2">&quot;/CN=yuzu-server/O=Your Org&quot;</span>
+
+<span class="c1"># 2. Sign with your CA</span>
+openssl<span class="w"> </span>x509<span class="w"> </span>-req<span class="w"> </span>-in<span class="w"> </span>server-new.csr<span class="w"> </span>-CA<span class="w"> </span>ca.crt<span class="w"> </span>-CAkey<span class="w"> </span>ca.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-CAcreateserial<span class="w"> </span>-out<span class="w"> </span>server-new.crt<span class="w"> </span>-days<span class="w"> </span><span class="m">365</span><span class="w"> </span>-sha256<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-extfile<span class="w"> </span>server-ext.cnf
+
+<span class="c1"># 3. Replace the certificate (atomic move for safety)</span>
+cp<span class="w"> </span>server-new.crt<span class="w"> </span>/etc/yuzu/certs/server.crt.tmp
+chmod<span class="w"> </span><span class="m">644</span><span class="w"> </span>/etc/yuzu/certs/server.crt.tmp
+mv<span class="w"> </span>/etc/yuzu/certs/server.crt.tmp<span class="w"> </span>/etc/yuzu/certs/server.crt
+</code></pre></div>
+<p>The server detects the file change within the polling interval (default: 60 seconds) and hot-swaps the certificate. Check the server log for <code>cert-reload: certificate hot-reloaded successfully</code>.</p>
+<p><strong>Downtime:</strong> None. Hot-reload is automatic. Disable with <code>--no-cert-reload</code> if you prefer manual restarts.</p>
+<h3 id="grpc-mtls-certificate-requires-restart">gRPC mTLS Certificate (requires restart)</h3>
+<p>gRPC TLS certificate hot-reload is <strong>not supported</strong>. After replacing gRPC cert/key files, restart the server:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Replace gRPC cert files, then:</span>
+systemctl<span class="w"> </span>restart<span class="w"> </span>yuzu-server
+</code></pre></div>
+<p><strong>Downtime:</strong> Brief (seconds during restart). Agents will automatically reconnect.</p>
+<h2 id="agent-certificate-renewal">Agent Certificate Renewal</h2>
+<h3 id="option-1-re-enrollment-recommended">Option 1: Re-enrollment (Recommended)</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># On the agent host:</span>
+<span class="c1"># 1. Generate new agent certificate</span>
+openssl<span class="w"> </span>genrsa<span class="w"> </span>-out<span class="w"> </span>agent-new.key<span class="w"> </span><span class="m">2048</span>
+openssl<span class="w"> </span>req<span class="w"> </span>-new<span class="w"> </span>-key<span class="w"> </span>agent-new.key<span class="w"> </span>-out<span class="w"> </span>agent-new.csr<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-subj<span class="w"> </span><span class="s2">&quot;/CN=</span><span class="k">$(</span>hostname<span class="k">)</span><span class="s2">/O=Your Org&quot;</span>
+
+<span class="c1"># 2. Sign with CA (on CA host)</span>
+openssl<span class="w"> </span>x509<span class="w"> </span>-req<span class="w"> </span>-in<span class="w"> </span>agent-new.csr<span class="w"> </span>-CA<span class="w"> </span>ca.crt<span class="w"> </span>-CAkey<span class="w"> </span>ca.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-CAcreateserial<span class="w"> </span>-out<span class="w"> </span>agent-new.crt<span class="w"> </span>-days<span class="w"> </span><span class="m">365</span><span class="w"> </span>-sha256
+
+<span class="c1"># 3. Replace and restart</span>
+cp<span class="w"> </span>agent-new.crt<span class="w"> </span>/etc/yuzu/certs/agent.crt
+cp<span class="w"> </span>agent-new.key<span class="w"> </span>/etc/yuzu/certs/agent.key
+systemctl<span class="w"> </span>restart<span class="w"> </span>yuzu-agent
+</code></pre></div>
+<h3 id="option-2-windows-certificate-store">Option 2: Windows Certificate Store</h3>
+<p>If the agent uses the Windows certificate store (<code>--cert-store MY</code>), renew the certificate in the store. The agent reads the certificate on each connection attempt — <strong>no restart needed</strong>.</p>
+<div class="highlight"><pre><span></span><code><span class="c"># Import renewed certificate</span>
+<span class="nb">Import-PfxCertificate</span> <span class="n">-FilePath</span> <span class="n">agent-renewed</span><span class="p">.</span><span class="n">pfx</span> <span class="n">-CertStoreLocation</span> <span class="n">Cert</span><span class="p">:\</span><span class="n">LocalMachine</span><span class="p">\</span><span class="n">My</span>
+<span class="c"># Remove old certificate</span>
+<span class="nb">Remove-Item</span> <span class="n">Cert</span><span class="p">:\</span><span class="n">LocalMachine</span><span class="p">\</span><span class="n">My</span><span class="p">\</span><span class="n">OLD_THUMBPRINT</span>
+</code></pre></div>
+<h3 id="rolling-update-for-large-fleets">Rolling Update for Large Fleets</h3>
+<ol>
+<li>Generate new certificates for a batch (10-20%) of agents</li>
+<li>Distribute via content staging or configuration management (Ansible, SCCM)</li>
+<li>Restart agents in the batch</li>
+<li>Monitor dashboard for reconnection</li>
+<li>Repeat for next batch</li>
+</ol>
+<h2 id="ca-rotation">CA Rotation</h2>
+<p>When the CA certificate itself expires:</p>
+<ol>
+<li><strong>Generate new CA</strong> with a long validity (10 years)</li>
+<li><strong>Cross-sign</strong>: Sign the new CA with the old CA to create a trust chain</li>
+<li><strong>Update server</strong>: Add both old and new CA to <code>--ca-cert</code> (concatenated PEM)</li>
+<li><strong>Issue new agent certs</strong> signed by the new CA</li>
+<li><strong>Roll out</strong> agent certs in batches</li>
+<li><strong>Remove old CA</strong> from server after all agents are updated</li>
+</ol>
+<h2 id="automated-renewal-with-acme">Automated Renewal with ACME</h2>
+<p>For the HTTPS dashboard certificate (not gRPC mTLS), use certbot:</p>
+<div class="highlight"><pre><span></span><code>certbot<span class="w"> </span>certonly<span class="w"> </span>--standalone<span class="w"> </span>-d<span class="w"> </span>yuzu.example.com
+</code></pre></div>
+<p>Configure the server to use the ACME certificate:
+<div class="highlight"><pre><span></span><code>yuzu-server<span class="w"> </span>--https-cert<span class="w"> </span>/etc/letsencrypt/live/yuzu.example.com/fullchain.pem<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-key<span class="w"> </span>/etc/letsencrypt/live/yuzu.example.com/privkey.pem
+</code></pre></div></p>
+<p>With certificate hot-reload enabled (default), certbot renewals are picked up automatically — <strong>no deploy hook or restart needed</strong>. The server detects the file change within the polling interval and hot-swaps the certificate.</p>
+<blockquote>
+<p><strong>Note:</strong> If you prefer explicit control, add <code>--deploy-hook "systemctl restart yuzu-server"</code> to the certbot command and disable hot-reload with <code>--no-cert-reload</code>.</p>
+</blockquote>
+</main>
+</body>
+</html>

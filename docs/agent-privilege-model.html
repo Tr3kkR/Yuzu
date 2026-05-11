@@ -1,0 +1,952 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuzu Agent Privilege Model</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/agent-privilege-model.md</div>
+<h1 class="doc-title">Yuzu Agent Privilege Model</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="yuzu-agent-privilege-model">Yuzu Agent Privilege Model</h1>
+<p><strong>Status:</strong> active reference doc
+<strong>Owners:</strong> <code>security-guardian</code>, <code>cross-platform</code>, <code>plugin-developer</code>
+<strong>Implementation:</strong> <code>scripts/install-agent-user.sh</code> (Linux/macOS), <code>scripts/install-agent-user.ps1</code> (Windows)
+<strong>First introduced:</strong> 2026-05-06</p>
+<hr>
+<h2 id="tldr">TL;DR</h2>
+<p>The Yuzu agent runs under a dedicated unprivileged account (<code>_yuzu</code> on macOS, <code>yuzu</code> on Linux, <code>YuzuAgent</code> or virtual <code>NT SERVICE\YuzuAgent</code> on Windows). Plugins that need privileged operations shell out via narrow <code>sudo NOPASSWD</code> entries (Linux/macOS) or rely on the service account's pre-granted LSA privileges (Windows). The agent's own process <strong>never runs as root or LocalSystem</strong>.</p>
+<p>If the doc and an install script disagree, <strong>the doc wins</strong> — fix the script, then re-run.</p>
+<hr>
+<h2 id="why-this-model">Why this model</h2>
+<p>Three options were considered:</p>
+<ol>
+<li>
+<p><strong>Run agent as root / LocalSystem.</strong> Simple, works for every plugin. Disqualified: a single bug in any plugin or in the gRPC stack becomes a full system compromise. The audit surface is the entire kernel.</p>
+</li>
+<li>
+<p><strong>Run agent unprivileged, escalate per-call via sudo / WTSQueryUserToken.</strong> This is the pattern shipped here. The audit surface is <strong>the explicit list of commands in <code>/etc/sudoers.d/yuzu-agent</code> plus the LSA privilege grants on Windows</strong> — finite and reviewable.</p>
+</li>
+<li>
+<p><strong>Run a privileged broker beside an unprivileged worker.</strong> Cleanest from a compartmentalization standpoint but doubles the operational surface (two processes, two sets of metrics, IPC contract between them). Reserved for a future hardening pass; the per-call model gets us 95% of the value at 20% of the cost.</p>
+</li>
+</ol>
+<p>The chosen model also lets <code>script_exec.exec</code> / <code>script_exec.bash</code> / <code>script_exec.powershell</code> run <strong>without</strong> elevated privileges by default — the agent has no path to root for arbitrary scripts. To run a privileged script, an operator authors and approves a specific instruction whose YAML wraps the exact command, and the sudoers/LSA grants are extended for that one binary.</p>
+<hr>
+<h2 id="per-platform-account-specifications">Per-platform account specifications</h2>
+<h3 id="macos">macOS</h3>
+<table>
+<thead>
+<tr>
+<th>Attribute</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Account name</td>
+<td><code>_yuzu</code> (leading underscore is the Apple convention for system daemons; matches <code>_postgres</code>, <code>_www</code>, <code>_unbound</code>)</td>
+</tr>
+<tr>
+<td>UID / GID</td>
+<td>First free integer ≥ 200 (system range), assigned by the install script via <code>dscl . -list /Users UniqueID</code></td>
+</tr>
+<tr>
+<td>Shell</td>
+<td><code>/usr/bin/false</code> (no interactive login)</td>
+</tr>
+<tr>
+<td>Home</td>
+<td><code>/var/empty</code> (no profile)</td>
+</tr>
+<tr>
+<td>Hidden from login window</td>
+<td>yes (<code>IsHidden 1</code>)</td>
+</tr>
+<tr>
+<td>Primary group</td>
+<td><code>_yuzu</code> (same name + GID)</td>
+</tr>
+<tr>
+<td>Group memberships</td>
+<td>none (macOS doesn't have systemd-journal / adm equivalents we need)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="linux">Linux</h3>
+<table>
+<thead>
+<tr>
+<th>Attribute</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Account name</td>
+<td><code>yuzu</code></td>
+</tr>
+<tr>
+<td>UID / GID</td>
+<td><code>useradd --system</code> picks from the distro's system range (typically 100–999)</td>
+</tr>
+<tr>
+<td>Shell</td>
+<td><code>/usr/sbin/nologin</code></td>
+</tr>
+<tr>
+<td>Home</td>
+<td><code>/var/lib/yuzu-agent</code> (the state directory; not auto-created — install script creates it explicitly)</td>
+</tr>
+<tr>
+<td>Group memberships</td>
+<td><code>systemd-journal</code> (read journal entries), <code>adm</code> (read <code>/var/log/*</code> files where applicable)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="windows">Windows</h3>
+<table>
+<thead>
+<tr>
+<th>Attribute</th>
+<th>Value (production)</th>
+<th>Value (dev)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Account</td>
+<td>virtual service account <code>NT SERVICE\YuzuAgent</code></td>
+<td>local user <code>YuzuAgent</code></td>
+</tr>
+<tr>
+<td>Created by</td>
+<td><code>sc.exe create yuzu-agent obj= "NT SERVICE\..." ...</code> at MSI install time</td>
+<td><code>New-LocalUser</code> from <code>install-agent-user.ps1</code></td>
+</tr>
+<tr>
+<td>Password</td>
+<td>managed by SCM (no plaintext password exists)</td>
+<td>random 24-char, DPAPI-stashed at <code>C:\ProgramData\Yuzu\agent-credential.dpapi</code> (SYSTEM + Administrators only)</td>
+</tr>
+<tr>
+<td>Interactive logon</td>
+<td>denied implicitly (virtual service account can't log on)</td>
+<td>denied via <code>SeDenyInteractiveLogonRight</code> + <code>SeDenyRemoteInteractiveLogonRight</code> (set by install script)</td>
+</tr>
+<tr>
+<td>Group memberships</td>
+<td><code>Event Log Readers</code>, <code>Performance Monitor Users</code>, <code>Performance Log Users</code></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>The production virtual-service-account path is preferred wherever it can be used. The local-user path exists for dev environments where the service hasn't been registered yet (typically during <code>/test</code> runs that exercise the agent binary directly).</p>
+<hr>
+<h2 id="privilege-matrix-all-217-instructions">Privilege matrix (all 217 instructions)</h2>
+<p>This table is the source of truth for what each plugin requires. When you add a new privileged plugin, add a row here AND a corresponding entry in <code>install-agent-user.{sh,ps1}</code> AND a sudoers entry / LSA privilege.</p>
+<h3 id="read-only-no-privilege-beyond-default-account">Read-only (no privilege beyond default account)</h3>
+<table>
+<thead>
+<tr>
+<th>Plugin / Action</th>
+<th>macOS</th>
+<th>Linux</th>
+<th>Windows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>processes.list</code>, <code>processes.query</code></td>
+<td>default</td>
+<td>default</td>
+<td>default</td>
+</tr>
+<tr>
+<td><code>processes.fetch</code>, <code>tar.process_tree</code></td>
+<td>default</td>
+<td><code>cap_sys_ptrace</code> (set on agent binary)</td>
+<td><code>SeDebugPrivilege</code> is <strong>NOT</strong> granted; a process can only inspect its own children. Operators that need this should run a one-off elevated dispatch.</td>
+</tr>
+<tr>
+<td><code>os_info.*</code></td>
+<td>default</td>
+<td>default</td>
+<td>default</td>
+</tr>
+<tr>
+<td><code>network_config.*</code></td>
+<td>default</td>
+<td>default</td>
+<td>default</td>
+</tr>
+<tr>
+<td><code>installed_apps.*</code>, <code>msi_packages.*</code></td>
+<td>default</td>
+<td>default</td>
+<td>default</td>
+</tr>
+<tr>
+<td><code>event_logs.*</code></td>
+<td>default</td>
+<td><code>systemd-journal</code> group</td>
+<td><code>Event Log Readers</code> group; <code>Security</code> log additionally needs <code>SeSecurityPrivilege</code></td>
+</tr>
+<tr>
+<td><code>services.list</code>, <code>services.running</code></td>
+<td>default</td>
+<td>default</td>
+<td>default</td>
+</tr>
+<tr>
+<td><code>certificates.list</code>, <code>certificates.details</code></td>
+<td>default</td>
+<td>default</td>
+<td>default</td>
+</tr>
+<tr>
+<td><code>tar.*</code> (TAR snapshots)</td>
+<td>default</td>
+<td><code>cap_dac_read_search</code> (read all <code>/proc/&lt;pid&gt;/*</code>)</td>
+<td><code>SeBackupPrivilege</code> (read regardless of DACL)</td>
+</tr>
+<tr>
+<td><code>netstat.*</code>, <code>sockwho.*</code></td>
+<td>default</td>
+<td>default</td>
+<td>default</td>
+</tr>
+<tr>
+<td><code>bitlocker.state</code></td>
+<td>n/a</td>
+<td>n/a</td>
+<td><code>SeBackupPrivilege</code> (some BitLocker WMI properties require this on system drives)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="privileged-actions-require-sudoers-entry-lsa-privilege">Privileged actions (require sudoers entry / LSA privilege)</h3>
+<table>
+<thead>
+<tr>
+<th>Plugin / Action</th>
+<th>macOS sudoers</th>
+<th>Linux sudoers</th>
+<th>Windows privilege</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>quarantine.isolate</code>, <code>quarantine.release</code>, <code>quarantine.whitelist</code></td>
+<td><code>/sbin/pfctl</code></td>
+<td><code>/usr/sbin/iptables</code>, <code>/usr/sbin/ip6tables</code>, <code>/usr/sbin/nft</code></td>
+<td>service account is in <code>Administrators</code> group OR has <code>SeAssignPrimaryTokenPrivilege</code> + uses <code>Set-NetFirewallRule</code> cmdlet</td>
+</tr>
+<tr>
+<td><code>services.set_start_mode</code></td>
+<td><code>/bin/launchctl bootstrap system *</code>, <code>/bin/launchctl bootout system *</code>, <code>/bin/launchctl enable system/*</code>, <code>/bin/launchctl disable system/*</code></td>
+<td><code>/bin/systemctl enable *</code>, <code>/bin/systemctl disable *</code>, <code>/bin/systemctl mask *</code>, <code>/bin/systemctl unmask *</code> (also <code>/usr/bin/systemctl</code> on distros that mirror it)</td>
+<td><code>SeAssignPrimaryTokenPrivilege</code> (service control)</td>
+</tr>
+<tr>
+<td><code>network_actions.flush_dns</code></td>
+<td><code>/usr/bin/dscacheutil -flushcache</code>, <code>/usr/bin/killall -HUP mDNSResponder</code></td>
+<td><code>/usr/bin/systemd-resolve --flush-caches</code>, <code>/usr/bin/resolvectl flush-caches</code></td>
+<td>runs as service; uses <code>Clear-DnsClientCache</code> cmdlet (no extra privilege required when running as service)</td>
+</tr>
+<tr>
+<td><code>certificates.delete</code> (system store only)</td>
+<td><code>/usr/bin/security delete-certificate -t /Library/Keychains/System.keychain *</code></td>
+<td>(uses <code>update-ca-certificates</code> reading <code>/etc/ssl/certs/*</code> → no sudo needed for CA store; OpenSSL trust chain is filesystem-managed)</td>
+<td><code>SeBackupPrivilege</code> + <code>SeRestorePrivilege</code> to write the certificate store</td>
+</tr>
+<tr>
+<td><code>registry.set_value</code>, <code>registry.delete_value</code>, <code>registry.delete_key</code></td>
+<td>n/a</td>
+<td>n/a</td>
+<td>service account in <code>Administrators</code> group required for <code>HKLM\*</code>; user hives (<code>HKCU</code>) work without elevation</td>
+</tr>
+<tr>
+<td><code>filesystem.write_content</code>, <code>filesystem.replace</code>, <code>filesystem.append</code>, <code>filesystem.delete_lines</code></td>
+<td>depends on path; system paths (<code>/etc/*</code>, <code>/Library/*</code>) require operator-authored per-path sudo entry. Default install grants nothing.</td>
+<td>depends on path; system paths require operator-authored per-path sudo entry.</td>
+<td>depends on path; system paths require service account to be <code>Administrators</code> member</td>
+</tr>
+<tr>
+<td><code>script_exec.exec</code>, <code>script_exec.bash</code>, <code>script_exec.powershell</code></td>
+<td>runs as <code>_yuzu</code> (no sudo)</td>
+<td>runs as <code>yuzu</code> (no sudo)</td>
+<td>runs as <code>YuzuAgent</code> (no extra privilege)</td>
+</tr>
+<tr>
+<td><code>wol.wake</code></td>
+<td>runs as <code>_yuzu</code> with raw socket privileges from <code>cap_net_raw</code></td>
+<td><code>cap_net_raw</code> set on agent binary</td>
+<td>service account; uses <code>Send-MagicPacket</code> (PowerShell) or socket APIs</td>
+</tr>
+<tr>
+<td><code>content_dist.execute_staged</code></td>
+<td>runs as <code>_yuzu</code> (the staging area is <code>_yuzu</code>-owned)</td>
+<td>runs as <code>yuzu</code></td>
+<td>runs as <code>YuzuAgent</code></td>
+</tr>
+<tr>
+<td><code>bitlocker.state</code></td>
+<td>n/a</td>
+<td>n/a</td>
+<td>service account in <code>Administrators</code> group for system drive queries</td>
+</tr>
+<tr>
+<td><code>patches.deploy</code></td>
+<td>(calls Apple's <code>softwareupdate</code> — needs <code>/usr/sbin/softwareupdate</code> sudo entry; not in default sudoers — operator opts in)</td>
+<td>(calls <code>apt-get</code> / <code>dnf upgrade</code> — needs <code>/usr/bin/apt-get</code>, <code>/usr/bin/dnf</code> sudo entries; not in default sudoers)</td>
+<td>service account in <code>Administrators</code> (Windows Update API)</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="deliberately-not-granted-negative-space">Deliberately NOT granted (negative space)</h2>
+<p>This section matters as much as the positive grants — it documents the privileges the agent could <em>plausibly</em> claim but explicitly does not, and the reasoning. When reviewing a PR that wants to add one of these, default to "no" and require an explicit threat-model justification.</p>
+<table>
+<thead>
+<tr>
+<th>Privilege</th>
+<th>Platform</th>
+<th>Why NOT granted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Generic <code>ALL=(ALL)</code> sudo</td>
+<td>macOS, Linux</td>
+<td>Makes the audit surface infinite. Every privileged operation must be itemized.</td>
+</tr>
+<tr>
+<td><code>SeDebugPrivilege</code></td>
+<td>Windows</td>
+<td>Effective full-system access via process token theft. Reserved for LocalSystem and a small set of debug tools.</td>
+</tr>
+<tr>
+<td><code>SeLoadDriverPrivilege</code></td>
+<td>Windows</td>
+<td>Drivers run in kernel mode. The agent stays user-mode; if a plugin ever needs kernel-mode telemetry, it goes through ETW, not a custom driver.</td>
+</tr>
+<tr>
+<td><code>SeImpersonatePrivilege</code></td>
+<td>Windows</td>
+<td>Lets the agent impersonate any logged-in user. Reserved for the future per-session interaction helper.</td>
+</tr>
+<tr>
+<td><code>SeTakeOwnershipPrivilege</code></td>
+<td>Windows</td>
+<td>Agent should never seize files. If a plugin needs to write a file the agent doesn't own, that's a configuration problem, not a privilege problem.</td>
+</tr>
+<tr>
+<td>Membership in <code>wheel</code> / <code>Administrators</code></td>
+<td>Linux / Windows (dev)</td>
+<td>Same audit-surface argument as generic sudo. Only the production virtual service account has equivalent privileges, and those are bounded by what <code>Administrators</code> grants in the platform default.</td>
+</tr>
+<tr>
+<td><code>cap_sys_admin</code></td>
+<td>Linux</td>
+<td>Grants too much (mount, swap, etc.). Plugins should never need this.</td>
+</tr>
+<tr>
+<td>Write access to <code>/usr/local/lib/yuzu/plugins/</code></td>
+<td>all</td>
+<td>A compromised plugin shouldn't be able to tamper with siblings. Plugin signing (future) will add a second layer.</td>
+</tr>
+<tr>
+<td>GUI session access</td>
+<td>all</td>
+<td>Daemons can't reach a logged-in user's display server. The interaction plugin needs a separate per-session helper, not the daemon.</td>
+</tr>
+<tr>
+<td><code>chown</code> / <code>chmod</code> shell-outs</td>
+<td>macOS, Linux</td>
+<td>Agent should never rewrite ACLs. If a plugin needs to write a path the agent doesn't own, that's a configuration problem.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="filesystem-hierarchy">Filesystem hierarchy</h2>
+<table>
+<thead>
+<tr>
+<th>Path (Linux)</th>
+<th>Path (macOS)</th>
+<th>Path (Windows)</th>
+<th>Owner</th>
+<th>Mode</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/var/lib/yuzu-agent/</code></td>
+<td><code>/Library/Application Support/Yuzu/state/</code></td>
+<td><code>C:\ProgramData\Yuzu\state\</code></td>
+<td>agent</td>
+<td>0750</td>
+<td>persistent state: <code>agent.db</code>, KV store, <code>cmd_execution_ids</code> cache</td>
+</tr>
+<tr>
+<td><code>/var/cache/yuzu-agent/</code></td>
+<td><code>/Library/Caches/Yuzu/</code></td>
+<td><code>C:\ProgramData\Yuzu\cache\</code></td>
+<td>agent</td>
+<td>0750</td>
+<td>regenerable cache; <code>content_dist.stage</code> writes downloads here</td>
+</tr>
+<tr>
+<td><code>/var/log/yuzu-agent/</code></td>
+<td><code>/Library/Logs/Yuzu/</code></td>
+<td><code>C:\ProgramData\Yuzu\logs\</code></td>
+<td>agent</td>
+<td>0750</td>
+<td>spdlog output (managed by logrotate / Apple ASL / Windows ETW)</td>
+</tr>
+<tr>
+<td><code>/usr/local/lib/yuzu/plugins/</code></td>
+<td><code>/Library/Application Support/Yuzu/plugins/</code></td>
+<td><code>C:\Program Files\Yuzu\plugins\</code> (or <code>C:\ProgramData\Yuzu\plugins\</code> for dev)</td>
+<td>root</td>
+<td>0755 (read-only to agent)</td>
+<td>plugin <code>.so</code> / <code>.dylib</code> / <code>.dll</code> loaded at agent startup. <strong>Must NOT be writable by the agent account</strong></td>
+</tr>
+<tr>
+<td><code>/etc/yuzu-agent/agent.cfg</code></td>
+<td><code>/Library/Application Support/Yuzu/config/agent.cfg</code></td>
+<td><code>C:\ProgramData\Yuzu\config\agent.cfg</code></td>
+<td>root</td>
+<td>0640 (root:agent)</td>
+<td>agent config; root-owned, agent-readable</td>
+</tr>
+<tr>
+<td><code>/etc/yuzu-agent/cert/</code></td>
+<td><code>/Library/Application Support/Yuzu/config/cert/</code></td>
+<td><code>C:\ProgramData\Yuzu\config\cert\</code></td>
+<td>root</td>
+<td>0640 (root:agent)</td>
+<td>mTLS cert+key for gRPC; root-owned, agent-readable</td>
+</tr>
+</tbody>
+</table>
+<p>The plugins directory specifically being root-owned and read-only-to-agent is a hardening invariant: a compromised plugin should not be able to drop a sibling .so that gets loaded on next agent restart. Plugin code-signing (a future feature) will be a defence-in-depth alongside this.</p>
+<hr>
+<h2 id="how-sudoers-entries-are-constructed">How sudoers entries are constructed</h2>
+<p>Every line in <code>/etc/sudoers.d/yuzu-agent</code> follows this exact shape:</p>
+<div class="highlight"><pre><span></span><code>yuzu ALL=(root) NOPASSWD: /absolute/path/to/binary [arg-template-with-globs]
+</code></pre></div>
+<p><strong>Why each piece matters:</strong></p>
+<ul>
+<li><strong><code>yuzu</code></strong> — the agent's account name. The default install uses <code>yuzu</code> (Linux) / <code>_yuzu</code> (macOS), but the sudoers file is regenerated by the install script and reflects whatever <code>--account-name</code> was passed.</li>
+<li><strong><code>ALL=</code></strong> — the host pattern. <code>ALL</code> is correct here because we're not using sudo's host-restriction feature; the file is host-local.</li>
+<li><strong><code>(root)</code></strong> — the target user. Always <code>root</code> for our entries; the privileged commands operate on system-level resources only the kernel has authority over.</li>
+<li><strong><code>NOPASSWD:</code></strong> — required because the agent runs non-interactively. Without this, every privileged plugin call would block on a password prompt the daemon can't answer.</li>
+<li><strong><code>/absolute/path/to/binary</code></strong> — required to prevent PATH-injection attacks. If we wrote <code>iptables</code> instead of <code>/usr/sbin/iptables</code>, an attacker who got code execution as the agent could prepend a directory to <code>PATH</code> containing a malicious <code>iptables</code> binary, and the sudoers entry would helpfully run that as root.</li>
+<li><strong><code>arg-template-with-globs</code></strong> — bounds the argument shape. <code>pfctl *</code> allows any pfctl subcommand; <code>systemctl enable *</code> only allows enable, not start/stop. We err on the side of broader globs (<code>pfctl *</code> rather than enumerating every subcommand) because <code>pfctl</code> is single-purpose; for <code>systemctl</code> we narrow to specific subcommands because the agent should never <code>systemctl reboot</code>.</li>
+</ul>
+<p>The install script always validates the generated file with <code>visudo -cf &lt;tempfile&gt;</code> before atomic move into place. A syntactically invalid sudoers file would brick every sudo call on the host, so this validation is non-optional.</p>
+<hr>
+<h2 id="how-lsa-privileges-are-granted-windows">How LSA privileges are granted (Windows)</h2>
+<p>Windows has no built-in cmdlet to grant <code>SeXxxPrivilege</code> rights to an account. The two real options:</p>
+<ol>
+<li><strong><code>secedit /export</code> → edit → <code>secedit /configure</code>.</strong> Clunky, race-prone if multiple admins are configuring policy at the same time, and the edit-the-INI step is fragile under encoding (UTF-16 LE BOM is required).</li>
+<li><strong>P/Invoke <code>advapi32!LsaAddAccountRights</code>.</strong> Atomic, no temp files, no encoding gotchas. This is what <code>install-agent-user.ps1</code> uses.</li>
+</ol>
+<p>The PowerShell script defines the LSA structures + function imports inline (in a <code>$lsaSource</code> C# string), loads them via <code>Add-Type</code>, and calls <code>LsaAddAccountRights</code> per privilege. The complement function <code>LsaRemoveAccountRights</code> is used by <code>-Uninstall</code>.</p>
+<p>We deliberately keep the C# definitions in the script rather than a separate module so the script is self-contained — operators can read it end-to-end without chasing imports.</p>
+<p>The deny-interactive logon rights (<code>SeDenyInteractiveLogonRight</code>, <code>SeDenyRemoteInteractiveLogonRight</code>) are an exception: they're set via <code>secedit</code> because LsaAddAccountRights doesn't include the deny-rights LSA functions in its public surface (those go through the user-rights-assignment policy, which is what <code>secedit</code> exports/imports).</p>
+<hr>
+<h2 id="how-to-add-a-new-privileged-plugin">How to add a new privileged plugin</h2>
+<p>Procedure for any change that introduces a new privileged shell-out:</p>
+<ol>
+<li><strong>Read this doc end-to-end.</strong> If your plugin's privilege isn't listed, it isn't granted.</li>
+<li><strong>Choose the narrowest grant that works.</strong> If your plugin only needs to run <code>mount /dev/sdX /mnt</code>, the sudoers entry is <code>/usr/bin/mount /dev/sd* /mnt/*</code> — not <code>/usr/bin/mount</code>.</li>
+<li><strong>Update the privilege matrix above.</strong> Add a row with the platform-specific grants.</li>
+<li><strong>Update <code>install-agent-user.{sh,ps1}</code> <code>generate_sudoers_content</code> / <code>RequiredPrivileges</code>.</strong> Both scripts. If the change is platform-specific, only the platform-specific script needs changing, but document that in the matrix.</li>
+<li><strong>Update the plugin's source to use <code>sudo -n</code> (Unix) or run inside the elevated service token (Windows).</strong> Code-review for argument quoting: every argv passed to <code>sudo -n</code> must come from a trusted source (a YAML-declared parameter that's been validated against its schema), not from raw operator input.</li>
+<li><strong>Add a regression test under <code>tests/instructions/</code> (PR C surface) that exercises the new privilege grant on a UAT stack</strong> with the install script's <code>--check</code> as a precondition.</li>
+<li><strong>File a security-guardian review</strong> referencing this doc. The reviewer's job: confirm the grant is the narrowest that works and the argv-validation in step 5 is sound.</li>
+</ol>
+<hr>
+<h2 id="production-vs-dev-install-paths">Production vs dev install paths</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Production (MSI / <code>.deb</code> / <code>.pkg</code>)</th>
+<th>Dev (<code>scripts/install-agent-user.{sh,ps1}</code> directly)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Account creation</td>
+<td>by the package's pre-install hook (<code>postinst</code> on <code>.deb</code>, <code>RunAfterInstall</code> MSI custom action)</td>
+<td>by the script invoked manually as root/admin</td>
+</tr>
+<tr>
+<td>Sudoers / LSA grants</td>
+<td>dropped by the package's pre-install hook (Linux/macOS); <code>Microsoft.Windows.LsaAddAccountRights</code> MSI custom action (Windows)</td>
+<td>by the script</td>
+</tr>
+<tr>
+<td>State dir creation</td>
+<td>as part of package extraction, with correct ACLs already set</td>
+<td>by the script</td>
+</tr>
+<tr>
+<td>Service registration</td>
+<td>as part of package install (<code>systemctl enable</code>, <code>launchctl bootstrap</code>, <code>sc.exe create</code>)</td>
+<td>the dev operator runs <code>scripts/start-UAT.sh</code> which doesn't register a service — the agent runs as a foreground process. Pass <code>--as-user _yuzu</code> (macOS) or <code>--as-user yuzu</code> (Linux) to launch the agent under the unprivileged account via <code>sudo -u</code>; the script's pre-flight verifies the user, sudoers grant, binary readability, and parent-path traversability before attempting to start.</td>
+</tr>
+<tr>
+<td>Account password (Windows)</td>
+<td>virtual service account; SCM manages credentials</td>
+<td>random password stashed in DPAPI blob; only relevant if the operator wants to log in as the account for debugging</td>
+</tr>
+</tbody>
+</table>
+<p>The dev path produces an account-and-grants combination that is <strong>functionally equivalent</strong> to the production virtual-service-account path for everything except service registration. This means <code>/test --instructions-quarantine</code> produces the same firewall behaviour as a production deployment would when the operator runs the same instruction.</p>
+<hr>
+<h2 id="audit-and-review">Audit and review</h2>
+<p><code>/etc/sudoers.d/yuzu-agent</code> is regenerated by <code>install-agent-user.sh</code> on every run. Treat the file as build artifact, not source — its source is the <code>generate_sudoers_content</code> function. The file's git history is in this repo, in the install script's commits.</p>
+<p>Windows LSA grants leave no on-disk artifact equivalent to a sudoers file. The <code>install-agent-user.ps1</code> script writes an install marker at <code>C:\ProgramData\Yuzu\install-marker.json</code> listing the account name, granted privileges, and groups. <code>secedit /export</code> against the live policy is the authoritative source on a running box.</p>
+<p>For a periodic audit, a <code>security-guardian</code> agent should:
+- Diff <code>/etc/sudoers.d/yuzu-agent</code> against the install script's <code>generate_sudoers_content</code> output. Any drift means an operator hand-edited the file (a violation of the model).
+- Diff the live policy's USER_RIGHTS section against this doc's matrix. Any privilege not listed here means an operator hand-granted via <code>secedit</code> or the Group Policy Editor.
+- Confirm the agent process is not running as root / LocalSystem (unless it's a deliberate development override; production images should refuse to start as root, see future hardening).</p>
+<hr>
+<h2 id="troubleshooting">Troubleshooting</h2>
+<h3 id="sudo-a-password-is-required"><code>sudo: a password is required</code></h3>
+<p>The agent shelled out to <code>sudo /sbin/pfctl</code> (or similar) and sudo asked for a password. Either:
+- The sudoers file isn't installed → run <code>install-agent-user.sh --check</code>.
+- The sudoers file is wrong → re-run <code>install-agent-user.sh</code> (it regenerates the file).
+- The agent is running as a different account than the one in sudoers → check <code>ps -o user= -p $(pgrep yuzu-agent)</code>.</p>
+<h3 id="pfctl-operation-not-permitted-macos-or-iptables-permission-denied-linux"><code>pfctl: Operation not permitted</code> (macOS) or <code>iptables: Permission denied</code> (Linux)</h3>
+<p>The shell-out used the bare command instead of <code>sudo -n /sbin/pfctl</code>. The plugin source needs updating — see "How to add a new privileged plugin" step 5. This was the state of the world up to and including the v0.10.x line; PR after this doc lands is what flips it.</p>
+<h3 id="windows-set-netfirewallrule-access-denied">Windows <code>Set-NetFirewallRule: Access denied</code></h3>
+<p>The service account is missing <code>SeAssignPrimaryTokenPrivilege</code> or isn't in <code>Administrators</code>. Run <code>install-agent-user.ps1 -Check</code> to see which.</p>
+<h3 id="_yuzu-user-gets-created-but-agent-still-runs-as-nathan"><code>_yuzu</code> user gets created but agent still runs as <code>nathan</code></h3>
+<p>The agent process started before the install script ran, OR the launch path (e.g., <code>start-UAT.sh</code>) isn't using <code>sudo -u _yuzu</code> to launch the agent. Update the launch path. Production deployments via launchd/systemd/SCM don't have this issue because the unit/plist specifies the account.</p>
+<hr>
+<h2 id="routing-for-the-agent-team">Routing for the agent team</h2>
+<table>
+<thead>
+<tr>
+<th>If you're touching...</th>
+<th>Read this section</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agents/plugins/quarantine/src/quarantine_plugin.cpp</code></td>
+<td>"How sudoers entries are constructed", privilege matrix row for <code>quarantine.*</code></td>
+</tr>
+<tr>
+<td><code>agents/plugins/services/src/services_plugin.cpp</code></td>
+<td>privilege matrix row for <code>services.set_start_mode</code></td>
+</tr>
+<tr>
+<td>Any new plugin that runs OS-level commands</td>
+<td>"How to add a new privileged plugin" — full procedure</td>
+</tr>
+<tr>
+<td><code>scripts/install-agent-user.{sh,ps1}</code></td>
+<td>the whole doc; the scripts implement what's specified here</td>
+</tr>
+<tr>
+<td><code>scripts/start-UAT.sh</code></td>
+<td>"Production vs dev install paths" — UAT is a dev path</td>
+</tr>
+<tr>
+<td><a href="yuzu-guardian-design-v1.1.html" class="doc-ref"><code>docs/yuzu-guardian-design-v1.1.md</code></a> (Guardian guards)</td>
+<td>each Guardian guard's enforcement action follows this same model: agent shells out via narrow sudo entries, never as root</td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

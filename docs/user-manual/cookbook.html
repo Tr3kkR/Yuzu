@@ -1,0 +1,2365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuzu Cookbook</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/cookbook.md</div>
+<h1 class="doc-title">Yuzu Cookbook</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="yuzu-cookbook">Yuzu Cookbook</h1>
+<p>Practical examples for every plugin — YAML definitions, Python automation, CEL compliance expressions, and Dashboard UI walkthroughs. Each example shows real scope expressions so you can target all machines, a filtered subset, or machines identified by a previous instruction.</p>
+<hr>
+<h2 id="how-to-use-this-guide">How to Use This Guide</h2>
+<h3 id="python-setup">Python Setup</h3>
+<p>All Python examples use the <code>requests</code> library with Bearer token authentication:</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span> <span class="nn">requests</span><span class="o">,</span> <span class="nn">time</span><span class="o">,</span> <span class="nn">json</span>
+
+<span class="n">YUZU</span> <span class="o">=</span> <span class="s2">&quot;https://yuzu.example.com&quot;</span>         <span class="c1"># Your Yuzu server URL</span>
+<span class="n">TOKEN</span> <span class="o">=</span> <span class="s2">&quot;yuzu_tok_abc123...&quot;</span>               <span class="c1"># API token from Settings &gt; API Tokens</span>
+<span class="n">HEADERS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;X-Yuzu-Token&quot;</span><span class="p">:</span> <span class="n">TOKEN</span><span class="p">,</span> <span class="s2">&quot;Content-Type&quot;</span><span class="p">:</span> <span class="s2">&quot;application/json&quot;</span><span class="p">}</span>
+
+<span class="k">def</span> <span class="nf">execute</span><span class="p">(</span><span class="n">definition_id</span><span class="p">,</span> <span class="n">scope</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Execute an instruction and return the execution ID.&quot;&quot;&quot;</span>
+    <span class="n">r</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">YUZU</span><span class="si">}</span><span class="s2">/api/executions&quot;</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="n">HEADERS</span><span class="p">,</span> <span class="n">json</span><span class="o">=</span><span class="p">{</span>
+        <span class="s2">&quot;definition_id&quot;</span><span class="p">:</span> <span class="n">definition_id</span><span class="p">,</span>
+        <span class="s2">&quot;scope_expression&quot;</span><span class="p">:</span> <span class="n">scope</span><span class="p">,</span>
+        <span class="s2">&quot;parameter_values&quot;</span><span class="p">:</span> <span class="n">params</span> <span class="ow">or</span> <span class="p">{}</span>
+    <span class="p">})</span>
+    <span class="n">r</span><span class="o">.</span><span class="n">raise_for_status</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">r</span><span class="o">.</span><span class="n">json</span><span class="p">()[</span><span class="s2">&quot;id&quot;</span><span class="p">]</span>
+
+<span class="k">def</span> <span class="nf">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">120</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Poll until execution completes. Returns the execution summary.&quot;&quot;&quot;</span>
+    <span class="n">deadline</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">+</span> <span class="n">timeout</span>
+    <span class="k">while</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">&lt;</span> <span class="n">deadline</span><span class="p">:</span>
+        <span class="n">r</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">YUZU</span><span class="si">}</span><span class="s2">/api/executions/</span><span class="si">{</span><span class="n">exec_id</span><span class="si">}</span><span class="s2">/summary&quot;</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="n">HEADERS</span><span class="p">)</span>
+        <span class="n">data</span> <span class="o">=</span> <span class="n">r</span><span class="o">.</span><span class="n">json</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">data</span><span class="p">[</span><span class="s2">&quot;status&quot;</span><span class="p">]</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;completed&quot;</span><span class="p">,</span> <span class="s2">&quot;failed&quot;</span><span class="p">,</span> <span class="s2">&quot;cancelled&quot;</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">data</span>
+        <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+    <span class="k">raise</span> <span class="ne">TimeoutError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Execution </span><span class="si">{</span><span class="n">exec_id</span><span class="si">}</span><span class="s2"> did not complete in </span><span class="si">{</span><span class="n">timeout</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">)</span>
+
+<span class="k">def</span> <span class="nf">get_responses</span><span class="p">(</span><span class="n">definition_id</span><span class="p">,</span> <span class="n">exec_id</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">limit</span><span class="o">=</span><span class="mi">1000</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Fetch result rows for a definition (optionally filtered by execution).&quot;&quot;&quot;</span>
+    <span class="n">params</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;limit&quot;</span><span class="p">:</span> <span class="n">limit</span><span class="p">}</span>
+    <span class="k">if</span> <span class="n">exec_id</span><span class="p">:</span>
+        <span class="n">params</span><span class="p">[</span><span class="s2">&quot;execution_id&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">exec_id</span>
+    <span class="n">r</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">YUZU</span><span class="si">}</span><span class="s2">/api/responses/</span><span class="si">{</span><span class="n">definition_id</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="n">HEADERS</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">params</span><span class="p">)</span>
+    <span class="n">r</span><span class="o">.</span><span class="n">raise_for_status</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">r</span><span class="o">.</span><span class="n">json</span><span class="p">()</span>
+</code></pre></div>
+<h3 id="scope-expression-cheat-sheet">Scope Expression Cheat Sheet</h3>
+<table>
+<thead>
+<tr>
+<th>Pattern</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><em>(empty string)</em></td>
+<td>All connected agents</td>
+</tr>
+<tr>
+<td><code>ostype == "windows"</code></td>
+<td>Windows machines only</td>
+</tr>
+<tr>
+<td><code>ostype == "linux"</code></td>
+<td>Linux machines only</td>
+</tr>
+<tr>
+<td><code>ostype == "darwin"</code></td>
+<td>macOS machines only</td>
+</tr>
+<tr>
+<td><code>tag:env == "production"</code></td>
+<td>Agents tagged with env=production</td>
+</tr>
+<tr>
+<td><code>hostname LIKE "web-*"</code></td>
+<td>Hostnames matching a wildcard</td>
+</tr>
+<tr>
+<td><code>hostname MATCHES "^db-\\d+$"</code></td>
+<td>Hostnames matching a regex</td>
+</tr>
+<tr>
+<td><code>arch IN ("x86_64", "aarch64")</code></td>
+<td>Multiple architectures</td>
+</tr>
+<tr>
+<td><code>ostype == "windows" AND tag:dept == "finance"</code></td>
+<td>Combined filters</td>
+</tr>
+<tr>
+<td><code>agent_id IN ("a1", "a2", "a3")</code></td>
+<td>Specific agents by ID</td>
+</tr>
+<tr>
+<td><code>NOT tag:quarantined == "true"</code></td>
+<td>Exclude tagged agents</td>
+</tr>
+</tbody>
+</table>
+<h3 id="cel-expression-cheat-sheet">CEL Expression Cheat Sheet</h3>
+<p>CEL expressions are used in PolicyFragment compliance checks to evaluate instruction results:</p>
+<table>
+<thead>
+<tr>
+<th>Pattern</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>result.status == 'running'</code></td>
+<td>Exact string match</td>
+</tr>
+<tr>
+<td><code>result.count &gt; 0</code></td>
+<td>Numeric comparison</td>
+</tr>
+<tr>
+<td><code>result.enabled == true</code></td>
+<td>Boolean check</td>
+</tr>
+<tr>
+<td><code>result.name.contains('yuzu')</code></td>
+<td>Substring search (case-insensitive)</td>
+</tr>
+<tr>
+<td><code>result.version.startsWith('2.')</code></td>
+<td>Prefix check</td>
+</tr>
+<tr>
+<td><code>result.host.matches('^web-\\d+$')</code></td>
+<td>Regex match</td>
+</tr>
+<tr>
+<td><code>result.status in ['running', 'starting']</code></td>
+<td>List membership</td>
+</tr>
+<tr>
+<td><code>result.score &gt;= 80 ? 'pass' : 'fail'</code></td>
+<td>Ternary</td>
+</tr>
+<tr>
+<td><code>result.uptime_seconds &gt; 86400 &amp;&amp; result.status == 'running'</code></td>
+<td>Combined</td>
+</tr>
+<tr>
+<td><code>timestamp(result.last_check) + duration('1h') &gt; timestamp(result.now)</code></td>
+<td>Time math</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="part-1-plugin-walkthroughs">Part 1: Plugin Walkthroughs</h2>
+<h3 id="11-os-information-os_info">1.1 OS Information (<code>os_info</code>)</h3>
+<p>Query operating system name, version, build, architecture, and uptime. The simplest plugin — no parameters, read-only, all platforms.</p>
+<h4 id="actions">Actions</h4>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Definition ID</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>os_name</code></td>
+<td><code>device.os_info.os_name</code></td>
+<td>OS product name (e.g., "Windows 11 Pro", "Ubuntu 24.04")</td>
+</tr>
+<tr>
+<td><code>os_version</code></td>
+<td><code>device.os_info.os_version</code></td>
+<td>Kernel/version string</td>
+</tr>
+<tr>
+<td><code>os_build</code></td>
+<td><code>device.os_info.os_build</code></td>
+<td>Build identifier (e.g., "22631.4890")</td>
+</tr>
+<tr>
+<td><code>os_arch</code></td>
+<td><code>device.os_info.os_arch</code></td>
+<td>CPU architecture (x86_64, aarch64)</td>
+</tr>
+<tr>
+<td><code>uptime</code></td>
+<td><code>device.os_info.uptime</code></td>
+<td>System uptime in seconds + display string</td>
+</tr>
+</tbody>
+</table>
+<h4 id="yaml-definition">YAML Definition</h4>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionDefinition</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">device.os_info.os_version</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">OS Kernel / Version String</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">question</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">windows</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">linux</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">darwin</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">os_info</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">os_version</span>
+<span class="w">  </span><span class="nt">parameters</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">    </span><span class="nt">properties</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{}</span>
+<span class="w">  </span><span class="nt">result</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">columns</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">os_version</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">os_product_version</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">  </span><span class="nt">approval</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">auto</span>
+</code></pre></div>
+<h4 id="python-get-os-version-from-all-machines">Python: Get OS Version from All Machines</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.os_info.os_version&quot;</span><span class="p">)</span>
+<span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;device.os_info.os_version&quot;</span><span class="p">,</span> <span class="n">exec_id</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;agent_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;output&#39;</span><span class="p">][</span><span class="s1">&#39;os_version&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="python-get-os-version-from-windows-machines-only">Python: Get OS Version from Windows Machines Only</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.os_info.os_version&quot;</span><span class="p">,</span> <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;ostype == &quot;windows&quot;&#39;</span><span class="p">)</span>
+<span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="python-get-os-name-for-production-servers">Python: Get OS Name for Production Servers</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.os_info.os_name&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;tag:env == &quot;production&quot; AND hostname LIKE &quot;srv-*&quot;&#39;</span><span class="p">)</span>
+<span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="cel-compliance-expression">CEL Compliance Expression</h4>
+<p>Use in a PolicyFragment to flag machines running old OS builds:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PolicyFragment</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policy.os_build_minimum</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">check</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">ref</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">device.os_info.os_build</span>
+<span class="w">  </span><span class="nt">compliance</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">result.os_build &gt;= &#39;22631&#39;</span>
+</code></pre></div>
+<p>CEL for uptime monitoring (flag machines not rebooted in 30 days):</p>
+<div class="highlight"><pre><span></span><code>result.uptime_seconds &lt; 2592000
+</code></pre></div>
+<h4 id="dashboard-ui">Dashboard UI</h4>
+<ol>
+<li>Navigate to <strong>Instructions &gt; Definitions</strong></li>
+<li>Find <code>device.os_info.os_version</code> in the list (or search for "os version")</li>
+<li>Click <strong>Execute</strong> on the definition row</li>
+<li>In the scope field, enter <code>ostype == "windows"</code> (or leave empty for all machines)</li>
+<li>Click <strong>Run</strong> — no parameters needed</li>
+<li>Switch to the <strong>Executions</strong> tab to monitor progress</li>
+<li>Click the execution row to see per-agent results</li>
+</ol>
+<hr>
+<h3 id="12-services-services">1.2 Services (<code>services</code>)</h3>
+<p>Query and manage system services. Demonstrates both read-only queries and state-changing actions with parameters and approval gates.</p>
+<h4 id="actions_1">Actions</h4>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Definition ID</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list</code></td>
+<td><code>crossplatform.service.list</code></td>
+<td>question</td>
+<td>List all installed services</td>
+</tr>
+<tr>
+<td><code>running</code></td>
+<td><code>crossplatform.service.running</code></td>
+<td>question</td>
+<td>List running services only</td>
+</tr>
+<tr>
+<td><code>set_start_mode</code></td>
+<td><code>crossplatform.service.set_start_mode</code></td>
+<td>action</td>
+<td>Change startup type (auto/manual/disabled)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="yaml-definition-action-with-parameters">YAML Definition (Action with Parameters)</h4>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionDefinition</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.set_start_mode</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Set Service Start Mode</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">action</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">windows</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">linux</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">darwin</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">set_start_mode</span>
+<span class="w">  </span><span class="nt">parameters</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">    </span><span class="nt">required</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">name</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">mode</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">properties</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">name</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">        </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service Name</span>
+<span class="w">        </span><span class="nt">validation</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">minLength</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+<span class="w">          </span><span class="nt">maxLength</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
+<span class="w">          </span><span class="nt">pattern</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^[a-zA-Z0-9._@-]+$&quot;</span>
+<span class="w">      </span><span class="nt">mode</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">        </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Startup Mode</span>
+<span class="w">        </span><span class="nt">validation</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">enum</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">automatic</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">manual</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">disabled</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">result</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">columns</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">status</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">service</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">mode</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">  </span><span class="nt">approval</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">role-gated</span>
+</code></pre></div>
+<h4 id="python-list-running-services-on-tagged-machines">Python: List Running Services on Tagged Machines</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;crossplatform.service.running&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;tag:role == &quot;webserver&quot;&#39;</span><span class="p">)</span>
+<span class="n">summary</span> <span class="o">=</span> <span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Responded: </span><span class="si">{</span><span class="n">summary</span><span class="p">[</span><span class="s1">&#39;agents_responded&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">summary</span><span class="p">[</span><span class="s1">&#39;agents_targeted&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;crossplatform.service.running&quot;</span><span class="p">,</span> <span class="n">exec_id</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;agent_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;output&#39;</span><span class="p">][</span><span class="s1">&#39;name&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;output&#39;</span><span class="p">][</span><span class="s1">&#39;status&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="python-disable-a-service-on-production-machines">Python: Disable a Service on Production Machines</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;crossplatform.service.set_start_mode&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;tag:env == &quot;production&quot; AND ostype == &quot;windows&quot;&#39;</span><span class="p">,</span>
+                  <span class="n">params</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;Spooler&quot;</span><span class="p">,</span> <span class="s2">&quot;mode&quot;</span><span class="p">:</span> <span class="s2">&quot;disabled&quot;</span><span class="p">})</span>
+<span class="c1"># This will require approval (role-gated) — check the Approvals tab</span>
+<span class="n">summary</span> <span class="o">=</span> <span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">300</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Success: </span><span class="si">{</span><span class="n">summary</span><span class="p">[</span><span class="s1">&#39;agents_success&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">, Failed: </span><span class="si">{</span><span class="n">summary</span><span class="p">[</span><span class="s1">&#39;agents_failure&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="cel-compliance-expressions">CEL Compliance Expressions</h4>
+<p>Policy to ensure the Print Spooler is disabled:</p>
+<div class="highlight"><pre><span></span><code>result.status == &#39;stopped&#39; &amp;&amp; result.startup_type == &#39;disabled&#39;
+</code></pre></div>
+<p>Policy to flag services with automatic start that are not running:</p>
+<div class="highlight"><pre><span></span><code>result.startup_type == &#39;automatic&#39; &amp;&amp; result.status != &#39;running&#39;
+</code></pre></div>
+<h4 id="dashboard-ui_1">Dashboard UI</h4>
+<p><strong>Querying services:</strong>
+1. <strong>Instructions &gt; Definitions</strong> &gt; find <code>crossplatform.service.running</code>
+2. Click <strong>Execute</strong>, set scope to <code>tag:env == "production"</code>
+3. Click <strong>Run</strong> — results appear in the Executions tab</p>
+<p><strong>Changing a service (requires approval):</strong>
+1. Find <code>crossplatform.service.set_start_mode</code>
+2. Click <strong>Execute</strong>
+3. Fill in parameters: <strong>Service Name</strong> = <code>Spooler</code>, <strong>Startup Mode</strong> = <code>disabled</code>
+4. Set scope: <code>ostype == "windows" AND tag:env == "staging"</code>
+5. Click <strong>Submit for Approval</strong> (role-gated actions require admin approval)
+6. An admin approves in <strong>Instructions &gt; Approvals</strong>
+7. Execution proceeds automatically after approval</p>
+<hr>
+<h3 id="13-processes-processes">1.3 Processes (<code>processes</code>)</h3>
+<p>List and query running processes. Demonstrates multi-row results and aggregation.</p>
+<h4 id="actions_2">Actions</h4>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Definition ID</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list</code></td>
+<td><code>crossplatform.process.list</code></td>
+<td>List all running processes (PID + name)</td>
+</tr>
+<tr>
+<td><code>query</code></td>
+<td><code>crossplatform.process.query</code></td>
+<td>Search processes by name substring</td>
+</tr>
+</tbody>
+</table>
+<h4 id="python-check-if-a-process-is-running-across-the-fleet">Python: Check if a Process is Running Across the Fleet</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;crossplatform.process.query&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;hostname LIKE &quot;web-*&quot;&#39;</span><span class="p">,</span>
+                  <span class="n">params</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;nginx&quot;</span><span class="p">})</span>
+<span class="n">summary</span> <span class="o">=</span> <span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;crossplatform.process.query&quot;</span><span class="p">,</span> <span class="n">exec_id</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+    <span class="n">found</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;output&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;found&quot;</span><span class="p">,</span> <span class="s2">&quot;false&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;agent_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">: nginx </span><span class="si">{</span><span class="s1">&#39;RUNNING&#39;</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">found</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s1">&#39;true&#39;</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">&#39;NOT FOUND&#39;</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="python-aggregate-process-count-across-fleet">Python: Aggregate Process Count Across Fleet</h4>
+<div class="highlight"><pre><span></span><code><span class="n">r</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">YUZU</span><span class="si">}</span><span class="s2">/api/responses/crossplatform.process.list/aggregate&quot;</span><span class="p">,</span>
+                 <span class="n">headers</span><span class="o">=</span><span class="n">HEADERS</span><span class="p">,</span>
+                 <span class="n">params</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;group_by&quot;</span><span class="p">:</span> <span class="s2">&quot;name&quot;</span><span class="p">,</span> <span class="s2">&quot;operation&quot;</span><span class="p">:</span> <span class="s2">&quot;count&quot;</span><span class="p">,</span> <span class="s2">&quot;limit&quot;</span><span class="p">:</span> <span class="mi">20</span><span class="p">})</span>
+<span class="k">for</span> <span class="n">entry</span> <span class="ow">in</span> <span class="n">r</span><span class="o">.</span><span class="n">json</span><span class="p">():</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">entry</span><span class="p">[</span><span class="s1">&#39;name&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">: running on </span><span class="si">{</span><span class="n">entry</span><span class="p">[</span><span class="s1">&#39;count&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> machines&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="cel-compliance-expression_1">CEL Compliance Expression</h4>
+<p>Policy: ensure a critical agent process is always running:</p>
+<div class="highlight"><pre><span></span><code>result.found == true
+</code></pre></div>
+<h4 id="dashboard-ui_2">Dashboard UI</h4>
+<ol>
+<li><strong>Instructions &gt; Definitions</strong> &gt; <code>crossplatform.process.query</code></li>
+<li>Click <strong>Execute</strong></li>
+<li>Enter parameter: <strong>Process Name Filter</strong> = <code>sshd</code></li>
+<li>Scope: <code>ostype == "linux"</code></li>
+<li>Click <strong>Run</strong></li>
+<li>In results, the <code>found</code> column shows <code>true</code>/<code>false</code> per agent</li>
+</ol>
+<hr>
+<h3 id="14-filesystem-filesystem">1.4 Filesystem (<code>filesystem</code>)</h3>
+<p>Secure file operations with path canonicalization. Demonstrates parameter-heavy definitions and the <code>base_dir</code> security constraint.</p>
+<h4 id="key-actions-15-total">Key Actions (15 total)</h4>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Definition ID</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>exists</code></td>
+<td><code>device.filesystem.exists</code></td>
+<td>question</td>
+<td>Check if a path exists</td>
+</tr>
+<tr>
+<td><code>list_dir</code></td>
+<td><code>device.filesystem.list_dir</code></td>
+<td>question</td>
+<td>List directory contents</td>
+</tr>
+<tr>
+<td><code>file_hash</code></td>
+<td><code>device.filesystem.file_hash</code></td>
+<td>question</td>
+<td>SHA-256 hash of a file</td>
+</tr>
+<tr>
+<td><code>read</code></td>
+<td><code>device.filesystem.read</code></td>
+<td>question</td>
+<td>Read file contents (size-limited)</td>
+</tr>
+<tr>
+<td><code>search</code></td>
+<td><code>device.filesystem.search</code></td>
+<td>question</td>
+<td>Search file for pattern matches</td>
+</tr>
+<tr>
+<td><code>replace</code></td>
+<td><code>device.filesystem.replace</code></td>
+<td>action</td>
+<td>Find and replace in a file</td>
+</tr>
+<tr>
+<td><code>write_content</code></td>
+<td><code>device.filesystem.write_content</code></td>
+<td>action</td>
+<td>Write content to a file</td>
+</tr>
+<tr>
+<td><code>create_temp</code></td>
+<td><code>device.filesystem.create_temp</code></td>
+<td>question</td>
+<td>Create a secure temp file</td>
+</tr>
+</tbody>
+</table>
+<h4 id="python-check-if-a-config-file-exists-on-specific-machines">Python: Check if a Config File Exists on Specific Machines</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.filesystem.exists&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;agent_id IN (&quot;agent-007&quot;, &quot;agent-042&quot;)&#39;</span><span class="p">,</span>
+                  <span class="n">params</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="s2">&quot;/etc/nginx/nginx.conf&quot;</span><span class="p">})</span>
+<span class="n">summary</span> <span class="o">=</span> <span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;device.filesystem.exists&quot;</span><span class="p">,</span> <span class="n">exec_id</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+    <span class="n">exists</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;output&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;exists&quot;</span><span class="p">,</span> <span class="s2">&quot;false&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;agent_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="s1">&#39;EXISTS&#39;</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">exists</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s1">&#39;true&#39;</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">&#39;MISSING&#39;</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="python-hash-a-binary-across-all-windows-machines">Python: Hash a Binary Across All Windows Machines</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.filesystem.file_hash&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;ostype == &quot;windows&quot;&#39;</span><span class="p">,</span>
+                  <span class="n">params</span><span class="o">=</span><span class="p">{</span>
+                      <span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="s2">&quot;C:</span><span class="se">\\</span><span class="s2">Windows</span><span class="se">\\</span><span class="s2">System32</span><span class="se">\\</span><span class="s2">cmd.exe&quot;</span><span class="p">,</span>
+                      <span class="s2">&quot;algorithm&quot;</span><span class="p">:</span> <span class="s2">&quot;sha256&quot;</span>
+                  <span class="p">})</span>
+<span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;device.filesystem.file_hash&quot;</span><span class="p">,</span> <span class="n">exec_id</span><span class="p">)</span>
+
+<span class="c1"># Find machines with unexpected hashes</span>
+<span class="n">known_hash</span> <span class="o">=</span> <span class="s2">&quot;abc123...&quot;</span>  <span class="c1"># expected hash</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;output&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;hash&quot;</span><span class="p">)</span> <span class="o">!=</span> <span class="n">known_hash</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;ALERT: </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;agent_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> has unexpected cmd.exe hash!&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="cel-compliance-expressions_1">CEL Compliance Expressions</h4>
+<p>Policy: critical config file must exist:</p>
+<div class="highlight"><pre><span></span><code>result.exists == true &amp;&amp; result.type == &#39;file&#39;
+</code></pre></div>
+<p>Policy: file hash must match known-good value:</p>
+<div class="highlight"><pre><span></span><code>result.hash == &#39;e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855&#39;
+</code></pre></div>
+<h4 id="dashboard-ui_3">Dashboard UI</h4>
+<ol>
+<li><strong>Instructions &gt; Definitions</strong> &gt; <code>device.filesystem.exists</code></li>
+<li>Click <strong>Execute</strong></li>
+<li>Parameters: <strong>Path</strong> = <code>/etc/ssh/sshd_config</code>, <strong>Base Directory</strong> = <code>/etc</code> (optional restriction)</li>
+<li>Scope: <code>ostype == "linux" AND tag:role == "server"</code></li>
+<li>Click <strong>Run</strong></li>
+</ol>
+<hr>
+<h3 id="15-network-configuration-network_config">1.5 Network Configuration (<code>network_config</code>)</h3>
+<p>Network interface and connectivity information. Demonstrates platform-specific filtering.</p>
+<h4 id="python-get-network-interfaces-on-linux-servers">Python: Get Network Interfaces on Linux Servers</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.network_config.ip_addresses&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;ostype == &quot;linux&quot; AND tag:env == &quot;production&quot;&#39;</span><span class="p">)</span>
+<span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;device.network_config.ip_addresses&quot;</span><span class="p">,</span> <span class="n">exec_id</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;agent_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;output&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;name&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;output&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;ip_address&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="python-dns-resolution-test">Python: DNS Resolution Test</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.network_actions.ping&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;ostype == &quot;windows&quot;&#39;</span><span class="p">,</span>
+                  <span class="n">params</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;hostname&quot;</span><span class="p">:</span> <span class="s2">&quot;internal-api.corp.example.com&quot;</span><span class="p">})</span>
+<span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="cel-compliance-expression_2">CEL Compliance Expression</h4>
+<p>Policy: DNS must resolve the internal API hostname:</p>
+<div class="highlight"><pre><span></span><code>result.resolved == true &amp;&amp; result.ip_address != &#39;&#39;
+</code></pre></div>
+<hr>
+<h3 id="16-installed-applications-installed_apps">1.6 Installed Applications (<code>installed_apps</code>)</h3>
+<p>Software inventory across all platforms. Demonstrates management group scoping and version compliance.</p>
+<h4 id="python-get-all-installed-software-in-a-management-group">Python: Get All Installed Software in a Management Group</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># Scope by management group</span>
+<span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;crossplatform.software.inventory&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;management_group == &quot;Finance Department&quot;&#39;</span><span class="p">)</span>
+<span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;crossplatform.software.inventory&quot;</span><span class="p">,</span> <span class="n">exec_id</span><span class="p">)</span>
+
+<span class="c1"># Find machines with outdated Java</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+    <span class="n">name</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;output&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;name&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+    <span class="n">version</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;output&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;version&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="s2">&quot;java&quot;</span> <span class="ow">in</span> <span class="n">name</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">and</span> <span class="n">version</span> <span class="o">&lt;</span> <span class="s2">&quot;21.0&quot;</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;OUTDATED JAVA: </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;agent_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> has </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> </span><span class="si">{</span><span class="n">version</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="cel-compliance-expression_3">CEL Compliance Expression</h4>
+<p>Policy: Java Runtime must be version 21+:</p>
+<div class="highlight"><pre><span></span><code>result.name.contains(&#39;Java&#39;) &amp;&amp; result.version.startsWith(&#39;21.&#39;)
+</code></pre></div>
+<hr>
+<h3 id="17-registry-registry-windows-only">1.7 Registry (<code>registry</code>) -- Windows Only</h3>
+<p>Windows registry operations. Since the plugin is Windows-only, scope expressions implicitly target Windows.</p>
+<h4 id="python-read-a-registry-value-from-all-windows-machines">Python: Read a Registry Value from All Windows Machines</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;windows.registry.get_value&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;ostype == &quot;windows&quot;&#39;</span><span class="p">,</span>
+                  <span class="n">params</span><span class="o">=</span><span class="p">{</span>
+                      <span class="s2">&quot;hive&quot;</span><span class="p">:</span> <span class="s2">&quot;HKLM&quot;</span><span class="p">,</span>
+                      <span class="s2">&quot;key&quot;</span><span class="p">:</span> <span class="s2">&quot;SOFTWARE</span><span class="se">\\</span><span class="s2">Microsoft</span><span class="se">\\</span><span class="s2">Windows NT</span><span class="se">\\</span><span class="s2">CurrentVersion&quot;</span><span class="p">,</span>
+                      <span class="s2">&quot;value&quot;</span><span class="p">:</span> <span class="s2">&quot;CurrentBuildNumber&quot;</span>
+                  <span class="p">})</span>
+<span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;windows.registry.get_value&quot;</span><span class="p">,</span> <span class="n">exec_id</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+    <span class="n">build</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;output&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;data&quot;</span><span class="p">,</span> <span class="s2">&quot;unknown&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;agent_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">: Windows Build </span><span class="si">{</span><span class="n">build</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="cel-compliance-expression_4">CEL Compliance Expression</h4>
+<p>Policy: Windows build must be 22621 or higher (Windows 11 22H2+):</p>
+<div class="highlight"><pre><span></span><code>int(result.data) &gt;= 22621
+</code></pre></div>
+<h4 id="dashboard-ui_4">Dashboard UI</h4>
+<ol>
+<li><strong>Instructions &gt; Definitions</strong> &gt; <code>windows.registry.get_value</code></li>
+<li>Click <strong>Execute</strong></li>
+<li>Parameters: <strong>Hive</strong> = <code>HKLM</code>, <strong>Key</strong> = <code>SOFTWARE\Microsoft\Windows NT\CurrentVersion</code>, <strong>Value</strong> = <code>CurrentBuildNumber</code></li>
+<li>Scope: leave empty (Windows-only plugin only runs on Windows agents)</li>
+<li>Click <strong>Run</strong></li>
+</ol>
+<hr>
+<h3 id="18-script-execution-script_exec">1.8 Script Execution (<code>script_exec</code>)</h3>
+<p>Execute PowerShell, Bash, or generic scripts on endpoints. This is the highest-risk plugin and always requires approval.</p>
+<h4 id="python-run-a-powershell-command-on-a-single-machine">Python: Run a PowerShell Command on a Single Machine</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;crossplatform.script.powershell&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;agent_id == &quot;agent-007&quot;&#39;</span><span class="p">,</span>
+                  <span class="n">params</span><span class="o">=</span><span class="p">{</span>
+                      <span class="s2">&quot;command&quot;</span><span class="p">:</span> <span class="s2">&quot;Get-Process | Where-Object {$_.CPU -gt 100} | Select-Object Name, CPU&quot;</span>
+                  <span class="p">})</span>
+<span class="c1"># Role-gated: check Approvals tab</span>
+<span class="n">summary</span> <span class="o">=</span> <span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">300</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="python-run-a-bash-script-on-linux-fleet">Python: Run a Bash Script on Linux Fleet</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;crossplatform.script.bash&quot;</span><span class="p">,</span>
+                  <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;ostype == &quot;linux&quot; AND tag:env == &quot;staging&quot;&#39;</span><span class="p">,</span>
+                  <span class="n">params</span><span class="o">=</span><span class="p">{</span>
+                      <span class="s2">&quot;command&quot;</span><span class="p">:</span> <span class="s2">&quot;df -h / | tail -1 | awk &#39;{print $5}&#39;&quot;</span>
+                  <span class="p">})</span>
+<span class="n">summary</span> <span class="o">=</span> <span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">300</span><span class="p">)</span>
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;crossplatform.script.bash&quot;</span><span class="p">,</span> <span class="n">exec_id</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;agent_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">: disk usage = </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;output&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;stdout&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;N/A&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="dashboard-ui_5">Dashboard UI</h4>
+<ol>
+<li><strong>Instructions &gt; Definitions</strong> &gt; <code>crossplatform.script.bash</code></li>
+<li>Click <strong>Execute</strong></li>
+<li>Parameters: <strong>Command</strong> = <code>uptime</code></li>
+<li>Scope: <code>hostname == "buildserver-01"</code> (always scope tightly for scripts)</li>
+<li>Click <strong>Submit for Approval</strong> (scripts always require approval)</li>
+<li>Admin approves in <strong>Approvals</strong> tab</li>
+</ol>
+<hr>
+<h3 id="19-vulnerability-scan-vuln_scan">1.9 Vulnerability Scan (<code>vuln_scan</code>)</h3>
+<p>Scan endpoints for known CVEs. Demonstrates security workflows with severity-based CEL.</p>
+<h4 id="python-scan-all-machines-for-vulnerabilities">Python: Scan All Machines for Vulnerabilities</h4>
+<div class="highlight"><pre><span></span><code><span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;security.vuln_scan.scan&quot;</span><span class="p">)</span>  <span class="c1"># empty scope = all machines</span>
+<span class="n">summary</span> <span class="o">=</span> <span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">600</span><span class="p">)</span>  <span class="c1"># scans take longer</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Scanned </span><span class="si">{</span><span class="n">summary</span><span class="p">[</span><span class="s1">&#39;agents_success&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> machines&quot;</span><span class="p">)</span>
+
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;security.vuln_scan.scan&quot;</span><span class="p">,</span> <span class="n">exec_id</span><span class="p">)</span>
+<span class="n">critical</span> <span class="o">=</span> <span class="p">[</span><span class="n">r</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">responses</span> <span class="k">if</span> <span class="n">r</span><span class="p">[</span><span class="s2">&quot;output&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;severity&quot;</span><span class="p">)</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;critical&quot;</span><span class="p">,</span> <span class="s2">&quot;high&quot;</span><span class="p">)]</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Found </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">critical</span><span class="p">)</span><span class="si">}</span><span class="s2"> critical/high vulnerabilities across fleet&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="cel-compliance-expression_5">CEL Compliance Expression</h4>
+<p>Policy: no critical vulnerabilities allowed:</p>
+<div class="highlight"><pre><span></span><code>result.severity != &#39;critical&#39; &amp;&amp; result.severity != &#39;high&#39;
+</code></pre></div>
+<p>Policy: CVSS score must be below threshold:</p>
+<div class="highlight"><pre><span></span><code>result.cvss_score &lt; 7.0
+</code></pre></div>
+<hr>
+<h3 id="110-hardware-hardware">1.10 Hardware (<code>hardware</code>)</h3>
+<p>Hardware inventory with no parameters. Demonstrates simple asset tracking.</p>
+<h4 id="python-collect-hardware-inventory-from-all-machines">Python: Collect Hardware Inventory from All Machines</h4>
+<div class="highlight"><pre><span></span><code><span class="k">for</span> <span class="n">action</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;manufacturer&quot;</span><span class="p">,</span> <span class="s2">&quot;model&quot;</span><span class="p">,</span> <span class="s2">&quot;processors&quot;</span><span class="p">,</span> <span class="s2">&quot;memory&quot;</span><span class="p">,</span> <span class="s2">&quot;disks&quot;</span><span class="p">]:</span>
+    <span class="n">exec_id</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;device.hardware.</span><span class="si">{</span><span class="n">action</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">)</span>
+
+<span class="c1"># Query manufacturer results</span>
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;device.hardware.manufacturer&quot;</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;agent_id&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">row</span><span class="p">[</span><span class="s1">&#39;output&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;manufacturer&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;Unknown&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="cel-compliance-expression_6">CEL Compliance Expression</h4>
+<p>Policy: minimum 8 GB RAM required:</p>
+<div class="highlight"><pre><span></span><code>result.total_memory_mb &gt;= 8192
+</code></pre></div>
+<hr>
+<h2 id="part-2-chaining-instructions">Part 2: Chaining Instructions</h2>
+<h3 id="scenario-find-os-version-for-all-windows-machines-that-connected-to-httpsexamplecom-in-the-last-90-days">Scenario: "Find OS version for all Windows machines that connected to <a href="https://example.com">https://example.com</a> in the last 90 days"</h3>
+<h4 id="query-plan">Query Plan</h4>
+<p>Apply the cheapest filters first to minimize work at each stage:</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>What</th>
+<th>Why first</th>
+<th>Cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Scope to <code>ostype == "windows"</code></td>
+<td>Attribute check, instant</td>
+<td>Free (scope engine)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Query TAR for network events matching <code>example.com</code></td>
+<td>SQLite SELECT on agent-side TAR DB</td>
+<td>Medium (per-agent DB query)</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Run <code>os_info.os_version</code> on matching agents only</td>
+<td>Only runs on the filtered set</td>
+<td>Low (small target set)</td>
+</tr>
+</tbody>
+</table>
+<p>The key insight: <strong>use the TAR (Timeline Activity Record), not netstat.</strong> <code>netstat</code> only shows <em>current</em> connections. The TAR continuously records network connection events (opened/closed) with timestamps, so it has 90 days of history. Each TAR network event stores both the IP and the DNS hostname (resolved at collection time):</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;proto&quot;</span><span class="p">:</span><span class="s2">&quot;tcp&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;local_addr&quot;</span><span class="p">:</span><span class="s2">&quot;10.0.1.5&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;local_port&quot;</span><span class="p">:</span><span class="mi">52341</span><span class="p">,</span>
+<span class="w"> </span><span class="nt">&quot;remote_addr&quot;</span><span class="p">:</span><span class="s2">&quot;93.184.216.34&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;remote_host&quot;</span><span class="p">:</span><span class="s2">&quot;example.com&quot;</span><span class="p">,</span>
+<span class="w"> </span><span class="nt">&quot;remote_port&quot;</span><span class="p">:</span><span class="mi">443</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;state&quot;</span><span class="p">:</span><span class="s2">&quot;ESTABLISHED&quot;</span><span class="p">,</span>
+<span class="w"> </span><span class="nt">&quot;pid&quot;</span><span class="p">:</span><span class="mi">1234</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;process_name&quot;</span><span class="p">:</span><span class="s2">&quot;chrome.exe&quot;</span><span class="p">}</span>
+</code></pre></div>
+<p>The <code>remote_host</code> field is resolved via reverse DNS at the moment the connection is first recorded by the TAR collector. This means hostname searches are just a string match against stored data — no DNS resolution at query time.</p>
+<h4 id="complete-python-script">Complete Python Script</h4>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span> <span class="nn">requests</span><span class="o">,</span> <span class="nn">time</span><span class="o">,</span> <span class="nn">json</span>
+
+<span class="n">YUZU</span> <span class="o">=</span> <span class="s2">&quot;https://yuzu.example.com&quot;</span>
+<span class="n">TOKEN</span> <span class="o">=</span> <span class="s2">&quot;yuzu_tok_abc123...&quot;</span>
+<span class="n">HEADERS</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;X-Yuzu-Token&quot;</span><span class="p">:</span> <span class="n">TOKEN</span><span class="p">,</span> <span class="s2">&quot;Content-Type&quot;</span><span class="p">:</span> <span class="s2">&quot;application/json&quot;</span><span class="p">}</span>
+
+<span class="n">TARGET_HOSTNAME</span> <span class="o">=</span> <span class="s2">&quot;example.com&quot;</span>
+<span class="n">DAYS_BACK</span> <span class="o">=</span> <span class="mi">90</span>
+
+<span class="k">def</span> <span class="nf">execute</span><span class="p">(</span><span class="n">definition_id</span><span class="p">,</span> <span class="n">scope</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="n">r</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">YUZU</span><span class="si">}</span><span class="s2">/api/executions&quot;</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="n">HEADERS</span><span class="p">,</span> <span class="n">json</span><span class="o">=</span><span class="p">{</span>
+        <span class="s2">&quot;definition_id&quot;</span><span class="p">:</span> <span class="n">definition_id</span><span class="p">,</span>
+        <span class="s2">&quot;scope_expression&quot;</span><span class="p">:</span> <span class="n">scope</span><span class="p">,</span>
+        <span class="s2">&quot;parameter_values&quot;</span><span class="p">:</span> <span class="n">params</span> <span class="ow">or</span> <span class="p">{}</span>
+    <span class="p">})</span>
+    <span class="n">r</span><span class="o">.</span><span class="n">raise_for_status</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">r</span><span class="o">.</span><span class="n">json</span><span class="p">()[</span><span class="s2">&quot;id&quot;</span><span class="p">]</span>
+
+<span class="k">def</span> <span class="nf">wait_for</span><span class="p">(</span><span class="n">exec_id</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">300</span><span class="p">):</span>
+    <span class="n">deadline</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">+</span> <span class="n">timeout</span>
+    <span class="k">while</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">&lt;</span> <span class="n">deadline</span><span class="p">:</span>
+        <span class="n">r</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">YUZU</span><span class="si">}</span><span class="s2">/api/executions/</span><span class="si">{</span><span class="n">exec_id</span><span class="si">}</span><span class="s2">/summary&quot;</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="n">HEADERS</span><span class="p">)</span>
+        <span class="n">data</span> <span class="o">=</span> <span class="n">r</span><span class="o">.</span><span class="n">json</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">data</span><span class="p">[</span><span class="s2">&quot;status&quot;</span><span class="p">]</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;completed&quot;</span><span class="p">,</span> <span class="s2">&quot;failed&quot;</span><span class="p">,</span> <span class="s2">&quot;cancelled&quot;</span><span class="p">):</span>
+            <span class="k">return</span> <span class="n">data</span>
+        <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mi">3</span><span class="p">)</span>
+    <span class="k">raise</span> <span class="ne">TimeoutError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Execution </span><span class="si">{</span><span class="n">exec_id</span><span class="si">}</span><span class="s2"> timed out&quot;</span><span class="p">)</span>
+
+<span class="k">def</span> <span class="nf">get_responses</span><span class="p">(</span><span class="n">definition_id</span><span class="p">,</span> <span class="n">exec_id</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">limit</span><span class="o">=</span><span class="mi">10000</span><span class="p">):</span>
+    <span class="n">params</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;limit&quot;</span><span class="p">:</span> <span class="n">limit</span><span class="p">}</span>
+    <span class="k">if</span> <span class="n">exec_id</span><span class="p">:</span>
+        <span class="n">params</span><span class="p">[</span><span class="s2">&quot;execution_id&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">exec_id</span>
+    <span class="n">r</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">YUZU</span><span class="si">}</span><span class="s2">/api/responses/</span><span class="si">{</span><span class="n">definition_id</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+                     <span class="n">headers</span><span class="o">=</span><span class="n">HEADERS</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">params</span><span class="p">)</span>
+    <span class="n">r</span><span class="o">.</span><span class="n">raise_for_status</span><span class="p">()</span>
+    <span class="k">return</span> <span class="n">r</span><span class="o">.</span><span class="n">json</span><span class="p">()</span>
+
+<span class="c1"># ── Step 1: Query TAR on Windows machines for network events ─────────────</span>
+<span class="c1"># Scope to Windows first (cheapest filter — just an attribute check).</span>
+<span class="c1"># Then query the TAR for network events in the last 90 days.</span>
+<span class="n">since_epoch</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">())</span> <span class="o">-</span> <span class="p">(</span><span class="n">DAYS_BACK</span> <span class="o">*</span> <span class="mi">86400</span><span class="p">)</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Step 1: Querying TAR network events on all Windows machines (last </span><span class="si">{</span><span class="n">DAYS_BACK</span><span class="si">}</span><span class="s2"> days)...&quot;</span><span class="p">)</span>
+<span class="n">exec1</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;crossplatform.tar.query&quot;</span><span class="p">,</span>
+                <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;ostype == &quot;windows&quot;&#39;</span><span class="p">,</span>
+                <span class="n">params</span><span class="o">=</span><span class="p">{</span>
+                    <span class="s2">&quot;from&quot;</span><span class="p">:</span> <span class="nb">str</span><span class="p">(</span><span class="n">since_epoch</span><span class="p">),</span>
+                    <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;network&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;limit&quot;</span><span class="p">:</span> <span class="s2">&quot;10000&quot;</span>
+                <span class="p">})</span>
+<span class="n">summary1</span> <span class="o">=</span> <span class="n">wait_for</span><span class="p">(</span><span class="n">exec1</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">600</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  Received responses from </span><span class="si">{</span><span class="n">summary1</span><span class="p">[</span><span class="s1">&#39;agents_responded&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> agents&quot;</span><span class="p">)</span>
+
+<span class="c1"># ── Step 2: Filter TAR results for connections to our target hostname ────</span>
+<span class="c1"># TAR stores remote_host (DNS name resolved at collection time), so this</span>
+<span class="c1"># is a simple string match — no DNS resolution needed at query time.</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Step 2: Filtering for connections to </span><span class="si">{</span><span class="n">TARGET_HOSTNAME</span><span class="si">}</span><span class="s2">...&quot;</span><span class="p">)</span>
+<span class="n">responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;crossplatform.tar.query&quot;</span><span class="p">,</span> <span class="n">exec1</span><span class="p">)</span>
+
+<span class="n">matching_agents</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">responses</span><span class="p">:</span>
+    <span class="n">detail_str</span> <span class="o">=</span> <span class="n">row</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;output&quot;</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;detail_json&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">detail_str</span><span class="p">:</span>
+        <span class="k">continue</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">detail</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">detail_str</span><span class="p">)</span>
+        <span class="n">remote_host</span> <span class="o">=</span> <span class="n">detail</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;remote_host&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">TARGET_HOSTNAME</span> <span class="ow">in</span> <span class="n">remote_host</span><span class="p">:</span>
+            <span class="n">matching_agents</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">row</span><span class="p">[</span><span class="s2">&quot;agent_id&quot;</span><span class="p">])</span>
+    <span class="k">except</span> <span class="n">json</span><span class="o">.</span><span class="n">JSONDecodeError</span><span class="p">:</span>
+        <span class="k">continue</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  Found </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">matching_agents</span><span class="p">)</span><span class="si">}</span><span class="s2"> Windows machines that connected to </span><span class="si">{</span><span class="n">TARGET_HOSTNAME</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="ow">not</span> <span class="n">matching_agents</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;  No matching machines found. Done.&quot;</span><span class="p">)</span>
+    <span class="n">exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="c1"># ── Step 3: Get OS version from only those machines ──────────────────────</span>
+<span class="c1"># This is the lightest operation — runs only on the filtered set.</span>
+<span class="n">agent_list</span> <span class="o">=</span> <span class="s2">&quot;, &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;&quot;</span><span class="si">{</span><span class="n">aid</span><span class="si">}</span><span class="s1">&quot;&#39;</span> <span class="k">for</span> <span class="n">aid</span> <span class="ow">in</span> <span class="n">matching_agents</span><span class="p">)</span>
+<span class="n">scope_expr</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;agent_id IN (</span><span class="si">{</span><span class="n">agent_list</span><span class="si">}</span><span class="s2">)&quot;</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Step 3: Getting OS version from </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">matching_agents</span><span class="p">)</span><span class="si">}</span><span class="s2"> machines...&quot;</span><span class="p">)</span>
+<span class="n">exec3</span> <span class="o">=</span> <span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.os_info.os_version&quot;</span><span class="p">,</span> <span class="n">scope</span><span class="o">=</span><span class="n">scope_expr</span><span class="p">)</span>
+<span class="n">summary3</span> <span class="o">=</span> <span class="n">wait_for</span><span class="p">(</span><span class="n">exec3</span><span class="p">)</span>
+
+<span class="c1"># ── Results ──────────────────────────────────────────────────────────────</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">Windows machines that connected to </span><span class="si">{</span><span class="n">TARGET_HOSTNAME</span><span class="si">}</span><span class="s2"> in the last </span><span class="si">{</span><span class="n">DAYS_BACK</span><span class="si">}</span><span class="s2"> days:&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;-&quot;</span> <span class="o">*</span> <span class="mi">70</span><span class="p">)</span>
+<span class="n">os_responses</span> <span class="o">=</span> <span class="n">get_responses</span><span class="p">(</span><span class="s2">&quot;device.os_info.os_version&quot;</span><span class="p">,</span> <span class="n">exec3</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">row</span> <span class="ow">in</span> <span class="n">os_responses</span><span class="p">:</span>
+    <span class="n">version</span> <span class="o">=</span> <span class="n">row</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;output&quot;</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;os_version&quot;</span><span class="p">,</span> <span class="s2">&quot;unknown&quot;</span><span class="p">)</span>
+    <span class="n">product</span> <span class="o">=</span> <span class="n">row</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;output&quot;</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;os_product_version&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+    <span class="n">agent</span> <span class="o">=</span> <span class="n">row</span><span class="p">[</span><span class="s2">&quot;agent_id&quot;</span><span class="p">]</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  </span><span class="si">{</span><span class="n">agent</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">version</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">product</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">Total: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">os_responses</span><span class="p">)</span><span class="si">}</span><span class="s2"> machines&quot;</span><span class="p">)</span>
+</code></pre></div>
+<h4 id="why-this-order-matters">Why This Order Matters</h4>
+<div class="highlight"><pre><span></span><code>All agents (e.g., 10,000)
+    │
+    ▼ scope: ostype == &quot;windows&quot;    ← FREE (attribute check)
+Windows agents (e.g., 6,000)
+    │
+    ▼ TAR query: network events     ← MEDIUM (SQLite SELECT per agent)
+Connected to example.com (e.g., 47)
+    │
+    ▼ os_info.os_version            ← CHEAP (47 agents, not 6,000)
+Final results (47 rows)
+</code></pre></div>
+<p>If you reversed the order and ran <code>os_info</code> on all 10,000 agents first, you'd gather 10,000 OS version responses only to discard 9,953 of them. By filtering first with the TAR, you avoid dispatching unnecessary work to thousands of agents.</p>
+<h4 id="dashboard-ui-walkthrough">Dashboard UI Walkthrough</h4>
+<p><strong>Manual three-step approach:</strong></p>
+<ol>
+<li>
+<p><strong>Step 1: Query TAR on Windows fleet</strong>
+   - <strong>Instructions &gt; Definitions</strong> &gt; <code>crossplatform.tar.query</code>
+   - Scope: <code>ostype == "windows"</code>
+   - Parameters: <strong>Start Time</strong> = epoch for 90 days ago (e.g., <code>1719500000</code>), <strong>Event Type Filter</strong> = <code>network</code>, <strong>Result Limit</strong> = <code>10000</code>
+   - Click <strong>Run</strong></p>
+</li>
+<li>
+<p><strong>Step 2: Review TAR results</strong>
+   - <strong>Instructions &gt; Executions</strong> &gt; click the TAR query execution
+   - In the results, look at the <code>detail_json</code> column for <code>remote_addr</code> values matching the target IP (e.g., <code>93.184.216.34</code> for example.com)
+   - Note the agent IDs of matching machines</p>
+</li>
+<li>
+<p><strong>Step 3: Run os_version on matching machines</strong>
+   - <strong>Instructions &gt; Definitions</strong> &gt; <code>device.os_info.os_version</code>
+   - Scope: <code>agent_id IN ("agent-007", "agent-042", ...)</code> (paste the IDs from step 2)
+   - Click <strong>Run</strong>
+   - Results show OS versions for only the machines that connected to the target</p>
+</li>
+</ol>
+<hr>
+<h2 id="part-3-quick-reference">Part 3: Quick Reference</h2>
+<p>Every plugin and action at a glance. Use Part 1 walkthroughs for detailed examples.</p>
+<p><strong>Legend:</strong> Q = question (read-only), A = action (state-changing) | W = Windows, L = Linux, M = macOS</p>
+<h3 id="system-identity">System &amp; Identity</h3>
+<table>
+<thead>
+<tr>
+<th>Definition ID</th>
+<th>Action</th>
+<th>Type</th>
+<th>Platforms</th>
+<th>Parameters</th>
+<th>Result Columns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>device.os_info.os_name</code></td>
+<td>os_name</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>os_name:string</td>
+</tr>
+<tr>
+<td><code>device.os_info.os_version</code></td>
+<td>os_version</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>os_version:string, os_product_version:string</td>
+</tr>
+<tr>
+<td><code>device.os_info.os_build</code></td>
+<td>os_build</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>os_build:string</td>
+</tr>
+<tr>
+<td><code>device.os_info.os_arch</code></td>
+<td>os_arch</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>os_arch:string</td>
+</tr>
+<tr>
+<td><code>device.os_info.uptime</code></td>
+<td>uptime</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>uptime_seconds:int64, uptime_display:string</td>
+</tr>
+<tr>
+<td><code>device.hardware.manufacturer</code></td>
+<td>manufacturer</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>manufacturer:string</td>
+</tr>
+<tr>
+<td><code>device.hardware.model</code></td>
+<td>model</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>model:string</td>
+</tr>
+<tr>
+<td><code>device.hardware.bios</code></td>
+<td>bios</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>vendor:string, version:string, date:string</td>
+</tr>
+<tr>
+<td><code>device.hardware.processors</code></td>
+<td>processors</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>model:string, cores:int32, clock_mhz:int32</td>
+</tr>
+<tr>
+<td><code>device.hardware.memory</code></td>
+<td>memory</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>total_mb:int64, slots:int32, speed_mhz:int32</td>
+</tr>
+<tr>
+<td><code>device.hardware.disks</code></td>
+<td>disks</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>model:string, size_gb:int64, interface:string</td>
+</tr>
+<tr>
+<td><code>device.identity.device_name</code></td>
+<td>device_name</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>hostname:string</td>
+</tr>
+<tr>
+<td><code>device.identity.domain</code></td>
+<td>domain</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>domain:string, domain_type:string</td>
+</tr>
+<tr>
+<td><code>device.identity.ou</code></td>
+<td>ou</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>ou:string</td>
+</tr>
+<tr>
+<td><code>device.diagnostics.disk_space</code></td>
+<td>disk_space</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>drive:string, total_gb:int64, free_gb:int64</td>
+</tr>
+<tr>
+<td><code>device.diagnostics.cpu_usage</code></td>
+<td>cpu_usage</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>cpu_percent:int32</td>
+</tr>
+<tr>
+<td><code>device.diagnostics.memory_usage</code></td>
+<td>memory_usage</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>total_mb:int64, used_mb:int64, percent:int32</td>
+</tr>
+</tbody>
+</table>
+<h3 id="process-service">Process &amp; Service</h3>
+<table>
+<thead>
+<tr>
+<th>Definition ID</th>
+<th>Action</th>
+<th>Type</th>
+<th>Platforms</th>
+<th>Parameters</th>
+<th>Result Columns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crossplatform.process.list</code></td>
+<td>list</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>pid:int64, name:string</td>
+</tr>
+<tr>
+<td><code>crossplatform.process.query</code></td>
+<td>query</td>
+<td>Q</td>
+<td>WLM</td>
+<td>name:string (req)</td>
+<td>found:bool, pid:int64, name:string</td>
+</tr>
+<tr>
+<td><code>crossplatform.service.list</code></td>
+<td>list</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>name:string, display_name:string, status:string, startup_type:string</td>
+</tr>
+<tr>
+<td><code>crossplatform.service.running</code></td>
+<td>running</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>name:string, display_name:string, status:string, startup_type:string</td>
+</tr>
+<tr>
+<td><code>crossplatform.service.set_start_mode</code></td>
+<td>set_start_mode</td>
+<td>A</td>
+<td>WLM</td>
+<td>name:string (req), mode:enum (req)</td>
+<td>status:string, service:string, mode:string</td>
+</tr>
+</tbody>
+</table>
+<h3 id="user-session">User &amp; Session</h3>
+<table>
+<thead>
+<tr>
+<th>Definition ID</th>
+<th>Action</th>
+<th>Type</th>
+<th>Platforms</th>
+<th>Parameters</th>
+<th>Result Columns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>device.users.list</code></td>
+<td>list</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>username:string, full_name:string, enabled:bool</td>
+</tr>
+<tr>
+<td><code>device.users.logged_in</code></td>
+<td>logged_in</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>username:string, session_type:string, login_time:string</td>
+</tr>
+<tr>
+<td><code>device.users.groups</code></td>
+<td>groups</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>group_name:string, members:string</td>
+</tr>
+<tr>
+<td><code>device.users.admin_check</code></td>
+<td>admin_check</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>username:string, is_admin:bool</td>
+</tr>
+</tbody>
+</table>
+<h3 id="network">Network</h3>
+<table>
+<thead>
+<tr>
+<th>Definition ID</th>
+<th>Action</th>
+<th>Type</th>
+<th>Platforms</th>
+<th>Parameters</th>
+<th>Result Columns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>device.network_config.adapters</code></td>
+<td>adapters</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>name:string, mac:string, speed_mbps:int64, status:string</td>
+</tr>
+<tr>
+<td><code>device.network_config.ip_addresses</code></td>
+<td>ip_addresses</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>adapter:string, address:string, prefix_length:int32, gateway:string</td>
+</tr>
+<tr>
+<td><code>device.network_config.dns_servers</code></td>
+<td>dns_servers</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>adapter:string, server:string, type:string</td>
+</tr>
+<tr>
+<td><code>device.network_config.proxy</code></td>
+<td>proxy</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>proxy_type:string, proxy_address:string, bypass:string</td>
+</tr>
+<tr>
+<td><code>device.network_config.dns_cache</code></td>
+<td>dns_cache</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>name:string, record_type:string, ttl:int32</td>
+</tr>
+<tr>
+<td><code>device.network.netstat_list</code></td>
+<td>netstat</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>proto:string, local_addr:string, local_port:int32, remote_addr:string, remote_port:int32, state:string, pid:int32</td>
+</tr>
+<tr>
+<td><code>device.network_diag.listening</code></td>
+<td>listening</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>proto:string, local_addr:string, local_port:int32, pid:int32</td>
+</tr>
+<tr>
+<td><code>device.network_diag.connections</code></td>
+<td>connections</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>proto:string, local_addr:string, remote_addr:string, remote_port:int32, pid:int32</td>
+</tr>
+<tr>
+<td><code>device.network.sockwho_list</code></td>
+<td>sockwho</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>pid:int32, process_name:string, proto:string, local_addr:string, remote_addr:string, state:string</td>
+</tr>
+<tr>
+<td><code>device.network_actions.flush_dns</code></td>
+<td>flush_dns</td>
+<td>A</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>status:string, output:string</td>
+</tr>
+<tr>
+<td><code>device.network_actions.ping</code></td>
+<td>ping</td>
+<td>A</td>
+<td>WLM</td>
+<td>host:string (req)</td>
+<td>output:string</td>
+</tr>
+<tr>
+<td><code>device.wifi.list_networks</code></td>
+<td>wifi scan</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>ssid:string, signal:string, security:string</td>
+</tr>
+<tr>
+<td><code>device.wifi.connected</code></td>
+<td>wifi status</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>ssid:string, signal:string, security:string, bssid:string</td>
+</tr>
+<tr>
+<td><code>device.wol.wake</code></td>
+<td>wake</td>
+<td>A</td>
+<td>WLM</td>
+<td>mac:string (req), port:string</td>
+<td>status:string, bytes_sent:string</td>
+</tr>
+<tr>
+<td><code>device.discovery.scan_subnet</code></td>
+<td>discovery</td>
+<td>Q</td>
+<td>WLM</td>
+<td>subnet:string (req)</td>
+<td>ip_address:string, hostname:string, mac_address:string, managed:string</td>
+</tr>
+</tbody>
+</table>
+<h3 id="software-patch">Software &amp; Patch</h3>
+<table>
+<thead>
+<tr>
+<th>Definition ID</th>
+<th>Action</th>
+<th>Type</th>
+<th>Platforms</th>
+<th>Parameters</th>
+<th>Result Columns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crossplatform.software.inventory</code></td>
+<td>list</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>name:string, version:string, publisher:string, install_date:string</td>
+</tr>
+<tr>
+<td><code>crossplatform.software.query</code></td>
+<td>query</td>
+<td>Q</td>
+<td>WLM</td>
+<td>name:string (req)</td>
+<td>found:bool, name:string, version:string, publisher:string</td>
+</tr>
+<tr>
+<td><code>device.software_actions.list_upgradable</code></td>
+<td>upgradable</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>package_name:string, current_version:string, available_version:string</td>
+</tr>
+<tr>
+<td><code>device.software_actions.installed_count</code></td>
+<td>count</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>count:int32</td>
+</tr>
+<tr>
+<td><code>windows.software.msi.list</code></td>
+<td>msi list</td>
+<td>Q</td>
+<td>W</td>
+<td><em>(none)</em></td>
+<td>product_code:guid, name:string, version:string</td>
+</tr>
+<tr>
+<td><code>windows.software.msi.product_codes</code></td>
+<td>msi codes</td>
+<td>Q</td>
+<td>W</td>
+<td><em>(none)</em></td>
+<td>product_code:guid, name:string</td>
+</tr>
+<tr>
+<td><code>device.windows_updates.installed</code></td>
+<td>installed updates</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>identifier:string, description:string, install_date:string</td>
+</tr>
+<tr>
+<td><code>device.windows_updates.missing</code></td>
+<td>missing updates</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>title:string, severity:string</td>
+</tr>
+<tr>
+<td><code>device.windows_updates.pending_reboot</code></td>
+<td>pending reboot</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>source:string, pending:bool, detail:string</td>
+</tr>
+</tbody>
+</table>
+<h3 id="security">Security</h3>
+<table>
+<thead>
+<tr>
+<th>Definition ID</th>
+<th>Action</th>
+<th>Type</th>
+<th>Platforms</th>
+<th>Parameters</th>
+<th>Result Columns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>security.antivirus.products</code></td>
+<td>products</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>name:string, state:string</td>
+</tr>
+<tr>
+<td><code>security.antivirus.defender_status</code></td>
+<td>defender</td>
+<td>Q</td>
+<td>W</td>
+<td><em>(none)</em></td>
+<td>realtime_protection:string, definition_version:string, last_update:string</td>
+</tr>
+<tr>
+<td><code>security.firewall.state</code></td>
+<td>state</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>profile_or_backend:string, state:string</td>
+</tr>
+<tr>
+<td><code>security.firewall.rules</code></td>
+<td>rules</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>rule_name:string, enabled:string, direction:string, action:string</td>
+</tr>
+<tr>
+<td><code>security.certificates.list</code></td>
+<td>list</td>
+<td>Q</td>
+<td>WLM</td>
+<td>store:string, expiring_within_days:int32</td>
+<td>subject:string, issuer:string, thumbprint:string, not_after:string</td>
+</tr>
+<tr>
+<td><code>security.certificates.details</code></td>
+<td>details</td>
+<td>Q</td>
+<td>WLM</td>
+<td>thumbprint:string (req)</td>
+<td>subject:string, issuer:string, thumbprint:string, serial:string</td>
+</tr>
+<tr>
+<td><code>security.certificates.delete</code></td>
+<td>delete</td>
+<td>A</td>
+<td>WLM</td>
+<td>thumbprint:string (req), store:string</td>
+<td>status:string</td>
+</tr>
+<tr>
+<td><code>device.event_logs.errors</code></td>
+<td>errors</td>
+<td>Q</td>
+<td>WLM</td>
+<td>log:string, hours:int32</td>
+<td>timestamp:string, event_id:string, source:string, message:string</td>
+</tr>
+<tr>
+<td><code>device.event_logs.query</code></td>
+<td>query</td>
+<td>Q</td>
+<td>WLM</td>
+<td>log:string (req), filter:string (req), count:int32</td>
+<td>timestamp:string, level:string, event_id:string, message:string</td>
+</tr>
+<tr>
+<td><code>security.ioc.check</code></td>
+<td>ioc check</td>
+<td>Q</td>
+<td>WLM</td>
+<td>ip_addresses:string, domains:string, file_hashes:string</td>
+<td>type:string, value:string, matched:bool, detail:string</td>
+</tr>
+<tr>
+<td><code>security.vuln_scan.scan</code></td>
+<td>vuln scan</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>severity:string, category:string, title:string, detail:string</td>
+</tr>
+<tr>
+<td><code>security.vuln_scan.summary</code></td>
+<td>vuln summary</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>severity:string, count:int32</td>
+</tr>
+<tr>
+<td><code>security.encryption.state</code></td>
+<td>bitlocker</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>volume:string, protection_status:string, encryption_method:string</td>
+</tr>
+<tr>
+<td><code>security.quarantine.status</code></td>
+<td>status</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>state:string, whitelist:string</td>
+</tr>
+<tr>
+<td><code>security.quarantine.isolate</code></td>
+<td>isolate</td>
+<td>A</td>
+<td>WLM</td>
+<td>server_ip:string, whitelist_ips:string</td>
+<td>status:string, rules_applied:int32</td>
+</tr>
+<tr>
+<td><code>security.quarantine.release</code></td>
+<td>release</td>
+<td>A</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>status:string</td>
+</tr>
+<tr>
+<td><code>security.sccm.client_version</code></td>
+<td>sccm version</td>
+<td>Q</td>
+<td>W</td>
+<td><em>(none)</em></td>
+<td>installed:bool, version:string, service_status:string</td>
+</tr>
+</tbody>
+</table>
+<h3 id="file-system">File System</h3>
+<table>
+<thead>
+<tr>
+<th>Definition ID</th>
+<th>Action</th>
+<th>Type</th>
+<th>Platforms</th>
+<th>Parameters</th>
+<th>Result Columns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>device.filesystem.exists</code></td>
+<td>exists</td>
+<td>Q</td>
+<td>WLM</td>
+<td>path:string (req), base_dir:string</td>
+<td>exists:bool, type:string, size:int64</td>
+</tr>
+<tr>
+<td><code>device.filesystem.list_dir</code></td>
+<td>list_dir</td>
+<td>Q</td>
+<td>WLM</td>
+<td>path:string (req), base_dir:string</td>
+<td>entry_name:string, entry_type:string, size:int64</td>
+</tr>
+<tr>
+<td><code>device.filesystem.file_hash</code></td>
+<td>file_hash</td>
+<td>Q</td>
+<td>WLM</td>
+<td>path:string (req), algorithm:string</td>
+<td>hash:string, algorithm:string, size:int64</td>
+</tr>
+<tr>
+<td><code>device.filesystem.read</code></td>
+<td>read</td>
+<td>Q</td>
+<td>WLM</td>
+<td>path:string (req), base_dir:string, max_bytes:int32</td>
+<td>content:clob, size:int64</td>
+</tr>
+<tr>
+<td><code>device.filesystem.search</code></td>
+<td>search</td>
+<td>Q</td>
+<td>WLM</td>
+<td>path:string (req), pattern:string (req), base_dir:string</td>
+<td>total_matches:int32, line:int32, text:string</td>
+</tr>
+<tr>
+<td><code>device.filesystem.replace</code></td>
+<td>replace</td>
+<td>A</td>
+<td>WLM</td>
+<td>path:string (req), search:string (req), replace:string (req)</td>
+<td>replacements_made:int32</td>
+</tr>
+<tr>
+<td><code>device.filesystem.write_content</code></td>
+<td>write_content</td>
+<td>A</td>
+<td>WLM</td>
+<td>path:string (req), content:string (req)</td>
+<td>status:string, bytes_written:int64</td>
+</tr>
+<tr>
+<td><code>device.filesystem.create_temp</code></td>
+<td>create_temp</td>
+<td>Q</td>
+<td>WLM</td>
+<td>prefix:string</td>
+<td>path:string</td>
+</tr>
+<tr>
+<td><code>device.filesystem.delete</code></td>
+<td>delete</td>
+<td>A</td>
+<td>WLM</td>
+<td>path:string (req)</td>
+<td>status:string</td>
+</tr>
+<tr>
+<td><code>device.filesystem.copy</code></td>
+<td>copy</td>
+<td>A</td>
+<td>WLM</td>
+<td>source:string (req), dest:string (req)</td>
+<td>status:string, bytes:int64</td>
+</tr>
+<tr>
+<td><code>device.filesystem.move</code></td>
+<td>move</td>
+<td>A</td>
+<td>WLM</td>
+<td>source:string (req), dest:string (req)</td>
+<td>status:string</td>
+</tr>
+<tr>
+<td><code>device.filesystem.mkdir</code></td>
+<td>mkdir</td>
+<td>A</td>
+<td>WLM</td>
+<td>path:string (req)</td>
+<td>status:string</td>
+</tr>
+<tr>
+<td><code>device.filesystem.permissions</code></td>
+<td>permissions</td>
+<td>Q</td>
+<td>WLM</td>
+<td>path:string (req)</td>
+<td>owner:string, group:string, mode:string</td>
+</tr>
+<tr>
+<td><code>device.filesystem.set_permissions</code></td>
+<td>set_permissions</td>
+<td>A</td>
+<td>WLM</td>
+<td>path:string (req), mode:string (req)</td>
+<td>status:string</td>
+</tr>
+<tr>
+<td><code>device.filesystem.disk_usage</code></td>
+<td>disk_usage</td>
+<td>Q</td>
+<td>WLM</td>
+<td>path:string (req)</td>
+<td>total_bytes:int64, used_bytes:int64, free_bytes:int64</td>
+</tr>
+</tbody>
+</table>
+<h3 id="execution">Execution</h3>
+<table>
+<thead>
+<tr>
+<th>Definition ID</th>
+<th>Action</th>
+<th>Type</th>
+<th>Platforms</th>
+<th>Parameters</th>
+<th>Result Columns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>crossplatform.script.exec</code></td>
+<td>exec</td>
+<td>A</td>
+<td>WLM</td>
+<td>command:string (req), timeout:int32</td>
+<td>exit_code:int32, stdout:clob, stderr:clob</td>
+</tr>
+<tr>
+<td><code>crossplatform.script.powershell</code></td>
+<td>powershell</td>
+<td>A</td>
+<td>W</td>
+<td>command:string (req), timeout:int32</td>
+<td>exit_code:int32, stdout:clob, stderr:clob</td>
+</tr>
+<tr>
+<td><code>crossplatform.script.bash</code></td>
+<td>bash</td>
+<td>A</td>
+<td>LM</td>
+<td>command:string (req), timeout:int32</td>
+<td>exit_code:int32, stdout:clob, stderr:clob</td>
+</tr>
+</tbody>
+</table>
+<h3 id="http-content-distribution">HTTP &amp; Content Distribution</h3>
+<table>
+<thead>
+<tr>
+<th>Definition ID</th>
+<th>Action</th>
+<th>Type</th>
+<th>Platforms</th>
+<th>Parameters</th>
+<th>Result Columns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>device.http.get</code></td>
+<td>get</td>
+<td>Q</td>
+<td>WLM</td>
+<td>url:string (req), headers:string</td>
+<td>status_code:int32, body:clob, content_type:string</td>
+</tr>
+<tr>
+<td><code>device.http.download</code></td>
+<td>download</td>
+<td>A</td>
+<td>WLM</td>
+<td>url:string (req), dest:string (req), hash:string</td>
+<td>status:string, bytes:int64, hash_ok:bool</td>
+</tr>
+<tr>
+<td><code>device.content.deploy</code></td>
+<td>deploy</td>
+<td>A</td>
+<td>WLM</td>
+<td>package_id:string (req), dest:string (req)</td>
+<td>status:string, files:int32</td>
+</tr>
+</tbody>
+</table>
+<h3 id="windows-depth">Windows Depth</h3>
+<table>
+<thead>
+<tr>
+<th>Definition ID</th>
+<th>Action</th>
+<th>Type</th>
+<th>Platforms</th>
+<th>Parameters</th>
+<th>Result Columns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>windows.registry.get_value</code></td>
+<td>get_value</td>
+<td>Q</td>
+<td>W</td>
+<td>hive:enum (req), key:string (req), name:string (req)</td>
+<td>value:string, type:string</td>
+</tr>
+<tr>
+<td><code>windows.registry.get_user_value</code></td>
+<td>get_user_value</td>
+<td>Q</td>
+<td>W</td>
+<td>username:string (req), key:string (req), name:string</td>
+<td>username:string, value:string, type:string</td>
+</tr>
+<tr>
+<td><code>windows.registry.set_value</code></td>
+<td>set_value</td>
+<td>A</td>
+<td>W</td>
+<td>hive:enum (req), key:string (req), name:string (req), value:string (req), type:enum</td>
+<td>status:string</td>
+</tr>
+<tr>
+<td><code>windows.registry.delete_value</code></td>
+<td>delete_value</td>
+<td>A</td>
+<td>W</td>
+<td>hive:enum (req), key:string (req), name:string (req)</td>
+<td>status:string</td>
+</tr>
+<tr>
+<td><code>windows.registry.delete_key</code></td>
+<td>delete_key</td>
+<td>A</td>
+<td>W</td>
+<td>hive:enum (req), key:string (req)</td>
+<td>status:string</td>
+</tr>
+<tr>
+<td><code>windows.registry.enumerate_keys</code></td>
+<td>enum_keys</td>
+<td>Q</td>
+<td>W</td>
+<td>hive:enum (req), key:string (req)</td>
+<td>subkey:string</td>
+</tr>
+<tr>
+<td><code>windows.registry.enumerate_values</code></td>
+<td>enum_values</td>
+<td>Q</td>
+<td>W</td>
+<td>hive:enum (req), key:string (req)</td>
+<td>name:string, type:string</td>
+</tr>
+<tr>
+<td><code>windows.registry.key_exists</code></td>
+<td>key_exists</td>
+<td>Q</td>
+<td>W</td>
+<td>hive:enum (req), key:string (req)</td>
+<td>exists:bool</td>
+</tr>
+<tr>
+<td><code>windows.wmi.query</code></td>
+<td>wmi query</td>
+<td>Q</td>
+<td>W</td>
+<td>wql:string (req), namespace:string</td>
+<td>property:string, value:string</td>
+</tr>
+<tr>
+<td><code>windows.wmi.get_instance</code></td>
+<td>wmi get</td>
+<td>Q</td>
+<td>W</td>
+<td>class:string (req), namespace:string</td>
+<td>property:string, value:string</td>
+</tr>
+</tbody>
+</table>
+<h3 id="agent-infrastructure">Agent Infrastructure</h3>
+<table>
+<thead>
+<tr>
+<th>Definition ID</th>
+<th>Action</th>
+<th>Type</th>
+<th>Platforms</th>
+<th>Parameters</th>
+<th>Result Columns</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>device.status.version</code></td>
+<td>version</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>version:string, build_number:string, git_commit:string</td>
+</tr>
+<tr>
+<td><code>device.status.info</code></td>
+<td>info</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>os:string, arch:string, hostname:string</td>
+</tr>
+<tr>
+<td><code>device.status.health</code></td>
+<td>health</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>uptime_seconds:int64, memory_rss_kb:int64</td>
+</tr>
+<tr>
+<td><code>device.status.plugins</code></td>
+<td>plugins</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>plugins_count:int32, plugin_name:string, plugin_version:string</td>
+</tr>
+<tr>
+<td><code>device.status.connection</code></td>
+<td>connection</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>server_address:string, tls_enabled:bool, log_level:string</td>
+</tr>
+<tr>
+<td><code>device.status.config</code></td>
+<td>config</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>agent_id:string, agent_version:string, server_address:string</td>
+</tr>
+<tr>
+<td><code>device.agent_actions.set_log_level</code></td>
+<td>set_log_level</td>
+<td>A</td>
+<td>WLM</td>
+<td>level:enum (req)</td>
+<td>status:string, level:string</td>
+</tr>
+<tr>
+<td><code>device.agent_actions.info</code></td>
+<td>agent info</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>agent_id:string, agent_version:string, server_address:string, heartbeat_interval:string, plugins_count:int32</td>
+</tr>
+<tr>
+<td><code>device.agent_logging.get_log</code></td>
+<td>get log</td>
+<td>Q</td>
+<td>WLM</td>
+<td>lines:int32</td>
+<td>log_file:string, line_count:int32, line:string</td>
+</tr>
+<tr>
+<td><code>device.tags.set</code></td>
+<td>set tag</td>
+<td>A</td>
+<td>WLM</td>
+<td>key:string (req), value:string</td>
+<td>key:string, value:string</td>
+</tr>
+<tr>
+<td><code>device.tags.get</code></td>
+<td>get tag</td>
+<td>Q</td>
+<td>WLM</td>
+<td>key:string (req)</td>
+<td>key:string, value:string</td>
+</tr>
+<tr>
+<td><code>device.tags.get_all</code></td>
+<td>list tags</td>
+<td>Q</td>
+<td>WLM</td>
+<td><em>(none)</em></td>
+<td>key:string, value:string, count:int32</td>
+</tr>
+<tr>
+<td><code>device.tags.delete</code></td>
+<td>delete tag</td>
+<td>A</td>
+<td>WLM</td>
+<td>key:string (req)</td>
+<td>key:string, found:bool</td>
+</tr>
+<tr>
+<td><code>agent.storage.set</code></td>
+<td>set kv</td>
+<td>A</td>
+<td>WLM</td>
+<td>key:string (req), value:string (req)</td>
+<td>status:string, key:string</td>
+</tr>
+<tr>
+<td><code>agent.storage.get</code></td>
+<td>get kv</td>
+<td>Q</td>
+<td>WLM</td>
+<td>key:string (req)</td>
+<td>key:string, value:string</td>
+</tr>
+<tr>
+<td><code>agent.storage.list</code></td>
+<td>list kv</td>
+<td>Q</td>
+<td>WLM</td>
+<td>prefix:string</td>
+<td>count:int32, key:string</td>
+</tr>
+</tbody>
+</table>
+<h3 id="python-quick-reference-snippets">Python Quick-Reference Snippets</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># ── One-liner examples for common operations ─────────────────────────────</span>
+
+<span class="c1"># Get OS name from all machines</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.os_info.os_name&quot;</span><span class="p">)</span>
+
+<span class="c1"># List services on production Windows</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;crossplatform.service.list&quot;</span><span class="p">,</span> <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;ostype == &quot;windows&quot; AND tag:env == &quot;production&quot;&#39;</span><span class="p">)</span>
+
+<span class="c1"># Check if nginx is running on web servers</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;crossplatform.process.query&quot;</span><span class="p">,</span> <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;hostname LIKE &quot;web-*&quot;&#39;</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;nginx&quot;</span><span class="p">})</span>
+
+<span class="c1"># Hash a file across all Linux machines</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.filesystem.file_hash&quot;</span><span class="p">,</span> <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;ostype == &quot;linux&quot;&#39;</span><span class="p">,</span>
+        <span class="n">params</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="s2">&quot;/usr/bin/ssh&quot;</span><span class="p">,</span> <span class="s2">&quot;algorithm&quot;</span><span class="p">:</span> <span class="s2">&quot;sha256&quot;</span><span class="p">})</span>
+
+<span class="c1"># Read a registry value on Windows</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;windows.registry.get_value&quot;</span><span class="p">,</span> <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;ostype == &quot;windows&quot;&#39;</span><span class="p">,</span>
+        <span class="n">params</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;hive&quot;</span><span class="p">:</span> <span class="s2">&quot;HKLM&quot;</span><span class="p">,</span> <span class="s2">&quot;key&quot;</span><span class="p">:</span> <span class="s2">&quot;SOFTWARE</span><span class="se">\\</span><span class="s2">Microsoft</span><span class="se">\\</span><span class="s2">Windows NT</span><span class="se">\\</span><span class="s2">CurrentVersion&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;value&quot;</span><span class="p">:</span> <span class="s2">&quot;ProductName&quot;</span><span class="p">})</span>
+
+<span class="c1"># Run a PowerShell command on one machine</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;crossplatform.script.powershell&quot;</span><span class="p">,</span> <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;agent_id == &quot;agent-007&quot;&#39;</span><span class="p">,</span>
+        <span class="n">params</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;command&quot;</span><span class="p">:</span> <span class="s2">&quot;Get-ComputerInfo | Select-Object OsName, OsVersion&quot;</span><span class="p">})</span>
+
+<span class="c1"># Scan for vulnerabilities fleet-wide</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;security.vuln_scan.scan&quot;</span><span class="p">)</span>
+
+<span class="c1"># Get hardware inventory</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.hardware.manufacturer&quot;</span><span class="p">)</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.hardware.memory&quot;</span><span class="p">)</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.hardware.disks&quot;</span><span class="p">)</span>
+
+<span class="c1"># Check antivirus status on all endpoints</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;security.antivirus.products&quot;</span><span class="p">)</span>
+
+<span class="c1"># Get network connections (for chaining)</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.network.netstat_list&quot;</span><span class="p">,</span> <span class="n">scope</span><span class="o">=</span><span class="s1">&#39;ostype == &quot;windows&quot;&#39;</span><span class="p">)</span>
+
+<span class="c1"># Deploy content package</span>
+<span class="n">execute</span><span class="p">(</span><span class="s2">&quot;device.content.deploy&quot;</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;package_id&quot;</span><span class="p">:</span> <span class="s2">&quot;pkg-001&quot;</span><span class="p">,</span> <span class="s2">&quot;dest&quot;</span><span class="p">:</span> <span class="s2">&quot;/opt/myapp&quot;</span><span class="p">})</span>
+</code></pre></div>
+</main>
+</body>
+</html>

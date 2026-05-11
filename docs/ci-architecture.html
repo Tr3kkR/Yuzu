@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CI architecture — runner topology, vcpkg cache, persistence</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/ci-architecture.md</div>
+<h1 class="doc-title">CI architecture — runner topology, vcpkg cache, persistence</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="ci-architecture-runner-topology-vcpkg-cache-persistence">CI architecture — runner topology, vcpkg cache, persistence</h1>
+<p>Reference for Yuzu's three-tier CI architecture (April 2026 overhaul).
+CLAUDE.md keeps the headline tier breakdown + runner topology; this document
+holds the cache-key contract, persistence rules, and operational knobs that
+the <code>build-ci</code> agent loads on workflow / vcpkg / scripts/ci changes.</p>
+<p>Plan of record: <code>/home/dornbrn/.claude/plans/our-ci-has-been-piped-castle.md</code>.
+Failure-mode runbook: <a href="ci-troubleshooting.html" class="doc-ref"><code>docs/ci-troubleshooting.md</code></a>.</p>
+<h2 id="tier-summary-mirrors-claudemd">Tier summary (mirrors CLAUDE.md)</h2>
+<ul>
+<li><strong>Tier 1 — PR fast-path</strong> (<code>ci.yml</code> on <code>pull_request</code>): one Linux variant
+  (gcc-13 debug on <code>yuzu-wsl2-linux</code>), one Windows variant (MSVC debug on
+  <code>yuzu-local-windows</code>), one macOS variant (appleclang debug on GHA-hosted
+  <code>macos-15</code>), plus <code>proto-compat</code>. Wall target: &lt;10 min per leg.</li>
+<li><strong>Tier 2 — push to dev/main</strong> (<code>ci.yml</code> on push): full 4-way Linux matrix
+  (gcc-13 / clang-19 × debug / release), 2-way Windows, 2-way macOS. <strong>No
+  sanitizers, no coverage</strong> — those moved out (#410).</li>
+<li><strong>Tier 3 — nightly cron</strong> (<code>nightly.yml</code>, <code>0 6 * * *</code> UTC +
+  <code>workflow_dispatch</code>): ASan+UBSan, TSan, coverage on the self-hosted Linux
+  runner. On any leg failure, the <code>alert</code> job auto-opens or comments on a
+  <code>nightly-broken</code> issue. <strong>Discipline norm: no merge to main while a
+  <code>nightly-broken</code> issue is open.</strong></li>
+</ul>
+<p><code>workflow_dispatch</code> only works once a workflow file exists on the <strong>default
+branch (<code>main</code>)</strong>. Cron schedules likewise. New workflows added on <code>dev</code> are
+dormant until merged.</p>
+<h2 id="self-hosted-runner-topology">Self-hosted runner topology</h2>
+<table>
+<thead>
+<tr>
+<th>Runner</th>
+<th>Host</th>
+<th>Jobs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu-wsl2-linux</code></td>
+<td>Shulgi 5950X WSL2 Ubuntu 24.04</td>
+<td>proto-compat, linux matrix, nightly (asan/tsan/coverage), cache-prune-linux</td>
+</tr>
+<tr>
+<td><code>yuzu-local-windows</code></td>
+<td>Shulgi native Windows 11</td>
+<td>windows matrix, cache-prune-windows</td>
+</tr>
+<tr>
+<td><code>macos-15</code></td>
+<td>GitHub-hosted</td>
+<td>macos matrix</td>
+</tr>
+</tbody>
+</table>
+<p>Inventory declared in <code>.github/runner-inventory.json</code>. The sentinel at
+<code>runner-inventory-sentinel.yml</code> (every 30 min) compares actual to expected
+and opens a <code>runner-inventory-drift</code> issue on mismatch. Both the sentinel
+and the new ci.yml <code>preflight</code> job share <code>scripts/ci/runner-health-check.py</code>
+(<code>--mode sentinel</code> vs <code>--mode preflight</code>). Preflight gates downstream
+self-hosted jobs with explicit
+<code>if: needs.preflight.outputs.&lt;runner&gt;_healthy == 'true'</code> — fail-closed: a
+degraded runner skips its jobs in &lt;30 s rather than queueing 30 min into a
+stalled runner. Requires the <code>RUNNER_INVENTORY_TOKEN</code> PAT secret
+(fine-grained, Administration:read on Tr3kkR/Yuzu); without it preflight
+returns false and self-hosted jobs are skipped with a clear reason.</p>
+<h2 id="universal-vcpkg-cache-key-contract">Universal vcpkg cache-key contract</h2>
+<p><code>scripts/ci/vcpkg-triplet-sentinel.sh</code> is the single source of truth for
+"have the inputs to vcpkg actually changed?". Key:</p>
+<div class="highlight"><pre><span></span><code>sha256(vcpkg.json + vcpkg-configuration.json + triplets/&lt;triplet&gt;.cmake + $VCPKG_COMMIT)
+</code></pre></div>
+<p>Stored at <code>vcpkg_installed/.&lt;triplet&gt;-cachekey.sha256</code>. On drift, wipes
+<code>vcpkg_installed/&lt;triplet&gt;/</code> AND <code>vcpkg_installed/vcpkg/</code> (the
+per-workspace registry — <code>info/</code>, <code>status</code>, <code>updates/</code>. Leaving the
+registry behind after wiping the triplet tree leaves orphaned
+<code>info/&lt;port&gt;_&lt;triplet&gt;.list</code> entries that make the next <code>vcpkg install</code>
+short-circuit to "already installed" and then fail post-install
+pkgconfig validation; this was #741.) Never touches <code>$WS/vcpkg/</code> (the
+sibling vcpkg tool root, owned by lukka/run-vcpkg), never
+<code>runner.tool_cache</code>, never ccache. Persistence: self-hosted in
+<code>${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows}</code>
+(per-triplet, outside workspace). macOS uses <code>actions/cache@v5</code> keyed on
+the same invariant.</p>
+<p>The script must run cleanly under MSYS2 bash on Windows. <strong>Do NOT use
+<code>set -e</code> + <code>[[ test ]] &amp;&amp; cmd</code> short-circuits</strong> — they silently exit under
+MSYS2 (cost us run #25051196135). Use <code>if/fi</code> blocks and explicit
+per-command error checks.</p>
+<h2 id="persistence-and-recovery">Persistence and recovery</h2>
+<p>Self-hosted checkouts use <code>clean: false</code>. Pre-checkout wipes <code>build-&lt;os&gt;/</code>
+ONLY on branch change; vcpkg state is invalidated by the sentinel above.
+<code>meson setup --reconfigure</code> when <code>meson-info/</code> exists. Manual recovery:
+<code>bash scripts/ci/runner-reset.sh</code>
+(<code>git clean -fdx -e vcpkg/ -e vcpkg_installed/ -e build-*/</code>) — <strong>the only
+sanctioned in-repo nuke path</strong>; never <code>rm -rf</code> runner caches (memory
+<code>feedback_vcpkg_cache.md</code>).</p>
+<h2 id="per-os-build-directory-names">Per-OS build directory names</h2>
+<p>Matrix: <code>build-{linux,windows,macos}</code>. Nightly variants:
+<code>build-linux-{asan,tsan,coverage}</code>. <code>sanitizer-tests.yml</code> + <code>release.yml</code> +
+<code>pre-release.yml</code> follow the same convention so the warm asan binary cache
+is shared. Closes #406.</p>
+<h2 id="workflow-pr-canary">Workflow-PR canary</h2>
+<p><code>ci.yml</code>'s <code>detect-ci-changes</code> + <code>canary</code> jobs run only when a PR touches
+<code>.github/workflows/</code>, <code>.github/actions/</code>, or <code>scripts/ci/</code>. Canary mirrors
+the linux build on a fresh-disk GHA-hosted <code>ubuntu-24.04</code> with
+<code>actions/cache</code> for vcpkg — catches workflow regressions before main.</p>
+<h2 id="cache-pruning">Cache pruning</h2>
+<p><code>cache-prune.yml</code> runs weekly (Sun 04:00 UTC) on each self-hosted runner.
+Deletes <code>${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/&lt;file&gt;</code> &gt;30 days
+old. Does not touch ccache (own LRU at <code>CCACHE_MAXSIZE=30G</code>).</p>
+<h2 id="vcpkg-state-corruption-recovery-path">vcpkg state corruption — recovery path</h2>
+<p>If a Windows CI run repeatedly fails at <code>Install vcpkg packages</code> with a
+missing <code>.pc</code> file under <code>vcpkg_installed/x64-windows/lib/pkgconfig/</code>, the
+corruption is in <code>vcpkg/packages/</code> (which the cache-key sentinel does NOT
+reach). Recovery procedure + full corruption-path inventory:
+<a href="ci-troubleshooting.html" class="doc-ref"><code>docs/ci-troubleshooting.md</code></a> §7. Don't leave the recovery step in <code>ci.yml</code>
+after an incident — it defeats the cache.</p>
+</main>
+</body>
+</html>

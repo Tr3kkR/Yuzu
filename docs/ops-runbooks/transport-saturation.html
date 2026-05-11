@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runbook: Transport saturation + agent channel-fault alerts</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/ops-runbooks/transport-saturation.md</div>
+<h1 class="doc-title">Runbook: Transport saturation + agent channel-fault alerts</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="runbook-transport-saturation-agent-channel-fault-alerts">Runbook: Transport saturation + agent channel-fault alerts</h1>
+<p>This runbook covers the three Grafana alerts that fire on the agent-listener transport surface:</p>
+<ul>
+<li><code>YuzuBidiPoolSaturationRejects</code> (warning) — bidi dispatcher pool rejecting new calls</li>
+<li><code>YuzuBidiPoolNearSaturation</code> (critical) — pool slot residency &gt;80% for 5 m</li>
+<li><code>YuzuAgentChannelFaultRate</code> (warning) — fleet-wide reconnect rate with <code>reason="channel_fault"</code> exceeds 0.5/s</li>
+</ul>
+<p>All three are operator-actionable. None are paging-suppressible by silencing alone — silencing leaves the underlying capacity / TLS / network issue unaddressed.</p>
+<hr>
+<h2 id="diagnostic-preamble-run-for-any-of-the-three-alerts">Diagnostic preamble (run for any of the three alerts)</h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. Listener health: is the agent listener accepting calls at all?</span>
+curl<span class="w"> </span>-fsS<span class="w"> </span>http://&lt;server&gt;:8080/readyz<span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+
+<span class="c1"># 2. Pool state at the time the alert fired:</span>
+yuzu_server_transport_bidi_pool_size<span class="w">      </span><span class="c1"># configured cap</span>
+yuzu_server_transport_bidi_pool_in_flight<span class="w"> </span><span class="c1"># slot residency</span>
+yuzu_server_transport_bidi_pool_saturated_total<span class="w">  </span><span class="c1"># lifetime reject count</span>
+
+<span class="c1"># 3. Recent dispatcher throw counter — distinguishes capacity from internal-error:</span>
+rate<span class="o">(</span>yuzu_server_transport_dispatcher_throws_total<span class="o">{</span><span class="nv">kind</span><span class="o">=</span><span class="s2">&quot;dispatcher_internal&quot;</span><span class="o">}[</span>5m<span class="o">])</span>
+<span class="c1"># If this is non-zero alongside saturation, you have BOTH internal failures</span>
+<span class="c1"># AND saturation — internal failures are the priority because they may be</span>
+<span class="c1"># the root cause of the saturation.</span>
+
+<span class="c1"># 4. Server log for the alert window:</span>
+journalctl<span class="w"> </span>-u<span class="w"> </span>yuzu-server<span class="w"> </span>--since<span class="w"> </span><span class="s1">&#39;5m ago&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;bidi|saturat|deadline|rate.limit&#39;</span>
+</code></pre></div>
+<hr>
+<h2 id="yuzubidipoolsaturationrejects-warning">YuzuBidiPoolSaturationRejects (warning)</h2>
+<p><strong>Trigger:</strong> <code>rate(yuzu_server_transport_bidi_pool_saturated_total[1m]) &gt; 0</code> sustained for 1 m.</p>
+<p><strong>Meaning:</strong> The agent listener is rejecting incoming bidi RPCs (Subscribe / DownloadUpdate) with <code>ResourceExhausted "transport: bidi dispatcher saturated"</code>. The pool reached its configured cap (<code>--bidi-dispatcher-pool-size</code>) and has no slot for new calls.</p>
+<p><strong>First-fire pilot experience:</strong> rare but expected on under-sized direct-connect deployments at fleet-scale. Acceptable on day-1 if the operator is in the process of sizing the pool; concerning if it persists past steady-state.</p>
+<h3 id="triage">Triage</h3>
+<ol>
+<li>
+<p><strong>Is <code>dispatcher_throws_total{kind=dispatcher_internal}</code> rising at the same rate?</strong>
+   - <strong>Yes</strong>: this is NOT a capacity issue, it's an internal failure that's been re-counted as a saturation reject (the legacy compatibility increment). Investigate the throw-counter rate for the underlying cause; check for recent code changes that introduced an exception in the dispatcher path. Skip to the dispatcher-internal section below.
+   - <strong>No</strong>: legitimate pool saturation. Continue.</p>
+</li>
+<li>
+<p><strong>Compare <code>bidi_pool_in_flight / bidi_pool_size</code>:</strong> if the ratio is at or near 1.0, the pool is genuinely full. Proceed.</p>
+</li>
+<li>
+<p><strong>Identify which <code>method</code> is rejecting:</strong> <code>yuzu_server_transport_bidi_pool_saturated_total</code> is labeled by method. Subscribe rejects are usually fleet-scale (every agent has one); DownloadUpdate rejects are bursty (correlated with OTA rollout).</p>
+</li>
+<li>
+<p><strong>Capacity decision:</strong>
+   - <strong>Direct-connect deployment</strong> (no gateway): raise <code>--bidi-dispatcher-pool-size</code> per <a href="../user-manual/server-admin.html" class="doc-ref"><code>docs/user-manual/server-admin.md</code></a> "Bidi dispatcher pool sizing". Default auto-compute = <code>clamp(64, hardware_concurrency × 8, 4096)</code>; for fleets above ~2K direct-connect agents you must set explicitly. Verify cgroup <code>TasksMax</code> / <code>LimitNPROC</code> / <code>pids_limit</code> is high enough (the pool will hit those before its configured cap if cgroups are tight).
+   - <strong>Gateway-mode deployment</strong>: this alert SHOULD NOT fire — the gateway terminates Subscribe per-fleet and the server only sees one upstream per gateway node. If it fires anyway, you may have routed direct-connect traffic accidentally; check <code>--gateway-upstream</code> and <code>--gateway-mode</code> flags and the agent config's <code>--server-address</code> to confirm agents are pointing at the gateway, not the server.</p>
+</li>
+</ol>
+<h3 id="mitigation">Mitigation</h3>
+<ul>
+<li><strong>Immediate</strong>: front the listener with the gateway (deploy <code>yuzu-gateway</code> and reroute agents). The gateway absorbs Subscribe per-fleet and reduces direct server load to one upstream stream per gateway node.</li>
+<li><strong>Short-term</strong>: raise <code>--bidi-dispatcher-pool-size</code> to expected concurrent agent count + 20% headroom + DownloadUpdate budget. Restart server. Monitor <code>bidi_pool_in_flight</code> to confirm headroom.</li>
+<li><strong>Long-term</strong>: capacity-plan based on <code>yuzu_server_transport_bidi_pool_in_flight</code> p99 over 7 d; the pool size should comfortably exceed p99 at all times.</li>
+</ul>
+<hr>
+<h2 id="yuzubidipoolnearsaturation-critical-paging">YuzuBidiPoolNearSaturation (critical, paging)</h2>
+<p><strong>Trigger:</strong> <code>bidi_pool_in_flight / bidi_pool_size &gt; 0.8</code> sustained for 5 m.</p>
+<p><strong>Meaning:</strong> The pool slot residency (queued calls + active handlers — see <a href="../user-manual/metrics.html" class="doc-ref"><code>docs/user-manual/metrics.md</code></a>) has been above 80% for &gt;5 m. Saturation rejects are imminent if the trend continues.</p>
+<p><strong>First-fire pilot experience:</strong> distinguishes a slow-creep capacity issue from a sudden burst. By the time this fires, you have ~1 m of slack before <code>YuzuBidiPoolSaturationRejects</code> joins it.</p>
+<h3 id="triage_1">Triage</h3>
+<p>Same as <code>YuzuBidiPoolSaturationRejects</code> above, but you have a few minutes of headroom to act before rejects start firing.</p>
+<ol>
+<li>
+<p>Check whether <code>bidi_pool_in_flight</code> is increasing, plateauing, or oscillating. A plateau at 0.8-0.9 is sustainable until something changes; a steady increase will hit 1.0 soon.</p>
+</li>
+<li>
+<p>Capacity decision identical to the saturation-rejects case. The earlier you act, the less reject noise and dropped agent calls.</p>
+</li>
+</ol>
+<h3 id="why-critical">Why critical?</h3>
+<p>This alert is rated <code>severity: critical</code> because it page-precedes a customer-visible outage (Subscribe rejects mean agents can't pick up commands). The <code>YuzuBidiPoolSaturationRejects</code> warning fires at the cliff edge; this critical fires while there is still time to act.</p>
+<hr>
+<h2 id="yuzuagentchannelfaultrate-warning">YuzuAgentChannelFaultRate (warning)</h2>
+<p><strong>Trigger:</strong> <code>rate(yuzu_agent_reconnections_total{reason="channel_fault"}[5m]) &gt; 0.5</code> sustained for 5 m.</p>
+<p><strong>Meaning:</strong> Across the fleet, agents are reconnecting at &gt;0.5/s with reason <code>channel_fault</code> (Register RPC failed OR Subscribe stream final_status was non-Ok — both transport-level errors). This typically signals one of:</p>
+<ul>
+<li>TLS certificate rotation has gone wrong — agents can't validate the server cert or the server can't validate agent certs.</li>
+<li>The listener is in a restart loop (server crashed / OOM / cgroup-killed).</li>
+<li>A network partition is dropping mTLS handshakes.</li>
+</ul>
+<p><strong>First-fire pilot experience:</strong> the most operator-actionable of the three. A fleet-wide TLS regression would otherwise be invisible until pilot operators report "agents stopped checking in".</p>
+<h3 id="triage_2">Triage</h3>
+<ol>
+<li>
+<p><strong>First, separate transport-level from auth-level</strong>: check the same query for <code>reason="enrollment_pending"</code>. If both are firing, you have an enrollment-approval backlog AND a transport regression — handle the enrollment side via Settings &gt; Pending Enrollments, then return here.</p>
+</li>
+<li>
+<p><strong>Check listener health</strong>: <code>curl -fsS http://&lt;server&gt;:8080/readyz | jq .</code>. If readyz is non-200, the listener itself is unhealthy. Check <code>journalctl -u yuzu-server --since '10m ago'</code> for crash / OOM / cgroup-kill logs.</p>
+</li>
+<li>
+<p><strong>Check TLS material</strong>: when did you last rotate certs? Was the rotation propagated to all agents? <code>openssl s_client -connect &lt;server&gt;:50051 -showcerts</code> to inspect what the server presents; compare to what agents have provisioned (cert expiry / SAN / chain).</p>
+</li>
+<li>
+<p><strong>Check correlated metrics</strong>:
+   - <code>yuzu_agent_reconnections_total{reason="stream_open_failed"}</code> — if this is also high, the listener is rejecting mTLS handshakes (auth side) or the dispatcher pool is saturated.
+   - <code>yuzu_server_transport_dispatcher_throws_total</code> — if dispatcher is throwing, the transport itself is sick.</p>
+</li>
+</ol>
+<h3 id="mitigation_1">Mitigation</h3>
+<ul>
+<li><strong>TLS regression</strong>: roll back the cert rotation; investigate before re-rotating. Agents will reconnect within a few seconds.</li>
+<li><strong>Listener restart loop</strong>: investigate the crash cause; the listener will not stop crashing on its own.</li>
+<li><strong>Network partition</strong>: out-of-band; the alert will clear when connectivity restores.</li>
+<li><strong>Fleet-wide cert expiry</strong>: the certs should have been renewed via the cert-rotation process before expiry — investigate why automation missed.</li>
+</ul>
+<hr>
+<h2 id="common-dispatcher_internal-throws">Common: dispatcher_internal throws</h2>
+<p><code>yuzu_server_transport_dispatcher_throws_total{kind="dispatcher_internal"}</code> increments on:</p>
+<ul>
+<li>The legacy "saturation reject" path (still fires alongside <code>bidi_pool_saturated_total</code> for backward dashboard compatibility — this is NOT a bug).</li>
+<li>A handler-construction exception (rare; usually means a recent code change is unstable).</li>
+<li>A CallContext-population failure (very rare).</li>
+</ul>
+<p>If the rate is <code>&gt; rate(bidi_pool_saturated_total)</code>, the difference is internal-error — investigate the server log around the increment. Code change in the last day is the most likely cause; consider rollback while diagnosing.</p>
+<hr>
+<h2 id="when-to-escalate">When to escalate</h2>
+<ul>
+<li>Any alert sustained for &gt;30 m without trending toward resolution.</li>
+<li><code>dispatcher_throws_total{kind=non_std_exception}</code> non-zero — this is a bug, not a capacity issue, and should be filed against the engineering team immediately with the server log.</li>
+<li><code>bidi_pool_in_flight</code> sustained at exactly <code>bidi_pool_size</code> for &gt;10 m WITHOUT corresponding new connection attempts — possible thread-pool deadlock; collect a <code>gdb -p $(pidof yuzu-server)</code> thread dump and escalate.</li>
+</ul>
+<hr>
+<h2 id="references">References</h2>
+<ul>
+<li><a href="../user-manual/server-admin.html" class="doc-ref"><code>docs/user-manual/server-admin.md</code></a> — bidi pool sizing + per-peer rate limit + chunk-write deadline</li>
+<li><a href="../user-manual/metrics.html" class="doc-ref"><code>docs/user-manual/metrics.md</code></a> — full transport metric families + label sets</li>
+<li><code>deploy/grafana/yuzu-alerts.yml</code> — alert source-of-truth</li>
+<li><code>transport/include/yuzu/transport/transport.hpp</code> — TransportMetricSink contract</li>
+<li>ADR-0001 — transport abstraction + mitigation matrix</li>
+</ul>
+</main>
+</body>
+</html>

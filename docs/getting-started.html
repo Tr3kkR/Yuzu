@@ -1,0 +1,1254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Getting Started with Yuzu: Hello, Infrastructure World!</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/getting-started.md</div>
+<h1 class="doc-title">Getting Started with Yuzu: Hello, Infrastructure World!</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="getting-started-with-yuzu-hello-infrastructure-world">Getting Started with Yuzu: Hello, Infrastructure World!</h1>
+<p>A hands-on tutorial for the Yuzu Instruction Engine.</p>
+<p><strong>Prerequisites:</strong> A running Yuzu server and at least one connected agent. You should be able to log in to the dashboard at <code>http://localhost:8080</code> and see your agent(s) on the Devices page. All <code>curl</code> commands below assume you have an active admin session cookie -- replace <code>$COOKIE</code> with your session token.</p>
+<hr>
+<h2 id="introduction">Introduction</h2>
+<p>When you first connect an agent and dispatch a command through the dashboard, Yuzu sends a raw <code>CommandRequest</code> over gRPC: a plugin name, an action name, and optional parameters. This works, but it leaves important questions unanswered. Who is allowed to run this command? What parameters does it accept? What does the output look like? Can it be scheduled? Does it need approval before it runs?</p>
+<p>The <strong>Instruction Engine</strong> answers all of these. It is a governed lifecycle layer that sits between the operator and the plugin execution layer, turning ad-hoc plugin-plus-action-plus-params commands into managed, auditable operations.</p>
+<p>Instead of dispatching raw commands, operators define reusable <strong>InstructionDefinitions</strong> -- versioned templates that declare everything about an endpoint operation: what plugin and action to invoke, what typed parameters it accepts, what typed columns it returns, which platforms it supports, whether it needs approval, and how long its results are retained.</p>
+<p>Here are the key concepts you will use in this tutorial:</p>
+<ul>
+<li>
+<p><strong>InstructionDefinition</strong> -- A reusable, versioned template for an endpoint operation. It declares the plugin, action, parameters, result schema, approval requirements, and retention policy in one place.</p>
+</li>
+<li>
+<p><strong>Question vs. Action</strong> -- Definitions have a <code>type</code> field. A <code>question</code> is read-only: it gathers information without modifying endpoint state (list services, read OS info, check disk space). An <code>action</code> may modify state (restart a service, install a package, change a registry value). This distinction drives the approval workflow -- questions can auto-execute, while actions can require sign-off.</p>
+</li>
+<li>
+<p><strong>Parameters</strong> -- Typed inputs with validation rules. Parameters are declared with a JSON Schema-style syntax (type, required fields, max length, allowed values) and validated before the command is dispatched to any agent.</p>
+</li>
+<li>
+<p><strong>Result Schema</strong> -- Typed output columns (string, int32, int64, bool, datetime) that describe the structure of response data. Typed results enable server-side aggregation (COUNT, SUM, AVG grouped by column) and clean export to CSV, JSON, ClickHouse, or Splunk.</p>
+</li>
+<li>
+<p><strong>Scope Expressions</strong> -- Target specific devices using a filter expression instead of listing agent IDs. The scope engine supports attribute comparisons (<code>ostype == "windows"</code>), tag lookups (<code>tag:env == "production"</code>), wildcards (<code>hostname LIKE "web-*"</code>), and boolean combinators (<code>AND</code>, <code>OR</code>, <code>NOT</code>).</p>
+</li>
+<li>
+<p><strong>Approval Modes</strong> -- Control who can execute what. <code>auto</code> means the instruction runs immediately. <code>role-gated</code> means it enters a pending queue and waits for an admin to approve or reject it. <code>always</code> means every execution requires approval, regardless of who submits it.</p>
+</li>
+<li>
+<p><strong>InstructionSet</strong> -- A permission boundary that groups related definitions together and declares which roles can author, execute, and approve the definitions it contains.</p>
+</li>
+</ul>
+<p>Let's build all of this up, one step at a time.</p>
+<hr>
+<h2 id="step-1-hello-infrastructure">Step 1: Hello, Infrastructure!</h2>
+<p>Start with the simplest possible instruction definition -- a read-only question that calls the <code>os_info</code> plugin's <code>os_name</code> action to return the operating system name from every targeted endpoint.</p>
+<h3 id="define-it-in-yaml">Define it in YAML</h3>
+<p>Create a file called <code>hello-system-info.yaml</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionDefinition</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">hello.system.info</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Get System Info</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Returns basic OS information from all targeted endpoints.</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">question</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">windows</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">linux</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">darwin</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">os_info</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">os_name</span>
+</code></pre></div>
+<p>This YAML is the canonical authoring format. The server's import API accepts JSON, so you convert the relevant fields when posting.</p>
+<h3 id="import-it-via-the-api">Import it via the API</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instructions/import<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;hello.system.info&quot;,</span>
+<span class="s1">    &quot;type&quot;: &quot;question&quot;,</span>
+<span class="s1">    &quot;plugin&quot;: &quot;os_info&quot;,</span>
+<span class="s1">    &quot;action&quot;: &quot;os_name&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Returns basic OS information from all targeted endpoints.&quot;,</span>
+<span class="s1">    &quot;version&quot;: &quot;1.0.0&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="s2">&quot;a1b2c3d4-...&quot;</span><span class="p">}</span>
+</code></pre></div>
+<p>The server assigns a unique ID and persists the definition in its SQLite store. An audit event is recorded: who imported it, when, and from where.</p>
+<h3 id="verify-the-definition-exists">Verify the definition exists</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/api/instructions?name<span class="o">=</span>hello.system.info<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;definitions&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;a1b2c3d4-...&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;hello.system.info&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1.0.0&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;question&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;plugin&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;os_info&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;action&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;os_name&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Returns basic OS information from all targeted endpoints.&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;enabled&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;instruction_set_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742300000</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;updated_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">],</span>
+<span class="w">    </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="execute-it">Execute it</h3>
+<p>Now dispatch the command to all connected agents:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/command<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;plugin&quot;: &quot;os_info&quot;,</span>
+<span class="s1">    &quot;action&quot;: &quot;os_name&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;command_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;os_info-a1b2c3d4e5f6g7h8&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sent_to&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;dispatched&quot;</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="view-the-results">View the results</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/responses/os_info-a1b2c3d4e5f6g7h8&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;instruction_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;os_info-a1b2c3d4e5f6g7h8&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;responses&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;instruction_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;os_info-a1b2c3d4e5f6g7h8&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;agent_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;agent-001&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742300005</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;output&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;os_name|Windows 11 Pro&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;error_detail&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="what-happened-under-the-hood">What happened under the hood</h3>
+<ol>
+<li>The server received your <code>POST /api/command</code> request and authenticated your session.</li>
+<li>It constructed a gRPC <code>CommandRequest</code> with <code>plugin=os_info</code> and <code>action=os_name</code>.</li>
+<li>The request was dispatched to all connected agents over the bidirectional gRPC stream.</li>
+<li>Each agent's plugin host loaded the <code>os_info</code> plugin, invoked the <code>os_name</code> action, and streamed the result back as a <code>CommandResponse</code>.</li>
+<li>The server's <code>ResponseStore</code> persisted each response in SQLite with the command ID, agent ID, timestamp, status, and output.</li>
+<li>An audit event was logged with your username, the action taken, and the number of agents targeted.</li>
+</ol>
+<hr>
+<h2 id="step-2-adding-parameters">Step 2: Adding Parameters</h2>
+<p>The first example had no inputs -- it ran the same action on every agent. Most real-world instructions need parameters. Let's create a definition that inspects a specific service by name.</p>
+<h3 id="define-it-in-yaml_1">Define it in YAML</h3>
+<p>Create a file called <code>service-inspect.yaml</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionDefinition</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tutorial.service.inspect</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Inspect Service Status</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Returns the current state of a named service.</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">question</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">windows</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">linux</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">darwin</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">list</span>
+<span class="w">  </span><span class="nt">parameters</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">    </span><span class="nt">required</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">serviceName</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">properties</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">serviceName</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">        </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service Name</span>
+<span class="w">        </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">The name of the service to inspect.</span>
+<span class="w">        </span><span class="nt">validation</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">maxLength</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
+<span class="w">  </span><span class="nt">readablePayload</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Inspect</span><span class="nv"> </span><span class="s">service</span><span class="nv"> </span><span class="s">&#39;${serviceName}&#39;&quot;</span>
+</code></pre></div>
+<p>Key additions:</p>
+<ul>
+<li><strong><code>parameters</code></strong> declares a typed input schema. The <code>serviceName</code> field is required, must be a string, and is limited to 256 characters.</li>
+<li><strong><code>readablePayload</code></strong> is a human-readable template that interpolates parameter values. When an operator views the execution log, they see "Inspect service 'sshd'" instead of a raw JSON blob.</li>
+</ul>
+<h3 id="import-it">Import it</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instructions/import<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;tutorial.service.inspect&quot;,</span>
+<span class="s1">    &quot;type&quot;: &quot;question&quot;,</span>
+<span class="s1">    &quot;plugin&quot;: &quot;services&quot;,</span>
+<span class="s1">    &quot;action&quot;: &quot;list&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Returns the current state of a named service.&quot;,</span>
+<span class="s1">    &quot;version&quot;: &quot;1.0.0&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="s2">&quot;b2c3d4e5-...&quot;</span><span class="p">}</span>
+</code></pre></div>
+<h3 id="execute-with-parameters">Execute with parameters</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/command<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;plugin&quot;: &quot;services&quot;,</span>
+<span class="s1">    &quot;action&quot;: &quot;list&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;command_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;services-f1e2d3c4b5a6a7b8&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sent_to&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;dispatched&quot;</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="view-the-results_1">View the results</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>On a Windows agent, you will see pipe-delimited output with the service name, display name, status, and startup type:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;instruction_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;services-f1e2d3c4b5a6a7b8&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;responses&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;instruction_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;services-f1e2d3c4b5a6a7b8&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;agent_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;agent-001&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742300100</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;output&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;svc|Spooler|Print Spooler|running|automatic\nsvc|sshd|OpenSSH SSH Server|running|automatic\nsvc|W32Time|Windows Time|stopped|manual&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;error_detail&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>On Linux, the output format is <code>svc|name|status|description</code>.</p>
+<hr>
+<h2 id="step-3-typed-results">Step 3: Typed Results</h2>
+<p>Raw pipe-delimited output works for viewing, but it is opaque to the server. To enable aggregation, filtering, and structured export, add a <strong>result schema</strong> that tells the server what columns the output contains and what types they are.</p>
+<h3 id="extend-the-definition">Extend the definition</h3>
+<p>Add a <code>result</code> section to the service inspect YAML:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionDefinition</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tutorial.service.inspect</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Inspect Service Status</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Returns the current state of a named service.</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">question</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">windows</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">linux</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">darwin</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">list</span>
+<span class="w">  </span><span class="nt">parameters</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">    </span><span class="nt">required</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">serviceName</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">properties</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">serviceName</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">        </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service Name</span>
+<span class="w">        </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">The name of the service to inspect.</span>
+<span class="w">        </span><span class="nt">validation</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">maxLength</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
+<span class="w">  </span><span class="nt">readablePayload</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Inspect</span><span class="nv"> </span><span class="s">service</span><span class="nv"> </span><span class="s">&#39;${serviceName}&#39;&quot;</span>
+<span class="w">  </span><span class="nt">result</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">columns</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serviceName</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">state</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">startupType</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pid</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">int32</span>
+<span class="w">    </span><span class="nt">aggregation</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">groupBy</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">state</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">operations</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">count</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+<p>The <code>result.columns</code> block declares four typed columns. The <code>aggregation</code> block declares default aggregation settings: group by the <code>state</code> column and count occurrences.</p>
+<h3 id="use-the-aggregation-endpoint">Use the aggregation endpoint</h3>
+<p>After executing the instruction and collecting responses, you can aggregate them server-side:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/aggregate?group_by=status&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;instruction_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;services-f1e2d3c4b5a6a7b8&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;groups&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;group_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;aggregate_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">],</span>
+<span class="w">    </span><span class="nt">&quot;total_groups&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;total_rows&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The <code>group_by</code> parameter accepts <code>status</code> or <code>agent_id</code>. Additional aggregation operations (<code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code>) can be specified with the <code>op</code> query parameter, along with <code>op_column</code> to specify which column to aggregate.</p>
+<h3 id="export-as-csv">Export as CSV</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/export?format=csv&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span>-o<span class="w"> </span>service-results.csv
+</code></pre></div>
+<p>This downloads a CSV file with headers:</p>
+<div class="highlight"><pre><span></span><code>id,instruction_id,agent_id,timestamp,status,output,error_detail
+</code></pre></div>
+<h3 id="export-as-json">Export as JSON</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/export?format=json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span>-o<span class="w"> </span>service-results.json
+</code></pre></div>
+<p>The JSON export returns a structured envelope:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;instruction_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;services-f1e2d3c4b5a6a7b8&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;responses&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;instruction_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;services-f1e2d3c4b5a6a7b8&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;agent_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;agent-001&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742300100</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;output&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;svc|Spooler|Print Spooler|running|automatic\n...&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;error_detail&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Typed results are what make Yuzu's data useful beyond the dashboard. When every column has a declared type, downstream systems -- ClickHouse, Splunk, Grafana, or a simple spreadsheet -- can ingest the data without guessing.</p>
+<hr>
+<h2 id="step-4-your-first-action">Step 4: Your First Action</h2>
+<p>So far, every instruction has been a <code>question</code> -- read-only, safe to run at any time. Now let's define an <code>action</code> that modifies endpoint state: restarting a service.</p>
+<p>Because actions change things, they should go through an approval workflow. We will set the approval mode to <code>role-gated</code>, which means the instruction enters a pending queue when submitted, and an admin must approve it before it executes.</p>
+<h3 id="define-it-in-yaml_2">Define it in YAML</h3>
+<p>Create a file called <code>service-restart.yaml</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionDefinition</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tutorial.service.restart</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Restart Service</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Restarts a named service. Requires approval.</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">action</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">windows</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">linux</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">darwin</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">restart</span>
+<span class="w">  </span><span class="nt">parameters</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">    </span><span class="nt">required</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">serviceName</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">properties</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">serviceName</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">  </span><span class="nt">approval</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">role-gated</span>
+<span class="w">  </span><span class="nt">readablePayload</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Restart</span><span class="nv"> </span><span class="s">service</span><span class="nv"> </span><span class="s">&#39;${serviceName}&#39;&quot;</span>
+</code></pre></div>
+<p>Key differences from a question:</p>
+<ul>
+<li><strong><code>type: action</code></strong> -- marks this as a state-changing operation.</li>
+<li><strong><code>approval.mode: role-gated</code></strong> -- requires an admin to approve before execution proceeds.</li>
+</ul>
+<h3 id="import-it_1">Import it</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instructions/import<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;tutorial.service.restart&quot;,</span>
+<span class="s1">    &quot;type&quot;: &quot;action&quot;,</span>
+<span class="s1">    &quot;plugin&quot;: &quot;services&quot;,</span>
+<span class="s1">    &quot;action&quot;: &quot;restart&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Restarts a named service. Requires approval.&quot;,</span>
+<span class="s1">    &quot;version&quot;: &quot;1.0.0&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="s2">&quot;c3d4e5f6-...&quot;</span><span class="p">}</span>
+</code></pre></div>
+<h3 id="walk-through-the-approval-flow">Walk through the approval flow</h3>
+<p><strong>1. Submit the action.</strong></p>
+<p>An operator submits the instruction for execution. Because the approval mode is <code>role-gated</code>, it does not execute immediately -- it enters the pending queue.</p>
+<p><strong>2. Check pending approvals.</strong></p>
+<p>An admin checks how many approvals are waiting:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/api/approvals/pending/count<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="mi">1</span><span class="p">}</span>
+</code></pre></div>
+<p><strong>3. List pending approvals.</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/approvals?status=pending&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;approvals&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;d4e5f6a7-...&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;definition_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;c3d4e5f6-...&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;pending&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;submitted_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;operator1&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;submitted_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742300200</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;reviewed_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;reviewed_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;review_comment&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;scope_expression&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><strong>4. Approve it.</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/approvals/d4e5f6a7-.../approve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;comment&quot;: &quot;Approved for maintenance window&quot;}&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="s2">&quot;approved&quot;</span><span class="p">}</span>
+</code></pre></div>
+<p>Once approved, the instruction is dispatched to the targeted agents. The approval record is preserved in the audit trail -- who submitted it, who approved it, when, and with what comment.</p>
+<p><strong>5. Reject (alternative).</strong></p>
+<p>If the action should not proceed, reject it instead:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/approvals/d4e5f6a7-.../reject<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;comment&quot;: &quot;Not approved -- outside maintenance window&quot;}&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="s2">&quot;rejected&quot;</span><span class="p">}</span>
+</code></pre></div>
+<p>The full lifecycle is: <strong>submit -&gt; pending -&gt; approve/reject -&gt; execute (if approved)</strong>. Every step is audited.</p>
+<hr>
+<h2 id="step-5-organizing-with-instructionsets">Step 5: Organizing with InstructionSets</h2>
+<p>As your library of definitions grows, you need a way to group related instructions and control who can use them. That is what <strong>InstructionSets</strong> are for.</p>
+<p>An InstructionSet is the permission boundary for instruction definitions. It declares which roles can author definitions in the set, which roles can execute them, and which roles can approve actions.</p>
+<h3 id="define-it-in-yaml_3">Define it in YAML</h3>
+<p>Create a file called <code>service-management-set.yaml</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionSet</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tutorial.service-management</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service Management Tutorial</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Tutorial set for service inspection and management.</span>
+<span class="w">  </span><span class="nt">permissions</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">executeRoles</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">endpoint-operator</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">endpoint-admin</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">authorRoles</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">content-author</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">approveRoles</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">endpoint-admin</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">contents</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">instructionDefinitions</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tutorial.service.inspect</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tutorial.service.restart</span>
+</code></pre></div>
+<p>The <code>permissions</code> block is the key governance feature:</p>
+<ul>
+<li><strong><code>executeRoles</code></strong> -- who can dispatch instructions from this set.</li>
+<li><strong><code>authorRoles</code></strong> -- who can create or modify definitions in this set.</li>
+<li><strong><code>approveRoles</code></strong> -- who can approve actions that require approval.</li>
+</ul>
+<h3 id="create-the-set-via-the-api">Create the set via the API</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/instruction-sets<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;tutorial.service-management&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Tutorial set for service inspection and management.&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="s2">&quot;e5f6a7b8-...&quot;</span><span class="p">}</span>
+</code></pre></div>
+<h3 id="list-all-sets">List all sets</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/api/instruction-sets<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;sets&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;e5f6a7b8-...&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;tutorial.service-management&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Tutorial set for service inspection and management.&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;created_by&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;admin&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742300300</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="assign-definitions-to-the-set">Assign definitions to the set</h3>
+<p>When creating or updating an instruction definition, set the <code>instruction_set_id</code> field to the set's ID. This binds the definition to the set's permission rules.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>PUT<span class="w"> </span>http://localhost:8080/api/instructions/b2c3d4e5-...<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;tutorial.service.inspect&quot;,</span>
+<span class="s1">    &quot;type&quot;: &quot;question&quot;,</span>
+<span class="s1">    &quot;plugin&quot;: &quot;services&quot;,</span>
+<span class="s1">    &quot;action&quot;: &quot;list&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Returns the current state of a named service.&quot;,</span>
+<span class="s1">    &quot;instruction_set_id&quot;: &quot;e5f6a7b8-...&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Once the granular RBAC system is fully implemented (Phase 3 on the roadmap), these permission declarations will be enforced server-side. For now, the structure is in place so that your definitions are organized and ready for access control from day one.</p>
+<hr>
+<h2 id="step-6-targeting-with-scope-expressions">Step 6: Targeting with Scope Expressions</h2>
+<p>So far, every command has been broadcast to all connected agents. In production, you need to target specific devices -- all Windows machines, all web servers in production, everything except quarantined endpoints.</p>
+<p>Yuzu's <strong>scope engine</strong> provides a filter expression language for this. It is a recursive-descent parser that supports attribute comparisons, tag lookups, wildcards, and boolean combinators.</p>
+<h3 id="scope-expression-examples">Scope expression examples</h3>
+<p>Target all Windows endpoints:</p>
+<div class="highlight"><pre><span></span><code>ostype == &quot;windows&quot;
+</code></pre></div>
+<p>Target Linux web servers:</p>
+<div class="highlight"><pre><span></span><code>ostype == &quot;linux&quot; AND hostname LIKE &quot;web-*&quot;
+</code></pre></div>
+<p>Target production endpoints that are not quarantined:</p>
+<div class="highlight"><pre><span></span><code>tag:env == &quot;production&quot; AND NOT tag:quarantined == &quot;true&quot;
+</code></pre></div>
+<h3 id="validate-a-scope-expression">Validate a scope expression</h3>
+<p>Before using a scope expression in a command, you can validate its syntax:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/scope/validate<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;expression&quot;: &quot;ostype == \&quot;windows\&quot;&quot;}&#39;</span>
+</code></pre></div>
+<p>Expected response for a valid expression:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;valid&quot;</span><span class="p">:</span><span class="kc">true</span><span class="p">}</span>
+</code></pre></div>
+<p>Expected response for an invalid expression:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;valid&quot;</span><span class="p">:</span><span class="kc">false</span><span class="p">,</span><span class="nt">&quot;error&quot;</span><span class="p">:</span><span class="s2">&quot;expected comparison operator at position 8&quot;</span><span class="p">}</span>
+</code></pre></div>
+<h3 id="estimate-how-many-agents-match">Estimate how many agents match</h3>
+<p>Before dispatching to a large fleet, check how many agents the scope expression matches:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/scope/estimate<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;expression&quot;: &quot;ostype == \&quot;windows\&quot;&quot;}&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;matched&quot;</span><span class="p">:</span><span class="mi">1</span><span class="p">,</span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="mi">3</span><span class="p">}</span>
+</code></pre></div>
+<p>This tells you that 1 out of 3 connected agents match the expression. No command is dispatched -- this is a dry run.</p>
+<h3 id="dispatch-with-a-scope-expression">Dispatch with a scope expression</h3>
+<p>Use the <code>scope</code> field in the command request to target specific agents:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/command<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;plugin&quot;: &quot;os_info&quot;,</span>
+<span class="s1">    &quot;action&quot;: &quot;os_name&quot;,</span>
+<span class="s1">    &quot;scope&quot;: &quot;ostype == \&quot;windows\&quot;&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;command_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;os_info-c4d5e6f7g8h9i0j1&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;sent_to&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;status&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;dispatched&quot;</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Only agents matching the scope expression receive the command. The server evaluates the expression against each agent's attributes (OS type, hostname, architecture) and tags.</p>
+<h3 id="supported-operators">Supported operators</h3>
+<table>
+<thead>
+<tr>
+<th>Operator</th>
+<th>Example</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>==</code></td>
+<td><code>ostype == "windows"</code></td>
+<td>Exact equality (case-insensitive)</td>
+</tr>
+<tr>
+<td><code>!=</code></td>
+<td><code>ostype != "linux"</code></td>
+<td>Not equal</td>
+</tr>
+<tr>
+<td><code>LIKE</code></td>
+<td><code>hostname LIKE "web-*"</code></td>
+<td>Wildcard match (<code>*</code> = any chars)</td>
+</tr>
+<tr>
+<td><code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code></td>
+<td><code>os_version &gt; "10"</code></td>
+<td>Numeric or string comparison</td>
+</tr>
+<tr>
+<td><code>IN</code></td>
+<td><code>ostype IN ("windows", "linux")</code></td>
+<td>Value in set</td>
+</tr>
+<tr>
+<td><code>CONTAINS</code></td>
+<td><code>hostname CONTAINS "prod"</code></td>
+<td>Substring match</td>
+</tr>
+<tr>
+<td><code>AND</code></td>
+<td><code>a == "1" AND b == "2"</code></td>
+<td>Both must be true</td>
+</tr>
+<tr>
+<td><code>OR</code></td>
+<td><code>a == "1" OR b == "2"</code></td>
+<td>Either must be true</td>
+</tr>
+<tr>
+<td><code>NOT</code></td>
+<td><code>NOT tag:quarantined == "true"</code></td>
+<td>Negation</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="step-7-scheduling-recurring-checks">Step 7: Scheduling Recurring Checks</h2>
+<p>Running instructions manually is fine for one-off tasks, but many operations need to run on a schedule -- service health checks every 15 minutes, disk space audits every hour, compliance scans every night.</p>
+<p>Yuzu's <strong>ScheduleEngine</strong> supports recurring execution with configurable frequency types.</p>
+<h3 id="create-a-schedule-via-the-api">Create a schedule via the API</h3>
+<p>Schedule the service inspect instruction to run every 15 minutes:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/schedules<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;Service health check (every 15m)&quot;,</span>
+<span class="s1">    &quot;definition_id&quot;: &quot;b2c3d4e5-...&quot;,</span>
+<span class="s1">    &quot;frequency_type&quot;: &quot;interval&quot;,</span>
+<span class="s1">    &quot;interval_minutes&quot;: 15,</span>
+<span class="s1">    &quot;scope_expression&quot;: &quot;ostype == \&quot;windows\&quot;&quot;,</span>
+<span class="s1">    &quot;requires_approval&quot;: false</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="s2">&quot;f6a7b8c9-...&quot;</span><span class="p">}</span>
+</code></pre></div>
+<h3 id="list-all-schedules">List all schedules</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/api/schedules<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;schedules&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;f6a7b8c9-...&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Service health check (every 15m)&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;definition_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;b2c3d4e5-...&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;enabled&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;frequency_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;interval&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;next_execution_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1742301200</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;last_executed_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;execution_count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="disable-a-schedule">Disable a schedule</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/schedules/f6a7b8c9-.../enable<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;enabled&quot;: &quot;false&quot;}&#39;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;enabled&quot;</span><span class="p">:</span><span class="kc">false</span><span class="p">}</span>
+</code></pre></div>
+<h3 id="re-enable-a-schedule">Re-enable a schedule</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/schedules/f6a7b8c9-.../enable<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;enabled&quot;: &quot;true&quot;}&#39;</span>
+</code></pre></div>
+<h3 id="delete-a-schedule">Delete a schedule</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>DELETE<span class="w"> </span>http://localhost:8080/api/schedules/f6a7b8c9-...<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span><span class="nt">&quot;deleted&quot;</span><span class="p">:</span><span class="kc">true</span><span class="p">}</span>
+</code></pre></div>
+<h3 id="schedule-parameters">Schedule parameters</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>name</code></td>
+<td>string</td>
+<td>Human-readable name for the schedule</td>
+</tr>
+<tr>
+<td><code>definition_id</code></td>
+<td>string</td>
+<td>ID of the instruction definition to execute</td>
+</tr>
+<tr>
+<td><code>frequency_type</code></td>
+<td>string</td>
+<td><code>"once"</code>, <code>"interval"</code>, <code>"daily"</code>, <code>"weekly"</code>, <code>"monthly"</code></td>
+</tr>
+<tr>
+<td><code>interval_minutes</code></td>
+<td>int</td>
+<td>Minutes between executions (for <code>interval</code> type)</td>
+</tr>
+<tr>
+<td><code>time_of_day</code></td>
+<td>string</td>
+<td><code>"HH:MM"</code> time for daily/weekly/monthly schedules</td>
+</tr>
+<tr>
+<td><code>day_of_week</code></td>
+<td>int</td>
+<td>0-6 (Sunday=0) for weekly schedules</td>
+</tr>
+<tr>
+<td><code>day_of_month</code></td>
+<td>int</td>
+<td>1-31 for monthly schedules</td>
+</tr>
+<tr>
+<td><code>scope_expression</code></td>
+<td>string</td>
+<td>Scope expression to target agents</td>
+</tr>
+<tr>
+<td><code>requires_approval</code></td>
+<td>bool</td>
+<td>Whether each scheduled run needs approval</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="step-8-exporting-results">Step 8: Exporting Results</h2>
+<p>Yuzu stores every response in its SQLite-backed ResponseStore. You can query, aggregate, and export this data through the REST API.</p>
+<h3 id="query-responses-for-an-instruction">Query responses for an instruction</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>Optional query parameters for filtering:</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agent_id</code></td>
+<td>Filter by specific agent</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>Filter by response status (integer)</td>
+</tr>
+<tr>
+<td><code>since</code></td>
+<td>Epoch seconds -- only responses after this time</td>
+</tr>
+<tr>
+<td><code>until</code></td>
+<td>Epoch seconds -- only responses before this time</td>
+</tr>
+<tr>
+<td><code>limit</code></td>
+<td>Maximum number of results (default: 100)</td>
+</tr>
+<tr>
+<td><code>offset</code></td>
+<td>Pagination offset</td>
+</tr>
+</tbody>
+</table>
+<p>Example with filters:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8?status=1&amp;limit=50&amp;since=1742300000&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<h3 id="export-as-csv_1">Export as CSV</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/export?format=csv&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span>-o<span class="w"> </span>responses.csv
+</code></pre></div>
+<p>The CSV file contains one row per agent response with headers:</p>
+<div class="highlight"><pre><span></span><code>id,instruction_id,agent_id,timestamp,status,output,error_detail
+1,services-f1e2d3c4b5a6a7b8,agent-001,1742300100,1,&quot;svc|Spooler|Print Spooler|running|automatic&quot;,&quot;&quot;
+</code></pre></div>
+<h3 id="export-as-json_1">Export as JSON</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/export?format=json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span>-o<span class="w"> </span>responses.json
+</code></pre></div>
+<h3 id="aggregate-responses">Aggregate responses</h3>
+<p>Group responses by status and count:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/aggregate?group_by=status&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>Expected response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;instruction_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;services-f1e2d3c4b5a6a7b8&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;groups&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="p">{</span><span class="nt">&quot;group_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;aggregate_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">},</span>
+<span class="w">        </span><span class="p">{</span><span class="nt">&quot;group_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;2&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;aggregate_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="p">}</span>
+<span class="w">    </span><span class="p">],</span>
+<span class="w">    </span><span class="nt">&quot;total_groups&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;total_rows&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>Group by agent and compute aggregates:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;http://localhost:8080/api/responses/services-f1e2d3c4b5a6a7b8/aggregate?group_by=agent_id&amp;op=count&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>Supported aggregation operations: <code>count</code>, <code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code>. Specify the target column with <code>op_column</code> when using <code>sum</code>, <code>avg</code>, <code>min</code>, or <code>max</code>.</p>
+<h3 id="execution-tracking">Execution tracking</h3>
+<p>For a higher-level view, query the execution tracker:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/api/executions?definition_id<span class="o">=</span>b2c3d4e5-...<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>Get a summary with progress percentage:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/api/executions/EXECUTION_ID/summary<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>View per-agent status:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/api/executions/EXECUTION_ID/agents<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>python<span class="w"> </span>-m<span class="w"> </span>json.tool
+</code></pre></div>
+<p>Rerun an execution (optionally targeting only failed agents):</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/executions/EXECUTION_ID/rerun<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;scope&quot;: &quot;failed_only&quot;}&#39;</span>
+</code></pre></div>
+<hr>
+<h2 id="whats-next">What's Next</h2>
+<p>This tutorial covered the core instruction lifecycle: define, import, execute, parameterize, type results, govern with approvals, organize into sets, target with scopes, schedule, and export. Here is where to go from here:</p>
+<ul>
+<li>
+<p><strong>Instruction Engine architecture</strong> -- <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> covers the full design, including the content model hierarchy (ProductPack &gt; InstructionSet &gt; InstructionDefinition), the execution substrate, error taxonomy, and concurrency model.</p>
+</li>
+<li>
+<p><strong>Capability map</strong> -- <a href="capability-map.html" class="doc-ref"><code>docs/capability-map.md</code></a> tracks all 139 planned capabilities and which ones are implemented. Use this to understand the full scope of what Yuzu is building toward.</p>
+</li>
+<li>
+<p><strong>Roadmap</strong> -- <a href="roadmap.html" class="doc-ref"><code>docs/roadmap.md</code></a> has the 56 issues across 7 phases. The features introduced in this tutorial span Phases 1-3.</p>
+</li>
+<li>
+<p><strong>PolicyFragments and compliance automation (Phase 5)</strong> -- PolicyFragments compose a check instruction, a compliance expression, and a fix instruction into a single unit. Policies bind fragments to triggers and scopes for continuous compliance enforcement.</p>
+</li>
+<li>
+<p><strong>TriggerTemplates for event-driven automation (Phase 4)</strong> -- Instead of schedules, fire instructions in response to events: file changes, service status transitions, event log entries, registry modifications, or agent startup.</p>
+</li>
+<li>
+<p><strong>ProductPacks for content distribution (Phase 7)</strong> -- Bundle InstructionSets, PolicyFragments, and static content into signed, versioned packages that can be distributed to servers and automatically applied.</p>
+</li>
+<li>
+<p><strong>Grafana dashboards</strong> -- <code>docs/grafana/</code> contains dashboard templates for visualizing Yuzu metrics. The server exposes a Prometheus-compatible <code>/metrics</code> endpoint with <code>yuzu_server_*</code> metrics.</p>
+</li>
+<li>
+<p><strong>Analytics integration</strong> -- <a href="clickhouse-setup.html" class="doc-ref"><code>docs/clickhouse-setup.md</code></a> and <a href="analytics-events.html" class="doc-ref"><code>docs/analytics-events.md</code></a> cover how to forward Yuzu's structured events and response data to ClickHouse or Splunk for long-term analytics.</p>
+</li>
+</ul>
+</main>
+</body>
+</html>

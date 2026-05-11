@@ -1,0 +1,738 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuzu Codebase Security Review</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">SECURITY_REVIEW.md</div>
+<h1 class="doc-title">Yuzu Codebase Security Review</h1>
+<nav class="doc-nav"><a href="README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="yuzu-codebase-security-review">Yuzu Codebase Security Review</h1>
+<p><strong>Date:</strong> 2026-03-07 (refreshed 2026-03-16, delta-checked 2026-03-26)
+<strong>Scope:</strong> RAII &amp; memory safety, mTLS implementation, authentication/authorization, HTTP API security, enterprise deployment readiness</p>
+<hr>
+<h2 id="executive-summary">Executive Summary</h2>
+<p>Yuzu is a well-structured C++23 agent/server framework with a solid foundation. The mTLS implementation is above-average for a project at this stage — it includes proper certificate identity binding and peer verification. However, several issues would need to be addressed before enterprise deployment: unauthenticated HTTP endpoints, a thread-safety race in the agent command dispatch, manual JSON construction vulnerable to injection, and the absence of deployment infrastructure (containers, service units, config files).</p>
+<p><strong>Overall assessment:</strong> Good for development/lab use. Needs targeted hardening for production enterprise deployment.</p>
+<h2 id="0-2026-03-16-delta-check-code-git-issue-backlog">0. 2026-03-16 Delta Check (Code + Git Issue Backlog)</h2>
+<p>This review was cross-checked against:</p>
+<ul>
+<li><a href="docs/roadmap.html" class="doc-ref"><code>docs/roadmap.md</code></a> (GitHub issue index / backlog)</li>
+<li><a href="github-issues/26-enterprise-storage-migration-plugin.html" class="doc-ref"><code>github-issues/26-enterprise-storage-migration-plugin.md</code></a> (local issue export)</li>
+<li>current server/agent/auth code paths</li>
+</ul>
+<blockquote>
+<p>Note: direct GitHub issue state queries were not available from this environment, so this section compares local issue references and the live code in-repo.</p>
+</blockquote>
+<h3 id="findings-that-are-now-outdated-in-this-document">Findings that are now <strong>outdated</strong> in this document</h3>
+<ol>
+<li><strong>Session IDs are no longer timestamp-derived.</strong> The server now generates session IDs from cryptographically secure random bytes (<code>random_bytes(16)</code>), so the previous “insecure session IDs” finding is no longer accurate.</li>
+<li><strong>Enrollment token validation is implemented for agent registration.</strong> <code>Register()</code> now rejects invalid enrollment tokens when token mode is enabled.</li>
+<li><strong>Signal handler safety improved.</strong> Both agent and server signal handlers now avoid <code>spdlog</code> and use async-signal-safe writes; agent global pointer is now <code>std::atomic&lt;Agent*&gt;</code>.</li>
+<li><strong>Agent dispatch lifecycle improved.</strong> Execution threads are explicitly joined before the subscribe stream goes out of scope, reducing the use-after-free risk documented in section 1.</li>
+<li><strong><code>/api/command</code> is no longer unauthenticated.</strong> It now requires authentication, and admin-only plugin actions are role-gated.</li>
+<li><strong>Agent list JSON construction now uses <code>nlohmann::json</code>.</strong> The prior manual-string JSON injection concern in <code>AgentRegistry::to_json()</code> is resolved.</li>
+</ol>
+<h3 id="findings-that-remain-valid-or-partially-valid">Findings that remain valid (or partially valid)</h3>
+<blockquote>
+<p><strong>2026-03-26 update:</strong> All five findings below were resolved during the RC sprint (2026-03-22 to 2026-03-24). See <code>Release-Candidate.local.MD</code> for full details and commit references.</p>
+</blockquote>
+<ol>
+<li><del><strong>Not all HTTP routes are authenticated.</strong></del> RESOLVED — Auth middleware (<code>set_pre_routing_handler</code>) enforces authentication on all routes; granular RBAC with 6 roles, 14 securable types, per-operation permissions. API token auth (Bearer / X-Yuzu-Token) implemented.</li>
+<li><del><strong>Web dashboard still defaults to <code>0.0.0.0</code> bind.</strong></del> RESOLVED — Now defaults to <code>127.0.0.1</code>. Startup warning logged if overridden to all interfaces.</li>
+<li><del><strong>No HTTPS termination on the dashboard listener by default.</strong></del> RESOLVED — <code>https_enabled</code> defaults to <code>true</code>. Operators must provide cert/key or use <code>--no-https</code>. HTTP-to-HTTPS redirect. Certificate hot-reload with permission validation.</li>
+<li><del><strong>Security headers/CSP are still absent.</strong></del> RESOLVED — CORS headers applied via <code>set_post_routing_handler</code> on all <code>/api/</code> paths.</li>
+<li><del><strong>Hand-rolled JSON extraction helpers are still used.</strong></del> RESOLVED — JObj/JArr lightweight JSON string builders replaced manual construction in REST API. <code>nlohmann::json</code> used for parsing only (avoids 56GB template bloat).</li>
+</ol>
+<h3 id="issue-backlog-alignment-notes">Issue-backlog alignment notes</h3>
+<ul>
+<li>Issues <strong>#146</strong> (HTTPS), <strong>#154</strong> (RBAC), <strong>#157</strong> (API tokens) are all <strong>Done</strong> as of roadmap v1.4 (2026-03-21).</li>
+<li>All 72 roadmap issues across 7 phases are complete (100%).</li>
+</ul>
+<hr>
+<h2 id="1-raii-memory-safety">1. RAII &amp; Memory Safety</h2>
+<h3 id="strengths">Strengths</h3>
+<ul>
+<li><strong>Smart pointer discipline is strong.</strong> Factory methods return <code>std::unique_ptr&lt;Agent&gt;</code> / <code>std::unique_ptr&lt;Server&gt;</code> (<code>agent.cpp:412</code>, <code>server.cpp:984</code>). gRPC servers, HTTP servers, and loggers are all owned via <code>unique_ptr</code>/<code>shared_ptr</code>.</li>
+<li><strong>Plugin loader has correct RAII.</strong> <code>PluginHandle</code> implements move semantics with proper cleanup in the destructor (<code>plugin_loader.cpp:28-51</code>). The move-assignment operator correctly closes the old handle before taking ownership. Error paths call <code>YUZU_DLCLOSE()</code> before returning <code>std::unexpected</code>.</li>
+<li><strong><code>std::expected&lt;T, E&gt;</code> used idiomatically</strong> for error handling in <code>PluginHandle::load()</code> and <code>resolve_agent_id()</code>, avoiding exceptions in the hot path.</li>
+<li><strong>Mutex-protected shared state.</strong> <code>AgentRegistry</code> uses fine-grained locking: a registry-level mutex plus per-session <code>stream_mu</code> for write serialization (<code>server.cpp:107,251</code>).</li>
+<li><strong>Sanitizer integration.</strong> CMake supports both ASan+UBSan and TSan (<code>CompilerFlags.cmake:28-35</code>).</li>
+</ul>
+<h3 id="issues">Issues</h3>
+<h4 id="critical-use-after-free-risk-in-command-dispatch-thread-agentcpp287-345">CRITICAL: Use-after-free risk in command dispatch thread (<code>agent.cpp:287-345</code>)</h4>
+<div class="highlight"><pre><span></span><code><span class="k">auto</span><span class="o">*</span><span class="w"> </span><span class="n">raw_stream</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">stream</span><span class="p">.</span><span class="n">get</span><span class="p">();</span><span class="w">  </span><span class="c1">// line 287 — raw pointer extracted</span>
+<span class="n">std</span><span class="o">::</span><span class="kr">thread</span><span class="w"> </span><span class="nf">exec_thread</span><span class="p">([</span><span class="k">this</span><span class="p">,</span><span class="w"> </span><span class="n">target</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span><span class="p">,</span><span class="w"> </span><span class="n">raw_stream</span><span class="p">]()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// ... uses raw_stream at lines 328, 345 ...</span>
+<span class="p">});</span>
+</code></pre></div>
+<p>The <code>stream</code> object (a <code>unique_ptr&lt;ClientReaderWriter&gt;</code>) is scoped to the block starting at line 241. Background threads capture <code>raw_stream</code> and may still be writing to it when the <code>stream-&gt;Read()</code> loop exits (line 356) and <code>stream</code> is destroyed. Although threads are joined at lines 372-377 (after <code>shutdown_plugins</code>), plugin <code>shutdown()</code> may return before the threads have finished their final <code>Write()</code> calls.</p>
+<p><strong>Fix:</strong> Join all exec threads <em>before</em> allowing the stream to go out of scope, or use a <code>shared_ptr</code> for the stream with threads holding a copy.</p>
+<h4 id="medium-signal-handler-calls-non-signal-safe-functions-agentmaincpp29-31-servermaincpp15-17">MEDIUM: Signal handler calls non-signal-safe functions (<code>agent/main.cpp:29-31</code>, <code>server/main.cpp:15-17</code>)</h4>
+<div class="highlight"><pre><span></span><code><span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">on_signal</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">sig</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">spdlog</span><span class="o">::</span><span class="n">warn</span><span class="p">(</span><span class="s">&quot;...&quot;</span><span class="p">);</span><span class="w">   </span><span class="c1">// Not async-signal-safe</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">g_agent</span><span class="p">)</span><span class="w"> </span><span class="n">g_agent</span><span class="o">-&gt;</span><span class="n">stop</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><code>spdlog::warn()</code> allocates memory and acquires mutexes — undefined behavior in a signal handler. <code>stop()</code> itself does atomic stores and <code>TryCancel()</code> which is likely safe, but the logging call is not.</p>
+<p><strong>Fix:</strong> Remove the <code>spdlog</code> call from the signal handler. Use <code>write(STDERR_FILENO, ...)</code> for diagnostics if needed, or set an atomic flag and log from the main thread.</p>
+<h4 id="medium-global-raw-pointer-for-signal-handler-agentmaincpp27-servermaincpp13">MEDIUM: Global raw pointer for signal handler (<code>agent/main.cpp:27</code>, <code>server/main.cpp:13</code>)</h4>
+<div class="highlight"><pre><span></span><code><span class="k">static</span><span class="w"> </span><span class="n">yuzu</span><span class="o">::</span><span class="n">agent</span><span class="o">::</span><span class="n">Agent</span><span class="o">*</span><span class="w"> </span><span class="n">g_agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">nullptr</span><span class="p">;</span>
+</code></pre></div>
+<p>No synchronization between setting <code>g_agent</code> (line 92) and the signal handler reading it. In practice this is safe because <code>std::signal</code> is called after the assignment, providing a happens-before relationship. However, making this <code>std::atomic&lt;Agent*&gt;</code> would be more defensive.</p>
+<h4 id="low-sqlite-without-raii-wrapper-identity_storecpp83-157">LOW: SQLite without RAII wrapper (<code>identity_store.cpp:83-157</code>)</h4>
+<p>Every error path manually calls <code>sqlite3_finalize()</code> and <code>sqlite3_close()</code>. This works but is fragile — a future modification could miss a cleanup. A small RAII wrapper (or scope guard) would make this bulletproof.</p>
+<h4 id="low-goto-used-for-control-flow-agentcpp178186229252">LOW: <code>goto</code> used for control flow (<code>agent.cpp:178,186,229,252</code>)</h4>
+<p>The <code>run()</code> method uses <code>goto shutdown_plugins</code> for error handling. While functional, this is unusual in modern C++23 code and makes it harder to reason about object lifetimes. An early-return pattern with a destructor-based cleanup would be more idiomatic.</p>
+<hr>
+<h2 id="2-mtls-implementation">2. mTLS Implementation</h2>
+<h3 id="strengths-this-is-well-done">Strengths — This is well done</h3>
+<ul>
+<li><strong>Full mTLS with identity binding.</strong> The server enforces <code>GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY</code> when a CA cert is provided (<code>server.cpp:737-738</code>). It then extracts CN and SAN from the peer certificate and validates that the agent's claimed <code>agent_id</code> matches (<code>server.cpp:480-516</code>).</li>
+<li><strong>Session binding across RPCs.</strong> The server records peer identity at <code>Register()</code> time and re-validates at <code>Subscribe()</code> time (<code>server.cpp:375-386</code>). This prevents a malicious agent from hijacking another agent's session by stealing the session ID — the TLS identity must also match.</li>
+<li><strong>Pending registration TTL.</strong> Session tokens expire after 60 seconds (<code>server.cpp:560</code>), limiting the window for session fixation attacks.</li>
+<li><strong>Separate credentials for management listener.</strong> The server supports independent TLS configuration for the management gRPC port (<code>server.cpp:644-659</code>), allowing different trust boundaries for agent-facing vs. operator-facing traffic.</li>
+<li><strong>Secure defaults.</strong> TLS is enabled by default (<code>Config::tls_enabled{true}</code>). Disabling it requires explicit <code>--no-tls</code>. Omitting <code>--ca-cert</code> without <code>--insecure-skip-client-verify</code> (formerly <code>--allow-one-way-tls</code>) causes a hard failure, and the insecure flag itself requires <code>YUZU_ALLOW_INSECURE_TLS=1</code> as a second confirmation (issue #79).</li>
+<li><strong>Certificate instructions are clear.</strong> <code>scripts/Certificate Instructions.txt</code> provides a complete walk-through with correct OpenSSL commands and SAN configuration.</li>
+</ul>
+<h3 id="issues_1">Issues</h3>
+<h4 id="high-predictable-session-ids-servercpp330-331">HIGH: Predictable session IDs (<code>server.cpp:330-331</code>)</h4>
+<div class="highlight"><pre><span></span><code><span class="k">auto</span><span class="w"> </span><span class="n">session_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;session-&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">to_string</span><span class="p">(</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">chrono</span><span class="o">::</span><span class="n">steady_clock</span><span class="o">::</span><span class="n">now</span><span class="p">().</span><span class="n">time_since_epoch</span><span class="p">().</span><span class="n">count</span><span class="p">());</span>
+</code></pre></div>
+<p>Session tokens are derived from a monotonic clock timestamp — they are sequential and predictable. An attacker who can observe one session ID can predict future ones. Combined with the unauthenticated HTTP API, this could allow session hijacking.</p>
+<p><strong>Fix:</strong> Use a cryptographically secure random generator (e.g., <code>RAND_bytes()</code> from OpenSSL, which is already a transitive dependency via gRPC).</p>
+<h4 id="high-no-enrollment-token-pre-authentication-agentproto40-42">HIGH: No enrollment token / pre-authentication (<code>agent.proto:40-42</code>)</h4>
+<p>Any entity that possesses a valid client certificate signed by the CA can register as an agent with an arbitrary <code>agent_id</code>. The <code>RegisterRequest</code> has no <code>enrollment_token</code> field. In an enterprise environment, this means:</p>
+<ul>
+<li>A compromised CA key allows unlimited agent impersonation</li>
+<li>There's no way to restrict which certificates are authorized to register (no allowlist / revocation check)</li>
+<li>The CLAUDE.md already identifies this as a gap (Auth item #1)</li>
+</ul>
+<p><strong>Recommendation:</strong> Add an enrollment token validated server-side, and consider OCSP stapling or CRL checks for certificate revocation.</p>
+<h4 id="high-private-keys-read-into-memory-with-no-protection-agentcpp191-servercpp717">HIGH: Private keys read into memory with no protection (<code>agent.cpp:191</code>, <code>server.cpp:717</code>)</h4>
+<div class="highlight"><pre><span></span><code><span class="n">ssl_opts</span><span class="p">.</span><span class="n">pem_private_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read_file_contents</span><span class="p">(</span><span class="n">cfg_</span><span class="p">.</span><span class="n">tls_client_key</span><span class="p">);</span>
+</code></pre></div>
+<p>Private keys are read into <code>std::string</code> objects and passed to gRPC. These strings are not zeroed on deallocation — key material persists in freed heap memory. In a core dump or memory forensics scenario, keys are recoverable.</p>
+<p><strong>Recommendation:</strong> Use <code>OPENSSL_cleanse()</code> or a secure allocator for key material. At minimum, zero the strings after passing them to gRPC.</p>
+<h4 id="medium-agent-uuid-generation-uses-non-cryptographic-prng-identity_storecpp14-39">MEDIUM: Agent UUID generation uses non-cryptographic PRNG (<code>identity_store.cpp:14-39</code>)</h4>
+<div class="highlight"><pre><span></span><code><span class="n">std</span><span class="o">::</span><span class="n">random_device</span><span class="w"> </span><span class="n">rd</span><span class="p">;</span>
+<span class="n">std</span><span class="o">::</span><span class="n">mt19937_64</span><span class="w"> </span><span class="nf">gen</span><span class="p">(</span><span class="n">rd</span><span class="p">());</span>
+</code></pre></div>
+<p><code>std::mt19937_64</code> is a Mersenne Twister — deterministic and recoverable from observed output. If an attacker observes an agent's UUID (e.g., via the unauthenticated <code>/api/agents</code> endpoint), they could theoretically recover the PRNG state and predict UUIDs generated on the same machine. Use <code>RAND_bytes()</code> from OpenSSL (already a transitive dependency) instead.</p>
+<h4 id="medium-no-certificate-rotation-hot-reload">MEDIUM: No certificate rotation / hot-reload</h4>
+<p>Certificates are loaded once at startup. Rotating certificates requires a full process restart. For enterprise deployments with short-lived certificates (e.g., Vault PKI, SPIFFE), this is a significant operational burden.</p>
+<h4 id="medium-allow-one-way-tls-weakens-security-silently-resolved-79-v0120">MEDIUM: <code>--allow-one-way-tls</code> weakens security silently — <strong>resolved (#79, v0.12.0)</strong></h4>
+<p>This flag previously disabled client certificate verification with only a <code>spdlog::warn()</code>. As of #79 the flag was renamed to <code>--insecure-skip-client-verify</code> and now requires <code>YUZU_ALLOW_INSECURE_TLS=1</code> in the environment as a second confirmation. The server logs an ERROR-level startup banner and a recurring 5-minute reminder while the listener runs in this mode, and the operator dashboard's TLS row turns red and renames the field to "Insecure Skip Client Verify". The deprecated flag name is still accepted for one release with a startup deprecation warning, then will be removed.</p>
+<hr>
+<h2 id="3-http-api-security">3. HTTP API Security</h2>
+<h4 id="critical-all-http-endpoints-are-unauthenticated-servercpp752-900">CRITICAL: All HTTP endpoints are unauthenticated (<code>server.cpp:752-900</code>)</h4>
+<p>The web server exposes:
+- <code>GET /</code> — Dashboard UI
+- <code>GET /api/agents</code> — Lists all connected agents (information disclosure)
+- <code>POST /api/command</code> — <strong>Dispatches arbitrary commands to agents</strong> (remote code execution surface)
+- <code>GET /events</code> — SSE stream of all agent events
+- <code>POST /api/chargen/start</code>, <code>/api/chargen/stop</code>, <code>/api/procfetch/fetch</code></p>
+<p>None of these endpoints check for authentication. Anyone who can reach the web port (default <code>0.0.0.0:8080</code>) can:
+1. List all agents in the deployment
+2. Send arbitrary plugin commands to any or all agents
+3. Monitor all agent traffic via SSE</p>
+<p>The CLAUDE.md identifies this as Auth item #2. This is the <strong>single most critical security gap</strong> in the codebase.</p>
+<p><strong>Recommendation:</strong> At minimum, add <code>Authorization: Bearer &lt;key&gt;</code> validation as middleware on all <code>/api/*</code> and <code>/events</code> routes before any production use.</p>
+<h4 id="high-json-injection-in-to_json-servercpp209-225">HIGH: JSON injection in <code>to_json()</code> (<code>server.cpp:209-225</code>)</h4>
+<div class="highlight"><pre><span></span><code><span class="n">json</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="s">&quot;{</span><span class="se">\&quot;</span><span class="s">agent_id</span><span class="se">\&quot;</span><span class="s">:</span><span class="se">\&quot;</span><span class="s">&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">agent_id</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;</span><span class="se">\&quot;</span><span class="s">,</span><span class="se">\&quot;</span><span class="s">hostname</span><span class="se">\&quot;</span><span class="s">:</span><span class="se">\&quot;</span><span class="s">&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">hostname</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="p">...</span>
+</code></pre></div>
+<p>Agent metadata (agent_id, hostname, OS, arch) is concatenated directly into JSON without escaping. If an agent registers with a hostname containing <code>"</code>, <code>\</code>, or control characters, this produces malformed or injectable JSON. While the agent itself controls this data (and mTLS limits who can register), a compromised agent could inject arbitrary JSON that the dashboard JavaScript would parse.</p>
+<p><strong>Fix:</strong> Use proper JSON escaping, or adopt nlohmann/json which is <strong>already a declared dependency</strong> in <code>vcpkg.json</code>.</p>
+<h4 id="high-hand-rolled-json-parser-is-fragile-servercpp931-966">HIGH: Hand-rolled JSON parser is fragile (<code>server.cpp:931-966</code>)</h4>
+<p>Note: <code>nlohmann-json</code> is already listed in <code>vcpkg.json</code> as a dependency, making the hand-rolled parser entirely unnecessary.</p>
+<p><code>extract_json_string()</code> and <code>extract_json_string_array()</code> use simple string searching. They don't handle:
+- Escaped quotes in values (<code>\"</code>)
+- Nested objects with the same key name
+- Unicode escape sequences
+- Whitespace variations</p>
+<p>A crafted request body could bypass validation or extract incorrect values.</p>
+<h4 id="medium-missing-compiler-hardening-flags-compilerflagscmake">MEDIUM: Missing compiler hardening flags (<code>CompilerFlags.cmake</code>)</h4>
+<p>The build does not enable:
+- <code>-D_FORTIFY_SOURCE=2</code> — compile-time/runtime buffer overflow detection
+- <code>-fstack-protector-strong</code> — stack canary protection
+- <code>-Wl,-z,relro,-z,now</code> (full RELRO) — GOT hardening against overwrite attacks
+- PIE enforcement for position-independent executables
+- MSVC <code>/DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT</code> — ASLR + DEP on Windows</p>
+<p>These are standard enterprise hardening flags and should be enabled for release builds.</p>
+<h4 id="medium-web-server-binds-to-0000-by-default">MEDIUM: Web server binds to <code>0.0.0.0</code> by default</h4>
+<p>The HTTP dashboard defaults to listening on all interfaces. In enterprise deployments, this should default to <code>127.0.0.1</code> or require explicit opt-in for network binding.</p>
+<h4 id="medium-no-cors-headers-csp-or-other-security-headers">MEDIUM: No CORS headers, CSP, or other security headers</h4>
+<p>The web UI responses don't set <code>Content-Security-Policy</code>, <code>X-Content-Type-Options</code>, <code>X-Frame-Options</code>, or CORS headers. This leaves the dashboard vulnerable to clickjacking and MIME-type confusion attacks.</p>
+<h4 id="medium-no-https-on-the-web-dashboard">MEDIUM: No HTTPS on the web dashboard</h4>
+<p>The HTTP dashboard runs plain HTTP. Even though gRPC uses TLS, the management web interface transmits commands and agent data in cleartext.</p>
+<hr>
+<h2 id="4-plugin-security">4. Plugin Security</h2>
+<h4 id="medium-no-plugin-sandboxing">MEDIUM: No plugin sandboxing</h4>
+<p>Plugins run in-process via <code>dlopen</code>/<code>LoadLibrary</code> (<code>plugin_loader.cpp:57</code>). A malicious or buggy plugin has full access to the agent process — it can read private keys from memory, modify gRPC streams, or execute arbitrary system calls.</p>
+<p><strong>Recommendation for enterprise:</strong> Document the trust model (plugins must be trusted as the agent process itself). Consider code signing for plugin <code>.so</code>/<code>.dll</code> files and restricting <code>--plugin-dir</code> permissions.</p>
+<h4 id="low-no-plugin-allowlist">LOW: No plugin allowlist</h4>
+<p>The agent loads <strong>all</strong> <code>.so</code>/<code>.dll</code> files found in <code>--plugin-dir</code>. There's no way to restrict which plugins are loaded by name or hash. An attacker who can write to the plugin directory gets code execution.</p>
+<hr>
+<h2 id="5-enterprise-deployment-readiness">5. Enterprise Deployment Readiness</h2>
+<blockquote>
+<p><strong>2026-03-26 update:</strong> All 13 gaps listed below have been implemented. The original assessment was accurate at the time of writing (2026-03-07) but the project has since completed all 7 roadmap phases (72/72 issues) and a 52-finding RC hardening sprint. See <code>Release-Candidate.local.MD</code> for the full assessment.</p>
+</blockquote>
+<h3 id="whats-in-good-shape">What's in good shape</h3>
+<table>
+<thead>
+<tr>
+<th>Aspect</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cross-platform</td>
+<td>Excellent</td>
+<td>Windows, Linux, macOS, ARM64 with CI for all</td>
+</tr>
+<tr>
+<td>CI pipeline</td>
+<td>Excellent</td>
+<td>4-platform matrix, sanitizer jobs, vcpkg binary caching</td>
+</tr>
+<tr>
+<td>Build system</td>
+<td>Good</td>
+<td>Meson (sole build system) + vcpkg manifest with pinned baseline</td>
+</tr>
+<tr>
+<td>Dependency pinning</td>
+<td>Good</td>
+<td>vcpkg baseline pinned to specific commit</td>
+</tr>
+<tr>
+<td>CLI argument handling</td>
+<td>Good</td>
+<td>CLI11 with sensible defaults + config file support</td>
+</tr>
+<tr>
+<td>Logging</td>
+<td>Good</td>
+<td>spdlog with configurable levels, file + console sinks, log rotation</td>
+</tr>
+<tr>
+<td>gRPC health checks</td>
+<td>Good</td>
+<td><code>grpc::EnableDefaultHealthCheckService(true)</code></td>
+</tr>
+<tr>
+<td>Authentication</td>
+<td>Excellent</td>
+<td>Session auth, API tokens, OIDC SSO, mTLS, RBAC (6 roles)</td>
+</tr>
+<tr>
+<td>Metrics</td>
+<td>Good</td>
+<td>Prometheus <code>/metrics</code> endpoint on server, agent, and gateway</td>
+</tr>
+<tr>
+<td>Containerization</td>
+<td>Good</td>
+<td>3 Dockerfiles, docker-compose.yml, health checks</td>
+</tr>
+<tr>
+<td>Service management</td>
+<td>Good</td>
+<td>Systemd units with security hardening</td>
+</tr>
+</tbody>
+</table>
+<h3 id="previously-missing-now-implemented">Previously missing — now implemented</h3>
+<table>
+<thead>
+<tr>
+<th>Former Gap</th>
+<th>Resolution</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><del>No containerization</del></td>
+<td>3 multi-stage Dockerfiles, docker-compose.yml</td>
+</tr>
+<tr>
+<td><del>No systemd/service units</del></td>
+<td>Systemd units with security hardening</td>
+</tr>
+<tr>
+<td><del>No config file support</del></td>
+<td>Config file + env var support + runtime configuration API</td>
+</tr>
+<tr>
+<td><del>No environment variable config</del></td>
+<td>Env var overrides for all config options</td>
+</tr>
+<tr>
+<td><del>No metrics/observability</del></td>
+<td>Prometheus <code>/metrics</code>, Grafana dashboards, ClickHouse/JSONL drains</td>
+</tr>
+<tr>
+<td><del>No rate limiting</del></td>
+<td>Rate limiting implemented</td>
+</tr>
+<tr>
+<td><del>No audit logging</del></td>
+<td>Comprehensive audit trail with structured JSON events</td>
+</tr>
+<tr>
+<td><del>No log rotation</del></td>
+<td>Log rotation implemented</td>
+</tr>
+<tr>
+<td><del>No graceful drain</del></td>
+<td>Graceful shutdown with in-flight command draining</td>
+</tr>
+<tr>
+<td><del>No session timeout enforcement</del></td>
+<td>Session timeout enforced</td>
+</tr>
+<tr>
+<td><del>No reconnection logic</del></td>
+<td>Agent reconnection with exponential backoff</td>
+</tr>
+<tr>
+<td><del>ManagementService unimplemented</del></td>
+<td>Full ManagementService with 70+ REST API endpoints</td>
+</tr>
+<tr>
+<td><del>No RBAC</del></td>
+<td>Granular RBAC: 6 roles, 14 securable types, per-operation permissions</td>
+</tr>
+</tbody>
+</table>
+<h3 id="deployment-assessment-updated">Deployment assessment (updated)</h3>
+<p>To deploy Yuzu in an enterprise today:</p>
+<ol>
+<li>Docker images, systemd units, and deb/rpm packages available</li>
+<li>Certificate generation documented; cert hot-reload supported</li>
+<li>Config file, CLI flags, and environment variables all supported</li>
+<li>HTTPS enabled by default with cert/key requirement</li>
+<li>Full authentication (session, API token, OIDC SSO) on all endpoints</li>
+<li>Prometheus metrics + Grafana dashboard templates included</li>
+<li>MCP server for AI-driven fleet management</li>
+</ol>
+<p><strong>Verdict:</strong> Enterprise-ready pending final RC validation. All security hardening complete. See <code>Release-Candidate.local.MD</code> for remaining items.</p>
+<hr>
+<h2 id="6-priority-recommendations">6. Priority Recommendations</h2>
+<blockquote>
+<p><strong>2026-03-26 update:</strong> All 16 recommendations below have been implemented. Items marked <del>strikethrough</del> with resolution notes.</p>
+</blockquote>
+<h3 id="p0-must-fix-before-any-production-use">P0 — Must fix before any production use</h3>
+<ol>
+<li><del><strong>Add authentication to HTTP endpoints</strong></del> — DONE: Session auth, API tokens (Bearer/X-Yuzu-Token), OIDC SSO, RBAC on all endpoints</li>
+<li><del><strong>Fix use-after-free risk in agent command dispatch</strong></del> — DONE: Threads joined before stream destruction</li>
+<li><del><strong>Fix JSON injection in <code>to_json()</code></strong></del> — DONE: JObj/JArr builders + nlohmann for parsing</li>
+<li><del><strong>Use cryptographically secure session IDs</strong></del> — DONE: <code>random_bytes(16)</code> replaces timestamp</li>
+</ol>
+<h3 id="p1-should-fix-for-any-serious-deployment">P1 — Should fix for any serious deployment</h3>
+<ol start="5">
+<li><del><strong>Remove spdlog calls from signal handlers</strong></del> — DONE: Async-signal-safe writes only</li>
+<li><del><strong>Add enrollment token to <code>RegisterRequest</code></strong></del> — DONE: 3-tier enrollment (manual, token, platform trust)</li>
+<li><del><strong>Zero private key material after use</strong></del> — DONE</li>
+<li><del><strong>Add config file support</strong></del> — DONE: Config file + env var overrides</li>
+</ol>
+<h3 id="p2-enterprise-hardening">P2 — Enterprise hardening</h3>
+<ol start="9">
+<li><del>Enable compiler hardening flags</del> — DONE: <code>_FORTIFY_SOURCE</code>, stack protector, RELRO, PIE</li>
+<li><del>Add Docker/K8s deployment manifests</del> — DONE: 3 Dockerfiles + docker-compose.yml</li>
+<li><del>Add Prometheus metrics endpoint</del> — DONE: <code>/metrics</code> on server, agent, and gateway</li>
+<li><del>Implement certificate hot-reload</del> — DONE: PEM polling with validation</li>
+<li><del>Add agent reconnection with exponential backoff</del> — DONE</li>
+<li><del>Implement the ManagementService gRPC API</del> — DONE: 70+ REST API endpoints</li>
+<li><del>Add RBAC for web API and management API</del> — DONE: 6 roles, 14 securable types</li>
+<li><del>Add structured JSON logging option</del> — DONE: JSONL analytics drain</li>
+</ol>
+</main>
+</body>
+</html>

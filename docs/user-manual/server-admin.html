@@ -1,0 +1,1947 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server Administration Guide</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/server-admin.md</div>
+<h1 class="doc-title">Server Administration Guide</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="server-administration-guide">Server Administration Guide</h1>
+<p>This document covers Yuzu server deployment, configuration, and ongoing administration. It is intended for operators who install, configure, and maintain the Yuzu server.</p>
+<hr>
+<h2 id="table-of-contents">Table of Contents</h2>
+<ol>
+<li><a href="#server-cli-flags">Server CLI Flags</a></li>
+<li><a href="#configuration-files">Configuration Files</a></li>
+<li><a href="#first-run-setup">First-Run Setup</a></li>
+<li><a href="#settings-page">Settings Page</a></li>
+<li><a href="#tls-configuration">TLS Configuration</a></li>
+<li><a href="#user-management">User Management</a></li>
+<li><a href="#agent-enrollment">Agent Enrollment</a></li>
+<li><a href="#ota-agent-updates">OTA Agent Updates</a></li>
+<li><a href="#rbac-management">RBAC Management</a></li>
+<li><a href="#tag-compliance">Tag Compliance</a></li>
+<li><a href="#oidc-sso-configuration">OIDC SSO Configuration</a></li>
+<li><a href="#data-storage-and-encryption">Data Storage and Encryption</a></li>
+<li><a href="#retention-settings">Retention Settings</a></li>
+<li><a href="#settings-api-reference">Settings API Reference</a></li>
+<li><a href="#deployment">Deployment</a></li>
+<li><a href="#windows-service-installation">Windows Service Installation</a></li>
+<li><a href="#planned-features">Planned Features</a></li>
+</ol>
+<hr>
+<h2 id="server-cli-flags">Server CLI Flags</h2>
+<p>The Yuzu server binary accepts the following command-line flags. All flags are optional; defaults are shown in the table.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--config</code></td>
+<td><em>(auto)</em></td>
+<td>Path to <code>yuzu-server.cfg</code>. If omitted, uses the default location next to the binary.</td>
+</tr>
+<tr>
+<td><code>--data-dir</code></td>
+<td><em>(config dir)</em></td>
+<td>Directory for SQLite databases and runtime state files (enrollment tokens, pending agents). Defaults to the parent directory of <code>--config</code>. Use this in containerized deployments where the config file is on a read-only mount but databases need a writable volume. The path is resolved to its canonical form at startup (symlinks are followed). Env: <code>YUZU_DATA_DIR</code>.</td>
+</tr>
+<tr>
+<td><code>--web-port</code></td>
+<td><code>8080</code></td>
+<td>HTTP listen port for the dashboard and REST API.</td>
+</tr>
+<tr>
+<td><code>--web-address</code></td>
+<td><code>127.0.0.1</code></td>
+<td>Web UI bind address.</td>
+</tr>
+<tr>
+<td><code>--no-https</code></td>
+<td>off</td>
+<td>Disable HTTPS (insecure, for development only). HTTPS is <strong>enabled by default</strong>; provide <code>--https-cert</code> and <code>--https-key</code>, or pass <code>--no-https</code> to disable. Env: <code>YUZU_NO_HTTPS</code>.</td>
+</tr>
+<tr>
+<td><code>--no-tls</code></td>
+<td>off</td>
+<td>Disable <strong>all</strong> gRPC TLS (agent listener AND management listener). Plaintext gRPC, no encryption, no peer authentication. <strong>The administrative surface is ungated when this flag is passed.</strong> Intended for local UAT, customer demos, and development. The server emits a multi-line ERROR-level startup banner and a 5-minute recurring reminder when running in this mode.</td>
+</tr>
+<tr>
+<td><code>--cert</code></td>
+<td><em>(none)</em></td>
+<td>Path to PEM-encoded gRPC server certificate for the <strong>agent listener</strong> (port 50051 by default). Env: <code>YUZU_CERT</code>.</td>
+</tr>
+<tr>
+<td><code>--key</code></td>
+<td><em>(none)</em></td>
+<td>Path to PEM-encoded gRPC server private key for the agent listener. The file must not be world-readable (Unix: <code>chmod 600</code>). Env: <code>YUZU_KEY</code>.</td>
+</tr>
+<tr>
+<td><code>--ca-cert</code></td>
+<td><em>(none)</em></td>
+<td>Path to PEM-encoded CA certificate used to verify agent client certificates (full mTLS). Without this, the agent listener has no client-cert verification — <code>--insecure-skip-client-verify</code> plus <code>YUZU_ALLOW_INSECURE_TLS=1</code> is required to start in that posture. Env: <code>YUZU_CA_CERT</code>.</td>
+</tr>
+<tr>
+<td><code>--insecure-skip-client-verify</code></td>
+<td>off</td>
+<td>Allow gRPC TLS without <code>--ca-cert</code> (one-way TLS — server cert is presented but client certs are not verified). Applies to BOTH the agent listener and the management listener. <strong>Requires <code>YUZU_ALLOW_INSECURE_TLS=1</code> in the environment as a second confirmation</strong> — the server refuses to start without it. Renamed from <code>--allow-one-way-tls</code> in v0.12.0; the old name is still accepted with a deprecation warning.</td>
+</tr>
+<tr>
+<td><code>--allow-one-way-tls</code></td>
+<td>off</td>
+<td><strong>[DEPRECATED]</strong> Renamed to <code>--insecure-skip-client-verify</code>. Still accepted for backward compatibility with a startup deprecation warning; will be removed in a future release.</td>
+</tr>
+<tr>
+<td><code>--management-cert</code></td>
+<td><em>(none)</em></td>
+<td>Optional PEM cert for the <strong>management listener</strong> (port 50052 by default). If unset, the management listener reuses the agent listener's certificate.</td>
+</tr>
+<tr>
+<td><code>--management-key</code></td>
+<td><em>(none)</em></td>
+<td>Optional PEM key for the management listener. If <code>--management-cert</code>/<code>--management-key</code> are set without <code>--management-ca-cert</code>, the same <code>--insecure-skip-client-verify</code> + <code>YUZU_ALLOW_INSECURE_TLS=1</code> gate applies.</td>
+</tr>
+<tr>
+<td><code>--management-ca-cert</code></td>
+<td><em>(none)</em></td>
+<td>Optional CA cert for management client cert verification. Without this (and without <code>--insecure-skip-client-verify</code>), the management listener refuses to start.</td>
+</tr>
+<tr>
+<td><code>--bidi-dispatcher-pool-size</code></td>
+<td><em>(auto)</em></td>
+<td>Bounded thread pool size for the <strong>agent listener's</strong> bidi-streaming RPCs (<code>Subscribe</code>, <code>DownloadUpdate</code>). Default auto-computes to <code>clamp(64, hardware_concurrency × 8, 4096)</code>. Direct-connect deployments with steady-state agent counts above the default must raise this to at least the expected concurrent Subscribe count plus headroom; gateway-mode deployments can leave at default because the gateway terminates Subscribe per-fleet. Saturation rejects new bidi RPCs with <code>StatusCode::ResourceExhausted "transport: bidi dispatcher saturated"</code>. Does <strong>not</strong> apply to the management listener (port 50052). See <a href="#bidi-dispatcher-pool-sizing-direct-connect-deployments-only">Bidi dispatcher pool sizing</a> for sizing guidance and OS thread-budget tuning. Env: <code>YUZU_BIDI_DISPATCHER_POOL_SIZE</code>.</td>
+</tr>
+<tr>
+<td><code>--https-port</code></td>
+<td><code>8443</code></td>
+<td>HTTPS listen port.</td>
+</tr>
+<tr>
+<td><code>--https-cert</code></td>
+<td><em>(none)</em></td>
+<td>Path to PEM-encoded TLS certificate file. Required unless <code>--no-https</code> is set.</td>
+</tr>
+<tr>
+<td><code>--https-key</code></td>
+<td><em>(none)</em></td>
+<td>Path to PEM-encoded TLS private key file. Required unless <code>--no-https</code> is set. The file must not be world-readable (Unix: <code>chmod 600</code>).</td>
+</tr>
+<tr>
+<td><code>--no-https-redirect</code></td>
+<td>off</td>
+<td>When HTTPS is enabled, do not redirect HTTP requests to HTTPS. By default, HTTP requests are redirected.</td>
+</tr>
+<tr>
+<td><code>--no-cert-reload</code></td>
+<td>off</td>
+<td>Disable automatic certificate hot-reload. By default, the server polls cert/key files and hot-swaps the SSL context when they change. Env: <code>YUZU_NO_CERT_RELOAD</code>.</td>
+</tr>
+<tr>
+<td><code>--cert-reload-interval</code></td>
+<td><code>60</code></td>
+<td>Certificate reload polling interval in seconds. Minimum effective interval is 10 seconds. Env: <code>YUZU_CERT_RELOAD_INTERVAL</code>.</td>
+</tr>
+<tr>
+<td><code>--metrics-no-auth</code></td>
+<td>off</td>
+<td>Allow unauthenticated <code>/metrics</code> access from any IP. By default, remote clients must authenticate; localhost access is always unauthenticated. <strong>Warning:</strong> enabling this exposes fleet composition data (OS, architecture, version counts) to any network client. See <a href="metrics.html#security-considerations">Metrics Security</a>. Env: <code>YUZU_METRICS_NO_AUTH</code>.</td>
+</tr>
+<tr>
+<td><code>--csp-extra-sources</code></td>
+<td><em>(none)</em></td>
+<td>Extra Content-Security-Policy source-list entries appended to <code>script-src</code>, <code>style-src</code>, <code>connect-src</code>, and <code>img-src</code>. Space-separated string of host/scheme expressions or whitelisted CSP keywords (<code>'self'</code>, <code>'none'</code>, <code>'sha256-...'</code>, <code>'sha384-...'</code>, <code>'sha512-...'</code>, <code>'nonce-...'</code>). The server <strong>refuses to start</strong> if the value contains control bytes, semicolons, commas, or unsafe CSP keywords like <code>'unsafe-eval'</code>. Use to whitelist customer CDNs, monitoring beacons, or analytics endpoints. See <a href="security-hardening.html#http-security-response-headers">HTTP Security Response Headers</a>. Env: <code>YUZU_CSP_EXTRA_SOURCES</code>.</td>
+</tr>
+<tr>
+<td><code>--oidc-issuer</code></td>
+<td><em>(none)</em></td>
+<td>OIDC identity provider issuer URL (e.g., <code>https://login.microsoftonline.com/{tenant}/v2.0</code>).</td>
+</tr>
+<tr>
+<td><code>--oidc-client-id</code></td>
+<td><em>(none)</em></td>
+<td>OIDC application (client) ID.</td>
+</tr>
+<tr>
+<td><code>--oidc-client-secret</code></td>
+<td><em>(none)</em></td>
+<td>OIDC client secret.</td>
+</tr>
+<tr>
+<td><code>--oidc-redirect-uri</code></td>
+<td><em>(auto)</em></td>
+<td>OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider.</td>
+</tr>
+<tr>
+<td><code>--oidc-admin-group</code></td>
+<td><em>(none)</em></td>
+<td>Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login.</td>
+</tr>
+<tr>
+<td><code>--oidc-skip-tls-verify</code></td>
+<td>off</td>
+<td>Disable TLS certificate verification for OIDC endpoints. <strong>Insecure — dev only.</strong> Env: <code>YUZU_OIDC_SKIP_TLS_VERIFY</code>.</td>
+</tr>
+<tr>
+<td><code>--mcp-disable</code></td>
+<td>off</td>
+<td>Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to <code>/mcp/v1/</code> are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: <code>YUZU_MCP_DISABLE</code>.</td>
+</tr>
+<tr>
+<td><code>--mcp-read-only</code></td>
+<td>off</td>
+<td>Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: <code>YUZU_MCP_READ_ONLY</code>.</td>
+</tr>
+<tr>
+<td><code>--log-file</code></td>
+<td><em>(none)</em></td>
+<td>Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see <a href="#file-logging">File Logging</a>).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="example">Example</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># HTTP only (development — HTTPS is on by default, must opt out)</span>
+./yuzu-server<span class="w"> </span>--no-https<span class="w"> </span>--web-port<span class="w"> </span><span class="m">8080</span>
+
+<span class="c1"># HTTPS with certificate files (default mode)</span>
+./yuzu-server<span class="w"> </span>--https-cert<span class="w"> </span>/etc/yuzu/server.crt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-key<span class="w"> </span>/etc/yuzu/server.key
+
+<span class="c1"># HTTPS with custom cert reload interval (30 seconds)</span>
+./yuzu-server<span class="w"> </span>--https-cert<span class="w"> </span>/etc/yuzu/server.crt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-key<span class="w"> </span>/etc/yuzu/server.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cert-reload-interval<span class="w"> </span><span class="m">30</span>
+
+<span class="c1"># HTTPS with cert reload disabled</span>
+./yuzu-server<span class="w"> </span>--https-cert<span class="w"> </span>/etc/yuzu/server.crt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-key<span class="w"> </span>/etc/yuzu/server.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--no-cert-reload
+
+<span class="c1"># MCP disabled (air-gapped environment)</span>
+./yuzu-server<span class="w"> </span>--https-cert<span class="w"> </span>/etc/yuzu/server.crt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-key<span class="w"> </span>/etc/yuzu/server.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mcp-disable
+
+<span class="c1"># MCP read-only mode (AI can query but not execute)</span>
+./yuzu-server<span class="w"> </span>--https-cert<span class="w"> </span>/etc/yuzu/server.crt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-key<span class="w"> </span>/etc/yuzu/server.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mcp-read-only
+
+<span class="c1"># HTTPS with OIDC SSO</span>
+./yuzu-server<span class="w"> </span>--https-cert<span class="w"> </span>/etc/yuzu/server.crt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--https-key<span class="w"> </span>/etc/yuzu/server.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--oidc-issuer<span class="w"> </span><span class="s2">&quot;https://login.microsoftonline.com/YOUR_TENANT/v2.0&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--oidc-client-id<span class="w"> </span><span class="s2">&quot;YOUR_CLIENT_ID&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--oidc-client-secret<span class="w"> </span><span class="s2">&quot;YOUR_SECRET&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--oidc-redirect-uri<span class="w"> </span><span class="s2">&quot;https://yuzu.example.com:8443/auth/callback&quot;</span>
+</code></pre></div>
+<hr>
+<h2 id="configuration-files">Configuration Files</h2>
+<p>The server stores its configuration in files located in the <strong>same directory as the <code>yuzu-server</code> binary</strong>. These files are created automatically during first-run setup and updated through the Settings page.</p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu-server.cfg</code></td>
+<td>First-boot seed for <code>auth.db</code>. Holds the initial admin credential as PBKDF2-SHA256 with a per-user salt. After first boot, <code>auth.db</code> is authoritative and this file is no longer read for live state — keep it as the seed for disaster-recovery (re-creating <code>auth.db</code> from scratch).</td>
+</tr>
+<tr>
+<td><code>auth.db</code></td>
+<td>SQLite-backed authentication database. Holds user accounts, sessions, and enrollment tokens with PBKDF2-SHA256 hashed passwords. Created in <code>--data-dir</code> on first boot. Mode <code>0600</code> on Linux; restricted ACL on Windows. <strong>This is the live source of truth for authentication state from v0.12.0 onwards.</strong></td>
+</tr>
+<tr>
+<td><code>enrollment-tokens.cfg</code></td>
+<td>Legacy enrollment-token file (Tier 2). New deployments persist tokens inside <code>auth.db</code>; this file remains writable for backwards-compatibility on upgrades from pre-AuthDB releases.</td>
+</tr>
+<tr>
+<td><code>pending-agents.cfg</code></td>
+<td>Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp.</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Backup recommendation:</strong> Back up <code>auth.db</code> (use <code>sqlite3 auth.db ".backup ..."</code>, NEVER <code>cp</code> against a live WAL DB), <code>yuzu-server.cfg</code>, and the rest of the <code>--data-dir</code> SQLite stores on the same schedule. Losing <code>auth.db</code> AND <code>yuzu-server.cfg</code> requires re-running <code>--first-run-setup</code> to create a new admin. Losing <code>auth.db</code> alone is recoverable — see <a href="../ops-runbooks/auth-db-recovery.html" class="doc-ref"><code>docs/ops-runbooks/auth-db-recovery.md</code></a>.</p>
+<p><strong>File permissions (Unix):</strong> <code>auth.db</code> is created with mode <code>0600</code> (owner read/write only); <code>yuzu-server.cfg</code>, <code>enrollment-tokens.cfg</code>, and <code>pending-agents.cfg</code> are also <code>0600</code> after every write. No manual <code>chmod</code> is required.</p>
+<p><strong>Windows Defender exclusion:</strong> On Windows production deploys, exclude <code>auth.db</code>, <code>auth.db-wal</code>, and <code>auth.db-shm</code> from real-time scan. See <a href="../ops-runbooks/auth-db-recovery.html" class="doc-ref"><code>docs/ops-runbooks/auth-db-recovery.md</code></a> for the <code>Add-MpPreference</code> commands.</p>
+</blockquote>
+<hr>
+<h2 id="first-run-setup">First-Run Setup</h2>
+<p>When the server starts for the first time and no <code>yuzu-server.cfg</code> exists, it enters <strong>interactive setup mode</strong> on the terminal. The setup prompts for:</p>
+<ol>
+<li><strong>Admin username</strong> -- the initial administrator account.</li>
+<li><strong>Admin password</strong> -- entered twice for confirmation. Stored as a PBKDF2 hash.</li>
+</ol>
+<p>After setup completes, the server writes <code>yuzu-server.cfg</code> and starts normally. Subsequent restarts skip the setup prompt.</p>
+<blockquote>
+<p><strong>Headless deployment:</strong> For automated or containerized deployments, pre-create <code>yuzu-server.cfg</code> with PBKDF2-hashed password entries before starting the server for the first time. A sample config with default credentials is provided below for quick evaluation.</p>
+</blockquote>
+<h3 id="default-credentials-evaluation-only">Default Credentials (Evaluation Only)</h3>
+<p>For Docker, automated, and quick-start deployments, the following <code>yuzu-server.cfg</code> ships with pre-hashed credentials so the server starts without interactive setup:</p>
+<table>
+<thead>
+<tr>
+<th>Username</th>
+<th>Password</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>admin</code></td>
+<td><code>administrator</code></td>
+<td>Admin (full access)</td>
+</tr>
+<tr>
+<td><code>user</code></td>
+<td><code>useroperator</code></td>
+<td>User (read-only)</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>WARNING: Change these credentials immediately after first login.</strong> These defaults are published in documentation and are not suitable for production. Use the Settings page (User Management) to change passwords and create new accounts. For enterprise deployments, integrate OIDC SSO and disable local accounts.</p>
+</blockquote>
+<hr>
+<h2 id="upgrade-notes">Upgrade Notes</h2>
+<h3 id="v0100-api-token-revocation-is-owner-scoped">v0.10.0 — API token revocation is owner-scoped</h3>
+<p>Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the <code>ApiToken:Delete</code> permission may revoke only tokens whose <code>principal_id</code> matches the session's username; the global <code>admin</code> role is the sole bypass. Prior releases allowed any holder of <code>ApiToken:Delete</code> to revoke any token, which was an IDOR (tracked in GitHub issue #222).</p>
+<p><strong>If your deployment uses a non-admin service account to rotate tokens for other principals</strong> — for example, a shared <code>ops</code> role that recycles service-account tokens on a schedule — those rotations will begin receiving <code>HTTP 404 token not found</code> after upgrade. To restore the behavior, either:</p>
+<ol>
+<li>Assign the rotation account the global <code>admin</code> role, or</li>
+<li>Refactor the rotation so each principal owns and rotates its own token.</li>
+</ol>
+<p>Option (2) is the recommended long-term posture because it aligns with least-privilege. The same ownership constraint applies to both the REST path <code>DELETE /api/v1/tokens/{id}</code> and the HTMX dashboard path <code>DELETE /api/settings/api-tokens/{id}</code>. Denied attempts are recorded in the audit log with <code>action=api_token.revoke</code>, <code>result=denied</code>, and <code>detail=owner=&lt;real owner&gt;</code> so operators can distinguish an enumeration probe from a legitimate self-revoke.</p>
+<p>Both paths return <code>HTTP 404 token not found</code> on a cross-user revoke attempt — identical to the response for a truly-nonexistent token — to prevent the endpoint from being used as an enumeration oracle.</p>
+<h3 id="v0120-tar-dashboard-page-mixed-version-agent-caveats">v0.12.0 — TAR dashboard page + mixed-version agent caveats</h3>
+<p>The new <code>/tar</code> dashboard page (issue #547) surfaces every device × source pair where a TAR collector has been disabled. The page is reachable from the <strong>TAR</strong> entry in the main navigation bar; viewing requires <code>Infrastructure:Read</code> and the per-source Re-enable / Scan-fleet actions require <code>Execution:Execute</code>.</p>
+<p><strong>Mixed-version rollout caveat.</strong> Agents running a build older than v0.12.0 do not emit the new per-source <code>paused_at</code> / <code>live_rows</code> / <code>oldest_ts</code> lines on <code>tar.status</code>. The dashboard renders an em-dash (<code>—</code>) for those columns when a pre-v0.12.0 agent appears in a scan result. This is not a server bug — it is an honest "we don't know when this collector was disabled because the agent reporting it pre-dates the field." Operators upgrading the server before the agent fleet should expect the em-dash for any pre-existing paused sources until the agent at the affected device is upgraded. See <a href="tar.html" class="doc-ref"><code>docs/user-manual/tar.md</code></a> for the full TAR dashboard workflow.</p>
+<p><strong>Per-operator scan state caveat.</strong> Scan results are held in the server's memory keyed by operator username, with a 30-second per-operator cooldown to defend against retry-storms. Restarting the server clears all scan state; operators will see "No scan data yet — click Scan fleet" after a restart and a fresh scan returns within seconds. Persistence across restarts and multi-server coordination land in Phase 15.G operational hardening.</p>
+<p><strong>Audit log additions.</strong> Two new audit actions emit on operator activity: <code>tar.status.scan</code> (every Scan-fleet click; <code>result=success</code>/<code>denied</code>/<code>failure</code> with detail) and <code>tar.source.reenable</code> (every Re-enable click; <code>result=success</code>/<code>denied</code>/<code>failure</code>). SIEM rules can distinguish forged form submissions from genuine connectivity failures via the <code>detail=scope_violation</code> vs <code>detail=agent_not_connected</code> distinction even though the HTTP response body is identical (<code>Agent not reachable.</code> 404) for both cases — the body identity is load-bearing for the no-enumeration-oracle property.</p>
+<h3 id="vnext-plugin-code-signing-80">vNEXT — Plugin code signing (#80)</h3>
+<p>Plugin signature verification ships in two parts: an agent-side CMS verifier and a server-side Settings UI for managing the trust bundle. <strong>Default behaviour is unchanged</strong> — agents that do not pass <code>--plugin-trust-bundle</code> and operators that do not upload a bundle through the new Settings card see identical behaviour to prior releases (allowlist-only, sha256 hash check).</p>
+<p><strong>New on-disk artifact.</strong> <code>&lt;cert-dir&gt;/plugin-trust-bundle.pem</code> (Linux/macOS: <code>/etc/yuzu/certs/plugin-trust-bundle.pem</code>; Windows: <code>C:\ProgramData\Yuzu\certs\plugin-trust-bundle.pem</code>). Server-managed via Settings → Plugin Code Signing. <strong>Back this up alongside <code>auth.db</code>.</strong> A backup that captures the SQLite databases but not the cert dir restores <code>plugin_signing_required=true</code> (in <code>runtime_config</code>) without the trust bundle file — agents fetching the policy will receive a 500 and require-mode agents will reject every plugin until the bundle is restored.</p>
+<p><strong>Cert-dir collision check.</strong> The server now treats this filename as authoritative. If a prior deployment placed an unrelated PEM at this exact path for a different purpose, it will be interpreted as the plugin trust bundle on first read. This is unlikely (the filename was unused before this release) but worth confirming before upgrade. Run <code>ls &lt;cert-dir&gt;/plugin-trust-bundle.pem</code> and rename the file if it pre-exists for any other purpose.</p>
+<p><strong>New <code>runtime_config</code> key.</strong> <code>plugin_signing_required</code> (string <code>"true"</code> or <code>"false"</code>). Set via the Settings card; reading and writing the key directly via the runtime-config REST surface is supported but not recommended — the Settings UI guarantees the disk-and-DB invariants (two-phase clear, file-presence-equals-enabled).</p>
+<p><strong>New audit actions.</strong> <code>plugin_signing.bundle.uploaded</code>, <code>plugin_signing.bundle.cleared</code>, <code>plugin_signing.require.changed</code> — see <a href="audit-log.html" class="doc-ref"><code>audit-log.md</code></a> for the result and detail conventions. SIEM rules already filtering on <code>success</code>/<code>failure</code>/<code>denied</code> will pick these up unchanged; no new vocabulary tokens.</p>
+<p><strong>Operator distribution.</strong> The server hosts the bundle at <code>GET /api/v1/agent/plugin-policy</code> (admin-only). Agents are pointed at a local copy via <code>--plugin-trust-bundle &lt;path&gt;</code>; the manual workflow today is <code>curl</code> + <code>jq</code> + write the JSON's <code>trust_bundle_pem</code> field to disk on each agent host. Automatic agent-side fetch is a forthcoming change.</p>
+<p><strong>Fleet-suicide caveat.</strong> The Yuzu release pipeline does not yet sign the 44 in-tree plugins under <code>agents/plugins/</code>. <strong>Do NOT enable "Require signed plugins" until you have signed every plugin your fleet uses, including the in-tree ones.</strong> Use the transitional mode (bundle uploaded, Require off) during rollout. The Settings card surfaces this warning inline.</p>
+<h3 id="vnext-response-templates-254-phase-82">vNEXT — Response templates (#254, Phase 8.2)</h3>
+<p>Phase 8.2 ships named response-view configurations attached to each <code>InstructionDefinition</code>: a column subset, sort order, and filter presets the dashboard's filter-bar <strong>View</strong> dropdown surfaces. The feature is purely additive — operators who never author a template see a synthesised <code>__default__</code> view that is byte-identical in behaviour to the prior "show all columns, sort by Agent" default.</p>
+<p><strong>Schema migration.</strong> <code>instruction_definitions</code> gains one column: <code>response_templates_spec TEXT NOT NULL DEFAULT '[]'</code>. The migration ledger advances from v2 to v3. <code>ALTER TABLE ADD COLUMN</code> with a constant default is O(1) in SQLite (metadata-only, no table rewrite); the migration is non-destructive.</p>
+<p><strong>Pre-upgrade snapshot (recommended).</strong> Take a backup of the InstructionStore database before upgrade:</p>
+<div class="highlight"><pre><span></span><code>cp<span class="w"> </span>/var/lib/yuzu/instructions.db<span class="w"> </span>/var/lib/yuzu/instructions.db.bak
+<span class="c1"># or, for a hot-running server, use SQLite&#39;s online backup:</span>
+sqlite3<span class="w"> </span>/var/lib/yuzu/instructions.db<span class="w"> </span><span class="s2">&quot;.backup /var/lib/yuzu/instructions.db.bak&quot;</span>
+</code></pre></div>
+<p><strong>Post-upgrade validation.</strong></p>
+<div class="highlight"><pre><span></span><code>sqlite3<span class="w"> </span>/var/lib/yuzu/instructions.db<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;SELECT version FROM schema_meta WHERE store=&#39;instruction_store&#39;;&quot;</span>
+<span class="c1"># expected output: 3</span>
+</code></pre></div>
+<p>If the value is <code>2</code> instead of <code>3</code>, the migration did not run — check the server logs for <code>MigrationRunner: instruction_store migrated to v3</code> (or for a <code>probe-and-stamp failed</code> line in the InstructionStore section).</p>
+<p><strong>Boot wedge recovery.</strong> A corrupt schema_meta row or a pre-existing <code>response_templates_spec</code> column with a missing schema_meta v3 stamp will trip the probe-and-stamp guard, which fails closed (server logs <code>InstructionStore: probe-and-stamp failed; closing database</code>). To recover, restore the snapshot or apply the column manually:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Stop the server first.</span>
+systemctl<span class="w"> </span>stop<span class="w"> </span>yuzu-server
+
+sqlite3<span class="w"> </span>/var/lib/yuzu/instructions.db<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;ALTER TABLE instruction_definitions ADD COLUMN response_templates_spec TEXT NOT NULL DEFAULT &#39;[]&#39;;&quot;</span>
+sqlite3<span class="w"> </span>/var/lib/yuzu/instructions.db<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;INSERT OR REPLACE INTO schema_meta (store, version, upgraded_at) VALUES (&#39;instruction_store&#39;, 3, strftime(&#39;%s&#39;,&#39;now&#39;));&quot;</span>
+
+systemctl<span class="w"> </span>start<span class="w"> </span>yuzu-server
+</code></pre></div>
+<p><strong>New audit actions.</strong> <code>response_template.create</code>, <code>response_template.update</code>, <code>response_template.delete</code> — see <a href="audit-log.html" class="doc-ref"><code>audit-log.md</code></a> for the failure-reason vocabulary. SIEM rules already filtering on <code>success</code>/<code>denied</code> will pick these up unchanged.</p>
+<p><strong>Authoring caveats.</strong> The dashboard YAML editor's lightweight line-scanner does not extract <code>spec.responseTemplates</code> into the indexed column; author through <code>POST /api/v1/definitions/import</code> (JSON envelope) or the REST template endpoints. Imported templates with the reserved <code>id: __default__</code> are silently dropped during normalisation.</p>
+<hr>
+<h2 id="settings-page">Settings Page</h2>
+<p>The Settings page is the primary administrative interface. It is accessible only to users with the <strong>admin</strong> role and is rendered server-side using HTMX.</p>
+<p><strong>URL:</strong> <code>/settings</code> (redirects to <code>/login</code> if unauthenticated or non-admin)</p>
+<p>The Settings page is organized into sections, each loaded as an HTMX fragment. Changes take effect immediately without a server restart unless otherwise noted.</p>
+<h3 id="sections">Sections</h3>
+<table>
+<thead>
+<tr>
+<th>Section</th>
+<th>Fragment Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TLS Configuration</td>
+<td><code>/fragments/settings/tls</code></td>
+<td>Enable/disable HTTPS, upload PEM certificate and key files.</td>
+</tr>
+<tr>
+<td>User Management</td>
+<td><code>/fragments/settings/users</code></td>
+<td>Create and delete local user accounts.</td>
+</tr>
+<tr>
+<td>Enrollment Tokens</td>
+<td><code>/fragments/settings/tokens</code></td>
+<td>Generate and revoke tokens for Tier 2 agent enrollment.</td>
+</tr>
+<tr>
+<td>Pending Agents</td>
+<td><code>/fragments/settings/pending</code></td>
+<td>Approve or deny agents waiting in the Tier 1 approval queue.</td>
+</tr>
+<tr>
+<td>Auto-Approval Policies</td>
+<td><code>/fragments/settings/auto-approve</code></td>
+<td>Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.).</td>
+</tr>
+<tr>
+<td>API Tokens</td>
+<td><code>/fragments/settings/api-tokens</code></td>
+<td>Create and revoke bearer tokens for REST API automation.</td>
+</tr>
+<tr>
+<td>Plugin Code Signing</td>
+<td><code>/fragments/settings/plugin-signing</code></td>
+<td>Upload a PEM trust bundle for agent plugin CMS signature verification, toggle the require-signed-plugins flag, and remove the bundle. The trust bundle persists at <code>&lt;cert-dir&gt;/plugin-trust-bundle.pem</code>; the require flag persists in <code>runtime_config</code> under key <code>plugin_signing_required</code>. Distribution to agents is operator-driven today (curl into a local file referenced by <code>--plugin-trust-bundle</code>); automatic agent-side fetch is a forthcoming change. See the user-manual <em>Agent Plugins → Plugin Code Signing</em> section.</td>
+</tr>
+<tr>
+<td>OTA Updates</td>
+<td><code>/fragments/settings/updates</code></td>
+<td>Upload agent binaries, view available versions, promote a version to production.</td>
+</tr>
+<tr>
+<td>Tag Compliance</td>
+<td><code>/fragments/settings/tag-compliance</code></td>
+<td>View compliance summary across the fleet based on tag-driven policies.</td>
+</tr>
+<tr>
+<td>RBAC Management</td>
+<td><em>(planned -- no fragment yet)</em></td>
+<td>Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via <code>RbacStore</code> and the <code>/api/v1/rbac/*</code> REST API, but has no Settings page fragment yet.</td>
+</tr>
+<tr>
+<td>OIDC SSO / Directory</td>
+<td><code>/fragments/settings/directory</code></td>
+<td>Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes persisted to runtime config and survive restart.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="tls-configuration">TLS Configuration</h2>
+<p>The Yuzu server has <strong>two independent TLS surfaces</strong>:</p>
+<ol>
+<li><strong>HTTPS</strong> — the dashboard and REST API (port 8443 by default). Configured via <code>--https-cert</code> / <code>--https-key</code> (or runtime via the Settings page). Disabled with <code>--no-https</code>.</li>
+<li><strong>gRPC TLS</strong> — the agent listener (port 50051) and the management listener (port 50052). Configured via <code>--cert</code> / <code>--key</code> / <code>--ca-cert</code> (and optionally <code>--management-cert</code> / <code>--management-key</code> / <code>--management-ca-cert</code> for a separate management cert). Disabled entirely with <code>--no-tls</code>.</li>
+</ol>
+<p>The two surfaces are configured separately and can be in different states (e.g., HTTPS enabled but gRPC TLS disabled for a local UAT against a remote dashboard).</p>
+<h3 id="https-via-cli-flags">HTTPS via CLI Flags</h3>
+<p>HTTPS is enabled by default. Pass <code>--https-cert</code> and <code>--https-key</code> at server startup. Use <code>--no-https</code> for development without TLS. See <a href="#server-cli-flags">Server CLI Flags</a>.</p>
+<h3 id="grpc-tls-via-cli-flags">gRPC TLS via CLI Flags</h3>
+<p>The recommended posture is <strong>mutual TLS (mTLS)</strong> — the server presents a certificate and verifies a client certificate from each connecting agent:</p>
+<div class="highlight"><pre><span></span><code>./yuzu-server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cert<span class="w"> </span>/etc/yuzu/grpc-server.crt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--key<span class="w">  </span>/etc/yuzu/grpc-server.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--ca-cert<span class="w"> </span>/etc/yuzu/agent-clients-ca.crt
+</code></pre></div>
+<p>If you have not yet stood up a CA for issuing agent client certificates, you have two fallback options:</p>
+<p><strong>Option 1 — One-way TLS</strong> (server cert is presented but client certs are not verified):</p>
+<div class="highlight"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">YUZU_ALLOW_INSECURE_TLS</span><span class="o">=</span><span class="m">1</span><span class="w">   </span><span class="c1"># required as a second confirmation</span>
+./yuzu-server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cert<span class="w"> </span>/etc/yuzu/grpc-server.crt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--key<span class="w">  </span>/etc/yuzu/grpc-server.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--insecure-skip-client-verify
+</code></pre></div>
+<p>This applies to <strong>both</strong> the agent listener and the management listener. The server emits an ERROR-level startup banner and a 5-minute recurring reminder log line for the duration the listener runs in this mode. An audit event with action <code>server.tls_degraded</code> is also written every 5 minutes for SOC 2 evidence.</p>
+<p><strong>Option 2 — <code>--no-tls</code></strong> (no encryption, no peer authentication, plaintext gRPC):</p>
+<div class="highlight"><pre><span></span><code>./yuzu-server<span class="w"> </span>--no-tls
+</code></pre></div>
+<p>This is the supported posture for <strong>local UAT, customer demos, and development</strong>. The administrative surface is ungated — anyone reachable on port 50052 can issue management RPCs. The server emits a multi-line ERROR-level startup banner and a 5-minute recurring reminder. Do not run <code>--no-tls</code> against any network you do not control end-to-end.</p>
+<h3 id="upgrade-note-v0120">Upgrade note (v0.12.0)</h3>
+<p>The <code>--allow-one-way-tls</code> flag was renamed to <code>--insecure-skip-client-verify</code> AND now requires <code>YUZU_ALLOW_INSECURE_TLS=1</code> in the environment as a second confirmation. <strong>Existing deployments that pass <code>--allow-one-way-tls</code> (or the new flag name) will refuse to start after upgrade until the env var is set.</strong> The old flag name remains accepted with a deprecation warning for one release.</p>
+<p>For systemd-managed deployments, add the env var via a drop-in:</p>
+<div class="highlight"><pre><span></span><code>sudo<span class="w"> </span>systemctl<span class="w"> </span>edit<span class="w"> </span>yuzu-server<span class="w">   </span><span class="c1"># creates /etc/systemd/system/yuzu-server.service.d/override.conf</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="k">[Service]</span>
+<span class="na">Environment</span><span class="o">=</span><span class="s">&quot;YUZU_ALLOW_INSECURE_TLS=1&quot;</span>
+</code></pre></div>
+<h3 id="via-settings-page">Via Settings Page</h3>
+<ol>
+<li>Navigate to <strong>Settings &gt; TLS Configuration</strong>.</li>
+<li>Toggle <strong>Enable HTTPS</strong>.</li>
+<li>Upload PEM-encoded certificate and private key files using the <strong>Upload PEM</strong> button, or paste PEM content directly using the <strong>Paste PEM</strong> button.</li>
+<li>The server begins serving HTTPS on the configured port. By default, HTTP requests are redirected to HTTPS.</li>
+</ol>
+<h3 id="certificate-requirements">Certificate Requirements</h3>
+<ul>
+<li>Format: PEM-encoded.</li>
+<li>The certificate file may contain the full chain (leaf + intermediates).</li>
+<li>The private key must not be password-protected.</li>
+<li>On Unix, the private key file must not be readable by group or others. The server will refuse to start if permissions are too open. Fix with: <code>chmod 600 /path/to/key.pem</code>.</li>
+<li>For production, use certificates signed by a trusted CA. Self-signed certificates work but require agents to trust the CA.</li>
+</ul>
+<h3 id="certificate-hot-reload">Certificate Hot-Reload</h3>
+<p>The server automatically detects when HTTPS certificate or key files change on disk and hot-swaps the SSL context <strong>without requiring a restart</strong>. This enables zero-downtime certificate rotation, including automated renewal via ACME/certbot.</p>
+<p><strong>How it works:</strong></p>
+<ol>
+<li>The server polls the cert and key file modification times at a configurable interval (default: 60 seconds).</li>
+<li>When a change is detected, the new files are validated:
+   - PEM format is parseable
+   - Certificate and private key match
+   - Key file permissions are secure (Unix: not group/others-readable)
+   - Files are not empty and not larger than 1 MB</li>
+<li>If validation passes, the SSL context is updated atomically. New connections use the new certificate; existing connections are unaffected.</li>
+<li>If validation fails, the current certificate is preserved and an error is logged.</li>
+</ol>
+<p><strong>Configuration:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--no-cert-reload</code></td>
+<td>off</td>
+<td>Disable automatic hot-reload. Env: <code>YUZU_NO_CERT_RELOAD</code>.</td>
+</tr>
+<tr>
+<td><code>--cert-reload-interval</code></td>
+<td><code>60</code></td>
+<td>Polling interval in seconds. Minimum: 10s. Env: <code>YUZU_CERT_RELOAD_INTERVAL</code>.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Best practice for atomic file replacement:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Write to temp files first, then move atomically</span>
+cp<span class="w"> </span>new-cert.pem<span class="w"> </span>/etc/yuzu/certs/server.crt.tmp
+cp<span class="w"> </span>new-key.pem<span class="w"> </span>/etc/yuzu/certs/server.key.tmp
+chmod<span class="w"> </span><span class="m">600</span><span class="w"> </span>/etc/yuzu/certs/server.key.tmp
+mv<span class="w"> </span>/etc/yuzu/certs/server.crt.tmp<span class="w"> </span>/etc/yuzu/certs/server.crt
+mv<span class="w"> </span>/etc/yuzu/certs/server.key.tmp<span class="w"> </span>/etc/yuzu/certs/server.key
+</code></pre></div>
+<p><strong>Observability:</strong></p>
+<ul>
+<li>Log messages: <code>cert-reload: certificate hot-reloaded successfully</code> or <code>cert-reload: ... failed</code></li>
+<li>Audit events: action <code>cert.reload</code> with result <code>success</code> or <code>failure</code></li>
+<li>Metrics: <code>yuzu_server_cert_reloads_total</code> (counter), <code>yuzu_server_cert_reload_failures_total</code> (counter)</li>
+</ul>
+<p><strong>Limitations:</strong></p>
+<ul>
+<li><strong>HTTPS only.</strong> gRPC mTLS certificate hot-reload is not supported. Rotating gRPC certificates still requires a server restart.</li>
+<li>The server logs a warning at startup if gRPC TLS is enabled with cert reload: <em>"gRPC TLS certificate hot-reload is not yet supported."</em></li>
+</ul>
+<hr>
+<h2 id="user-management">User Management</h2>
+<p>Yuzu supports two built-in roles for local users:</p>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Permissions</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>admin</code></td>
+<td>Full access to all features, including Settings, user management, agent enrollment, and instruction execution.</td>
+</tr>
+<tr>
+<td><code>user</code></td>
+<td>Read-only access to the dashboard, agent list, and query results. Cannot modify settings or execute instructions.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="creating-a-user">Creating a User</h3>
+<ol>
+<li>Navigate to <strong>Settings &gt; User Management</strong>.</li>
+<li>Enter a username, password, and select a role.</li>
+<li>Click <strong>Create User</strong>.</li>
+</ol>
+<p>The password is hashed with PBKDF2 before storage. Plaintext passwords are never written to disk.</p>
+<blockquote>
+<p><strong>Breaking change in v0.12.0</strong> — the <code>role</code> field is <strong>ignored</strong> on
+create. New users are always created as <code>user</code>. To grant admin, use
+the <strong>Change Role</strong> button on the user's row, or <code>POST
+/api/settings/users/{username}/role</code> programmatically. This is a
+deliberate split (security finding C1): collapsing role assignment
+into the create endpoint allowed a 4xx-on-create + audit-as-success
+pattern that operators couldn't audit cleanly. Each role transition
+now produces a single <code>user.role_change</code> audit event with <code>old_role</code>
+and <code>new_role</code> recorded in the detail field.</p>
+</blockquote>
+<h3 id="changing-a-users-role">Changing a User's Role</h3>
+<ol>
+<li>Navigate to <strong>Settings &gt; User Management</strong>.</li>
+<li>Click <strong>Change Role</strong> next to the target user.</li>
+<li>Pick <code>admin</code> or <code>user</code> and confirm.</li>
+</ol>
+<p>The server emits an audit event on every branch:</p>
+<table>
+<thead>
+<tr>
+<th>Branch</th>
+<th>Audit <code>result</code></th>
+<th>Detail</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Role changed</td>
+<td><code>success</code></td>
+<td><code>old_role=user,new_role=admin</code> (or vice versa)</td>
+</tr>
+<tr>
+<td>Same role requested</td>
+<td><code>no_op</code></td>
+<td><code>same_role=admin</code> (or <code>user</code>)</td>
+</tr>
+<tr>
+<td>Self-target rejected</td>
+<td><code>denied</code></td>
+<td><code>self_role_change_blocked</code></td>
+</tr>
+<tr>
+<td>Invalid username</td>
+<td><code>denied</code></td>
+<td><code>invalid_username</code></td>
+</tr>
+<tr>
+<td>Invalid JSON body</td>
+<td><code>denied</code></td>
+<td><code>invalid_json</code></td>
+</tr>
+<tr>
+<td>Missing <code>role</code> field</td>
+<td><code>denied</code></td>
+<td><code>missing_role</code></td>
+</tr>
+<tr>
+<td>Invalid role value</td>
+<td><code>denied</code></td>
+<td><code>invalid_role</code></td>
+</tr>
+<tr>
+<td>User not found</td>
+<td><code>denied</code></td>
+<td><code>user_not_found</code></td>
+</tr>
+<tr>
+<td>DB write failed</td>
+<td><code>denied</code></td>
+<td><code>db_failure</code></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>You cannot change your own role.</strong> The endpoint rejects self-target
+with HTTP 403, audited as <code>denied:self_role_change_blocked</code>. The same
+motivation as the self-delete guard: prevent an operator from locking
+themselves out via a misclick or scripted demotion.</p>
+<p><strong>Active sessions are invalidated atomically.</strong> After a successful
+<code>user.role_change</code>, every active session for the target user is
+destroyed; the user must re-authenticate to pick up the new role.</p>
+</blockquote>
+<h3 id="deleting-a-user">Deleting a User</h3>
+<ol>
+<li>Navigate to <strong>Settings &gt; User Management</strong>.</li>
+<li>Click <strong>Remove</strong> next to the target user.</li>
+<li>Confirm the deletion.</li>
+</ol>
+<blockquote>
+<p><strong>Note:</strong> You cannot delete your own account. The Users table renders
+the text "Current user" in place of the <strong>Remove</strong> button for the
+currently authenticated operator's row, and the server rejects any
+hand-crafted <code>DELETE /api/settings/users/&lt;your-username&gt;</code> request with
+HTTP 403 and a <code>Cannot delete your own account</code> toast. This prevents
+a misclick — or a scripted revoke loop — from dropping the only
+credential on the running server and locking every operator out
+until the process is restarted against its on-disk config. To remove
+the account you are signed in as, first create a second admin, log
+out, log in as the second admin, and delete the original.</p>
+</blockquote>
+<hr>
+<h2 id="agent-enrollment">Agent Enrollment</h2>
+<p>Yuzu uses a tiered enrollment model. Each tier provides a different balance of security and convenience.</p>
+<h3 id="tier-1-manual-approval">Tier 1: Manual Approval</h3>
+<p>The default enrollment method. No pre-shared token is required.</p>
+<ol>
+<li>The agent starts and sends a <code>RegisterRequest</code> to the server.</li>
+<li>The server places the agent in the <strong>pending queue</strong>.</li>
+<li>An admin reviews pending agents in <strong>Settings &gt; Pending Agents</strong>.</li>
+<li>The admin approves or denies each agent.</li>
+<li>Approved agents complete registration on their next heartbeat.</li>
+<li>Denied agents are removed from the queue. They can re-register if restarted.</li>
+</ol>
+<h3 id="tier-2-pre-shared-token">Tier 2: Pre-Shared Token</h3>
+<p>For automated or bulk deployment. Agents present a token at startup for instant enrollment.</p>
+<p><strong>Server side:</strong>
+1. Navigate to <strong>Settings &gt; Enrollment Tokens</strong>.
+2. Click <strong>Generate Token</strong>.
+3. Configure token properties:
+   - <strong>Expiry</strong> -- time limit (e.g., 24 hours, 7 days).
+   - <strong>Max uses</strong> -- how many agents can use this token (1 for single-device, unlimited for bulk).
+4. Copy the generated token string.</p>
+<p><strong>Agent side:</strong>
+<div class="highlight"><pre><span></span><code>./yuzu-agent<span class="w"> </span>--enrollment-token<span class="w"> </span><span class="s2">&quot;TOKEN_STRING&quot;</span>
+</code></pre></div></p>
+<p>The agent passes the token in <code>RegisterRequest.enrollment_token</code>. If the token is valid and not expired or exhausted, the agent is enrolled immediately.</p>
+<h3 id="tier-3-platform-trust-planned">Tier 3: Platform Trust (Planned)</h3>
+<p>Reserved protocol fields (<code>machine_certificate</code>, <code>attestation_signature</code>, <code>attestation_provider</code>) support future integration with:
+- Windows certificate store (machine certificates)
+- Azure Attestation
+- Cloud instance identity documents (AWS, GCP, Azure)</p>
+<h3 id="auto-approval-policies">Auto-Approval Policies</h3>
+<p>For environments that need something between manual approval and pre-shared tokens, auto-approval policies can automatically approve agents that match defined criteria:</p>
+<ol>
+<li>Navigate to <strong>Settings &gt; Auto-Approval Policies</strong>.</li>
+<li>Create a rule with conditions (e.g., hostname matches <code>prod-web-*</code>, source IP in <code>10.0.0.0/8</code>).</li>
+<li>Agents matching any active policy are approved automatically at registration time.</li>
+</ol>
+<hr>
+<h2 id="ota-agent-updates">OTA Agent Updates</h2>
+<p>The server can distribute agent binary updates to enrolled endpoints.</p>
+<h3 id="uploading-a-new-version">Uploading a New Version</h3>
+<ol>
+<li>Navigate to <strong>Settings &gt; OTA Updates</strong>.</li>
+<li>Click <strong>Upload</strong> and select the agent binary.</li>
+<li>The server stores the binary and assigns a version identifier.</li>
+</ol>
+<h3 id="promoting-to-production">Promoting to Production</h3>
+<ol>
+<li>In the OTA Updates list, locate the uploaded version.</li>
+<li>Click <strong>Promote</strong> to mark it as the current production version.</li>
+<li>Agents check for updates on their next heartbeat and download the new binary automatically.</li>
+</ol>
+<h3 id="managing-versions">Managing Versions</h3>
+<ul>
+<li>View all uploaded versions with their upload date, size, and promotion status.</li>
+<li>Delete old versions to reclaim storage.</li>
+<li>Only one version can be promoted (active) at a time.</li>
+</ul>
+<h3 id="connection-and-timeout-behaviour-since-902-up-8-376-pr-1c-4">Connection and timeout behaviour (since #902 / UP-8 + #376 PR 1c-4)</h3>
+<p>The server enforces a <strong>30-second idle-read deadline on the request frame</strong> of every <code>DownloadUpdate</code> stream. This deadline applies <em>only</em> to the initial request frame — it bounds slot-seconds against a stalled or malicious agent that opens the stream but never sends a request.</p>
+<p>Since #376 PR 1c-4, the <strong>agent</strong> additionally enforces a symmetric 30-second per-chunk idle deadline on its read side. If the server stalls between chunks for more than 30 seconds, the agent cancels the stream and retries on its next heartbeat cycle. This is the agent-side guard against a stalled or malicious server pinning the agent's OTA thread; legitimate large-binary transfers where chunks arrive continuously are not affected (the deadline is per-chunk <em>idle</em> time, not cumulative).</p>
+<p><strong>What an operator observes when the deadline fires:</strong></p>
+<ul>
+<li>Server log line: <code>DownloadUpdate: idle-read deadline expired for peer=&lt;agent-id-or-host:port&gt; (pool slot released; agent will retry on next heartbeat)</code> (severity: warn).</li>
+<li>Prometheus counter increment: <code>yuzu_grpc_requests_total{method="DownloadUpdate", status="deadline_exceeded"}</code>.</li>
+<li>The agent observes wire status <code>Cancelled</code> (gRPC backend behaviour — see
+  <code>BidiStream</code> contract block in <code>transport/include/yuzu/transport/transport.hpp</code>)
+  and treats it as a generic update failure; the agent retries on its next
+  heartbeat cycle (default every 30 s) with no human intervention required.</li>
+</ul>
+<p><strong>Operational symptoms that should trigger investigation:</strong></p>
+<ul>
+<li><code>yuzu_grpc_requests_total{method="DownloadUpdate", status="deadline_exceeded"}</code> rate &gt; 0 for 2 minutes — a fleet-wide misconfiguration (e.g., NAT/proxy delays the agent's first frame, agent build broken on initial connect) is silently retrying every heartbeat cycle.</li>
+<li><code>ResourceExhausted "transport: bidi dispatcher saturated"</code> paired with a high <code>deadline_exceeded</code> count — stalled peers are consuming pool slots and the deadline is the only mechanism freeing them; consider raising <code>--bidi-dispatcher-pool-size</code> or investigating the network path.</li>
+<li>Agent log lines like <code>DownloadUpdate RPC failed: ... (code 1)</code> (where 1 = <code>Cancelled</code> per <code>transport::StatusCode</code>) repeating every heartbeat cycle — the same failure mode from the agent side.</li>
+</ul>
+<p><strong>Per-chunk write deadline (#911 / UP-101 + #934 / UP-206):</strong> in addition to the request-frame read deadline, the server enforces a per-chunk write deadline on <code>DownloadUpdate</code> (default 30 s; <code>ota_chunk_write_deadline_secs_</code> member of <code>AgentServiceImpl</code>). A peer whose TCP receive window has collapsed for &gt;deadline — typical causes: a stuck NAT/firewall, HTTP/2 flow-control window collapse, a transparent proxy buffering badly — sees <code>DeadlineExceeded</code> and the server log emits <code>DownloadUpdate: chunk-write deadline expired for peer=&lt;peer&gt; at offset &lt;N&gt; (pool slot released; rate-limit token refunded)</code>. The pool slot is reclaimed within the deadline; the agent retries OTA on its next heartbeat cycle. The counter <code>yuzu_grpc_requests_total{method="DownloadUpdate", status="chunk_write_deadline_exceeded"}</code> increments per fired deadline.</p>
+<p>The deadline is <strong>operator-tunable</strong> via <code>--ota-chunk-write-deadline-secs &lt;n&gt;</code> or the <code>YUZU_OTA_CHUNK_WRITE_DEADLINE_SECS</code> env var (post-#934). Operators with deployments behind genuinely slow links (satellite, residential 4G/LTE, congested corp WAN) can raise this to 120 or higher to avoid spurious deadlines. Setting <code>&lt;= 0</code> is clamped to the 30 s default — the deadline is the only thing freeing the bidi pool slot held by a stalled write, so disabling it is not a supported configuration. Pick the smallest value that works for your slowest legitimate link; the deadline directly bounds how long a malicious peer can pin a pool slot during the chunk-streaming phase.</p>
+<p><strong>Per-peer rate limit (#913 / UP-116):</strong> the server enforces a per-peer-identity token bucket on <code>DownloadUpdate</code>. Capacity 5 tokens, refill ~1 token per 90 minutes (= <code>update_check_interval</code> default 6 h / 4). A normally-behaved agent never approaches the limit; a misbehaving agent (or compromised mTLS-authenticated peer) hammering OTA exhausts within seconds and sees <code>ResourceExhausted "per-peer DownloadUpdate rate limit exceeded"</code>. The counter <code>yuzu_grpc_requests_total{method="DownloadUpdate", status="rate_limited_per_peer"}</code> increments per rejected call; the server log emits <code>DownloadUpdate: per-peer rate limit exhausted for peer=&lt;peer&gt;</code>. Bucket state is <strong>process-local and resets on server restart</strong> — the limit is a fleet-monopolisation guard, not a persistent quota. In a multi-server HA deployment the buckets are NOT shared across servers; an agent rotated to a different server resets its bucket. The peer key is the verified mTLS SAN identity; mTLS-disabled deployments fall back to <code>peer_uri</code> (host:port) which is unstable across NAT port rotation — production deployments should always run with mTLS verification enabled.</p>
+<p><strong>Token refund on chunk-write deadline (#934 / UP-206):</strong> when the per-chunk write deadline fires, the consumed rate-limit token is refunded so a slow-link peer cannot compound the deadline + the rate-limit into a 7.5h lockout. The refund is recorded under a distinct metric label <code>yuzu_grpc_requests_total{method="DownloadUpdate", status="rate_limit_token_refunded"}</code>; this counter should track the <code>chunk_write_deadline_exceeded</code> counter exactly. A divergence (chunk-write-deadline &gt; token-refunded) signals a regression in the refund wiring. Refund caps at bucket capacity (5 tokens), so a future caller that double-refunds cannot grant a peer excess credit. Threat model: a fast-valid monopoliser still drains the bucket because their calls succeed (no chunk-write-deadline → no refund); only the failing-but-not-monopolising peer benefits from refunds.</p>
+<p><strong>What the deadlines + rate limit do NOT protect against:</strong></p>
+<ul>
+<li>A malicious peer that sends a malformed request frame within the 30-second window — request validation occurs after the deadline-bounded read, so a peer that races the deadline still consumes a pool slot for the validation path.</li>
+<li>A multi-server HA deployment where an attacker connects to each server in turn — each server has an independent bucket, so an attacker with N servers gets 5×N tokens. Tracked as a follow-up item; mitigation requires shared bucket state (Redis/Dragonfly) or a sticky-session hint at the LB layer.</li>
+<li>A peer that holds open 5+ DownloadUpdate streams in parallel and lets each chunk-write-deadline simultaneously — every stream consumes a pool slot for the deadline duration. The bidi pool's bound (#904) caps the absolute concurrency; if a single peer can exhaust the pool, raise <code>--bidi-dispatcher-pool-size</code> or front the listener with the gateway.</li>
+</ul>
+<hr>
+<h2 id="rbac-management">RBAC Management</h2>
+<p>Role-Based Access Control adds granular permissions beyond the built-in admin/user roles.</p>
+<h3 id="enabling-rbac">Enabling RBAC</h3>
+<ol>
+<li>Navigate to <strong>Settings &gt; RBAC Management</strong>.</li>
+<li>Toggle <strong>Enable RBAC</strong>.</li>
+<li>When RBAC is enabled, the system enforces fine-grained permissions based on assigned roles.</li>
+</ol>
+<h3 id="built-in-vs-custom-roles">Built-in vs. Custom Roles</h3>
+<table>
+<thead>
+<tr>
+<th>Aspect</th>
+<th>Built-in Roles</th>
+<th>Custom Roles (RBAC)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Granularity</td>
+<td>Two roles: admin, user</td>
+<td>Per-operation permissions on securable types</td>
+</tr>
+<tr>
+<td>Assignment</td>
+<td>Per-user</td>
+<td>Per-principal (users, service accounts, API tokens)</td>
+</tr>
+<tr>
+<td>Management groups</td>
+<td>Not scoped</td>
+<td>Permissions can be scoped to management groups</td>
+</tr>
+</tbody>
+</table>
+<h3 id="creating-a-role">Creating a Role</h3>
+<ol>
+<li>Navigate to <strong>Settings &gt; RBAC Management</strong>.</li>
+<li>Click <strong>Create Role</strong>.</li>
+<li>Name the role and assign permissions for each securable type and operation.</li>
+</ol>
+<p>For the full RBAC model, see <a href="rbac.html" class="doc-ref"><code>docs/user-manual/rbac.md</code></a>.</p>
+<hr>
+<h2 id="tag-compliance">Tag Compliance</h2>
+<p>The Tag Compliance section provides a fleet-wide view of compliance based on tag-driven policies.</p>
+<ol>
+<li>Navigate to <strong>Settings &gt; Tag Compliance</strong>.</li>
+<li>View the compliance summary showing:
+   - Total devices, compliant count, non-compliant count.
+   - Breakdown by tag category.
+   - Devices missing required tags.</li>
+</ol>
+<p>Tag compliance data is also available via the REST API (<code>GET /api/v1/tag-compliance</code>) for integration with external dashboards and reporting tools.</p>
+<hr>
+<h2 id="oidc-sso-configuration">OIDC SSO Configuration</h2>
+<p>Yuzu supports OpenID Connect (OIDC) for single sign-on with external identity providers such as Microsoft Entra ID (Azure AD), Okta, or any OIDC-compliant provider.</p>
+<h3 id="configuration">Configuration</h3>
+<p>OIDC can be configured via CLI flags at startup or through the Settings page:</p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>CLI Flag</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Issuer URL</td>
+<td><code>--oidc-issuer</code></td>
+<td>The OIDC discovery endpoint base URL.</td>
+</tr>
+<tr>
+<td>Client ID</td>
+<td><code>--oidc-client-id</code></td>
+<td>Application (client) ID from your identity provider.</td>
+</tr>
+<tr>
+<td>Client Secret</td>
+<td><code>--oidc-client-secret</code></td>
+<td>Client secret for the confidential client flow.</td>
+</tr>
+<tr>
+<td>Redirect URI</td>
+<td><code>--oidc-redirect-uri</code></td>
+<td>Callback URL registered with the identity provider. Must point to the Yuzu server's <code>/auth/callback</code> path.</td>
+</tr>
+<tr>
+<td>Admin Group</td>
+<td><code>--oidc-admin-group</code></td>
+<td>Entra ID group object ID that maps to the admin role.</td>
+</tr>
+<tr>
+<td>Skip TLS Verify</td>
+<td><code>--oidc-skip-tls-verify</code></td>
+<td>Disable TLS cert verification for OIDC endpoints (insecure, dev only). Env: <code>YUZU_OIDC_SKIP_TLS_VERIFY</code>.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="identity-provider-setup">Identity Provider Setup</h3>
+<ol>
+<li>Register Yuzu as an application in your identity provider.</li>
+<li>Set the redirect URI to <code>https://&lt;yuzu-server&gt;:&lt;port&gt;/auth/callback</code>.</li>
+<li>Note the client ID and client secret.</li>
+<li>Enter these values in the Yuzu Settings page or pass them as CLI flags.</li>
+</ol>
+<h3 id="user-mapping">User Mapping</h3>
+<p>OIDC-authenticated users are mapped to Yuzu roles based on claims or group membership. The mapping configuration depends on your identity provider and is set in the OIDC section of the Settings page.</p>
+<hr>
+<h2 id="data-storage-and-encryption">Data Storage and Encryption</h2>
+<p>Yuzu stores persistent data in SQLite databases, including the response store, analytics event store, audit log, and RBAC store. By default, database files are created in the same directory as the <code>yuzu-server.cfg</code> config file. Use <code>--data-dir</code> to place databases in a separate writable directory (required for containerized deployments where the config file is on a read-only mount).</p>
+<blockquote>
+<p><strong>Important: SQLite databases are not encrypted at rest.</strong> The <code>.db</code> files contain query results, audit logs, and agent metadata in plaintext on disk. Any user or process with read access to the filesystem can read this data.</p>
+</blockquote>
+<h3 id="protecting-data-at-rest">Protecting Data at Rest</h3>
+<p>Operators must use full-disk encryption to protect Yuzu data at rest:</p>
+<table>
+<thead>
+<tr>
+<th>Platform</th>
+<th>Recommended Solution</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Linux</td>
+<td>dm-crypt / LUKS</td>
+<td>Encrypt the partition or volume where Yuzu data resides. Most distributions support LUKS during OS installation.</td>
+</tr>
+<tr>
+<td>Windows</td>
+<td>BitLocker</td>
+<td>Enable BitLocker on the drive containing the Yuzu server directory. Requires TPM or startup key.</td>
+</tr>
+<tr>
+<td>macOS</td>
+<td>FileVault</td>
+<td>Enable FileVault in System Settings. Encrypts the entire startup volume.</td>
+</tr>
+</tbody>
+</table>
+<p>For containerized deployments (Docker Compose), ensure the host volume backing <code>server-data</code> is on an encrypted filesystem.</p>
+<blockquote>
+<p><strong>Planned:</strong> A future <code>--encrypt-db</code> option will add application-level SQLite encryption using SQLCipher, providing defense-in-depth independent of disk encryption. Track progress in the roadmap (Phase 7).</p>
+</blockquote>
+<hr>
+<h2 id="retention-settings">Retention Settings</h2>
+<p>The server applies retention policies to stored data to manage disk usage. Retention values are set via CLI flags at startup.</p>
+<table>
+<thead>
+<tr>
+<th>Data Type</th>
+<th>CLI Flag</th>
+<th>Default TTL</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Instruction responses</td>
+<td><code>--response-retention-days</code></td>
+<td>90 days</td>
+<td>Results from executed instructions. Older responses are purged on a daily schedule.</td>
+</tr>
+<tr>
+<td>Audit log entries</td>
+<td><code>--audit-retention-days</code></td>
+<td>365 days</td>
+<td>Records of who did what, when, and on which devices.</td>
+</tr>
+<tr>
+<td>Guardian (Guaranteed State) events</td>
+<td><code>--guardian-event-retention-days</code></td>
+<td>30 days</td>
+<td>Guaranteed State drift events, remediation events, and agent-sync events written by the Guardian engine. See <a href="guaranteed-state.html">Guaranteed State</a> for the feature context.</td>
+</tr>
+</tbody>
+</table>
+<p>Reducing the TTL frees disk space; increasing it preserves history for compliance.</p>
+<blockquote>
+<p><strong>Note:</strong> All three retention values can also be set via environment variables (<code>YUZU_RESPONSE_RETENTION_DAYS</code>, <code>YUZU_AUDIT_RETENTION_DAYS</code>, <code>YUZU_GUARDIAN_EVENT_RETENTION_DAYS</code>) and can be updated at runtime via <code>PUT /api/v1/config/&lt;key&gt;</code> with an <code>Infrastructure:Write</code> permission. Runtime updates are persisted via <code>RuntimeConfigStore</code> and reflected immediately in the <code>/api/v1/config</code> GET response — <strong>but the running store captures its retention value at construction time and does not re-read it, so TTL computation on new inserts continues to use the startup value until the next server restart.</strong> This "takes effect on restart" limitation is shared across all three retention keys and is tracked as issue #483.</p>
+</blockquote>
+<hr>
+<h2 id="settings-api-reference">Settings API Reference</h2>
+<p>All Settings page operations are backed by REST API routes. These can be called directly for automation.</p>
+<h3 id="authentication">Authentication</h3>
+<p>All API routes require a valid session cookie (obtained via <code>POST /login</code>) or, when available, a bearer token. Admin-role sessions are required for all write operations.</p>
+<h3 id="tls">TLS</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/fragments/settings/tls</code></td>
+<td>Render the TLS configuration fragment (HTMX).</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/tls</code></td>
+<td>Update TLS settings (enable/disable, port).</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/cert-upload</code></td>
+<td>Upload PEM certificate and key files (multipart form).</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/cert-paste</code></td>
+<td>Paste PEM certificate content (form-encoded).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="oidc-directory">OIDC / Directory</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/fragments/settings/directory</code></td>
+<td>Render the OIDC/Directory configuration fragment (HTMX).</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/oidc</code></td>
+<td>Save OIDC/Entra ID configuration (form-encoded). Persisted to runtime config.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/oidc/test</code></td>
+<td>Test OIDC discovery endpoint connectivity.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="users">Users</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/fragments/settings/users</code></td>
+<td>Render the user management fragment (HTMX).</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/users</code></td>
+<td>Create a new user. Body: <code>{ "username", "password", "role" }</code>.</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/settings/users/{username}</code></td>
+<td>Delete a user by username.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="enrollment-tokens">Enrollment Tokens</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/fragments/settings/tokens</code></td>
+<td>Render the enrollment tokens fragment (HTMX).</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/enrollment-tokens</code></td>
+<td>Generate a new enrollment token. Body: <code>{ "expiry", "max_uses" }</code>.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/enrollment-tokens/batch</code></td>
+<td>Generate multiple tokens in one call. Body: <code>{ "label", "count", "max_uses", "ttl_hours" }</code>.</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/settings/enrollment-tokens/{id}</code></td>
+<td>Revoke a token by ID.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="pending-agents">Pending Agents</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/fragments/settings/pending</code></td>
+<td>Render the pending agents fragment (HTMX).</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/pending-agents/{id}/approve</code></td>
+<td>Approve a pending agent.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/pending-agents/{id}/deny</code></td>
+<td>Deny a pending agent.</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/settings/pending-agents/{id}</code></td>
+<td>Remove a pending agent from the queue.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="auto-approval-policies_1">Auto-Approval Policies</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/fragments/settings/auto-approve</code></td>
+<td>Render the auto-approval policies fragment (HTMX).</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/auto-approve</code></td>
+<td>Create a new auto-approval rule.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/auto-approve/mode</code></td>
+<td>Set the auto-approval mode (manual, policy-based).</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/auto-approve/{index}/toggle</code></td>
+<td>Toggle an auto-approval rule on or off.</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/settings/auto-approve/{index}</code></td>
+<td>Delete an auto-approval rule.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="api-tokens">API Tokens</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/fragments/settings/api-tokens</code></td>
+<td>Render the API tokens management fragment (HTMX).</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/api-tokens</code></td>
+<td>Create a new API bearer token. Body: <code>{ "name", "role", "scopes" }</code>.</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/settings/api-tokens/{id}</code></td>
+<td>Revoke an API token by ID.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="ota-updates">OTA Updates</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/fragments/settings/updates</code></td>
+<td>Render the OTA updates fragment (HTMX).</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/updates/upload</code></td>
+<td>Upload an agent binary (multipart form).</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/settings/updates/{platform}/{arch}/{version}</code></td>
+<td>Delete an uploaded agent binary.</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/updates/{platform}/{arch}/{version}/rollout</code></td>
+<td>Promote a version to production rollout.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tag-compliance_1">Tag Compliance</h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/fragments/settings/tag-compliance</code></td>
+<td>Render the tag compliance summary fragment (HTMX).</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/v1/tag-compliance</code></td>
+<td>Tag compliance summary (JSON, via REST API v1).</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="file-logging">File Logging</h2>
+<p>Yuzu writes logs to stdout by default. File logging is opt-in via <code>--log-file</code>, with a best-effort fallback at the platform default path (<code>/var/log/yuzu/server.log</code> on Linux, <code>C:\ProgramData\Yuzu\logs\server.log</code> on Windows, <code>~/Library/Logs/Yuzu/server.log</code> on macOS).</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Behaviour</th>
+<th>Failure mode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--log-file &lt;path&gt;</code> (explicit)</td>
+<td>Writes to <code>&lt;path&gt;</code> in addition to stdout.</td>
+<td>If the file/directory cannot be opened, server logs an ERROR and continues without file logging.</td>
+</tr>
+<tr>
+<td>Platform default path (implicit)</td>
+<td>Writes to the platform default path if it exists and is writable.</td>
+<td>If the directory cannot be created or the file cannot be opened, server logs a single INFO line and continues without file logging. The default fallback is best-effort observability, not load-bearing.</td>
+</tr>
+</tbody>
+</table>
+<p>The Docker server image pre-creates <code>/var/log/yuzu</code> (mode 0750, owned by the <code>yuzu</code> user) so the implicit default path works out of the box. When mounting an external host volume at <code>/var/log/yuzu</code>, ensure the host directory is owned by the same UID as the in-container <code>yuzu</code> user (verify with <code>docker exec yuzu-server id yuzu</code>); a wrong-ownership mount silently degrades to stdout-only logging.</p>
+<h2 id="health-endpoints">Health Endpoints</h2>
+<p>Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and monitoring integrations. All four are unauthenticated and exempt from the API rate limiter.</p>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Use case</th>
+<th>Body</th>
+<th>Draining-aware</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/livez</code></td>
+<td>Kubernetes liveness probe — fast check that the HTTP listener is up.</td>
+<td><code>{"status":"ok"}</code></td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>/readyz</code></td>
+<td>Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain.</td>
+<td><code>{"status":"ready"}</code> (200) or <code>{"status":"draining"}</code> (503)</td>
+<td><strong>Yes</strong></td>
+</tr>
+<tr>
+<td><code>/health</code></td>
+<td>Monitoring dashboards (Prometheus blackbox exporter, Datadog, Nagios). Rich JSON with per-store status, agent counts, execution stats, and version.</td>
+<td>Structured JSON — see <a href="rest-api.html#health">REST API: Health</a>.</td>
+<td>No</td>
+</tr>
+<tr>
+<td><code>/api/health</code></td>
+<td>Identical alias of <code>/health</code>, provided for monitoring integrations that prefix every REST call with <code>/api/</code>. Restored in v0.12.0 (issue #620).</td>
+<td>Identical to <code>/health</code>.</td>
+<td>No</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Choose the right endpoint for your use case.</strong> Load balancers that should drain in-flight traffic during a rolling deploy MUST use <code>/readyz</code> — <code>/health</code> and <code>/api/health</code> continue returning 200 during shutdown by design (Kubernetes pattern: liveness/health probes are not draining-aware). Aggressive monitoring poll cadences (sub-second) should target <code>/livez</code> rather than <code>/health</code> to minimise per-probe SQLite touches.</p>
+<h2 id="deployment">Deployment</h2>
+<p>Yuzu provides multiple deployment options: Docker Compose for quick setup, systemd units for bare-metal Linux, and a development stack script for local testing.</p>
+<h3 id="docker-compose">Docker Compose</h3>
+<p>The default Docker deployment runs the server and agent standalone -- no gateway required. For scaled deployments with a gateway, see <code>docker-compose.full-uat.yml</code>.</p>
+<p><strong>Files:</strong></p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>deploy/docker/Dockerfile.server</code></td>
+<td>Multi-stage build for the Yuzu server binary</td>
+</tr>
+<tr>
+<td><code>deploy/docker/Dockerfile.gateway</code></td>
+<td>Erlang/OTP build for the gateway node</td>
+</tr>
+<tr>
+<td><code>deploy/docker/docker-compose.yml</code></td>
+<td>Build-from-source dev stack (server + agent + monitoring)</td>
+</tr>
+<tr>
+<td><code>deploy/docker/docker-compose.reference.yml</code></td>
+<td>Copyable deployment template — pulls pinned ghcr.io images, uses a named <code>server-data</code> volume, carries inline TLS hardening + backup + rollback commentary. Requires operator hardening (TLS, bind address) before production use.</td>
+</tr>
+<tr>
+<td><code>deploy/docker/docker-compose.full-uat.yml</code></td>
+<td>Gateway deployment (server + gateway + monitoring)</td>
+</tr>
+<tr>
+<td><code>docker-compose.uat.yml</code></td>
+<td>Self-contained single-file UAT stack pulled from ghcr.io (server + gateway + Prometheus + Grafana + ClickHouse)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Usage:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>deploy/docker
+docker<span class="w"> </span>compose<span class="w"> </span>up<span class="w"> </span>-d<span class="w">          </span><span class="c1"># start all services</span>
+docker<span class="w"> </span>compose<span class="w"> </span>logs<span class="w"> </span>-f<span class="w">        </span><span class="c1"># follow logs</span>
+docker<span class="w"> </span>compose<span class="w"> </span>down<span class="w">           </span><span class="c1"># stop all services</span>
+</code></pre></div>
+<p><strong>Pinning a specific release with <code>docker-compose.uat.yml</code>:</strong></p>
+<p>The top-level UAT compose file parameterises its <code>ghcr.io/.../yuzu-server</code> and <code>yuzu-gateway</code> tags through <code>${YUZU_VERSION:-&lt;default&gt;}</code>. The default tracks the latest published release, but operators testing an earlier or newer image can override at the command line:</p>
+<div class="highlight"><pre><span></span><code><span class="nv">YUZU_VERSION</span><span class="o">=</span><span class="m">0</span>.9.0<span class="w"> </span>docker<span class="w"> </span>compose<span class="w"> </span>-f<span class="w"> </span>docker-compose.uat.yml<span class="w"> </span>up<span class="w"> </span>-d
+</code></pre></div>
+<p>A GitHub Actions check (<code>scripts/check-compose-versions.sh</code>) runs as the first step of the release workflow and blocks asset publication if any tracked compose file carries a hardcoded <code>X.Y.Z</code> tag or a <code>${YUZU_VERSION:-...}</code> default that does not match the release tag — so the default in the checked-in file is guaranteed to match the latest shipped release.</p>
+<p><strong>Exposed ports:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Port</th>
+<th>Service</th>
+<th>Deployment</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>8080</td>
+<td>Web dashboard + REST API</td>
+<td>Always</td>
+</tr>
+<tr>
+<td>50051</td>
+<td>gRPC (agent connections)</td>
+<td>Always -- server in standalone, gateway in scaled</td>
+</tr>
+<tr>
+<td>50052</td>
+<td>gRPC (management)</td>
+<td>Always</td>
+</tr>
+<tr>
+<td>50055</td>
+<td>gRPC (gateway upstream)</td>
+<td>Gateway deployments only</td>
+</tr>
+<tr>
+<td>50063</td>
+<td>gRPC (gateway command forwarding)</td>
+<td>Gateway deployments only</td>
+</tr>
+<tr>
+<td>8081</td>
+<td>Gateway health/readiness</td>
+<td>Gateway deployments only</td>
+</tr>
+<tr>
+<td>9568</td>
+<td>Gateway Prometheus metrics</td>
+<td>Gateway deployments only</td>
+</tr>
+<tr>
+<td>9090</td>
+<td>Prometheus</td>
+<td>Monitoring stack</td>
+</tr>
+<tr>
+<td>3000</td>
+<td>Grafana (default login: admin/admin)</td>
+<td>Monitoring stack</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Volumes:</strong> <code>server-data</code>, <code>agent-data</code>, <code>prometheus-data</code>, and <code>grafana-data</code> are persisted across container restarts.</p>
+<h3 id="systemd-units">systemd Units</h3>
+<p>For bare-metal Linux deployments, systemd service files are provided for each component.</p>
+<p><strong>Files:</strong></p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>deploy/systemd/yuzu-server.service</code></td>
+<td>Yuzu server unit</td>
+</tr>
+<tr>
+<td><code>deploy/systemd/yuzu-agent.service</code></td>
+<td>Yuzu agent unit</td>
+</tr>
+<tr>
+<td><code>deploy/systemd/yuzu-gateway.service</code></td>
+<td>Erlang gateway unit</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Installation:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Copy binaries</span>
+sudo<span class="w"> </span>cp<span class="w"> </span>builddir/yuzu-server<span class="w"> </span>/usr/local/bin/
+sudo<span class="w"> </span>cp<span class="w"> </span>builddir/yuzu-agent<span class="w"> </span>/usr/local/bin/
+
+<span class="c1"># Create service user</span>
+sudo<span class="w"> </span>useradd<span class="w"> </span>--system<span class="w"> </span>--no-create-home<span class="w"> </span>yuzu
+
+<span class="c1"># Install units</span>
+sudo<span class="w"> </span>cp<span class="w"> </span>deploy/systemd/yuzu-server.service<span class="w"> </span>/etc/systemd/system/
+sudo<span class="w"> </span>systemctl<span class="w"> </span>daemon-reload
+sudo<span class="w"> </span>systemctl<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>yuzu-server
+sudo<span class="w"> </span>systemctl<span class="w"> </span>start<span class="w"> </span>yuzu-server
+</code></pre></div>
+<p><strong>Security hardening:</strong> The systemd units include <code>NoNewPrivileges</code>, <code>ProtectSystem=strict</code>, <code>ProtectHome=true</code>, and <code>PrivateTmp=true</code> for defense-in-depth.</p>
+<p><strong>Graceful shutdown:</strong> The shipped unit sets <code>TimeoutStopSec=30</code>. As of #376 PR 1c-2 the agent-facing transport listener performs an unbounded graceful drain on shutdown — in-flight Subscribe handlers run to completion rather than being force-cancelled at 5 s as in earlier releases. The 30 s <code>TimeoutStopSec</code> caps the worst case (a stuck handler under disk-full or Defender-quarantine) at half of systemd's 90 s default. Operators with longer-stream workloads (e.g. large <code>DownloadUpdate</code> transfers in flight at restart) should raise this in a drop-in (<code>systemctl edit yuzu-server</code>); operators with strict shutdown SLOs should keep it. Setting it below ~10 s is not recommended — Subscribe sessions that survive routine restarts will be cut off, prompting agents to reconnect to a server that is still draining.</p>
+<h3 id="bidi-dispatcher-pool-sizing-direct-connect-deployments-only">Bidi dispatcher pool sizing (direct-connect deployments only)</h3>
+<p>The agent-facing transport listener runs a bounded thread pool for bidi-streaming RPCs (<code>Subscribe</code>, <code>DownloadUpdate</code>). The pool replaces the per-call OS thread that the pre-#904 dispatcher spawned per active stream and caps the server's bidi-handler thread count at an operator-controlled value.</p>
+<p><strong>Default (auto-compute):</strong> <code>clamp(64, hardware_concurrency × 8, 4096)</code> threads. On a 16-core server this is 128; on a 64-core server it is 512. Suitable for development, small fleets (&lt;2K direct-connect agents), and <strong>all gateway-mode deployments</strong> regardless of fleet size.</p>
+<p><strong>When to raise it:</strong> if you run <strong>direct-connect</strong> (no gateway in front of the server) and your steady-state Subscribe count exceeds the default, the listener will reject new Subscribe streams with <code>StatusCode::ResourceExhausted "transport: bidi dispatcher saturated"</code> once the pool is full. Each long-lived Subscribe holds one pool slot for the connection lifetime, so the pool must be sized at least as large as the expected concurrent agent count plus headroom for <code>DownloadUpdate</code> calls and dashboard SSE-equivalent surfaces. Since #902, <code>DownloadUpdate</code> slots are bounded by a 30-second idle-read deadline on the request frame: a stalled or misbehaving agent that opens the stream and never sends the request frame has its slot reclaimed at 30 seconds, so headroom only needs to absorb peak <em>concurrent active</em> transfers, not stalled-forever streams. If you observe <code>ResourceExhausted</code> spikes lasting longer than 30 seconds on <code>DownloadUpdate</code> paths, the deadline may not be firing as expected — check <code>yuzu_grpc_requests_total{method="DownloadUpdate", status="deadline_exceeded"}</code> (see "Connection and timeout behaviour" under "OTA Agent Updates"). Set the pool explicitly via the CLI flag or environment variable:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 10K direct-connect agents + 20% headroom + DownloadUpdate budget</span>
+./yuzu-server<span class="w"> </span>--bidi-dispatcher-pool-size<span class="w"> </span><span class="m">12500</span><span class="w"> </span>...
+<span class="c1"># or via environment</span>
+<span class="nv">YUZU_BIDI_DISPATCHER_POOL_SIZE</span><span class="o">=</span><span class="m">12500</span><span class="w"> </span>./yuzu-server<span class="w"> </span>...
+</code></pre></div>
+<p>A dashboard surface for <code>ListenerOptions</code> is not yet exposed; configure via flag or env only.</p>
+<p><strong>Metric-based saturation signals (#912 / OBS-1):</strong> the bidi pool now exposes three metrics for capacity-planning queries:
+* <code>yuzu_server_transport_bidi_pool_size</code> (gauge) — the configured cap (= <code>--bidi-dispatcher-pool-size</code>).
+* <code>yuzu_server_transport_bidi_pool_in_flight</code> (gauge) — slot residency: queued calls + active handlers. The matching -1 fires AFTER the handler returns, so a long-running bidi handler holds 1 unit for its lifetime.
+* <code>yuzu_server_transport_bidi_pool_saturated_total{method}</code> (counter) — increments per saturation reject (peer sees <code>ResourceExhausted</code>).</p>
+<p>Use these for utilization queries: <code>yuzu_server_transport_bidi_pool_in_flight / yuzu_server_transport_bidi_pool_size &gt; 0.8</code> is the threshold for the shipped <code>YuzuBidiPoolNearSaturation</code> Grafana alert (severity: critical, fires after 5 m sustained). The shipped <code>YuzuBidiPoolSaturationRejects</code> alert (severity: warning) fires when <code>rate(...bidi_pool_saturated_total[1m]) &gt; 0</code> for 1 m. See <a href="../ops-runbooks/transport-saturation.html" class="doc-ref"><code>docs/ops-runbooks/transport-saturation.md</code></a> for the runbook.</p>
+<p><strong>Gateway-mode does NOT need this knob</strong> — the gateway terminates Subscribe per-fleet (one process per agent, lightweight), and the server only sees one upstream stream per gateway node. The default pool comfortably covers tens of gateway nodes.</p>
+<p><strong>OS thread budget must match the pool size.</strong> If you raise <code>bidi_dispatcher_pool_size</code>, also verify cgroup-level limits:</p>
+<ul>
+<li><strong>systemd:</strong> the shipped <code>yuzu-server.service</code> sets <code>TasksMax=infinity</code> and <code>LimitNPROC=infinity</code> so the cgroup never throttles thread creation. If you have a custom unit, mirror those.</li>
+<li><strong>Docker / Podman:</strong> the shipped compose files set <code>ulimits.nproc: 65536</code> and <code>pids_limit: -1</code>. Without these the container's pid cgroup throttles before your pool size is reached.</li>
+<li><strong>Kubernetes:</strong> add <code>pids: 65536</code> to the pod's resource requests (requires <code>pids</code> extended resource on the kubelet).</li>
+<li><strong>Bare metal:</strong> verify <code>/etc/security/limits.d/yuzu.conf</code> includes <code>yuzu  -  nproc  65536</code> (or your chosen ceiling).</li>
+</ul>
+<p>If thread creation throttles before the pool reaches its configured size, the listener falls back to the saturated-rejection path even though logical capacity exists. Operators see this as a sustained ResourceExhausted spike correlated with <code>pids.current</code> cgroup metrics.</p>
+<h3 id="development-stack-script">Development Stack Script</h3>
+<p>The <code>scripts/start-stack.sh</code> script starts the full development stack locally (without Docker).</p>
+<p><strong>Components started:</strong></p>
+<ol>
+<li><code>yuzu-server</code> -- gRPC on :50051, web on :8080</li>
+<li>Erlang gateway -- agent gRPC on :50051, metrics on :9568</li>
+<li><code>yuzu-agent</code> -- connects to gateway on :50051</li>
+<li>Prometheus -- scraper on :9090</li>
+<li>Grafana -- dashboards on :3000</li>
+</ol>
+<p><strong>Usage:</strong></p>
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>scripts/start-stack.sh<span class="w">          </span><span class="c1"># start all components</span>
+bash<span class="w"> </span>scripts/start-stack.sh<span class="w"> </span>stop<span class="w">     </span><span class="c1"># kill all components</span>
+bash<span class="w"> </span>scripts/start-stack.sh<span class="w"> </span>status<span class="w">   </span><span class="c1"># show running processes and ports</span>
+</code></pre></div>
+<hr>
+<h2 id="windows-service-installation">Windows Service Installation</h2>
+<p>On Windows, Yuzu server and agent can be installed as Windows services for automatic startup and recovery. A native Windows service wrapper is planned for a future release; until then, use <code>sc.exe</code> or NSSM (Non-Sucking Service Manager).</p>
+<h3 id="using-scexe">Using sc.exe</h3>
+<div class="highlight"><pre><span></span><code>REM Create the Yuzu server service
+sc.exe create YuzuServer binPath= &quot;C:\Yuzu\yuzu-server.exe --https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key&quot; start= auto DisplayName= &quot;Yuzu Server&quot;
+
+REM Create the Yuzu agent service
+sc.exe create YuzuAgent binPath= &quot;C:\Yuzu\yuzu-agent.exe --server-address yuzu.example.com:50051&quot; start= auto DisplayName= &quot;Yuzu Agent&quot;
+
+REM Set startup type to automatic (delayed start, recommended)
+sc.exe config YuzuServer start= delayed-auto
+sc.exe config YuzuAgent start= delayed-auto
+
+REM Configure recovery: restart on first, second, and subsequent failures
+sc.exe failure YuzuServer reset= 86400 actions= restart/5000/restart/10000/restart/30000
+sc.exe failure YuzuAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000
+
+REM Start the services
+sc.exe start YuzuServer
+sc.exe start YuzuAgent
+
+REM Stop the services
+sc.exe stop YuzuServer
+sc.exe stop YuzuAgent
+</code></pre></div>
+<blockquote>
+<p><strong>Note:</strong> With <code>sc.exe</code>, spaces after <code>=</code> are required (e.g., <code>start= auto</code>, not <code>start=auto</code>). This is a quirk of the <code>sc.exe</code> command parser.</p>
+</blockquote>
+<h3 id="using-nssm">Using NSSM</h3>
+<p><a href="https://nssm.cc/">NSSM</a> provides a more user-friendly wrapper with a GUI configuration dialog.</p>
+<div class="highlight"><pre><span></span><code>REM Install services
+nssm install YuzuServer &quot;C:\Yuzu\yuzu-server.exe&quot;
+nssm install YuzuAgent &quot;C:\Yuzu\yuzu-agent.exe&quot;
+
+REM Set arguments
+nssm set YuzuServer AppParameters &quot;--https-cert C:\Yuzu\certs\server.crt --https-key C:\Yuzu\certs\server.key&quot;
+nssm set YuzuAgent AppParameters &quot;--server-address yuzu.example.com:50051&quot;
+
+REM Configure startup and recovery
+nssm set YuzuServer Start SERVICE_DELAYED_AUTO_START
+nssm set YuzuAgent Start SERVICE_DELAYED_AUTO_START
+
+REM Configure stdout/stderr logging
+nssm set YuzuServer AppStdout &quot;C:\Yuzu\logs\server-stdout.log&quot;
+nssm set YuzuServer AppStderr &quot;C:\Yuzu\logs\server-stderr.log&quot;
+nssm set YuzuAgent AppStdout &quot;C:\Yuzu\logs\agent-stdout.log&quot;
+nssm set YuzuAgent AppStderr &quot;C:\Yuzu\logs\agent-stderr.log&quot;
+
+REM Start the services
+nssm start YuzuServer
+nssm start YuzuAgent
+</code></pre></div>
+<h3 id="service-account">Service Account</h3>
+<p>For production deployments, create a dedicated service account with minimal permissions rather than running as <code>LocalSystem</code>:</p>
+<ol>
+<li>Create a local user account (e.g., <code>YuzuSvc</code>) with no interactive logon rights.</li>
+<li>Grant the account read/write access to the Yuzu installation directory and data directory only.</li>
+<li>Assign the "Log on as a service" right via Local Security Policy (<code>secpol.msc</code>).</li>
+<li>Configure the service to run as this account: <code>sc.exe config YuzuServer obj= ".\YuzuSvc" password= "PASSWORD"</code>.</li>
+</ol>
+<blockquote>
+<p><strong>Planned:</strong> A native Windows service wrapper (<code>yuzu-server --install-service</code>) is planned for a future release, which will handle service registration, recovery configuration, and Event Log integration automatically.</p>
+</blockquote>
+<hr>
+<h2 id="planned-features">Planned Features</h2>
+<p>The following server administration features are on the roadmap but not yet implemented.</p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Phase</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Runtime Configuration API</td>
+<td>Phase 7 (7.3)</td>
+<td>Change retention TTLs, connection limits, and other server parameters via REST API without restarting the server.</td>
+</tr>
+<tr>
+<td>AD/Entra Integration</td>
+<td>Phase 7 (7.5)</td>
+<td>Sync users and groups from Active Directory (LDAP) or Microsoft Entra ID. Auto-create Yuzu principals from directory membership.</td>
+</tr>
+<tr>
+<td>System Health Monitoring</td>
+<td>Phase 7 (7.2)</td>
+<td>Server-side health dashboard showing memory, CPU, disk, database size, connected agent count, and gRPC stream health. Prometheus metrics for server internals.</td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

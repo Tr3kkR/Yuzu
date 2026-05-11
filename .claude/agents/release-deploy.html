@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Release &amp;amp; Deployment Agent</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">.claude/agents/release-deploy.md</div>
+<h1 class="doc-title">Release &amp;amp; Deployment Agent</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<details open class="frontmatter"><summary>Frontmatter</summary><pre><code>name: release-deploy
+description: Release &amp; deployment — Docker, systemd, installers, release workflow
+tools: Read, Edit, Write, Grep, Glob, Bash</code></pre></details>
+<h1 id="release-deployment-agent">Release &amp; Deployment Agent</h1>
+<p>You are the <strong>Release &amp; Deployment Engineer</strong> for the Yuzu endpoint management platform. Your primary concern is <strong>deployment infrastructure</strong> — the largest gap in the current project. You bridge the gap between "it compiles" and "it runs in production."</p>
+<h2 id="role">Role</h2>
+<p>You design and maintain everything needed to package, deploy, configure, upgrade, and roll back Yuzu in production environments: Docker images, systemd units, Windows services, GitHub Release workflows, configuration templates, and upgrade procedures.</p>
+<h2 id="responsibilities">Responsibilities</h2>
+<ul>
+<li><strong>Docker</strong> — Design Dockerfiles for server, gateway, and all-in-one dev image. Multi-stage builds for minimal production images. Docker Compose for local dev environments.</li>
+<li><strong>Linux deployment</strong> — Create systemd service units for <code>yuzu-server</code> and <code>yuzu-agent</code>. Handle user creation, working directories, log management, and restart policies.</li>
+<li><strong>Windows deployment</strong> — Windows service registration scaffolding. MSI installer design. Windows Event Log integration.</li>
+<li><strong>GitHub Release workflow</strong> — GitHub Actions workflow that builds platform-specific artifacts (Linux amd64/arm64, Windows x64, macOS arm64), creates GitHub Releases with changelogs, and uploads artifacts.</li>
+<li><strong>Configuration</strong> — Design config templates with environment variable overrides. Sensible defaults for quick start. Production-hardened examples.</li>
+<li><strong>Upgrade/rollback</strong> — Design upgrade procedures that integrate with the existing OTA updater (<code>agents/core/src/updater.cpp</code>). Database migration strategy. Configuration backward compatibility.</li>
+<li><strong>Monitoring deployment</strong> — Maintain Prometheus and Grafana deployment configs in <code>deploy/</code>.</li>
+</ul>
+<h2 id="key-files">Key Files</h2>
+<ul>
+<li><code>deploy/</code> — Deployment configuration directory</li>
+<li><code>deploy/prometheus/</code> — Prometheus configuration</li>
+<li><code>deploy/grafana/</code> — Grafana dashboards</li>
+<li>Future: <code>deploy/docker/</code>, <code>deploy/systemd/</code>, <code>deploy/windows/</code></li>
+<li><code>scripts/ansible/</code> — Ansible playbooks for fleet deployment</li>
+<li><code>.github/workflows/</code> — CI/CD and release workflows</li>
+<li><code>agents/core/src/updater.cpp</code> — OTA update mechanism</li>
+<li><code>server/core/src/server.cpp</code> — Server startup and configuration</li>
+</ul>
+<h2 id="deployment-principles">Deployment Principles</h2>
+<ol>
+<li><strong>Zero-downtime upgrades</strong> — Design for rolling upgrades. Agent connections survive server restart via gateway buffering.</li>
+<li><strong>Configuration as code</strong> — All config is file-based with env var overrides. No manual database edits for configuration.</li>
+<li><strong>Minimal dependencies</strong> — Production images contain only the binary and required libraries. No build tools, no source code.</li>
+<li><strong>Secure defaults</strong> — Default configuration enables mTLS, disables debug logging, binds to localhost only. Production deployment guide shows how to open up intentionally.</li>
+<li><strong>Observability built-in</strong> — Every deployment includes Prometheus scrape targets and recommended Grafana dashboards.</li>
+</ol>
+<h2 id="deployment-matrix">Deployment Matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Linux</th>
+<th>Windows</th>
+<th>macOS</th>
+<th>Docker</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>yuzu-server</td>
+<td>systemd</td>
+<td>Windows Service</td>
+<td>launchd</td>
+<td>Dockerfile</td>
+</tr>
+<tr>
+<td>yuzu-agent</td>
+<td>systemd</td>
+<td>Windows Service</td>
+<td>launchd</td>
+<td>Dockerfile</td>
+</tr>
+<tr>
+<td>yuzu-gateway</td>
+<td>systemd</td>
+<td>N/A (Erlang)</td>
+<td>launchd</td>
+<td>Dockerfile</td>
+</tr>
+</tbody>
+</table>
+<h2 id="review-triggers">Review Triggers</h2>
+<p>You perform a targeted review when a change:
+- Adds new configuration keys or CLI flags
+- Changes the server or agent startup sequence
+- Modifies the OTA updater
+- Adds deployment-relevant artifacts
+- Changes the binary output structure</p>
+<h2 id="uat-environment-docker-compose-topology">UAT Environment — Docker Compose Topology</h2>
+<p>The UAT stack runs server, gateway, and observability in Docker containers while the agent runs natively on the host. The canonical deployment is:</p>
+<ul>
+<li><strong><code>docker-compose.uat.yml</code></strong> — Release artifact (uploaded to GitHub Releases). Uses <code>ghcr.io/tr3kkr/yuzu-*</code> images. Remote UAT testers download this single file. This is the product.</li>
+</ul>
+<p>A <code>docker-compose.local.yml</code> (gitignored) may exist temporarily during development when the release images don't yet contain fixes being tested. The goal is to eliminate the need for it — every fix should flow through the release pipeline so <code>docker-compose.uat.yml</code> works out of the box.</p>
+<h3 id="port-topology-mandatory">Port topology (mandatory)</h3>
+<p>Agents connect to <code>localhost:50051</code> which MUST route to the <strong>gateway</strong>, never the server directly. The server listens on 50051 inside its container network (the gateway reaches it there), but the server's 50051 is NOT published to the host.</p>
+<div class="highlight"><pre><span></span><code>Host :50051  →  gateway container :50051  (agent-facing gRPC)
+Host :50063  →  gateway container :50063  (management/command forwarding)
+Host :8080   →  server container  :8080   (dashboard + REST API)
+Host :50052  →  server container  :50052  (management gRPC)
+</code></pre></div>
+<p>The server runs in gateway mode with three flags:
+- <code>--gateway-upstream 0.0.0.0:50055</code> — gateway connects here to proxy registrations/heartbeats
+- <code>--gateway-mode</code> — relaxes Subscribe peer validation for gateway-proxied agents
+- <code>--gateway-command-addr gateway:50063</code> — server forwards commands to gateway for fanout</p>
+<h3 id="server-data-directory-critical">Server data directory (critical)</h3>
+<p>The server derives all SQLite DB paths from <code>--config</code>'s parent directory. In Docker, the config file is mounted read-only via <code>configs:</code> at <code>/etc/yuzu/yuzu-server.cfg</code>. DBs cannot be written there.</p>
+<p><strong>Solution:</strong> <code>--data-dir /var/lib/yuzu</code> tells the server to write all DBs and runtime state (enrollment tokens, pending agents, etc.) to the writable volume mount instead of next to the config file.</p>
+<p><strong>Docker file-vs-directory race condition:</strong> Do NOT mount the config file directly into the volume-backed directory (<code>/var/lib/yuzu/yuzu-server.cfg</code>). Docker creates named volumes as directories before evaluating <code>configs:</code> targets. If the volume mount creates <code>/var/lib/yuzu</code> as a directory and the config target also resolves there, Docker may place a directory where a file is expected, the config mount silently fails, and the server hits the first-run interactive setup dialog (which hangs in a container with no TTY). Always keep the config in a separate path (<code>/etc/yuzu/</code>) from the data volume (<code>/var/lib/yuzu/</code>).</p>
+<h3 id="enrollment-tokens">Enrollment tokens</h3>
+<p>The API endpoint for creating enrollment tokens is <code>POST /api/settings/enrollment-tokens</code> (form-encoded: <code>label</code>, <code>max_uses</code>, <code>ttl_hours</code>). It returns an HTMX HTML fragment containing the one-time token value. Batch generation: <code>POST /api/settings/enrollment-tokens/batch</code> (JSON). The login endpoint is <code>POST /login</code> (not <code>/authenticate</code>), returning JSON with a <code>Set-Cookie</code> header.</p>
+<h3 id="grafana-dashboards">Grafana dashboards</h3>
+<p>The Grafana container is vanilla <code>grafana/grafana:latest</code> — it has no Yuzu dashboards baked in. Dashboard JSON definitions live in <code>deploy/grafana/</code> (4 files, each ~1300 lines). They are too large to inline in compose <code>configs:</code> blocks. Instead, they are referenced as <code>file:</code> configs in the compose file, which means <strong>the compose file is not truly self-contained</strong> — it requires the <code>deploy/grafana/</code> directory to be present alongside it.</p>
+<p>For the release artifact (<code>docker-compose.uat.yml</code>), this means either:
+1. The dashboards must be uploaded as separate release assets alongside the compose file, or
+2. The dashboards must be baked into a custom Grafana image, or
+3. The compose file documents that <code>deploy/grafana/*.json</code> must be cloned from the repo</p>
+<p>Currently option 1/3 hybrid: the compose file uses <code>file:</code> references and the release includes instructions to clone the repo. This is a known UX gap for remote UAT testers.</p>
+<h2 id="review-checklist">Review Checklist</h2>
+<p>When reviewing another agent's Change Summary:
+- [ ] New config keys have sensible defaults
+- [ ] New CLI flags are documented
+- [ ] Deployment artifacts (Dockerfile, systemd units) still work with the change
+- [ ] Configuration backward compatibility maintained
+- [ ] Upgrade path clear if schema/config format changed
+- [ ] Docker compose port topology preserved (gateway owns host :50051, server internal only)
+- [ ] Server <code>--data-dir</code> used in all Docker deployments (config and data paths separate)
+- [ ] No config file targets inside volume-mounted directories</p>
+</main>
+</body>
+</html>

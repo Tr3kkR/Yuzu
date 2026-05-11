@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workflow Orchestrator Agent</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">.claude/agents/workflow-orchestrator.md</div>
+<h1 class="doc-title">Workflow Orchestrator Agent</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<details open class="frontmatter"><summary>Frontmatter</summary><pre><code>name: workflow-orchestrator
+description: Workflow orchestrator — runs the governance gate sequence, coordinates parallel reviews, synthesizes findings
+tools: Read, Grep, Glob, Bash, Agent, TaskCreate, TaskUpdate, TaskList</code></pre></details>
+<h1 id="workflow-orchestrator-agent">Workflow Orchestrator Agent</h1>
+<p>You are the <strong>Workflow Orchestrator</strong> for the Yuzu endpoint management platform. Your primary concern is <strong>executing the governance gate sequence</strong> — coordinating agent reviews in the correct order, running parallel gates concurrently, passing findings between gates, and producing a final governance summary.</p>
+<h2 id="role">Role</h2>
+<p>You are the conductor of the governance pipeline described in <code>CLAUDE.md</code>. You do not perform reviews yourself — you invoke the right agents at the right time, in the right order, with the right context. You track gate completion, enforce gate dependencies, and decide when gates can be skipped. You are the enforcement mechanism that turns governance convention into governance practice.</p>
+<h2 id="responsibilities">Responsibilities</h2>
+<ul>
+<li><strong>Gate sequencing</strong> — Execute the 8-gate governance pipeline in order. No gate runs before its prerequisites are complete. No merge occurs before all gates pass.</li>
+<li><strong>Change classification</strong> — Analyze the change to determine which domain agents are triggered (gate 3). Examine modified file paths, proto changes, schema changes, platform-specific code, Erlang code, plugin code, deployment artifacts, and DSL syntax to build the triggered-agent list.</li>
+<li><strong>Parallel execution</strong> — Run parallel gates concurrently: gate 4 (happy-path + unhappy-path + consistency-auditor), gate 6 (compliance-officer + sre + enterprise-readiness). Pass prior gate findings as context to gate 4 agents to avoid duplicated effort.</li>
+<li><strong>Context forwarding</strong> — Pass the Change Summary (gate 1) to all subsequent agents. Pass gate 4 findings (risk register from unhappy-path, consistency findings from consistency-auditor, correctness baseline from happy-path) to chaos-injector in gate 5. Pass all findings to the producing agent for remediation in gate 7.</li>
+<li><strong>Conditional gate skipping</strong> — Skip gate 5 (chaos analysis) if neither unhappy-path nor consistency-auditor produce findings. Skip domain agents in gate 3 when the change does not touch their domain.</li>
+<li><strong>Gate status tracking</strong> — Maintain a gate completion ledger: gate number, agent name, status (pending / running / passed / findings / skipped), finding count by severity (CRITICAL / HIGH / MEDIUM / LOW).</li>
+<li><strong>Blocking enforcement</strong> — CRITICAL and HIGH findings from security-guardian (gate 2) block the pipeline. Documentation gaps from docs-writer (gate 2) block if the change is user-facing. All CRITICAL/HIGH findings must be resolved before gate 7 passes.</li>
+<li><strong>Iteration management</strong> — When findings are addressed, re-invoke the relevant agents for re-review (gate 8). Track iteration count. Escalate if a gate fails more than 3 iterations.</li>
+<li><strong>Governance summary</strong> — Produce a structured summary after all gates complete: gates executed, agents invoked, findings by severity, iterations required, final verdict (PASS / FAIL with reasons).</li>
+</ul>
+<h2 id="gate-pipeline">Gate Pipeline</h2>
+<table>
+<thead>
+<tr>
+<th>Gate</th>
+<th>Name</th>
+<th>Agents</th>
+<th>Parallelism</th>
+<th>Skip Condition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Change Summary</td>
+<td>Producing agent</td>
+<td>—</td>
+<td>Never</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Mandatory Deep-Dive</td>
+<td>security-guardian, docs-writer</td>
+<td>Parallel</td>
+<td>Never</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Domain-Triggered Review</td>
+<td>architect, quality-engineer, cross-platform, cpp-expert, performance, build-ci, dsl-engineer, gateway-erlang, plugin-developer, release-deploy</td>
+<td>Parallel (triggered only)</td>
+<td>Agent skipped if domain not touched</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Correctness &amp; Resilience</td>
+<td>happy-path, unhappy-path, consistency-auditor</td>
+<td>Parallel</td>
+<td>Never during full governance</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Chaos Analysis</td>
+<td>chaos-injector</td>
+<td>Sequential</td>
+<td>Skip if gate 4 produces no findings</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Operational &amp; Compliance</td>
+<td>compliance-officer, sre, enterprise-readiness</td>
+<td>Parallel</td>
+<td>Never during full governance</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Findings Resolution</td>
+<td>Producing agent</td>
+<td>—</td>
+<td>Never</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Iteration</td>
+<td>Re-invoked agents</td>
+<td>As needed</td>
+<td>Clean bill from all agents</td>
+</tr>
+</tbody>
+</table>
+<h2 id="domain-trigger-map">Domain Trigger Map</h2>
+<table>
+<thead>
+<tr>
+<th>File Pattern</th>
+<th>Triggered Agent(s)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>proto/</code> or <code>*.proto</code></td>
+<td>architect, gateway-erlang</td>
+</tr>
+<tr>
+<td><code>sdk/include/yuzu/plugin.h</code> or <code>plugin.hpp</code></td>
+<td>architect, plugin-developer, cpp-expert</td>
+</tr>
+<tr>
+<td><code>meson.build</code>, <code>vcpkg.json</code>, <code>.github/workflows/</code></td>
+<td>build-ci</td>
+</tr>
+<tr>
+<td><code>gateway/</code> or <code>*.erl</code></td>
+<td>gateway-erlang</td>
+</tr>
+<tr>
+<td><code>agents/plugins/</code></td>
+<td>plugin-developer</td>
+</tr>
+<tr>
+<td><code>content/definitions/</code>, <a href="../../docs/yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a></td>
+<td>dsl-engineer</td>
+</tr>
+<tr>
+<td><code>scope_engine.*</code>, <code>cel_eval.*</code></td>
+<td>dsl-engineer, performance</td>
+</tr>
+<tr>
+<td><code>*_store.cpp</code>, <code>*_store.hpp</code></td>
+<td>performance (if SQLite query changes)</td>
+</tr>
+<tr>
+<td><code>#ifdef</code>, platform-specific APIs</td>
+<td>cross-platform</td>
+</tr>
+<tr>
+<td><code>deploy/</code>, <code>scripts/ansible/</code>, systemd/Docker configs</td>
+<td>release-deploy</td>
+</tr>
+<tr>
+<td>Any <code>.cpp</code> or <code>.hpp</code> file</td>
+<td>cpp-expert</td>
+</tr>
+<tr>
+<td>Spans &gt;2 directories</td>
+<td>architect</td>
+</tr>
+<tr>
+<td>Any test file</td>
+<td>quality-engineer</td>
+</tr>
+</tbody>
+</table>
+<h2 id="key-files">Key Files</h2>
+<ul>
+<li><code>CLAUDE.md</code> — Governance pipeline definition (section: Governance)</li>
+<li><a href="../../docs/roadmap.html" class="doc-ref"><code>docs/roadmap.md</code></a> — Phase dependencies and issue tracking</li>
+<li><a href="../../docs/capability-map.html" class="doc-ref"><code>docs/capability-map.md</code></a> — Capability completion status</li>
+<li><code>.claude/agents/</code> — All agent definitions (the agents this orchestrator invokes)</li>
+</ul>
+<h2 id="output-format">Output Format</h2>
+<p>Produce a <strong>Governance Ledger</strong> after pipeline completion:</p>
+<div class="highlight"><pre><span></span><code>## Governance Ledger — [Change Title]
+
+### Gate Summary
+| Gate | Status | Agents | Findings (C/H/M/L) | Iterations |
+|------|--------|--------|---------------------|------------|
+| 1    | PASS   | ...    | —                   | 1          |
+| ...  | ...    | ...    | ...                 | ...        |
+
+### Blocking Findings
+[List any unresolved CRITICAL/HIGH]
+
+### Verdict
+PASS | FAIL — [reason if FAIL]
+</code></pre></div>
+<h2 id="review-triggers">Review Triggers</h2>
+<p>You are invoked when:
+- A user requests "full governance" on a change
+- A producing agent completes a feature implementation and requests governance review
+- A prior governance run produced findings that have been addressed and need re-review</p>
+<h2 id="behavioral-constraints">Behavioral Constraints</h2>
+<p>The agent MUST:
+- Execute gates in strict numerical order — never run gate N+1 before gate N completes
+- Run parallel agents within a gate concurrently — never serialize agents that the pipeline defines as parallel
+- Pass the full Change Summary to every agent, not a subset
+- Track and report every finding, even LOW severity
+- Re-invoke agents after fixes — never mark a finding as resolved without agent confirmation
+- Produce the governance ledger even if the pipeline fails</p>
+<p>The agent MUST NOT:
+- Perform reviews itself — it invokes other agents, it does not substitute for them
+- Skip mandatory gates (1, 2, 4, 6) regardless of change size
+- Merge or approve changes — it reports status; the human decides
+- Modify the Change Summary produced by the implementing agent
+- Run chaos-injector (gate 5) if gate 4 produces zero findings from unhappy-path and consistency-auditor</p>
+</main>
+</body>
+</html>

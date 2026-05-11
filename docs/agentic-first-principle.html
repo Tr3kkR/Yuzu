@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agentic-First Principle</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/agentic-first-principle.md</div>
+<h1 class="doc-title">Agentic-First Principle</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="agentic-first-principle">Agentic-First Principle</h1>
+<p><strong>Version:</strong> 1.0 | <strong>Date:</strong> 2026-05-01 | <strong>Status:</strong> Architectural rule (proposed)</p>
+<h2 id="what-this-document-is">What this document is</h2>
+<p>A four-rule architectural principle. Every operation an authorised human can perform via the dashboard must be performable by an authenticated agentic worker through a documented, discoverable, machine-readable surface. Every signal a human can see must be available to that worker. Every error must be machine-actionable.</p>
+<p>This is the canonical reference for the A1–A4 invariants. The audit at <a href="capability-agentic-audit-2026-05.html" class="doc-ref"><code>docs/capability-agentic-audit-2026-05.md</code></a> references and applies these rules.</p>
+<h2 id="glossary">Glossary</h2>
+<p>The word "agent" is overloaded in Yuzu. To stay precise:</p>
+<ul>
+<li><strong>Agent daemon</strong> — the C++ binary in <code>agents/core/</code> that runs on each managed endpoint and executes plugins.</li>
+<li><strong>Governance agent</strong> — the <code>.claude/agents/*.md</code> review actors run during the <code>/governance</code> pipeline.</li>
+<li><strong>Agentic worker</strong> — an external LLM-driven client (Claude, GPT, in-house) that drives Yuzu through MCP, REST, or the dashboard.</li>
+</ul>
+<p>The four invariants below apply to <strong>agentic workers</strong> consuming Yuzu's surfaces.</p>
+<h2 id="a1-dashboard-parity">A1 — Dashboard parity</h2>
+<p>Every new <code>/fragments/*</code> route ships with either (a) a parallel JSON variant via <code>Accept: application/json</code> content negotiation on the same URL, or (b) a sibling REST endpoint in <code>/api/v1/*</code> that returns the same data as a structured object.</p>
+<p><strong>Why this matters.</strong> Today most <code>/fragments/*</code> routes return only <code>text/html</code> for HTMX consumption. An agentic worker reading the dashboard either has to parse HTML (brittle, lossy on dynamic content, no schema) or re-implement the dashboard logic against a separate REST endpoint that may not exist for admin surfaces (user management, enrollment-token administration, settings). Parity removes that asymmetry.</p>
+<p><strong>Scope.</strong> Existing fragments are not retroactively required to comply — backfilling them is tracked separately. New fragment routes are gated by this rule from the date of adoption. The audit lists which admin surfaces are dashboard-only today and earmarks them for the proposed Phase 17 (Agentic Surface Hardening).</p>
+<p><strong>Enforced by.</strong> <code>consistency-auditor</code> agent — A1 is added to its trigger list as a post-merge invariant check on any new <code>/fragments/*</code> route.</p>
+<h2 id="a2-discovery">A2 — Discovery</h2>
+<p>Every MCP tool, REST route, plugin action, scope kind, RBAC permission, and instruction definition is enumerable through a documented, authenticated discovery endpoint. An agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch.</p>
+<p><strong>Today.</strong> MCP <code>tools/list</code> enumerates 23 MCP tools with input schemas. <code>/api/v1/openapi.json</code> (<code>rest_api_v1.cpp:165</code>) enumerates the REST surface. Both are read-only and partial: there is no introspection for plugin actions, scope kinds, RBAC permission catalog, or live instruction definitions.</p>
+<p><strong>Future.</strong> A <code>/api/v1/discover/*</code> family will expose:
+- <code>/api/v1/discover/routes</code> — REST + dashboard route catalog with method, scope, RBAC requirement
+- <code>/api/v1/discover/plugins</code> — every plugin loaded across the fleet with action surface and parameter schemas
+- <code>/api/v1/discover/scope-kinds</code> — every scope DSL kind, syntax, examples
+- <code>/api/v1/discover/permissions</code> — RBAC permission catalog (securable_type × operation)
+- <code>/api/v1/discover/instructions</code> — published <code>InstructionDefinition</code> set with parameter and result schemas</p>
+<p>Each is mirrored as an MCP tool (<code>discover_routes</code>, <code>discover_plugins</code>, etc.) so the LLM-native flow does not require an out-of-band fetch.</p>
+<p><strong>Enforced by.</strong> <code>architect</code> and <code>consistency-auditor</code> on any new MCP tool, REST route, plugin action, or scope kind — the change is incomplete until the relevant <code>/discover/*</code> is updated.</p>
+<h2 id="a3-observability">A3 — Observability</h2>
+<p>Every long-running operation emits Server-Sent Events on a documented, authenticated, agent-accessible channel. Events are JSON envelopes (not HTML fragments). Every event carries an <code>execution_id</code> and a deterministic step name from a published taxonomy.</p>
+<p><strong>Today.</strong> The dashboard SSE channel (<code>server.cpp:2200-2228</code>, route <code>/events</code>) emits events designed for HTMX <code>sse-swap</code> HTML targets — they drive <code>&lt;div hx-target&gt;</code> updates, not machine consumption. The same <code>event_bus_</code> underlies them, so a parallel JSON channel can be added without duplicating the bus. The audit also flags that <code>/events</code> is unauthenticated today — see audit §Security follow-ups.</p>
+<p><strong>Future.</strong> A new authenticated <code>/api/v1/events?since=…&amp;filter=execution_id:X|agent_id:Y</code> channel emits structured JSON envelopes. The <code>ExecutionEventBus</code> referenced in <a href="executions-history-ladder.html" class="doc-ref"><code>docs/executions-history-ladder.md</code></a> is the canonical source. No new bus.</p>
+<p><strong>Enforced by.</strong> <code>architect</code> on any change that introduces a new long-running operation — the operation is incomplete without the corresponding event taxonomy and SSE wiring.</p>
+<h2 id="a4-error-envelope">A4 — Error envelope</h2>
+<p>Every failure response — REST, MCP, gRPC error — includes:</p>
+<ul>
+<li><code>code</code> — machine-readable error code (HTTP status for REST, JSON-RPC code for MCP, gRPC status for gRPC)</li>
+<li><code>message</code> — human-readable summary (one sentence)</li>
+<li><code>correlation_id</code> — server-issued ID that ties the error to the audit log entry</li>
+<li><code>retry_after_ms</code> — nullable; if non-null, the agent should wait at least this long before retrying</li>
+<li><code>remediation</code> — nullable URL or natural-language hint (e.g. <code>"request the missing permission via POST /api/v1/approvals"</code>)</li>
+</ul>
+<p>Two specialisations:</p>
+<ul>
+<li>On <code>kPermissionDenied</code> (-32003 / HTTP 403), the envelope names the missing permission as <code>securable_type:operation</code> (e.g. <code>Tag:Write</code>).</li>
+<li>On <code>kApprovalRequired</code> (-32006 / HTTP 202), the envelope returns <code>approval_id</code> and <code>status_url</code> so the agent can poll the approval workflow rather than re-issuing the same request.</li>
+</ul>
+<p><strong>Why this matters.</strong> Today errors give a code and message; nothing else. An agentic worker hitting <code>Permission denied</code> cannot tell which permission, who can grant it, or whether to retry. A4 closes that loop and makes self-recovery feasible.</p>
+<p><strong>Enforced by.</strong> <code>security-guardian</code> and <code>consistency-auditor</code> on any change to error-emitting code paths.</p>
+<h2 id="where-these-invariants-are-referenced">Where these invariants are referenced</h2>
+<ul>
+<li>The audit at <a href="capability-agentic-audit-2026-05.html" class="doc-ref"><code>docs/capability-agentic-audit-2026-05.md</code></a> cites this doc and applies the invariants to current state.</li>
+<li><code>CLAUDE.md</code> routes consistency-auditor to this doc on every PR.</li>
+<li>The proposed Phase 17 in <a href="roadmap.html" class="doc-ref"><code>docs/roadmap.md</code></a> (Agentic Surface Hardening) implements the gaps identified by A1–A4.</li>
+</ul>
+<h2 id="open-question-backfill-policy">Open question — backfill policy</h2>
+<p>A1–A4 apply forward from adoption. The audit identifies a backlog of existing surfaces that do not satisfy them (most dashboard fragments, most error sites, the existing <code>/events</code> SSE). Backfill is tracked as proposed Phase 17 issues 17.1–17.5; this principle doc does not mandate retroactive compliance, but agents reviewing PRs that touch existing non-compliant code should encourage a partial backfill of the touched paths rather than perpetuating the gap.</p>
+</main>
+</body>
+</html>

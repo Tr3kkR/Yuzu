@@ -1,0 +1,2707 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuzu Development Roadmap</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/roadmap.md</div>
+<h1 class="doc-title">Yuzu Development Roadmap</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="yuzu-development-roadmap">Yuzu Development Roadmap</h1>
+<p><strong>Version:</strong> 2.0 | <strong>Date:</strong> 2026-03-30</p>
+<p>This roadmap transforms Yuzu from a functional agent/server framework into a full-featured enterprise endpoint management platform. Work is organized into 7 phases, each building on the previous. Every item is a GitHub issue.</p>
+<h2 id="github-issue-index">GitHub Issue Index</h2>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Issue</th>
+<th>#</th>
+<th>Title</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>0</strong></td>
+<td>0.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/146">#146</a></td>
+<td>HTTPS for Web Dashboard</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>0.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/147">#147</a></td>
+<td>Agent OTA Update Management</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>0.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/148">#148</a></td>
+<td>Secure Temp File Creation in Filesystem Plugin</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>0.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/150">#150</a></td>
+<td>SDK Utility Functions (JSON/Table Conversion)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>0.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/152">#152</a></td>
+<td>Complete Foundation Partial Items</td>
+<td>Done</td>
+</tr>
+<tr>
+<td><strong>1</strong></td>
+<td>1.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/166">#166</a></td>
+<td>Server-Side Response Persistence (SQLite)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>1.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/167">#167</a></td>
+<td>Response Filtering, Pagination, and Sorting</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>1.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/168">#168</a></td>
+<td>Response Aggregation Engine</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>1.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/169">#169</a></td>
+<td>Audit Trail System</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>1.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/170">#170</a></td>
+<td>Device Tagging System</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>1.6</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/171">#171</a></td>
+<td>Scope Expression Engine and Device Filtering</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>1.7</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/172">#172</a></td>
+<td>CSV and JSON Data Export</td>
+<td>Done</td>
+</tr>
+<tr>
+<td><strong>2</strong></td>
+<td>2.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/149">#149</a></td>
+<td>Instruction Definitions</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>2.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/151">#151</a></td>
+<td>Instruction Sets (Grouping and Organization)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>2.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/153">#153</a></td>
+<td>Instruction Scheduling</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>2.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/155">#155</a></td>
+<td>Instruction Approval Workflows</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>2.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/158">#158</a></td>
+<td>Instruction Hierarchies and Follow-Up Workflows</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>2.6</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/160">#160</a></td>
+<td>Instruction Progress Tracking and Statistics</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>2.7</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/163">#163</a></td>
+<td>Instruction Rerun and Cancellation</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>2.8</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/205">#205</a></td>
+<td>Error Code Taxonomy (1xxx-4xxx)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>2.9</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/206">#206</a></td>
+<td>Concurrency Enforcement (5 Modes)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>2.10</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/207">#207</a></td>
+<td>YAML Authoring UI (Form + CodeMirror)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>2.11</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/208">#208</a></td>
+<td>Legacy Command Shim</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>2.12</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/209">#209</a></td>
+<td>Structured Result Envelope</td>
+<td>Done</td>
+</tr>
+<tr>
+<td><strong>3</strong></td>
+<td>3.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/154">#154</a></td>
+<td>Granular RBAC System</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>3.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/156">#156</a></td>
+<td>Management Groups</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>3.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/157">#157</a></td>
+<td>Token-Based API Authentication</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>3.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/159">#159</a></td>
+<td>OIDC / SSO Integration</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>3.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/161">#161</a></td>
+<td>REST / HTTP Management API (v1)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>3.6</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/162">#162</a></td>
+<td>Device Quarantine (Network Isolation)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>3.7</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/164">#164</a></td>
+<td>IOC Checking</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>3.8</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/165">#165</a></td>
+<td>Certificate Inventory and Management</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>3.9</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/210">#210</a></td>
+<td>Scope DSL Extensions (MATCHES, EXISTS, len, startswith)</td>
+<td><strong>Done</strong></td>
+</tr>
+<tr>
+<td><strong>4</strong></td>
+<td>4.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/173">#173</a></td>
+<td>Agent-Side Key-Value Storage</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>4.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/174">#174</a></td>
+<td>HTTP Download and Upload (Agent-Initiated)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>4.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/177">#177</a></td>
+<td>Content Staging and Execution</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>4.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/181">#181</a></td>
+<td>Agent Sleep and Stagger Control</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>4.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/184">#184</a></td>
+<td>Trigger Framework (Agent-Side)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>4.6</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/189">#189</a></td>
+<td>Desktop User Interaction (Windows)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>4.7</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/193">#193</a></td>
+<td>Agent Logging and Remote Log Retrieval</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>4.8</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/212">#212</a></td>
+<td>service.set_start_mode Cross-Platform Primitive</td>
+<td>Done</td>
+</tr>
+<tr>
+<td><strong>5</strong></td>
+<td>5.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/175">#175</a></td>
+<td>Policy Rules and Fragments</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>5.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/176">#176</a></td>
+<td>Policy Assignment and Deployment</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>5.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/178">#178</a></td>
+<td>Compliance Dashboard and Statistics</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>5.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/179">#179</a></td>
+<td>Policy Cache Invalidation and Force Re-Evaluation</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>5.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/211">#211</a></td>
+<td>CEL Adoption for Policy Compliance Expressions</td>
+<td>Done</td>
+</tr>
+<tr>
+<td><strong>6</strong></td>
+<td>6.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/180">#180</a></td>
+<td>Registry Plugin (Read/Write/Enumerate)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>6.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/182">#182</a></td>
+<td>Per-User Registry Operations</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>6.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/183">#183</a></td>
+<td>WMI Query and Method Invocation</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>6.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/186">#186</a></td>
+<td>Per-User Application Inventory</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>6.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/188">#188</a></td>
+<td>File System Advanced Operations</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>6.6</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/192">#192</a></td>
+<td>Registry Change Trigger</td>
+<td>Done</td>
+</tr>
+<tr>
+<td><strong>7</strong></td>
+<td>7.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/185">#185</a></td>
+<td>Gateway Node Implementation</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/187">#187</a></td>
+<td>System Health Monitoring and Statistics</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/190">#190</a></td>
+<td>Runtime Configuration API</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/191">#191</a></td>
+<td>System Notifications</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/194">#194</a></td>
+<td>Active Directory / Entra Integration</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.6</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/195">#195</a></td>
+<td>Custom Properties on Devices</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.7</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/196">#196</a></td>
+<td>Agent Deployment Jobs</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.8</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/197">#197</a></td>
+<td>Patch Deployment Workflow</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.9</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/198">#198</a></td>
+<td>Product Packs (Bundled Definitions)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.10</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/199">#199</a></td>
+<td>User Sessions and Group Membership Plugins</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.11</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/200">#200</a></td>
+<td>Advanced User Interaction (Surveys, DND)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.12</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/201">#201</a></td>
+<td>Event Subscriptions (Webhooks)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.13</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/213">#213</a></td>
+<td>ProductPack Ed25519 Trust Chain and Verification</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.14</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/214">#214</a></td>
+<td>Workflow Primitives (if, foreach, retry)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.15</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/215">#215</a></td>
+<td>WiFi Network Enumeration</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.16</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/216">#216</a></td>
+<td>Wake-on-LAN Support</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.17</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/217">#217</a></td>
+<td>Inventory Table Enumeration and Item Lookup</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.18</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/218">#218</a></td>
+<td>Device Discovery (Unmanaged Endpoints)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.19</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/235">#235</a></td>
+<td>Timeline Activity Record (TAR)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td></td>
+<td>7.20</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/236">#236</a></td>
+<td>MCP Server (Model Context Protocol) Phase 1</td>
+<td>Done</td>
+</tr>
+<tr>
+<td><strong>8</strong></td>
+<td>8.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/253">#253</a></td>
+<td>Response Visualization Engine</td>
+<td><strong>Done</strong></td>
+</tr>
+<tr>
+<td></td>
+<td>8.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/254">#254</a></td>
+<td>Response Templates</td>
+<td><strong>Done</strong></td>
+</tr>
+<tr>
+<td>:white_check_mark:</td>
+<td>8.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/255">#255</a></td>
+<td>Response Offloading (Data Export Streams)</td>
+<td>Done</td>
+</tr>
+<tr>
+<td><strong>9</strong></td>
+<td>9.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/256">#256</a></td>
+<td>Connector Framework (Core)</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>9.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/257">#257</a></td>
+<td>Inventory Repository Model</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>9.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/258">#258</a></td>
+<td>SCCM / ConfigMgr Connector</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>9.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/259">#259</a></td>
+<td>Intune Connector</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>9.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/260">#260</a></td>
+<td>ServiceNow Connector</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>9.6</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/261">#261</a></td>
+<td>WSUS Connector</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>9.7</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/262">#262</a></td>
+<td>CSV / File Upload Connector</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>9.8</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/263">#263</a></td>
+<td>Inventory Consolidation &amp; Normalization</td>
+<td>Open</td>
+</tr>
+<tr>
+<td><strong>10</strong></td>
+<td>10.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/264">#264</a></td>
+<td>Software Catalog Store</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>10.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/265">#265</a></td>
+<td>Software Usage Tracking</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>10.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/266">#266</a></td>
+<td>License Entitlements &amp; Compliance</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>10.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/267">#267</a></td>
+<td>Software Tags</td>
+<td>Open</td>
+</tr>
+<tr>
+<td><strong>11</strong></td>
+<td>11.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/268">#268</a></td>
+<td>Consumer Application Registration</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>11.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/269">#269</a></td>
+<td>Event Source Management</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>11.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/270">#270</a></td>
+<td>PowerShell Module</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>11.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/271">#271</a></td>
+<td>Python SDK</td>
+<td>Open</td>
+</tr>
+<tr>
+<td><strong>12</strong></td>
+<td>12.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/272">#272</a></td>
+<td>Mapped Drive History</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/273">#273</a></td>
+<td>Printer Inventory</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/274">#274</a></td>
+<td>Port Scanning</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/275">#275</a></td>
+<td>NetBIOS Lookup</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/276">#276</a></td>
+<td>Open Windows Enumeration</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.6</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/277">#277</a></td>
+<td>Directory Hash (Recursive)</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.7</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/278">#278</a></td>
+<td>Survey Dialog</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.8</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/279">#279</a></td>
+<td>Do-Not-Disturb Mode</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.9</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/280">#280</a></td>
+<td>Active Response Tracking</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.10</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/281">#281</a></td>
+<td>Patch Inventory Event Generation</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.11</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/282">#282</a></td>
+<td>Application Whitelisting</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.12</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/283">#283</a></td>
+<td>Inventory Replication (Delta Sync)</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>12.13</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/284">#284</a></td>
+<td>Binary Resource Distribution</td>
+<td>Open</td>
+</tr>
+<tr>
+<td><strong>13</strong></td>
+<td>13.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/285">#285</a></td>
+<td>2FA for Instruction Approval (TOTP)</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>13.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/286">#286</a></td>
+<td>Composable Instruction Chains</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>13.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/287">#287</a></td>
+<td>Process / Sync Logging UI</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>13.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/288">#288</a></td>
+<td>Dashboard Branding</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>13.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/289">#289</a></td>
+<td>MCP Phase 2 (Write Tools)</td>
+<td>Open</td>
+</tr>
+<tr>
+<td><strong>14</strong></td>
+<td>14.1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/290">#290</a></td>
+<td>P2P Content Distribution</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>14.2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/291">#291</a></td>
+<td>Multi-Gateway Topology</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>14.3</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/292">#292</a></td>
+<td>Database Sharding (Response Partitioning)</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>14.4</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/293">#293</a></td>
+<td>vCenter Connector</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>14.5</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/294">#294</a></td>
+<td>Additional Connectors (BigFix, O365, Oracle)</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>14.6</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/295">#295</a></td>
+<td>High Availability (Active-Passive)</td>
+<td>Open</td>
+</tr>
+<tr>
+<td><strong>15</strong></td>
+<td>15.A</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/547">#547</a></td>
+<td>TAR dashboard page shell + retention-paused source list</td>
+<td><strong>In progress — PR-A.A shipped</strong> (paused_at + status extension + dashboard page + Scan + Re-enable; purge action + persistence pending)</td>
+</tr>
+<tr>
+<td></td>
+<td>15.B</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/548">#548</a></td>
+<td>Result-set store + REST API (composable scope, the differentiator)</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>15.C</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/549">#549</a></td>
+<td>Scope-engine <code>from_result_set:</code> + dashboard chip + sidebar + breadcrumb</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>15.D</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/550">#550</a></td>
+<td>TAR SQL frame: relocate, scope-walking-aware, "save as result set"</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>15.E</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/551">#551</a></td>
+<td>YAML DSL <code>fromResultSet:</code> + <code>definition_store</code> validation + spec amendment</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>15.F</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/552">#552</a></td>
+<td>Reference walkthrough integration test (Chrome IR end-to-end)</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>15.G</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/553">#553</a></td>
+<td>Operational hardening — live re-eval, GC sweep, Prometheus + audit polish</td>
+<td>Open</td>
+</tr>
+<tr>
+<td></td>
+<td>15.H</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/554">#554</a></td>
+<td>TAR process tree viewer (seed snapshot + reconstruction from <code>process_live</code>)</td>
+<td>Open (gated on agent service-install hardening)</td>
+</tr>
+<tr>
+<td><strong>16</strong></td>
+<td>16.A</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/555">#555</a></td>
+<td>System Guardian — Windows-first delivery (PRs 1-15 per implementation plan)</td>
+<td><strong>In progress</strong> (PRs 1-2 shipped)</td>
+</tr>
+<tr>
+<td></td>
+<td>16.B</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/556">#556</a></td>
+<td>System Guardian — Linux delivery (inotify, netlink, D-Bus, audit, sysctl)</td>
+<td>Open (gated on 16.A soak)</td>
+</tr>
+<tr>
+<td></td>
+<td>16.C</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/557">#557</a></td>
+<td>System Guardian — macOS delivery (Endpoint Security, fseventsd, launchd)</td>
+<td>Open (gated on 16.A + 16.B soak + ES entitlement)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="current-status">Current Status</h2>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th style="text-align: center;">Done</th>
+<th style="text-align: center;">Open</th>
+<th style="text-align: center;">Total</th>
+<th>Progress</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0: Foundation</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">5</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>1: Data Infrastructure</td>
+<td style="text-align: center;">7</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">7</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>2: Instruction System</td>
+<td style="text-align: center;">12</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">12</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>3: Security &amp; RBAC</td>
+<td style="text-align: center;">9</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">9</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>4: Agent Infrastructure</td>
+<td style="text-align: center;">8</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">8</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>5: Policy Engine</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">5</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>6: Windows Depth</td>
+<td style="text-align: center;">6</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">6</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>7: Scale &amp; Integration</td>
+<td style="text-align: center;">20</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">20</td>
+<td>100%</td>
+</tr>
+<tr>
+<td>8: Visualization &amp; Response Experience</td>
+<td style="text-align: center;">2</td>
+<td style="text-align: center;">1</td>
+<td style="text-align: center;">3</td>
+<td>67%</td>
+</tr>
+<tr>
+<td>9: Connector Framework &amp; Multi-Source Inventory</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">8</td>
+<td style="text-align: center;">8</td>
+<td>0%</td>
+</tr>
+<tr>
+<td>10: Software Catalog &amp; License Compliance</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">4</td>
+<td>0%</td>
+</tr>
+<tr>
+<td>11: Consumer Model &amp; Platform Extensibility</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">4</td>
+<td>0%</td>
+</tr>
+<tr>
+<td>12: Remaining Agent Capabilities</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">13</td>
+<td style="text-align: center;">13</td>
+<td>0%</td>
+</tr>
+<tr>
+<td>13: Security Hardening &amp; Operational Polish</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">5</td>
+<td>0%</td>
+</tr>
+<tr>
+<td>14: Scale &amp; Enterprise Readiness</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">6</td>
+<td style="text-align: center;">6</td>
+<td>0%</td>
+</tr>
+<tr>
+<td>15: TAR Dashboard &amp; Scope Walking</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">8</td>
+<td style="text-align: center;">8</td>
+<td>0%</td>
+</tr>
+<tr>
+<td>16: System Guardian — Real-Time GS</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">3</td>
+<td style="text-align: center;">3</td>
+<td>0%</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td style="text-align: center;"><strong>74</strong></td>
+<td style="text-align: center;"><strong>52</strong></td>
+<td style="text-align: center;"><strong>126</strong></td>
+<td><strong>59%</strong></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Scaffolded</strong> means DDL/structs/stubs exist but business logic is not wired. See <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> for Phase 2 scaffold details.</p>
+<hr>
+<h2 id="phase-0-foundation-completion">Phase 0: Foundation Completion</h2>
+<p><em>Close the remaining Foundation-tier gaps. These are prerequisites for production use.</em></p>
+<h3 id="issue-01-https-for-web-dashboard-white_check_mark">Issue 0.1: HTTPS for Web Dashboard :white_check_mark:</h3>
+<p><strong>Capability:</strong> 18.9 | <strong>Scope:</strong> Server | <strong>Status:</strong> Done</p>
+<p><code>httplib::SSLServer</code> with OpenSSL support (<code>-DCPPHTTPLIB_OPENSSL_SUPPORT</code>). CLI flags: <code>--https</code>, <code>--https-port</code> (default 8443), <code>--https-cert</code>, <code>--https-key</code>, <code>--no-https-redirect</code>. HTTP-to-HTTPS 301 redirect server. Secure cookie flag when HTTPS enabled. Settings UI has TLS configuration section.</p>
+<p><strong>Files:</strong> <code>server/core/src/server.cpp</code> (lines 2531-2560, 4412-4462), <code>server/core/meson.build</code> (OpenSSL dep)</p>
+<h3 id="issue-02-agent-ota-update-management-white_check_mark">Issue 0.2: Agent OTA Update Management :white_check_mark:</h3>
+<p><strong>Capability:</strong> 1.4 | <strong>Scope:</strong> Agent + Server | <strong>Status:</strong> Done</p>
+<p><code>CheckForUpdate</code>/<code>DownloadUpdate</code> RPCs in agent.proto. Full updater implementation with hash verification and platform-specific self-update.</p>
+<p><strong>Files:</strong> <code>agents/core/src/updater.cpp</code>, <code>proto/yuzu/agent/v1/agent.proto</code> (lines 29-33, 130-157)</p>
+<h3 id="issue-03-secure-temp-file-creation-in-filesystem-plugin-white_check_mark">Issue 0.3: Secure Temp File Creation in Filesystem Plugin :white_check_mark:</h3>
+<p><strong>Capability:</strong> 10.12 | <strong>Scope:</strong> Plugin | <strong>Status:</strong> Done</p>
+<p><code>yuzu_create_temp_file()</code> and <code>yuzu_create_temp_dir()</code> in SDK with secure permissions (POSIX 0600/0700, Windows owner-only DACL). Filesystem plugin exposes <code>create_temp</code> and <code>create_temp_dir</code> actions.</p>
+<p><strong>Files:</strong> <code>sdk/include/yuzu/plugin.h</code> (lines 207-244), <code>agents/plugins/filesystem/src/filesystem_plugin.cpp</code></p>
+<h3 id="issue-04-sdk-utility-functions-jsontable-conversion-white_check_mark">Issue 0.4: SDK Utility Functions (JSON/Table Conversion) :white_check_mark:</h3>
+<p><strong>Capability:</strong> 24.6 | <strong>Scope:</strong> SDK | <strong>Status:</strong> Done</p>
+<p><code>yuzu_table_to_json()</code>, <code>yuzu_json_to_table()</code>, <code>yuzu_split_lines()</code>, <code>yuzu_generate_sequence()</code>, <code>yuzu_free_string()</code> implemented in plugin.h C ABI.</p>
+<p><strong>Files:</strong> <code>sdk/include/yuzu/plugin.h</code> (lines 153-206)</p>
+<h3 id="issue-05-complete-foundation-partial-items-white_check_mark">Issue 0.5: Complete Foundation Partial Items :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 1.8, 4.5, 10.3 | <strong>Scope:</strong> Agent + Plugins | <strong>Status:</strong> Done</p>
+<ul>
+<li><strong>1.8</strong> <code>connection_info</code> action: server address, TLS status, session ID, gRPC channel state, reconnect count, latency, uptime.</li>
+<li><strong>4.5</strong> <code>dns_cache</code> action: Windows <code>DnsGetCacheDataTable</code>, Linux systemd-resolved query.</li>
+<li><strong>10.3</strong> <code>offset</code>/<code>limit</code> parameters on filesystem <code>read</code> action (1-based line offset, configurable max).</li>
+</ul>
+<p><strong>Files:</strong> <code>agents/plugins/diagnostics/src/diagnostics_plugin.cpp</code>, <code>agents/plugins/network_config/src/network_config_plugin.cpp</code>, <code>agents/plugins/filesystem/src/filesystem_plugin.cpp</code></p>
+<hr>
+<h2 id="phase-1-server-side-data-infrastructure">Phase 1: Server-Side Data Infrastructure</h2>
+<p><em>Build the server-side systems that all advanced features depend on: persistent response storage, device metadata, audit logging, and a query language.</em></p>
+<h3 id="issue-11-server-side-response-persistence-sqlite-white_check_mark">Issue 1.1: Server-Side Response Persistence (SQLite) :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 20.2, 20.4 | <strong>Scope:</strong> Server | <strong>Status:</strong> Done</p>
+<p>SQLite with WAL mode, <code>StoredResponse</code> struct, configurable TTL retention (default 90 days), background cleanup thread.</p>
+<p><strong>Files:</strong> <code>server/core/src/response_store.hpp</code>, <code>server/core/src/response_store.cpp</code></p>
+<h3 id="issue-12-response-filtering-pagination-and-sorting-white_check_mark">Issue 1.2: Response Filtering, Pagination, and Sorting :white_check_mark:</h3>
+<p><strong>Capability:</strong> 20.2 | <strong>Scope:</strong> Server | <strong>Status:</strong> Done</p>
+<p><code>ResponseQuery</code> struct with agent_id, status, time range (since/until), limit/offset pagination. Exposed via <code>GET /api/responses/{instruction_id}</code> with query parameters.</p>
+<p><strong>Files:</strong> <code>server/core/src/response_store.hpp</code>, <code>server/core/src/response_store.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-13-response-aggregation-engine">Issue 1.3: Response Aggregation Engine</h3>
+<p><strong>Capability:</strong> 20.3 | <strong>Scope:</strong> Server</p>
+<p>Server-side aggregation of response data. Support group-by columns with <code>count</code>, <code>sum</code>, <code>min</code>, <code>max</code> operations. Aggregation definitions are attached to instruction definitions (when those exist) or specified ad-hoc. Return aggregated results alongside raw data.</p>
+<p><strong>Files:</strong> <code>server/core/src/response_store.cpp</code>, <code>proto/yuzu/server/v1/management.proto</code></p>
+<h3 id="issue-14-audit-trail-system-white_check_mark">Issue 1.4: Audit Trail System :white_check_mark:</h3>
+<p><strong>Capability:</strong> 21.2 | <strong>Scope:</strong> Server | <strong>Status:</strong> Done</p>
+<p><code>AuditStore</code> with SQLite WAL backend. <code>AuditEvent</code> struct: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, user_agent, session_id, result. Query with filtering and pagination. Default 365-day retention.</p>
+<p><strong>Files:</strong> <code>server/core/src/audit_store.hpp</code>, <code>server/core/src/audit_store.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-15-device-tagging-system-white_check_mark">Issue 1.5: Device Tagging System :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 3.10, 3.6, 3.7 | <strong>Scope:</strong> Server + Agent | <strong>Status:</strong> Done</p>
+<p><code>TagStore</code> with SQLite backend. <code>DeviceTag</code> struct: agent_id, key, value, source (agent/server/api), updated_at. Validation: key max 64 chars <code>[a-zA-Z0-9_.:-]</code>, value max 448 bytes. Agent tag sync from heartbeat. <code>agents_with_tag()</code> for scope queries. Device criticality (3.6) and location (3.7) implemented as special-purpose tags.</p>
+<p><strong>Files:</strong> <code>server/core/src/tag_store.hpp</code>, <code>server/core/src/tag_store.cpp</code>, <code>agents/plugins/tags/src/tags_plugin.cpp</code></p>
+<h3 id="issue-16-scope-expression-engine-and-device-filtering-white_check_mark">Issue 1.6: Scope Expression Engine and Device Filtering :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 19.3, 2.2, 2.11 | <strong>Scope:</strong> Server | <strong>Status:</strong> Done</p>
+<p>494-line recursive-descent parser. 9 operators: <code>==</code>, <code>!=</code>, <code>LIKE</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>IN</code>, <code>CONTAINS</code>. AND/OR/NOT combinators, wildcard LIKE matching, case-insensitive comparison, max nesting depth 10. <code>AttributeResolver</code> callback for evaluation. Target estimation via <code>GET /api/target/estimate</code>.</p>
+<p><strong>Files:</strong> <code>server/core/src/scope_engine.hpp</code>, <code>server/core/src/scope_engine.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-17-csv-and-json-data-export">Issue 1.7: CSV and JSON Data Export</h3>
+<p><strong>Capabilities:</strong> 20.5, 24.5 | <strong>Scope:</strong> Server</p>
+<p>Export response data and inventory as CSV or JSON. Support:
+- Export specific instruction responses by ID
+- Export inventory data by plugin
+- Generic JSON-to-CSV conversion endpoint
+- Stream large exports to avoid memory pressure</p>
+<p><strong>Files:</strong> <code>server/core/src/server.cpp</code>, new <code>server/core/src/data_export.cpp</code></p>
+<hr>
+<h2 id="phase-2-instruction-system">Phase 2: Instruction System</h2>
+<p><em>Transform ad-hoc commands into a governed instruction lifecycle. YAML-defined instruction definitions with typed parameter and result schemas, executed through the existing <code>CommandRequest</code> wire protocol, tracked by <code>ExecutionTracker</code>, stored by <code>ResponseStore</code>, and audited by <code>AuditStore</code>. See <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> for the full architectural blueprint and <a href="yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a> for the YAML specification.</em></p>
+<h3 id="issue-21-instruction-definitions">Issue 2.1: Instruction Definitions</h3>
+<p><strong>Capability:</strong> 2.6 | <strong>Scope:</strong> Server + Proto</p>
+<p>YAML-first InstructionDefinitions (see <a href="yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a> Section 3). Each definition stored with <code>yaml_source</code> column (verbatim YAML, source of truth) plus denormalized columns for efficient queries. Features:
+- <strong>Content model:</strong> <code>apiVersion: yuzu.io/v1alpha1</code>, <code>kind: InstructionDefinition</code>, <code>metadata</code> + <code>spec</code> + <code>status</code>
+- <strong>Type:</strong> <code>question</code> (read-only) or <code>action</code> (may modify state)
+- <strong>Execution spec:</strong> plugin, action, concurrency mode (per-device/per-definition/per-set/global:N/unlimited), stagger
+- <strong>Parameter schema:</strong> JSON Schema subset — type (string, boolean, int32, int64, datetime, guid), required, validation (maxLength, pattern, enum, min/max)
+- <strong>Result schema:</strong> Typed columns (bool, int32, int64, string, datetime, guid, clob) with aggregation config (groupBy + operations)
+- <strong>Approval mode:</strong> auto (default for questions), role-gated (default for actions), always
+- <strong>Compatibility:</strong> minAgentVersion, requiredPlugins — server-side pre-dispatch check
+- <strong>Legacy command shim:</strong> Auto-generate definitions from plugin descriptors on server startup (Section 15 of Instruction-Engine.md)</p>
+<p>CRUD via REST API. Import/export as YAML and JSON.</p>
+<p><strong>Files:</strong> <code>server/core/src/instruction_store.hpp</code>, <code>server/core/src/instruction_store.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-22-instruction-sets-grouping-and-organization">Issue 2.2: Instruction Sets (Grouping and Organization)</h3>
+<p><strong>Capability:</strong> 2.7 | <strong>Scope:</strong> Server</p>
+<p>InstructionSets are the <strong>permission boundary</strong> (see <a href="yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a> Section 4). Users execute definitions within sets; authors publish to sets; approvers approve set-governed actions. Sets declare:
+- <code>contents</code> — list of InstructionDefinition IDs, PolicyFragment IDs, workflow templates
+- <code>permissions</code> — executeRoles, authorRoles, approveRoles
+- <code>defaults</code> — approvalMode, responseRetentionDays, targetEstimationRequiredAbove
+- <code>publishing</code> — signed flag, visibility (org/public)</p>
+<p>CRUD via management API. RBAC system (Phase 3) binds <code>Principal + Role + SecurableType(InstructionSet) + Operation</code>.</p>
+<p><strong>Files:</strong> <code>server/core/src/instruction_store.hpp</code>, <code>server/core/src/instruction_store.cpp</code></p>
+<h3 id="issue-23-instruction-scheduling">Issue 2.3: Instruction Scheduling</h3>
+<p><strong>Capability:</strong> 2.9 | <strong>Scope:</strong> Server</p>
+<p><code>ScheduleEngine</code> evaluates due schedules on a background thread (60-second tick). Schedule model:
+- frequency_type (daily, weekly, monthly, interval)
+- interval_minutes for sub-day granularity
+- time_of_day, day_of_week, day_of_month for calendar schedules
+- scope_expression for device targeting (evaluated by <code>ScopeEngine</code>)
+- requires_approval flag — creates approval record instead of immediate dispatch
+- next/last execution tracking, execution_count</p>
+<p>Dispatches via the same <code>CommandRequest</code> path. CRUD via management API.</p>
+<p><strong>Files:</strong> <code>server/core/src/schedule_engine.hpp</code>, <code>server/core/src/schedule_engine.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-24-instruction-approval-workflows">Issue 2.4: Instruction Approval Workflows</h3>
+<p><strong>Capability:</strong> 2.10 | <strong>Scope:</strong> Server</p>
+<p><code>ApprovalManager</code> implements approval gating per Instruction-Engine.md Section 6.1 <code>spec.approval.mode</code>:
+- <code>auto</code> — questions auto-approved, no gate
+- <code>role-gated</code> — actions require approval from a user with an approveRole on the InstructionSet
+- <code>always</code> — all executions require explicit approval</p>
+<p>Rules: submitter cannot approve own actions. Approval record includes submitted_by, reviewed_by, review_comment, scope_expression. On approval, dispatch proceeds automatically. On rejection, execution is marked rejected with comment.</p>
+<p><strong>Files:</strong> <code>server/core/src/approval_manager.hpp</code>, <code>server/core/src/approval_manager.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-25-instruction-hierarchies-and-follow-up-workflows">Issue 2.5: Instruction Hierarchies and Follow-Up Workflows</h3>
+<p><strong>Capability:</strong> 2.8 | <strong>Scope:</strong> Server</p>
+<p><code>Execution.parent_id</code> tracks parent-child relationships. Follow-up instructions dispatched using parent's response data as input. <code>ExecutionTracker.get_children()</code> enables drill-down. Previous-result filtering: server extracts columns from parent response, passes as parameters to child definition.</p>
+<p><strong>Files:</strong> <code>server/core/src/execution_tracker.hpp</code>, <code>server/core/src/execution_tracker.cpp</code></p>
+<h3 id="issue-26-instruction-progress-tracking-and-statistics">Issue 2.6: Instruction Progress Tracking and Statistics</h3>
+<p><strong>Capabilities:</strong> 2.12, 1.9 | <strong>Scope:</strong> Server + Agent</p>
+<p><code>ExecutionTracker</code> maintains per-execution aggregate status per Instruction-Engine.md Section 9.3:
+- <code>Execution</code> struct: agents_targeted, agents_responded, agents_success, agents_failure
+- <code>AgentExecStatus</code> struct: per-agent dispatched_at, first_response_at, completed_at, exit_code, error_detail
+- <code>ExecutionSummary</code> with progress_pct
+- Aggregate status: succeeded, completed (≥minSuccessPercent), failed, timed_out, cancelled, partial</p>
+<p>Error codes follow the 4-category taxonomy (1xxx plugin, 2xxx transport, 3xxx orchestration, 4xxx agent).</p>
+<p><strong>Files:</strong> <code>server/core/src/execution_tracker.hpp</code>, <code>server/core/src/execution_tracker.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-27-instruction-rerun-and-cancellation">Issue 2.7: Instruction Rerun and Cancellation</h3>
+<p><strong>Capability:</strong> 2.13 | <strong>Scope:</strong> Server + Agent</p>
+<ul>
+<li><strong>Rerun:</strong> <code>ExecutionTracker.create_rerun()</code> — clone execution with same params/scope, set <code>rerun_of</code>, optionally target only failed agents</li>
+<li><strong>Cancel:</strong> <code>ExecutionTracker.mark_cancelled()</code> — set status=cancelled, send cancel signal to agents via heartbeat flag or new <code>CancelCommand</code> message</li>
+</ul>
+<p><strong>Files:</strong> <code>server/core/src/execution_tracker.hpp</code>, <code>server/core/src/execution_tracker.cpp</code>, <code>server/core/src/server.cpp</code>, <code>agents/core/src/agent.cpp</code></p>
+<h3 id="issue-28-error-code-taxonomy-1xxx-4xxx">Issue 2.8: Error Code Taxonomy (1xxx-4xxx)</h3>
+<p><strong>Scope:</strong> Server + Agent</p>
+<p>Implement the 4-category error code taxonomy from <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> Section 9: 1xxx plugin, 2xxx transport, 3xxx orchestration, 4xxx agent. Each code has defined retry semantics. Per-definition <code>minSuccessPercent</code> determines aggregate execution status.</p>
+<p><strong>Files:</strong> <code>server/core/src/execution_tracker.hpp</code>, <code>server/core/src/execution_tracker.cpp</code>, <code>agents/core/src/agent.cpp</code>, <code>proto/yuzu/common/v1/common.proto</code></p>
+<h3 id="issue-29-concurrency-enforcement-5-modes">Issue 2.9: Concurrency Enforcement (5 Modes)</h3>
+<p><strong>Scope:</strong> Server + Agent</p>
+<p>Implement 5 concurrency modes from <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> Section 10: <code>per-device</code> (agent-side, default), <code>per-definition</code> (server-side), <code>per-set</code> (agent-side), <code>global:&lt;N&gt;</code> (server-side semaphore), <code>unlimited</code>. Agent maintains in-memory lock set; server uses <code>concurrency_locks</code> SQLite table.</p>
+<p><strong>Files:</strong> <code>agents/core/src/agent.cpp</code>, <code>server/core/src/execution_tracker.cpp</code>, <code>server/core/src/instruction_store.cpp</code></p>
+<h3 id="issue-210-yaml-authoring-ui-form-codemirror">Issue 2.10: YAML Authoring UI (Form + CodeMirror)</h3>
+<p><strong>Scope:</strong> Server</p>
+<p>Extend <code>instruction_ui.cpp</code> with form mode (input fields, parameter/result builders) and YAML mode (CodeMirror 6 editor, server-side validation). Import/export endpoints. Follows HTMX fragment pattern. Design: <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> Section 11.</p>
+<p><strong>Files:</strong> <code>server/core/src/instruction_ui.cpp</code>, <code>server/core/src/instruction_store.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-211-legacy-command-shim">Issue 2.11: Legacy Command Shim</h3>
+<p><strong>Scope:</strong> Server</p>
+<p>Auto-generate InstructionDefinitions from plugin descriptors (<code>YuzuPluginDescriptor.actions[]</code>). Bridges ad-hoc commands into the governed pipeline with open-schema parameters. CLI tool: <code>yuzu-admin generate-definitions</code>. Design: <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> Section 15.</p>
+<p><strong>Files:</strong> New <code>server/core/src/legacy_shim.cpp</code>, <code>server/core/src/instruction_store.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-212-structured-result-envelope">Issue 2.12: Structured Result Envelope</h3>
+<p><strong>Scope:</strong> Server + Agent</p>
+<p>Implement the canonical <code>InstructionResult</code> envelope from <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> Section 18. Typed columns (bool, int32, int64, string, datetime, guid, clob) with structured rows. Prerequisite for workflow chaining, policy evaluation, and typed data export.</p>
+<p><strong>Files:</strong> <code>server/core/src/response_store.hpp</code>, <code>server/core/src/response_store.cpp</code>, <code>server/core/src/execution_tracker.cpp</code>, <code>agents/core/src/agent.cpp</code></p>
+<hr>
+<h2 id="phase-3-security-rbac-and-access-control">Phase 3: Security, RBAC, and Access Control</h2>
+<p><em>Enterprise authentication, granular permissions, and security response capabilities.</em></p>
+<h3 id="issue-31-granular-rbac-system">Issue 3.1: Granular RBAC System</h3>
+<p><strong>Capability:</strong> 18.3 | <strong>Scope:</strong> Server</p>
+<p>Replace the two-role system with a full RBAC model:
+- <strong>Principals:</strong> Users or groups with unique IDs
+- <strong>Roles:</strong> Named permission containers (built-in + custom)
+- <strong>Securable types:</strong> Categories of protected resources (InstructionSet, Policy, Security, Infrastructure, etc.)
+- <strong>Operations:</strong> Per-securable-type actions (Read, Write, Execute, Delete, Approve, etc.)
+- <strong>Permissions:</strong> Bind role + securable type + operation + allowed/denied</p>
+<p>CRUD for all entities via management API and Settings UI. RBAC can be globally enabled/disabled. System roles cannot be deleted.</p>
+<p><strong>Files:</strong> <code>server/core/src/auth.cpp</code>, new <code>server/core/src/rbac.cpp</code>, <code>server/core/src/settings_ui.cpp</code>, <code>proto/yuzu/server/v1/management.proto</code></p>
+<h3 id="issue-32-management-groups">Issue 3.2: Management Groups</h3>
+<p><strong>Capabilities:</strong> 19.4, 18.4, 16.3 | <strong>Scope:</strong> Server</p>
+<p>Hierarchical device groups for scoping access, policies, and operations:
+- Static membership (manual device assignment) or dynamic (scope expression evaluation)
+- Nested hierarchy (parent/child groups)
+- Role assignments scoped to management groups (Principal + Role + ManagementGroup triple)
+- Policies assigned to management groups
+- All list/query endpoints filter results by the caller's group visibility</p>
+<p>CRUD via management API and dashboard UI.</p>
+<p><strong>Files:</strong> New <code>server/core/src/management_groups.cpp</code>, <code>server/core/src/server.cpp</code>, <code>server/core/src/rbac.cpp</code>, <code>proto/yuzu/server/v1/management.proto</code></p>
+<h3 id="issue-33-token-based-api-authentication">Issue 3.3: Token-Based API Authentication</h3>
+<p><strong>Capability:</strong> 18.7 | <strong>Scope:</strong> Server</p>
+<p>API tokens for programmatic access alongside session cookies:
+- Generate long-lived tokens with optional expiry
+- Per-token scope (all operations, or restricted to specific instruction sets)
+- Token passed via <code>Authorization: Bearer &lt;token&gt;</code> header or custom <code>X-Yuzu-Token</code> header
+- Token CRUD in Settings UI (admin) and via management API
+- Rate limiting per token</p>
+<p><strong>Files:</strong> <code>server/core/src/auth.cpp</code>, <code>server/core/src/server.cpp</code>, <code>server/core/src/settings_ui.cpp</code></p>
+<h3 id="issue-34-oidc-sso-integration">Issue 3.4: OIDC / SSO Integration</h3>
+<p><strong>Capability:</strong> 18.5 | <strong>Scope:</strong> Server</p>
+<p>Replace the greyed-out SSO stub with a real OIDC flow:
+- Configure IdP (issuer URL, client ID, client secret, redirect URI)
+- Authorization code flow with PKCE
+- Map OIDC claims to Yuzu principals and roles
+- Session creation after successful OIDC authentication
+- Support multiple IdPs (future)</p>
+<p><strong>Files:</strong> <code>server/core/src/auth.cpp</code>, <code>server/core/src/login_ui.cpp</code>, <code>server/core/src/server.cpp</code>, <code>server/core/src/settings_ui.cpp</code></p>
+<h3 id="issue-35-rest-http-management-api-v1">Issue 3.5: REST / HTTP Management API (v1)</h3>
+<p><strong>Capability:</strong> 24.3 | <strong>Scope:</strong> Server</p>
+<p>Formalize the existing HTTP endpoints into a versioned REST API at <code>/api/v1/</code>:
+- All entity CRUD follows consistent patterns: <code>GET /api/v1/{entity}</code>, <code>GET /api/v1/{entity}/{id}</code>, <code>POST /api/v1/{entity}</code>, <code>PUT /api/v1/{entity}/{id}</code>, <code>DELETE /api/v1/{entity}/{id}</code>, <code>POST /api/v1/{entity}/search</code>
+- Search endpoint accepts filter expression tree, sort, start, pageSize
+- JSON request/response bodies
+- Authentication via session cookie or API token
+- OpenAPI/Swagger spec generation</p>
+<p><strong>Files:</strong> <code>server/core/src/server.cpp</code>, new <code>server/core/src/rest_api.cpp</code></p>
+<h3 id="issue-36-device-quarantine-network-isolation">Issue 3.6: Device Quarantine (Network Isolation)</h3>
+<p><strong>Capabilities:</strong> 9.6, 9.9 | <strong>Scope:</strong> Plugin + Server</p>
+<p>New <code>quarantine</code> plugin:
+- <strong>QuarantineDevice:</strong> Modify routing tables/hosts file to restrict networking to management channel only. Disable IPv6. Accept whitelist IPs.
+- <strong>UnquarantineDevice:</strong> Restore original network config. Optional reboot.
+- <strong>GetQuarantineStatus:</strong> Return current quarantine state.
+- <strong>ModifyQuarantineWhitelist:</strong> Add IPs to whitelist of quarantined device.</p>
+<p>Server-side: track quarantine state per device, history, and whitelist. Dashboard indicator for quarantined devices.</p>
+<p><strong>Files:</strong> New <code>agents/plugins/quarantine/</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-37-ioc-checking">Issue 3.7: IOC Checking</h3>
+<p><strong>Capability:</strong> 9.7 | <strong>Scope:</strong> Plugin</p>
+<p>New <code>ioc</code> plugin or add to existing <code>security</code>-related plugin:
+- <strong>CheckSimpleIoc:</strong> Match IP ranges, IP addresses, ports, domains, and file hashes against local endpoint state. Multiple parameters OR'd together.
+- File spec checks done live; network checks use historical connection data (configurable lookback window, default 7 days).
+- Cross-platform where data sources exist (Windows primary, Linux/macOS best-effort).</p>
+<p><strong>Files:</strong> New <code>agents/plugins/ioc/</code></p>
+<h3 id="issue-38-certificate-inventory-and-management">Issue 3.8: Certificate Inventory and Management</h3>
+<p><strong>Capability:</strong> 9.8 | <strong>Scope:</strong> Plugin</p>
+<p>New <code>certificates</code> plugin:
+- <strong>GetCertificates:</strong> Enumerate certificates in system stores. Return subject, issuer, thumbprint, dates, serial number, store name.
+- <strong>DeleteCertificates:</strong> Remove certificate by thumbprint from specified store.
+- Windows: CryptoAPI certificate store enumeration. Linux: <code>/etc/ssl/certs</code>. macOS: Keychain.</p>
+<p><strong>Files:</strong> New <code>agents/plugins/certificates/</code></p>
+<h3 id="issue-39-scope-dsl-extensions-matches-exists-len-startswith">Issue 3.9: Scope DSL Extensions (MATCHES, EXISTS, len, startswith)</h3>
+<p><strong>Scope:</strong> Server</p>
+<p>Add 4 operators to <code>scope_engine.cpp</code>: <code>MATCHES</code> (regex), <code>EXISTS</code> (tag presence), <code>len()</code> (string length), <code>startswith()</code> (prefix check). Parser architecture supports these without structural changes — add <code>TokenType</code> variants and <code>CompOp</code> cases. Design: <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> Section 8.2.</p>
+<p><strong>Files:</strong> <code>server/core/src/scope_engine.hpp</code>, <code>server/core/src/scope_engine.cpp</code>, <code>tests/unit/</code></p>
+<hr>
+<h2 id="phase-4-agent-infrastructure">Phase 4: Agent Infrastructure</h2>
+<p><em>Agent-side capabilities that enable advanced features: persistent storage, content distribution, triggers, and user interaction.</em></p>
+<h3 id="issue-41-agent-side-key-value-storage-white_check_mark">Issue 4.1: Agent-Side Key-Value Storage :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 23.1, 23.3 | <strong>Scope:</strong> Agent SDK + Plugin | <strong>Status:</strong> Done</p>
+<p>Add persistent key-value storage to the agent, backed by the existing <code>agent.db</code> SQLite database:
+- <strong>Storage.Set:</strong> Store a named table (overwrite or append with max row limit)
+- <strong>Storage.Get:</strong> Retrieve by name
+- <strong>Storage.List:</strong> List all table names
+- <strong>Storage.Delete:</strong> Remove a table
+- <strong>Storage.Check:</strong> Test if table exists</p>
+<p>Expose via plugin SDK (new <code>yuzu_ctx_storage_*</code> functions in <code>plugin.h</code>) and as a built-in <code>storage</code> plugin.</p>
+<p><strong>Files:</strong> <code>sdk/include/yuzu/plugin.h</code>, <code>sdk/include/yuzu/plugin.hpp</code>, <code>agents/core/src/agent.cpp</code>, new <code>agents/plugins/storage/</code></p>
+<h3 id="issue-42-http-download-and-upload-agent-initiated-white_check_mark">Issue 4.2: HTTP Download and Upload (Agent-Initiated) :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 13.3, 13.4, 10.13 | <strong>Scope:</strong> Plugin + Agent | <strong>Status:</strong> Done</p>
+<p>New <code>http</code> plugin or extend agent core:
+- <strong>HttpGetFile:</strong> Download file from URL with hash/size verification. Support both server content channel and external URLs. Return temp file path (cleaned up after instruction).
+- <strong>HttpPost:</strong> Send data to external endpoint. Support custom headers, content types, authorization. Return status code and response body.
+- <strong>FileUpload:</strong> Upload file from endpoint to server (reverse of HttpGetFile). Streaming upload for large files.</p>
+<p><strong>Files:</strong> New <code>agents/plugins/http_client/</code>, <code>server/core/src/server.cpp</code> (file receive endpoint)</p>
+<h3 id="issue-43-content-staging-and-execution-white_check_mark">Issue 4.3: Content Staging and Execution :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 13.1, 13.2 | <strong>Scope:</strong> Agent + Server | <strong>Status:</strong> Done</p>
+<p>Server-to-agent content distribution:
+- <strong>Stage:</strong> Server pushes content manifest, agent downloads files to local staging directory. Verify integrity via hash.
+- <strong>StageAndExecute:</strong> Download to temp directory, execute command, clean up. Return exit code and output.</p>
+<p>Server side: content repository for hosting files, manifest generation, and download tracking.</p>
+<p><strong>Files:</strong> New <code>agents/plugins/content_dist/</code>, <code>server/core/src/server.cpp</code> (content hosting endpoints)</p>
+<h3 id="issue-44-agent-sleep-and-stagger-control-white_check_mark">Issue 4.4: Agent Sleep and Stagger Control :white_check_mark:</h3>
+<p><strong>Capability:</strong> 1.6 | <strong>Scope:</strong> Agent | <strong>Status:</strong> Done</p>
+<ul>
+<li><strong>Sleep:</strong> Server instructs agent to pause for N seconds (testing/maintenance).</li>
+<li><strong>Stagger:</strong> Agent introduces random delay (0 to N seconds) before executing an instruction, preventing thundering herd on broadcast. Configurable default stagger range.</li>
+</ul>
+<p>Implement as built-in agent behavior (not a plugin), triggered by fields in <code>CommandRequest</code>.</p>
+<p><strong>Files:</strong> <code>agents/core/src/agent.cpp</code>, <code>proto/yuzu/agent/v1/agent.proto</code></p>
+<h3 id="issue-45-trigger-framework-agent-side-white_check_mark">Issue 4.5: Trigger Framework (Agent-Side) :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 17.1-17.6 | <strong>Scope:</strong> Agent SDK + Agent Core | <strong>Status:</strong> Done</p>
+<p>Add a trigger evaluation engine to the agent:
+- <strong>Plugin SDK extension:</strong> New <code>yuzu_register_trigger</code> function in <code>plugin.h</code> for plugins to register trigger handlers.
+- <strong>Trigger types:</strong>
+  - <code>interval</code>: Timer-based (configurable seconds/minutes/hours, min 30s)
+  - <code>file_change</code>: Filesystem watcher (inotify on Linux, FSEvents on macOS, ReadDirectoryChangesW on Windows)
+  - <code>directory_change</code>: Recursive directory monitoring
+  - <code>service_status_change</code>: React to service start/stop/crash (Windows SCM, systemd on Linux)
+  - <code>event_log</code>: React to Windows Event Log entries matching XPath filter
+  - <code>agent_startup</code>: Fire on agent boot
+- <strong>Debouncing:</strong> Configurable debounce window to coalesce rapid events.
+- <strong>Trigger templates:</strong> Server-defined trigger configurations pushed to agents.</p>
+<p>Triggers invoke a callback (plugin action + params) when they fire. Used by the policy engine.</p>
+<p><strong>Files:</strong> <code>sdk/include/yuzu/plugin.h</code>, <code>sdk/include/yuzu/plugin.hpp</code>, <code>agents/core/src/agent.cpp</code>, new <code>agents/core/src/trigger_engine.cpp</code></p>
+<h3 id="issue-46-desktop-user-interaction-windows-white_check_mark">Issue 4.6: Desktop User Interaction (Windows) :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 14.1-14.3 | <strong>Scope:</strong> Plugin | <strong>Status:</strong> Done</p>
+<p>New <code>interaction</code> plugin (Windows-only initially):
+- <strong>ShowNotification:</strong> Toast notification (Information/Warning/Error) with configurable timeout. Returns immediately.
+- <strong>ShowAnnouncement:</strong> Modal dialog with description, optional icon, choices, and default buttons (Later/Dismiss). Sync or async.
+- <strong>ShowQuestion:</strong> Yes/No dialog with customizable button text. Sync or async.
+- Async mode: returns immediately, response delivered via topic when user interacts.
+- Target specific user session or all sessions.</p>
+<p><strong>Files:</strong> New <code>agents/plugins/interaction/</code></p>
+<h3 id="issue-47-agent-logging-and-remote-log-retrieval-white_check_mark">Issue 4.7: Agent Logging and Remote Log Retrieval :white_check_mark:</h3>
+<p><strong>Capability:</strong> 1.7 | <strong>Scope:</strong> Agent + Plugin | <strong>Status:</strong> Done</p>
+<p>Extend the <code>diagnostics</code> plugin:
+- <strong>GetKeyFiles:</strong> Return paths to config, executable, log, data directory, temp directory.
+- <strong>SetLogLevel:</strong> Dynamically change agent log level without restart.
+- <strong>GetLog:</strong> Retrieve last N lines of agent log (or by time range). Stream large logs.</p>
+<p><strong>Files:</strong> <code>agents/plugins/diagnostics/src/diagnostics_plugin.cpp</code>, <code>agents/core/src/agent.cpp</code></p>
+<h3 id="issue-48-serviceset_start_mode-cross-platform-primitive-white_check_mark">Issue 4.8: service.set_start_mode Cross-Platform Primitive :white_check_mark:</h3>
+<p><strong>Scope:</strong> Plugin | <strong>Status:</strong> Done</p>
+<p>Add <code>set_start_mode</code> action to the <code>services</code> plugin. Parameters: <code>serviceName</code>, <code>mode</code> (automatic/manual/disabled/masked). Cross-platform: Windows <code>ChangeServiceConfigW</code>, Linux <code>systemctl enable/disable/mask</code>, macOS <code>launchctl enable/disable</code>. <code>masked</code> maps to <code>disabled</code> with warning on non-Linux. Returns previous/new/effective mode. Design: <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> Section 16.</p>
+<p><strong>Files:</strong> <code>agents/plugins/services/src/services_plugin.cpp</code></p>
+<hr>
+<h2 id="phase-5-policy-engine-and-compliance">Phase 5: Policy Engine and Compliance</h2>
+<p><em>Desired-state policies with trigger-based evaluation and auto-remediation.</em></p>
+<h3 id="issue-51-policy-rules-and-fragments-white_check_mark">Issue 5.1: Policy Rules and Fragments :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 16.1, 16.2 | <strong>Scope:</strong> Server + Agent | <strong>Status:</strong> Done</p>
+<p>Core policy engine:
+- <strong>Fragments:</strong> Reusable compliance check/fix code blocks. Each fragment defines a check instruction (evaluate state) and optional fix instruction (remediate). Parameters are configured when rules are created.
+- <strong>Rules:</strong> Bind a fragment to one or more triggers. Rule types: Check (evaluate only) or Fix (evaluate + remediate). Status codes: Received, CheckErrored, CheckFailed, CheckPassed, FixErrored, FixPassed, FixFailed.
+- <strong>Agent-side evaluation:</strong> Rules evaluate on trigger fire, agent startup, and initial receipt. De-bounce prevents rapid re-evaluation.
+- <strong>Server-side management:</strong> CRUD for fragments and rules via management API.</p>
+<p><strong>Files:</strong> New <code>server/core/src/policy_engine.cpp</code>, <code>agents/core/src/agent.cpp</code>, <code>proto/yuzu/agent/v1/agent.proto</code> (policy push/status RPCs)</p>
+<h3 id="issue-52-policy-assignment-and-deployment-white_check_mark">Issue 5.2: Policy Assignment and Deployment :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 16.3, 16.8 | <strong>Scope:</strong> Server | <strong>Status:</strong> Done</p>
+<ul>
+<li>Policies are assigned to management groups (from Issue 3.2)</li>
+<li>Changes accumulate as pending; admin explicitly deploys</li>
+<li>Deployment compiles the policy document, hashes it, and pushes to agents</li>
+<li>Agents pull policy on next connection or receive push notification</li>
+<li>Pending changes review UI in dashboard</li>
+</ul>
+<p><strong>Files:</strong> <code>server/core/src/policy_engine.cpp</code>, <code>server/core/src/server.cpp</code>, dashboard UI updates</p>
+<h3 id="issue-53-compliance-dashboard-and-statistics-white_check_mark">Issue 5.3: Compliance Dashboard and Statistics :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 16.4, 16.5 | <strong>Scope:</strong> Server | <strong>Status:</strong> Done</p>
+<ul>
+<li>Device compliance status per policy and per rule</li>
+<li>Fleet-wide compliance posture summary (% compliant, % non-compliant, % unknown)</li>
+<li>Rule evaluation history (chronological log with status changes)</li>
+<li>Effectiveness metrics: time to compliance, remediation success rate</li>
+<li>Dashboard UI: compliance tab with drill-down from fleet → policy → rule → device</li>
+</ul>
+<p><strong>Files:</strong> <code>server/core/src/policy_engine.cpp</code>, <code>server/core/src/dashboard_ui.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-54-policy-cache-invalidation-and-force-re-evaluation-white_check_mark">Issue 5.4: Policy Cache Invalidation and Force Re-Evaluation :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 16.7 | <strong>Scope:</strong> Agent + Server | <strong>Status:</strong> Done</p>
+<ul>
+<li><strong>Invalidate:</strong> Reset agent's policy to empty; agent re-downloads on next connection.</li>
+<li><strong>ForceStatusReport:</strong> Schedule a full compliance status report on next agent restart.</li>
+<li>Expose both as actions dispatchable from the dashboard.</li>
+</ul>
+<p><strong>Files:</strong> <code>agents/core/src/agent.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-55-cel-adoption-for-policy-compliance-expressions-white_check_mark">Issue 5.5: CEL Adoption for Policy Compliance Expressions :white_check_mark:</h3>
+<p><strong>Scope:</strong> Server | <strong>Status:</strong> Done
+<strong>Depends on:</strong> 5.1</p>
+<p>Adopt <a href="https://github.com/google/cel-spec">Common Expression Language (CEL)</a> for typed policy evaluation. CEL handles <code>spec.compliance.expression</code>, <code>spec.fix.when</code>, and <code>spec.rollout.condition</code> — typed evaluation that the scope DSL cannot do. The scope DSL stays for device targeting. abseil is already a transitive dep via gRPC, making cel-cpp a natural addition. Design: <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> Section 8.3.</p>
+<p><strong>Files:</strong> <code>vcpkg.json</code>, new <code>server/core/src/cel_evaluator.cpp</code>, <code>server/core/src/policy_engine.cpp</code></p>
+<hr>
+<h2 id="phase-6-windows-platform-depth">Phase 6: Windows Platform Depth</h2>
+<p><em>Registry, WMI, per-user operations, and Windows-specific advanced capabilities.</em></p>
+<h3 id="issue-61-registry-plugin-readwriteenumerate-white_check_mark">Issue 6.1: Registry Plugin (Read/Write/Enumerate) :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 12.4-12.6 | <strong>Scope:</strong> Plugin | <strong>Status:</strong> Done</p>
+<p>New <code>registry</code> plugin (Windows-only):
+- <strong>GetValue:</strong> Read registry value by hive/subkey/name. Return name, type, data.
+- <strong>SetValue:</strong> Write registry value. Support REG_SZ, REG_DWORD, REG_QWORD, REG_BINARY, REG_EXPAND_SZ, REG_MULTI_SZ.
+- <strong>DeleteKey / DeleteValue:</strong> Remove registry keys or values.
+- <strong>KeyExists / ValueExists:</strong> Check existence.
+- <strong>EnumerateKeys / EnumerateValues:</strong> Recursive listing.</p>
+<p>All operations support HKLM, HKCU, HKCR, HKU hives.</p>
+<p><strong>Files:</strong> New <code>agents/plugins/registry/</code></p>
+<h3 id="issue-62-per-user-registry-operations-white_check_mark">Issue 6.2: Per-User Registry Operations :white_check_mark:</h3>
+<p><strong>Capability:</strong> 12.7 | <strong>Scope:</strong> Plugin | <strong>Status:</strong> Done</p>
+<p>Extend the registry plugin with per-user variants:
+- Load each user's NTUSER.DAT hive
+- Enumerate/get/set/delete across all user hives
+- Dedicated methods: <code>EnumerateUserKeys</code>, <code>GetUserValues</code>, <code>SetUserValues</code>, <code>DeleteUserKey</code>, <code>DeleteUserValues</code></p>
+<p><strong>Files:</strong> <code>agents/plugins/registry/src/registry_plugin.cpp</code></p>
+<h3 id="issue-63-wmi-query-and-method-invocation-white_check_mark">Issue 6.3: WMI Query and Method Invocation :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 12.1, 12.2 | <strong>Scope:</strong> Plugin | <strong>Status:</strong> Done</p>
+<p>New <code>wmi</code> plugin (Windows-only):
+- <strong>RunWmiQuery:</strong> Execute WQL query against any WMI namespace. Return structured tabular results.
+- <strong>RunWmiInstanceMethod:</strong> Call instance method on a WMI object.
+- <strong>RunWmiStaticMethod:</strong> Call static method on a WMI class.
+- COM initialization with proper cleanup. Structured output (not raw PowerShell text).</p>
+<p><strong>Files:</strong> New <code>agents/plugins/wmi/</code></p>
+<h3 id="issue-64-per-user-application-inventory-white_check_mark">Issue 6.4: Per-User Application Inventory :white_check_mark:</h3>
+<p><strong>Capability:</strong> 7.5 | <strong>Scope:</strong> Plugin | <strong>Status:</strong> Done</p>
+<p>Extend <code>installed_apps</code> plugin:
+- Enumerate per-user installations from HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall for each user profile.
+- Distinguish system-wide from user-specific installs in output.</p>
+<p><strong>Files:</strong> <code>agents/plugins/installed_apps/src/installed_apps_plugin.cpp</code></p>
+<h3 id="issue-65-file-system-advanced-operations-white_check_mark">Issue 6.5: File System Advanced Operations :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 10.7-10.10, 10.14, 10.15 | <strong>Scope:</strong> Plugin | <strong>Status:</strong> Done</p>
+<p>Extend the <code>filesystem</code> plugin:
+- <strong>GetFilePermissions:</strong> ACL enumeration (Windows DACL, POSIX permissions)
+- <strong>GetDigitalSignature:</strong> Authenticode/codesign verification (Windows WinVerifyTrust, macOS codesign)
+- <strong>GetVersionInfo:</strong> PE version resource extraction (Windows)
+- <strong>FindAndReplace / FindAndDelete / WriteText / AppendText:</strong> Text file manipulation operations
+- <strong>FindFileBySizeAndHash:</strong> Locate files matching both size and hash criteria
+- <strong>FindDirectoryByName:</strong> Find directories by name pattern</p>
+<p><strong>Files:</strong> <code>agents/plugins/filesystem/src/filesystem_plugin.cpp</code></p>
+<h3 id="issue-66-registry-change-trigger-white_check_mark">Issue 6.6: Registry Change Trigger :white_check_mark:</h3>
+<p><strong>Capability:</strong> 17.5 | <strong>Scope:</strong> Agent | <strong>Status:</strong> Done</p>
+<p>Add <code>registry_change</code> trigger type to the trigger framework (Issue 4.5):
+- Monitor HKLM or HKCR subkeys using Windows Registry change notification APIs
+- Optional recursive monitoring of subkeys
+- Used by the policy engine to react to registry modifications</p>
+<p><strong>Files:</strong> <code>agents/core/src/trigger_engine.cpp</code></p>
+<hr>
+<h2 id="phase-7-scale-integration-and-advanced-features">Phase 7: Scale, Integration, and Advanced Features</h2>
+<p><em>Multi-node architecture, external integrations, and remaining advanced/future capabilities.</em></p>
+<h3 id="issue-71-gateway-node-implementation">Issue 7.1: Gateway Node Implementation</h3>
+<p><strong>Capability:</strong> 22.5 | <strong>Scope:</strong> Erlang gateway (<code>gateway/</code>)</p>
+<p>The Erlang gateway (<code>gateway/</code>) implements the command fanout plane. Core proxy
+functionality (Register, Subscribe, Heartbeat batching, Inventory, StreamStatus)
+is implemented. See <a href="erlang-gateway-blueprint.html" class="doc-ref"><code>docs/erlang-gateway-blueprint.md</code></a>.</p>
+<p>Remaining work:
+- Proxy agent registrations to upstream server — <strong>done</strong>
+- Batch heartbeats (reduce connection count on server) — <strong>done</strong>
+- Proxy subscribe streams — <strong>done</strong>
+- Report stream status to upstream — <strong>done</strong>
+- Gateway handles local TLS termination — <strong>done</strong>
+- Deploy at branch offices to reduce WAN traffic</p>
+<p><strong>Files:</strong> <code>gateway/</code> (Erlang/OTP, rebar3), <code>proto/yuzu/gateway/v1/gateway.proto</code>, <code>server/core/src/server.cpp</code> (GatewayUpstream handlers)</p>
+<h3 id="issue-711-gateway-adjacency-load-shedding-and-latency-based-redistribution">Issue 7.1.1: Gateway Adjacency, Load Shedding, and Latency-Based Redistribution</h3>
+<p><strong>Capability:</strong> 22.5 | <strong>Scope:</strong> Erlang gateway (<code>gateway/</code>)
+<strong>Depends on:</strong> 7.1</p>
+<p>Implement cluster-aware agent redistribution so gateway nodes can dynamically
+balance agent load based on measured latency and node capacity:</p>
+<ul>
+<li><strong>Adjacency table</strong> — each node tracks peer agent count, CPU/memory, inter-node RTT, drain state</li>
+<li><strong>Load shedding</strong> — shed agents via GOAWAY when overloaded, draining, or rebalancing for a new node; rate-limited to prevent reconnection storms</li>
+<li><strong>Agent absorption</strong> — accept reconnecting agents; optionally pull agents from overloaded peers</li>
+<li><strong>Latency-based redistribution</strong> — measure agent↔node RTT from heartbeats, compute affinity scores, migrate agents to lower-latency peers when improvement exceeds threshold</li>
+<li><strong>Stability</strong> — cooldown window and hysteresis to prevent oscillation</li>
+<li><strong>Telemetry</strong> — adjacency updates, shed/absorb counts, migration decisions exposed as Prometheus metrics</li>
+</ul>
+<p><strong>Design:</strong> <a href="erlang-gateway-blueprint.html" class="doc-ref"><code>docs/erlang-gateway-blueprint.md</code></a> § "Gateway Adjacency and Latency-Based Agent Redistribution"</p>
+<p><strong>Files:</strong> <code>gateway/apps/yuzu_gw/src/yuzu_gw_cluster.erl</code> (new), <code>gateway/apps/yuzu_gw/src/yuzu_gw_agent.erl</code>, <code>gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl</code></p>
+<h3 id="issue-72-system-health-monitoring-and-statistics">Issue 7.2: System Health Monitoring and Statistics</h3>
+<p><strong>Capabilities:</strong> 22.1, 22.6, 22.2 | <strong>Scope:</strong> Server</p>
+<ul>
+<li><strong>Health endpoint:</strong> CPU, memory, connection counts, queue depths, per-component health</li>
+<li><strong>Statistics:</strong> High-level (connected devices, in-flight instructions, pending approvals) and detailed (per-definition execution counts, response rates)</li>
+<li><strong>Topology:</strong> Map of server nodes, gateways, and agent counts</li>
+<li>Expose via REST API and dashboard UI</li>
+</ul>
+<p><strong>Files:</strong> <code>server/core/src/server.cpp</code>, new <code>server/core/src/system_health.cpp</code></p>
+<h3 id="issue-73-runtime-configuration-api">Issue 7.3: Runtime Configuration API</h3>
+<p><strong>Capability:</strong> 22.4 | <strong>Scope:</strong> Server</p>
+<p>Expose server configuration via REST API (no restart required for supported settings):
+- <code>MaxInstructionTtlMinutes</code>, <code>MaxResponseTtlMinutes</code>, <code>MaxSimultaneousInFlightInstructions</code>
+- Heartbeat interval range
+- Session timeout
+- NVD sync interval</p>
+<p>Read-only for most settings initially; writable for operational tuning params.</p>
+<p><strong>Files:</strong> <code>server/core/src/server.cpp</code>, REST API endpoints</p>
+<h3 id="issue-74-system-notifications">Issue 7.4: System Notifications</h3>
+<p><strong>Capability:</strong> 21.3 | <strong>Scope:</strong> Server</p>
+<p>Server-generated alerts for:
+- System health warnings (high CPU, low disk, connection limits approaching)
+- License expiry warnings
+- Agent enrollment surge
+- Per-instruction and per-component notifications</p>
+<p>Notification store with CRUD, filtering, and search. Dashboard notification bell.</p>
+<p><strong>Files:</strong> New <code>server/core/src/notifications.cpp</code>, <code>server/core/src/dashboard_ui.cpp</code></p>
+<h3 id="issue-75-active-directory-entra-integration">Issue 7.5: Active Directory / Entra Integration</h3>
+<p><strong>Capability:</strong> 18.6 | <strong>Scope:</strong> Server</p>
+<p>Replace the greyed-out AD/Entra section:
+- LDAP/LDAPS connection to AD
+- Import users and security groups as principals
+- Map AD group membership to Yuzu roles
+- Periodic sync for membership changes
+- Entra ID (Azure AD) support via Microsoft Graph API</p>
+<p><strong>Files:</strong> <code>server/core/src/auth.cpp</code>, <code>server/core/src/settings_ui.cpp</code>, new <code>server/core/src/directory_sync.cpp</code></p>
+<h3 id="issue-76-custom-properties-on-devices">Issue 7.6: Custom Properties on Devices</h3>
+<p><strong>Capability:</strong> 19.6 | <strong>Scope:</strong> Server</p>
+<p>Extensible typed metadata on devices:
+- <strong>Custom property types:</strong> Define name, data type (string, int, bool, datetime), validation
+- <strong>Custom property values:</strong> Set/get per device
+- Usable in scope expressions for targeting
+- CRUD via management API and dashboard</p>
+<p><strong>Files:</strong> <code>server/core/src/server.cpp</code>, <code>proto/yuzu/server/v1/management.proto</code></p>
+<h3 id="issue-77-agent-deployment-jobs">Issue 7.7: Agent Deployment Jobs</h3>
+<p><strong>Capability:</strong> 19.7 | <strong>Scope:</strong> Server</p>
+<p>Server-initiated agent installation on discovered endpoints:
+- Store installer binaries per OS/arch
+- Create deployment jobs targeting IP/FQDN lists with credentials
+- Job management: status tracking, cancellation, retry
+- Supported OS enumeration</p>
+<p><strong>Files:</strong> New <code>server/core/src/deploy.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-78-patch-deployment-workflow">Issue 7.8: Patch Deployment Workflow</h3>
+<p><strong>Capabilities:</strong> 8.3-8.8 | <strong>Scope:</strong> Plugin + Server</p>
+<p>New <code>patch</code> plugin and server-side patch management:
+- <strong>Plugin (agent-side):</strong> Deploy patch (download + install), get status, test patch server connection, restart with notification
+- <strong>Server-side:</strong> Patch metadata retrieval (KB details, severity, supersedence), per-device compliance tracking, fleet-wide compliance dashboard, deployment orchestration with reboot control</p>
+<p><strong>Files:</strong> New <code>agents/plugins/patch/</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-79-product-packs-bundled-definitions">Issue 7.9: Product Packs (Bundled Definitions)</h3>
+<p><strong>Capability:</strong> 22.8 | <strong>Scope:</strong> Server</p>
+<p>Import/export bundles of instruction definitions, policy fragments, trigger templates:
+- ZIP format containing definition files
+- Upload via management API or dashboard
+- Automatic instruction set creation
+- Version tracking and conflict resolution</p>
+<p><strong>Files:</strong> <code>server/core/src/instruction_store.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-710-user-sessions-and-group-membership-plugins">Issue 7.10: User Sessions and Group Membership Plugins</h3>
+<p><strong>Capabilities:</strong> 6.2-6.5 | <strong>Scope:</strong> Plugin</p>
+<p>Extend the <code>users</code> plugin:
+- <strong>GetPrimaryUser:</strong> Heuristic-based primary user detection (most frequent login, console owner)
+- <strong>GetLocalGroupMembers:</strong> Enumerate members of local groups (Administrators, Remote Desktop Users, etc.)
+- <strong>GetInboundConnectionHistory:</strong> Login/logout and RDP session audit trail
+- <strong>GetActiveSessions:</strong> RDP, console, SSH sessions with state</p>
+<p><strong>Files:</strong> <code>agents/plugins/users/src/users_plugin.cpp</code></p>
+<h3 id="issue-711-advanced-user-interaction-surveys-dnd">Issue 7.11: Advanced User Interaction (Surveys, DND)</h3>
+<p><strong>Capabilities:</strong> 14.4-14.6 | <strong>Scope:</strong> Plugin</p>
+<p>Extend the <code>interaction</code> plugin (Issue 4.6):
+- <strong>ShowSurvey:</strong> Multi-question form with customizable choices, icons, free-text option, and response aggregation. Unique survey names prevent repeat display. Response validity period.
+- <strong>SetDoNotDisturb:</strong> Suppress notifications for N minutes.
+- <strong>GetActiveResponses:</strong> List pending survey/question responses.</p>
+<p><strong>Files:</strong> <code>agents/plugins/interaction/src/interaction_plugin.cpp</code></p>
+<h3 id="issue-712-event-subscriptions-webhooks">Issue 7.12: Event Subscriptions (Webhooks)</h3>
+<p><strong>Capabilities:</strong> 21.4, 21.5, 16.6 | <strong>Scope:</strong> Server</p>
+<p>Push events to external systems:
+- Webhook endpoints (HTTP POST with event payload)
+- Event source configuration (which events trigger notifications)
+- Management-group-scoped subscriptions
+- Policy compliance change events
+- Retry with exponential backoff</p>
+<p><strong>Files:</strong> New <code>server/core/src/event_subscriptions.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-713-productpack-ed25519-trust-chain-and-verification">Issue 7.13: ProductPack Ed25519 Trust Chain and Verification</h3>
+<p><strong>Scope:</strong> Server
+<strong>Depends on:</strong> 7.9</p>
+<p>Implement Ed25519-based signing, 3-level key hierarchy (org root → signing key → manifest), and verification pipeline for ProductPacks. <code>tar.zst</code> format with <code>manifest.json</code> (per-file SHA-256), <code>manifest.sig</code>, <code>signing-key.der</code>. JSON revocation list. Server config: <code>require_signed</code>, <code>allow_self_signed</code>, <code>trust_store_path</code>. Self-signing CLI for dev. Design: <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> Section 13.</p>
+<p><strong>Files:</strong> New <code>server/core/src/pack_signing.cpp</code>, <code>server/core/src/instruction_store.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-714-workflow-primitives-if-foreach-retry">Issue 7.14: Workflow Primitives (if, foreach, retry)</h3>
+<p><strong>Scope:</strong> Server
+<strong>Depends on:</strong> 2.5, 2.12</p>
+<p>Server-side orchestration: <code>workflow.if</code> (branch on expression), <code>workflow.foreach</code> (iterate result rows, dispatch child per row), <code>workflow.retry</code> (retry with backoff). Compose existing InstructionDefinitions — no new execution semantics. Uses <code>Execution.parent_id</code> for linking. Design: <a href="Instruction-Engine.html" class="doc-ref"><code>docs/Instruction-Engine.md</code></a> Section 7.9.</p>
+<p><strong>Files:</strong> New <code>server/core/src/workflow_engine.cpp</code>, <code>server/core/src/execution_tracker.cpp</code>, <code>server/core/src/instruction_store.cpp</code></p>
+<h3 id="issue-715-wifi-network-enumeration">Issue 7.15: WiFi Network Enumeration</h3>
+<p><strong>Capability:</strong> 4.6 | <strong>Scope:</strong> Plugin</p>
+<p>List visible SSIDs (signal, security, channel, BSSID) and saved WiFi profiles. Windows: WlanAPI. Linux: NetworkManager D-Bus / <code>nmcli</code>. macOS: CoreWLAN.</p>
+<p><strong>Files:</strong> <code>agents/plugins/network_config/src/network_config_plugin.cpp</code> or new <code>agents/plugins/wifi/</code></p>
+<h3 id="issue-716-wake-on-lan-support">Issue 7.16: Wake-on-LAN Support</h3>
+<p><strong>Capability:</strong> 4.7 | <strong>Scope:</strong> Plugin + Server</p>
+<p>Send WoL magic packets from server or agent (peer wake for same-subnet). Check WoL adapter status. Windows: WMI. Linux: <code>ethtool</code>. macOS: <code>pmset</code>.</p>
+<p><strong>Files:</strong> <code>agents/plugins/network_actions/src/network_actions_plugin.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-717-inventory-table-enumeration-and-item-lookup">Issue 7.17: Inventory Table Enumeration and Item Lookup</h3>
+<p><strong>Capabilities:</strong> 15.3, 15.4 | <strong>Scope:</strong> Agent SDK + Server</p>
+<p><code>inventory.list_tables</code> — enumerate available data sources per plugin. <code>inventory.query</code> — query a table with optional filter, column subset, limit. Plugins declare tables via SDK. Server caches and exposes via REST.</p>
+<p><strong>Files:</strong> <code>sdk/include/yuzu/plugin.h</code>, <code>agents/core/src/agent.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-718-device-discovery-unmanaged-endpoints">Issue 7.18: Device Discovery (Unmanaged Endpoints)</h3>
+<p><strong>Capability:</strong> 19.5 | <strong>Scope:</strong> Plugin + Server</p>
+<p>Discover unmanaged endpoints via agent-assisted subnet scanning (ARP, mDNS, ICMP), AD/DHCP import, or CSV upload. Server reconciles against registered agents: managed, unmanaged, or stale. Dashboard coverage view with deployment link (Issue 7.7).</p>
+<p><strong>Files:</strong> New <code>agents/plugins/discovery/</code>, new <code>server/core/src/device_discovery.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<h3 id="issue-720-mcp-server-model-context-protocol-phase-1-white_check_mark">Issue 7.20: MCP Server (Model Context Protocol) Phase 1 :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 24.8, 24.9, 24.10 | <strong>Scope:</strong> Server | <strong>Status:</strong> Done
+<strong>Depends on:</strong> 3.3, 3.5</p>
+<p>Embedded MCP server at <code>POST /mcp/v1/</code> using JSON-RPC 2.0 transport. Enables AI models (e.g., Claude Desktop) to query fleet status and investigate endpoints. Phase 1 delivers 22 read-only tools, 3 resources, and 4 prompts. Three authorization tiers (readonly, operator, supervised) enforced before RBAC. MCP tokens use the existing API token system with an <code>mcp_tier</code> column and mandatory expiration (max 90 days). Kill switch: <code>--mcp-disable</code>, <code>--mcp-read-only</code>. Settings UI section with enable/disable and read-only toggles. Audit logging on every tool call (<code>action: "mcp.&lt;tool_name&gt;"</code>).</p>
+<p><strong>Files:</strong> <code>server/core/src/mcp_server.hpp</code>, <code>server/core/src/mcp_server.cpp</code>, <code>server/core/src/mcp_jsonrpc.hpp</code>, <code>server/core/src/mcp_policy.hpp</code>, <code>server/core/src/server.cpp</code>, <code>server/core/src/settings_ui.cpp</code></p>
+<hr>
+<h2 id="phase-8-visualization-response-experience">Phase 8: Visualization &amp; Response Experience</h2>
+<p><em>Make collected data actionable with charts, templates, and processing pipelines.</em></p>
+<h3 id="issue-81-response-visualization-engine-white_check_mark">Issue 8.1: Response Visualization Engine :white_check_mark:</h3>
+<p><strong>Capabilities:</strong> 20.6 (partial), new | <strong>Scope:</strong> Server | <strong>Status:</strong> Done</p>
+<p>Server-side chart rendering for instruction responses. <code>spec.visualization</code> (singular) or <code>spec.visualizations</code> (canonical plural for multi-chart) on <code>InstructionDefinition</code>. Five chart types (<code>pie</code>, <code>bar</code>, <code>column</code>, <code>line</code>, <code>area</code>) × three processors (<code>single_series</code>, <code>multi_series</code>, <code>datetime_series</code>) with camelCase fields (<code>labelField</code>, <code>valueField</code>, <code>seriesField</code>, <code>xField</code>, <code>yField</code>, <code>maxCategories</code>, <code>valueLabel</code>); snake_case forms accepted as deprecated aliases. REST: <code>GET /api/v1/executions/{id}/visualization?definition_id=&lt;id&gt;&amp;index=&lt;N&gt;</code> gated on <code>Response:Read</code>. Dashboard auto-renders a chart deck above the results table by reverse-resolving the dispatched <code>(plugin, action)</code> to a chart-bearing definition (<code>InstructionDefinition:Read</code> required for chart to appear). Renderer is Apache ECharts 5 (vendored at <code>server/core/vendor/echarts.min.js</code>, served at <code>/static/echarts.min.js</code>) wrapped by a thin adapter at <code>/static/yuzu-charts.js</code> that maps the visualization payload onto ECharts options and reads Yuzu design tokens (<code>--mds-color-chart-*</code>) for theming, so re-skinning Yuzu re-skins every chart with no JS rebuild. Engine row cap 10 000 with <code>rows_capped: true</code> flag; label cardinality cap 10 000.</p>
+<p>Six demo charts ship as default examples — <code>content/definitions/visualization_demo_set.yaml</code> (<code>InstructionSet demo.visualization.fleet-posture</code>) and <code>content/packs/visualization-demo-pack.yaml</code> (<code>ProductPack pack.demo.visualization</code>) — covering vulnerability severity (the headline pie), Defender real-time protection, disk encryption protection state, firewall state per profile (multi-series column), certificate issuer breakdown (top-N + Other), and OS distribution.</p>
+<p><strong>Files:</strong> <code>server/core/src/visualization_engine.{hpp,cpp}</code>, <code>server/core/src/charts_js_bundle.cpp</code>, <code>server/core/src/instruction_store.{hpp,cpp}</code> (visualization_spec column + MigrationRunner v2), <code>server/core/src/rest_api_v1.cpp</code>, <code>server/core/src/dashboard_routes.{hpp,cpp}</code>, <a href="yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a> § <code>spec.visualization</code>, <a href="user-manual/instructions.html" class="doc-ref"><code>docs/user-manual/instructions.md</code></a> § Response Visualization, plus <code>tests/unit/server/test_visualization_engine.cpp</code> and <code>tests/unit/server/test_rest_visualization.cpp</code>.</p>
+<h3 id="issue-82-response-templates-white_check_mark">Issue 8.2: Response Templates :white_check_mark:</h3>
+<p><strong>Capability:</strong> 20.6 | <strong>Scope:</strong> Server | <strong>Status:</strong> Done
+<strong>Depends on:</strong> 8.1</p>
+<p>Named response view configurations on <code>InstructionDefinition</code> — column subset, sort order, and filter presets the dashboard's filter-bar <strong>View</strong> dropdown surfaces. Storage is the <code>response_templates_spec</code> JSON column on <code>instruction_definitions</code> (migration v3); a <code>__default__</code> template is synthesised on read from <code>spec.result.columns</code> (preferred) or the plugin's column schema, so the dropdown is never empty even before an operator authors anything.</p>
+<p>REST CRUD at <code>/api/v1/definitions/{id}/response-templates[/{template_id}]</code>. Filter ops accepted: <code>equals</code>, <code>not_equals</code>, <code>contains</code>, <code>starts_with</code>, <code>ends_with</code>. Reads gated on <code>InstructionDefinition:Read</code>, mutations on <code>InstructionDefinition:Write</code>. Audit events: <code>response_template.create</code>, <code>response_template.update</code>, <code>response_template.delete</code>. Dashboard auto-applies the <code>equals</code>-op clauses to the URL filter map; other ops are honoured by REST consumers but not auto-applied client-side in this revision.</p>
+<p><strong>Files:</strong> <code>server/core/src/response_templates_engine.{hpp,cpp}</code> (new), <code>server/core/src/instruction_store.{hpp,cpp}</code> (column + migration v3), <code>server/core/src/rest_api_v1.cpp</code> (5 routes), <code>server/core/src/dashboard_routes.{hpp,cpp}</code> (selector + visibility + template-driven sort/filter defaults), <a href="yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a> § <code>spec.responseTemplates</code>, <a href="user-manual/instructions.html" class="doc-ref"><code>docs/user-manual/instructions.md</code></a> § Response Templates, <a href="user-manual/rest-api.html" class="doc-ref"><code>docs/user-manual/rest-api.md</code></a> § Response Templates, <code>tests/unit/server/test_response_templates_engine.cpp</code>, <code>tests/unit/server/test_rest_response_templates.cpp</code>.</p>
+<h3 id="issue-83-response-offloading-data-export-streams-white_check_mark">Issue 8.3: Response Offloading (Data Export Streams) :white_check_mark:</h3>
+<p><strong>Capability:</strong> 20.7 | <strong>Scope:</strong> Server | <strong>Status:</strong> Done
+<strong>Depends on:</strong> 8.1</p>
+<p>Named external HTTP endpoints that receive a copy of <code>agent.registered</code> and <code>execution.completed</code> events as they fire. Built around a sibling <code>OffloadTargetStore</code> SQLite database (<code>offload_targets.db</code>) wired into <code>AgentServiceImpl</code> next to the existing webhook fan-out, so every event that fires a webhook also fans out to every enabled offload target whose <code>event_types</code> filter matches.</p>
+<p>Targets carry typed auth (none / bearer / basic / hmac), a server-side batching threshold (<code>batch_size &gt; 1</code> accumulates events into a per-target buffer and flushes on threshold), and a unique <code>name</code> so a definition can name a specific subset via <code>spec.offload.targets</code> in YAML. <code>auth_credential</code> is persisted but never returned by any REST surface (paranoia-double-check assertion in <code>test_rest_offload_targets.cpp</code>). Outgoing requests carry <code>X-Yuzu-Event</code>, <code>X-Yuzu-Event-Count</code>, and (for hmac) <code>X-Yuzu-Signature: sha256=&lt;hex&gt;</code> headers — receivers can share verification code with webhooks.</p>
+<p>REST: <code>GET/POST/DELETE /api/v1/offload-targets</code>, <code>GET /api/v1/offload-targets/{id}</code>, <code>GET /api/v1/offload-targets/{id}/deliveries</code>. RBAC: <code>Infrastructure:Read</code>/<code>Write</code>. Audit events: <code>offload_target.create</code> (success | denied), <code>offload_target.delete</code>.</p>
+<p><strong>Known follow-up:</strong> the dispatcher does not yet extract <code>spec.offload.targets</code> from the originating definition — <code>fire_event(target_filter)</code> honours an explicit caller-supplied filter, but the agent-service fan-out passes none. Wiring the per-instruction filter through <code>cmd_execution_ids_ → execution_id → definition_id → InstructionStore</code> is tracked separately so the global fan-out path lands clean first.</p>
+<p><strong>Files:</strong> <code>server/core/src/offload_target_store.{hpp,cpp}</code> (new, migration v1), <code>server/core/src/offload_routes.{hpp,cpp}</code> (new), <code>server/core/src/server.cpp</code> (DB open + AgentService wiring + route registration), <code>server/core/src/agent_service_impl.{hpp,cpp}</code> (<code>set_offload_target_store</code> + fire_event at 3 call sites), <a href="yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a> § <code>spec.offload</code>, <a href="user-manual/rest-api.html" class="doc-ref"><code>docs/user-manual/rest-api.md</code></a> § Offload Targets, <code>tests/unit/server/test_offload_target_store.cpp</code>, <code>tests/unit/server/test_rest_offload_targets.cpp</code>.</p>
+<hr>
+<h2 id="phase-9-connector-framework-multi-source-inventory">Phase 9: Connector Framework &amp; Multi-Source Inventory</h2>
+<p><em>Federate inventory data from external management systems. Core enterprise integration capability.</em></p>
+<h3 id="issue-91-connector-framework-core">Issue 9.1: Connector Framework (Core)</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open</p>
+<p>Pluggable connector architecture for bidirectional data sync with external systems:
+- <code>ConnectorStore</code> (SQLite): connector type, name, config (encrypted credentials), schedule, status
+- <code>ConnectorEngine</code>: background sync with pluggable connector implementations
+- Connector interface:
+  <div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">Connector</span><span class="w"> </span><span class="p">{</span>
+<span class="k">public</span><span class="o">:</span>
+<span class="w">    </span><span class="k">virtual</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">type</span><span class="p">()</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="k">virtual</span><span class="w"> </span><span class="n">SyncResult</span><span class="w"> </span><span class="nf">sync</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">ConnectorConfig</span><span class="o">&amp;</span><span class="w"> </span><span class="n">config</span><span class="p">,</span><span class="w"> </span><span class="n">InventoryRepository</span><span class="o">&amp;</span><span class="w"> </span><span class="n">repo</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="k">virtual</span><span class="w"> </span><span class="n">ConnectionTestResult</span><span class="w"> </span><span class="nf">test</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">ConnectorConfig</span><span class="o">&amp;</span><span class="w"> </span><span class="n">config</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">};</span>
+</code></pre></div>
+- Sync lifecycle: NotStarted → Pending → InProgress → Completed/Failed/Cancelled
+- REST: <code>GET/POST/PUT/DELETE /api/v1/connectors</code>, <code>POST .../sync</code>, <code>POST .../test</code>
+- Dashboard: Connectors page in Settings with add/edit/delete/test/sync actions</p>
+<p><strong>Files:</strong> New <code>server/core/src/connector_store.cpp</code>, <code>server/core/src/connector_engine.cpp</code>, <code>server/core/src/settings_routes.cpp</code></p>
+<h3 id="issue-92-inventory-repository-model">Issue 9.2: Inventory Repository Model</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 9.1</p>
+<p>Named repositories for partitioned inventory data:
+- <code>RepositoryStore</code> (SQLite): named repositories per type (inventory, compliance, entitlement)
+- Default repository created on first boot (cannot be deleted)
+- Connectors bound to repositories; multiple connectors per repository
+- Consolidation, deduplication, normalization pipeline
+- Repository types: Inventory, Compliance, Entitlement (extensible)
+- REST: <code>GET/POST/PUT/DELETE /api/v1/repositories</code></p>
+<p><strong>Files:</strong> New <code>server/core/src/repository_store.cpp</code>, <code>server/core/src/rest_api_v1.cpp</code></p>
+<h3 id="issue-93-sccm-configmgr-connector">Issue 9.3: SCCM / ConfigMgr Connector</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 9.1</p>
+<p>SQL query against ConfigMgr database:
+- Hardware inventory (Win32_ComputerSystem, Win32_OperatingSystem, etc.)
+- Software inventory (installed applications, MSI packages)
+- User/device associations
+- Patch compliance data
+- Configuration: database server, instance, auth (Windows/SQL login)</p>
+<p><strong>Files:</strong> New <code>server/core/src/connectors/sccm_connector.cpp</code></p>
+<h3 id="issue-94-intune-connector">Issue 9.4: Intune Connector</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 9.1</p>
+<p>Microsoft Graph API integration (<code>/deviceManagement/managedDevices</code>):
+- Device inventory (hardware, OS, compliance state)
+- Installed applications
+- Configuration profiles and compliance policies
+- OAuth2 client credentials flow (reuse DirectorySync Graph client)</p>
+<p><strong>Files:</strong> New <code>server/core/src/connectors/intune_connector.cpp</code></p>
+<h3 id="issue-95-servicenow-connector">Issue 9.5: ServiceNow Connector</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 9.1</p>
+<p>ServiceNow REST API (Table API) integration:
+- CMDB CI records (cmdb_ci_computer, cmdb_ci_server)
+- Incidents and change requests (optional)
+- User/group import
+- OAuth2 or basic auth</p>
+<p><strong>Files:</strong> New <code>server/core/src/connectors/servicenow_connector.cpp</code></p>
+<h3 id="issue-96-wsus-connector">Issue 9.6: WSUS Connector</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 9.1</p>
+<p>SQL query against WSUS database:
+- Update approval status
+- Per-device patch compliance
+- Update metadata (KB, severity, classification)
+- Configuration: database server, instance, auth</p>
+<p><strong>Files:</strong> New <code>server/core/src/connectors/wsus_connector.cpp</code></p>
+<h3 id="issue-97-csv-file-upload-connector">Issue 9.7: CSV / File Upload Connector</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 9.1</p>
+<p>Import inventory data from structured files:
+- Parse TSV/CSV with configurable column mapping
+- Upload via REST API or dashboard file picker
+- Validation and error reporting per row
+- Scheduling support for automated file ingestion from watched directories</p>
+<p><strong>Files:</strong> New <code>server/core/src/connectors/file_upload_connector.cpp</code></p>
+<h3 id="issue-98-inventory-consolidation-normalization">Issue 9.8: Inventory Consolidation &amp; Normalization</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 9.2</p>
+<p>Multi-source inventory cleanup pipeline:
+- Deduplication by device identity (hostname + MAC + serial)
+- Software normalization: vendor/title/version canonicalization
+- Hardware normalization: processor model mapping, VM detection
+- Consolidation reports: matched vs. unmatched, normalization coverage percentage
+- Runs after each connector sync or on-demand via REST</p>
+<p><strong>Files:</strong> New <code>server/core/src/inventory_consolidation.cpp</code>, <code>server/core/src/repository_store.cpp</code></p>
+<hr>
+<h2 id="phase-10-software-catalog-license-compliance">Phase 10: Software Catalog &amp; License Compliance</h2>
+<p><em>Normalized software identification for license management and compliance reporting.</em></p>
+<h3 id="issue-101-software-catalog-store">Issue 10.1: Software Catalog Store</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 9.8</p>
+<p>Canonical software registry:
+- <code>CatalogStore</code> (SQLite): normalized software entries (vendor, title, version, edition, platform)
+- Catalog import from CSV/JSON
+- Manual curation UI: merge duplicates, set canonical names, mark as ignored
+- Automatic matching: raw inventory entries linked to catalog entries by fuzzy title/vendor
+- REST: <code>GET/POST/PUT /api/v1/catalog/software</code>, <code>POST /api/v1/catalog/software/match</code></p>
+<p><strong>Files:</strong> New <code>server/core/src/catalog_store.cpp</code>, <code>server/core/src/rest_api_v1.cpp</code></p>
+<h3 id="issue-102-software-usage-tracking">Issue 10.2: Software Usage Tracking</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Agent + Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 10.1</p>
+<p>Agent-side application usage metering:
+- New <code>software_usage</code> agent plugin
+- Track application launches, cumulative run time, last-used timestamp
+- Categorize: Used (30d), Rarely Used (90d), Unused (&gt;90d), Unreported
+- Report via ReportInventory RPC
+- Server-side aggregation: per-title usage across fleet
+- Dashboard: usage summary with reclamation candidates</p>
+<p><strong>Files:</strong> New <code>agents/plugins/software_usage/</code>, <code>server/core/src/catalog_store.cpp</code></p>
+<h3 id="issue-103-license-entitlements-compliance">Issue 10.3: License Entitlements &amp; Compliance</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 10.1</p>
+<p>License compliance calculation:
+- Entitlement records: product, purchased_seats, license_type (per-device/per-user/site/enterprise)
+- Compliance calculation: installed_count vs. entitled_count
+- Over/under-licensed reporting per product
+- REST: <code>GET/POST/PUT/DELETE /api/v1/entitlements</code>
+- Dashboard: license compliance summary with drill-down</p>
+<p><strong>Files:</strong> New <code>server/core/src/entitlement_store.cpp</code>, <code>server/core/src/rest_api_v1.cpp</code></p>
+<h3 id="issue-104-software-tags">Issue 10.4: Software Tags</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 10.1</p>
+<p>Server-side tags on software catalog entries:
+- Tag software titles for categorization (e.g., "approved", "prohibited", "eval")
+- Used for Management Group rules ("devices with software tagged X")
+- REST: <code>GET/POST/DELETE /api/v1/catalog/software/{id}/tags</code>
+- Dashboard: tag management in catalog view</p>
+<p><strong>Files:</strong> <code>server/core/src/catalog_store.cpp</code>, <code>server/core/src/management_group_store.cpp</code></p>
+<hr>
+<h2 id="phase-11-consumer-model-platform-extensibility">Phase 11: Consumer Model &amp; Platform Extensibility</h2>
+<p><em>Formalize third-party integration and provide client libraries for automation.</em></p>
+<h3 id="issue-111-consumer-application-registration">Issue 11.1: Consumer Application Registration</h3>
+<p><strong>Capability:</strong> 24.4 | <strong>Scope:</strong> Server | <strong>Status:</strong> Open</p>
+<p>Formal model for external systems consuming Yuzu data:
+- <code>ConsumerStore</code> (SQLite): name, URL, max_concurrent_instructions, offload_target, enabled
+- Consumers get scoped API tokens with rate limits
+- Custom data field for consumer-specific metadata
+- Consumer deploy: push instruction definitions and policies to specific consumers
+- REST: <code>GET/POST/PUT/DELETE /api/v1/consumers</code>
+- Dashboard: Consumers page in Settings</p>
+<p><strong>Files:</strong> New <code>server/core/src/consumer_store.cpp</code>, <code>server/core/src/settings_routes.cpp</code></p>
+<h3 id="issue-112-event-source-management">Issue 11.2: Event Source Management</h3>
+<p><strong>Capability:</strong> 21.5 | <strong>Scope:</strong> Server | <strong>Status:</strong> Open</p>
+<p>Configure which system events generate notifications and webhook deliveries:
+- Event source categories: agent_lifecycle, execution, compliance, security, system
+- Per-category enable/disable with severity threshold
+- Granular event type selection within each category
+- REST: <code>GET/PUT /api/v1/event-sources</code>
+- Dashboard: Event Sources section in Settings</p>
+<p><strong>Files:</strong> New <code>server/core/src/event_source_config.cpp</code>, <code>server/core/src/webhook_store.cpp</code>, <code>server/core/src/notification_store.cpp</code></p>
+<h3 id="issue-113-powershell-module">Issue 11.3: PowerShell Module</h3>
+<p><strong>Capability:</strong> 24.7 (partial) | <strong>Scope:</strong> External | <strong>Status:</strong> Open</p>
+<p><code>Yuzu.Management</code> PowerShell module wrapping REST API v1:
+- Cmdlets: <code>Connect-YuzuServer</code>, <code>Get-YuzuAgent</code>, <code>Send-YuzuInstruction</code>, <code>Get-YuzuCompliance</code>, <code>Get-YuzuAuditLog</code>, <code>New-YuzuSchedule</code>, etc.
+- Authentication: API token via <code>Connect-YuzuServer -Server &lt;url&gt; -Token &lt;token&gt;</code>
+- Tab completion for instruction names, agent IDs, scope attributes
+- Published to PowerShell Gallery</p>
+<p><strong>Files:</strong> New <code>sdk/powershell/</code></p>
+<h3 id="issue-114-python-sdk">Issue 11.4: Python SDK</h3>
+<p><strong>Capability:</strong> 24.7 (partial) | <strong>Scope:</strong> External | <strong>Status:</strong> Open</p>
+<p><code>yuzu-sdk</code> Python package wrapping REST API v1:
+- Async support via httpx
+- Typed models (dataclasses or Pydantic)
+- Convenience methods: <code>client.agents.list()</code>, <code>client.instructions.execute()</code>, etc.
+- Published to PyPI</p>
+<p><strong>Files:</strong> New <code>sdk/python/</code></p>
+<hr>
+<h2 id="phase-12-remaining-agent-capabilities">Phase 12: Remaining Agent Capabilities</h2>
+<p><em>Close all 19 "Not Started" items from the capability map to reach 100% coverage.</em></p>
+<h3 id="issue-121-mapped-drive-history">Issue 12.1: Mapped Drive History</h3>
+<p><strong>Capability:</strong> 3.8 | <strong>Scope:</strong> Agent Plugin | <strong>Status:</strong> Open</p>
+<p>New actions in <code>users</code> plugin: <code>mapped_drives</code>, <code>mapped_drive_history</code>.
+- Windows: WMI <code>Win32_MappedLogicalDisk</code> + Event Log 4624/4634 for historical connections
+- Returns: drive_letter, remote_path, username, timestamp, direction (inbound/outbound)</p>
+<p><strong>Files:</strong> <code>agents/plugins/users/src/users_plugin.cpp</code></p>
+<h3 id="issue-122-printer-inventory">Issue 12.2: Printer Inventory</h3>
+<p><strong>Capability:</strong> 3.9 | <strong>Scope:</strong> Agent Plugin | <strong>Status:</strong> Open</p>
+<p>New action in <code>hardware</code> plugin: <code>printers</code>.
+- Windows: <code>EnumPrinters</code> API. Linux: CUPS <code>lpstat</code>. macOS: <code>lpstat</code>
+- Returns: name, driver, port, status, shared, default, network/local</p>
+<p><strong>Files:</strong> <code>agents/plugins/hardware/src/hardware_plugin.cpp</code></p>
+<h3 id="issue-123-port-scanning">Issue 12.3: Port Scanning</h3>
+<p><strong>Capability:</strong> 4.11 | <strong>Scope:</strong> Agent Plugin | <strong>Status:</strong> Open</p>
+<p>New action in <code>discovery</code> plugin: <code>scan_ports</code>.
+- Parameters: target_ips (comma-separated), ports (range notation: "22,80,443,8000-8100")
+- Non-blocking connect with configurable timeout (default 2s)
+- Returns: ip, port, status (open/closed/filtered), service_guess</p>
+<p><strong>Files:</strong> <code>agents/plugins/discovery/src/discovery_plugin.cpp</code></p>
+<h3 id="issue-124-netbios-lookup">Issue 12.4: NetBIOS Lookup</h3>
+<p><strong>Capability:</strong> 4.9 | <strong>Scope:</strong> Agent Plugin | <strong>Status:</strong> Open</p>
+<p>New action in <code>discovery</code> plugin: <code>netbios_lookup</code>.
+- Parameters: ip_addresses (comma-separated)
+- Send NetBIOS Name Query (UDP 137) and parse response
+- Returns: ip, netbios_name, domain, mac_address</p>
+<p><strong>Files:</strong> <code>agents/plugins/discovery/src/discovery_plugin.cpp</code></p>
+<h3 id="issue-125-open-windows-enumeration">Issue 12.5: Open Windows Enumeration</h3>
+<p><strong>Capability:</strong> 5.5 | <strong>Scope:</strong> Agent Plugin | <strong>Status:</strong> Open</p>
+<p>New action in <code>interaction</code> plugin: <code>list_windows</code> (Windows-only).
+- <code>EnumWindows</code> + <code>GetWindowText</code> + <code>GetWindowThreadProcessId</code>
+- Returns: hwnd, title, process_name, pid, visible, minimized</p>
+<p><strong>Files:</strong> <code>agents/plugins/interaction/src/interaction_plugin.cpp</code></p>
+<h3 id="issue-126-directory-hash-recursive">Issue 12.6: Directory Hash (Recursive)</h3>
+<p><strong>Capability:</strong> 10.11 | <strong>Scope:</strong> Agent Plugin | <strong>Status:</strong> Open</p>
+<p>New action in <code>filesystem</code> plugin: <code>hash_directory</code>.
+- Recursive SHA-256 of all file contents, sorted by relative path for deterministic output
+- Returns: directory_hash, file_count, total_bytes, elapsed_ms</p>
+<p><strong>Files:</strong> <code>agents/plugins/filesystem/src/filesystem_plugin.cpp</code></p>
+<h3 id="issue-127-survey-dialog">Issue 12.7: Survey Dialog</h3>
+<p><strong>Capability:</strong> 14.4 | <strong>Scope:</strong> Agent Plugin | <strong>Status:</strong> Open</p>
+<p>Extend <code>interaction</code> plugin: <code>survey</code> action.
+- Multi-question form: text input, single-choice, multi-choice, rating scale
+- Windows: WinForms-style dialog. Linux: zenity --forms. macOS: osascript
+- Unique survey name prevents repeat display. Response validity period.
+- Returns: structured JSON response with question_id → answer mapping</p>
+<p><strong>Files:</strong> <code>agents/plugins/interaction/src/interaction_plugin.cpp</code></p>
+<h3 id="issue-128-do-not-disturb-mode">Issue 12.8: Do-Not-Disturb Mode</h3>
+<p><strong>Capability:</strong> 14.5 | <strong>Scope:</strong> Agent Plugin | <strong>Status:</strong> Open</p>
+<p>Extend <code>interaction</code> plugin: <code>set_dnd</code> / <code>get_dnd_status</code> actions.
+- Suppress all notifications/dialogs for configurable duration
+- Persisted in agent KV storage (survives restart)
+- Returns: active (bool), expires_at (timestamp)</p>
+<p><strong>Files:</strong> <code>agents/plugins/interaction/src/interaction_plugin.cpp</code></p>
+<h3 id="issue-129-active-response-tracking">Issue 12.9: Active Response Tracking</h3>
+<p><strong>Capability:</strong> 14.6 | <strong>Scope:</strong> Agent Plugin | <strong>Status:</strong> Open</p>
+<p>Extend <code>interaction</code> plugin: <code>list_pending</code> action.
+- Returns all outstanding surveys/questions awaiting user input
+- Includes: interaction_id, type, prompt, issued_at, timeout_at</p>
+<p><strong>Files:</strong> <code>agents/plugins/interaction/src/interaction_plugin.cpp</code></p>
+<h3 id="issue-1210-patch-inventory-event-generation">Issue 12.10: Patch Inventory Event Generation</h3>
+<p><strong>Capability:</strong> 8.9 | <strong>Scope:</strong> Agent Plugin | <strong>Status:</strong> Open</p>
+<p>Extend <code>windows_updates</code> plugin: <code>generate_inventory_events</code> action.
+- Emit structured events for each installed/missing patch
+- Feed into AnalyticsEventStore for SIEM/compliance integration
+- Event format: patch_kb, status (installed/missing), severity, agent_id, timestamp</p>
+<p><strong>Files:</strong> <code>agents/plugins/windows_updates/src/windows_updates_plugin.cpp</code></p>
+<h3 id="issue-1211-application-whitelisting">Issue 12.11: Application Whitelisting</h3>
+<p><strong>Capability:</strong> 9.10 | <strong>Scope:</strong> Agent Plugin | <strong>Status:</strong> Open</p>
+<p>New <code>app_control</code> plugin:
+- Windows: AppLocker policy query/modification via WMI or PowerShell
+- Linux: fapolicyd rules (if available)
+- Actions: <code>get_policy</code>, <code>add_rule</code>, <code>remove_rule</code>, <code>get_blocked_events</code></p>
+<p><strong>Files:</strong> New <code>agents/plugins/app_control/</code></p>
+<h3 id="issue-1212-inventory-replication-delta-sync">Issue 12.12: Inventory Replication (Delta Sync)</h3>
+<p><strong>Capability:</strong> 15.5 | <strong>Scope:</strong> Agent + Server | <strong>Status:</strong> Open</p>
+<p>Agent-side inventory cache with delta sync:
+- Agent-side: inventory cache in SQLite KV store, track hash of last-sent inventory per plugin
+- Server-side: track per-agent sync state (last_sync_at, inventory_hash)
+- Only send changed inventory since last sync, reducing bandwidth for large fleets</p>
+<p><strong>Files:</strong> <code>agents/core/src/agent.cpp</code>, <code>server/core/src/inventory_store.cpp</code></p>
+<h3 id="issue-1213-binary-resource-distribution">Issue 12.13: Binary Resource Distribution</h3>
+<p><strong>Capability:</strong> 22.7 | <strong>Scope:</strong> Server | <strong>Status:</strong> Open</p>
+<p>Server-side resource registry for versioned binary blobs:
+- Resource model: name, version, platform, hash, size, upload_at
+- Agents pull resources by name + version with SHA-256 hash verification
+- Used by instructions that need supporting files (scripts, configs, tools)
+- REST: <code>GET/POST/DELETE /api/v1/resources</code>, <code>GET /api/v1/resources/{name}/{version}/download</code></p>
+<p><strong>Files:</strong> New <code>server/core/src/resource_store.cpp</code>, <code>server/core/src/rest_api_v1.cpp</code></p>
+<hr>
+<h2 id="phase-13-security-hardening-operational-polish">Phase 13: Security Hardening &amp; Operational Polish</h2>
+<p><em>Close remaining security gaps and improve operational UX.</em></p>
+<h3 id="issue-131-2fa-for-instruction-approval-totp">Issue 13.1: 2FA for Instruction Approval (TOTP)</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open</p>
+<p>TOTP (RFC 6238) second factor on instruction approval:
+- Per-user TOTP secret stored encrypted in auth store
+- QR code enrollment via Settings UI
+- Approval endpoint requires <code>totp_code</code> parameter when 2FA is enabled for the user
+- Fallback: email-based one-time code (requires SMTP configuration)
+- Configurable: per-user opt-in or system-wide enforcement</p>
+<p><strong>Files:</strong> <code>server/core/src/approval_manager.cpp</code>, <code>server/core/src/auth.cpp</code>, <code>server/core/src/settings_routes.cpp</code></p>
+<h3 id="issue-132-composable-instruction-chains">Issue 13.2: Composable Instruction Chains</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 7.14 (Workflow Primitives)</p>
+<p>Server-side multi-step instruction composition extending the WorkflowEngine:
+- Variables from previous steps available via <code>${step_name.field}</code> interpolation
+- CEL conditions for conditional step execution
+- Result row iteration via <code>foreach</code> for fan-out patterns
+- Provides composable instruction chaining without requiring an agent-side scripting language</p>
+<p><strong>Files:</strong> <code>server/core/src/workflow_engine.cpp</code>, <code>server/core/src/execution_tracker.cpp</code></p>
+<h3 id="issue-133-process-sync-logging-ui">Issue 13.3: Process / Sync Logging UI</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open</p>
+<p>Dashboard page at <code>/monitoring</code> with operational log views:
+- Tabs: Connector Sync Log, Scheduled Executions, Infrastructure Log
+- Reuse existing AuditStore with category filtering
+- HTMX fragments with 30s auto-refresh
+- Status indicators, filtering by action type / status / time range</p>
+<p><strong>Files:</strong> New <code>server/core/src/monitoring_ui.cpp</code>, <code>server/core/src/dashboard_routes.cpp</code></p>
+<h3 id="issue-134-dashboard-branding">Issue 13.4: Dashboard Branding</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open</p>
+<p>White-label customization for enterprise deployments:
+- <code>BrandingConfig</code>: logo_url, product_name, primary_color, accent_color
+- Stored in RuntimeConfigStore (safe keys)
+- Settings UI: branding section with live preview
+- CSS variables for theme customization, applied globally</p>
+<p><strong>Files:</strong> <code>server/core/src/css_bundle.cpp</code>, <code>server/core/src/settings_routes.cpp</code>, <code>server/core/src/runtime_config_store.cpp</code></p>
+<h3 id="issue-135-mcp-phase-2-write-tools">Issue 13.5: MCP Phase 2 (Write Tools)</h3>
+<p><strong>Capabilities:</strong> 24.8 (extension) | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 7.20 (MCP Phase 1)</p>
+<p>6 write/execute tools for the MCP server:
+- <code>set_tag</code>, <code>delete_tag</code> — device tag management
+- <code>execute_instruction</code> — dispatch instruction to agents (operator/supervised tiers)
+- <code>approve_request</code>, <code>reject_request</code> — approval workflow actions (supervised tier)
+- <code>quarantine_device</code> — network isolation (supervised tier)
+- Approval workflow integration for destructive operations
+- SSE streaming for execution progress</p>
+<p><strong>Files:</strong> <code>server/core/src/mcp_server.cpp</code>, <code>server/core/src/mcp_policy.hpp</code></p>
+<hr>
+<h2 id="phase-14-scale-enterprise-readiness">Phase 14: Scale &amp; Enterprise Readiness</h2>
+<p><em>Features needed for very large deployments (&gt;100K devices) and enterprise-grade resilience.</em></p>
+<h3 id="issue-141-p2p-content-distribution">Issue 14.1: P2P Content Distribution</h3>
+<p><strong>Capability:</strong> 13.5 | <strong>Scope:</strong> Agent | <strong>Status:</strong> Open</p>
+<p>Agent mesh for peer content sharing within subnets:
+- Leader election via mDNS/broadcast within subnet
+- Content announce/request protocol over UDP
+- Cache management: LRU eviction, configurable max size
+- Falls back to server download when no peers have content
+- Bandwidth throttling to avoid network saturation</p>
+<p><strong>Files:</strong> New <code>agents/core/src/p2p_mesh.cpp</code>, <code>agents/plugins/content_dist/src/content_dist_plugin.cpp</code></p>
+<h3 id="issue-142-multi-gateway-topology">Issue 14.2: Multi-Gateway Topology</h3>
+<p><strong>Capability:</strong> 22.5 (extension) | <strong>Scope:</strong> Gateway + Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 7.1, 7.1.1</p>
+<p>Server supports multiple concurrent gateway registrations:
+- Gateway affinity: agents assigned to nearest gateway via latency probing
+- Gateway failover: agents reconnect to alternate gateway on primary failure
+- Topology view shows all gateways with agent counts and health status</p>
+<p><strong>Files:</strong> <code>server/core/src/agent_registry.cpp</code>, <code>server/core/src/gateway_service_impl.cpp</code>, <code>gateway/apps/yuzu_gw/src/yuzu_gw_cluster.erl</code></p>
+<h3 id="issue-143-database-sharding-response-partitioning">Issue 14.3: Database Sharding (Response Partitioning)</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open</p>
+<p>Time-partitioned response storage for high-throughput environments:
+- Response data partitioned by time (monthly SQLite files)
+- Automatic file rotation and TTL cleanup
+- Query router spans partitions transparently
+- Reduces WAL contention for high-throughput response collection</p>
+<p><strong>Files:</strong> <code>server/core/src/response_store.cpp</code></p>
+<h3 id="issue-144-vcenter-connector">Issue 14.4: vCenter Connector</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 9.1</p>
+<p>VMware vSphere API integration:
+- Sync: VMs, ESXi hosts, datastores, clusters, resource pools
+- VM-to-agent correlation via hostname or UUID
+- Virtual summary reporting (physical hosts, guest count, density)</p>
+<p><strong>Files:</strong> New <code>server/core/src/connectors/vcenter_connector.cpp</code></p>
+<h3 id="issue-145-additional-connectors-bigfix-o365-oracle">Issue 14.5: Additional Connectors (BigFix, O365, Oracle)</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 9.1</p>
+<p>Extend the connector framework with additional integrations:
+- <strong>BigFix</strong>: REST API integration for inventory and patch compliance sync
+- <strong>Office 365</strong>: Microsoft Graph API for license and usage data
+- <strong>Oracle LMS</strong>: Database query for Oracle deployment facts and licensing</p>
+<p><strong>Files:</strong> New <code>server/core/src/connectors/bigfix_connector.cpp</code>, <code>server/core/src/connectors/o365_connector.cpp</code>, <code>server/core/src/connectors/oracle_connector.cpp</code></p>
+<h3 id="issue-146-high-availability-active-passive">Issue 14.6: High Availability (Active-Passive)</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open</p>
+<p>Active-passive failover for server resilience:
+- Shared SQLite over network filesystem (NFS/SMB) or replicated storage
+- Heartbeat between primary and standby servers
+- Automatic failover on primary health check failure
+- Gateway re-registration on failover event</p>
+<p><strong>Files:</strong> New <code>server/core/src/ha_manager.cpp</code>, <code>server/core/src/server.cpp</code></p>
+<hr>
+<h2 id="phase-15-tar-dashboard-scope-walking">Phase 15: TAR Dashboard &amp; Scope Walking</h2>
+<p><em>The differentiating operator experience. Composable scope from previous query results, surfaced in the dashboard and the YAML DSL, anchored on a dedicated TAR page that puts retention awareness, ad-hoc SQL, and process-tree forensics under one roof. The reference end-to-end walkthrough is the Chrome IR scenario in <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §10.</em></p>
+<h3 id="issue-15a-tar-dashboard-page-shell-retention-paused-source-list">Issue 15.A: TAR Dashboard Page Shell + Retention-Paused Source List</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server (dashboard + REST) + TAR plugin (status extension) | <strong>Status:</strong> In progress</p>
+<p>New <code>/tar</code> page off the main dashboard nav. First frame is the retention-paused source list — directly enabled by the issue #539 retention guard. Per-source <code>&lt;source&gt;_paused_at</code> timestamp added to <code>tar.status</code>, server aggregates per-device responses, dashboard renders a sortable filterable table with one-click re-enable and a typed-confirmation purge. Independent re-enable per source (the #539 invariant).</p>
+<p><strong>Files:</strong> <code>server/core/src/dashboard_routes.cpp</code>, <code>server/core/src/dashboard_ui.cpp</code>, <code>agents/plugins/tar/src/tar_plugin.cpp</code>, new <code>tests/unit/server/test_tar_dashboard_*</code>. Design: <a href="tar-dashboard.html" class="doc-ref"><code>docs/tar-dashboard.md</code></a> §3.</p>
+<h3 id="issue-15b-result-set-store-rest-api">Issue 15.B: Result-Set Store + REST API</h3>
+<p><strong>Capability:</strong> new (foundational) | <strong>Scope:</strong> Server | <strong>Status:</strong> Open</p>
+<p><code>result_set_store.cpp</code> with new <code>result_sets.db</code>. Schema per <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §3 — immutable lineage edges, TTL with pin override, source payload JSON for live re-eval. REST: <code>POST /api/v1/result-sets</code>, <code>from-inventory-query</code>, <code>from-tar-query</code>, <code>from-instruction-result</code>, <code>GET .../{id}</code>, <code>.../{id}/members</code>, <code>.../{id}/lineage</code>, <code>pin</code> / <code>unpin</code> / <code>re-eval</code>, <code>DELETE</code>. Audit hooks per §9.</p>
+<p><strong>Files:</strong> new <code>server/core/src/result_set_store.{cpp,hpp}</code>, new <code>server/core/src/result_set_routes.cpp</code>, <code>migration_runner.cpp</code>. Design: <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §3, §6, §9.</p>
+<h3 id="issue-15c-scope-engine-from_result_set-dashboard-chip-sidebar-breadcrumb">Issue 15.C: Scope Engine <code>from_result_set:</code> + Dashboard Chip + Sidebar + Breadcrumb</h3>
+<p><strong>Capability:</strong> 1.6 (extension) | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 15.B</p>
+<p>Scope Engine grammar gains <code>from_result_set:&lt;id-or-alias&gt;</code> as a third short-circuit kind alongside <code>__all__</code> and <code>group:&lt;name&gt;</code>. Composes with attribute predicates via <code>AND</code>/<code>OR</code>/<code>NOT</code>. Dashboard sidebar lists active result sets (last_used_at then created_at DESC); chain breadcrumb above every query frame mirrors <code>parent_id</code> walks; scope chip surfaces in TAR / inventory / instruction frames.</p>
+<p><strong>Files:</strong> <code>server/core/src/scope_engine.{cpp,hpp}</code>, <code>server/core/src/dashboard_routes.cpp</code>, <code>server/core/src/dashboard_ui.cpp</code>. Design: <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §4, §8.</p>
+<h3 id="issue-15d-tar-sql-frame-relocate-scope-walking-aware-save-as-result-set">Issue 15.D: TAR SQL Frame — Relocate, Scope-Walking-Aware, Save-as-Result-Set</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 15.A, 15.B, 15.C</p>
+<p>Relocate the existing <code>/fragments/tar-sql</code> route onto the TAR dashboard page. Wire scope-chip resolution to <code>from_result_set:</code> (15.C). Add "Save as result set" affordance on the results pane — server creates a new result set with <code>source_kind=tar_query</code>, members = union of agents that returned ≥1 row by default. Default name is <code>tar-&lt;5-char-sql-hash&gt;</code>.</p>
+<p><strong>Files:</strong> <code>server/core/src/dashboard_routes.cpp</code>, <code>server/core/src/agent_service_impl.cpp</code> (TAR result envelope to carry the producing agent IDs explicitly). Design: <a href="tar-dashboard.html" class="doc-ref"><code>docs/tar-dashboard.md</code></a> §4.</p>
+<h3 id="issue-15e-yaml-dsl-fromresultset-definition_store-validation-spec-amendment">Issue 15.E: YAML DSL <code>fromResultSet:</code> + <code>definition_store</code> Validation + Spec Amendment</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server (DSL) | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 15.B, 15.C</p>
+<p><code>scope:</code> block in <code>InstructionDefinition</code>, <code>InstructionSet</code>, <code>Policy</code> gains <code>fromResultSet:</code> as a mutually-exclusive (or composable-with-<code>selector:</code>) form. Validation: <code>fromResultSet + assignment.managementGroups</code> rejected at YAML load; <code>fromResultSet</code> requires <code>assignment.mode = static</code>. Resolution at instruction <em>invocation</em> time, not load time. Spec section in <a href="yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a>.</p>
+<p><strong>Files:</strong> <code>server/core/src/definition_store.cpp</code>, <code>server/core/src/policy_store.cpp</code>, <a href="yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a>. Design: <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §7.</p>
+<h3 id="issue-15f-reference-walkthrough-chrome-ir-end-to-end-integration-test">Issue 15.F: Reference Walkthrough — Chrome IR End-to-End Integration Test</h3>
+<p><strong>Capability:</strong> new (regression net) | <strong>Scope:</strong> Tests | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 15.B, 15.C, 15.D, 15.E</p>
+<p><code>tests/integration/test_chrome_ir_chain.cpp</code> drives the full §10 walkthrough against a live UAT stack with synthetic agents. Asserts: each step's audit row carries <code>parent_result_set_id</code> and <code>result_result_set_id</code>; the resulting lineage chain is complete; pinning prevents mid-incident GC; the final un-quarantine + watch step terminates cleanly. The reference test for end-to-end correctness — when this passes, scope walking is real.</p>
+<p><strong>Files:</strong> <code>tests/integration/test_chrome_ir_chain.cpp</code>, supporting fixtures in <code>scripts/uat/synthetic-fleet.sh</code>. Design: <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §10.</p>
+<h3 id="issue-15g-operational-hardening-live-re-eval-gc-sweep-prometheus-audit-polish">Issue 15.G: Operational Hardening — Live Re-Eval, GC Sweep, Prometheus + Audit Polish</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 15.B</p>
+<p>Live re-eval (<code>POST /api/v1/result-sets/{id}/re-eval</code>); background GC sweep every 5 min; per-operator 10K result-set quota + 50 pin cap with <code>429 RESULT_SET_QUOTA</code> / <code>409 PIN_LIMIT</code>; Prometheus metrics (<code>yuzu_result_sets_total</code>, <code>yuzu_result_sets_alive</code>, <code>yuzu_result_set_resolve_seconds</code> histogram, GC counter, quota-rejection counter); audit polish on every state transition.</p>
+<p><strong>Files:</strong> <code>server/core/src/result_set_store.cpp</code>, <code>server/core/src/result_set_routes.cpp</code>, <code>server/core/src/server.cpp</code>. Design: <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §3.3, §9.</p>
+<h3 id="issue-15h-tar-process-tree-viewer">Issue 15.H: TAR Process Tree Viewer</h3>
+<p><strong>Capability:</strong> new (forensic) | <strong>Scope:</strong> TAR plugin + Server (renderer) | <strong>Status:</strong> Open (gated on agent service-install hardening readiness)</p>
+<p><code>tar.process_tree</code> agent action walks <code>/proc</code> (Linux), <code>CreateToolhelp32Snapshot</code> + <code>Process32FirstW</code>/<code>NextW</code> (Windows), <code>proc_listallpids</code> + <code>proc_pidinfo(PROC_PIDTBSDINFO|PIDPATHINFO)</code> (macOS). Stores tagged <code>action='seed'</code> rows in <code>process_live</code> per PID. Server reconstructs the tree by replaying seed + subsequent <code>started</code> / <code>stopped</code> events from <code>process_live</code>. Renderer: collapsible nested <code>&lt;details&gt;</code> / <code>&lt;summary&gt;</code> for v1, no graph library. Time-slicing via <code>?as_of=&lt;ts&gt;</code>. Honest "tree as observed since <seed_ts>" badge; orphan reparenting shown as it would be in a live <code>ps</code>. Cmdline redaction reuses <code>tar_plugin.cpp</code> <code>load_redaction_patterns</code>.</p>
+<p>Data quality depends on the agent running from boot/install and being tamper-resistant — that hardening pillar is the parallel Guardian PR ladder (<a href="yuzu-guardian-windows-implementation-plan.html" class="doc-ref"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a> and successors). The viewer ships with honest "observation window" badging; the hardening track does not block this issue.</p>
+<p><strong>Files:</strong> <code>agents/plugins/tar/src/tar_plugin.cpp</code> (new <code>do_process_tree</code>), new <code>agents/plugins/tar/src/tar_process_tree_collector.{cpp,hpp}</code> (cross-platform walks), <code>server/core/src/dashboard_routes.cpp</code> (renderer), new <code>server/core/src/tar_process_tree_reconstruct.{cpp,hpp}</code>. Design: <a href="tar-dashboard.html" class="doc-ref"><code>docs/tar-dashboard.md</code></a> §5.</p>
+<hr>
+<h2 id="phase-16-system-guardian-real-time-agent-side-guaranteed-state">Phase 16: System Guardian — Real-Time Agent-Side Guaranteed State</h2>
+<p><em>The headline parity feature against the leading commercial endpoint-management platforms' real-time enforcement engines. PolicyStore (Phase 5) covers server-side compliance evaluation on a 5-minute poll; this phase covers the </em><em>kernel-event-driven, microsecond-latency, pre-login-active, fully-offline-capable</em><em> agent-side enforcement that makes guaranteed state operationally true rather than approximately true. Without Phase 16, "policy engine equivalent" overclaims — a 5-minute window is unacceptable for security-sensitive settings (firewall ports, registry-backed posture, EDR running). Design: <a href="yuzu-guardian-design-v1.1.html" class="doc-ref"><code>docs/yuzu-guardian-design-v1.1.md</code></a> (architecture), <a href="yuzu-guardian-windows-implementation-plan.html" class="doc-ref"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a> (Windows-first 17-PR delivery ladder).</em></p>
+<h3 id="issue-16a-system-guardian-windows-first-delivery">Issue 16.A: System Guardian — Windows-first delivery</h3>
+<p><strong>Capability:</strong> 31.1, 31.2, 31.3, 31.6, 31.7, 31.8, 31.9, 31.10 | <strong>Scope:</strong> Agent (Windows) + Server | <strong>Status:</strong> In progress (PRs 1-2 shipped)
+<strong>GitHub:</strong> <a href="https://github.com/Tr3kkR/Yuzu/issues/555">#555</a></p>
+<p>End-to-end Windows enforcement using kernel-backed user-mode APIs:
+- <strong>Event guards (~0 ms latency)</strong> — RegNotifyChangeKeyValue (Registry Guard), NotifyServiceStatusChange (SCM Guard), FwpmFilterSubscribeChanges0 (WFP Guard), OpenTrace + ProcessTrace with session pooling (ETW Guard).
+- <strong>Condition guards (configurable interval)</strong> — Process Guard (hybrid ETW + ToolHelp32), Software Guard (Registry Uninstall + WMI), Compliance Guard (Event Log + WMI), WMI Guard (arbitrary query).
+- <strong>Pre-login activation</strong> — agent service <code>SERVICE_AUTO_START</code> + <code>FailureActions</code>; <code>GuardianEngine::start_local()</code> runs before Register RPC.
+- <strong>Offline capable</strong> — policy cached in <code>kv_store.db</code> <code>__guardian__</code> namespace; enforcement continues when server is unreachable.
+- <strong>Operator surface</strong> — <code>/guaranteed-state</code> dashboard page (rule list + event timeline + kernel-wiring health), HTMX rule editor, approval workflow via existing <code>ApprovalManager</code>, MCP read-only tools, HMAC rule signing with <code>CredWrite</code>/<code>CredRead</code> key storage, quarantine integration via WFP block-all filter at weight 65535.</p>
+<p>PRs 1-2 (proto, server store, agent scaffolding, REST + dispatch hook) shipped. PRs 3-15 in <a href="yuzu-guardian-windows-implementation-plan.html" class="doc-ref"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a>. 14 prerequisite issues already filed (#452-#457, #477-#479, #483, #485, #487, #488, #491).</p>
+<p><strong>Files (anticipated):</strong> <code>proto/yuzu/guardian/v1/guaranteed_state.proto</code> (shipped), <code>server/core/src/guaranteed_state_store.{hpp,cpp}</code> (shipped), <code>agents/core/src/guardian_engine.{hpp,cpp}</code> (shipped), <code>agents/core/src/guard_*.{hpp,cpp}</code> (PR 3+), <code>agents/core/src/state_evaluator.{hpp,cpp}</code>, <code>agents/core/src/remediation_engine.{hpp,cpp}</code>, <code>agents/core/src/guard_audit.{hpp,cpp}</code>, <code>server/core/src/dashboard_guaranteed_state.{hpp,cpp}</code> (PR 4).</p>
+<h3 id="issue-16b-system-guardian-linux-delivery">Issue 16.B: System Guardian — Linux delivery</h3>
+<p><strong>Capability:</strong> 31.4, 31.6 (Linux) | <strong>Scope:</strong> Agent (Linux) | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 16.A soak | <strong>GitHub:</strong> <a href="https://github.com/Tr3kkR/Yuzu/issues/556">#556</a></p>
+<p>Linux equivalents of Windows event guards: Inotify Guard (<code>inotify_add_watch</code>), Netlink Guard (<code>NETLINK_KOBJECT_UEVENT</code>), D-Bus Guard (<code>org.freedesktop.systemd1</code> signals), Audit Guard (<code>auditd</code> consumer for syscall-level assertions), Sysctl Guard (<code>/proc/sys</code> watch + write remediation). Linux-specific assertion types (<code>config-file-key-equals</code>, <code>kernel-param-equals</code>, <code>selinux-mode-enforcing</code>). Remediation methods: systemd D-Bus service control, atomic file rewrite, <code>sysctl -w</code>, package install/remove via dpkg/rpm.</p>
+<p><strong>Why gated on Windows soak:</strong> the architectural primitives (state evaluator, remediation engine, resilience strategies, audit journal) are platform-agnostic — only the guard implementations are platform-specific. Building Linux before Windows soak risks discovering a primitive-level bug that the Windows track would have caught first.</p>
+<p><strong>Files:</strong> new <code>agents/core/src/guard_inotify.{cpp,hpp}</code>, <code>guard_netlink.{cpp,hpp}</code>, <code>guard_dbus.{cpp,hpp}</code>, <code>guard_audit_linux.{cpp,hpp}</code>, <code>guard_sysctl.{cpp,hpp}</code> (all Linux-only); <code>agents/core/meson.build</code> Linux block adding <code>libdbus-1</code>, <code>libaudit</code> deps.</p>
+<h3 id="issue-16c-system-guardian-macos-delivery">Issue 16.C: System Guardian — macOS delivery</h3>
+<p><strong>Capability:</strong> 31.5, 31.6 (macOS) | <strong>Scope:</strong> Agent (macOS) | <strong>Status:</strong> Open
+<strong>Depends on:</strong> 16.A + 16.B soak, Endpoint Security entitlement | <strong>GitHub:</strong> <a href="https://github.com/Tr3kkR/Yuzu/issues/557">#557</a></p>
+<p>macOS equivalents using Apple's Endpoint Security (ES) framework — <em>requires the <code>com.apple.developer.endpoint-security.client</code> entitlement</em>, which Apple grants per-bundle-ID after Developer Program enrolment and notarisation review (typically 4-8 weeks). Without ES the macOS surface is reduced to FSEvents Guard (<code>fseventsd</code> consumer) + Launchd Guard (plist polling + <code>launchctl</code> poll). macOS-specific assertion types (<code>plist-key-equals</code>, <code>launchd-service-running</code>, <code>xprotect-version-current</code>, <code>gatekeeper-enabled</code>). Remediation: plist serialisation + atomic write, <code>launchctl bootstrap</code>/<code>bootout</code>, <code>spctl --master-enable</code>.</p>
+<p><strong>Entitlement gating</strong> is tracked out-of-band in the customer-facing release-readiness doc; the issue ships in two phases — degraded surface first (FSEvents + Launchd, no ES), full surface when entitlement lands.</p>
+<p><strong>Files:</strong> new <code>agents/core/src/guard_endpoint_security.{cpp,hpp}</code> (macOS, ES-entitlement-gated), <code>guard_fsevents.{cpp,hpp}</code> (macOS), <code>guard_launchd.{cpp,hpp}</code> (macOS).</p>
+<hr>
+<h2 id="phase-17-agentic-surface-hardening-proposed">Phase 17: Agentic Surface Hardening (Proposed)</h2>
+<p><em>Implements the four agentic-first invariants from <a href="agentic-first-principle.html" class="doc-ref"><code>docs/agentic-first-principle.md</code></a> (A1 dashboard parity, A2 discovery, A3 observability, A4 error envelope). Source: <a href="capability-agentic-audit-2026-05.html" class="doc-ref"><code>docs/capability-agentic-audit-2026-05.md</code></a> §7 P1. Every operation a human can perform via the dashboard must be performable by an authenticated agentic worker through a documented, discoverable, machine-readable surface.</em></p>
+<h3 id="issue-171-introspection-endpoints-apiv1discover">Issue 17.1: Introspection Endpoints (<code>/api/v1/discover/*</code>)</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server (REST + MCP) | <strong>Status:</strong> Proposed</p>
+<p><code>/api/v1/discover/routes</code> (sourced from <code>openapi_spec()</code>), <code>/discover/plugins</code> (sourced from registered <code>PluginInfo</code>), <code>/discover/scope-kinds</code>, <code>/discover/permissions</code> (RBAC catalog), <code>/discover/instructions</code>. Each mirrored as an MCP tool (<code>discover_routes</code>, etc.). Supplants out-of-band YAML / Markdown for agent worker capability discovery. Implements <strong>A2</strong>.</p>
+<p><strong>Files:</strong> new <code>server/core/src/discovery_routes.{cpp,hpp}</code>, <code>mcp_server.cpp</code> tool registration, <a href="agentic-first-principle.html" class="doc-ref"><code>docs/agentic-first-principle.md</code></a> §A2.</p>
+<h3 id="issue-172-dashboard-json-content-negotiation">Issue 17.2: Dashboard JSON Content Negotiation</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server (dashboard) | <strong>Status:</strong> Proposed</p>
+<p>Honor <code>Accept: application/json</code> on <code>/fragments/*</code> page routes; return structured rows/columns/links/actions parallel to the HTML fragment. First-cut targets the admin surfaces (user mgmt, enrollment-token administration, settings panels). Existing fragments are not retroactively required to comply — backfill is opportunistic, A1 applies to new routes from the date of adoption. Implements <strong>A1</strong>.</p>
+<p><strong>Files:</strong> <code>server/core/src/dashboard_routes.cpp</code>, <code>dashboard_ui.cpp</code>, fragment route handlers.</p>
+<h3 id="issue-173-agent-facing-json-sse-channel">Issue 17.3: Agent-Facing JSON SSE Channel</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server (REST) | <strong>Status:</strong> Proposed</p>
+<p><code>/api/v1/events?since=&amp;filter=execution_id:X|agent_id:Y</code> emits structured JSON envelopes (not HTML fragments) on the same <code>event_bus_</code> and <code>ExecutionEventBus</code> that drive the existing HTMX <code>/events</code>. Patterns after <code>/api/v1/guaranteed-state/events</code> (<code>rest_api_v1.cpp:2498</code>). Decide separately whether to deprecate the HTML-fragment <code>/events</code> channel or keep both. Implements <strong>A3</strong>.</p>
+<p><strong>Files:</strong> new <code>server/core/src/agent_sse_routes.{cpp,hpp}</code>, reuse <code>server.cpp:2450-2478</code> infrastructure.</p>
+<h3 id="issue-174-service-account-principal-type">Issue 17.4: Service-Account Principal Type</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server (auth) | <strong>Status:</strong> Proposed</p>
+<p><code>auth_db</code> migration adds <code>principal_type IN ('user','service_account')</code>. Service accounts can be scoped to mgmt-group / plugin / operation subsets. Token rotation pair-overlap workflow exposed via REST. Required for least-privilege agentic worker identity in multi-tenant deployments. Touches A2 (discovery surface for service-account scopes).</p>
+<p><strong>Files:</strong> <code>server/core/src/auth_db.{cpp,hpp}</code>, <code>auth_routes.{cpp,hpp}</code>, <code>auth_manager.cpp</code>, new migration.</p>
+<h3 id="issue-175-structured-error-envelope-rev">Issue 17.5: Structured Error Envelope Rev</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server (REST + MCP) | <strong>Status:</strong> Proposed</p>
+<p>Every failure response includes <code>correlation_id</code>, <code>retry_after_ms</code> (nullable), <code>remediation</code> (URL or hint, nullable). On <code>kPermissionDenied</code> name the missing <code>securable_type:operation</code>. On <code>kApprovalRequired</code> return <code>approval_id</code> + <code>status_url</code>. Implements <strong>A4</strong>.</p>
+<p><strong>Files:</strong> <code>mcp_jsonrpc.hpp</code>, every REST handler emitting an error response, OpenAPI spec.</p>
+<hr>
+<h2 id="phase-18-compliance-lifecycle-proposed">Phase 18: Compliance &amp; Lifecycle (Proposed)</h2>
+<p><em>Capabilities currently absent from the roadmap; commonly required for enterprise compliance and lifecycle management. Source: <a href="capability-agentic-audit-2026-05.html" class="doc-ref"><code>docs/capability-agentic-audit-2026-05.md</code></a> §7 P3.</em></p>
+<h3 id="issue-181-vulnerability-lifecycle">Issue 18.1: Vulnerability Lifecycle</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Proposed</p>
+<p>CVE → CVSS → owner → SLA → remediation tracking. Supplements existing <code>vuln_scan</code> plugin with a server-side lifecycle store. Integrates with Phase 9 connectors for SCCM/Intune CVE feeds.</p>
+<h3 id="issue-182-compliance-reporting-templates">Issue 18.2: Compliance Reporting Templates</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Proposed</p>
+<p>CIS Benchmarks, NIST 800-171, SOC 2 evidence-pack templates that compose PolicyStore rules + audit log entries into auditor-ready PDF/CSV bundles.</p>
+<h3 id="issue-183-certificate-lifecycle">Issue 18.3: Certificate Lifecycle</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server + agent | <strong>Status:</strong> Proposed</p>
+<p>Auto-renewal, expiry alerts, revocation workflow. Extends existing certificate inventory (capability §3.8) with lifecycle.</p>
+<h3 id="issue-184-secrets-vault-integration">Issue 18.4: Secrets-Vault Integration</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Proposed</p>
+<p>HashiCorp Vault, Azure Key Vault, AWS Secrets Manager connectors for connector credentials and enrollment tokens. Replaces SQLite-encrypted-at-rest for shops with a vault.</p>
+<h3 id="issue-185-sbom-ingest">Issue 18.5: SBOM Ingest</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Server | <strong>Status:</strong> Proposed</p>
+<p>CycloneDX / SPDX import. Component-level vulnerability linkage so a CVE on <code>openssl-1.1.1k</code> lights up every fleet host carrying that component.</p>
+<h3 id="issue-186-hardware-attestation">Issue 18.6: Hardware Attestation</h3>
+<p><strong>Capability:</strong> new | <strong>Scope:</strong> Agent + server | <strong>Status:</strong> Proposed</p>
+<p>TPM, Secure Boot, UEFI verification. Reports posture state into compliance reporting (18.2).</p>
+<h3 id="out-of-scope-documented-exclusions">Out of scope (documented exclusions)</h3>
+<ul>
+<li><strong>MDM (mobile)</strong> — partner integration only; Yuzu's agent surface is workstation + server, not iOS / Android.</li>
+<li><strong>OS deployment / imaging / PXE</strong> — partner integration only; out of scope for endpoint management.</li>
+<li><strong>EDR-class telemetry at the agent</strong> — integrate via Phase 9 connectors to existing EDR (CrowdStrike, SentinelOne, MS Defender for Endpoint); do not re-implement at the agent.</li>
+</ul>
+<hr>
+<h2 id="open-decisions">Open Decisions</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Issue</th>
+<th>Topic</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>D1</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/251">#251</a></td>
+<td>License key generation and signing strategy</td>
+<td><strong>Open</strong> — Options: signed keys (offline), license server (online), or hybrid. Blocks production use of capability 22.3.</td>
+</tr>
+<tr>
+<td>D2</td>
+<td><a href="https://github.com/Tr3kkR/Yuzu/issues/252">#252</a></td>
+<td>CEL is a custom subset, not full Common Expression Language</td>
+<td><strong>Open</strong> — Current evaluator covers basic comparisons. Full CEL (cel-cpp) needed for enterprise policy expressions.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="future-phase-t3-items-not-scheduled">Future Phase (T3 Items — Not Scheduled)</h2>
+<p>These capabilities are tracked but not yet scheduled. Each will become a GitHub issue when prioritized.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Capability</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4.10</td>
+<td>ARP scanning</td>
+<td>Active subnet discovery (partially covered by <code>discovery</code> plugin <code>scan_subnet</code>)</td>
+</tr>
+<tr>
+<td>12.3</td>
+<td>WMI namespace enumeration</td>
+<td>WMI discovery (partially covered by <code>wmi</code> plugin configurable namespace)</td>
+</tr>
+<tr>
+<td>22.3</td>
+<td>License management</td>
+<td>Seat count, expiry, feature entitlements (LicenseStore exists; key generation strategy TBD — see D1)</td>
+</tr>
+<tr>
+<td>23.2</td>
+<td>Remote key-value access</td>
+<td>Cross-agent storage access</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="dependency-graph">Dependency Graph</h2>
+<div class="highlight"><pre><span></span><code>Phase 0–7 (All Done)
+  └── Foundation → Data Infrastructure → Instruction System → Security/RBAC
+      → Agent Infrastructure → Policy Engine → Windows Depth → Scale &amp; Integration
+
+Phase 8 (Visualization &amp; Response Experience)
+  ├── 8.1 Visualization Engine ── builds on ResponseStore + InstructionStore
+  ├── 8.2 Response Templates ──── requires 8.1
+  └── 8.3 Response Offloading ─── independent (reuses WebhookStore pattern)
+
+Phase 9 (Connector Framework)
+  ├── 9.1 Connector Core ──────── independent (new subsystem)
+  ├── 9.2 Repository Model ────── requires 9.1
+  ├── 9.3–9.7 Connectors ─────── require 9.1 (all independent of each other)
+  └── 9.8 Consolidation ──────── requires 9.2
+
+Phase 10 (Software Catalog)
+  ├── 10.1 Catalog Store ──────── requires 9.8 (normalized inventory data)
+  ├── 10.2 Usage Tracking ─────── requires 10.1
+  ├── 10.3 Entitlements ───────── requires 10.1
+  └── 10.4 Software Tags ─────── requires 10.1
+
+Phase 11 (Consumer Model)
+  ├── 11.1 Consumer Registration ── independent
+  ├── 11.2 Event Sources ──────── independent (extends WebhookStore + NotificationStore)
+  ├── 11.3 PowerShell Module ──── independent (wraps REST API)
+  └── 11.4 Python SDK ─────────── independent (wraps REST API)
+
+Phase 12 (Agent Capabilities)
+  ├── 12.1–12.6 ─── independent plugin extensions (no cross-deps)
+  ├── 12.7–12.9 ─── extend interaction plugin (sequential within plugin)
+  ├── 12.10 Patch Events ──────── extends windows_updates plugin
+  ├── 12.11 App Whitelisting ──── new plugin (independent)
+  ├── 12.12 Inventory Delta ───── extends agent core + InventoryStore
+  └── 12.13 Resource Distribution ── independent (new server store)
+
+Phase 13 (Security &amp; Polish)
+  ├── 13.1 2FA / TOTP ─────────── extends ApprovalManager
+  ├── 13.2 Instruction Chains ─── requires 7.14 Workflows
+  ├── 13.3 Monitoring UI ──────── independent (new dashboard page)
+  ├── 13.4 Branding ───────────── independent (CSS + RuntimeConfigStore)
+  └── 13.5 MCP Phase 2 ───────── requires 7.20 MCP Phase 1
+
+Phase 14 (Scale &amp; Enterprise)
+  ├── 14.1 P2P Content ────────── independent (agent-side mesh)
+  ├── 14.2 Multi-Gateway ──────── requires 7.1 + 7.1.1
+  ├── 14.3 DB Sharding ────────── extends ResponseStore
+  ├── 14.4 vCenter Connector ──── requires 9.1
+  ├── 14.5 Additional Connectors ── requires 9.1
+  └── 14.6 High Availability ──── independent (new subsystem)
+
+Cross-phase dependencies:
+  Phase 10 ──→ Phase 9.8 (catalog needs normalized inventory)
+  Phase 13.2 ──→ Phase 7.14 (chains extend workflows)
+  Phase 14.4–14.5 ──→ Phase 9.1 (connectors need framework)
+</code></pre></div>
+<hr>
+<h2 id="recommended-execution-order">Recommended Execution Order</h2>
+<p>Phases 0–7 are complete. For the remaining phases, execution order is based on enterprise value and dependencies:</p>
+<ol>
+<li><strong>Phase 8</strong> — Visualization &amp; response experience (immediate UX impact, small scope). 8.1 Response Visualization Engine done; six demo charts ship in <code>content/definitions/visualization_demo_set.yaml</code> and <code>content/packs/visualization-demo-pack.yaml</code>. 8.2 Response Templates done. 8.3 Response Offloading done — <code>offload_targets.db</code> + REST <code>/api/v1/offload-targets</code> + global fan-out wired into <code>AgentServiceImpl</code> for <code>agent.registered</code> and <code>execution.completed</code>. Phase 8 complete.</li>
+<li><strong>Phase 9</strong> — Connector framework (largest enterprise gap, enables Phases 10, 14.4–14.5)</li>
+<li><strong>Phase 10</strong> — Software catalog &amp; license compliance (builds on 9.8 normalization)</li>
+<li><strong>Phase 12</strong> — Remaining agent capabilities (closes capability map to 100%, parallelizable)</li>
+<li><strong>Phase 11</strong> — Consumer model &amp; SDKs (platform extensibility, parallelizable with 12)</li>
+<li><strong>Phase 13</strong> — Security hardening &amp; polish (2FA, branding, MCP write tools)</li>
+<li><strong>Phase 14</strong> — Scale &amp; enterprise readiness (P2P, multi-gateway, HA — large deployment needs)</li>
+<li><strong>Phase 15</strong> — TAR dashboard + scope walking (composable scope from previous query results — the product differentiator). 8-step PR ladder; PR-A (TAR page + retention-paused list) is in flight. Full design in <a href="tar-dashboard.html" class="doc-ref"><code>docs/tar-dashboard.md</code></a> and <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a>. Reference walkthrough: Chrome IR.</li>
+<li><strong>Phase 16</strong> — System Guardian (real-time agent-side guaranteed state). The headline parity feature against the leading commercial endpoint-management platforms' real-time enforcement engines. Windows-first 17-PR ladder per <a href="yuzu-guardian-windows-implementation-plan.html" class="doc-ref"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a>; PRs 1-2 shipped, PR 3+ open. Linux + macOS phases gated on Windows soak. Without this phase, "policy engine equivalent" overclaims.</li>
+</ol>
+<hr>
+<h2 id="issue-summary">Issue Summary</h2>
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th style="text-align: center;">Issues</th>
+<th style="text-align: center;">Capabilities Covered</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0: Foundation</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">7</td>
+</tr>
+<tr>
+<td>1: Data Infrastructure</td>
+<td style="text-align: center;">7</td>
+<td style="text-align: center;">12</td>
+</tr>
+<tr>
+<td>2: Instruction System</td>
+<td style="text-align: center;">12</td>
+<td style="text-align: center;">10</td>
+</tr>
+<tr>
+<td>3: Security &amp; RBAC</td>
+<td style="text-align: center;">9</td>
+<td style="text-align: center;">12</td>
+</tr>
+<tr>
+<td>4: Agent Infrastructure</td>
+<td style="text-align: center;">8</td>
+<td style="text-align: center;">14</td>
+</tr>
+<tr>
+<td>5: Policy Engine</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">6</td>
+</tr>
+<tr>
+<td>6: Windows Depth</td>
+<td style="text-align: center;">6</td>
+<td style="text-align: center;">13</td>
+</tr>
+<tr>
+<td>7: Scale &amp; Integration</td>
+<td style="text-align: center;">20</td>
+<td style="text-align: center;">24</td>
+</tr>
+<tr>
+<td>8: Visualization &amp; Response Experience</td>
+<td style="text-align: center;">3</td>
+<td style="text-align: center;">3</td>
+</tr>
+<tr>
+<td>9: Connector Framework</td>
+<td style="text-align: center;">8</td>
+<td style="text-align: center;">8</td>
+</tr>
+<tr>
+<td>10: Software Catalog</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">4</td>
+</tr>
+<tr>
+<td>11: Consumer Model</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">4</td>
+</tr>
+<tr>
+<td>12: Agent Capabilities</td>
+<td style="text-align: center;">13</td>
+<td style="text-align: center;">13</td>
+</tr>
+<tr>
+<td>13: Security &amp; Polish</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">5</td>
+</tr>
+<tr>
+<td>14: Scale &amp; Enterprise</td>
+<td style="text-align: center;">6</td>
+<td style="text-align: center;">6</td>
+</tr>
+<tr>
+<td>15: TAR Dashboard &amp; Scope Walking</td>
+<td style="text-align: center;">8</td>
+<td style="text-align: center;">8</td>
+</tr>
+<tr>
+<td>16: System Guardian (Real-Time GS)</td>
+<td style="text-align: center;">3</td>
+<td style="text-align: center;">10</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td style="text-align: center;"><strong>126</strong></td>
+<td style="text-align: center;"><strong>159</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Plus 4 future-tier items tracked but not scheduled. The remaining capabilities are covered by existing "Done" implementations.</p>
+</main>
+</body>
+</html>

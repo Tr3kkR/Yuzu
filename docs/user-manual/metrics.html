@@ -1,0 +1,1032 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prometheus Metrics and Observability</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/metrics.md</div>
+<h1 class="doc-title">Prometheus Metrics and Observability</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="prometheus-metrics-and-observability">Prometheus Metrics and Observability</h1>
+<p>Yuzu exposes a Prometheus-compatible <code>/metrics</code> endpoint on the server and
+provides real-time event streaming for dashboard live updates. This page covers
+how to scrape metrics, what is exposed, and how to connect Grafana or other
+monitoring tools.</p>
+<h2 id="metrics-endpoint">Metrics endpoint</h2>
+<h3 id="get-metrics">GET /metrics</h3>
+<p>Returns all server and connected-agent metrics in Prometheus exposition format.
+Localhost requests (<code>127.0.0.1</code>, <code>::1</code>) are always unauthenticated for
+Prometheus scraping. Remote requests require authentication by default. Use
+<code>--metrics-no-auth</code> (env: <code>YUZU_METRICS_NO_AUTH</code>) to allow unauthenticated
+remote access for external monitoring infrastructure.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span><span class="s1">&#39;http://localhost:8080/metrics&#39;</span>
+</code></pre></div>
+<p><strong>Example response (excerpt):</strong></p>
+<div class="highlight"><pre><span></span><code># HELP yuzu_server_http_requests_total Total HTTP requests handled
+# TYPE yuzu_server_http_requests_total counter
+yuzu_server_http_requests_total{method=&quot;GET&quot;,status=&quot;200&quot;} 1542
+yuzu_server_http_requests_total{method=&quot;POST&quot;,status=&quot;200&quot;} 87
+yuzu_server_http_requests_total{method=&quot;GET&quot;,status=&quot;404&quot;} 12
+
+# HELP yuzu_server_http_request_duration_seconds HTTP request latency
+# TYPE yuzu_server_http_request_duration_seconds histogram
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;0.005&quot;} 920
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;0.01&quot;} 1100
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;0.025&quot;} 1350
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;0.05&quot;} 1450
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;0.1&quot;} 1500
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;0.25&quot;} 1530
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;0.5&quot;} 1540
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;1.0&quot;} 1542
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;2.5&quot;} 1542
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;5.0&quot;} 1542
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;10.0&quot;} 1542
+yuzu_server_http_request_duration_seconds_bucket{method=&quot;GET&quot;,le=&quot;+Inf&quot;} 1542
+yuzu_server_http_request_duration_seconds_sum{method=&quot;GET&quot;} 12.345
+yuzu_server_http_request_duration_seconds_count{method=&quot;GET&quot;} 1542
+
+# HELP yuzu_server_connected_agents Number of currently connected agents
+# TYPE yuzu_server_connected_agents gauge
+yuzu_server_connected_agents 47
+</code></pre></div>
+<h2 id="naming-conventions">Naming conventions</h2>
+<p>All Yuzu metrics follow a consistent naming scheme.</p>
+<table>
+<thead>
+<tr>
+<th>Prefix</th>
+<th>Source</th>
+<th>Examples</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu_server_</code></td>
+<td>Server process</td>
+<td><code>yuzu_server_http_requests_total</code>, <code>yuzu_server_connected_agents</code></td>
+</tr>
+<tr>
+<td><code>yuzu_server_cert_</code></td>
+<td>Certificate reload</td>
+<td><code>yuzu_server_cert_reloads_total</code>, <code>yuzu_server_cert_reload_failures_total</code></td>
+</tr>
+<tr>
+<td><code>yuzu_agent_</code></td>
+<td>Agent process</td>
+<td><code>yuzu_agent_plugin_executions_total</code>, <code>yuzu_agent_heartbeat_latency_seconds</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="labels">Labels</h2>
+<p>Metrics carry a standard set of labels for filtering and grouping in queries.</p>
+<table>
+<thead>
+<tr>
+<th>Label</th>
+<th>Description</th>
+<th>Example values</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agent_id</code></td>
+<td>Unique agent identifier</td>
+<td><code>agent-001</code>, <code>dc2-web-14</code></td>
+</tr>
+<tr>
+<td><code>plugin</code></td>
+<td>Plugin that produced the metric</td>
+<td><code>hardware_info</code>, <code>network_info</code></td>
+</tr>
+<tr>
+<td><code>method</code></td>
+<td>HTTP method or RPC name</td>
+<td><code>GET</code>, <code>POST</code>, <code>Heartbeat</code></td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>HTTP status code or outcome</td>
+<td><code>200</code>, <code>500</code>, <code>success</code>, <code>failure</code></td>
+</tr>
+<tr>
+<td><code>os</code></td>
+<td>Agent operating system</td>
+<td><code>windows</code>, <code>linux</code>, <code>darwin</code></td>
+</tr>
+<tr>
+<td><code>arch</code></td>
+<td>Agent CPU architecture</td>
+<td><code>x64</code>, <code>arm64</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="histogram-buckets">Histogram buckets</h2>
+<p>All histogram metrics use the same default bucket boundaries (in seconds):</p>
+<div class="highlight"><pre><span></span><code>0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
+</code></pre></div>
+<p>These buckets are suitable for request latency tracking. The range covers
+sub-millisecond local operations through multi-second network calls.</p>
+<h2 id="prometheus-scrape-configuration">Prometheus scrape configuration</h2>
+<p>Add Yuzu to your Prometheus <code>prometheus.yml</code>. For local scrapers, no
+credentials are needed. Remote scrapers need <code>--metrics-no-auth</code> on the
+server or must provide authentication:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">scrape_configs</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">job_name</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;yuzu-server&#39;</span>
+<span class="w">    </span><span class="nt">static_configs</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">targets</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&#39;localhost:8080&#39;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">metrics_path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/metrics</span>
+<span class="w">    </span><span class="nt">scheme</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">http</span>
+</code></pre></div>
+<p><strong>Multiple servers:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nt">scrape_configs</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">job_name</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;yuzu-server&#39;</span>
+<span class="w">    </span><span class="nt">static_configs</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">targets</span><span class="p">:</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;yuzu-primary.example.com:8080&#39;</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;yuzu-secondary.example.com:8080&#39;</span>
+<span class="w">    </span><span class="nt">metrics_path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/metrics</span>
+<span class="w">    </span><span class="nt">scheme</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https</span>
+</code></pre></div>
+<h3 id="verifying-the-scrape">Verifying the scrape</h3>
+<p>After adding the configuration, confirm that Prometheus is scraping
+successfully:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Check target status</span>
+curl<span class="w"> </span>-s<span class="w"> </span><span class="s1">&#39;http://localhost:9090/api/v1/targets&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span><span class="s1">&#39;.data.activeTargets[] | select(.labels.job == &quot;yuzu-server&quot;)&#39;</span>
+
+<span class="c1"># Query a metric</span>
+curl<span class="w"> </span>-s<span class="w"> </span><span class="s1">&#39;http://localhost:9090/api/v1/query?query=yuzu_server_connected_agents&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+</code></pre></div>
+<h2 id="real-time-event-stream">Real-time event stream</h2>
+<h3 id="get-events">GET /events</h3>
+<p>The server exposes a Server-Sent Events (SSE) endpoint for real-time updates.
+The dashboard uses this for live agent status, but any SSE client can consume
+it. This endpoint requires authentication (session cookie).</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-N<span class="w"> </span><span class="s1">&#39;http://localhost:8080/events&#39;</span>
+</code></pre></div>
+<p><strong>Example output:</strong></p>
+<div class="highlight"><pre><span></span><code>event: agent-online
+data: agent-001
+
+event: agent-offline
+data: agent-003
+
+event: command-status
+data: cmd-20240319-001|success
+
+event: output
+data: agent-001|hardware_info|{&quot;cpu&quot;:&quot;Intel i7&quot;,&quot;ram_gb&quot;:32}
+</code></pre></div>
+<p><strong>Event types:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Event</th>
+<th>Data format</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agent-online</code></td>
+<td><code>{agent_id}</code></td>
+<td>An agent established a gRPC connection</td>
+</tr>
+<tr>
+<td><code>agent-offline</code></td>
+<td><code>{agent_id}</code></td>
+<td>An agent connection was lost</td>
+</tr>
+<tr>
+<td><code>pending-agent</code></td>
+<td><code>{agent_id}</code></td>
+<td>An agent is awaiting enrollment approval</td>
+</tr>
+<tr>
+<td><code>command-status</code></td>
+<td><code>{command_id}\|{status}</code></td>
+<td>An instruction finished executing</td>
+</tr>
+<tr>
+<td><code>output</code></td>
+<td><code>{agent_id}\|{plugin}\|{data}</code></td>
+<td>Streaming output from an instruction</td>
+</tr>
+<tr>
+<td><code>timing</code></td>
+<td><code>{command_id}\|{metric}={value}\|{phase}</code></td>
+<td>Execution timing data</td>
+</tr>
+</tbody>
+</table>
+<p>Note: event data is plain text (not JSON). Fields are pipe-delimited where
+multiple values are present.</p>
+<h3 id="agent-lifecycle-via-watchevents-rpc">Agent lifecycle via WatchEvents RPC</h3>
+<p>The gRPC <code>WatchEvents</code> RPC provides the same lifecycle events (connect,
+disconnect, plugin load) over a bidirectional stream. This is used internally
+by the gateway and can be consumed by custom integrations that prefer gRPC over
+SSE.</p>
+<h2 id="management-group-metrics">Management group metrics</h2>
+<p>The server exposes two gauges for management group telemetry. These are
+refreshed on every <code>/metrics</code> scrape.</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu_server_management_groups_total</code></td>
+<td>gauge</td>
+<td>Total number of management groups (including the root "All Devices" group)</td>
+</tr>
+<tr>
+<td><code>yuzu_server_group_members_total</code></td>
+<td>gauge</td>
+<td>Total membership records across all management groups</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Example output:</strong></p>
+<div class="highlight"><pre><span></span><code># HELP yuzu_server_management_groups_total Total number of management groups
+# TYPE yuzu_server_management_groups_total gauge
+yuzu_server_management_groups_total 5
+
+# HELP yuzu_server_group_members_total Total members across all management groups
+# TYPE yuzu_server_group_members_total gauge
+yuzu_server_group_members_total 42
+</code></pre></div>
+<p><strong>Useful PromQL queries:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Total management groups</span>
+<span class="nv">yuzu_server_management_groups_total</span>
+
+<span class="c1"># Average members per group</span>
+<span class="nv">yuzu_server_group_members_total</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="nv">yuzu_server_management_groups_total</span>
+
+<span class="c1"># Alert if no management groups exist (store may be down)</span>
+<span class="nv">yuzu_server_management_groups_total</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span>
+</code></pre></div>
+<h2 id="useful-promql-queries">Useful PromQL queries</h2>
+<h3 id="fleet-overview">Fleet overview</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Total connected agents</span>
+<span class="nv">yuzu_server_connected_agents</span>
+
+<span class="c1"># Connected agents by OS</span>
+<span class="k">count</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">os</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="nv">yuzu_agent_info</span><span class="o">)</span>
+
+<span class="c1"># Connected agents by architecture</span>
+<span class="k">count</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">arch</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="nv">yuzu_agent_info</span><span class="o">)</span>
+</code></pre></div>
+<h3 id="request-performance">Request performance</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Request rate (per second, 5-minute window)</span>
+<span class="kr">rate</span><span class="o">(</span><span class="nv">yuzu_server_http_requests_total</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span>
+
+<span class="c1"># 95th percentile latency</span>
+<span class="kr">histogram_quantile</span><span class="o">(</span><span class="mf">0.95</span><span class="p">,</span><span class="w"> </span><span class="kr">rate</span><span class="o">(</span><span class="nv">yuzu_server_http_request_duration_seconds_bucket</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">))</span>
+
+<span class="c1"># Error rate (percentage of 5xx responses)</span>
+<span class="k">sum</span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">yuzu_server_http_requests_total</span><span class="p">{</span><span class="nl">status</span><span class="o">=~</span><span class="p">&quot;</span><span class="s">5..</span><span class="p">&quot;}[</span><span class="s">5m</span><span class="p">]</span><span class="o">))</span>
+<span class="o">/</span><span class="w"> </span><span class="k">sum</span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">yuzu_server_http_requests_total</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">))</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">100</span>
+</code></pre></div>
+<h3 id="agent-health">Agent health</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Agents with heartbeat latency over 5 seconds</span>
+<span class="nv">yuzu_agent_heartbeat_latency_seconds</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">5</span>
+
+<span class="c1"># Plugin execution failure rate by plugin</span>
+<span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">plugin</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">yuzu_agent_plugin_executions_total</span><span class="p">{</span><span class="nl">status</span><span class="o">=</span><span class="p">&quot;</span><span class="s">failure</span><span class="p">&quot;}[</span><span class="s">5m</span><span class="p">]</span><span class="o">))</span>
+<span class="o">/</span><span class="w"> </span><span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">plugin</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="kr">rate</span><span class="o">(</span><span class="nv">yuzu_agent_plugin_executions_total</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">))</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">100</span>
+</code></pre></div>
+<h3 id="plugin-load-signing-rejections-yuzu_agent_plugin_rejected_total">Plugin load + signing rejections (<code>yuzu_agent_plugin_rejected_total</code>)</h3>
+<p>Counter incremented every time the agent rejects a plugin at scan time
+<strong>before</strong> the plugin's code runs. The <code>reason</code> label is bounded to a
+fixed set of stable string prefixes — alert rules SHOULD pin against
+the literal label values, not substring matches.</p>
+<table>
+<thead>
+<tr>
+<th>Reason label</th>
+<th>Meaning</th>
+<th>Operator action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>reserved_name</code></td>
+<td>Plugin declared a reserved name (<code>__guard__</code>, <code>__system__</code>, <code>__update__</code>). Possible plugin-author error or a malicious shadowing attempt (#453).</td>
+<td>Investigate the plugin source / drop.</td>
+</tr>
+<tr>
+<td><code>load_failed</code></td>
+<td><code>dlopen</code> / <code>LoadLibrary</code> failed, missing <code>yuzu_plugin_descriptor</code> export, or ABI version mismatch.</td>
+<td>Check the agent log for the dlopen error and rebuild the plugin against the current SDK ABI.</td>
+</tr>
+<tr>
+<td><code>signature_missing</code></td>
+<td><code>--plugin-trust-bundle</code> is set, <code>--plugin-require-signature</code> is set, and a plugin has no <code>&lt;plugin&gt;.so.sig</code> sibling.</td>
+<td>Sign the plugin, deploy the <code>.sig</code> alongside, or relax the require flag.</td>
+</tr>
+<tr>
+<td><code>signature_invalid</code></td>
+<td><code>.sig</code> file exists but the CMS verification failed at the signature/digest layer (most commonly: the plugin file was modified after signing).</td>
+<td>Re-sign the plugin or investigate tampering.</td>
+</tr>
+<tr>
+<td><code>signature_untrusted_chain</code></td>
+<td>The signing cert does not chain to a CA in the operator's trust bundle, OR the leaf cert lacks <code>EKU=codeSigning</code>, OR the cert chain has expired.</td>
+<td>Verify the bundle includes the right CA root; re-issue a leaf with <code>extendedKeyUsage=codeSigning</code>; rotate expired CAs.</td>
+</tr>
+</tbody>
+</table>
+<div class="highlight"><pre><span></span><code><span class="c1"># WARN: any plugin rejected for an invalid signature in the last 5 min</span>
+<span class="c1"># (most often: tampered file in the plugin dir).</span>
+<span class="kr">increase</span><span class="o">(</span><span class="nv">yuzu_agent_plugin_rejected_total</span><span class="p">{</span><span class="nl">reason</span><span class="o">=</span><span class="p">&quot;</span><span class="s">signature_invalid</span><span class="p">&quot;}[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span>
+
+<span class="c1"># CRITICAL: chain validation failure means a plugin was signed against</span>
+<span class="c1"># a CA the operator&#39;s trust bundle doesn&#39;t anchor — supply-chain signal,</span>
+<span class="c1"># or an expired/revoked operator CA.</span>
+<span class="kr">increase</span><span class="o">(</span><span class="nv">yuzu_agent_plugin_rejected_total</span><span class="p">{</span><span class="nl">reason</span><span class="o">=</span><span class="p">&quot;</span><span class="s">signature_untrusted_chain</span><span class="p">&quot;}[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span>
+
+<span class="c1"># Volume tracker: missing-sig rejections during a signing rollout</span>
+<span class="c1"># (transitional → enforced). Expect this to be non-zero only during</span>
+<span class="c1"># rollout, then drop to 0 once every plugin has a .sig sibling.</span>
+<span class="k">sum</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="o">(</span><span class="nv">instance</span><span class="o">)</span><span class="w"> </span><span class="o">(</span><span class="kr">increase</span><span class="o">(</span><span class="nv">yuzu_agent_plugin_rejected_total</span><span class="p">{</span><span class="nl">reason</span><span class="o">=</span><span class="p">&quot;</span><span class="s">signature_missing</span><span class="p">&quot;}[</span><span class="s">1h</span><span class="p">]</span><span class="o">))</span>
+
+<span class="c1"># Reserved-name attempts (#453) — should be 0 in normal operation.</span>
+<span class="kr">increase</span><span class="o">(</span><span class="nv">yuzu_agent_plugin_rejected_total</span><span class="p">{</span><span class="nl">reason</span><span class="o">=</span><span class="p">&quot;</span><span class="s">reserved_name</span><span class="p">&quot;}[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span>
+</code></pre></div>
+<h3 id="instruction-throughput">Instruction throughput</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Instructions completed per minute</span>
+<span class="kr">rate</span><span class="o">(</span><span class="nv">yuzu_server_instructions_completed_total</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">60</span>
+
+<span class="c1"># Average instruction duration</span>
+<span class="kr">rate</span><span class="o">(</span><span class="nv">yuzu_server_instruction_duration_seconds_sum</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span>
+<span class="o">/</span><span class="w"> </span><span class="kr">rate</span><span class="o">(</span><span class="nv">yuzu_server_instruction_duration_seconds_count</span><span class="p">[</span><span class="s">5m</span><span class="p">]</span><span class="o">)</span>
+</code></pre></div>
+<h2 id="grafana-integration">Grafana integration</h2>
+<p>Import the Prometheus data source into Grafana and use the PromQL queries
+above to build dashboards. A typical Yuzu dashboard includes:</p>
+<table>
+<thead>
+<tr>
+<th>Panel</th>
+<th>Visualization</th>
+<th>Query</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Connected agents</td>
+<td>Stat / single value</td>
+<td><code>yuzu_server_connected_agents</code></td>
+</tr>
+<tr>
+<td>Agents by OS</td>
+<td>Pie chart</td>
+<td><code>count by (os) (yuzu_agent_info)</code></td>
+</tr>
+<tr>
+<td>Request rate</td>
+<td>Time series</td>
+<td><code>rate(yuzu_server_http_requests_total[5m])</code></td>
+</tr>
+<tr>
+<td>Request latency (p95)</td>
+<td>Time series</td>
+<td><code>histogram_quantile(0.95, ...)</code></td>
+</tr>
+<tr>
+<td>Error rate</td>
+<td>Time series</td>
+<td><code>5xx / total * 100</code></td>
+</tr>
+<tr>
+<td>Instruction throughput</td>
+<td>Time series</td>
+<td><code>rate(yuzu_server_instructions_completed_total[5m])</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="alerting-rules">Alerting rules</h3>
+<p>Example Prometheus alerting rules for Yuzu:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">groups</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu</span>
+<span class="w">    </span><span class="nt">rules</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">alert</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">YuzuNoAgentsConnected</span>
+<span class="w">        </span><span class="nt">expr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu_server_connected_agents == 0</span>
+<span class="w">        </span><span class="nt">for</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5m</span>
+<span class="w">        </span><span class="nt">labels</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">severity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">critical</span>
+<span class="w">        </span><span class="nt">annotations</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">summary</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;No</span><span class="nv"> </span><span class="s">agents</span><span class="nv"> </span><span class="s">connected</span><span class="nv"> </span><span class="s">to</span><span class="nv"> </span><span class="s">Yuzu</span><span class="nv"> </span><span class="s">server&quot;</span>
+
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">alert</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">YuzuHighErrorRate</span>
+<span class="w">        </span><span class="nt">expr</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">          </span><span class="no">sum(rate(yuzu_server_http_requests_total{status=~&quot;5..&quot;}[5m]))</span>
+<span class="w">          </span><span class="no">/ sum(rate(yuzu_server_http_requests_total[5m])) &gt; 0.05</span>
+<span class="w">        </span><span class="nt">for</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10m</span>
+<span class="w">        </span><span class="nt">labels</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">severity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">warning</span>
+<span class="w">        </span><span class="nt">annotations</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">summary</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Yuzu</span><span class="nv"> </span><span class="s">server</span><span class="nv"> </span><span class="s">error</span><span class="nv"> </span><span class="s">rate</span><span class="nv"> </span><span class="s">above</span><span class="nv"> </span><span class="s">5%&quot;</span>
+
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">alert</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">YuzuHighLatency</span>
+<span class="w">        </span><span class="nt">expr</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">          </span><span class="no">histogram_quantile(0.95,</span>
+<span class="w">            </span><span class="no">rate(yuzu_server_http_request_duration_seconds_bucket[5m])</span>
+<span class="w">          </span><span class="no">) &gt; 2.0</span>
+<span class="w">        </span><span class="nt">for</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10m</span>
+<span class="w">        </span><span class="nt">labels</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">severity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">warning</span>
+<span class="w">        </span><span class="nt">annotations</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">summary</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Yuzu</span><span class="nv"> </span><span class="s">server</span><span class="nv"> </span><span class="s">p95</span><span class="nv"> </span><span class="s">latency</span><span class="nv"> </span><span class="s">above</span><span class="nv"> </span><span class="s">2</span><span class="nv"> </span><span class="s">seconds&quot;</span>
+</code></pre></div>
+<h2 id="security-considerations">Security considerations</h2>
+<h3 id="fleet-metadata-in-metrics-labels">Fleet metadata in metrics labels</h3>
+<p>The <code>/metrics</code> endpoint exposes aggregated fleet composition data through gauge metrics:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Labels</th>
+<th>Information exposed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu_fleet_agents_by_os</code></td>
+<td><code>os</code></td>
+<td>OS distribution (windows, linux, darwin counts)</td>
+</tr>
+<tr>
+<td><code>yuzu_fleet_agents_by_arch</code></td>
+<td><code>arch</code></td>
+<td>CPU architecture distribution (x64, arm64 counts)</td>
+</tr>
+<tr>
+<td><code>yuzu_fleet_agents_by_version</code></td>
+<td><code>version</code></td>
+<td>Agent version inventory</td>
+</tr>
+</tbody>
+</table>
+<p>This data reveals your fleet's attack surface to anyone who can reach the metrics endpoint. An attacker who learns that 80% of your fleet runs Windows x64 with agent v0.4.2 can target known vulnerabilities for that specific combination.</p>
+<p><strong>Mitigations (in order of preference):</strong></p>
+<ol>
+<li><strong>Keep the default</strong> — remote <code>/metrics</code> access requires authentication. Localhost is always open for co-located Prometheus.</li>
+<li><strong>Restrict network access</strong> — if Prometheus scrapes remotely, use firewall rules or a reverse proxy with authentication in front of the metrics endpoint.</li>
+<li><strong>Use <code>--metrics-no-auth</code> with caution</strong> — only enable unauthenticated remote access when the metrics endpoint is on a trusted monitoring network, not exposed to the general corporate network or internet.</li>
+<li><strong>API token auth</strong> — when available (Phase 3), create a dedicated metrics-scraper API token with read-only scope.</li>
+</ol>
+<blockquote>
+<p><strong>Default posture:</strong> The server binds to <code>127.0.0.1</code> and requires auth for remote <code>/metrics</code> access. No action is needed if you scrape from localhost.</p>
+</blockquote>
+<h2 id="transport-observability-905-912">Transport observability (#905 / #912)</h2>
+<p>The agent listener pumps per-call observability into the <code>yuzu_server_transport_*</code> namespace. Wired in 0.13.x — pre-0.13 these metrics did not exist.</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Type</th>
+<th>Labels</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu_server_transport_streams_total</code></td>
+<td>counter</td>
+<td><code>direction</code> ∈ {opened, closed}, <code>method</code></td>
+<td>One increment per stream open + one per close. <code>direction</code> distinguishes start from end of stream lifetime.</td>
+</tr>
+<tr>
+<td><code>yuzu_server_transport_active_streams</code></td>
+<td>gauge</td>
+<td>(none)</td>
+<td>Open streams minus closed streams. Eventually returns to 0; persistent non-zero post-quiet-period suggests a torn shutdown leaked an open count (operator: process restart resets).</td>
+</tr>
+<tr>
+<td><code>yuzu_server_transport_bytes_total</code></td>
+<td>counter</td>
+<td received sent_="sent,"><code>direction</code> ∈</td>
+<td>Total bytes flowing through the listener. Useful for sanity-checking throughput.</td>
+</tr>
+<tr>
+<td><code>yuzu_server_transport_dispatcher_throws_total</code></td>
+<td>counter</td>
+<td dispatcher_internal non_std_exception_="non_std_exception," std_exception_="std_exception,"><code>kind</code> ∈</td>
+<td>Dispatcher-layer exception counter. Distinct from <code>bidi_pool_saturated_total</code> — saturation is capacity, throws are bugs. Investigate any non-zero rate.</td>
+</tr>
+<tr>
+<td><code>yuzu_server_transport_bidi_pool_size</code></td>
+<td>gauge</td>
+<td>(none)</td>
+<td>The configured <code>--bidi-dispatcher-pool-size</code>. Set once at start, zeroed at shutdown.</td>
+</tr>
+<tr>
+<td><code>yuzu_server_transport_bidi_pool_in_flight</code></td>
+<td>gauge</td>
+<td>(none)</td>
+<td>Slot residency: queued calls + active handlers. Long-running bidi handlers hold 1 unit for their lifetime.</td>
+</tr>
+<tr>
+<td><code>yuzu_server_transport_bidi_pool_saturated_total</code></td>
+<td>counter</td>
+<td><code>method</code></td>
+<td>Saturation rejects (peer saw <code>ResourceExhausted</code>). One per fired reject.</td>
+</tr>
+</tbody>
+</table>
+<p>Three Grafana alerts ship in <code>deploy/grafana/yuzu-alerts.yml</code> against this surface — see <a href="../ops-runbooks/transport-saturation.html" class="doc-ref"><code>docs/ops-runbooks/transport-saturation.md</code></a> for the runbook.</p>
+<h2 id="ota-observability-911-913-924">OTA observability (#911 / #913 / #924)</h2>
+<p>The OTA path emits both client-side (agent) and server-side (<code>yuzu-server</code>) counters so operators can correlate failure across the boundary.</p>
+<h3 id="server-side-extends-yuzu_grpc_requests_total">Server side (extends <code>yuzu_grpc_requests_total</code>)</h3>
+<p><code>yuzu_grpc_requests_total{method="DownloadUpdate"}</code> gains three bounded <code>status</code> values in 0.13.x:</p>
+<table>
+<thead>
+<tr>
+<th>Status</th>
+<th>Cause</th>
+<th>Operator action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>chunk_write_deadline_exceeded</code></td>
+<td>Per-chunk write deadline fired during chunk streaming — peer's TCP receive window collapsed, NAT/firewall held the stream, or HTTP/2 flow-control window collapsed. Deadline is operator-tunable via <code>--ota-chunk-write-deadline-secs</code> / <code>YUZU_OTA_CHUNK_WRITE_DEADLINE_SECS</code> (default 30 s; #934 / UP-206).</td>
+<td>If sustained on a slow-link fleet (satellite, residential 4G/LTE, congested corp WAN): raise the deadline. If a single peer: that peer's link is dropping; investigate the network path. Note that raising the deadline directly increases worst-case bidi pool occupancy — keep it well below half the heartbeat deadline (<code>kBidiHeartbeatDeadline = 30 s</code>) to avoid starving Subscribe / heartbeat traffic, and add <code>expected_concurrent_ota × (new_deadline / 30)</code> slots to your <code>--bidi-dispatcher-pool-size</code> headroom.</td>
+</tr>
+<tr>
+<td><code>rate_limited_per_peer</code></td>
+<td>Per-peer token bucket exhausted (5 tokens, ~1 token / 90 min refill — the deadline side is operator-tunable via <code>--ota-chunk-write-deadline-secs</code>, but bucket capacity / refill rate are not yet operator-tunable). The peer hammered DownloadUpdate <strong>with calls that succeeded</strong> — chunk-write-deadline failures are refunded (see <code>rate_limit_token_refunded</code> below) so a slow-link peer cannot exhaust the bucket through deadline failures alone.</td>
+<td>If a single peer: investigate that peer for misbehavior or compromise (a peer that drains the bucket via successful calls is the fast-valid monopolisation case the rate limit is designed to catch). If many peers: bucket sizing may be too tight for your fleet — file an issue.</td>
+</tr>
+<tr>
+<td><code>rate_limit_token_refunded</code></td>
+<td>A chunk-write deadline fired and the consumed bucket token was refunded (#934 / UP-206). This counter must track <code>chunk_write_deadline_exceeded</code> 1:1 in steady state; divergence (<code>chunk_write_deadline_exceeded</code> − <code>rate_limit_token_refunded</code> &gt; 0<code>) signals a refund-wiring regression. Companion event to a</code>chunk_write_deadline_exceeded<code>increment on the same call, not a standalone denial outcome. | Wire a Prometheus alert on</code>increase(...status="chunk_write_deadline_exceeded"[5m]) &gt; increase(...status="rate_limit_token_refunded"[5m])`; non-zero divergence is a regression bug worth filing.</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="agent-side">Agent side</h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Type</th>
+<th>Labels</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu_agent_ota_chunk_deadline_total</code></td>
+<td>counter</td>
+<td read write_="write,"><code>phase</code> ∈</td>
+<td>Per-frame deadline expiries observed by the agent during DownloadUpdate. <code>phase=write</code> = request-frame write deadline (5 s) tripped — usually means the channel is stuck before the request even landed. <code>phase=read</code> = chunk-read deadline (30 s) tripped — server stalled mid-stream or the channel is broken.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="reconnect-observability-sre-3-925">Reconnect observability (SRE-3 / #925)</h2>
+<p><code>yuzu_agent_reconnections_total</code> gains a <code>reason</code> label in 0.13.x. <strong>Existing bare-counter PromQL still works</strong> (aggregates across labels); operators alerting on the bare counter need no migration.</p>
+<table>
+<thead>
+<tr>
+<th>Reason</th>
+<th>Cause</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>channel_fault</code></td>
+<td>Transport-level error: Register RPC failed, OR Subscribe stream final_status was non-Ok. The most operator-actionable signal — TLS rotation gone wrong, certificate expiry, listener restart loop.</td>
+</tr>
+<tr>
+<td><code>peer_halfclose</code></td>
+<td>Server gracefully closed bidi (Subscribe final_status Ok). Benign — happens during planned restart.</td>
+</tr>
+<tr>
+<td><code>stream_open_failed</code></td>
+<td><code>open_bidi()</code> returned null (resource exhaustion, listener saturation, channel closed).</td>
+</tr>
+<tr>
+<td><code>enrollment_pending</code></td>
+<td>RegisterResponse marked the agent pending admin approval. Will retry on next backoff cycle.</td>
+</tr>
+</tbody>
+</table>
+<p>The <code>YuzuAgentChannelFaultRate</code> alert in <code>deploy/grafana/yuzu-alerts.yml</code> fires on <code>channel_fault</code> rate &gt; 0.5/s sustained.</p>
+<h2 id="planned-features">Planned features</h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Roadmap</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>System health dashboard</td>
+<td>Phase 7, Issue 7.2</td>
+<td>Server CPU, memory, connection counts, queue depths</td>
+</tr>
+<tr>
+<td>Topology map</td>
+<td>Phase 7</td>
+<td>Visual map of server nodes, gateways, and agent counts</td>
+</tr>
+<tr>
+<td>Grafana dashboard templates</td>
+<td>Planned</td>
+<td>Pre-built JSON dashboard files in <code>docs/grafana/</code></td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

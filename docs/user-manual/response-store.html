@@ -1,0 +1,885 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Response Store and Data Export</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/response-store.md</div>
+<h1 class="doc-title">Response Store and Data Export</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="response-store-and-data-export">Response Store and Data Export</h1>
+<p>The response store persists every instruction result returned by agents. It
+provides filtering, aggregation, and export capabilities so operators can
+analyze fleet-wide data without an external database.</p>
+<h2 id="storage">Storage</h2>
+<p>Responses are stored in a dedicated SQLite database using WAL (Write-Ahead
+Logging) mode. Each response is recorded as a <code>StoredResponse</code> containing the
+agent identity, instruction metadata, execution status, result payload, and
+timing information.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Retention period</td>
+<td>90 days</td>
+<td>Responses older than this are deleted by background cleanup</td>
+</tr>
+<tr>
+<td>Cleanup interval</td>
+<td>1 hour</td>
+<td>How often the background thread prunes expired responses</td>
+</tr>
+</tbody>
+</table>
+<h2 id="response-structure">Response structure</h2>
+<p>Every stored response contains:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id</code></td>
+<td>integer</td>
+<td>Unique identifier for the response</td>
+</tr>
+<tr>
+<td><code>instruction_id</code></td>
+<td>string</td>
+<td>Identifier of the instruction that was executed</td>
+</tr>
+<tr>
+<td><code>agent_id</code></td>
+<td>string</td>
+<td>Agent that produced the response</td>
+</tr>
+<tr>
+<td><code>timestamp</code></td>
+<td>integer</td>
+<td>Unix timestamp when the server recorded the response</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>integer</td>
+<td>CommandResponse::Status enum value (0 = success, etc.)</td>
+</tr>
+<tr>
+<td><code>output</code></td>
+<td>string</td>
+<td>Command output text</td>
+</tr>
+<tr>
+<td><code>error_detail</code></td>
+<td>string</td>
+<td>Error message if the execution failed</td>
+</tr>
+</tbody>
+</table>
+<h2 id="typed-result-schemas">Typed result schemas</h2>
+<p>Every instruction definition declares a result schema specifying column names
+and types. This enables structured querying and ensures clean export to
+downstream analytics platforms.</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Description</th>
+<th>Example value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bool</code></td>
+<td>Boolean</td>
+<td><code>true</code></td>
+</tr>
+<tr>
+<td><code>int32</code></td>
+<td>32-bit signed integer</td>
+<td><code>42</code></td>
+</tr>
+<tr>
+<td><code>int64</code></td>
+<td>64-bit signed integer</td>
+<td><code>1099511627776</code></td>
+</tr>
+<tr>
+<td><code>string</code></td>
+<td>UTF-8 text</td>
+<td><code>"Windows 11 Pro"</code></td>
+</tr>
+<tr>
+<td><code>datetime</code></td>
+<td>ISO 8601 timestamp</td>
+<td><code>"2024-03-19T14:30:00Z"</code></td>
+</tr>
+<tr>
+<td><code>guid</code></td>
+<td>UUID</td>
+<td><code>"550e8400-e29b-41d4-a716-446655440000"</code></td>
+</tr>
+<tr>
+<td><code>clob</code></td>
+<td>Large text (configurable truncation)</td>
+<td>Full file contents, log output</td>
+</tr>
+</tbody>
+</table>
+<p>Typed schemas make it straightforward to create ClickHouse tables, Splunk
+sourcetypes, or Excel pivot tables from exported data.</p>
+<h2 id="rest-api">REST API</h2>
+<h3 id="get-apiresponsesinstruction_id">GET /api/responses/{instruction_id}</h3>
+<p>Retrieve responses for a specific instruction execution with optional
+filtering and pagination.</p>
+<p><strong>Path parameters:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>instruction_id</code></td>
+<td>string</td>
+<td>The instruction execution to query</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Query parameters:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agent_id</code></td>
+<td>string</td>
+<td>Filter by agent</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>integer</td>
+<td>Filter by status (integer enum value)</td>
+</tr>
+<tr>
+<td><code>since</code></td>
+<td>integer</td>
+<td>Only responses after this Unix timestamp</td>
+</tr>
+<tr>
+<td><code>until</code></td>
+<td>integer</td>
+<td>Only responses before this Unix timestamp</td>
+</tr>
+<tr>
+<td><code>limit</code></td>
+<td>integer</td>
+<td>Number of responses to return (default 100)</td>
+</tr>
+<tr>
+<td><code>offset</code></td>
+<td>integer</td>
+<td>Offset for pagination (default 0)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Response envelope:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;responses&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w"> </span><span class="err">...</span><span class="w"> </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">42</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><strong>Example --- fetch all responses for an instruction:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/responses/instr-20240319-001&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+</code></pre></div>
+<p><strong>Example --- filter by agent and status:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/responses/instr-20240319-001?agent_id=agent-007&amp;status=0&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+</code></pre></div>
+<p><strong>Example --- paginate through large result sets:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Page 1 (first 100)</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/responses/instr-20240319-001?limit=100&amp;offset=0&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+
+<span class="c1"># Page 2 (next 100)</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/responses/instr-20240319-001?limit=100&amp;offset=100&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+</code></pre></div>
+<p><strong>Example --- find all failures:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/responses/instr-20240319-001?status=1&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span><span class="s1">&#39;.responses[] | {agent_id, error_detail}&#39;</span>
+</code></pre></div>
+<h2 id="aggregation">Aggregation</h2>
+<h3 id="get-apiresponsesinstruction_idaggregate">GET /api/responses/{instruction_id}/aggregate</h3>
+<p>The response store supports server-side aggregation so operators can compute
+fleet-wide statistics without downloading every row.</p>
+<p><strong>Query parameters:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>group_by</code></td>
+<td>string</td>
+<td>Column to group by (default: <code>status</code>). Common values: <code>status</code>, <code>agent_id</code></td>
+</tr>
+<tr>
+<td><code>op</code></td>
+<td>string</td>
+<td>Aggregation function: <code>count</code> (default), <code>sum</code>, <code>avg</code>, <code>min</code>, <code>max</code></td>
+</tr>
+<tr>
+<td><code>op_column</code></td>
+<td>string</td>
+<td>Column for sum/avg/min/max operations</td>
+</tr>
+<tr>
+<td><code>agent_id</code></td>
+<td>string</td>
+<td>Filter by agent</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>integer</td>
+<td>Filter by status</td>
+</tr>
+<tr>
+<td><code>since</code></td>
+<td>integer</td>
+<td>Only responses after this Unix timestamp</td>
+</tr>
+<tr>
+<td><code>until</code></td>
+<td>integer</td>
+<td>Only responses before this Unix timestamp</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Response:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;instruction_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;instr-20240319-001&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;groups&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;group_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;0&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">35</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;aggregate_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;group_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">7</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;aggregate_value&quot;</span><span class="p">:</span><span class="w"> </span><span class="mf">0.0</span><span class="w"> </span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;total_groups&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;total_rows&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">42</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="supported-functions">Supported functions</h3>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th><code>op</code> value</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Count</td>
+<td><code>count</code></td>
+<td>Number of matching responses (default)</td>
+</tr>
+<tr>
+<td>Sum</td>
+<td><code>sum</code></td>
+<td>Sum of a numeric column</td>
+</tr>
+<tr>
+<td>Average</td>
+<td><code>avg</code></td>
+<td>Average of a numeric column</td>
+</tr>
+<tr>
+<td>Minimum</td>
+<td><code>min</code></td>
+<td>Minimum value of a column</td>
+</tr>
+<tr>
+<td>Maximum</td>
+<td><code>max</code></td>
+<td>Maximum value of a column</td>
+</tr>
+</tbody>
+</table>
+<h3 id="drill-down">Drill-down</h3>
+<p>Operators can click an aggregate row in the dashboard to drill down into the
+individual responses that compose it. The dashboard passes the group key as
+filter parameters to the response query endpoint.</p>
+<h2 id="data-export">Data export</h2>
+<h3 id="get-apiresponsesinstruction_idexport">GET /api/responses/{instruction_id}/export</h3>
+<p>The dedicated export endpoint supports both CSV and JSON formats with the same
+filter parameters as the query endpoint. It defaults to a higher limit
+(10,000 rows) for bulk exports.</p>
+<p><strong>Query parameters:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>format</code></td>
+<td>string</td>
+<td>Export format: <code>csv</code> or <code>json</code> (default: <code>json</code>)</td>
+</tr>
+<tr>
+<td><code>agent_id</code></td>
+<td>string</td>
+<td>Filter by agent</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>integer</td>
+<td>Filter by status</td>
+</tr>
+<tr>
+<td><code>since</code></td>
+<td>integer</td>
+<td>Only responses after this Unix timestamp</td>
+</tr>
+<tr>
+<td><code>until</code></td>
+<td>integer</td>
+<td>Only responses before this Unix timestamp</td>
+</tr>
+<tr>
+<td><code>limit</code></td>
+<td>integer</td>
+<td>Number of responses to export (default 10,000)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Example --- export instruction responses as CSV:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/responses/instr-20240319-001/export?format=csv&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-o<span class="w"> </span>responses.csv
+</code></pre></div>
+<p><strong>Example --- export as JSON:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/responses/instr-20240319-001/export?format=json&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-o<span class="w"> </span>responses.json
+</code></pre></div>
+<p>The CSV format includes the columns:
+<code>id</code>, <code>instruction_id</code>, <code>agent_id</code>, <code>timestamp</code>, <code>status</code>, <code>output</code>, <code>error_detail</code>.</p>
+<h3 id="generic-json-to-csv-export">Generic JSON-to-CSV export</h3>
+<p><strong>POST /api/export/json-to-csv</strong></p>
+<p>A generic endpoint that accepts any JSON array in the request body and returns
+a CSV file. This can be used with data from any Yuzu API.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/v1/audit?limit=1000&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;.data&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>-H<span class="w"> </span><span class="s1">&#39;Content-Type: application/json&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>-d<span class="w"> </span>@-<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span><span class="s1">&#39;http://localhost:8080/api/export/json-to-csv&#39;</span><span class="w"> </span>-o<span class="w"> </span>audit.csv
+</code></pre></div>
+<h3 id="exportable-data-sources">Exportable data sources</h3>
+<p>The JSON-to-CSV endpoint accepts data from any Yuzu API. Common sources:</p>
+<table>
+<thead>
+<tr>
+<th>Source</th>
+<th>How to fetch</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Instruction responses</td>
+<td><code>GET /api/responses/{instruction_id}</code></td>
+</tr>
+<tr>
+<td>Audit events</td>
+<td><code>GET /api/v1/audit</code> (use <code>.data</code> from the envelope)</td>
+</tr>
+<tr>
+<td>Inventory data</td>
+<td>Per-plugin structured blobs via the REST API</td>
+</tr>
+</tbody>
+</table>
+<h2 id="analytics-integration">Analytics integration</h2>
+<h3 id="clickhouse">ClickHouse</h3>
+<p>Create a ClickHouse table matching the instruction's typed result schema, then
+periodically load exported CSV or JSON files:</p>
+<div class="highlight"><pre><span></span><code><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">yuzu_disk_usage</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">agent_id</span><span class="w">    </span><span class="n">String</span><span class="p">,</span>
+<span class="w">    </span><span class="n">drive</span><span class="w">       </span><span class="n">String</span><span class="p">,</span>
+<span class="w">    </span><span class="n">total_gb</span><span class="w">    </span><span class="n">Int64</span><span class="p">,</span>
+<span class="w">    </span><span class="n">free_gb</span><span class="w">     </span><span class="n">Int64</span><span class="p">,</span>
+<span class="w">    </span><span class="n">collected</span><span class="w">   </span><span class="n">DateTime</span>
+<span class="p">)</span><span class="w"> </span><span class="n">ENGINE</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MergeTree</span><span class="p">()</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="p">(</span><span class="n">agent_id</span><span class="p">,</span><span class="w"> </span><span class="n">collected</span><span class="p">);</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># Export and load</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/responses/disk-usage-001&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>-X<span class="w"> </span>POST<span class="w"> </span>-H<span class="w"> </span><span class="s1">&#39;Content-Type: application/json&#39;</span><span class="w"> </span>-d<span class="w"> </span>@-<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span><span class="s1">&#39;http://localhost:8080/api/export/json-to-csv&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span>clickhouse-client<span class="w"> </span>--query<span class="w"> </span><span class="s2">&quot;INSERT INTO yuzu_disk_usage FORMAT CSV&quot;</span>
+</code></pre></div>
+<h3 id="splunk">Splunk</h3>
+<p>Forward response data to Splunk via HEC:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/responses/instr-20240319-001&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;.responses[]&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="nb">read</span><span class="w"> </span>-r<span class="w"> </span>row<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">      </span>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Splunk YOUR-HEC-TOKEN&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>-d<span class="w"> </span><span class="s2">&quot;{\&quot;sourcetype\&quot;: \&quot;yuzu:response\&quot;, \&quot;event\&quot;: </span><span class="si">${</span><span class="nv">row</span><span class="si">}</span><span class="s2">}&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>https://splunk.example.com:8088/services/collector/event
+<span class="w">    </span><span class="k">done</span>
+</code></pre></div>
+<h2 id="retention-and-cleanup">Retention and cleanup</h2>
+<p>Responses are retained for 90 days by default. A background thread runs every
+hour and deletes responses whose <code>timestamp</code> falls outside the retention
+window. Deletion is permanent.</p>
+<p>To preserve data beyond the retention window, set up periodic exports using
+cron or a scheduled task:</p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># /etc/cron.daily/yuzu-response-export</span>
+<span class="nv">DATE</span><span class="o">=</span><span class="k">$(</span>date<span class="w"> </span>+%Y-%m-%d<span class="k">)</span>
+<span class="k">for</span><span class="w"> </span>INSTR_ID<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="k">$(</span>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>/opt/yuzu/cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/v1/instructions&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>-r<span class="w"> </span><span class="s1">&#39;.[].id&#39;</span><span class="k">)</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>/opt/yuzu/cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span><span class="s2">&quot;http://localhost:8080/api/responses/</span><span class="si">${</span><span class="nv">INSTR_ID</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>&gt;<span class="w"> </span><span class="s2">&quot;/var/log/yuzu/responses-</span><span class="si">${</span><span class="nv">INSTR_ID</span><span class="si">}</span><span class="s2">-</span><span class="si">${</span><span class="nv">DATE</span><span class="si">}</span><span class="s2">.json&quot;</span>
+<span class="k">done</span>
+</code></pre></div>
+<h2 id="planned-features">Planned features</h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Roadmap</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Response templates</td>
+<td>Planned</td>
+<td>Pre-defined views with saved filters and column selections</td>
+</tr>
+<tr>
+<td>Response offloading</td>
+<td>Planned</td>
+<td>Forward response data to external HTTP endpoints automatically</td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

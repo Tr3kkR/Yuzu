@@ -1,0 +1,1043 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Test Coverage Tracking</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/test-coverage.md</div>
+<h1 class="doc-title">Test Coverage Tracking</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="test-coverage-tracking">Test Coverage Tracking</h1>
+<p>Last updated: 2026-05-10 (post PR 1c-4 closet-clean governance Round-1)</p>
+<h2 id="overview">Overview</h2>
+<table>
+<thead>
+<tr>
+<th>Suite</th>
+<th>Executable</th>
+<th>Test Files</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent unit tests</td>
+<td><code>yuzu_agent_tests</code></td>
+<td>17 files</td>
+<td>Active</td>
+</tr>
+<tr>
+<td>Server unit tests</td>
+<td><code>yuzu_server_tests</code></td>
+<td>35 files</td>
+<td>Active (requires <code>build_server=true</code>)</td>
+</tr>
+<tr>
+<td>Transport unit tests</td>
+<td><code>yuzu_transport_tests</code></td>
+<td>1 file (~42 cases)</td>
+<td>Active</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Totals:</strong> 52 test files. Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests.</p>
+<p>Run all tests: <code>meson test -C builddir --print-errorlogs</code></p>
+<hr>
+<h2 id="agent-tests">Agent Tests</h2>
+<h3 id="tested">Tested</h3>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Component</th>
+<th>What's Covered</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_sdk_utilities.cpp</code></td>
+<td>SDK utilities</td>
+<td>split_lines, table_to_json, json_to_table, generate_sequence, C ABI wrappers</td>
+</tr>
+<tr>
+<td><code>test_plugin_loader.cpp</code></td>
+<td>Plugin loader</td>
+<td>Nonexistent/empty directory handling</td>
+</tr>
+<tr>
+<td><code>test_updater.cpp</code></td>
+<td>OTA updater</td>
+<td>current_executable_path, cleanup_old_binary, rollback_if_needed</td>
+</tr>
+<tr>
+<td><code>test_temp_file.cpp</code></td>
+<td>Temp file API</td>
+<td>create_temp_file, create_temp_dir, RAII wrappers, move semantics</td>
+</tr>
+<tr>
+<td><code>test_filesystem_read.cpp</code></td>
+<td>Filesystem plugin</td>
+<td>validate_path, read parameters, CRLF stripping, binary detection, pagination</td>
+</tr>
+<tr>
+<td><code>test_string_utils.cpp</code></td>
+<td>Shared utilities</td>
+<td>icontains, sanitize_utf8, escape_pipes, sanitize_input, format_uptime, split_args, chargen_line</td>
+</tr>
+<tr>
+<td><code>test_vuln_rules.cpp</code></td>
+<td>Vuln scan rules</td>
+<td>compare_versions, CveRule data integrity, CVE matching logic</td>
+</tr>
+<tr>
+<td><code>test_kv_store.cpp</code></td>
+<td>KV storage</td>
+<td>Set/get/delete, namespace isolation, list with prefix, clear, persistence across reopens (30 cases)</td>
+</tr>
+<tr>
+<td><code>test_trigger_engine.cpp</code></td>
+<td>Trigger engine</td>
+<td>Interval triggers, file-change triggers, service-status triggers, event-log triggers, registry triggers, startup triggers, trigger registration/deregistration, concurrent trigger evaluation (28 cases)</td>
+</tr>
+<tr>
+<td><code>test_new_plugins.cpp</code></td>
+<td>Plugin runtime</td>
+<td>Plugin load/init lifecycle, action dispatch, output callback, multi-plugin coexistence, error handling, config access (~40 cases)</td>
+</tr>
+<tr>
+<td><code>test_metrics.cpp</code></td>
+<td>Prometheus metrics</td>
+<td>Metric registration, counter/gauge/histogram operations, label handling</td>
+</tr>
+<tr>
+<td><code>test_metrics_perf.cpp</code></td>
+<td>Metrics performance</td>
+<td>High-throughput metric emission, contention under concurrent writers</td>
+</tr>
+<tr>
+<td><code>test_tar_diff.cpp</code></td>
+<td>TAR diff engine</td>
+<td>Process tree diff, network change detection, service state transitions</td>
+</tr>
+<tr>
+<td><code>test_tar_store.cpp</code></td>
+<td>TAR store</td>
+<td>Timeline event persistence, query by time range, agent scoping</td>
+</tr>
+<tr>
+<td><code>test_parse_target_address.cpp</code></td>
+<td>Agent target-address parser (#376 PR 1c-3)</td>
+<td>host:port rejection-path matrix + IPv6 happy paths + <code>static_assert(noexcept(...))</code> contract pin (22 cases / 44 assertions)</td>
+</tr>
+<tr>
+<td><code>test_heartbeat_cancel_pattern.cpp</code></td>
+<td>Agent Heartbeat per-cycle <code>stop_source</code> wiring (#376 PR 1c-3)</td>
+<td>emplace replacement semantics, in-flight unary returns Cancelled on request_stop, cycle-2 fresh token (3 cases / 24 assertions)</td>
+</tr>
+<tr>
+<td><code>test_agent_subscribe_lift.cpp</code></td>
+<td>Agent Subscribe + DownloadUpdate lift onto <code>transport::Channel</code> (#376 PR 1c-4 + closet-clean)</td>
+<td>Subscribe multi-frame proto round-trip, per-cycle stop_source plumbing, reconnect-cycle fresh-token, DownloadUpdate happy path with writes_done(), per-chunk read deadline expiry, <strong>qe S-2 nullptr open_bidi (#926)</strong>, <strong>qe S-3 concurrent shared-stream writes (#927)</strong> (7 cases / 125 assertions)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="untested-agent-components">Untested Agent Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Why Untested</th>
+<th>Priority</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Plugin host</strong> (dynamic loading)</td>
+<td>Requires .dll/.so artifacts</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><strong>Trigger engine</strong></td>
+<td>Covered by test_trigger_engine.cpp</td>
+<td>Done</td>
+</tr>
+<tr>
+<td><strong>gRPC client — agent connection-loop integration</strong></td>
+<td>The transport-layer bidi RPC patterns (Subscribe round-trip, DownloadUpdate streaming, per-cycle stop_source, deadline expiry) are now covered by <code>test_agent_subscribe_lift.cpp</code> and <code>test_heartbeat_cancel_pattern.cpp</code> via in-proc gRPC fixtures. What remains untested is the full <code>agent.cpp</code> connection-loop integration: shared_ptr<BidiStream> across the OutputCallback worker pool, reconnect-backoff scheduler, channel-state diagnostic, dedup-buffer rotation under churn.</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td><strong>Certificate discovery</strong></td>
+<td>Windows-specific CryptoAPI</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><strong>Cloud identity</strong></td>
+<td>Requires cloud environment</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><strong>Identity store</strong></td>
+<td>File I/O, low logic density</td>
+<td>Low</td>
+</tr>
+</tbody>
+</table>
+<h3 id="untested-plugin-runtime-logic">Untested Plugin Runtime Logic</h3>
+<p>All plugins are loaded as dynamic libraries; their OS-dependent runtime code (subprocess calls, registry queries, WMI, /proc parsing) cannot be unit tested without mocking. The <strong>pure functions</strong> extracted to <code>string_utils.hpp</code> (icontains, sanitize_utf8, escape_pipes, etc.) cover the shared logic used by these plugins:</p>
+<table>
+<thead>
+<tr>
+<th>Plugin</th>
+<th>Key Pure Logic Tested Via</th>
+<th>OS-Dependent (Not Tested)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>chargen</td>
+<td><code>chargen_line()</code> in string_utils</td>
+<td>Thread/sleep loop</td>
+</tr>
+<tr>
+<td>script_exec</td>
+<td><code>split_args()</code> in string_utils</td>
+<td>CreateProcess/fork/execvp</td>
+</tr>
+<tr>
+<td>installed_apps</td>
+<td><code>icontains()</code>, <code>sanitize_utf8()</code></td>
+<td>Registry enum, dpkg, rpm</td>
+</tr>
+<tr>
+<td>vuln_scan</td>
+<td><code>compare_versions()</code>, <code>icontains()</code>, <code>escape_pipes()</code></td>
+<td>Registry, package queries</td>
+</tr>
+<tr>
+<td>event_logs</td>
+<td><code>sanitize_input()</code></td>
+<td>PowerShell, journalctl, log</td>
+</tr>
+<tr>
+<td>os_info</td>
+<td><code>format_uptime()</code></td>
+<td>uname, sysctl, registry</td>
+</tr>
+<tr>
+<td>netstat</td>
+<td>TCP state enums, IP parsing</td>
+<td>GetExtendedTcpTable, /proc/net</td>
+</tr>
+<tr>
+<td>firewall</td>
+<td>Netsh output parsing</td>
+<td>netsh, firewall-cmd, ufw</td>
+</tr>
+<tr>
+<td>services</td>
+<td>Service state/startup enums</td>
+<td>SCManager, systemctl, launchctl</td>
+</tr>
+<tr>
+<td>diagnostics</td>
+<td>Uptime calculation</td>
+<td>Plugin context reads</td>
+</tr>
+<tr>
+<td>network_config</td>
+<td>MAC formatting, IP parsing</td>
+<td>GetAdaptersAddresses, ip/ifconfig</td>
+</tr>
+<tr>
+<td>hardware</td>
+<td>Size conversion, CPUID parsing</td>
+<td>WMI, dmidecode, sysctl</td>
+</tr>
+<tr>
+<td>processes</td>
+<td>Case-insensitive name matching</td>
+<td>CreateToolhelp32Snapshot, /proc</td>
+</tr>
+<tr>
+<td>users</td>
+<td>Wide string conversion, FILETIME formatting</td>
+<td>Net API, utmp, dscl</td>
+</tr>
+<tr>
+<td>procfetch</td>
+<td>Pipe escaping</td>
+<td>File hashing, process enum</td>
+</tr>
+<tr>
+<td>tags</td>
+<td>Key/value validation</td>
+<td>File I/O</td>
+</tr>
+<tr>
+<td>antivirus</td>
+<td>(none)</td>
+<td>Get-CimInstance, pgrep</td>
+</tr>
+<tr>
+<td>bitlocker</td>
+<td>(none)</td>
+<td>PowerShell</td>
+</tr>
+<tr>
+<td>status</td>
+<td>RSS parsing</td>
+<td>Hostname, architecture</td>
+</tr>
+<tr>
+<td>agent_actions</td>
+<td>Log level validation</td>
+<td>spdlog state changes</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="server-tests">Server Tests</h2>
+<h3 id="tested_1">Tested</h3>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Component</th>
+<th>What's Covered</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_auth.cpp</code></td>
+<td>Auth manager</td>
+<td>Crypto primitives, user CRUD, sessions, enrollment tokens, pending agents, config persistence</td>
+</tr>
+<tr>
+<td><code>test_auto_approve.cpp</code></td>
+<td>Auto-approve</td>
+<td>Hostname glob, CIDR subnet, CA fingerprints, rule evaluation (any/all mode), config persistence</td>
+</tr>
+<tr>
+<td><code>test_nvd.cpp</code></td>
+<td>NVD database</td>
+<td>Version comparison, CVE CRUD, batch inserts, match_inventory, metadata, builtin rules</td>
+</tr>
+<tr>
+<td><code>test_update_registry.cpp</code></td>
+<td>OTA registry</td>
+<td>Package CRUD, latest_for version selection, rollout eligibility, binary_path</td>
+</tr>
+<tr>
+<td><code>test_https_config.cpp</code></td>
+<td>HTTPS config</td>
+<td>Default values, cookie security attributes (Secure, HttpOnly, SameSite), retention config</td>
+</tr>
+<tr>
+<td><code>test_response_store.cpp</code></td>
+<td>Response store</td>
+<td>Store/retrieve, query filters (agent_id, status, time range), pagination, TTL, ordering</td>
+</tr>
+<tr>
+<td><code>test_audit_store.cpp</code></td>
+<td>Audit store</td>
+<td>Log/query, filter by principal/action/target, pagination, timestamp ordering</td>
+</tr>
+<tr>
+<td><code>test_tag_store.cpp</code></td>
+<td>Tag store</td>
+<td>CRUD, sync_agent_tags, agents_with_tag, key/value validation</td>
+</tr>
+<tr>
+<td><code>test_scope_engine.cpp</code></td>
+<td>Scope engine</td>
+<td>Parser (equality, AND, OR, NOT, LIKE, IN, CONTAINS, parens, errors), evaluator, performance</td>
+</tr>
+<tr>
+<td><code>test_web_utils.cpp</code></td>
+<td>Web utilities</td>
+<td>base64_decode, html_escape, url_decode, extract_form_value, extract_plugin</td>
+</tr>
+<tr>
+<td><code>test_policy_store.cpp</code></td>
+<td>Policy store</td>
+<td>Policy CRUD, fragment binding, scope expression storage, enable/disable, management group association, trigger configuration, input parameters, cascade delete (42 cases)</td>
+</tr>
+<tr>
+<td><code>test_compliance_eval.cpp</code></td>
+<td>Compliance evaluator</td>
+<td>Status transitions (compliant/non_compliant/unknown/fixing/error), per-agent tracking, fleet summary aggregation, cache invalidation, policy-scoped queries, auto-remediation triggers (35 cases)</td>
+</tr>
+<tr>
+<td><code>test_custom_properties_store.cpp</code></td>
+<td>Custom properties</td>
+<td>Property CRUD, schema validation, allowed-value enforcement, type checking, required-property compliance, scope engine integration via <code>props.</code> prefix, bulk operations (34 cases)</td>
+</tr>
+<tr>
+<td><code>test_mcp_server.cpp</code></td>
+<td>MCP server</td>
+<td>JSON-RPC parsing, tier policy enforcement, token integration, tool dispatch, store interactions</td>
+</tr>
+<tr>
+<td><code>test_api_token_store.cpp</code></td>
+<td>API token store</td>
+<td>Token CRUD, expiration, MCP tier assignment</td>
+</tr>
+<tr>
+<td><code>test_agent_health_store.cpp</code></td>
+<td>Agent health store</td>
+<td>Health status tracking, query, TTL</td>
+</tr>
+<tr>
+<td><code>test_analytics_event.cpp</code></td>
+<td>Analytics events</td>
+<td>Event creation, serialization, drain integration</td>
+</tr>
+<tr>
+<td><code>test_approval_manager.cpp</code></td>
+<td>Approval manager</td>
+<td>Approval CRUD, status transitions, role-gated approvals</td>
+</tr>
+<tr>
+<td><code>test_cert_reloader.cpp</code></td>
+<td>Certificate reloader</td>
+<td>PEM reload, validation, permission checks, hot-swap</td>
+</tr>
+<tr>
+<td><code>test_concurrency_manager.cpp</code></td>
+<td>Concurrency manager</td>
+<td>5 enforcement modes, lock/release</td>
+</tr>
+<tr>
+<td><code>test_error_codes.cpp</code></td>
+<td>Error taxonomy</td>
+<td>Error code ranges (1xxx-4xxx), message formatting</td>
+</tr>
+<tr>
+<td><code>test_execution_tracker.cpp</code></td>
+<td>Execution tracker</td>
+<td>Progress tracking, per-agent status, completion</td>
+</tr>
+<tr>
+<td><code>test_instruction_store.cpp</code></td>
+<td>Instruction store</td>
+<td>Definition CRUD, YAML persistence, denormalized queries</td>
+</tr>
+<tr>
+<td><code>test_legacy_shim.cpp</code></td>
+<td>Legacy command shim</td>
+<td>Raw command-to-instruction translation</td>
+</tr>
+<tr>
+<td><code>test_management_group_store.cpp</code></td>
+<td>Management groups</td>
+<td>Group CRUD, hierarchy, device membership</td>
+</tr>
+<tr>
+<td><code>test_migration_runner.cpp</code></td>
+<td>Schema migrations</td>
+<td>Migration execution, version tracking</td>
+</tr>
+<tr>
+<td><code>test_notification_store.cpp</code></td>
+<td>Notifications</td>
+<td>In-app notification CRUD, read/unread status</td>
+</tr>
+<tr>
+<td><code>test_oidc_provider.cpp</code></td>
+<td>OIDC SSO</td>
+<td>PKCE flow, JWT validation, group claim parsing</td>
+</tr>
+<tr>
+<td><code>test_quarantine_store.cpp</code></td>
+<td>Quarantine</td>
+<td>Device quarantine/release, network isolation state</td>
+</tr>
+<tr>
+<td><code>test_rate_limiter.cpp</code></td>
+<td>Rate limiting</td>
+<td>Token bucket, per-IP/per-token limits</td>
+</tr>
+<tr>
+<td><code>test_rbac_store.cpp</code></td>
+<td>RBAC store</td>
+<td>Role CRUD, permission assignment, deny-override logic</td>
+</tr>
+<tr>
+<td><code>test_result_envelope.cpp</code></td>
+<td>Result envelope</td>
+<td>Structured response formatting</td>
+</tr>
+<tr>
+<td><code>test_schedule_engine.cpp</code></td>
+<td>Scheduler</td>
+<td>Cron scheduling, next-run calculation, scope-based targeting</td>
+</tr>
+<tr>
+<td><code>test_webhook_store.cpp</code></td>
+<td>Webhooks</td>
+<td>Subscription CRUD, HMAC-SHA256 signing, delivery</td>
+</tr>
+<tr>
+<td><code>test_security_headers.cpp</code></td>
+<td>HTTP security headers (SOC2-C1)</td>
+<td><code>validate_csp_extra_sources</code> accept/reject grammar (control bytes, semicolons, unsafe keywords, hash/nonce expressions, quoted/unquoted tokens, position tracking), <code>build_csp</code> directives + extras + <code>upgrade-insecure-requests</code> gating, <code>build_permissions_policy</code> deny-all baseline, <code>build_referrer_policy</code>, <code>HeaderBundle::apply</code> six-header emission, end-to-end integration via <code>httplib::Server</code>/<code>httplib::Client</code> (38 cases)</td>
+</tr>
+<tr>
+<td><code>test_agent_service_impl.cpp</code></td>
+<td>AgentServiceImpl response-path helpers + per-peer rate limit (#913)</td>
+<td>record_execution_id mapping, process_gateway_response execution_id stamping, multi-agent fan-out non-erase invariant, terminal SUCCESS folds into RUNNING rows, re-mapping a command_id, <strong>admit_download_update bucket-starts-full + per-peer isolation + empty-key handling</strong> (closet-clean Round-1, 28 assertions in 3 [rate_limit] cases)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="untested-server-components">Untested Server Components</h3>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Why Untested</th>
+<th>Priority</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>EventBus</strong> (SSE)</td>
+<td>Needs thread-safe test harness</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td><strong>AgentRegistry</strong></td>
+<td>Depends on gRPC protobuf types</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td><strong>AgentServiceImpl</strong> (Register/Subscribe)</td>
+<td>Requires mock gRPC streams</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><strong>GatewayUpstreamServiceImpl</strong></td>
+<td>Requires mock gRPC streams</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><strong>HTML fragment renderers</strong></td>
+<td>Output is fragile HTML strings</td>
+<td>Very Low</td>
+</tr>
+<tr>
+<td><strong>Web route handlers</strong></td>
+<td>Requires full httplib mock</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><strong>TLS credential loading</strong></td>
+<td>Requires filesystem + certs</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><strong>ServerTransportMetricSink</strong></td>
+<td>Currently exercised only via the full agent listener integration; per-callback unit coverage deferred (consistency Q5 from PR 1c-4 closet governance)</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td><strong>OTA chunk-deadline counter increment</strong> (<code>yuzu_agent_ota_chunk_deadline_total</code>)</td>
+<td>Counter site in <code>agents/core/src/updater.cpp</code> only verified by inspection — no test drives the deadline-expiry path through the real <code>Updater</code> instance</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td><strong>Reconnect-reason label increments</strong></td>
+<td>Counter sites in <code>agents/core/src/agent.cpp</code> connection loop verified by inspection — no test asserts the label value for <code>channel_fault</code> / <code>peer_halfclose</code> / <code>enrollment_pending</code> paths</td>
+<td>Medium</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="transport-tests">Transport Tests</h2>
+<h3 id="tested_2">Tested</h3>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Component</th>
+<th>What's Covered</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>test_transport_smoke.cpp</code></td>
+<td>Transport abstraction smoke + bidi deadline battery</td>
+<td>Channel + ServerListener happy paths, bidi round-trip, in-proc gRPC fixture, ALPN negotiation, <strong>bidi read deadline (#902)</strong>, <strong>bidi write deadline (#911)</strong> including negative-deadline-clamp + cancel-short-circuit + happy-path-with-deadline (closet-clean Round-1, 6 cases / 63 assertions in <code>[deadline]</code> battery), pool fanout + saturation reject path, <code>bound_endpoint()</code> semantics</td>
+</tr>
+</tbody>
+</table>
+<h3 id="untested-transport-paths">Untested Transport Paths</h3>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>Why Untested</th>
+<th>Priority</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Bidi write deadline expiry under HTTP/2 flow-control fill</strong></td>
+<td>Engineering an HTTP/2 flow-control fill in CI is rejected as flake-prone; structurally identical to the read-side path which is covered</td>
+<td>Low</td>
+</tr>
+<tr>
+<td><strong>Bidi pool gauge under-read on transient saturation</strong></td>
+<td>UP-218 — needs synthetic burst harness</td>
+<td>Medium</td>
+</tr>
+<tr>
+<td><strong>Token-bucket refill arithmetic</strong></td>
+<td>Implementation is straightforward; deferred unit test would synthesize a stale <code>last_refill_at</code> and assert refill</td>
+<td>Low</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="shared-test-infrastructure">Shared Test Infrastructure</h2>
+<table>
+<thead>
+<tr>
+<th>Header</th>
+<th>Location</th>
+<th>Used By</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>yuzu/string_utils.hpp</code></td>
+<td><code>sdk/include/yuzu/</code></td>
+<td>Agent tests, plugins</td>
+</tr>
+<tr>
+<td><code>web_utils.hpp</code></td>
+<td><code>server/core/src/</code></td>
+<td>Server tests</td>
+</tr>
+<tr>
+<td><code>cve_rules.hpp</code></td>
+<td><code>agents/plugins/vuln_scan/src/</code></td>
+<td>Agent tests (vuln rules)</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="adding-new-tests">Adding New Tests</h2>
+<h3 id="agent-tests_1">Agent tests</h3>
+<ol>
+<li>Add test file to <code>tests/unit/</code></li>
+<li>Add to <code>agent_test_exe</code> sources in <code>tests/meson.build</code></li>
+<li>Use <code>[tag]</code> categories for filtering</li>
+</ol>
+<h3 id="server-tests_1">Server tests</h3>
+<ol>
+<li>Add test file to <code>tests/unit/server/</code></li>
+<li>Add to <code>server_test_exe</code> sources in <code>tests/meson.build</code></li>
+<li>Private headers are accessible via <code>include_directories('../server/core/src')</code></li>
+</ol>
+<h3 id="new-plugin-tests">New plugin tests</h3>
+<p>If a plugin has pure functions worth testing:
+1. Extract pure functions to a header (or <code>string_utils.hpp</code>)
+2. Add the plugin's <code>src/</code> to <code>include_directories</code> in <code>tests/meson.build</code>
+3. Write a test file that includes the header</p>
+<hr>
+<h2 id="future-test-priorities">Future Test Priorities</h2>
+<ol>
+<li><strong>EventBus</strong> — thread-safe subscribe/publish/unsubscribe</li>
+<li><strong>AgentRegistry</strong> — to_json, help_json, evaluate_scope (once protobuf dep is available to tests)</li>
+<li><strong>Netstat parsing</strong> — extract Linux parse_ipv4/ipv6/hex_port to a header for testing</li>
+<li><strong>Firewall parsing</strong> — extract Windows parse_firewall_state/rules to a header for testing</li>
+<li><strong>NvdClient JSON parsing</strong> — mock HTTP responses and test parse_response</li>
+<li><strong>Integration tests</strong> — full Register/Subscribe flow with mock gRPC</li>
+</ol>
+</main>
+</body>
+</html>

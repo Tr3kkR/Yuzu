@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TAR Data Warehouse: Mini-Snowflake on Every Endpoint</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/tar-warehouse-plan.md</div>
+<h1 class="doc-title">TAR Data Warehouse: Mini-Snowflake on Every Endpoint</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="tar-data-warehouse-mini-snowflake-on-every-endpoint">TAR Data Warehouse: Mini-Snowflake on Every Endpoint</h1>
+<h2 id="context">Context</h2>
+<p>Yuzu's TAR (Timeline Activity Record) plugin currently stores all events in a single flat <code>tar_events</code> table with JSON blobs in <code>detail_json</code>. Queries are limited to "filter by type + time range." The target architecture treats this data as <strong>typed relational tables with granularity tiers</strong> (Live/Hourly/Daily/Monthly) queryable via SQL SELECT. Each agent endpoint becomes a self-contained analytics node -- a mini-data-warehouse with typed tables per capture source, automatic roll-up aggregation, and a SQL query engine scoped to its own data. The server fans out SQL queries to targeted agents and aggregates results. The Dashboard is the operator's query interface.</p>
+<hr>
+<h2 id="phase-0-schema-registry-and-database-migration">Phase 0: Schema Registry and Database Migration</h2>
+<p><strong>Goal:</strong> Define the canonical table schemas and migrate the SQLite database from the single <code>tar_events</code> table to typed per-source tables.</p>
+<h3 id="new-files">New files</h3>
+<ul>
+<li><code>agents/plugins/tar/src/tar_schema_registry.hpp</code> -- Data structures defining every capture source, its supported granularities, column definitions, DDL, and rollup SQL</li>
+<li><code>agents/plugins/tar/src/tar_schema_registry.cpp</code> -- DDL string builders, <code>$</code>-name-to-table-name translation map, column metadata</li>
+</ul>
+<h3 id="key-data-structures">Key data structures</h3>
+<div class="highlight"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">ColumnDef</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">name</span><span class="p">;</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">sql_type</span><span class="p">;</span><span class="w"> </span><span class="p">};</span>
+
+<span class="k">struct</span><span class="w"> </span><span class="nc">GranularityDef</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">suffix</span><span class="p">;</span><span class="w">              </span><span class="c1">// &quot;live&quot;, &quot;hourly&quot;, &quot;daily&quot;, &quot;monthly&quot;</span>
+<span class="w">    </span><span class="k">enum</span><span class="w"> </span><span class="nc">RetentionType</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">kRowCount</span><span class="p">,</span><span class="w"> </span><span class="n">kTimeBased</span><span class="w"> </span><span class="p">};</span>
+<span class="w">    </span><span class="n">RetentionType</span><span class="w"> </span><span class="n">retention_type</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int64_t</span><span class="w"> </span><span class="n">retention_value</span><span class="p">;</span><span class="w">         </span><span class="c1">// row count or seconds</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">span</span><span class="o">&lt;</span><span class="k">const</span><span class="w"> </span><span class="n">ColumnDef</span><span class="o">&gt;</span><span class="w"> </span><span class="n">columns</span><span class="p">;</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">rollup_sql</span><span class="p">;</span><span class="w">          </span><span class="c1">// NULL for live tier</span>
+<span class="p">};</span>
+
+<span class="k">struct</span><span class="w"> </span><span class="nc">CaptureSourceDef</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">name</span><span class="p">;</span><span class="w">                </span><span class="c1">// &quot;process&quot;, &quot;tcp&quot;, &quot;service&quot;, &quot;user&quot;</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">dollar_name</span><span class="p">;</span><span class="w">         </span><span class="c1">// &quot;Process&quot;, &quot;TCP&quot;, &quot;Service&quot;, &quot;User&quot;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">span</span><span class="o">&lt;</span><span class="k">const</span><span class="w"> </span><span class="n">GranularityDef</span><span class="o">&gt;</span><span class="w"> </span><span class="n">granularities</span><span class="p">;</span>
+<span class="p">};</span>
+</code></pre></div>
+<h3 id="database-migration">Database migration</h3>
+<ul>
+<li>Add <code>schema_version</code> key in <code>tar_config</code> (version 1 = legacy implied, version 2 = typed tables exist alongside tar_events)</li>
+<li>In <code>TarDatabase::open()</code>, after existing schema creation, check version and create typed tables via DDL from the registry</li>
+<li>Old <code>tar_events</code> table is NOT dropped yet (backward compat)</li>
+</ul>
+<h3 id="modified-files">Modified files</h3>
+<ul>
+<li><code>agents/plugins/tar/src/tar_db.hpp</code> -- Add <code>execute_ddl()</code>, <code>create_typed_tables()</code>, <code>schema_version()</code>/<code>set_schema_version()</code>, <code>execute_query()</code> (returns generic rows)</li>
+<li><code>agents/plugins/tar/src/tar_db.cpp</code> -- Migration logic in <code>open()</code>, typed table DDL</li>
+<li><code>agents/plugins/tar/meson.build</code> -- Add <code>tar_schema_registry.cpp</code></li>
+</ul>
+<hr>
+<h2 id="phase-1-typed-live-tables">Phase 1: Typed Live Tables</h2>
+<p><strong>Goal:</strong> Collectors write to typed <code>*_live</code> tables with real columns instead of JSON blobs. Dual-write to legacy <code>tar_events</code> for backward compat.</p>
+<h3 id="typed-table-schemas-initial-4-sources">Typed table schemas (initial 4 sources)</h3>
+<p><strong><code>process_live</code>:</strong> id, ts, snapshot_id, action, pid, ppid, name, cmdline, user
+<strong><code>tcp_live</code>:</strong> id, ts, snapshot_id, action, proto, local_addr, local_port, remote_addr, remote_host, remote_port, state, pid, process_name
+<strong><code>service_live</code>:</strong> id, ts, snapshot_id, action, name, display_name, status, prev_status, startup_type, prev_startup_type
+<strong><code>user_live</code>:</strong> id, ts, snapshot_id, action, user, domain, logon_type, session_id</p>
+<h3 id="modified-files_1">Modified files</h3>
+<ul>
+<li><code>agents/plugins/tar/src/tar_collectors.hpp</code> -- Add typed event structs: <code>ProcessEvent</code>, <code>NetworkEvent</code>, <code>ServiceEvent</code>, <code>UserEvent</code></li>
+<li><code>agents/plugins/tar/src/tar_diff.cpp</code> -- Produce typed events alongside legacy <code>TarEvent</code></li>
+<li><code>agents/plugins/tar/src/tar_db.hpp</code> -- Add typed insert methods: <code>insert_process_events()</code>, <code>insert_network_events()</code>, etc.</li>
+<li><code>agents/plugins/tar/src/tar_db.cpp</code> -- Implement typed inserts with prepared statements</li>
+<li><code>agents/plugins/tar/src/tar_plugin.cpp</code> -- Dual-write in collectors</li>
+</ul>
+<hr>
+<h2 id="phase-2-aggregation-engine">Phase 2: Aggregation Engine</h2>
+<p><strong>Goal:</strong> Automatic roll-up from Live -&gt; Hourly -&gt; Daily -&gt; Monthly via timer-driven SQL.</p>
+<h3 id="aggregation-tables">Aggregation tables</h3>
+<ul>
+<li><code>process_hourly/daily/monthly</code>: hour_ts, name, user, start_count, stop_count</li>
+<li><code>tcp_hourly/daily/monthly</code>: hour_ts, remote_addr, remote_port, proto, process_name, connect_count, disconnect_count</li>
+<li><code>service_hourly</code>: hour_ts, name, status_changes, last_status</li>
+<li><code>user_daily</code>: day_ts, user, domain, login_count, logout_count (Daily-only)</li>
+</ul>
+<h3 id="rollup-mechanism">Rollup mechanism</h3>
+<ul>
+<li>New trigger <code>tar.rollup</code> fires every 900 seconds (15 min)</li>
+<li>Tracks <code>rollup_{source}_{tier}_at</code> in <code>tar_config</code></li>
+<li><code>INSERT INTO ... SELECT ... FROM *_live WHERE ts &gt;= last AND ts &lt; boundary GROUP BY ...</code></li>
+<li>Idempotent: safe to re-fire, only processes new data</li>
+<li>Retention runs after aggregation</li>
+</ul>
+<h3 id="retention-defaults">Retention defaults</h3>
+<table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Type</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Live</td>
+<td>Row count</td>
+<td>5,000 rows per table</td>
+</tr>
+<tr>
+<td>Hourly</td>
+<td>Time-based</td>
+<td>24 hours</td>
+</tr>
+<tr>
+<td>Daily</td>
+<td>Time-based</td>
+<td>31 days</td>
+</tr>
+<tr>
+<td>Monthly</td>
+<td>Time-based</td>
+<td>12 months</td>
+</tr>
+</tbody>
+</table>
+<h3 id="new-files_1">New files</h3>
+<ul>
+<li><code>agents/plugins/tar/src/tar_aggregator.hpp</code></li>
+<li><code>agents/plugins/tar/src/tar_aggregator.cpp</code></li>
+</ul>
+<h3 id="modified-files_2">Modified files</h3>
+<ul>
+<li><code>agents/plugins/tar/src/tar_plugin.cpp</code> -- Register <code>tar.rollup</code> trigger, add <code>rollup</code> action</li>
+<li><code>agents/plugins/tar/meson.build</code> -- Add <code>tar_aggregator.cpp</code></li>
+</ul>
+<hr>
+<h2 id="phase-3-sql-query-engine-agent-side">Phase 3: SQL Query Engine (Agent-Side)</h2>
+<p><strong>Goal:</strong> New <code>tar.sql</code> action that executes arbitrary SELECT queries against <code>$</code>-prefixed tables.</p>
+<h3 id="-name-translation"><code>$</code>-name translation</h3>
+<p><code>$Process_Live</code> -&gt; <code>process_live</code>, <code>$TCP_Hourly</code> -&gt; <code>tcp_hourly</code>, etc. Whitelist-based via the schema registry.</p>
+<h3 id="safety-3-layer-defense">Safety (3-layer defense)</h3>
+<ol>
+<li><strong>SELECT-only</strong> -- Reject INSERT/UPDATE/DELETE/DROP/ALTER/CREATE/ATTACH/PRAGMA</li>
+<li><strong><code>$</code>-name whitelist</strong> -- Only registered tables translate; unknowns error</li>
+<li><strong>Single-statement</strong> -- <code>sqlite3_prepare_v2()</code> + reject trailing SQL</li>
+<li><strong>Timeout</strong> -- <code>sqlite3_progress_handler()</code> at 5 seconds</li>
+</ol>
+<h3 id="output-protocol-schema-in-band">Output protocol: schema-in-band</h3>
+<div class="highlight"><pre><span></span><code>__schema__|pid|name|cmdline|user|ts
+1234|nginx|nginx -g daemon off;|www-data|1711050123
+__total__|1
+</code></pre></div>
+<h3 id="new-files_2">New files</h3>
+<ul>
+<li><code>agents/plugins/tar/src/tar_sql_executor.hpp</code></li>
+<li><code>agents/plugins/tar/src/tar_sql_executor.cpp</code></li>
+</ul>
+<h3 id="modified-files_3">Modified files</h3>
+<ul>
+<li><code>agents/plugins/tar/src/tar_plugin.cpp</code> -- Add <code>"sql"</code> action, implement <code>do_sql()</code> handler</li>
+<li><code>agents/plugins/tar/meson.build</code> -- Add <code>tar_sql_executor.cpp</code></li>
+<li><code>content/definitions/tar.yaml</code> -- Add <code>crossplatform.tar.sql</code> InstructionDefinition</li>
+</ul>
+<hr>
+<h2 id="phase-4-server-side-dynamic-schema-support">Phase 4: Server-Side Dynamic Schema Support</h2>
+<p><strong>Goal:</strong> Handle TAR SQL results with query-dependent column headers.</p>
+<h3 id="__schema__-line-detection"><code>__schema__</code> line detection</h3>
+<p>In <code>publish_output_rows()</code>, detect <code>__schema__|</code> prefix -&gt; parse columns, cache per command_id, publish OOB <code>&lt;thead&gt;</code> swap.</p>
+<h3 id="dispatchfn-extension">DispatchFn extension</h3>
+<p>Add <code>parameters</code> map to the existing signature so the SQL can be forwarded to the agent.</p>
+<h3 id="modified-files_4">Modified files</h3>
+<ul>
+<li><code>server/core/src/dashboard_routes.hpp</code> -- DispatchFn signature change</li>
+<li><code>server/core/src/dashboard_routes.cpp</code> -- New <code>POST /api/dashboard/tar-execute</code> route, dynamic schema in <code>render_results()</code></li>
+<li><code>server/core/src/agent_service_impl.cpp</code> -- <code>__schema__</code>/<code>__total__</code> detection, per-command schema cache</li>
+<li><code>server/core/src/result_parsing.hpp</code> -- Add <code>"tar"</code> to kSchemas with dynamic marker</li>
+<li><code>server/core/src/server.cpp</code> -- Update DispatchFn lambda to forward parameters</li>
+</ul>
+<hr>
+<h2 id="phase-5-dashboard-tar-query-ui">Phase 5: Dashboard TAR Query UI</h2>
+<p><strong>Goal:</strong> Add a TAR Query Composer to the Dashboard.</p>
+<h3 id="three-interaction-tiers">Three interaction tiers</h3>
+<ol>
+<li><strong>Pre-built queries</strong> -- InstructionDefinitions. Type "TAR:" in instruction bar, autocomplete shows options</li>
+<li><strong>Free-form SQL</strong> -- <code>tar query</code>/<code>tar sql</code> activates SQL Editor textarea + Schema Browser sidebar</li>
+<li><strong>Guided Query Builder</strong> -- Source/granularity dropdowns, column checkboxes, WHERE builder, time range picker</li>
+</ol>
+<h3 id="htmx-flow">HTMX flow</h3>
+<ol>
+<li><code>tar query</code> prefix -&gt; OOB swap results area to TAR Composer, scope panel to Schema Browser</li>
+<li>"Run Query" -&gt; <code>POST /api/dashboard/tar-execute</code> with sql + scope</li>
+<li><code>__schema__</code> from first agent -&gt; dynamic <code>&lt;thead&gt;</code> OOB swap</li>
+<li>Data rows stream via SSE</li>
+<li>Progress: <code>N / M agents</code> OOB updates</li>
+</ol>
+<h3 id="new-routes">New routes</h3>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Method</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/api/dashboard/tar-execute</code></td>
+<td>POST</td>
+<td>Dispatch TAR SQL query</td>
+</tr>
+<tr>
+<td><code>/fragments/tar/schema</code></td>
+<td>GET</td>
+<td>Schema browser HTMX fragment</td>
+</tr>
+<tr>
+<td><code>/fragments/tar/composer</code></td>
+<td>GET</td>
+<td>TAR Composer panel</td>
+</tr>
+</tbody>
+</table>
+<h3 id="modified-files_5">Modified files</h3>
+<ul>
+<li><code>server/core/src/dashboard_ui.cpp</code> -- TAR Composer HTML/CSS/JS</li>
+<li><code>server/core/src/dashboard_routes.cpp</code> -- New TAR routes</li>
+</ul>
+<hr>
+<h2 id="phase-6-pre-built-query-pack">Phase 6: Pre-built Query Pack</h2>
+<h3 id="new-file-contentdefinitionstar_warehouseyaml">New file: <code>content/definitions/tar_warehouse.yaml</code></h3>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>SQL</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TAR: Recent Processes</td>
+<td><code>SELECT name, pid, cmdline, user, ts FROM $Process_Live WHERE ts &gt; strftime('%s','now','-24 hours') ORDER BY ts DESC LIMIT 500</code></td>
+</tr>
+<tr>
+<td>TAR: TCP Connections by Process</td>
+<td><code>SELECT process_name, remote_addr, remote_port, proto, COUNT(*) as conn_count FROM $TCP_Live GROUP BY process_name, remote_addr, remote_port, proto ORDER BY conn_count DESC</code></td>
+</tr>
+<tr>
+<td>TAR: Listening Ports</td>
+<td><code>SELECT local_port, proto, pid, process_name FROM $TCP_Live WHERE state = 'LISTEN' ORDER BY local_port</code></td>
+</tr>
+<tr>
+<td>TAR: Hourly Process Summary</td>
+<td><code>SELECT hour_ts, name, start_count FROM $Process_Hourly ORDER BY hour_ts DESC LIMIT 168</code></td>
+</tr>
+<tr>
+<td>TAR: Service State Changes</td>
+<td><code>SELECT ts, name, action, status, prev_status FROM $Service_Live WHERE action = 'state_changed' ORDER BY ts DESC</code></td>
+</tr>
+<tr>
+<td>TAR: Network Connections to IP</td>
+<td><code>SELECT ts, process_name, pid, remote_port, proto FROM $TCP_Live WHERE remote_addr = '${target_ip}' ORDER BY ts DESC</code></td>
+</tr>
+<tr>
+<td>TAR: Daily Connection Summary</td>
+<td><code>SELECT day_ts, remote_addr, process_name, connect_count FROM $TCP_Daily ORDER BY day_ts DESC, connect_count DESC</code></td>
+</tr>
+<tr>
+<td>TAR: User Sessions</td>
+<td><code>SELECT ts, user, domain, logon_type, action FROM $User_Live ORDER BY ts DESC LIMIT 200</code></td>
+</tr>
+<tr>
+<td>TAR: Process Tree</td>
+<td><code>SELECT pid, ppid, name, user, ts FROM $Process_Live WHERE action = 'started' AND ts &gt; strftime('%s','now','-1 hours') ORDER BY ts</code></td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="phase-7-retire-legacy-tar_events-table">Phase 7: Retire Legacy <code>tar_events</code> Table</h2>
+<ul>
+<li>Migration to schema version 3: <code>DROP TABLE IF EXISTS tar_events</code></li>
+<li>Remove legacy insert calls from collectors</li>
+<li><code>tar.query</code> and <code>tar.export</code> rewritten to query typed live tables (same output format)</li>
+</ul>
+<hr>
+<h2 id="phase-8-additional-capture-sources">Phase 8: Additional Capture Sources</h2>
+<h3 id="wave-1-cross-platform">Wave 1: Cross-platform</h3>
+<ol>
+<li><strong>Software installations</strong> -- Windows: registry. Linux: dpkg/rpm. macOS: Applications + pkgutil. Tables: <code>software_live</code>, <code>software_daily</code></li>
+<li><strong>Device performance</strong> -- CPU %, memory, disk I/O. Tables: <code>performance_live</code>, <code>performance_hourly</code></li>
+</ol>
+<h3 id="wave-2-windows-partial-macos">Wave 2: Windows + partial macOS</h3>
+<ol start="3">
+<li><strong>Boot performance</strong> -- Event Log / uptime. Live-only</li>
+<li><strong>DNS resolutions</strong> -- Windows ETW. All 4 tiers</li>
+</ol>
+<h3 id="wave-3-windows-specific">Wave 3: Windows-specific</h3>
+<ol start="5">
+<li><strong>ARP cache</strong> -- Polling via GetIpNetTable</li>
+<li><strong>Performance events</strong> -- Crashes, patches, service failures</li>
+<li><strong>Process stabilization</strong> -- Launch timing for monitored processes</li>
+<li><strong>Sensitive processes</strong> -- Elevated system monitoring activity</li>
+</ol>
+<hr>
+<h2 id="verification-plan">Verification Plan</h2>
+<h3 id="unit-tests">Unit tests</h3>
+<ul>
+<li><code>tests/unit/test_tar_schema_registry.cpp</code> -- DDL generation, <code>$</code>-name translation</li>
+<li><code>tests/unit/test_tar_aggregator.cpp</code> -- Rollup boundaries, idempotency, retention</li>
+<li><code>tests/unit/test_tar_sql_executor.cpp</code> -- SELECT-only validation, injection rejection, timeout</li>
+</ul>
+<h3 id="integration">Integration</h3>
+<ol>
+<li>Build: <code>meson compile -C builddir</code></li>
+<li>Unit tests: <code>meson test -C builddir --print-errorlogs</code></li>
+<li>UAT: <code>bash scripts/start-UAT.sh</code></li>
+<li>Verify tables: <code>tar.sql</code> with <code>SELECT name FROM sqlite_master WHERE type='table' AND name LIKE '%_live'</code></li>
+<li>After 60s collection: <code>tar.sql</code> with <code>SELECT * FROM $Process_Live LIMIT 10</code></li>
+<li>After 15min rollup: <code>tar.sql</code> with <code>SELECT * FROM $Process_Hourly</code></li>
+<li>Fleet fan-out: scope <code>__all__</code>, verify multi-agent results</li>
+<li>Dashboard: TAR query mode, dynamic columns, streaming</li>
+<li>Gateway unaffected: <code>rebar3 eunit &amp;&amp; rebar3 dialyzer</code></li>
+</ol>
+<h3 id="security-validation">Security validation</h3>
+<ul>
+<li><code>INSERT INTO process_live ...</code> -&gt; rejected</li>
+<li><code>SELECT * FROM $Nonexistent_Live</code> -&gt; rejected</li>
+<li><code>SELECT 1; DROP TABLE process_live</code> -&gt; rejected</li>
+<li><code>ATTACH DATABASE</code> -&gt; rejected</li>
+</ul>
+</main>
+</body>
+</html>

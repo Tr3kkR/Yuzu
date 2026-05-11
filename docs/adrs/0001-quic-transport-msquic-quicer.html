@@ -1,0 +1,916 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADR-0001: Use msquic + quicer for QUIC transport</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/adrs/0001-quic-transport-msquic-quicer.md</div>
+<h1 class="doc-title">ADR-0001: Use msquic + quicer for QUIC transport</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="adr-0001-use-msquic-quicer-for-quic-transport">ADR-0001: Use msquic + quicer for QUIC transport</h1>
+<ul>
+<li><strong>Status</strong>: Accepted — spike validation passed 2026-05-07
+  (<a href="../spike-results/0001-quic-transport/README.html" class="doc-ref"><code>docs/spike-results/0001-quic-transport/README.md</code></a>).</li>
+<li><strong>Accepted-by</strong>: Nathan Dornbrook (project lead) on 2026-05-07.
+  Approval references the spike-results files committed in <code>af706ea</code> and
+  the surrounding governance hardening rolled into governance round 5
+  (this branch); both are in-tree under git tamper-evidence.</li>
+<li><strong>Date</strong>: 2026-05-07</li>
+<li><strong>Tracking issue</strong>: #376</li>
+<li><strong>Supersedes</strong>: prior implicit decision to use gRPC (no ADR existed)</li>
+<li><strong>Related</strong>: #375 (LNK2038/LNK2005 saga), #501 (absl DLL kSeed),
+  <a href="../per-target-agent-build-pipeline-scope.html" class="doc-ref"><code>docs/per-target-agent-build-pipeline-scope.md</code></a>,
+  <a href="../../.claude/agents/build-ci.html" class="doc-ref"><code>.claude/agents/build-ci.md</code></a> "Windows MSVC static-link history and #375",
+  <code>docs/spike-results/0001-quic-transport/</code> (PR 0 evidence)</li>
+</ul>
+<h2 id="context">Context</h2>
+<p>Yuzu's RPC transport between agent ↔ server, server ↔ gateway, and gateway
+↔ agent has been gRPC since project inception. The wire format is
+protobuf; the framing and flow control come from gRPC over HTTP/2.</p>
+<p>The C++ side of this brings in a heavy dependency closure via vcpkg —
+<code>grpc</code>, <code>abseil</code>, <code>c-ares</code>, <code>re2</code>, <code>upb</code>, <code>utf8-range</code> — which has been a
+recurring source of build outages:</p>
+<ol>
+<li><strong>#375</strong> (2026-04-10 → 2026-04-14): LNK2038 / LNK2005 saga on Windows
+   MSVC. Three failed fix attempts, ~4 days of CI red. Resolved via the
+   "option D" hand-wire block in <code>meson.build</code> (lines ~91–240) plus a
+   static-linkage override in <code>triplets/x64-windows.cmake</code>.</li>
+<li><strong>#501</strong>: Abseil's <code>__hash.kSeed</code> becomes a different value in each
+   DLL when abseil is linked dynamically, breaking <code>absl::flat_hash_*</code>
+   across DLL boundaries. Multiple test workarounds.</li>
+<li><strong>2026-04-28 vcpkg cache nuke</strong>: Exposed CLI11 + Catch2 as the next two
+   dominoes after the option-D pattern was set; they were hand-wired the
+   same way.</li>
+<li><strong>Alpine/musl ambition</strong>: <a href="../per-target-agent-build-pipeline-scope.html" class="doc-ref"><code>docs/per-target-agent-build-pipeline-scope.md</code></a>
+   (2026-05-07) determined that abseil, grpc, re2, c-ares, upb collectively
+   have no usable musl story in vcpkg, blocking Alpine support for the
+   agent. Phase 2 of that plan is gated on this migration.</li>
+</ol>
+<p>The Erlang gateway side has parallel issues: <code>grpcbox</code> pulls in
+<code>chatterbox</code> (HTTP/2 implementation that has been a recurring source of
+brittleness) plus <code>gproc</code>. The grpcbox sub-tree is non-trivial.</p>
+<p>The strategic option captured in #376 is to replace gRPC with <strong>QUIC</strong>,
+retaining protobuf as the wire format. QUIC gives us reliable multiplexed
+bidirectional streams (the same shape gRPC uses) without the C++ ABI /
+CMake ecosystem tax of gRPC.</p>
+<h2 id="decision">Decision</h2>
+<p>We will use <strong>msquic</strong> on the C++ side and <strong>quicer</strong> (Emqx's NIF wrapper
+around msquic) on the Erlang gateway side.</p>
+<p>Both ends terminate the same QUIC implementation. No QUIC-frame-level
+heterogeneity between agent/server (C++) and gateway (Erlang).</p>
+<p>Wire format remains protobuf, generated by the existing <code>proto/gen_proto.py</code>
+toolchain. Service definitions in <code>proto/yuzu/{agent,server,gateway}/v1/</code>
+are unchanged.</p>
+<p>Each logical RPC is mapped to a single QUIC bidirectional stream. Each
+direction frames protobuf messages with a 4-byte big-endian length prefix.
+Trailing gRPC-style status/metadata becomes a final protobuf message
+(<code>yuzu.transport.v1.TrailingStatus</code>) on the stream before half-close.</p>
+<p>mTLS is preserved via msquic's TLS API.</p>
+<h2 id="alternatives-considered">Alternatives considered</h2>
+<h3 id="lsquic-litespeed">lsquic (LiteSpeed)</h3>
+<ul>
+<li><strong>Pros</strong>: Mature C library, used in production by LiteSpeed Web Server.
+  Includes HTTP/3 layer (not relevant for us but indicates depth).</li>
+<li><strong>Cons</strong>: No first-class Erlang binding. Would require us to maintain
+  custom NIF on the gateway side or commission/port an Erlang wrapper.
+  Heterogeneous stack (lsquic on C++ side, something else on Erlang) is
+  exactly the QUIC-frame-level interop risk we want to avoid.</li>
+<li><strong>Rejected</strong> because of the Erlang-side gap.</li>
+</ul>
+<h3 id="ngtcp2-nghttp3">ngtcp2 + nghttp3</h3>
+<ul>
+<li><strong>Pros</strong>: Reference-quality C QUIC implementation; widely used by
+  curl-side ecosystems. Cleanly separable QUIC / HTTP/3 layers.</li>
+<li><strong>Cons</strong>: Same Erlang-side gap as lsquic — no maintained NIF binding.
+  Would need to be paired with quicer or a custom binding regardless,
+  which means two QUIC implementations in production. Library API is
+  lower-level than msquic's; more boilerplate to wire bidi streams +
+  flow control.</li>
+<li><strong>Rejected</strong> because the Erlang-side gap forces a heterogeneous stack
+  that we explicitly want to avoid.</li>
+</ul>
+<h3 id="picoquic">picoquic</h3>
+<ul>
+<li><strong>Pros</strong>: Research-grade QUIC implementation with strong reputation
+  for correctness. Used in IETF interop testing.</li>
+<li><strong>Cons</strong>: Marketed as a research/experimentation library, not a
+  production-deployment library. No first-class Erlang binding.
+  Maintenance cadence uncertain.</li>
+<li><strong>Rejected</strong> as not production-grade.</li>
+</ul>
+<h3 id="quiche-cloudflare">quiche (Cloudflare)</h3>
+<ul>
+<li><strong>Pros</strong>: Production-grade Rust QUIC implementation with C ABI.
+  Used by Cloudflare's edge.</li>
+<li><strong>Cons</strong>: Rust dep adds toolchain complexity (we are otherwise C++23).
+  Erlang binding situation comparable to lsquic — none maintained at
+  first-class. Cloudflare's primary use case (HTTP/3 proxy front-end)
+  is not aligned with our use case (long-lived control-plane bidi
+  streams).</li>
+<li><strong>Rejected</strong> because of the Rust toolchain addition and Erlang gap.</li>
+</ul>
+<h3 id="stay-on-grpc">Stay on gRPC</h3>
+<ul>
+<li><strong>Pros</strong>: Already working. No migration risk. No customer-facing impact.</li>
+<li><strong>Cons</strong>: Permanent vcpkg+abseil+cmake-method tax. Alpine/musl support
+  remains blocked. Future vcpkg upgrades continue to surprise. The
+  cumulative cost of the recurring fire-fights (#375, #501,
+  2026-04-28 cache nuke) outweighs the migration cost on a multi-year
+  view.</li>
+<li><strong>Rejected</strong> because the recurring tax is unsustainable and Alpine
+  support is on the roadmap.</li>
+</ul>
+<h2 id="why-msquic-specifically">Why msquic specifically</h2>
+<ul>
+<li>Microsoft-maintained, used by Windows Server and .NET — production
+  grade, not research.</li>
+<li>vcpkg port exists. Conan recipe exists. msquic is C, doesn't pull
+  abseil — none of the gRPC-class dep-graph problems.</li>
+<li>Cross-platform: Windows / Linux / macOS via the same C ABI. Linux
+  build uses OpenSSL by default; Windows uses schannel by default; we
+  pin OpenSSL on Windows too for symmetry with the cert-store contract.</li>
+<li>Has an actively maintained Erlang binding (quicer) by Emqx — no
+  orphan-binding risk.</li>
+</ul>
+<h3 id="cryptographic-module-posture-workstream-c">Cryptographic module posture (Workstream C)</h3>
+<p>The current gRPC stack uses BoringSSL (vcpkg's gRPC port links its
+embedded copy). Post-migration the C++ side uses msquic with
+<strong>quictls/openssl 3.1.7-quic1</strong> on Linux/macOS and on Windows (we pin
+away from schannel for symmetry). The Erlang gateway side continues to
+use upstream OpenSSL via OTP's crypto application.</p>
+<p>The fork distinction matters for compliance:
+- <code>quictls/openssl 3.1.7-quic1</code> is a <strong>fork</strong> of upstream OpenSSL 3.1.x
+  maintained by the QUIC ecosystem to add the QUIC API extensions
+  removed from the upstream 3.2 line. vcpkg's msquic 2.4.8 port vendors
+  it directly. It is NOT the upstream OpenSSL 3.x line.
+- The fork does not share an upstream-coordinated CVE disclosure
+  timeline with OpenSSL. A vulnerability patched in upstream 3.1.x may
+  be patched in the fork at a later date; Yuzu's exposure window is
+  bounded by the fork's release cadence and our vcpkg msquic port-bump
+  latency. CVE monitoring posture for the fork is part of the
+  questionnaire-update package (#891).
+- Customer-questionnaire answers MUST cite the fork explicitly, not
+  "OpenSSL 3.x".</p>
+<p>Yuzu does not currently claim FIPS 140-3 validation. If a future
+customer requires FIPS-validated TLS, upstream OpenSSL 3.x ships a FIPS
+provider that satisfies that bar with explicit configuration; the
+quictls fork is NOT FIPS-validated. The migration preserves the
+upstream-OpenSSL FIPS option for a future re-platform without
+committing to it. BoringSSL has its own FIPS-validated build
+(BoringCrypto) used by some downstream consumers, but Yuzu has never
+relied on it.</p>
+<p>This posture is a customer-questionnaire-relevant change. <strong>Tracking
+issue: #891</strong> — covers CAIQ encryption row, architecture whitepaper
+transport section, DPA "encryption in transit" annex, SRM network-layer
+row, and the fork-CVE-monitoring posture. Hard gate before PR 6 merge.</p>
+<h2 id="why-quicer-specifically">Why quicer specifically</h2>
+<ul>
+<li>Maintained by Emqx, a high-load production user (MQTT broker over QUIC).</li>
+<li>NIF wraps msquic directly, so the Erlang gateway and the C++ stack
+  speak the same QUIC implementation byte-for-byte at the frame level.</li>
+<li>Active development cadence. Used in production at scale.</li>
+</ul>
+<p>The primary risk with a NIF-based binding is that a bug in the NIF can
+crash the BEAM VM. We mitigate this by isolating quicer-using processes
+under their own simple_one_for_one supervisor and ensuring dialyzer is
+clean across the whole gateway after the migration.</p>
+<h2 id="consequences">Consequences</h2>
+<h3 id="positive">Positive</h3>
+<ul>
+<li>Eliminates <code>grpc</code>, <code>abseil</code>, <code>c-ares</code>, <code>re2</code>, <code>upb</code>, <code>utf8-range</code> from
+  the C++ dep graph (~6 deps).</li>
+<li>Eliminates <code>grpcbox</code>, <code>chatterbox</code>, <code>gproc</code> from the Erlang dep graph
+  (3 deps).</li>
+<li>Removes the <code>meson.build</code> Windows option-D hand-wire block (~150 lines).</li>
+<li>Removes the <code>triplets/x64-windows.cmake</code> static-linkage override.</li>
+<li>Removes the #501 absl DLL kSeed cross-DLL workarounds (becomes obsolete
+  once abseil is gone).</li>
+<li>Unblocks Alpine/musl support — <code>docs/per-target-agent-build-pipeline-
+  scope.md</code> Phase 2.</li>
+<li>Reduces binary size; expected ≥ 30 % reduction post-migration.</li>
+<li>Reduces Windows MSVC debug link time; expected ≥ 50 % reduction post-
+  migration (option-D hand-wire was a major contributor).</li>
+</ul>
+<h3 id="negative-costs">Negative / costs</h3>
+<ul>
+<li>~6–9 weeks of dedicated engineering effort across 11 PRs
+  (<a href="../per-target-agent-build-pipeline-scope.html" class="doc-ref"><code>docs/per-target-agent-build-pipeline-scope.md</code></a> references the same
+  effort estimate from #376).</li>
+<li>Greenfield C++ on QUIC primitives — risk of subtle bugs at first.</li>
+<li>Greenfield Erlang on quicer — risk of NIF crashes in early use.</li>
+<li>Dual-stack soak period (PRs 5–7) ⇒ for ~3 release cycles we maintain
+  both transports. Operational complexity during that window.</li>
+<li>Long-lived <code>feat/quic-transport</code> branch off <code>dev</code> — must be
+  rebased/merged from <code>dev</code> weekly to avoid drift.</li>
+</ul>
+<h3 id="mitigation-matrix">Mitigation matrix</h3>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>msquic ↔ quicer QUIC-frame interop divergence</td>
+<td>PR 0 spike validates before any production code; pin both sides to compatible msquic versions</td>
+</tr>
+<tr>
+<td>Bidi-stream semantics: gRPC half-close + status trailers vs raw QUIC streams</td>
+<td>Encode trailing-status as final protobuf message (<code>TrailingStatus</code>); document explicitly in <code>transport.hpp</code></td>
+</tr>
+<tr>
+<td>mTLS cert rotation on msquic vs grpc::SslCredentials</td>
+<td>PR 3 explicitly tests <code>cert_reloader</code> rotation; design <code>Credentials</code> interface to expose a reload callback; cert lifecycle policy doc required pre-PR 3 merge (Workstream B)</td>
+</tr>
+<tr>
+<td>quicer NIF crash takes BEAM VM down</td>
+<td>Isolate quicer-using processes under their own supervisor; dialyzer-clean is mandatory before merge</td>
+</tr>
+<tr>
+<td>Agent fleet rollout breaks production</td>
+<td>PR 5 dual-stack ⇒ PR 6 default-flip ⇒ rollback is just an agent flag change with server still dual-listening</td>
+</tr>
+<tr>
+<td>Customer enterprise networks block UDP/443 (firewalls, Zscaler, Netskope)</td>
+<td>Documented <code>--transport grpc</code> flag preserves the old transport; <code>yuzu-agent --probe-transport</code> subcommand surfaces UDP reachability before fleet-wide flip; required pre-PR 5 merge. Pilot-customer hand-test gate tracked at <strong>#892</strong>.</td>
+</tr>
+<tr>
+<td><strong>Per-call dispatcher-thread fanout at enterprise scale (governance UP-14)</strong> — PR 1b-3's bidi server dispatcher spawns one <code>std::thread</code> per active bidi RPC. At 100K Subscribe streams (one per agent), Linux default 8 MiB stack means ~800 GiB virtual; even a 256 KiB tuned stack yields ~25 GiB and a fragile thread-creation ceiling. Plus head-of-line block on the cq_worker when joining slow-exiting handlers (UP-13).</td>
+<td><strong>Mitigated by bounded dispatcher pool (#904, 2026-05-09).</strong> Option (a) shipped: <code>GrpcServerListener</code> now owns a fixed-size pool sized at <code>start()</code> from <code>ListenerOptions::bidi_dispatcher_pool_size</code> (default <code>clamp(64, hardware_concurrency × 8, 4096)</code>). <code>ServerCall::dispatch_bidi</code> enqueues to the pool's queue under <code>bidi_pool_mtx_</code>; workers pop and run <code>run_bidi_handler</code>. Saturation rejects with <code>StatusCode::ResourceExhausted "transport: bidi dispatcher saturated"</code> via the existing <code>UnaryPendingFinish</code> reaper path (preserves UP-1 lifetime invariant). <code>on_bidi_finish</code> no longer joins per-call threads — closes UP-13 head-of-line block on cq_worker. Operator guidance in <a href="../user-manual/server-admin.html" class="doc-ref"><code>docs/user-manual/server-admin.md</code></a> direct-connect-vs-gateway sizing section. systemd <code>TasksMax=infinity</code> + <code>LimitNPROC=infinity</code> and Docker compose <code>nproc: 65536</code> / <code>pids_limit: -1</code> provide cgroup-level headroom. Tests at <code>tests/unit/transport/test_transport_smoke.cpp</code> <code>[transport][bidi][pool]</code>: pool reuse across more sequential calls than <code>pool_size</code>, overflow → ResourceExhausted, default size absorbs moderate concurrency. Gateway-mode deployment further reduces server-side pressure since the gateway (Erlang processes, lightweight) terminates Subscribe and only per-gateway concurrency reaches the C++ pool.</td>
+</tr>
+<tr>
+<td><strong>DownloadUpdate idle-read pins a bidi dispatcher pool slot indefinitely (governance UP-8 / #902)</strong> — pre-#902 the lifted <code>DownloadUpdate</code> handler at <code>agent_service_impl.cpp</code> blocks on <code>read_pb</code> for the request frame with no timeout. A misbehaving or stalled client that opens the stream and never writes would hold a pool slot until peer half-close or external cancel. Combined with #904's bounded pool, idle clients monopolise the pool and operators see <code>ResourceExhausted</code> rejections on legitimate concurrent downloads.</td>
+<td><strong>Mitigated by <code>BidiStream::read</code> idle-deadline (#902, 2026-05-09).</strong> The pure virtual gained an optional <code>std::chrono::milliseconds deadline</code> parameter (default zero = no deadline, mirroring <code>CallContext::deadline</code>). On expiry, the implementation cancels the stream and surfaces <code>StatusCode::DeadlineExceeded</code> via <code>final_status()</code> on the side that armed the deadline. <code>DownloadUpdate</code> now arms the request-frame read with a 30 s deadline. Server-side handler distinguishes deadline expiry from peer-close by querying <code>stream.final_status()</code> after <code>read()</code> returns false. The matching <code>read_pb(stream, out, deadline)</code> template overload in <code>proto_adapter.hpp</code> keeps the adapter surface symmetric. Wire semantics caveat documented in the BidiStream contract block: the gRPC backend's <code>TryCancel</code> path means the peer observes <code>Cancelled</code> regardless of handler-supplied final status; the local <code>DeadlineExceeded</code> signal is what gates the slot release, not the wire-trailer reason. Tests at <code>[transport][bidi][deadline]</code>: server-side timeout, client-side timeout, happy-path no-fire.</td>
+</tr>
+<tr>
+<td><strong>Slow-write peer pins a bidi dispatcher pool slot during chunk streaming (governance UP-101 / #911)</strong> — UP-8's read deadline only bounds the FIRST read on a bidi stream. The chunk-streaming phase of <code>DownloadUpdate</code> (server writes 64 KiB chunks in a tight loop) re-stalls the dispatcher slot when a peer's TCP receive window collapses, NAT/firewall holds the stream, or HTTP/2 flow control window collapses. Combined with #904's bounded pool, slow-write peers re-introduce the UP-8 saturation surface at the streaming phase.</td>
+<td><strong>Mitigated by <code>BidiStream::write</code> per-frame deadline (#911, 2026-05-10).</strong> The pure virtual gained an optional <code>std::chrono::milliseconds deadline</code> parameter symmetric with the read side. Default zero preserves unbounded; negative values clamp to zero (#915). Mechanism is identical to read: <code>cv_.wait_for(lock, deadline, pred)</code> + on-expiry set-flag + TryCancel + return-false. <code>final_status()</code> promotes to <code>DeadlineExceeded</code> on either flag. Server-side <code>DownloadUpdate</code> arms each chunk write with the operator-tunable <code>ota_chunk_write_deadline_secs_</code> (default 30 s); agent-side <code>Updater</code> arms request-frame write with <code>kRequestWriteDeadline = 5 s</code>. Counter <code>yuzu_grpc_requests_total{status="chunk_write_deadline_exceeded"}</code> + agent-side <code>yuzu_agent_ota_chunk_deadline_total{phase}</code> (#924 / SRE-2) close CC7.2 evidence asymmetry. Tests at <code>[transport][bidi][deadline][write]</code>. Slow-link compound lockout (UP-206) closed by #934 (next row).</td>
+</tr>
+<tr>
+<td><strong>Slow-link compound lockout — chunk-write deadline + per-peer rate limit (governance UP-206 / #934)</strong> — A genuinely slow legitimate peer (satellite, residential 4G/LTE, congested corp WAN) hits the 30 s chunk-write deadline (#911) mid-OTA, retries on the next heartbeat, and burns through the per-peer rate-limit bucket (#913) within 5 cycles. Bucket refills at 1 token / 90 min, so the agent is locked out of OTA for 7.5 h despite being mostly-healthy.</td>
+<td><strong>Mitigated by operator-tunable deadline + chunk-write-deadline token refund (#934, 2026-05-10).</strong> Two-part fix: (1) <code>--ota-chunk-write-deadline-secs &lt;n&gt;</code> / <code>YUZU_OTA_CHUNK_WRITE_DEADLINE_SECS</code> env (default 30, <code>&lt;= 0</code> clamps to default) lets operators raise the deadline to fit slow links — threaded through <code>Config::ota_chunk_write_deadline_seconds</code> → <code>AgentServiceImpl::set_ota_chunk_write_deadline()</code> → atomic member read once per call (snapshotted so reload doesn't reshape in-flight). (2) <code>AgentServiceImpl::refund_download_update(peer)</code> credits the consumed token back when the chunk-write deadline fires; refund caps at bucket capacity, empty-peer/unseen-peer no-op. New metric label <code>yuzu_grpc_requests_total{status="rate_limit_token_refunded"}</code> tracks the refund path so dashboards can split chunk-write-deadline failures into "charged" vs "refunded" — refund-counter MUST track chunk-write-deadline-counter exactly; divergence signals a regression. Threat model unchanged: fast-valid monopolisers still drain the bucket (their calls succeed, no chunk-write-deadline → no refund). Tests at <code>[agent_service][rate_limit][refund]</code>.</td>
+</tr>
+<tr>
+<td><strong>Valid-mTLS insider monopolises bidi pool with rapid DownloadUpdate calls (governance UP-116 / #913)</strong> — #904's bounded pool + #902 / #911 deadlines cap slot-seconds, but a fast-valid client (mTLS-authed insider) can saturate the pool with legitimate-looking calls. Per-peer counter is needed to limit concurrency by identity.</td>
+<td><strong>Mitigated by per-peer DownloadUpdate token bucket (#913, 2026-05-10).</strong> Token bucket in <code>AgentServiceImpl::admit_download_update</code> keyed by verified SAN identity (falls back to <code>peer_uri</code> in dev/UAT). Capacity 5 tokens, refill ~1 token / 90 minutes (= <code>update_check_interval</code> / 4). Excess requests return <code>ResourceExhausted "per-peer DownloadUpdate rate limit exceeded"</code>. Counter <code>yuzu_grpc_requests_total{status="rate_limited_per_peer"}</code> + spdlog::warn with peer attribution. State is process-local (resets on restart) — fleet-monopolisation guard, not persistent quota. Multi-server HA bucket-sharing gap tracked at <strong>#935</strong>; bucket-map cap and size-metric also #935. Tests at <code>[agent_service][rate_limit]</code>.</td>
+</tr>
+<tr>
+<td><strong>Bidi pool saturation lacks alertable metric (governance OBS-1 / CMP-2 / UP-111 / #912)</strong> — pre-#912 the saturation reject path increments only <code>dispatcher_throws_total{kind="dispatcher_internal"}</code>, conflating capacity with internal failure. Three Gate 6 reviewers (compliance + sre + enterprise-readiness) converged on this as BLOCKING for pre-pilot tagging in PR 1c-4 governance.</td>
+<td><strong>Mitigated by dedicated saturation gauge + counter (#912, 2026-05-10).</strong> <code>TransportMetricSink</code> gained 3 new methods: <code>on_bidi_pool_size</code>, <code>on_bidi_pool_in_flight_delta</code>, <code>on_bidi_pool_saturated</code>. <code>ServerTransportMetricSink</code> (closes #905 OBS-2 sink-wiring) implements them as <code>yuzu_server_transport_bidi_pool_size</code>, <code>yuzu_server_transport_bidi_pool_in_flight</code>, <code>yuzu_server_transport_bidi_pool_saturated_total{method}</code>. Gauge measures slot residency including active handler (closet-clean Round-1 contract alignment). 3 Grafana alerts ship at <code>deploy/grafana/yuzu-alerts.yml</code> with runbook at <a href="../ops-runbooks/transport-saturation.html" class="doc-ref"><code>docs/ops-runbooks/transport-saturation.md</code></a>: <code>YuzuBidiPoolSaturationRejects</code> (warning, on any reject for 1 m), <code>YuzuBidiPoolNearSaturation</code> (critical, residency &gt;80% for 5 m), <code>YuzuAgentChannelFaultRate</code> (warning, channel_fault reconnects &gt; 0.5/s for 5 m).</td>
+</tr>
+<tr>
+<td><strong>Server-side ServerTransportMetricSink wiring deferred (governance OBS-2 / #905)</strong> — pre-#905 <code>opts.metric_sink</code> was nullptr at <code>server.cpp</code> agent-listener creation; the <code>yuzu_server_transport_*</code> namespace was dead.</td>
+<td><strong>Mitigated by inline <code>detail::ServerTransportMetricSink</code> (#905, 2026-05-10).</strong> New class in <code>server.cpp</code> derives from <code>TransportMetricSink</code> and pumps every hook (streams_total, active_streams, bytes_total, dispatcher_throws_total, bidi_pool_<em>) into <code>MetricsRegistry</code>. Wired via <code>opts.metric_sink = std::make_shared&lt;...&gt;(metrics_)</code> at agent-listener creation. Direct unit-test coverage deferred to </em><em>#936</em>* (currently exercised implicitly through the listener integration).</td>
+</tr>
+<tr>
+<td>DPI / TLS-interception middleboxes (Bluecoat, Symantec ProxySG) cannot inspect QUIC handshake</td>
+<td>Document operator bypass-list procedure for the Yuzu control-plane FQDN; add to security-hardening doc pre-PR 5; pilot-customer hand-test gate (<strong>#892</strong>) validates each design partner's DPI environment before default-flip</td>
+</tr>
+<tr>
+<td>Compliance questionnaire answer becomes stale (BoringSSL → OpenSSL/msquic)</td>
+<td>Tracked at <strong>#891</strong> — CAIQ encryption row, architecture whitepaper transport section, DPA "encryption in transit" annex, SRM network-layer row, fork-CVE-monitoring posture. Hard gate before PR 6 merge.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="implementation-status">Implementation status</h2>
+<p>In-repo tracking of the migration progress so future Claude sessions
+and SOC 2 auditors can see what has shipped without grepping git log
+(governance round-3 F-5 + round-4 doc-S3).</p>
+<table>
+<thead>
+<tr>
+<th>PR</th>
+<th>Description</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PR 0</td>
+<td>Spike (msquic ↔ quicer echo)</td>
+<td><strong>Passed 2026-05-07</strong> — evidence at <code>docs/spike-results/0001-quic-transport/</code></td>
+</tr>
+<tr>
+<td>PR 1a</td>
+<td>Transport abstraction skeleton (header, proto, build wiring)</td>
+<td>Merged</td>
+</tr>
+<tr>
+<td>PR 1b-1</td>
+<td>Client-side unary dispatch (grpc::GenericStub callback API)</td>
+<td>Merged</td>
+</tr>
+<tr>
+<td>PR 1b-2</td>
+<td>Server-side AsyncGenericService dispatcher + ServerCall state machine</td>
+<td>Merged</td>
+</tr>
+<tr>
+<td>PR 1b-3</td>
+<td>Client/server bidi-stream wiring (PrepareCall, ServerAsyncReaderWriter)</td>
+<td>Merged</td>
+</tr>
+<tr>
+<td>PR 1c-1</td>
+<td>Adapter shim — <code>register_unary_pb&lt;Req,Resp&gt;</code> + <code>OwnedProtoMessage&lt;T&gt;</code> typed-proto helpers in <code>transport/include/yuzu/transport/proto_adapter.hpp</code></td>
+<td>Merged</td>
+</tr>
+<tr>
+<td>PR 1c-2</td>
+<td>Server-side: drop <code>pb::AgentService::Service</code> inheritance, lift <code>AgentServiceImpl</code> onto <code>transport::ServerListener</code>; populate CallContext::peer_san_identities (CN+SAN+GetPeerIdentity union) + initial metadata in GrpcServerListener; <code>agent_server_</code> → <code>agent_listener_</code>; mgmt + gateway services stay on <code>grpc::ServerBuilder</code> (deferred to 1c-5); <code>grpc::EnableDefaultHealthCheckService</code> removed (Yuzu uses HTTP /readyz)</td>
+<td>Merged</td>
+</tr>
+<tr>
+<td>PR 1c-3</td>
+<td>Agent-side unary lift — Register, Heartbeat, ReportInventory, CheckForUpdate onto <code>transport::Channel::unary</code></td>
+<td>Merged (224067d, 2026-05-09) + governance hardening round 1 (1af8ab5)</td>
+</tr>
+<tr>
+<td>PR 1c-4</td>
+<td>Agent-side Subscribe (bidi) + DownloadUpdate (server-stream-via-bidi) lift; three-commit chain — (i) #916 server-side <code>CallContext::cancel</code> contract softened to backend-best-effort, (ii) Subscribe + DownloadUpdate lifted onto <code>channel_t-&gt;bidi_stream(...)</code> with <code>subscribe_stop_src_</code> per-cycle pattern + 30 s per-chunk read deadline, (iii) legacy <code>creds_grpc</code>/<code>channel</code>/diagnostic-block + <code>KEEPALIVE_*</code> args cleanup. Keepalive args migrated into <code>GrpcChannel</code> (closes SRE-1) before (iii). New tests at <code>tests/unit/test_agent_subscribe_lift.cpp</code> (5 cases / 102 assertions). Hard predecessors all closed: UP-14 by #904, UP-8 by #902, <code>parse_target_address</code> test by <code>1af8ab5</code>, Heartbeat per-cycle <code>stop_source</code> round-trip test by <code>e075648</code></td>
+<td>Merged: (i) <code>0b5f89c</code>, (ii) <code>7269ba7</code>, hardening rounds <code>98f25f9</code> + <code>3e14517</code>, keepalive <code>1c05ce7</code>, (iii) cleanup</td>
+</tr>
+<tr>
+<td>PR 1c-5</td>
+<td>Server-side: lift <code>gateway_service_impl</code> + <code>ManagementServiceImpl</code> + <code>gw_mgmt_channel_</code> onto transport; unify shutdown SLO across listeners (gov round 7 architect S1)</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR 1c-6</td>
+<td>Cleanup + #896 readiness probe wiring (<code>is_serving() ∧ bound_endpoint().port != 0</code> already added to <code>/readyz</code> for the agent listener in 1c-2 hardening; 1c-6 closes the mgmt-side equivalent) + #897 trailing-metadata scrub</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR 2</td>
+<td>Conan toolchain bring-up (parallel to vcpkg)</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR 3</td>
+<td>msquic transport implementation behind the same abstraction</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR 4</td>
+<td>quicer Erlang gateway transport (also removes grpcbox; gateway scaling decisions land here per ADR-0002)</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR 5</td>
+<td>Dual-stack feature flag (<code>--transport=grpc|quic|auto</code>)</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR 6</td>
+<td>Agent default cutover to QUIC</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR 7</td>
+<td>Gateway default cutover to QUIC</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR 8</td>
+<td>Big delete (gRPC + grpcbox + abseil + meson option-D + #501 absl-DLL workarounds)</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>PR 9</td>
+<td>vcpkg deletion (Conan-only)</td>
+<td>Pending</td>
+</tr>
+</tbody>
+</table>
+<p>Update this table at every merge to <code>feat/quic-transport</code>. The table
+is the canonical "where are we" reference; the commit log is the
+audit trail.</p>
+<h2 id="spike-validation-gate-pr-0">Spike validation gate (PR 0)</h2>
+<p>Before any production code is written, PR 0 includes a throwaway spike
+that stands up:</p>
+<ul>
+<li>A C++ msquic server listening on <code>localhost:50053</code></li>
+<li>An Erlang quicer client connecting to it</li>
+<li>A bidirectional echo: each end writes 1 KiB protobuf-encoded messages
+  in both directions for 30 seconds</li>
+<li>Server and client both terminate cleanly on half-close</li>
+</ul>
+<p>Pass criteria:
+- TLS 1.3 handshake succeeds with self-signed cert pair
+- Bidi stream survives 30 s of two-way writes with zero loss
+- Half-close from either end is detected by the other within 1 s
+- Flow control: writer that blocks for 5 s on a slow reader resumes
+  cleanly when reader catches up</p>
+<p>Fail mode: any of the above. If the spike fails, halt the migration
+plan, re-evaluate library choice (probable next move: lsquic + custom
+Erlang NIF, or stay on gRPC and re-scope), and update this ADR with
+status <code>Rejected</code> and a new ADR with the alternative.</p>
+<h3 id="evidence-capture-workstream-d">Evidence capture (Workstream D)</h3>
+<p>The spike output (msquic server log, quicer client log, frame-counter
+totals, half-close timing, slow-reader resume timing) is redirected to
+files under <code>docs/spike-results/0001-quic-transport/</code> (or attached as
+artifacts to issue #376) and committed to the repo. The retention
+target is the lifetime of the migration — these files are
+audit-evidence for the SOC 2 change-management trail (Workstream F)
+proving the architectural decision was validated before commitment.</p>
+<p>A separate <a href="../spike-results/0001-quic-transport/README.html" class="doc-ref"><code>docs/spike-results/0001-quic-transport/README.md</code></a> summarises
+which environment ran the spike (host OS, msquic version, quicer
+version, cert-pair fingerprint), who ran it, and pass/fail per
+criterion. The named approver in this ADR's header signs off on the
+evidence by referencing the spike-results commit SHA in their approval.</p>
+<h4 id="evidence-2026-05-07-run">Evidence — 2026-05-07 run</h4>
+<p>Macro-summary (full detail in <a href="../spike-results/0001-quic-transport/README.html" class="doc-ref"><code>docs/spike-results/0001-quic-transport/README.md</code></a>):</p>
+<table>
+<thead>
+<tr>
+<th>Pass criterion</th>
+<th>Observed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TLS 1.3 handshake</td>
+<td>4 ms; ALPN <code>yuzu-spike</code> negotiated</td>
+</tr>
+<tr>
+<td>Bidi 30 s, zero loss</td>
+<td>15 000 chunks each direction, <code>loss_bytes = 0</code></td>
+</tr>
+<tr>
+<td>Half-close &lt; 1 s</td>
+<td>client peer-FIN observed in 0 ms (sub-millisecond)</td>
+</tr>
+<tr>
+<td>Flow control resume</td>
+<td><code>slow_pause_observed_ms = 5005</code>, zero loss across the pause</td>
+</tr>
+</tbody>
+</table>
+<p>Environment: macOS 26.4 / Apple Silicon arm64, AppleClang 21.0,
+OTP 28 / erts 16.4, msquic 2.4.8 (vcpkg port <code>arm64-osx</code>), quicer
+0.2.15 (hex). Spike repo SHA at run time: <code>054cda0</code>.</p>
+<p>Two design choices that the production transport (<code>transport/</code>) must
+honour, pulled forward from spike findings (Caveats section of the
+spike-results README; ordering kept identical between this section and
+the README so a reader cross-referencing them does not see drift):</p>
+<ol>
+<li><code>quicer:async_send/3</code> without <code>?QUICER_SEND_FLAG_SYNC</code> does <strong>not</strong>
+   deliver <code>send_complete</code> events to the controlling process (gated at
+   <code>quicer/c_src/quicer_stream.c:1174</code> <code>if (send_ctx-&gt;is_sync)</code>).
+   Application-level back-pressure tracking must use <code>send/2</code> (sync) or
+   <code>async_send</code> <em>with</em> the SYNC bit.</li>
+<li>quicer 0.2.x event tuples are <strong>4-element</strong> <code>{quic, Tag, Resource,
+   Prop}</code> even when the event has no payload (the shape is built at
+   <code>quicer/c_src/quicer_nif.c:1710</code> via <code>enif_make_tuple4</code>). 3-tuple
+   patterns silently fall through to catchalls.</li>
+</ol>
+<p>Both constraints are tracked for PR 4 (Erlang gateway QUIC migration) at
+<strong>#895</strong> so the production gateway author has the complete patterns-to-
+inherit + patterns-to-NOT-inherit list before writing the production
+quicer client.</p>
+<h2 id="release-communication-checklist">Release communication checklist</h2>
+<p>Each implementation PR in the ladder carries explicit
+operator-communication obligations:</p>
+<ul>
+<li><strong>PR 5 (dual-stack feature flag)</strong>:</li>
+<li>CHANGELOG <code>[Unreleased] – Added</code> entry naming the new
+    <code>--transport=grpc|quic|auto</code> flag</li>
+<li><a href="../user-manual/security-hardening.html" class="doc-ref"><code>docs/user-manual/security-hardening.md</code></a> Network Requirements
+    section adding UDP/50051 (or whichever ports apply)</li>
+<li><a href="../user-manual/upgrading.html" class="doc-ref"><code>docs/user-manual/upgrading.md</code></a> version-table row documenting that
+    server $X+1 dual-listens, agents may stay on $X</li>
+<li><code>--probe-transport</code> subcommand documented in the same section</li>
+<li>
+<p><strong>Pilot-customer hand-test gate</strong>: 1–3 design-partner customers
+    validate dual-stack in their actual enterprise networks (including
+    DPI/proxy infrastructure) for ≥ 1 week before PR 6 may merge</p>
+</li>
+<li>
+<p><strong>PR 6 (agent default-flip to QUIC)</strong>:</p>
+</li>
+<li>CHANGELOG <code>Breaking</code> entry: agent default transport changes</li>
+<li>upgrading.md version-table row noting rollback path</li>
+<li>
+<p>Compliance questionnaire-update issue closed (CAIQ + whitepaper +
+    DPA + SRM)</p>
+</li>
+<li>
+<p><strong>PR 7 (gateway default-flip)</strong>:</p>
+</li>
+<li>CHANGELOG <code>Breaking</code> entry</li>
+<li>
+<p>upgrading.md version-table row</p>
+</li>
+<li>
+<p><strong>PR 8 (gRPC removal)</strong>:</p>
+</li>
+<li>CHANGELOG <code>Breaking</code> entry: agents older than this version cannot
+    connect</li>
+<li>CLAUDE.md target-architecture diagram updated (gRPC label → QUIC)</li>
+<li><a href="../per-target-agent-build-pipeline-scope.html" class="doc-ref"><code>docs/per-target-agent-build-pipeline-scope.md</code></a> Status updated to
+    "Phase 2 unblocked"</li>
+</ul>
+<p>The governance pipeline runs on each PR; the docs-writer agent
+verifies the relevant items above land in the same commit as the
+behaviour change.</p>
+<h2 id="references">References</h2>
+<ul>
+<li>Issue #376 — Strategic: Migrate transport off gRPC to QUIC</li>
+<li>Issue #375 — P0 build: ci.yml Windows MSVC debug broken since LNK2038</li>
+<li>Issue #501 — abseil DLL kSeed cross-DLL test workarounds</li>
+<li><a href="../../.claude/agents/build-ci.html" class="doc-ref"><code>.claude/agents/build-ci.md</code></a> — "Windows MSVC static-link history and #375"</li>
+<li><a href="../per-target-agent-build-pipeline-scope.html" class="doc-ref"><code>docs/per-target-agent-build-pipeline-scope.md</code></a> — Phase 2 dependency</li>
+<li><a href="../dependency-rollout-2026-04-14.html" class="doc-ref"><code>docs/dependency-rollout-2026-04-14.md</code></a> — #375 timeline</li>
+<li><a href="../enterprise-readiness-soc2-first-customer.html" class="doc-ref"><code>docs/enterprise-readiness-soc2-first-customer.md</code></a> — Workstreams B/C/G
+  for compliance impact framing</li>
+<li><a href="https://github.com/microsoft/msquic">msquic on GitHub</a></li>
+<li><a href="https://github.com/emqx/quicer">quicer on GitHub</a></li>
+</ul>
+</main>
+</body>
+</html>

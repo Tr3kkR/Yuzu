@@ -1,0 +1,847 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADR-0002: Gateway scaling — direction toward WhatsApp/RabbitMQ density tier</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/adrs/0002-gateway-scaling.md</div>
+<h1 class="doc-title">ADR-0002: Gateway scaling — direction toward WhatsApp/RabbitMQ density tier</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="adr-0002-gateway-scaling-direction-toward-whatsapprabbitmq-density-tier">ADR-0002: Gateway scaling — direction toward WhatsApp/RabbitMQ density tier</h1>
+<ul>
+<li><strong>Status</strong>: Proposed — design direction; commits no code yet.</li>
+<li><strong>Accepted-by</strong>: pending project-lead sign-off.</li>
+<li><strong>Date</strong>: 2026-05-09</li>
+<li><strong>Tracking issue</strong>: TBD (umbrella issue to be filed as a follow-up to
+  this ADR; referenced in the implementation plan section below).</li>
+<li><strong>Related</strong>:</li>
+<li>ADR-0001 (QUIC transport — msquic + quicer). The gateway QUIC bring-up
+    is PR 4 of that workstream and is the natural inflection point for
+    the scaling work this ADR describes.</li>
+<li><code>.claude/projects/-Users-nathan-Yuzu/memory/project_gateway_scalability_workstream.md</code>
+    (private project memory — informal decomposition that fed this ADR).</li>
+<li>
+<h1 id="904-governance-up-14-server-side-bounded-bidi-dispatcher-pool">904 / governance UP-14 (server-side bounded bidi dispatcher pool)</h1>
+<p>closed the <strong>server</strong>'s thread-fanout problem on 2026-05-09; this
+ADR is its sibling for the <strong>gateway</strong>.</p>
+</li>
+<li><a href="../capability-map.html" class="doc-ref"><code>docs/capability-map.md</code></a> Reliability / Scalability section.</li>
+<li><a href="../enterprise-readiness-soc2-first-customer.html" class="doc-ref"><code>docs/enterprise-readiness-soc2-first-customer.md</code></a> Workstream D.</li>
+<li><strong>Supersedes</strong>: nothing. This is the first explicit scaling ADR for
+  the gateway.</li>
+</ul>
+<h2 id="context">Context</h2>
+<p>Yuzu's production topology has two fanout tiers:</p>
+<div class="highlight"><pre><span></span><code>agents (10² … 10⁶)  →  gateway (Erlang/OTP, 1..N nodes)  →  server (C++, single-node)
+</code></pre></div>
+<p>Long-lived bidi RPCs (<code>Subscribe</code>, <code>DownloadUpdate</code>) carry the bulk of
+the connection budget. The agent's <code>Subscribe</code> stream is open for the
+lifetime of the connection — same shape as a WhatsApp client or a
+RabbitMQ consumer. At enterprise scale this is <strong>the</strong> scaling axis;
+short-lived unary RPCs (Register, Heartbeat, ReportInventory) are
+trivial by comparison.</p>
+<h3 id="where-each-tier-stands-today">Where each tier stands today</h3>
+<ul>
+<li><strong>Server (C++):</strong> as of #904 (2026-05-09) the agent-facing transport
+  listener uses a bounded bidi-handler thread pool sized at start by
+  <code>ListenerOptions::bidi_dispatcher_pool_size</code>. Default
+  <code>clamp(64, hardware_concurrency × 8, 4096)</code>; saturation rejects with
+  <code>StatusCode::ResourceExhausted</code>. Gateway-mode deployments don't
+  pressure this pool because the gateway terminates Subscribe per-fleet
+  and only one upstream stream per gateway node reaches the server.
+  The server's bounded pool is a per-node ceiling, not a fleet ceiling.</li>
+<li><strong>Gateway (Erlang/OTP):</strong> today uses <code>grpcbox</code> for the gRPC server
+  surface, with a per-RPC Erlang process spawned by grpcbox's stream
+  handler. The gateway has not been load-tested above ~10² simulated
+  agents in CI; production deployments to date have been small
+  (development clusters, design partners). The single-node ceiling is
+  <strong>unmeasured</strong> but bounded by:</li>
+<li>grpcbox's accept-pool / stream-process model (opaque to us).</li>
+<li>BEAM's <code>+P</code> process limit (default <code>262_144</code>; raisable to <code>134_217_728</code>).</li>
+<li>File-descriptor limits (per-systemd-unit, per-cgroup).</li>
+<li>TCP socket buffer sizing (per-socket, default ~256 KiB on Linux).</li>
+<li>prometheus_httpd label cardinality (per-agent labels would explode).</li>
+</ul>
+<h3 id="industry-reference-points">Industry reference points</h3>
+<table>
+<thead>
+<tr>
+<th>System</th>
+<th>Connection density per node</th>
+<th>Architecture notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>WhatsApp (2012)</td>
+<td>~2M concurrent TCP per FreeBSD Erlang node</td>
+<td>Rick Reed's @scale talk; tuned BEAM (<code>+K true</code>, <code>+P 16M</code>, scheduler pinning), tuned FreeBSD (<code>kern.maxfiles</code>, jumbo frames, NIC IRQ pinning), per-connection Erlang process (~2 KiB heap with <code>fullsweep_after, 10</code>).</td>
+</tr>
+<tr>
+<td>RabbitMQ (current)</td>
+<td>~100K AMQP connections per node</td>
+<td><code>file_handle_cache</code>, <code>vm_memory_high_watermark</code>, Erlang-distribution tuning.</td>
+</tr>
+<tr>
+<td>Redis</td>
+<td>N/A (single-threaded event loop, ~10⁵ ops/sec)</td>
+<td>Different architecture; not a direct comparison for long-lived bidi.</td>
+</tr>
+</tbody>
+</table>
+<p>The applicable target tier is <strong>WhatsApp</strong> — long-lived stateful bidi
+streams over TLS, with per-connection identity. RabbitMQ is the floor;
+WhatsApp is the headroom we want.</p>
+<h3 id="why-this-needs-an-adr-now">Why this needs an ADR now</h3>
+<p>Three reasons converge:</p>
+<ol>
+<li><strong>The QUIC migration (#376) is the inflection point.</strong> PR 4 of #376
+   replaces grpcbox in the gateway with quicer (raw QUIC NIF). Once
+   grpcbox is gone we own the connection lifecycle from the UDP socket
+   up — buffer sizes, stream cancellation, accept-pool topology, and
+   process-to-stream mapping are all directly tunable. This is a
+   <strong>one-time</strong> opportunity: if we lock in scaling decisions before
+   PR 4 lands, PR 4 becomes the design vehicle. If we wait, we'll
+   re-do the work twice.</li>
+<li><strong>#904 closed the server-side fanout.</strong> The bounded dispatcher pool
+   means server scaling is now operator-controlled. The gateway is the
+   next ceiling and is the one that matters at enterprise scale —
+   gateway-mode is the production topology for fleets &gt;~2K agents.</li>
+<li><strong>Pilot customer pipeline</strong> (Workstream G of the enterprise readiness
+   plan) brings 10⁴–10⁵ agent counts into testing horizon over the
+   next 1–2 quarters. The gateway must be load-validated before any
+   pilot signs an SLA.</li>
+</ol>
+<h2 id="decision-drivers">Decision drivers</h2>
+<p>In rough priority order:</p>
+<ol>
+<li><strong>Connection density per node.</strong> Target is WhatsApp tier (~10⁶ per
+   node). Hard floor is RabbitMQ tier (~10⁵).</li>
+<li><strong>Operational simplicity.</strong> Single-node deployments must remain
+   trivial (<code>docker run</code> works). Clustering is opt-in for very large
+   fleets, not mandatory.</li>
+<li><strong>Process model.</strong> Erlang is committed (no migration off OTP planned
+   or considered). Within Erlang, the choice is process-per-connection
+   (matches WhatsApp's design) vs a gen_statem dispatcher fronting a
+   small worker pool (RabbitMQ-ish). The per-connection model wins on
+   isolation and fault containment; the dispatcher model wins on
+   memory at extreme density. <strong>Bias: process-per-connection</strong> because
+   isolation is load-bearing for the agent-management workload (one
+   agent's misbehaviour cannot affect others).</li>
+<li><strong>grpcbox dependency.</strong> grpcbox is a constraint we want to remove.
+   It abstracts the connection model, the stream cancellation
+   semantics, and the buffer tuning surface — which is convenient for
+   small-scale gRPC services and a liability for high-density bidi.
+   The QUIC migration removes it as a side effect; this ADR aligns the
+   scaling work with that removal.</li>
+<li><strong>Compatibility with the C++ server's bounded pool.</strong> Gateway must
+   not push more upstream concurrent Subscribe streams than the
+   server's pool can absorb. Today the server default is
+   ≤4096 streams. The gateway either multiplexes (one upstream stream
+   per gateway node, fanning out N agent streams downstream) or
+   coordinates with operator pool sizing.</li>
+<li><strong>Observability without cardinality explosion.</strong> prometheus_httpd
+   labels must NOT include <code>agent_id</code> or any 10⁶-cardinality
+   dimension. Per-agent state lives in ETS / per-process state, not
+   in metric labels.</li>
+<li><strong>Soak verifiability.</strong> Whatever architecture lands MUST be
+   validatable by an in-tree synthetic-agent simulator running in CI
+   (with ≥10⁴ simulated agents per driver box, scaling to 10⁵ in a
+   nightly job).</li>
+</ol>
+<h2 id="decision">Decision</h2>
+<p><strong>Direction (proposed):</strong></p>
+<ul>
+<li><strong>A. Process-per-connection on quicer.</strong> Once PR 4 of #376 lands,
+  each agent QUIC connection is owned by a dedicated <code>gen_statem</code>
+  process under a <code>simple_one_for_one</code> supervisor. The <code>gen_statem</code>
+  drives the Subscribe bidi stream and any short-lived unary RPCs
+  multiplexed over the same QUIC connection. State: <code>~2-4 KiB</code> heap
+  per process post-hibernate, matching the WhatsApp envelope.</li>
+<li><strong>B. Single-node first; clustering second.</strong> Optimise the single-node
+  ceiling to ~10⁶ agents before introducing clustering. Clustering is
+  scoped as a follow-up ADR (ADR-0003 or similar) and is gated on a
+  demonstrated single-node ceiling that warrants horizontal scale.</li>
+<li><strong>C. Soak harness in tree.</strong> A synthetic-agent simulator written in
+  Erlang (one BEAM process per simulated agent, identical to
+  production agent behaviour at the wire level) lives in
+  <code>gateway/test/load/</code>. CI runs a 10⁴-agent variant on each PR;
+  nightly runs a 10⁵-agent variant. The harness drives Subscribe +
+  Heartbeat + occasional command round-trips and asserts:</li>
+<li>p99 dispatch latency under 100 ms.</li>
+<li>Process count stable (no leaks).</li>
+<li>VmRSS growth bounded by <code>O(N_agents × known-per-process-budget)</code>.</li>
+<li>prometheus_httpd <code>/metrics</code> scrape latency under 1 s.</li>
+</ul>
+<p><strong>Rejected — option (D) "external proxy".</strong> A reverse proxy
+(HAProxy, envoy) in front of the gateway would terminate TLS and fan
+out to a smaller pool of gateway worker connections. This trades one
+scaling problem for another (the proxy's connection density), adds an
+operational dependency, and breaks per-connection identity at the
+gateway. Not pursued.</p>
+<p><strong>Rejected — option (E) "stay on grpcbox forever".</strong> grpcbox does not
+expose the surface we need (per-stream buffer tuning, accept-pool
+sizing, send-completion ordering control) and the QUIC migration is
+removing it anyway. Continuing to invest in grpcbox-bound scaling work
+would be thrown away at PR 4.</p>
+<p><strong>Conditional accept.</strong> This decision becomes binding when:</p>
+<ol>
+<li>The QUIC spike's gateway side (PR 0 covered the C++ side; gateway
+   PR 0' is implicit) demonstrates quicer can carry ≥10⁴ concurrent
+   bidi streams without process-table or socket-table exhaustion at
+   default tuning.</li>
+<li>A first-pass soak harness (10⁴ agents) runs green on a developer
+   box with default tuning.</li>
+<li>Project lead sign-off on the workstream decomposition below.</li>
+</ol>
+<h2 id="workstream-decomposition">Workstream decomposition</h2>
+<p>Eight items. Each is a sub-issue of the umbrella tracking issue. Order
+matters where noted; otherwise items can ship in any sequence.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Item</th>
+<th>Hard predecessor</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><strong>BEAM startup tuning audit + bake.</strong> <code>gateway/config/vm.args</code> review: <code>+P 16M</code>, <code>+Q 65536</code>, <code>+K true</code>, <code>+sbt db</code>, <code>+sbwt very_short</code>, <code>+swt very_low</code>. Bake into <code>release.yml</code> so CI artifacts ship with the tuned values.</td>
+<td>none</td>
+<td>Cheapest item; do first to establish the baseline ceiling.</td>
+</tr>
+<tr>
+<td>2</td>
+<td><strong>Per-process memory tuning.</strong> <code>{fullsweep_after, 10}</code> or <code>hibernate_after</code> on the per-agent gen_statem. Goal: ≤4 KiB heap per idle agent process.</td>
+<td>item 1</td>
+<td>Validate via <code>erlang:process_info/2</code> post-hibernate in soak.</td>
+</tr>
+<tr>
+<td>3</td>
+<td><strong>Soak harness in <code>gateway/test/load/</code>.</strong> Synthetic agents driving Subscribe + Heartbeat + command round-trip; CI gate at 10⁴, nightly at 10⁵.</td>
+<td>items 1+2</td>
+<td>Prerequisite for every later item — no PR after item 3 may regress soak.</td>
+</tr>
+<tr>
+<td>4</td>
+<td><strong>TCP / QUIC socket-options profile.</strong> <code>{nodelay, true}</code>, send/recv buffer sizes (~256K target after measurement, NOT default), keepalive cadence aligned to heartbeat. Document under <code>docs/gateway-tuning.md</code>.</td>
+<td>item 3</td>
+<td>Profile <strong>before</strong> prescribing — the WhatsApp numbers are FreeBSD; Linux defaults differ.</td>
+</tr>
+<tr>
+<td>5</td>
+<td><strong>Supervisor topology audit.</strong> Per-agent processes MUST live under <code>simple_one_for_one</code>. <code>one_for_one</code> with millions of children is a known footgun (linear restart-strategy walks, ets writes per child).</td>
+<td>item 3</td>
+<td>Walk every supervisor in <code>gateway/apps/yuzu_gw/src/</code>.</td>
+</tr>
+<tr>
+<td>6</td>
+<td><strong>grpcbox removal (rolls into PR 4 of #376).</strong> Replace grpcbox with quicer + a thin yuzu_gw dispatcher. The dispatcher owns the connection-to-process mapping; per-connection gen_statem replaces grpcbox's per-RPC process. ADR-0001 already commits to this; ADR-0002 only adds the explicit scaling-driven rationale.</td>
+<td>items 1-3</td>
+<td>This is the inflection — every scaling item below this row depends on owning the connection lifecycle directly.</td>
+</tr>
+<tr>
+<td>7</td>
+<td><strong>Observability under load.</strong> prometheus_httpd label-cardinality budget; ETS sizing for per-agent state if any; msacc traces on schedulers; <code>/metrics</code> scrape latency budget.</td>
+<td>items 3+6</td>
+<td>Pin a cardinality-explosion test in soak — <code>/metrics</code> must scrape under 1 s with 10⁵ agents.</td>
+</tr>
+<tr>
+<td>8</td>
+<td><strong>Cluster-mode ADR (follow-up, not in this ADR's scope).</strong> When item 6 has demonstrated single-node ceiling and the operator demand justifies horizontal scale, write ADR-000N for clustering. Likely libcluster + consistent-hash agent_id → gateway node, with partition handling.</td>
+<td>items 6+7 + measured demand</td>
+<td>One-way door — do NOT pre-commit topology before measurement.</td>
+</tr>
+</tbody>
+</table>
+<p>Hard not-doing-now (tracked separately or deferred):</p>
+<ul>
+<li><strong>OS migration to FreeBSD.</strong> WhatsApp's 2M-per-node was on FreeBSD;
+  Yuzu is Linux-first. Linux can hit similar density (~10⁶) with
+  tuned <code>epoll</code>, but the FreeBSD ceiling will remain higher. Not
+  pursuing FreeBSD as a target OS.</li>
+<li><strong>Erlang distribution between gateway nodes.</strong> Cluster-mode
+  workstream — see item 8.</li>
+<li><strong>Replacing the C++ server's bounded pool.</strong> #904 is sufficient;
+  gateway-mode termination keeps server-side concurrency bounded by
+  gateway count (small) regardless of fleet size.</li>
+</ul>
+<h2 id="consequences">Consequences</h2>
+<h3 id="positive">Positive</h3>
+<ol>
+<li><strong>Predictable single-node density.</strong> With items 1-5 + 7 in place,
+   the gateway has a measured ceiling tied to BEAM/Linux tuning, not
+   grpcbox's opaque accept-pool model.</li>
+<li><strong>Direct QUIC stream control post-item 6.</strong> Per-stream send buffer
+   sizing, application-level back-pressure (the <code>quicer:async_send</code> SYNC
+   bit caveat from the spike), and idle-stream timeouts are all
+   directly addressable rather than mediated by grpcbox.</li>
+<li><strong>Operational floor.</strong> Even if the project never reaches 10⁶ per
+   node in deployment, items 1-5 lift the floor from "untested" to
+   "10⁵-validated", which is sufficient for the foreseeable pilot
+   pipeline (Workstream G).</li>
+<li><strong>Compose with #904.</strong> The bounded server pool gives operators a
+   visible and tunable ceiling; the gateway scaling work gives them
+   the headroom that lets the server pool stay at its default in
+   gateway-mode.</li>
+</ol>
+<h3 id="negative-costs">Negative / costs</h3>
+<ol>
+<li><strong>Soak harness is real engineering.</strong> A 10⁵-agent simulator in
+   Erlang is non-trivial. Estimated effort: 1-2 weeks of focused work
+   for items 1-3 combined; nightly CI infrastructure adds runner cost.</li>
+<li><strong>Tuning is environment-specific.</strong> Item 4's socket-buffer numbers
+   are not portable across cloud providers (AWS ENA, GCP gVNIC, Azure
+   accelerated networking each have different defaults). Document
+   ranges, not magic numbers.</li>
+<li><strong>prometheus_httpd cardinality discipline is forever.</strong> Once the
+   soak harness exists, every new metric must be scrutinised for
+   per-agent labels. No exceptions, no "just for debugging".</li>
+<li><strong>PR 4 of #376 grows in scope.</strong> The grpcbox removal already lives
+   there; the scaling decisions in items 1, 2, 4, 5 may need to land
+   in PR 4 (rather than as separate PRs) to avoid a scaling regression
+   between the grpcbox-era code and the post-grpcbox code. Plan for a
+   larger-than-typical PR 4 review.</li>
+</ol>
+<h3 id="mitigation-matrix">Mitigation matrix</h3>
+<table>
+<thead>
+<tr>
+<th>Risk</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Soak harness becomes flaky and is silenced</td>
+<td>Pin nightly soak as a <strong>release-gate</strong> (no merge to main if soak is broken, mirroring the <code>nightly-broken</code> discipline); per-component pass-fail attribution so a flake's source is debuggable, not a black-box red.</td>
+</tr>
+<tr>
+<td>Single-node ceiling is below 10⁵ even after items 1-5</td>
+<td>Item 8 (clustering) is escalated from "follow-up" to "concurrent". The bias toward single-node first is a soft preference, not a hard one — measurement decides.</td>
+</tr>
+<tr>
+<td>grpcbox removal breaks an unanticipated grpc-only invariant</td>
+<td>PR 4 of #376 lands behind a feature flag (<code>--transport grpc</code>) for the dual-stack period (PR 5 / PR 6 of #376). Rollback is a flag flip.</td>
+</tr>
+<tr>
+<td>QUIC NIF crash takes BEAM down (per ADR-0001 rejected-alternatives caveat)</td>
+<td>Crash-isolation supervisor trees: quicer NIF processes live under their own dedicated supervisor; a NIF crash kills only the affected gen_statem, not the whole BEAM. Validated in soak by injecting <code>quicer:close_connection/1</code> mid-stream and asserting BEAM stays up. Inherits ADR-0001 §"Mitigation matrix" "quicer NIF crash takes BEAM VM down" row.</td>
+</tr>
+<tr>
+<td>Linux distro defaults bite us in pilot</td>
+<td><code>docs/gateway-tuning.md</code> ships sysctl + ulimit recipes per supported distro (Ubuntu 24.04, RHEL 9, Amazon Linux 2023). Pilot deployments require operator sign-off on the tuning checklist.</td>
+</tr>
+<tr>
+<td>FreeBSD demand from a customer</td>
+<td>Document in <code>docs/gateway-tuning.md</code> that FreeBSD has been measured higher in the literature but is not Yuzu-supported; offer a pilot-engineering escalation path.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="implementation-status">Implementation status</h2>
+<table>
+<thead>
+<tr>
+<th>Item</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ADR drafted</td>
+<td><strong>2026-05-09</strong> (this document)</td>
+</tr>
+<tr>
+<td>Project-lead sign-off</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>Umbrella tracking issue filed</td>
+<td>Pending</td>
+</tr>
+<tr>
+<td>Item 1 (BEAM startup tuning)</td>
+<td>Not started</td>
+</tr>
+<tr>
+<td>Item 2 (per-process memory)</td>
+<td>Not started</td>
+</tr>
+<tr>
+<td>Item 3 (soak harness)</td>
+<td>Not started</td>
+</tr>
+<tr>
+<td>Item 4 (socket profile)</td>
+<td>Not started</td>
+</tr>
+<tr>
+<td>Item 5 (supervisor audit)</td>
+<td>Not started</td>
+</tr>
+<tr>
+<td>Item 6 (grpcbox removal — PR 4 of #376)</td>
+<td>Pending — predecessor PRs 1c-4..1c-6 of #376 still in flight</td>
+</tr>
+<tr>
+<td>Item 7 (observability under load)</td>
+<td>Not started</td>
+</tr>
+<tr>
+<td>Item 8 (clustering ADR)</td>
+<td>Deferred per workstream ordering</td>
+</tr>
+</tbody>
+</table>
+<h2 id="validation-gate">Validation gate</h2>
+<p>This ADR's decision becomes binding when:</p>
+<ol>
+<li><strong>Soak harness greenlit at 10⁴.</strong> Item 3 lands and a developer-box
+   run holds 10⁴ simulated agents under default tuning for 1 hour
+   without process-table growth, RSS growth above linear, or scheduler
+   utilisation drift.</li>
+<li><strong>Item 6 design review passed.</strong> PR 4 of #376's design doc covers
+   the connection-to-process mapping, the per-stream send-back-pressure
+   model (using the <code>quicer:async_send</code> SYNC bit per ADR-0001 spike
+   caveats), and the idle-stream timeout. Reviewer: cpp-expert +
+   gateway-erlang agents + project lead.</li>
+<li><strong>No nightly-broken outstanding</strong> on <code>feat/quic-transport</code> or <code>main</code>
+   for the 24h preceding sign-off.</li>
+</ol>
+<h2 id="spike-style-evidence-capture-workstream-d-pattern-lifted-from-adr-0001">Spike-style evidence capture (Workstream D pattern, lifted from ADR-0001)</h2>
+<p>When the soak harness lands (item 3), it MUST persist evidence under
+<code>docs/spike-results/0002-gateway-scaling/</code> mirroring the ADR-0001 spike
+layout:</p>
+<ul>
+<li><a href="README.html" class="doc-ref"><code>README.md</code></a> — methodology, tuning applied, results summary.</li>
+<li>Raw <code>.jsonl</code> per-run logs (timestamp, agent_count, process_count,
+  rss_kb, p99_latency_ms, schedulers_utilization).</li>
+<li>Plots / summary charts where helpful (PNG; small, &lt; 200 KiB).</li>
+<li>Caveats section — what didn't work, what surprised us, what's known
+  to be flaky and why.</li>
+</ul>
+<p>This gives future Claude sessions and SOC 2 auditors a tamper-evident
+record of the scaling validation, identical pattern to PR 0 of #376.</p>
+<h2 id="release-communication-checklist">Release communication checklist</h2>
+<p>When item 6 ships (grpcbox removal as part of PR 4 of #376), release
+notes MUST include:</p>
+<ul>
+<li>Operator-visible tuning changes (vm.args defaults shipped).</li>
+<li>Required cgroup / ulimit / sysctl changes for high-density
+  deployments (linking <code>docs/gateway-tuning.md</code>).</li>
+<li>Migration path for design-partner clusters that depended on grpcbox-
+  specific behaviour (none expected, but flag for review during PR 4).</li>
+<li>Compose-file updates if the gateway needs new ulimits (likely yes,
+  mirroring the server's #904 changes).</li>
+</ul>
+<p>This complements ADR-0001's existing release-communication checklist
+for the C++ side of the QUIC migration; release notes for the cut
+that contains PR 4 should reference both.</p>
+<h2 id="references">References</h2>
+<ul>
+<li>ADR-0001 — <a href="0001-quic-transport-msquic-quicer.html" class="doc-ref"><code>docs/adrs/0001-quic-transport-msquic-quicer.md</code></a>. The
+  gateway QUIC bring-up (PR 4 of #376) is item 6 of this ADR's
+  workstream.</li>
+<li><a href="../spike-results/0001-quic-transport/README.html" class="doc-ref"><code>docs/spike-results/0001-quic-transport/README.md</code></a> — quicer caveats
+  from the C++ side (4-element event tuples, async_send SYNC bit).
+  Item 6 inherits these.</li>
+<li>WhatsApp engineering blog (Reed, 2012) — "Scaling to Millions of
+  Simultaneous Connections" @scale talk; canonical reference for the
+  WhatsApp tier numbers cited above.</li>
+<li>RabbitMQ documentation — "Networking and RabbitMQ" tuning guide;
+  source for the ~100K floor cited above.</li>
+<li><a href="../capability-map.html" class="doc-ref"><code>docs/capability-map.md</code></a> Reliability / Scalability section.</li>
+<li><a href="../enterprise-readiness-soc2-first-customer.html" class="doc-ref"><code>docs/enterprise-readiness-soc2-first-customer.md</code></a> Workstream D.</li>
+<li><a href="../user-manual/server-admin.html" class="doc-ref"><code>docs/user-manual/server-admin.md</code></a> "Bidi dispatcher pool sizing"
+  (#904 / 2026-05-09) — the server-side counterpart to this ADR's
+  gateway-side scaling story.</li>
+</ul>
+</main>
+</body>
+</html>

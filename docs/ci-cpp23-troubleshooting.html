@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Troubleshooting CI for Cross-Platform C++23 Projects</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/ci-cpp23-troubleshooting.md</div>
+<h1 class="doc-title">Troubleshooting CI for Cross-Platform C++23 Projects</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="troubleshooting-ci-for-cross-platform-c23-projects">Troubleshooting CI for Cross-Platform C++23 Projects</h1>
+<p><strong>A practical guide to getting C++23 code compiling on GitHub Actions across GCC, Clang, MSVC, and Apple Clang — the problems nobody warns you about.</strong></p>
+<p>This was written after spending a full day debugging CI failures for <a href="https://github.com/Tr3kkR/Yuzu">Yuzu</a>, a cross-platform C++23 endpoint management platform. Every issue below was discovered the hard way.</p>
+<hr>
+<h2 id="1-clang-18-github-actions-broken-stdexpected">1. Clang 18 + GitHub Actions = broken <code>std::expected</code></h2>
+<p><strong>Symptom:</strong> <code>error: no template named 'expected' in namespace 'std'</code> with clang-18, <code>-std=c++23</code>, on <code>ubuntu-24.04</code> runners.</p>
+<p><strong>Root cause chain:</strong></p>
+<ol>
+<li>The <code>ubuntu-24.04</code> runner has GCC 12, 13, AND 14 pre-installed</li>
+<li>Clang doesn't ship its own C++ standard library on Linux — it uses GCC's libstdc++</li>
+<li>Clang's <code>GCCInstallationDetector</code> always picks the <strong>highest version</strong> → GCC 14</li>
+<li>libstdc++'s <code>&lt;expected&gt;</code> header is guarded by <code>__cpp_concepts &gt;= 202002L</code></li>
+<li><strong>Clang 18 sets <code>__cpp_concepts</code> to a value below <code>202002L</code></strong></li>
+<li>So <code>&lt;expected&gt;</code> compiles to an empty header — the template is never defined</li>
+</ol>
+<p><strong>Why it works locally but fails on CI:</strong> A fresh <code>ubuntu:24.04</code> Docker container only has GCC 13. Clang picks it and everything works. The CI runner has three GCC versions and clang picks the wrong one.</p>
+<p><strong>Fix:</strong> Upgrade to <strong>Clang 19</strong>, which correctly sets <code>__cpp_concepts = 202002L</code>. This was explicitly noted in the <a href="https://releases.llvm.org/19.1.0/tools/clang/docs/ReleaseNotes.html">Clang 19.1.0 release notes</a>.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># ci.yml — use clang-19, not clang-18</span>
+<span class="nt">matrix</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">compiler</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">gcc-13</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">clang-19</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># Install step</span>
+<span class="l l-Scalar l-Scalar-Plain">sudo apt-get install -y clang-19</span>
+</code></pre></div>
+<p><strong>Alternative fixes (if you must stay on clang-18):</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Force clang to use GCC 13&#39;s headers</span>
+clang++-18<span class="w"> </span>--gcc-install-dir<span class="o">=</span>/usr/lib/gcc/x86_64-linux-gnu/13
+
+<span class="c1"># Or purge GCC 14 (fragile — runner images change)</span>
+sudo<span class="w"> </span>apt-get<span class="w"> </span>purge<span class="w"> </span>-yq<span class="w"> </span>gcc-14<span class="w"> </span>g++-14<span class="w"> </span>libstdc++-14-dev
+
+<span class="c1"># Or use clang&#39;s own libc++ (changes ABI — all deps must match)</span>
+sudo<span class="w"> </span>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>libc++-18-dev<span class="w"> </span>libc++abi-18-dev
+clang++-18<span class="w"> </span>-stdlib<span class="o">=</span>libc++<span class="w"> </span>-std<span class="o">=</span>c++23
+</code></pre></div>
+<p><strong>References:</strong>
+- <a href="https://github.com/actions/runner-images/issues/8659">actions/runner-images#8659</a>
+- <a href="https://github.com/actions/runner-images/issues/11229">actions/runner-images#11229</a>
+- <a href="https://github.com/clangd/clangd/issues/2200">clangd/clangd#2200</a></p>
+<hr>
+<h2 id="2-apple-clang-version-numbers-lie">2. Apple Clang: version numbers lie</h2>
+<p>Apple Clang version numbers <strong>do not match upstream LLVM</strong>. "Apple clang version 15.0.0" is based on LLVM 16, not LLVM 15.</p>
+<table>
+<thead>
+<tr>
+<th>Xcode</th>
+<th>Apple Clang</th>
+<th>Actual LLVM basis</th>
+<th>GitHub runner</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>15.4</td>
+<td>15.0.0</td>
+<td>~LLVM 16</td>
+<td><code>macos-14</code></td>
+</tr>
+<tr>
+<td>16.0</td>
+<td>16.0.0</td>
+<td>~LLVM 17</td>
+<td><code>macos-15</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Practical impact on C++23:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>macos-14 (Xcode 15)</th>
+<th>macos-15 (Xcode 16)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>std::expected</code></td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>std::format</code></td>
+<td>Needs <code>-mmacosx-version-min=13.3</code></td>
+<td>Needs <code>-mmacosx-version-min=13.3</code></td>
+</tr>
+<tr>
+<td><code>std::chrono::clock_cast</code></td>
+<td><strong>No</strong></td>
+<td><strong>No</strong></td>
+</tr>
+<tr>
+<td>CTAD for aggregates</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Deducing <code>this</code></td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>-std=c++23</code> flag</td>
+<td><strong>No</strong> (needs <code>-std=c++2b</code>)</td>
+<td>Yes</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Fix:</strong> Use <code>macos-15</code> runners and set the deployment target.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># ci.yml</span>
+<span class="nt">runs-on</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">macos-15</span>
+
+<span class="c1"># meson native file</span>
+<span class="p p-Indicator">[</span><span class="nv">built-in options</span><span class="p p-Indicator">]</span>
+<span class="l l-Scalar l-Scalar-Plain">cpp_std = &#39;c++23&#39;</span>
+<span class="l l-Scalar l-Scalar-Plain">cpp_args = [&#39;-mmacosx-version-min=13.3&#39;]</span>
+<span class="l l-Scalar l-Scalar-Plain">cpp_link_args = [&#39;-mmacosx-version-min=13.3&#39;]</span>
+</code></pre></div>
+<h3 id="the-deployment-target-trap">The deployment target trap</h3>
+<p>Apple gates certain C++23 library features behind <strong>minimum macOS version</strong> because the implementation lives in the system <code>libc++.dylib</code>. If you compile with default settings but use <code>std::format</code>, you get link-time errors or runtime crashes on older macOS. The threshold is <strong>macOS 13.3</strong> for <code>std::format</code>, <code>std::to_chars(float)</code>, and <code>std::from_chars(float)</code>.</p>
+<h3 id="stdchronoclock_cast-broken-everywhere"><code>std::chrono::clock_cast</code> — broken everywhere</h3>
+<p><code>clock_cast</code> is not implemented in Apple's libc++ on any version, and it's incomplete in upstream libc++ too. Use a portable alternative:</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// Instead of: auto sys_tp = std::chrono::clock_cast&lt;std::chrono::system_clock&gt;(file_tp);</span>
+<span class="c1">// Use relative offset (accurate to nanoseconds, portable everywhere):</span>
+<span class="k">auto</span><span class="w"> </span><span class="n">file_now</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fs</span><span class="o">::</span><span class="n">file_time_type</span><span class="o">::</span><span class="n">clock</span><span class="o">::</span><span class="n">now</span><span class="p">();</span>
+<span class="k">auto</span><span class="w"> </span><span class="n">sys_now</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">chrono</span><span class="o">::</span><span class="n">system_clock</span><span class="o">::</span><span class="n">now</span><span class="p">();</span>
+<span class="k">auto</span><span class="w"> </span><span class="n">sys_tp</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="n">sys_now</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="p">(</span><span class="n">file_tp</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">file_now</span><span class="p">);</span>
+</code></pre></div>
+<h3 id="dont-use-raw-stdc23">Don't use raw <code>-std=c++23</code></h3>
+<p>Apple Clang 15 doesn't accept <code>-std=c++23</code> — it needs <code>-std=c++2b</code>. If your build system uses raw compiler flags, it will break on macOS.</p>
+<p><strong>Fix:</strong> Let your build system handle the translation. In Meson, set <code>cpp_std = 'c++23'</code> as a project option, not as a raw argument. Meson emits the correct flag per compiler.</p>
+<div class="highlight"><pre><span></span><code><span class="c"># Good — Meson translates per compiler</span>
+<span class="nb">project</span><span class="p">(</span><span class="s">&#39;myproject&#39;</span><span class="p">,</span><span class="w"> </span><span class="s">&#39;cpp&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">default_options</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s">&#39;cpp_std=c++23&#39;</span><span class="p">])</span>
+
+<span class="c"># Bad — breaks Apple Clang 15</span>
+<span class="nb">add_project_arguments</span><span class="p">(</span><span class="s">&#39;-std=c++23&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">language</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;cpp&#39;</span><span class="p">)</span>
+</code></pre></div>
+<hr>
+<h2 id="3-msvc-pre-1938-cv_wait_for-grpc-system_clock-deadlines-ntp-step-risk-914-up-108">3. MSVC pre-19.38 <code>cv_.wait_for</code> + gRPC <code>system_clock</code> deadlines: NTP step risk (#914 / UP-108)</h2>
+<p><code>std::condition_variable::wait_for(lock, duration, pred)</code> is the workhorse primitive in any cross-platform RPC layer. The duration overload is supposed to be steady-clock-based, but <strong>MSVC &lt; 19.38 implemented it on <code>system_clock</code> internally</strong> — meaning a backward NTP step adjustment expires the wait early, and a forward step delays it.</p>
+<table>
+<thead>
+<tr>
+<th>MSVC</th>
+<th><code>wait_for(lock, duration, pred)</code> clock</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>19.34 (Windows Server 2019 default until rolled forward)</td>
+<td><code>system_clock</code> — vulnerable to NTP step</td>
+</tr>
+<tr>
+<td>19.38+</td>
+<td><code>steady_clock</code> — NTP-step-safe</td>
+</tr>
+</tbody>
+</table>
+<p>Yuzu's project floor is exactly <strong>MSVC 19.38</strong>. Any backsliding to 19.34 surfaces as spurious <code>DeadlineExceeded</code> returns under chrony / ntpd step adjustments &gt; 100 ms (and most enterprise NTP setups slew, but startup-time corrections, virtualization clock drift, or post-suspend resume can step several seconds).</p>
+<p><strong>The other half of this footgun is gRPC.</strong> <code>grpc::ClientContext::set_deadline</code> accepts a <code>std::chrono::system_clock::time_point</code> per gRPC's published API (still true as of gRPC 1.62). gRPC's <code>TimePoint</code> adapter explicitly <strong>deletes</strong> non-system-clock overloads — you cannot pass a <code>steady_clock::time_point</code>. Every unary RPC and bidi stream construction in <code>transport/src/grpc/grpc_channel.cpp</code> therefore stamps a system-clock deadline, and any system-clock step during the in-flight window is observable as a premature <code>DeadlineExceeded</code>.</p>
+<p><strong>Mitigation in this repo:</strong></p>
+<ol>
+<li>The MSVC 19.38 floor is enforced in <code>meson.build</code>'s compiler-detection probe.</li>
+<li>Unary calls in <code>grpc_channel.cpp</code> capture <code>steady_clock::now()</code> at deadline arming and compare on <code>DeadlineExceeded</code> returns; if elapsed steady time is significantly less than the configured deadline (default slack: 50 ms), the call site logs <code>transport: deadline fired but elapsed steady time was X ms &lt; expected Y ms — possible system_clock NTP step</code>. The signal is observable in incident triage but does not change the user-visible status.</li>
+<li>Revisit when gRPC exposes a steady-clock-based deadline API (no upstream issue at time of writing — file one if you bump into this in a downstream project).</li>
+</ol>
+<p><strong>References:</strong>
+- MSVC 19.38 chrono migration: <a href="https://github.com/microsoft/STL/issues/1051">microsoft/STL#1051</a>
+- gRPC <code>TimePoint</code> deletion of non-system_clock overloads: <a href="https://github.com/grpc/grpc/blob/master/include/grpcpp/support/time.h">grpcpp/support/time.h:46-47</a></p>
+<hr>
+<h2 id="4-macos-linker-rejects-gnu-flags">4. macOS linker rejects GNU flags</h2>
+<p><strong>Symptom:</strong> <code>ld: unknown option: -z</code> on macOS.</p>
+<p>Apple's <code>ld64</code> linker does not support GNU ld flags like <code>-Wl,-z,relro,-z,now</code> (RELRO + immediate binding). These are ELF security hardening flags that don't apply to Mach-O binaries.</p>
+<div class="highlight"><pre><span></span><code><span class="c"># Guard for ELF platforms only</span>
+<span class="k">if</span><span class="w"> </span><span class="vm">host_machine</span><span class="p">.</span><span class="n">system</span><span class="p">()</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="s">&#39;darwin&#39;</span>
+<span class="w">  </span><span class="nb">add_project_link_arguments</span><span class="p">(</span><span class="s">&#39;-Wl,-z,relro,-z,now&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">language</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;cpp&#39;</span><span class="p">)</span>
+<span class="k">endif</span>
+</code></pre></div>
+<hr>
+<h2 id="5-macos-specific-api-differences">5. macOS-specific API differences</h2>
+<p>These are <strong>platform differences</strong>, not compiler version issues. They apply regardless of which Xcode you use.</p>
+<ul>
+<li><strong><code>execvpe</code></strong> — Linux-only. Use <code>execvp</code> on macOS/BSD.</li>
+<li><strong><code>extern char **environ</code></strong> — not available in anonymous namespaces on macOS. Use <code>_NSGetEnviron()</code> from <code>&lt;crt_externs.h&gt;</code>.</li>
+<li><strong>Path comparisons</strong> — macOS <code>/var</code> is a symlink to <code>/private/var</code>. Always <code>fs::canonical()</code> both sides before comparing.</li>
+</ul>
+<hr>
+<h2 id="6-vcpkg-on-ci-the-90-minute-tax">6. vcpkg on CI: the 90-minute tax</h2>
+<p>Without binary caching, vcpkg builds gRPC + protobuf + abseil from source on every CI run. This takes 40-90 minutes.</p>
+<p><strong>Fix:</strong> Enable GitHub Actions binary caching.</p>
+<div class="highlight"><pre><span></span><code><span class="nt">env</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">VCPKG_BINARY_SOURCES</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;clear;x-gha,readwrite&quot;</span>
+
+<span class="nt">steps</span><span class="p">:</span>
+<span class="w">  </span><span class="c1"># This step exports the cache URL — required for x-gha backend</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">actions/github-script@v7</span>
+<span class="w">    </span><span class="nt">with</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">script</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">        </span><span class="no">core.exportVariable(&#39;ACTIONS_CACHE_URL&#39;, process.env.ACTIONS_CACHE_URL || &#39;&#39;);</span>
+<span class="w">        </span><span class="no">core.exportVariable(&#39;ACTIONS_RUNTIME_TOKEN&#39;, process.env.ACTIONS_RUNTIME_TOKEN || &#39;&#39;);</span>
+</code></pre></div>
+<p>First run: still slow (populating cache). Every subsequent run: ~2-5 minutes.</p>
+<h3 id="dont-use-release-triplets">Don't use <code>-release</code> triplets</h3>
+<p>vcpkg's release-only triplets (<code>x64-linux-release</code>, <code>arm64-osx-release</code>) can produce broken CMake config files where version strings are empty. Stick to standard triplets (<code>x64-linux</code>, <code>arm64-osx</code>).</p>
+<hr>
+<h2 id="7-ccache-silently-doing-nothing">7. ccache: silently doing nothing</h2>
+<p>If you use Meson native files with a <code>[binaries]</code> section, Meson ignores <code>CC</code>/<code>CXX</code> environment variables — so your <code>CC='ccache gcc-13'</code> never reaches the compiler. ccache is installed, configured, and cached, but never invoked.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Bad — overrides CC/CXX env vars, bypasses ccache</span>
+<span class="k">[binaries]</span>
+<span class="na">c</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="s">&#39;gcc-13&#39;</span>
+<span class="na">cpp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&#39;g++-13&#39;</span>
+
+<span class="k">[built-in options]</span>
+<span class="na">cpp_std</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&#39;c++23&#39;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># Good — let CC/CXX from the environment control the compiler</span>
+<span class="k">[built-in options]</span>
+<span class="na">cpp_std</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&#39;c++23&#39;</span>
+</code></pre></div>
+<p>For <strong>cross-compilation</strong> files, <code>[binaries]</code> is required (Meson doesn't read env vars for cross builds). Use array syntax to include ccache:</p>
+<div class="highlight"><pre><span></span><code><span class="k">[binaries]</span>
+<span class="na">c</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="s">[&#39;ccache&#39;, &#39;aarch64-linux-gnu-gcc&#39;]</span>
+<span class="na">cpp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">[&#39;ccache&#39;, &#39;aarch64-linux-gnu-g++&#39;]</span>
+</code></pre></div>
+<p>Also, don't use <code>github.sha</code> in your ccache key — it guarantees a miss every run:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Bad — misses every time</span>
+<span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ccache-${{ github.sha }}</span>
+
+<span class="c1"># Good — hits when source hasn&#39;t changed</span>
+<span class="nt">key</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ccache-${{ matrix.compiler }}-${{ hashFiles(&#39;**/*.cpp&#39;, &#39;**/*.hpp&#39;, &#39;**/*.h&#39;) }}</span>
+</code></pre></div>
+<hr>
+<h2 id="8-ci-workflow-hygiene">8. CI workflow hygiene</h2>
+<p>Things we added after getting burned:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Manual re-runs without pushing</span>
+<span class="nt">on</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">workflow_dispatch</span><span class="p">:</span>
+
+<span class="c1"># Least privilege</span>
+<span class="nt">permissions</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">contents</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">read</span>
+
+<span class="c1"># PR-aware concurrency (prevents dependabot PRs from cancelling each other)</span>
+<span class="nt">concurrency</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}</span>
+<span class="w">  </span><span class="nt">cancel-in-progress</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+
+<span class="c1"># Don&#39;t let hung builds burn 6 hours of runner time</span>
+<span class="nt">timeout-minutes</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">90</span>
+</code></pre></div>
+<hr>
+<h2 id="9-validate-locally-with-docker">9. Validate locally with Docker</h2>
+<p>Don't iterate on CI by pushing and waiting 40 minutes. Build a local CI image with deps pre-compiled:</p>
+<div class="highlight"><pre><span></span><code><span class="k">FROM</span><span class="w"> </span><span class="s">ubuntu:24.04</span>
+<span class="k">RUN</span><span class="w"> </span>apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>cmake<span class="w"> </span>ninja-build<span class="w"> </span>gcc-13<span class="w"> </span>g++-13<span class="w"> </span>clang-19<span class="w"> </span>ccache<span class="w"> </span>pkg-config<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>curl<span class="w"> </span>zip<span class="w"> </span>unzip<span class="w"> </span>tar<span class="w"> </span>python3-pip<span class="w"> </span>git
+<span class="k">RUN</span><span class="w"> </span>pip3<span class="w"> </span>install<span class="w"> </span><span class="nv">meson</span><span class="o">==</span><span class="m">1</span>.9.2
+
+<span class="c"># Pre-build vcpkg deps (the expensive part)</span>
+<span class="k">COPY</span><span class="w"> </span>vcpkg.json<span class="w"> </span>vcpkg-configuration.json<span class="w"> </span>./
+<span class="k">RUN</span><span class="w"> </span>vcpkg<span class="w"> </span>install<span class="w"> </span>--triplet<span class="w"> </span>x64-linux<span class="w"> </span>--x-manifest-root<span class="o">=</span>.
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># Build once (~40 min), reuse forever</span>
+docker<span class="w"> </span>build<span class="w"> </span>-t<span class="w"> </span>my-ci<span class="w"> </span>-f<span class="w"> </span>Dockerfile.ci<span class="w"> </span>.
+
+<span class="c1"># Run CI locally (~3 min with ccache)</span>
+docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-v<span class="w"> </span><span class="k">$(</span><span class="nb">pwd</span><span class="k">)</span>:/src<span class="w"> </span>my-ci
+</code></pre></div>
+<p>This is how we found most of the issues above — fast iteration in Docker, then translate fixes to GitHub Actions.</p>
+<hr>
+<h2 id="summary-the-c23-ci-compatibility-matrix">Summary: the C++23 CI compatibility matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>GCC 13</th>
+<th>Clang 18</th>
+<th>Clang 19</th>
+<th>MSVC 19.38+</th>
+<th>Apple Clang 15</th>
+<th>Apple Clang 16</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>std::expected</code></td>
+<td>Yes</td>
+<td><strong>No</strong>*</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>std::format</code></td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>macOS 13.3+</td>
+<td>macOS 13.3+</td>
+</tr>
+<tr>
+<td><code>std::chrono::clock_cast</code></td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+<td><strong>No</strong></td>
+<td><strong>No</strong></td>
+</tr>
+<tr>
+<td>CTAD for aggregates</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+<td><strong>No</strong></td>
+<td>Yes</td>
+</tr>
+<tr>
+<td><code>-std=c++23</code> flag</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>N/A</td>
+<td><strong>No</strong> (<code>c++2b</code>)</td>
+<td>Yes</td>
+</tr>
+</tbody>
+</table>
+<p><em>* Clang 18 technically supports <code>std::expected</code>, but fails when paired with GCC 14's libstdc++ on GitHub Actions runners due to the <code>__cpp_concepts</code> feature test macro.</em></p>
+<hr>
+<p><em>Written after a full day of debugging. If this saves you time, that's the point.</em></p>
+</main>
+</body>
+</html>

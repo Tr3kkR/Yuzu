@@ -1,0 +1,922 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audit Log</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/audit-log.md</div>
+<h1 class="doc-title">Audit Log</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="audit-log">Audit Log</h1>
+<p>Yuzu records every operator action as a structured audit event. The audit log
+provides a tamper-evident trail suitable for compliance reporting, incident
+investigation, and forwarding to external SIEM platforms such as Splunk or
+Elastic.</p>
+<blockquote>
+<p><strong>Known issue in v0.9.0 (advisory YZA-2026-001):</strong> audit rows for requests
+authenticated via <code>Authorization: Bearer</code> or <code>X-Yuzu-Token</code> (every MCP tool
+call and every REST automation using an API token) had an empty <code>principal</code>
+field. Cookie-authenticated dashboard activity was unaffected. Fixed forward
+in v0.10.0; pre-fix rows are not backfilled. Operators auditing a window that
+spans the v0.9.0 → v0.10.0 boundary should expect a bimodal <code>principal</code>
+distribution. See <a href="../../CHANGELOG.html" class="doc-ref"><code>CHANGELOG.md</code></a> for full remediation context.</p>
+</blockquote>
+<h2 id="storage">Storage</h2>
+<p>Audit events are persisted in a dedicated SQLite database using WAL
+(Write-Ahead Logging) mode for high write throughput without blocking readers.</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Retention period</td>
+<td>365 days</td>
+<td>Events older than this are deleted by background cleanup</td>
+</tr>
+<tr>
+<td>Cleanup interval</td>
+<td>1 hour</td>
+<td>How often the background thread prunes expired events</td>
+</tr>
+</tbody>
+</table>
+<h2 id="event-structure">Event structure</h2>
+<p>Every audit event contains the following fields:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>timestamp</code></td>
+<td>integer (Unix epoch)</td>
+<td>When the event occurred</td>
+</tr>
+<tr>
+<td><code>principal</code></td>
+<td>string</td>
+<td>Username of the operator who performed the action</td>
+</tr>
+<tr>
+<td><code>principal_role</code></td>
+<td>string</td>
+<td>Role of the principal at the time of the action (<code>admin</code>, <code>user</code>)</td>
+</tr>
+<tr>
+<td><code>action</code></td>
+<td>string</td>
+<td>Dot-notated action identifier (see table below)</td>
+</tr>
+<tr>
+<td><code>target_type</code></td>
+<td>string</td>
+<td>Category of the affected object (<code>Tag</code>, <code>Agent</code>, <code>Session</code>, etc.)</td>
+</tr>
+<tr>
+<td><code>target_id</code></td>
+<td>string</td>
+<td>Identifier of the affected object</td>
+</tr>
+<tr>
+<td><code>detail</code></td>
+<td>string</td>
+<td>Human-readable description or the new value</td>
+</tr>
+<tr>
+<td><code>source_ip</code></td>
+<td>string</td>
+<td>IP address of the client that initiated the request</td>
+</tr>
+<tr>
+<td><code>user_agent</code></td>
+<td>string</td>
+<td>HTTP User-Agent header value</td>
+</tr>
+<tr>
+<td><code>session_id</code></td>
+<td>string</td>
+<td>Session cookie identifier (empty for API-token / Bearer / <code>X-Yuzu-Token</code> requests, which have no cookie)</td>
+</tr>
+<tr>
+<td><code>result</code></td>
+<td>string</td>
+<td>Outcome: <code>success</code>, <code>denied</code>, or <code>failure</code>. See <strong>Result vocabulary</strong> below the actions table for the precise semantics of each value.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="logged-actions">Logged actions</h2>
+<p>The following actions are recorded automatically. No operator configuration is
+required.</p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Target type</th>
+<th>When</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>auth.login</code></td>
+<td>Session</td>
+<td>Operator logs in via the dashboard or API</td>
+</tr>
+<tr>
+<td><code>auth.logout</code></td>
+<td>Session</td>
+<td>Operator logs out</td>
+</tr>
+<tr>
+<td><code>auth.login_failed</code></td>
+<td>Session</td>
+<td>Failed login attempt</td>
+</tr>
+<tr>
+<td><code>tag.set</code></td>
+<td>Tag</td>
+<td>A tag is created or updated on an agent</td>
+</tr>
+<tr>
+<td><code>tag.delete</code></td>
+<td>Tag</td>
+<td>A tag is removed from an agent</td>
+</tr>
+<tr>
+<td><code>instruction.execute</code></td>
+<td>Instruction</td>
+<td>An instruction is dispatched to one or more agents</td>
+</tr>
+<tr>
+<td><code>instruction.approve</code></td>
+<td>Instruction</td>
+<td>An instruction pending approval is approved</td>
+</tr>
+<tr>
+<td><code>instruction.deny</code></td>
+<td>Instruction</td>
+<td>An instruction pending approval is denied</td>
+</tr>
+<tr>
+<td><code>enrollment.approve</code></td>
+<td>Agent</td>
+<td>A pending agent enrollment is approved</td>
+</tr>
+<tr>
+<td><code>enrollment.deny</code></td>
+<td>Agent</td>
+<td>A pending agent enrollment is denied</td>
+</tr>
+<tr>
+<td><code>enrollment.token_create</code></td>
+<td>EnrollmentToken</td>
+<td>An enrollment token is generated</td>
+</tr>
+<tr>
+<td><code>settings.update</code></td>
+<td>Setting</td>
+<td>A server setting is changed</td>
+</tr>
+<tr>
+<td><code>rbac.role_assign</code></td>
+<td>Principal</td>
+<td>A role is assigned to a principal</td>
+</tr>
+<tr>
+<td><code>rbac.role_revoke</code></td>
+<td>Principal</td>
+<td>A role is revoked from a principal</td>
+</tr>
+<tr>
+<td><code>management_group.create</code></td>
+<td>ManagementGroup</td>
+<td>A management group is created</td>
+</tr>
+<tr>
+<td><code>management_group.delete</code></td>
+<td>ManagementGroup</td>
+<td>A management group is deleted</td>
+</tr>
+<tr>
+<td><code>management_group.add_member</code></td>
+<td>ManagementGroup</td>
+<td>An agent is added to a management group</td>
+</tr>
+<tr>
+<td><code>management_group.remove_member</code></td>
+<td>ManagementGroup</td>
+<td>An agent is removed from a management group</td>
+</tr>
+<tr>
+<td><code>management_group.assign_role</code></td>
+<td>ManagementGroup</td>
+<td>A role is assigned to a principal on a management group</td>
+</tr>
+<tr>
+<td><code>management_group.unassign_role</code></td>
+<td>ManagementGroup</td>
+<td>A role is unassigned from a principal on a management group</td>
+</tr>
+<tr>
+<td><code>api_token.create</code></td>
+<td>ApiToken</td>
+<td>An API token is generated</td>
+</tr>
+<tr>
+<td><code>api_token.revoke</code></td>
+<td>ApiToken</td>
+<td>An API token is revoked</td>
+</tr>
+<tr>
+<td><code>quarantine.enable</code></td>
+<td>Security</td>
+<td>A device is placed in quarantine</td>
+</tr>
+<tr>
+<td><code>quarantine.disable</code></td>
+<td>Security</td>
+<td>A device is released from quarantine</td>
+</tr>
+<tr>
+<td><code>cert.reload</code></td>
+<td>TlsCertificate</td>
+<td>Certificate hot-reload attempted; detail contains outcome (success or failure reason)</td>
+</tr>
+<tr>
+<td><code>guaranteed_state.rule.create</code></td>
+<td>GuaranteedState</td>
+<td>A Guaranteed State rule is created. On 400 (missing required fields), 409 (rule_id/name conflict), or RBAC rejection, emits <code>result=denied</code> with the store error in <code>detail</code>.</td>
+</tr>
+<tr>
+<td><code>guaranteed_state.rule.update</code></td>
+<td>GuaranteedState</td>
+<td>A Guaranteed State rule is updated (version is incremented on every successful update). On 404 (rule not found), 400 (invalid JSON body — <code>detail</code> is the literal string <code>"invalid JSON body"</code>), 409 (name conflict), or RBAC rejection, emits <code>result=denied</code>.</td>
+</tr>
+<tr>
+<td><code>guaranteed_state.rule.delete</code></td>
+<td>GuaranteedState</td>
+<td>A Guaranteed State rule is deleted. On 404 or RBAC rejection, emits <code>result=denied</code>.</td>
+</tr>
+<tr>
+<td><code>guaranteed_state.push</code></td>
+<td>GuaranteedState</td>
+<td>A push of the active rule set to scoped agents is accepted. <code>target_id</code> is empty (pushes are fleet-level, not per-entity); <code>detail</code> carries <code>rules=&lt;N&gt; full_sync=&lt;bool&gt; scope="&lt;sanitised-expr&gt;" fan_out_deferred_pr3=true</code>. The scope value in <code>detail</code> is <strong>sanitised before embedding</strong>: <code>"</code> and <code>\</code> are backslash-escaped, C0 control bytes (0x00–0x1F, DEL) are dropped. SIEM parsers reconstructing the original scope expression must account for this normalisation — a raw operator input of <code>env="prod"</code> appears in the audit as <code>scope="env=\"prod\""</code>. The <code>fan_out_deferred_pr3=true</code> marker means the REST call is accepted and persisted server-side but agent fan-out is not wired until Guardian PR 3; SIEM rules that infer "rules were delivered to agents" from this event are premature until that flag disappears. Non-object JSON bodies are rejected with <code>result=denied</code> and <code>detail="invalid JSON body"</code>.</td>
+</tr>
+<tr>
+<td><code>tar.status.scan</code></td>
+<td>Infrastructure</td>
+<td>An operator clicked <strong>Scan fleet</strong> on the TAR dashboard page (<code>/tar</code>). A <code>tar.status</code> command was dispatched to the operator's visible-agent set. <code>detail</code> carries the count of agents the dispatch reached (e.g. <code>dispatched to 47 agent(s) in scope</code>). One row per Scan button press; no row on page-load Refresh.</td>
+</tr>
+<tr>
+<td><code>tar.source.reenable</code></td>
+<td>Infrastructure</td>
+<td>An operator clicked <strong>Re-enable</strong> on a row of the TAR retention-paused list and a <code>tar.configure</code> command with <code>&lt;source&gt;_enabled=true</code> was dispatched to a single device. <code>detail</code> carries <code>device=&lt;id&gt; source=&lt;process|tcp|service|user&gt;</code> on success. Failures emit <code>result=failure</code> with <code>detail</code> set to the real reason (<code>scope_violation source=&lt;src&gt;</code> for out-of-scope device IDs, <code>agent_not_connected source=&lt;src&gt;</code> for connected-but-zero-sent dispatches) so SIEM rules can distinguish a forged-form attempt from a transient connectivity issue — even though the HTTP response body is identical (<code>Agent not reachable.</code> 404) for both, to deny enumeration.</td>
+</tr>
+<tr>
+<td><code>execution.visualization.fetch</code></td>
+<td>Execution</td>
+<td>Chart-ready JSON was rendered for an execution's response set via <code>GET /api/v1/executions/{id}/visualization</code> (issue #253 / #587). <code>target_id</code> is the <code>command_id</code>; <code>detail</code> carries <code>&lt;definition_id&gt; index=&lt;N&gt;</code> on success, or <code>&lt;definition_id&gt; reason=&lt;r&gt;</code> on the failure path where <code>&lt;r&gt;</code> is one of <code>missing_definition_id</code>, <code>malformed_definition_id</code>, <code>definition_not_found</code>, <code>no_visualization</code>, <code>index_oor</code>. Permission gate: <code>Response:Read</code>. The <code>command.dispatch</code> event (above, when emitted from the dashboard) appends <code>definition_id=&lt;id&gt;</code> to its <code>detail</code> when the dashboard reverse-resolves a chart-bearing definition, so SIEM can join <code>command.dispatch</code> to the subsequent <code>execution.visualization.fetch</code> by <code>definition_id</code>.</td>
+</tr>
+<tr>
+<td><code>plugin_signing.bundle.uploaded</code></td>
+<td>PluginTrustBundle</td>
+<td>An admin uploaded a PEM trust bundle via Settings → Plugin Code Signing. <code>detail</code> carries <code>&lt;N&gt; cert(s), sha256=&lt;hex&gt;</code> on success. On <code>result=failure</code> (PEM validation rejected the input — empty body, missing markers, no parsable cert, hashing failure, etc.) <code>detail</code> carries the validation error string. Audit row is emitted on both branches so a SIEM rule on <code>failure</code> can detect malformed-upload probing.</td>
+</tr>
+<tr>
+<td><code>plugin_signing.bundle.cleared</code></td>
+<td>PluginTrustBundle</td>
+<td>An admin removed the trust bundle (Settings → Plugin Code Signing → Remove). <code>detail</code> carries <code>file removed</code> (a file existed and was deleted) or <code>no file present</code> (clear was a no-op). Always emits <code>success</code> unless the require-flag DB write fails first, in which case <code>result=failure</code> and <code>detail</code> carries the store error — and the file is <strong>not</strong> removed (two-phase commit prevents the disk/DB-flag desync).</td>
+</tr>
+<tr>
+<td><code>plugin_signing.require.changed</code></td>
+<td>RuntimeConfig</td>
+<td>An admin toggled "Require signed plugins" via Settings. <code>target_id</code> is <code>plugin_signing_required</code>, <code>detail</code> carries the new value (<code>"true"</code> or <code>"false"</code>). Emitted on every change including no-op idempotent re-saves.</td>
+</tr>
+<tr>
+<td><code>response_template.create</code></td>
+<td>InstructionDefinition</td>
+<td>A response-view template was created via <code>POST /api/v1/definitions/{id}/response-templates</code> (issue #254 / Phase 8.2). <code>target_id</code> is the definition id; <code>detail</code> is the new template id on success, or <code>reason=&lt;r&gt;</code> on the audit path. RBAC denials, 400 (malformed id / invalid JSON / validation), 404 (definition not found), and 413 (body too large) emit <code>result=denied</code>; 500 (persist failure) emits <code>result=failure</code>. Reasons: <code>malformed_definition_id</code>, <code>body_too_large</code>, <code>invalid_json</code>, <code>definition_not_found</code>, <code>validation_failed</code>, <code>persist_failure</code>. Permission gate: <code>InstructionDefinition:Write</code>.</td>
+</tr>
+<tr>
+<td><code>response_template.update</code></td>
+<td>InstructionDefinition</td>
+<td>A response-view template was replaced via <code>PUT /api/v1/definitions/{id}/response-templates/{tid}</code> (issue #254). <code>target_id</code> is the definition id; <code>detail</code> is the template id on success, or <code>reason=&lt;r&gt;</code> on the audit path. 4xx branches emit <code>result=denied</code>; 500 persist failure emits <code>result=failure</code>. Reasons: <code>malformed_id</code>, <code>reserved_id</code>, <code>body_too_large</code>, <code>invalid_json</code>, <code>definition_not_found</code>, <code>template_not_found</code>, <code>validation_failed</code>, <code>persist_failure</code>. Permission gate: <code>InstructionDefinition:Write</code>.</td>
+</tr>
+<tr>
+<td><code>response_template.delete</code></td>
+<td>InstructionDefinition</td>
+<td>A response-view template was removed via <code>DELETE /api/v1/definitions/{id}/response-templates/{tid}</code> (issue #254). <code>target_id</code> is the definition id; <code>detail</code> is the deleted template id on success, or <code>reason=&lt;r&gt;</code> on the audit path. 4xx branches emit <code>result=denied</code>; 500 persist failure emits <code>result=failure</code>. Reasons: <code>malformed_id</code>, <code>reserved_id</code>, <code>definition_not_found</code>, <code>template_not_found</code>, <code>persist_failure</code>. Permission gate: <code>InstructionDefinition:Write</code>.</td>
+</tr>
+<tr>
+<td><code>offload_target.create</code></td>
+<td>OffloadTarget</td>
+<td>An offload target was created via <code>POST /api/v1/offload-targets</code> (issue #255 / Phase 8.3). On success: <code>target_id</code> is the assigned numeric id (string-form), <code>detail</code> is the target <code>name</code>, <code>result=success</code>. On 400 (validation failed — invalid URL scheme, empty name, batch_size &lt; 1, control bytes in <code>auth_credential</code>, or duplicate name): <code>target_id</code> is the submitted name, <code>detail=validation_failed</code>, <code>result=denied</code>. RBAC denial is emitted by the permission gate before this handler is reached. Permission gate: <code>Infrastructure:Write</code>.</td>
+</tr>
+<tr>
+<td><code>offload_target.delete</code></td>
+<td>OffloadTarget</td>
+<td>An offload target was deleted via <code>DELETE /api/v1/offload-targets/{id}</code> (issue #255). On success: <code>target_id</code> is the numeric id, <code>detail</code> is empty, <code>result=success</code>. On 404 (id not found, or numeric overflow on the path segment): <code>detail=not_found</code>, <code>result=denied</code> — the operator's attempt is recorded so SIEMs can surface probing of non-existent offload targets. Permission gate: <code>Infrastructure:Write</code>.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Result vocabulary.</strong> Every action above emits <code>result</code> as <code>success</code> or <code>denied</code> (with the rare <code>failure</code> reserved for internal-error paths the handler does not itself audit). <code>denied</code> is used for RBAC rejections and for every 400/404/409 branch where the handler explicitly audits the failure — including Guardian <code>rule.create</code> (400 missing fields, 409 conflict), <code>rule.update</code> (400 invalid body, 404 not found, 409 conflict), <code>rule.delete</code> (404 not found), <code>push</code> (400 non-object body), and the Phase 8.3 <code>offload_target.create</code> (400 validation_failed) / <code>offload_target.delete</code> (404 not_found) handlers. SIEM rules that filter on <code>result == "success"</code> will match every completed mutation including <code>guaranteed_state.push</code> (which returns 202 rather than 201/200 because agent fan-out is asynchronous). To surface probe/fuzz traffic on the REST surface, filter on <code>result == "denied"</code> scoped to the actions you care about — every mutating branch produces a row.</p>
+<h2 id="rest-api">REST API</h2>
+<h3 id="get-apiv1audit">GET /api/v1/audit</h3>
+<p>Query audit events with filtering and pagination. Maximum page size is 1000.</p>
+<p><strong>Query parameters:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>limit</code></td>
+<td>integer</td>
+<td>Number of events to return (default 100, max 1000)</td>
+</tr>
+<tr>
+<td><code>principal</code></td>
+<td>string</td>
+<td>Filter by principal username</td>
+</tr>
+<tr>
+<td><code>action</code></td>
+<td>string</td>
+<td>Filter by action (exact match)</td>
+</tr>
+</tbody>
+</table>
+<p>Note: the v1 endpoint supports <code>principal</code> and <code>action</code> filters only. For
+additional filters (<code>target_type</code>, <code>target_id</code>, <code>since</code>, <code>until</code>, <code>offset</code>),
+use the legacy <code>/api/audit</code> endpoint.</p>
+<p><strong>Example --- fetch the 20 most recent events:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/v1/audit?limit=20&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+</code></pre></div>
+<p><strong>Response:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;timestamp&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1710849600</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;principal&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;admin&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;action&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;tag.set&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;result&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;success&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;target_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Tag&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;target_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;agent-001:environment&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;detail&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Production&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;pagination&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">150</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;start&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;page_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">20</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><strong>Example --- filter by principal and action:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/v1/audit?principal=admin&amp;action=auth.login&amp;limit=50&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+</code></pre></div>
+<p><strong>Example --- find all failed login attempts:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/v1/audit?action=auth.login_failed&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+</code></pre></div>
+<h3 id="get-apiaudit-legacy">GET /api/audit (legacy)</h3>
+<p>The legacy endpoint supports the full set of query parameters and has no
+hard-coded limit cap. New integrations should prefer <code>/api/v1/audit</code> once
+additional filters are added there.</p>
+<p><strong>Query parameters:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Parameter</th>
+<th>Type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>limit</code></td>
+<td>integer</td>
+<td>Number of events to return (default 100, no hard cap)</td>
+</tr>
+<tr>
+<td><code>offset</code></td>
+<td>integer</td>
+<td>Offset for pagination (default 0)</td>
+</tr>
+<tr>
+<td><code>principal</code></td>
+<td>string</td>
+<td>Filter by principal username</td>
+</tr>
+<tr>
+<td><code>action</code></td>
+<td>string</td>
+<td>Filter by action (exact match)</td>
+</tr>
+<tr>
+<td><code>target_type</code></td>
+<td>string</td>
+<td>Filter by target type</td>
+</tr>
+<tr>
+<td><code>target_id</code></td>
+<td>string</td>
+<td>Filter by target identifier</td>
+</tr>
+<tr>
+<td><code>since</code></td>
+<td>integer</td>
+<td>Only events after this Unix timestamp</td>
+</tr>
+<tr>
+<td><code>until</code></td>
+<td>integer</td>
+<td>Only events before this Unix timestamp</td>
+</tr>
+</tbody>
+</table>
+<p>The legacy response envelope differs from v1:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;events&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="w"> </span><span class="err">...</span><span class="w"> </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">20</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">150</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>The legacy response includes additional fields per event not present in the v1
+response: <code>id</code>, <code>principal_role</code>, <code>source_ip</code>.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/audit?limit=5000&amp;principal=admin&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+</code></pre></div>
+<h2 id="dashboard-viewer">Dashboard viewer</h2>
+<p>The Yuzu dashboard includes a built-in audit log viewer accessible from the
+navigation menu. The viewer renders audit events as an HTMX-powered table with
+live filtering by principal, action, and date range. No additional
+configuration is required.</p>
+<h2 id="retention-and-cleanup">Retention and cleanup</h2>
+<p>Audit events are retained for 365 days by default. A background thread runs
+every hour and deletes events whose <code>timestamp</code> falls outside the retention
+window. Deletion is permanent --- there is no soft-delete or archive step.</p>
+<p>To preserve audit data beyond the retention window, export events periodically
+using the REST API or forward them to an external system (see Planned Features
+below).</p>
+<h2 id="integration-patterns">Integration patterns</h2>
+<h3 id="export-to-csv">Export to CSV</h3>
+<p>Use the JSON-to-CSV export endpoint to convert audit query results into a
+downloadable CSV file:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. Fetch audit events as JSON</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/v1/audit?limit=1000&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span><span class="s1">&#39;.data&#39;</span><span class="w"> </span>&gt;<span class="w"> </span>audit.json
+
+<span class="c1"># 2. Convert to CSV</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s1">&#39;Content-Type: application/json&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span>@audit.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/export/json-to-csv&#39;</span><span class="w"> </span>-o<span class="w"> </span>audit.csv
+</code></pre></div>
+<h3 id="periodic-export-with-cron">Periodic export with cron</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># /etc/cron.daily/yuzu-audit-export</span>
+<span class="nv">DATE</span><span class="o">=</span><span class="k">$(</span>date<span class="w"> </span>+%Y-%m-%d<span class="k">)</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>/opt/yuzu/cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;http://localhost:8080/api/v1/audit?limit=1000&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span><span class="s1">&#39;.data&#39;</span><span class="w"> </span>&gt;<span class="w"> </span><span class="s2">&quot;/var/log/yuzu/audit-</span><span class="si">${</span><span class="nv">DATE</span><span class="si">}</span><span class="s2">.json&quot;</span>
+</code></pre></div>
+<h3 id="splunk-http-event-collector">Splunk HTTP Event Collector</h3>
+<p>Poll the audit API and forward events to Splunk HEC:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Fetch recent audit events and forward each to Splunk</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;http://localhost:8080/api/v1/audit?limit=100&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;.data[]&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="nb">read</span><span class="w"> </span>-r<span class="w"> </span>event<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">      </span>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Splunk YOUR-HEC-TOKEN&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>-d<span class="w"> </span><span class="s2">&quot;{\&quot;event\&quot;: </span><span class="si">${</span><span class="nv">event</span><span class="si">}</span><span class="s2">}&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>https://splunk.example.com:8088/services/collector/event
+<span class="w">    </span><span class="k">done</span>
+</code></pre></div>
+<h2 id="planned-features">Planned features</h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Roadmap</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Event subscriptions / webhooks</td>
+<td>Phase 7, Issue 7.12</td>
+<td>Push audit events to external HTTP endpoints in real time</td>
+</tr>
+<tr>
+<td>System notifications</td>
+<td>Phase 7, Issue 7.4</td>
+<td>Alerts for health, capacity, and compliance events</td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

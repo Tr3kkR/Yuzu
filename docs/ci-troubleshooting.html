@@ -1,0 +1,788 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CI / Infrastructure Troubleshooting Runbook</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/ci-troubleshooting.md</div>
+<h1 class="doc-title">CI / Infrastructure Troubleshooting Runbook</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="ci-infrastructure-troubleshooting-runbook">CI / Infrastructure Troubleshooting Runbook</h1>
+<p><strong>A decision tree for the failure modes we have actually hit on Yuzu's
+self-hosted CI infrastructure.</strong> Every entry is here because a previous
+session burned wall-clock time chasing it without a runbook. Add a new
+entry whenever you spend more than ~5 minutes diagnosing something that
+will recur — fresh memory is the highest-quality writing material.</p>
+<p>If you are about to run <code>gh api</code>, <code>journalctl</code>, or <code>last reboot</code> to figure
+out why a CI run is failing, <strong>search this file first</strong>. The pattern you
+are about to debug is probably already here.</p>
+<p>Companion docs:</p>
+<ul>
+<li><a href="ci-cpp23-troubleshooting.html" class="doc-ref"><code>docs/ci-cpp23-troubleshooting.md</code></a> — C++23 / cross-compiler issues
+  (Clang 18 + libstdc++, Apple Clang version drift, MSVC-only failures).
+  Read that one first if you suspect a compile-time problem.</li>
+<li><a href="../.claude/agents/build-ci.html" class="doc-ref"><code>.claude/agents/build-ci.md</code></a> — full Windows MSVC static-link history,
+  including the option D LNK2038 fix and the four failed approaches that
+  preceded it.</li>
+<li><a href="windows-build.html" class="doc-ref"><code>docs/windows-build.md</code></a> — the canonical Windows build path
+  (MSYS2 bash + <code>setup_msvc_env.sh</code> + <code>scripts/ensure-erlang.sh</code>).</li>
+</ul>
+<hr>
+<h2 id="1-linux-runner-yuzu-wsl2-linux-shows-offline-tmux-is-dying">1. Linux runner <code>yuzu-wsl2-linux</code> shows offline / tmux is dying</h2>
+<p><strong>Symptom:</strong></p>
+<ul>
+<li>GitHub Actions runners page (<code>gh api repos/Tr3kkR/Yuzu/actions/runners</code>)
+  shows <code>yuzu-wsl2-linux</code> as <code>{"status":"offline"}</code>.</li>
+<li>A scheduled or push CI run is stuck with one or more Linux jobs in
+  <code>in_progress</code> for far longer than the job's normal duration.</li>
+<li><code>tmux ls</code> from inside the WSL2 distro returns "no server running" even
+  though you had a session attached recently.</li>
+<li><code>last reboot</code> inside the distro shows multiple "system boot" entries
+  in the last few hours despite no manual reboots.</li>
+</ul>
+<p><strong>Root cause:</strong></p>
+<p>The <code>yuzu-wsl2-linux</code> runner lives <strong>inside the WSL2 host distro on
+Shulgi</strong>. WSL2's default <code>vmIdleTimeout=60000</code> (60 seconds) shuts the
+utility VM down ~60 seconds after the last interactive shell session
+ends. When the VM dies:</p>
+<ol>
+<li>The
+   <code>actions.runner.Tr3kkR-Yuzu.yuzu-wsl2-linux.service</code> systemd unit
+   dies with it.</li>
+<li>Any <code>tmux</code> server in the distro dies (tmux servers don't survive VM
+   shutdowns — they are processes inside the VM).</li>
+<li>Any in-flight CI job loses its runner mid-execution. From GitHub's
+   side the job stays <code>in_progress</code> until the 6-hour job timeout, because
+   the new Runner.Listener that comes up on next VM boot is a fresh
+   process with no record of the orphaned job assignment, so it cannot
+   acknowledge cancellation.</li>
+</ol>
+<p><strong>Why it appears intermittent:</strong> the VM only shuts down when the <strong>last</strong>
+shell session (SSH + interactive WSL + service worker shells) is gone for
+60 s. As long as you have one SSH session attached or one long-running
+foreground command, the VM stays up. The pattern looks random because
+"last session ended" depends on whether you had two SSH windows or one.</p>
+<p><strong>Detection commands:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># From the WSL2 distro:</span>
+last<span class="w"> </span>reboot<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-10<span class="w">            </span><span class="c1"># multiple boots/day == VM cycling</span>
+uptime<span class="w">                            </span><span class="c1"># tiny uptime + load average suggests fresh boot</span>
+
+<span class="c1"># Look for the signature in dmesg-equivalent journal of the previous boot</span>
+sudo<span class="w"> </span>journalctl<span class="w"> </span>-b<span class="w"> </span>-1<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;recv failed|InitCreateProcessUtilityVm&#39;</span>
+<span class="c1"># Pattern: &quot;InitCreateProcessUtilityVm:1805: recv failed 0 17&quot;</span>
+
+<span class="c1"># Check WSL2 host config</span>
+cat<span class="w"> </span>/mnt/c/Users/<span class="nv">$USER</span>/.wslconfig<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>vmIdleTimeout
+<span class="c1"># Default (broken for runner host): vmIdleTimeout=60000 or unset</span>
+<span class="c1"># Fixed: vmIdleTimeout=-1</span>
+</code></pre></div>
+<p><strong>Fix (two coordinated changes — both are required):</strong></p>
+<ol>
+<li>Edit <code>/mnt/c/Users/&lt;your-user&gt;/.wslconfig</code> (Windows-side WSL2 host
+   config) and add inside the <code>[wsl2]</code> section:</li>
+</ol>
+<div class="highlight"><pre><span></span><code><span class="k">[wsl2]</span>
+<span class="na">memory</span><span class="o">=</span><span class="s">48GB</span>
+<span class="na">processors</span><span class="o">=</span><span class="s">16</span>
+
+<span class="c1"># Keep the WSL2 utility VM alive even when no shells are connected.</span>
+<span class="c1"># vmIdleTimeout=-1 disables the idle timeout entirely. Required for</span>
+<span class="c1"># runner hosts because the cost of the VM running idle is dwarfed by</span>
+<span class="c1"># the cost of cancelling an in-flight CI run.</span>
+<span class="na">vmIdleTimeout</span><span class="o">=</span><span class="s">-1</span>
+</code></pre></div>
+<ol start="2">
+<li>
+<p>Apply by running <code>wsl --shutdown</code> from a Windows shell (or
+   <code>cmd.exe /c "wsl --shutdown"</code> from inside WSL — note that this kills
+   the calling session, so reconnect afterward). The setting takes
+   effect on the next VM boot.</p>
+</li>
+<li>
+<p>Defense-in-depth: enable systemd user-session linger so user-scope
+   units survive "no sessions" windows even with the VM up:</p>
+</li>
+</ol>
+<div class="highlight"><pre><span></span><code>sudo<span class="w"> </span>loginctl<span class="w"> </span>enable-linger<span class="w"> </span>dornbrn
+<span class="c1"># Verify:</span>
+ls<span class="w"> </span>/var/lib/systemd/linger/dornbrn<span class="w">   </span><span class="c1"># should exist</span>
+loginctl<span class="w"> </span>show-user<span class="w"> </span>dornbrn<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>Linger<span class="w">   </span><span class="c1"># Linger=yes</span>
+</code></pre></div>
+<p>The runner unit itself is system-scope so it does not strictly need
+   linger, but tmux servers and any future user-scope helper services do.</p>
+<p><strong>Verification (next session):</strong></p>
+<p>After applying the fix, the next SSH disconnect/reconnect cycle should
+NOT produce a new entry in <code>last reboot</code>. The VM uptime should keep
+growing past 60 s of idle time. Subsequent CI runs should have all Linux
+jobs report a stable single runner across the run lifetime.</p>
+<p><strong>If a CI run is wedged with an orphaned <code>in_progress</code> job from before
+the fix landed:</strong></p>
+<div class="highlight"><pre><span></span><code>gh<span class="w"> </span>run<span class="w"> </span>view<span class="w"> </span>&lt;run-id&gt;<span class="w"> </span>--json<span class="w"> </span><span class="nb">jobs</span><span class="w"> </span>--jq<span class="w"> </span><span class="s1">&#39;.jobs[] | select(.status==&quot;in_progress&quot;)&#39;</span>
+gh<span class="w"> </span>api<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>repos/Tr3kkR/Yuzu/actions/runs/&lt;run-id&gt;/force-cancel
+<span class="c1"># Force-cancel takes ~30-60 s to propagate; re-poll until status==completed</span>
+</code></pre></div>
+<p>After force-cancel, the runner state should free up:
+<code>gh api repos/Tr3kkR/Yuzu/actions/runners</code> should show
+<code>{"status":"online", "busy": false}</code>. Note that the orphaned job's logs
+will return <code>BlobNotFound</code> because the dead runner never finalized them.</p>
+<p><strong>Reference incident:</strong> session 2026-04-15b → 2026-04-15c. Four VM
+cycles on 2026-04-15 (07:52, 08:24, 10:06, 13:07 UTC) correlated with
+SSH disconnect events. CI run <code>24450261405</code> lost its <code>Linux gcc-13
+debug</code> job at 13:07 and stayed wedged until force-cancel at 13:37.</p>
+<hr>
+<h2 id="2-ci-linux-job-fails-on-apt-get-install-with-sudo-password-prompt">2. CI Linux job fails on <code>apt-get install</code> with sudo password prompt</h2>
+<p><strong>Symptom:</strong></p>
+<p><code>Install system packages</code> step on a self-hosted Linux runner job fails
+with one of:</p>
+<div class="highlight"><pre><span></span><code>sudo: a terminal is required to read the password
+sudo: a password is required
+E: Could not open lock file /var/lib/dpkg/lock-frontend - open (13: Permission denied)
+</code></pre></div>
+<p><strong>Root cause:</strong></p>
+<p>The <code>github-runner</code> user that runs the <code>actions.runner.*.service</code>
+systemd unit on <code>yuzu-wsl2-linux</code> does not have NOPASSWD sudo by default.
+GHA workflows that use <code>sudo apt-get install</code> assume passwordless sudo,
+which works on hosted <code>ubuntu-24.04</code> runners (where the runner user is
+in <code>/etc/sudoers.d/runner</code>) but not on freshly registered self-hosted
+runners.</p>
+<p><strong>Fix:</strong></p>
+<p>Create <code>/etc/sudoers.d/github-runner</code> on the runner host, granting
+NOPASSWD for the apt family only (do not grant blanket NOPASSWD ALL):</p>
+<div class="highlight"><pre><span></span><code>sudo<span class="w"> </span>tee<span class="w"> </span>/etc/sudoers.d/github-runner<span class="w"> </span>&gt;<span class="w"> </span>/dev/null<span class="w"> </span><span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">github-runner ALL=(ALL) NOPASSWD: /usr/bin/apt-get, /usr/bin/apt, /usr/bin/dpkg</span>
+<span class="s">EOF</span>
+sudo<span class="w"> </span>chmod<span class="w"> </span><span class="m">0440</span><span class="w"> </span>/etc/sudoers.d/github-runner
+sudo<span class="w"> </span>visudo<span class="w"> </span>-c<span class="w">   </span><span class="c1"># validates all sudoers files, exits non-zero on syntax error</span>
+</code></pre></div>
+<p>This grant is host-side and not version-controlled. If you re-image the
+runner, re-apply it as part of the runner-bootstrap procedure. (Future
+work: bake into a runner provisioning script — tracked in issue #387's
+research deliverable.)</p>
+<p><strong>Verification:</strong></p>
+<div class="highlight"><pre><span></span><code>sudo<span class="w"> </span>-u<span class="w"> </span>github-runner<span class="w"> </span>sudo<span class="w"> </span>-n<span class="w"> </span>apt-get<span class="w"> </span>-v<span class="w"> </span>&gt;/dev/null<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;OK&quot;</span>
+</code></pre></div>
+<p><strong>Reference incident:</strong> session 2026-04-15b, commit <code>f4d634e</code> first push
+to dev with the migrated Linux runners failed before this grant landed.</p>
+<hr>
+<h2 id="3-ci-linux-job-fails-on-pip3-install-with-externally-managed-environment">3. CI Linux job fails on <code>pip3 install</code> with <code>externally-managed-environment</code></h2>
+<p><strong>Symptom:</strong></p>
+<div class="highlight"><pre><span></span><code>error: externally-managed-environment
+
+× This environment is externally managed
+╰─&gt; To install Python packages system-wide, try apt install
+    python3-xyz, where xyz is the package you are trying to install.
+
+    If you wish to install a non-Debian-packaged Python package,
+    create a virtual environment using python3 -m venv path/to/venv.
+</code></pre></div>
+<p><strong>Root cause:</strong></p>
+<p>Ubuntu 24.04 (and the Debian-derived WSL2 distro on <code>yuzu-wsl2-linux</code>)
+ships <strong>PEP 668</strong> which marks the system Python as externally managed
+to prevent system-wide <code>pip install</code> from clobbering apt-managed Python
+packages. The hosted <code>ubuntu-24.04</code> GHA runners disable this marker;
+self-hosted ones do not.</p>
+<p><strong>Fix:</strong></p>
+<p>Use the documented <code>--user --break-system-packages</code> bypass for ephemeral
+CI install-and-go environments, plus a <code>$GITHUB_PATH</code> append so the
+<code>~/.local/bin/&lt;binary&gt;</code> shim is found by subsequent steps:</p>
+<div class="highlight"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Install Meson</span>
+<span class="w">  </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">    </span><span class="no">pip3 install --user --break-system-packages -r requirements-ci.txt</span>
+<span class="w">    </span><span class="no">echo &quot;$HOME/.local/bin&quot; &gt;&gt; $GITHUB_PATH</span>
+</code></pre></div>
+<p><code>--user</code> writes to <code>~/.local/lib/python3.X/site-packages</code> instead of the
+system site-packages. <code>--break-system-packages</code> is the explicit opt-out
+of PEP 668 for the install. The combination is safe in CI because the
+runner workspace is not used for anything except the CI job.</p>
+<p><strong>Why not <code>python3 -m venv</code>?</strong> The error message suggests it, but venvs
+add ~5 s of CI overhead per job and complicate the <code>meson</code> shim search
+path because <code>$VIRTUAL_ENV/bin</code> would have to be added per-step. For a
+single tooling pin we accept the lighter-weight <code>--user</code> approach.</p>
+<p><strong>Verification:</strong></p>
+<div class="highlight"><pre><span></span><code>pip3<span class="w"> </span>install<span class="w"> </span>--user<span class="w"> </span>--break-system-packages<span class="w"> </span><span class="nv">meson</span><span class="o">==</span><span class="m">1</span>.9.2
+<span class="nb">echo</span><span class="w"> </span><span class="nv">$?</span><span class="w"> </span><span class="s2">&quot;  </span><span class="k">$(</span>meson<span class="w"> </span>--version<span class="k">)</span><span class="s2">&quot;</span>
+</code></pre></div>
+<p><strong>Reference incident:</strong> session 2026-04-15b, commit <code>d12ba74</code> after the
+first CI run on the Linux self-hosted runners hit this on every Linux
+matrix leg.</p>
+<hr>
+<h2 id="4-ci-run-is-wedged-with-a-stuck-in_progress-job">4. CI run is wedged with a stuck <code>in_progress</code> job</h2>
+<p><strong>Symptom:</strong></p>
+<p>A CI run shows <code>status: in_progress</code> with one or more jobs stuck in
+<code>in_progress</code> long after their normal duration. Plain <code>gh run cancel</code>
+returns success but the run does not transition to <code>completed</code> /
+<code>cancelled</code> even after several minutes.</p>
+<p><strong>Root cause (most common):</strong></p>
+<p>The runner that owned the stuck job died mid-execution (see Section 1
+for the WSL2 case, but other causes are: runner host hard-rebooted,
+network split, runner.listener crash, OOM kill of the worker). When the
+runner reincarnates (systemd restart, host reboot, etc.) it is a fresh
+Runner.Listener instance with no record of the prior job assignment.
+Plain cancel waits for the runner to acknowledge; the new instance
+never will.</p>
+<p><strong>Fix:</strong></p>
+<p>Use the <strong>force-cancel</strong> API endpoint, which is documented for exactly
+this case:</p>
+<div class="highlight"><pre><span></span><code>gh<span class="w"> </span>api<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>repos/Tr3kkR/Yuzu/actions/runs/&lt;run-id&gt;/force-cancel
+<span class="c1"># Returns 202 with {} on success.</span>
+<span class="c1"># Wait ~30-60 s and re-poll status:</span>
+gh<span class="w"> </span>run<span class="w"> </span>view<span class="w"> </span>&lt;run-id&gt;<span class="w"> </span>--json<span class="w"> </span>status,conclusion
+</code></pre></div>
+<p>The endpoint propagates within ~1 minute. Once the run transitions to
+<code>completed/cancelled</code>, the runner's <code>busy</code> flag clears.</p>
+<p><strong>Side effect:</strong> logs for the orphaned job will return <code>BlobNotFound</code>
+(<code>HTTP 404</code>) because the dead runner never finalized the log upload.
+Step state from <code>gh api repos/&lt;owner&gt;/&lt;repo&gt;/actions/jobs/&lt;job-id&gt;</code> is
+still available and is often enough to identify which step the job was
+on when it died — useful for diagnosing whether the failure was real
+or just runner death.</p>
+<p><strong>Verification:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Before force-cancel:</span>
+gh<span class="w"> </span>api<span class="w"> </span>repos/Tr3kkR/Yuzu/actions/runners<span class="w"> </span>--jq<span class="w"> </span><span class="s1">&#39;.runners[] | {name, status, busy}&#39;</span>
+<span class="c1"># {&quot;busy&quot;:true, &quot;name&quot;:&quot;yuzu-wsl2-linux&quot;, &quot;status&quot;:&quot;offline&quot;}</span>
+
+<span class="c1"># After force-cancel propagates:</span>
+gh<span class="w"> </span>api<span class="w"> </span>repos/Tr3kkR/Yuzu/actions/runners<span class="w"> </span>--jq<span class="w"> </span><span class="s1">&#39;.runners[] | {name, status, busy}&#39;</span>
+<span class="c1"># {&quot;busy&quot;:false, &quot;name&quot;:&quot;yuzu-wsl2-linux&quot;, &quot;status&quot;:&quot;online&quot;}</span>
+</code></pre></div>
+<p><strong>Reference incident:</strong> session 2026-04-15c, run <code>24450261405</code> had
+<code>Linux gcc-13 debug</code> (databaseId <code>71437122017</code>) wedged from 12:25 UTC
+after the WSL2 VM cycled at 13:07. Plain cancel did not propagate;
+force-cancel resolved within ~1 minute.</p>
+<hr>
+<h2 id="5-codeql-windows-job-fails-with-pathc_str-wchar_t-mismatches">5. CodeQL Windows job fails with <code>path::c_str()</code> / <code>wchar_t*</code> mismatches</h2>
+<p><strong>Symptom:</strong></p>
+<p>CodeQL Windows analysis fails with errors like:</p>
+<div class="highlight"><pre><span></span><code>error: cannot convert &#39;const wchar_t*&#39; to &#39;const char*&#39;
+note: in template argument deduction for std::filesystem::path::c_str
+</code></pre></div>
+<p><strong>Root cause:</strong></p>
+<p><code>std::filesystem::path::c_str()</code> returns <code>const value_type*</code>, where
+<code>value_type</code> is <code>wchar_t</code> on Windows and <code>char</code> on POSIX. Code that
+splices <code>path.c_str()</code> into a <code>const char*</code>-expecting API (<code>fopen</code>,
+<code>std::system</code>, gRPC channel address) compiles cleanly on Linux/macOS and
+fails on Windows. CodeQL's Windows leg is the first place this surfaces
+because it's the only Windows leg in the matrix that runs the full
+project build.</p>
+<p><strong>Fix:</strong></p>
+<p>Use <code>path.string().c_str()</code> (which produces a UTF-8 <code>std::string</code> on
+both POSIX and Windows) for narrow-char APIs, OR use the wide-char
+variant of the API on Windows behind <code>#ifdef _WIN32</code>.</p>
+<p><strong>Reference fix:</strong> commit <code>cd190f2</code>. Search the diff for the pattern
+<code>.string().c_str()</code> to see the canonical replacement.</p>
+<p><strong>Why this is in the runbook:</strong> Every Yuzu C++ author who touches
+<code>std::filesystem::path</code> will eventually hit this. The diagnostic chain
+is non-obvious because the Windows-only failure looks like a CodeQL
+configuration problem at first glance.</p>
+<hr>
+<h2 id="6-windows-msvc-build-fails-with-lnk2038-lnk2005-_iterator_debug_level">6. Windows MSVC build fails with LNK2038 / LNK2005 / <code>_ITERATOR_DEBUG_LEVEL</code></h2>
+<p><strong>Symptom:</strong></p>
+<div class="highlight"><pre><span></span><code>error LNK2038: mismatch detected for &#39;_ITERATOR_DEBUG_LEVEL&#39;:
+  value &#39;2&#39; doesn&#39;t match value &#39;0&#39; in &lt;object&gt;.obj
+error LNK2038: mismatch detected for &#39;RuntimeLibrary&#39;:
+  value &#39;MD_DynamicRelease&#39; doesn&#39;t match value &#39;MDd_DynamicDebug&#39;
+error LNK2005: &lt;symbol&gt; already defined in absl_*.lib
+</code></pre></div>
+<p>against <code>absl_cord.lib</code>, <code>protobuf.lib</code>, <code>grpc.lib</code>, or other vcpkg
+dependencies.</p>
+<p><strong>Root cause:</strong></p>
+<p>This is the long story. The short version: meson's cmake dependency
+translator on Windows MSVC has a bug where it bakes the <strong>release</strong>
+library paths into the <strong>debug</strong> link line, regardless of the active
+<code>buildtype</code>. vcpkg's standard Windows triplet does not emit per-build-type
+static archives, so debug builds end up linking against
+release-CRT-flavored archives.</p>
+<p><strong>Fix:</strong></p>
+<p>The fix is "option D" — combination of:</p>
+<ol>
+<li><code>triplets/x64-windows.cmake</code> forcing
+   <code>VCPKG_LIBRARY_LINKAGE static</code> + <code>VCPKG_CRT_LINKAGE dynamic</code> so vcpkg
+   emits per-build-type static archives (<code>.lib</code> for release, <code>d.lib</code>
+   for debug).</li>
+<li><code>meson.build</code> replacing the meson <code>dependency('grpc++', method:
+   'cmake')</code> wiring on Windows MSVC with a hand-rolled
+   <code>cxx.find_library()</code> chain that picks the correct variant per the
+   active <code>buildtype</code>.</li>
+<li><code>vcpkg.json</code> openssl as an unconditional top-level dep
+   (the previous <code>"platform": "!windows"</code> filter was aspirational and
+   never worked).</li>
+</ol>
+<p><strong>Both halves are load-bearing.</strong> Removing either the triplet override
+OR the hand-rolled <code>find_library()</code> wiring re-introduces the failure.</p>
+<p><strong>Full history</strong> including every failed approach
+(per-build-type triplets → explicit <code>CMAKE_BUILD_TYPE</code> → drop static
+override → option H hybrid) and the strategic escape path (#376 QUIC
+migration if option D ever rots) lives in
+<a href="../.claude/agents/build-ci.html" class="doc-ref"><code>.claude/agents/build-ci.md</code></a> under <strong>"Windows MSVC static-link history
+and #375"</strong>. <strong>Read that file before touching the Windows build wiring.</strong></p>
+<p><strong>Reference fix:</strong> PR #373 merged as <code>bf95d3b</code> on 2026-04-15. Don't
+simplify either half without reading the agent doc first.</p>
+<hr>
+<h2 id="7-windows-vcpkg-install-vcpkg-packages-fails-with-missing-pc-file">7. Windows vcpkg <code>Install vcpkg packages</code> fails with missing <code>.pc</code> file</h2>
+<p><strong>Symptom:</strong> Windows CI run repeatedly fails at the <code>Install vcpkg packages</code>
+step with:</p>
+<div class="highlight"><pre><span></span><code>read_lines(&quot;...vcpkg_installed/x64-windows/lib/pkgconfig/&lt;pkg&gt;.pc&quot;): no such file or directory
+</code></pre></div>
+<p><strong>Root cause — two distinct paths produce this same symptom:</strong></p>
+<ol>
+<li>
+<p><strong><code>&lt;workspace&gt;/vcpkg_installed/vcpkg/info/&lt;port&gt;_&lt;triplet&gt;.list</code>
+   desync</strong> (#741, fixed 2026-05-03). The sentinel previously wiped
+   <code>vcpkg_installed/&lt;triplet&gt;/</code> on key drift but left the sibling
+   workspace registry intact. The orphaned <code>info/*.list</code> files convince
+   the next <code>vcpkg install</code> that ports are "already installed" and it
+   skips restoration; post-install pkgconfig validation then fails
+   against the missing <code>.pc</code>. The sentinel now wipes both halves of
+   <code>vcpkg_installed/</code> together — see <code>scripts/ci/vcpkg-triplet-sentinel.sh</code>
+   and <code>scripts/ci/test-vcpkg-sentinel.sh</code> — so this path should not
+   recur on runners that picked up the patched script. If you see the
+   symptom on an unpatched runner, manual recovery is
+   <code>rm -rf &lt;workspace&gt;/vcpkg_installed/</code>.</p>
+</li>
+<li>
+<p><strong><code>&lt;workspace&gt;/vcpkg/packages/&lt;port&gt;_&lt;triplet&gt;/</code> partial build</strong>
+   (separate failure mode, predates #741). A build killed mid-port leaves
+   a partial <code>vcpkg/packages/abseil_x64-windows/</code> (no <code>.pc</code> files yet)
+   in the vcpkg tool root. vcpkg's manifest install trusts that dir's
+   hash and short-circuits to "already installed" regardless of what's
+   in <code>vcpkg_installed/&lt;triplet&gt;/</code> or the binary cache. The cache-key
+   sentinel does <strong>NOT</strong> reach <code>vcpkg/packages/</code>; manual recovery is
+   the script in the <strong>Fix</strong> block below.</p>
+</li>
+</ol>
+<p>Full set of candidate corruption paths under <code>clean: false</code>:</p>
+<ul>
+<li><code>&lt;workspace&gt;/vcpkg/packages/</code> — pre-stage zips (path 2)</li>
+<li><code>&lt;workspace&gt;/vcpkg/buildtrees/</code> — port build state</li>
+<li><code>&lt;workspace&gt;/vcpkg/installed/</code> — vcpkg classic-mode install (rare in manifest mode)</li>
+<li><code>&lt;workspace&gt;/vcpkg_installed/&lt;triplet&gt;/</code> — project install root (sentinel-managed)</li>
+<li><code>&lt;workspace&gt;/vcpkg_installed/vcpkg/</code> — per-workspace registry (sentinel-managed since #741)</li>
+<li><code>&lt;workspace&gt;/vcpkg_installed/.&lt;triplet&gt;-cachekey.sha256</code> — the sentinel hash file</li>
+<li><code>${runner.tool_cache}/yuzu-vcpkg-binary-cache-windows</code> — runner-local binary cache</li>
+<li><code>C:\Users\&lt;user&gt;\AppData\Local\vcpkg\archives\</code> — interactive-user default cache (vcpkg consults this even when <code>VCPKG_DEFAULT_BINARY_CACHE</code> is set)</li>
+<li><code>C:\Windows\System32\config\systemprofile\AppData\Local\vcpkg\</code> — LOCAL SYSTEM profile cache (mostly registry clone, not archives, but check anyway)</li>
+</ul>
+<p><strong>Fix:</strong> <code>scripts/ci/recovery/probe-and-nuke-vcpkg-windows.ps1</code>. Run over
+SSH on the runner as the <code>natha</code> interactive user with output redirected
+to a <code>.out</code> file:</p>
+<div class="highlight"><pre><span></span><code><span class="n">pwsh</span> <span class="n">C</span><span class="p">:\</span><span class="n">path</span><span class="p">\</span><span class="n">to</span><span class="p">\</span><span class="n">Yuzu</span><span class="p">\</span><span class="n">scripts</span><span class="p">\</span><span class="n">ci</span><span class="p">\</span><span class="n">recovery</span><span class="p">\</span><span class="n">probe</span><span class="o">-and</span><span class="n">-nuke-vcpkg-windows</span><span class="p">.</span><span class="n">ps1</span> <span class="p">&gt;&gt;</span> <span class="n">C</span><span class="p">:\</span><span class="n">Users</span><span class="p">\</span><span class="n">natha</span><span class="p">\</span><span class="n">Nuke</span><span class="o">-File</span><span class="p">.</span><span class="n">out</span> <span class="n">2</span><span class="p">&gt;&amp;</span><span class="n">1</span>
+</code></pre></div>
+<p>Outputs structured <code>KEY: value</code> inventory before + nuke + after. Preserves
+<code>vcpkg/</code> (the tool itself) and <code>vcpkg/downloads/</code> (source tarballs — slow
+to refetch). Wipes everything else.</p>
+<p><strong>Verification:</strong> Re-run the failing job; <code>Install vcpkg packages</code> should
+proceed past the missing <code>.pc</code> symptom and rebuild from source on first
+warm.</p>
+<p><strong>Reference incident:</strong> 2026-04-28 incident freed 33.9 GB.</p>
+<p><strong>After running:</strong> REMOVE any TEMP one-shot recovery step from <code>ci.yml</code>
+if one was added during the incident — leaving it in forces from-source
+rebuild on every run and defeats the cache.</p>
+<hr>
+<h2 id="when-to-add-a-new-entry">When to add a new entry</h2>
+<p>Add an entry here if:</p>
+<ul>
+<li>You spent more than ~5 minutes diagnosing something that will recur.</li>
+<li>The diagnostic chain involved more than ~2 commands you had to think
+  about.</li>
+<li>The fix is non-obvious from the symptom alone.</li>
+<li>The fix is reversible / non-destructive (i.e. the runbook is safe to
+  apply blind).</li>
+</ul>
+<p>Each entry should follow the same shape as the entries above:</p>
+<ol>
+<li><strong>Symptom</strong> — exact strings you would search for.</li>
+<li><strong>Root cause</strong> — the why, in 2-4 sentences.</li>
+<li><strong>Detection commands</strong> — what to run to confirm the diagnosis.</li>
+<li><strong>Fix</strong> — exact commands or file edits.</li>
+<li><strong>Verification</strong> — how to know the fix landed.</li>
+<li><strong>Reference incident</strong> — session date + commit/run-id where this
+   happened, so future-you can find the original context.</li>
+</ol>
+<p>The runbook is most valuable when the fix is <em>exactly</em> runnable. Avoid
+"tweak the config" — paste the config block.</p>
+</main>
+</body>
+</html>

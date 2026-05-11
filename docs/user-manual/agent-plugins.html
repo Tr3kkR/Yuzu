@@ -1,0 +1,2567 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Plugin Catalog</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/agent-plugins.md</div>
+<h1 class="doc-title">Agent Plugin Catalog</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="agent-plugin-catalog">Agent Plugin Catalog</h1>
+<p>This document is the complete reference for all Yuzu agent plugins. Each plugin runs inside the agent process on managed endpoints and exposes one or more <strong>actions</strong> that the server can invoke via instructions.</p>
+<p>Plugins are organized by functional category. The <strong>Platforms</strong> column uses: <strong>W</strong> = Windows, <strong>L</strong> = Linux, <strong>M</strong> = macOS.</p>
+<hr>
+<h2 id="table-of-contents">Table of Contents</h2>
+<ol>
+<li><a href="#system--identity">System &amp; Identity</a></li>
+<li><a href="#process--service">Process &amp; Service</a></li>
+<li><a href="#user--session">User &amp; Session</a></li>
+<li><a href="#network">Network</a></li>
+<li><a href="#software--patch">Software &amp; Patch</a></li>
+<li><a href="#security">Security</a></li>
+<li><a href="#file-system">File System</a></li>
+<li><a href="#execution">Execution</a></li>
+<li><a href="#test--debug">Test / Debug</a></li>
+<li><a href="#http--content-distribution">HTTP &amp; Content Distribution</a></li>
+<li><a href="#user-interaction">User Interaction</a></li>
+<li><a href="#agent-infrastructure">Agent Infrastructure</a></li>
+<li><a href="#windows-depth">Windows Depth</a></li>
+<li><a href="#stub-plugins-planned">Stub Plugins (Planned)</a></li>
+<li><a href="#plugin-architecture">Plugin Architecture</a></li>
+<li><a href="#plugin-allowlist">Plugin Allowlist</a></li>
+<li><a href="#plugin-code-signing">Plugin Code Signing</a></li>
+</ol>
+<hr>
+<h2 id="system-identity">System &amp; Identity</h2>
+<p>Plugins for querying operating system details, hardware inventory, device identity, and agent health.</p>
+<h3 id="os_info">os_info</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Returns core operating system metadata.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>os_name</code></td>
+<td>Operating system name (e.g., "Windows 11 Pro", "Ubuntu 24.04").</td>
+</tr>
+<tr>
+<td><code>os_version</code></td>
+<td>OS version string.</td>
+</tr>
+<tr>
+<td><code>os_build</code></td>
+<td>OS build number or kernel version.</td>
+</tr>
+<tr>
+<td><code>os_arch</code></td>
+<td>CPU architecture (x64, arm64, etc.).</td>
+</tr>
+<tr>
+<td><code>uptime</code></td>
+<td>System uptime in seconds since last boot.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="hardware">hardware</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Collects hardware inventory. Uses WMI on Windows, DMI tables on Linux, and <code>sysctl</code> on macOS.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>manufacturer</code></td>
+<td>Device manufacturer (e.g., "Dell Inc.").</td>
+</tr>
+<tr>
+<td><code>model</code></td>
+<td>Device model name.</td>
+</tr>
+<tr>
+<td><code>bios</code></td>
+<td>BIOS/UEFI vendor, version, and date.</td>
+</tr>
+<tr>
+<td><code>processors</code></td>
+<td>CPU model, core count, clock speed, and socket information.</td>
+</tr>
+<tr>
+<td><code>memory</code></td>
+<td>Total physical memory, speed, and slot details.</td>
+</tr>
+<tr>
+<td><code>disks</code></td>
+<td>Physical disk model, size, interface type, and health status.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="device_identity">device_identity</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Returns the device's identity within its network/domain.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>device_name</code></td>
+<td>Hostname of the device.</td>
+</tr>
+<tr>
+<td><code>domain</code></td>
+<td>Active Directory domain or workgroup.</td>
+</tr>
+<tr>
+<td><code>ou</code></td>
+<td>Organizational unit (if domain-joined).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="status">status</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Agent self-reporting. Returns operational health and configuration state.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>version</code></td>
+<td>Agent binary version string.</td>
+</tr>
+<tr>
+<td><code>info</code></td>
+<td>Summary of agent build, OS, and runtime environment.</td>
+</tr>
+<tr>
+<td><code>health</code></td>
+<td>Agent health check (uptime, memory usage, error counts).</td>
+</tr>
+<tr>
+<td><code>plugins</code></td>
+<td>List of loaded plugins with their versions.</td>
+</tr>
+<tr>
+<td><code>connection</code></td>
+<td>Server connection state (connected, reconnecting, disconnected).</td>
+</tr>
+<tr>
+<td><code>config</code></td>
+<td>Current agent configuration values (sanitized, no secrets).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="diagnostics">diagnostics</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v0.2.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Troubleshooting data for diagnosing agent or connectivity issues.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>log_level</code></td>
+<td>Current log verbosity level.</td>
+</tr>
+<tr>
+<td><code>certificates</code></td>
+<td>mTLS certificate details (subject, issuer, expiry, thumbprint).</td>
+</tr>
+<tr>
+<td><code>connection_info</code></td>
+<td>Server endpoint, connection age, reconnect count, last error.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="agent_actions">agent_actions</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v0.1.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Administrative actions on the agent itself.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>set_log_level</code></td>
+<td>Change the agent's log verbosity at runtime (trace, debug, info, warn, error).</td>
+</tr>
+<tr>
+<td><code>info</code></td>
+<td>Return agent build and environment summary.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="process-service">Process &amp; Service</h2>
+<p>Plugins for enumerating running processes, fetching process metadata, and querying system services.</p>
+<h3 id="processes">processes</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Enumerate and query running processes.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list</code></td>
+<td>List all running processes (PID, name, user, memory, CPU).</td>
+</tr>
+<tr>
+<td><code>query</code></td>
+<td>Filter processes by name pattern. Returns matching entries.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="procfetch">procfetch</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Fetch detailed metadata for processes, including file hashes for integrity verification.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>procfetch_fetch</code></td>
+<td>For each running process, returns PID, name, executable path, and SHA-1 hash of the binary on disk.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="services">services</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Query and configure system services. Uses Service Control Manager on Windows, <code>systemctl</code> on Linux, and <code>launchd</code> on macOS.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list</code></td>
+<td>List all registered services with their current state and start type.</td>
+</tr>
+<tr>
+<td><code>running</code></td>
+<td>List only services that are currently running.</td>
+</tr>
+<tr>
+<td><code>set_start_mode</code></td>
+<td>Change a service's startup type. Parameters: <code>name</code> (service identifier), <code>mode</code> (<code>automatic</code>, <code>manual</code>, or <code>disabled</code>). On Windows, calls <code>ChangeServiceConfig</code>. On Linux, maps to <code>systemctl enable</code>/<code>disable</code>/<code>mask</code>. On macOS, uses <code>launchctl enable</code>/<code>disable</code> on the system domain. Requires <code>endpoint-admin</code> role and role-gated approval.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="user-session">User &amp; Session</h2>
+<p>Plugins for querying user accounts and active sessions.</p>
+<h3 id="users">users</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Enumerate local user accounts and active login sessions.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>logged_on</code></td>
+<td>Users currently logged on (interactive and remote sessions).</td>
+</tr>
+<tr>
+<td><code>sessions</code></td>
+<td>All active sessions (console, RDP, SSH) with session ID and state.</td>
+</tr>
+<tr>
+<td><code>local_users</code></td>
+<td>All local user accounts with enabled/disabled status.</td>
+</tr>
+<tr>
+<td><code>local_admins</code></td>
+<td>Members of the local administrators group.</td>
+</tr>
+<tr>
+<td><code>group_members</code></td>
+<td>Members of a specified local group. Parameters: <code>group</code> (group name).</td>
+</tr>
+<tr>
+<td><code>primary_user</code></td>
+<td>Identifies the primary user of the device based on login frequency. Returns username, login count, and detection method.</td>
+</tr>
+<tr>
+<td><code>session_history</code></td>
+<td>Historical login/logout session records. Returns username, terminal, source, login time, logout time, and duration. Parameters: <code>days</code> (optional, default 30).</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="network">Network</h2>
+<p>Plugins for network configuration, active connections, diagnostics, and administrative actions.</p>
+<h3 id="network_config">network_config</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Network adapter configuration and addressing.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>adapters</code></td>
+<td>List network adapters with type, MAC address, and link status.</td>
+</tr>
+<tr>
+<td><code>ip_addresses</code></td>
+<td>IPv4 and IPv6 addresses per adapter, including subnet mask and gateway.</td>
+</tr>
+<tr>
+<td><code>dns_servers</code></td>
+<td>Configured DNS servers per adapter.</td>
+</tr>
+<tr>
+<td><code>proxy</code></td>
+<td>System proxy settings (HTTP, HTTPS, SOCKS, PAC URL).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="netstat">netstat</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Active network connections (similar to the <code>netstat</code> command-line tool).</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>netstat_list</code></td>
+<td>List all TCP and UDP connections with local/remote address, port, state, and owning PID.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="sockwho">sockwho</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Maps open sockets to the processes that own them.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sockwho_list</code></td>
+<td>For each listening or established socket, returns the owning process name and PID alongside connection details.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="network_diag">network_diag</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Network diagnostic queries.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>listening</code></td>
+<td>List all listening ports with owning process.</td>
+</tr>
+<tr>
+<td><code>connections</code></td>
+<td>List established connections with owning process.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="network_actions">network_actions</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Administrative network operations.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>flush_dns</code></td>
+<td>Flush the local DNS resolver cache.</td>
+</tr>
+<tr>
+<td><code>ping</code></td>
+<td>ICMP ping a target host and return round-trip statistics.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="wifi">wifi</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>WiFi network scanning and connection status. Uses WlanAPI on Windows, <code>nmcli</code> on Linux, and <code>airport</code> on macOS.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list_networks</code></td>
+<td>Scan for visible WiFi networks. Returns SSID, signal strength, security type, channel, and BSSID for each network.</td>
+</tr>
+<tr>
+<td><code>connected</code></td>
+<td>Report the currently connected WiFi network including SSID, signal strength, security type, and BSSID.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="wol">wol</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Wake-on-LAN (WoL) magic packet sender. Sends UDP broadcast packets to wake powered-off devices. Uses Winsock2 on Windows, POSIX sockets on Linux/macOS.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>wake</code></td>
+<td>Send a Wake-on-LAN magic packet to a target MAC address. The packet contains 6 bytes of <code>0xFF</code> followed by the target MAC repeated 16 times. Parameters: <code>mac</code> (required, format <code>AA:BB:CC:DD:EE:FF</code>).</td>
+</tr>
+<tr>
+<td><code>check</code></td>
+<td>Ping a host to verify it responded to a WoL wake. Parameters: <code>host</code> (required, IP address or hostname).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="discovery">discovery</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Network device discovery via ARP scan and ping sweep. Discovers hosts on a subnet and reports their IP, MAC address, hostname, and managed/unmanaged status. Input is validated to prevent command injection.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>scan_subnet</code></td>
+<td>Scan a CIDR subnet for active hosts. Parameters: <code>subnet</code> (required, e.g., <code>192.168.1.0/24</code>). Returns IP address, MAC address, resolved hostname, and whether the device is managed by Yuzu.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="software-patch">Software &amp; Patch</h2>
+<p>Plugins for software inventory, Windows-specific package management, update status, and SCCM integration.</p>
+<h3 id="installed_apps">installed_apps</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Enumerate installed applications from OS-native registries.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list</code></td>
+<td>All installed applications with name, version, publisher, and install date.</td>
+</tr>
+<tr>
+<td><code>query</code></td>
+<td>Search installed applications by name pattern.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="msi_packages">msi_packages</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Windows Installer (MSI) package inventory.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list</code></td>
+<td>All installed MSI packages with name, version, and vendor.</td>
+</tr>
+<tr>
+<td><code>product_codes</code></td>
+<td>MSI product codes (GUIDs) for each installed package. Useful for silent uninstall automation.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="windows_updates">windows_updates</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W (L M via package managers)</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Windows Update status. On Linux and macOS, queries the native package manager for available updates.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>installed</code></td>
+<td>List installed updates/hotfixes with KB number, date, and type.</td>
+</tr>
+<tr>
+<td><code>missing</code></td>
+<td>List updates that are available but not yet installed.</td>
+</tr>
+<tr>
+<td><code>pending_reboot</code></td>
+<td>Detect whether the endpoint requires a reboot after updates. Checks Windows registry keys, Linux reboot-required file and kernel version, macOS softwareupdate restart flag.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="software_actions">software_actions</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Software inventory actions.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list_upgradable</code></td>
+<td>List packages with available upgrades (version comparison).</td>
+</tr>
+<tr>
+<td><code>installed_count</code></td>
+<td>Total count of installed applications.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="sccm">sccm</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Microsoft SCCM/ConfigMgr client integration.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>client_version</code></td>
+<td>Installed SCCM client version.</td>
+</tr>
+<tr>
+<td><code>site</code></td>
+<td>SCCM site code and management point the client reports to.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="security">Security</h2>
+<p>Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scanning, certificate management, IOC checking, and device quarantine.</p>
+<h3 id="antivirus">antivirus</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v0.1.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Antivirus product detection and status.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>products</code></td>
+<td>List registered antivirus products with name, vendor, and version.</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>Real-time protection state, signature date, and scan status per product.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="firewall">firewall</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Host firewall state and rules.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>state</code></td>
+<td>Whether the firewall is enabled, per profile (domain, private, public on Windows).</td>
+</tr>
+<tr>
+<td><code>rules</code></td>
+<td>List firewall rules with direction, action, port, and protocol.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="bitlocker">bitlocker</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v0.1.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Disk encryption status. Reports BitLocker on Windows, LUKS on Linux, and FileVault on macOS.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>state</code></td>
+<td>Encryption status per volume (encrypted, decrypted, encrypting, protection on/off).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="event_logs">event_logs</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Query OS event logs. Uses Windows Event Log API, <code>journalctl</code> on Linux, and macOS unified log.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>errors</code></td>
+<td>Recent error-level events from system and application logs.</td>
+</tr>
+<tr>
+<td><code>query</code></td>
+<td>Filter events by log name, level, source, time range, and keyword.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="vuln_scan">vuln_scan</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Lightweight vulnerability and configuration scanning.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>scan</code></td>
+<td>Run a full vulnerability scan (installed software against known CVE data).</td>
+</tr>
+<tr>
+<td><code>cve_scan</code></td>
+<td>Check for a specific CVE by ID.</td>
+</tr>
+<tr>
+<td><code>config_scan</code></td>
+<td>Audit system configuration against security baselines.</td>
+</tr>
+<tr>
+<td><code>summary</code></td>
+<td>Return counts of critical, high, medium, and low findings.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="certificates">certificates</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Manage certificates in the system store. Uses CryptoAPI on Windows, PEM files on Linux, and the <code>security</code> CLI on macOS.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>list</code></td>
+<td>List certificates with subject, issuer, thumbprint, and expiry date.</td>
+</tr>
+<tr>
+<td><code>details</code></td>
+<td>Full details for a specific certificate by thumbprint.</td>
+</tr>
+<tr>
+<td><code>delete</code></td>
+<td>Remove a certificate from the store by thumbprint.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="ioc">ioc</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Indicator of Compromise (IOC) checking for threat hunting.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>check</code></td>
+<td>Check the endpoint against a set of IOCs. Supports multiple indicator types.</td>
+</tr>
+</tbody>
+</table>
+<p>Supported indicator types for the <code>check</code> action:</p>
+<table>
+<thead>
+<tr>
+<th>Indicator</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ip_addresses</code></td>
+<td>Check for connections to known-bad IP addresses.</td>
+</tr>
+<tr>
+<td><code>domains</code></td>
+<td>Check DNS cache and hosts file for known-bad domains.</td>
+</tr>
+<tr>
+<td><code>file_hashes</code></td>
+<td>Scan specified paths for files matching known-bad SHA-256 hashes.</td>
+</tr>
+<tr>
+<td><code>file_paths</code></td>
+<td>Check for the existence of specific file paths.</td>
+</tr>
+<tr>
+<td><code>ports</code></td>
+<td>Check for processes listening on suspicious ports.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="quarantine">quarantine</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Network quarantine for compromised or suspicious devices. Uses <code>netsh</code> on Windows, <code>iptables</code>/<code>nftables</code> on Linux, and <code>pfctl</code> on macOS.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>quarantine</code></td>
+<td>Isolate the device by blocking all network traffic except the Yuzu server connection.</td>
+</tr>
+<tr>
+<td><code>unquarantine</code></td>
+<td>Remove quarantine rules and restore normal network access.</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>Check whether quarantine is currently active.</td>
+</tr>
+<tr>
+<td><code>whitelist</code></td>
+<td>Add an IP or CIDR range to the quarantine exception list.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="file-system">File System</h2>
+<p>Plugins for file and directory operations.</p>
+<h3 id="filesystem">filesystem</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>File system queries and temporary file creation. All paths are canonicalized before use to prevent directory traversal attacks.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>exists</code></td>
+<td>Check whether a file or directory exists at the given path.</td>
+</tr>
+<tr>
+<td><code>list_dir</code></td>
+<td>List directory contents with name, size, type, and modification time.</td>
+</tr>
+<tr>
+<td><code>file_hash</code></td>
+<td>Compute SHA-256 hash of a file.</td>
+</tr>
+<tr>
+<td><code>create_temp</code></td>
+<td>Create a temporary file and return its path.</td>
+</tr>
+<tr>
+<td><code>create_temp_dir</code></td>
+<td>Create a temporary directory and return its path.</td>
+</tr>
+<tr>
+<td><code>read</code></td>
+<td>Read a text file with line-number offsets (max 100 MB, binary detection, paginated).</td>
+</tr>
+<tr>
+<td><code>get_acl</code></td>
+<td>Return the file or directory ACL permissions. On Windows, returns the SDDL security descriptor. On Linux/macOS, returns POSIX permission bits and owner/group. Parameters: <code>path</code> (required).</td>
+</tr>
+<tr>
+<td><code>get_signature</code></td>
+<td>Check the Authenticode digital signature of a file (Windows only). Returns signer, timestamp, and trust status. On Linux/macOS, returns unsigned status. Parameters: <code>path</code> (required).</td>
+</tr>
+<tr>
+<td><code>find_by_hash</code></td>
+<td>Search a directory tree for files matching a SHA-256 hash. Useful for threat hunting and file integrity verification. Parameters: <code>hash</code> (required, SHA-256 hex string), <code>path</code> (required, directory to search).</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="execution">Execution</h2>
+<p>Plugins for running arbitrary commands, managing device tags, and structured asset tagging.</p>
+<h3 id="script_exec">script_exec</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Execute arbitrary commands on the endpoint. <strong>Admin-only</strong> -- requires an admin-level RBAC role. Supports configurable execution timeouts.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>exec</code></td>
+<td>Execute a raw shell command and return stdout, stderr, and exit code.</td>
+</tr>
+<tr>
+<td><code>powershell</code></td>
+<td>Execute a PowerShell script block (Windows only).</td>
+</tr>
+<tr>
+<td><code>bash</code></td>
+<td>Execute a bash script block (Linux and macOS).</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Security note:</strong> The <code>script_exec</code> plugin is the most powerful plugin in the catalog. Access should be restricted to trusted administrators via RBAC roles. All executions are recorded in the audit log.</p>
+</blockquote>
+<h3 id="tags">tags</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Manage key-value tags on the device. Tags are persisted locally in <code>tags.json</code> and synced to the server for use in scope expressions.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>set</code></td>
+<td>Set a tag (key-value pair). Creates or overwrites.</td>
+</tr>
+<tr>
+<td><code>get</code></td>
+<td>Get the value of a specific tag by key.</td>
+</tr>
+<tr>
+<td><code>get_all</code></td>
+<td>Return all tags as key-value pairs.</td>
+</tr>
+<tr>
+<td><code>delete</code></td>
+<td>Remove a tag by key.</td>
+</tr>
+<tr>
+<td><code>check</code></td>
+<td>Check whether a tag with the given key exists.</td>
+</tr>
+<tr>
+<td><code>clear</code></td>
+<td>Remove all tags.</td>
+</tr>
+<tr>
+<td><code>count</code></td>
+<td>Return the total number of tags.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="asset_tags">asset_tags</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v0.1.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Structured asset tagging with server-side awareness. Supports tag sync and change tracking.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sync</code></td>
+<td>Synchronize local tags with the server's authoritative tag set.</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>Report sync state (last sync time, pending changes, conflict count).</td>
+</tr>
+<tr>
+<td><code>get</code></td>
+<td>Retrieve a structured tag value by key.</td>
+</tr>
+<tr>
+<td><code>changes</code></td>
+<td>List tag changes since the last sync (additions, modifications, deletions).</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="test-debug">Test / Debug</h2>
+<p>Plugins used for development, testing, and plugin authoring reference.</p>
+<h3 id="chargen">chargen</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>RFC 864 character generator. Produces a continuous stream of output for testing transport throughput and backpressure handling.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>chargen_start</code></td>
+<td>Begin generating character output.</td>
+</tr>
+<tr>
+<td><code>chargen_stop</code></td>
+<td>Stop the character generator.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="example">example</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v0.1.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Minimal reference plugin. Use as a template when writing new plugins.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ping</code></td>
+<td>Returns "pong". Verifies the plugin host is functioning.</td>
+</tr>
+<tr>
+<td><code>echo</code></td>
+<td>Returns the input string unchanged. Tests parameter passing.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="http-content-distribution">HTTP &amp; Content Distribution</h2>
+<p>Plugins for HTTP operations, file downloads, content staging, and package deployment.</p>
+<h3 id="http_client">http_client</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>HTTP client for downloading files and making HTTP requests. Uses cpp-httplib directly (no shell invocation). Supports SHA256 hash verification on downloads. Includes SSRF protection that blocks requests to private/reserved IP ranges (RFC 1918, link-local, loopback).</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>download</code></td>
+<td>Download a file from a URL to a local path. Parameters: <code>url</code> (required), <code>path</code> (required), <code>expected_hash</code> (optional SHA256 for verification). Returns status, path, size, and hash.</td>
+</tr>
+<tr>
+<td><code>get</code></td>
+<td>Perform an HTTP GET request and return the response status code and body. Parameters: <code>url</code> (required).</td>
+</tr>
+<tr>
+<td><code>head</code></td>
+<td>Perform an HTTP HEAD request and return the response status code and headers. Parameters: <code>url</code> (required). Useful for checking file availability or size before downloading.</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Security note:</strong> All HTTP requests are made using cpp-httplib's native HTTP implementation. No shell commands are invoked. Outbound requests are subject to SSRF protection that rejects URLs resolving to private IP ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16, and IPv6 equivalents).</p>
+</blockquote>
+<h3 id="content_dist">content_dist</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Content staging and execution. Downloads files to the agent's staging directory using httplib (no shell invocation) with hash verification, then executes them via <code>CreateProcessW</code> (Windows) or <code>fork</code>+<code>execvp</code> (Linux/macOS) with no shell interpretation. Arguments are validated against a metacharacter blocklist.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>stage</code></td>
+<td>Download a file to the agent's staging directory and verify its SHA256 hash. Parameters: <code>url</code> (required), <code>filename</code> (required), <code>sha256</code> (required). Returns status and staged file path.</td>
+</tr>
+<tr>
+<td><code>execute_staged</code></td>
+<td>Execute a previously staged file with optional arguments. Parameters: <code>filename</code> (required), <code>args</code> (optional). Returns status, exit code, and output.</td>
+</tr>
+<tr>
+<td><code>list_staged</code></td>
+<td>List all files in the agent's staging directory with size and SHA256 hash.</td>
+</tr>
+<tr>
+<td><code>cleanup</code></td>
+<td>Remove one or all files from the staging directory. Parameters: <code>filename</code> (optional; omit to clear all staged files). Returns status and count of files removed.</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Security note:</strong> Downloads use httplib's native HTTP client -- no shell commands are spawned for file retrieval. Execution of staged files uses <code>CreateProcessW</code> on Windows and <code>fork</code>+<code>execvp</code> on Linux/macOS, bypassing shell interpretation entirely. The <code>args</code> parameter is validated against a metacharacter blocklist (<code>;</code>, <code>|</code>, <code>&amp;</code>, <code>`</code>, <code>$</code>, <code>(</code>, <code>)</code>, <code>{</code>, <code>}</code>, <code>&lt;</code>, <code>&gt;</code>) to prevent command injection.</p>
+</blockquote>
+<hr>
+<h2 id="user-interaction">User Interaction</h2>
+<p>Plugins for displaying notifications, dialogs, and input prompts on endpoint desktops.</p>
+<h3 id="interaction">interaction</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Desktop user interaction. Shows toast notifications, message box dialogs, and text input dialogs. Uses native APIs per platform: <code>ShellNotifyIcon</code> on Windows, <code>notify-send</code>/<code>zenity</code> on Linux, <code>osascript</code> on macOS.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>notify</code></td>
+<td>Show a desktop notification/toast. Parameters: <code>title</code> (required), <code>message</code> (required), <code>type</code> (<code>info</code>, <code>warning</code>, or <code>error</code>; default <code>info</code>).</td>
+</tr>
+<tr>
+<td><code>message_box</code></td>
+<td>Show a modal message box dialog that blocks until the user responds. Parameters: <code>title</code> (required), <code>message</code> (required), <code>buttons</code> (<code>ok</code>, <code>okcancel</code>, or <code>yesno</code>; default <code>ok</code>). Returns which button was clicked.</td>
+</tr>
+<tr>
+<td><code>input</code></td>
+<td>Show a text input dialog. Parameters: <code>title</code> (required), <code>prompt</code> (required), <code>default_value</code> (optional). Returns the text entered by the user, or indicates cancellation.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="agent-infrastructure">Agent Infrastructure</h2>
+<p>Plugins for agent-side persistent storage, logging, and remote diagnostics.</p>
+<h3 id="storage">storage</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Persistent key-value storage on the agent, backed by SQLite. Keys are namespaced per plugin. Survives agent restarts and upgrades. Used for cross-instruction state and plugin-local persistence.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>set</code></td>
+<td>Store a key-value pair. Parameters: <code>key</code> (required), <code>value</code> (required).</td>
+</tr>
+<tr>
+<td><code>get</code></td>
+<td>Retrieve a value by key. Parameters: <code>key</code> (required).</td>
+</tr>
+<tr>
+<td><code>delete</code></td>
+<td>Delete a key from storage. Parameters: <code>key</code> (required).</td>
+</tr>
+<tr>
+<td><code>list</code></td>
+<td>List all keys, optionally filtered by prefix. Parameters: <code>prefix</code> (optional). Returns count and key names.</td>
+</tr>
+<tr>
+<td><code>clear</code></td>
+<td>Delete all keys from the storage namespace. Returns status and count of cleared keys.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="agent_logging">agent_logging</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W L M</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Remote access to agent log files and key agent files. Enables server-initiated log retrieval for diagnostics without requiring direct endpoint access.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>get_log</code></td>
+<td>Return the last N lines of the agent's log file. Parameters: <code>lines</code> (1-500, default 50). The log file path is discovered from agent config, falling back to platform defaults (<code>/var/log/yuzu</code> on Linux, <code>ProgramData/Yuzu</code> on Windows).</td>
+</tr>
+<tr>
+<td><code>get_key_files</code></td>
+<td>List important agent files (executable, log files, config files, data stores, plugins, TLS certificates) with their absolute paths, sizes in bytes, and last-modified timestamps.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="windows-depth">Windows Depth</h2>
+<p>Plugins for Windows-specific system management: registry operations and WMI queries.</p>
+<h3 id="registry">registry</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Windows registry CRUD operations. Read, write, delete, and enumerate registry keys and values. Supports per-user registry operations via NTUSER.DAT hive loading for offline users.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>get_value</code></td>
+<td>Read a value from the Windows registry. Parameters: <code>hive</code> (<code>HKLM</code>, <code>HKCU</code>, <code>HKCR</code>, <code>HKU</code>), <code>key</code> (path), <code>name</code> (value name). Returns value and type.</td>
+</tr>
+<tr>
+<td><code>set_value</code></td>
+<td>Write a value to the Windows registry. Creates the key if it does not exist. Parameters: <code>hive</code>, <code>key</code>, <code>name</code>, <code>value</code>, <code>type</code> (<code>REG_SZ</code> or <code>REG_DWORD</code>).</td>
+</tr>
+<tr>
+<td><code>delete_value</code></td>
+<td>Delete a specific value from a registry key. Parameters: <code>hive</code>, <code>key</code>, <code>name</code>.</td>
+</tr>
+<tr>
+<td><code>delete_key</code></td>
+<td>Delete a registry key and all its values. Parameters: <code>hive</code>, <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>key_exists</code></td>
+<td>Check whether a registry key exists. Parameters: <code>hive</code>, <code>key</code>. Returns boolean.</td>
+</tr>
+<tr>
+<td><code>enumerate_keys</code></td>
+<td>List all subkeys under a registry key. Parameters: <code>hive</code>, <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>enumerate_values</code></td>
+<td>List all value names and types under a registry key. Parameters: <code>hive</code>, <code>key</code>.</td>
+</tr>
+<tr>
+<td><code>get_user_value</code></td>
+<td>Read a registry value from a specific user's NTUSER.DAT hive. Loads the hive via <code>RegLoadKey</code> if the user is not logged in. Requires <code>SE_RESTORE_NAME</code> and <code>SE_BACKUP_NAME</code> privileges. Parameters: <code>username</code>, <code>key</code>, <code>name</code> (optional).</td>
+</tr>
+</tbody>
+</table>
+<h3 id="wmi">wmi</h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Version</strong></td>
+<td>v1.0.0</td>
+</tr>
+<tr>
+<td><strong>Platforms</strong></td>
+<td>W</td>
+</tr>
+<tr>
+<td><strong>Description</strong></td>
+<td>Windows Management Instrumentation (WMI) queries. Execute WQL SELECT statements against any WMI namespace with structured property/value output.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>query</code></td>
+<td>Execute a WQL SELECT query. Only SELECT statements are allowed. Parameters: <code>wql</code> (required, e.g., <code>"SELECT * FROM Win32_OperatingSystem"</code>), <code>namespace</code> (optional, default <code>root\cimv2</code>). Returns property/value pairs.</td>
+</tr>
+<tr>
+<td><code>get_instance</code></td>
+<td>Get all properties of the first instance of a WMI class. Parameters: <code>class</code> (required, e.g., <code>Win32_OperatingSystem</code>), <code>namespace</code> (optional).</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="stub-plugins-planned">Stub Plugins (Planned)</h2>
+<p>The following plugins are defined in the roadmap but not yet implemented. They are listed here for planning purposes.</p>
+<table>
+<thead>
+<tr>
+<th>Plugin</th>
+<th>Description</th>
+<th>Target Phase</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>patch</code></td>
+<td>Patch deployment agent-side automation (scanning, downloading, installing). Server-side patch management is implemented via <code>PatchManager</code>.</td>
+<td>Phase 7 (7.8)</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="plugin-architecture">Plugin Architecture</h2>
+<h3 id="overview">Overview</h3>
+<p>All agent plugins share a common architecture based on a <strong>stable C ABI</strong> defined in <code>sdk/include/yuzu/plugin.h</code>. This ABI is designed to remain binary-compatible across compiler versions and agent upgrades, so plugins can be updated independently of the agent binary.</p>
+<p>A <strong>C++23 CRTP wrapper</strong> (<code>sdk/include/yuzu/plugin.hpp</code>) provides ergonomic C++ authoring on top of the C ABI. The <code>YUZU_PLUGIN_EXPORT</code> macro handles symbol visibility and the export table automatically.</p>
+<h3 id="plugin-lifecycle">Plugin Lifecycle</h3>
+<ol>
+<li>The agent scans its plugin directory at startup. If an allowlist is configured, each library's SHA-256 hash is verified <strong>before loading</strong> (see <a href="#plugin-allowlist">Plugin Allowlist</a> below). If a code-signing trust bundle is configured, the library's CMS detached signature is verified against it as well (see <a href="#plugin-code-signing">Plugin Code Signing</a> below) — both checks run before <code>dlopen</code>/<code>LoadLibrary</code> so tampered or untrusted binaries never execute code.</li>
+<li>Each shared library (<code>.dll</code> on Windows, <code>.so</code> on Linux, <code>.dylib</code> on macOS) is loaded dynamically.</li>
+<li>The agent calls the plugin's <code>init</code> function, passing a context with configuration and callbacks.</li>
+<li>When the server sends an instruction targeting a plugin action, the agent dispatches it to the correct plugin.</li>
+<li>The plugin executes the action and returns results via the output callback.</li>
+</ol>
+<h3 id="plugin-allowlist">Plugin Allowlist</h3>
+<p>The agent can verify plugin shared libraries against a SHA-256 allowlist before loading them. This prevents loading of tampered or unauthorized plugins.</p>
+<p><strong>Configuration:</strong></p>
+<div class="highlight"><pre><span></span><code>yuzu-agent<span class="w"> </span>--plugin-allowlist<span class="w"> </span>/etc/yuzu/plugin-allowlist.txt
+<span class="c1"># or via environment variable:</span>
+<span class="nv">YUZU_PLUGIN_ALLOWLIST</span><span class="o">=</span>/etc/yuzu/plugin-allowlist.txt<span class="w"> </span>yuzu-agent
+</code></pre></div>
+<p><strong>Allowlist file format</strong> (compatible with <code>sha256sum</code> output):</p>
+<div class="highlight"><pre><span></span><code>a1b2c3d4e5f6...  libhardware.so
+f6e5d4c3b2a1...  libnetwork_info.so
+9876543210ab...  libos_info.so
+</code></pre></div>
+<p>Generate the allowlist from your verified plugin builds:</p>
+<div class="highlight"><pre><span></span><code>sha256sum<span class="w"> </span>/opt/yuzu/plugins/*.so<span class="w"> </span>&gt;<span class="w"> </span>/etc/yuzu/plugin-allowlist.txt
+</code></pre></div>
+<p><strong>Behavior:</strong></p>
+<ul>
+<li>If <code>--plugin-allowlist</code> is not set, all plugins in the plugin directory are loaded (default).</li>
+<li>If set, only plugins listed in the allowlist file are loaded, and only if their hash matches.</li>
+<li>Plugins not in the allowlist or with a hash mismatch are logged as errors and skipped.</li>
+<li>The allowlist is checked <strong>before</strong> <code>dlopen</code>/<code>LoadLibrary</code>, so tampered binaries never execute code.</li>
+</ul>
+<h3 id="plugin-code-signing">Plugin Code Signing</h3>
+<p>The agent can verify a CMS detached signature for each plugin shared library and reject any plugin whose signature does not chain to an operator-configured trust anchor. This is the <strong>provenance</strong> layer that complements the allowlist's <strong>integrity</strong> layer: the allowlist binds <em>this filename to this hash on this host</em>, and the signature binds <em>this file content to a CA-issued signing identity</em>. With both enabled, an attacker who drops a malicious <code>.so</code> plus a fresh <code>.sig</code> is rejected because their cert does not chain to the trusted CA.</p>
+<p><strong>Trust anchor.</strong> A standard PEM file containing one or more X.509 root or intermediate certificates the operator chooses to trust. The bundle is <em>deployment-format-agnostic</em> — it can hold a public CA root, an internal-CA root, or (when shipped) the Yuzu self-managed CA root. The verifier does not care which authority issued the signing cert as long as the chain validates against the bundle.</p>
+<p><strong>Signature file convention.</strong> For each plugin file <code>&lt;plugin&gt;.so</code> (or <code>.dll</code> / <code>.dylib</code>), the agent looks for a sibling <code>&lt;plugin&gt;.so.sig</code> containing a PEM-armoured CMS detached signature over the plugin file bytes. Inspect a signature with:</p>
+<div class="highlight"><pre><span></span><code>openssl<span class="w"> </span>cms<span class="w"> </span>-inform<span class="w"> </span>pem<span class="w"> </span>-text<span class="w"> </span>-noout<span class="w"> </span>-in<span class="w"> </span>chargen.so.sig
+</code></pre></div>
+<p><strong>Configuration.</strong> There are two paths — server-managed (recommended for fleets) and agent-local (for one-off hosts or air-gapped environments).</p>
+<p><strong>Server-managed (Settings → Plugin Code Signing).</strong> An admin operator goes to the Settings page and uploads the PEM trust bundle through the <strong>Plugin Code Signing</strong> card. The server validates the PEM (counts certs, computes SHA-256, surfaces parse errors immediately), persists it atomically (temp file + rename) under the server's cert directory, and exposes it at <code>GET /api/v1/agent/plugin-policy</code> (admin-only, returns JSON containing the bundle PEM + the require flag). The card also has a "Require signed plugins" checkbox that flips the require flag and a "Remove trust bundle" button that disables signing for new agent starts. Every change emits an <code>audit_event</code> with action <code>plugin_signing.bundle.uploaded</code> / <code>plugin_signing.bundle.cleared</code> / <code>plugin_signing.require.changed</code>.</p>
+<p>In this mode, agents are configured by curling the policy endpoint (with an admin token) into a local file at startup:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-fsSL<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$YUZU_ADMIN_TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>https://server.example.com:8443/api/v1/agent/plugin-policy<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>-r<span class="w"> </span>.trust_bundle_pem<span class="w"> </span>&gt;<span class="w"> </span>/etc/yuzu/plugin-trust-bundle.pem
+
+yuzu-agent<span class="w"> </span>--plugin-trust-bundle<span class="w"> </span>/etc/yuzu/plugin-trust-bundle.pem<span class="w"> </span><span class="se">\</span>
+<span class="w">           </span>--plugin-require-signature
+</code></pre></div>
+<blockquote>
+<p><strong>Important — fail-closed when require is set.</strong> If you pass <code>--plugin-require-signature</code> without <code>--plugin-trust-bundle</code> (or with an empty path), the agent <strong>refuses to start</strong> rather than silently fail-open. This is intentional: the prior behaviour would have skipped the entire signing block and quietly loaded unsigned plugins while the operator believed enforcement was active.</p>
+<p><strong>Important — Yuzu-shipped plugins are not signed yet.</strong> This release ships the verifier; it does not yet sign the in-tree <code>agents/plugins/</code>. If you turn on Require with a trust bundle anchored only at your own CA, every Yuzu-bundled plugin will be rejected at next agent restart. Use the transitional mode (bundle uploaded, Require off) until you have signed every plugin your fleet uses, including the in-tree ones. The Settings card displays this warning inline.</p>
+<p><strong>Windows admins.</strong> The curl/jq recipe above assumes a Unix host; equivalent PowerShell using <code>Invoke-RestMethod</code> + <code>ConvertFrom-Json</code> works against the same endpoint. Place the resulting PEM at <code>C:\ProgramData\Yuzu\certs\plugin-trust-bundle.pem</code> and pass the path via <code>--plugin-trust-bundle</code>.</p>
+</blockquote>
+<p>(Fully automatic agent-side fetch is a planned follow-up; today's contract is "the bundle is hosted on the server, the agent is told where the local copy lives via CLI flags".)</p>
+<p><strong>Agent-local CLI flags:</strong></p>
+<div class="highlight"><pre><span></span><code>yuzu-agent<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--plugin-trust-bundle<span class="w"> </span>/etc/yuzu/plugin-trust-bundle.pem<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--plugin-require-signature
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--plugin-trust-bundle &lt;path&gt;</code></td>
+<td>Enables signature verification. PEM file with one or more CA certs. Env: <code>YUZU_PLUGIN_TRUST_BUNDLE</code>.</td>
+</tr>
+<tr>
+<td><code>--plugin-require-signature</code></td>
+<td>When set, plugins without a <code>.sig</code> sibling are rejected. When unset (default), unsigned plugins are allowed (transitional mode for ops rolling out signing). Env: <code>YUZU_PLUGIN_REQUIRE_SIGNATURE</code>.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Signing a plugin (operator workflow with openssl(1)):</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># One-time: generate an operator CA + signing leaf, or use your existing PKI.</span>
+openssl<span class="w"> </span>ecparam<span class="w"> </span>-genkey<span class="w"> </span>-name<span class="w"> </span>prime256v1<span class="w"> </span>-out<span class="w"> </span>ca.key
+openssl<span class="w"> </span>req<span class="w"> </span>-new<span class="w"> </span>-x509<span class="w"> </span>-key<span class="w"> </span>ca.key<span class="w"> </span>-out<span class="w"> </span>ca.pem<span class="w"> </span>-days<span class="w"> </span><span class="m">3650</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-subj<span class="w"> </span><span class="s2">&quot;/CN=My Yuzu Plugin CA&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-addext<span class="w"> </span><span class="s2">&quot;basicConstraints=critical,CA:TRUE&quot;</span>
+
+openssl<span class="w"> </span>ecparam<span class="w"> </span>-genkey<span class="w"> </span>-name<span class="w"> </span>prime256v1<span class="w"> </span>-out<span class="w"> </span>signer.key
+openssl<span class="w"> </span>req<span class="w"> </span>-new<span class="w"> </span>-key<span class="w"> </span>signer.key<span class="w"> </span>-out<span class="w"> </span>signer.csr<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-subj<span class="w"> </span><span class="s2">&quot;/CN=Plugin Signer&quot;</span>
+<span class="c1"># extendedKeyUsage=codeSigning is REQUIRED — the agent&#39;s verifier</span>
+<span class="c1"># enforces X509_PURPOSE_CODE_SIGN, so a leaf without this EKU is</span>
+<span class="c1"># rejected even if it chains to the trusted CA. This prevents a CA that</span>
+<span class="c1"># also issues mTLS or S/MIME certs from being a plugin-signing</span>
+<span class="c1"># authority for those siblings.</span>
+openssl<span class="w"> </span>x509<span class="w"> </span>-req<span class="w"> </span>-in<span class="w"> </span>signer.csr<span class="w"> </span>-CA<span class="w"> </span>ca.pem<span class="w"> </span>-CAkey<span class="w"> </span>ca.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-CAcreateserial<span class="w"> </span>-out<span class="w"> </span>signer.pem<span class="w"> </span>-days<span class="w"> </span><span class="m">365</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-extfile<span class="w"> </span>&lt;<span class="o">(</span><span class="nb">printf</span><span class="w"> </span><span class="s2">&quot;extendedKeyUsage=codeSigning\nkeyUsage=critical,digitalSignature&quot;</span><span class="o">)</span>
+
+<span class="c1"># Per-plugin: sign with the leaf, distribute ca.pem as the trust bundle.</span>
+openssl<span class="w"> </span>cms<span class="w"> </span>-sign<span class="w"> </span>-binary<span class="w"> </span>-nodetach<span class="o">=</span><span class="nb">false</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-signer<span class="w"> </span>signer.pem<span class="w"> </span>-inkey<span class="w"> </span>signer.key<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-in<span class="w"> </span>chargen.so<span class="w"> </span>-outform<span class="w"> </span>pem<span class="w"> </span>-out<span class="w"> </span>chargen.so.sig
+</code></pre></div>
+<p>Distribute <code>ca.pem</code> to every agent (e.g. as <code>/etc/yuzu/plugin-trust-bundle.pem</code>) and ship the <code>.sig</code> files alongside each <code>.so</code> in the plugin directory.</p>
+<p><strong>Behavior:</strong></p>
+<ul>
+<li>If <code>--plugin-trust-bundle</code> is not set, signature checking is off entirely (default).</li>
+<li>If set + plugin has a <code>.sig</code> → must verify, else rejected.</li>
+<li>If set + plugin has no <code>.sig</code> + <code>--plugin-require-signature</code> not set → loaded (transitional mode).</li>
+<li>If set + plugin has no <code>.sig</code> + <code>--plugin-require-signature</code> set → rejected.</li>
+<li>Verification happens <strong>before</strong> <code>dlopen</code>/<code>LoadLibrary</code>. Cert validity (<code>notBefore</code>/<code>notAfter</code>), digest match over file bytes, and chain anchor are all enforced.</li>
+<li>Rejection reason is recorded as a stable label on <code>yuzu_agent_plugin_rejected_total</code>: <code>signature_missing</code>, <code>signature_invalid</code>, or <code>signature_untrusted_chain</code> — alert distinctly on each.</li>
+</ul>
+<p><strong>Self-managed CA roadmap.</strong> A future Yuzu release will ship a server-managed CA whose root cert is published at a known URL; pointing <code>--plugin-trust-bundle</code> at that file lets operators sign plugins against the same CA they use for mTLS. The verifier itself does not change — the same code path accepts public-CA, internal-CA, and Yuzu-CA issued certs.</p>
+<p><strong>Not yet supported (follow-up work):</strong></p>
+<ul>
+<li>CRL / OCSP revocation checking. Today only <code>notBefore</code>/<code>notAfter</code> and chain anchor are enforced; revoke a compromised signing cert by removing its issuing CA from the trust bundle or rotating to a new CA.</li>
+<li>Authenticode-signed Windows DLLs. The agent uses the same CMS PEM format on every platform; Authenticode is a separate signature format and is not currently consumed.</li>
+</ul>
+<h3 id="output-format">Output Format</h3>
+<p>Plugins emit results by calling <code>write_output()</code> with pipe-delimited (<code>|</code>) fields. Each call writes one row of output. The server parses these rows according to the result schema declared in the plugin's <code>InstructionDefinition</code> YAML.</p>
+<p>Example:
+<div class="highlight"><pre><span></span><code>write_output(&quot;hostname|Windows 11 Pro|10.0.26200|x64&quot;);
+</code></pre></div></p>
+<h3 id="configuration-access">Configuration Access</h3>
+<p>Plugins can read configuration values set by the server using <code>get_config(key)</code>. This allows the server to pass parameters (filter strings, thresholds, target paths) to plugin actions at execution time.</p>
+<h3 id="data-storage">Data Storage</h3>
+<p>Each plugin can persist state locally. Per-plugin data is stored at:</p>
+<div class="highlight"><pre><span></span><code>&lt;agent_data_dir&gt;/&lt;plugin_name&gt;.json
+</code></pre></div>
+<p>For example, the <code>tags</code> plugin stores its tag set in <code>tags.json</code> within the agent's data directory. This file survives agent restarts and upgrades.</p>
+<h3 id="writing-a-new-plugin">Writing a New Plugin</h3>
+<p>Use the <code>example</code> plugin as a starting template. The minimum steps are:</p>
+<ol>
+<li>Create a new directory under <code>agents/plugins/&lt;your_plugin&gt;/</code>.</li>
+<li>Implement the C ABI entry points (or use the C++ CRTP wrapper).</li>
+<li>Add the plugin to <code>meson.build</code>.</li>
+<li>Write an <code>InstructionDefinition</code> YAML file in <code>content/definitions/</code> following the <code>yuzu.io/v1alpha1</code> DSL spec.</li>
+<li>Register plugin actions in the Substrate Primitive Reference table (<a href="../yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a>, section 14).</li>
+</ol>
+<p>For the full DSL specification, see <a href="../yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a>. For a walkthrough, see <a href="../getting-started.html" class="doc-ref"><code>docs/getting-started.md</code></a>.</p>
+</main>
+</body>
+</html>

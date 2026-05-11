@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guaranteed State (Guardian)</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/guaranteed-state.md</div>
+<h1 class="doc-title">Guaranteed State (Guardian)</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="guaranteed-state-guardian">Guaranteed State (Guardian)</h1>
+<p>Guardian is Yuzu's real-time policy enforcement engine. A <strong>guaranteed-state rule</strong> is a desired-state assertion about an endpoint — a registry value, a service status, a file presence, a configuration key — plus optional automatic remediation when the endpoint drifts. Unlike the server-side <a href="policy-engine.html">Policy Engine</a>, Guardian runs <em>inside the agent</em>, reacts to kernel-backed change notifications in sub-second time, and can repair drift without an operator in the loop.</p>
+<blockquote>
+<p><strong>PR 2 status — read this first.</strong> The v0.12 release ships Guardian's <strong>control plane + agent skeleton only</strong>. Rules can be authored, stored, retrieved, and pushed through the REST API. The agent persists the pushed rule set into a reserved KV namespace (<code>__guardian__</code>). <strong>No guards run yet</strong> — every rule reports <code>errored</code> in <code>/api/v1/guaranteed-state/status</code> and dashboards will surface this as "Guardian installed but inert." Server-to-agent fan-out is audited as <code>result=success</code> with <code>fan_out_deferred_pr3=true</code> in the detail field, but does not actually deliver rules to agents until Guardian PR 3 lands. SIEM correlation rules that infer "rules were delivered to agents" from these events are premature until that marker disappears. Operators pilot-testing Guardian should treat this release as an API-shape preview, not working enforcement. Design reference: <a href="../yuzu-guardian-design-v1.1.html" class="doc-ref"><code>docs/yuzu-guardian-design-v1.1.md</code></a>. Windows-first rollout plan: <a href="../yuzu-guardian-windows-implementation-plan.html" class="doc-ref"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a>.</p>
+</blockquote>
+<h2 id="concepts">Concepts</h2>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Rule</strong></td>
+<td>A YAML document describing a desired state, a detection strategy, and an optional remediation. Stored server-side with <code>yaml_source</code> as the authoritative form.</td>
+</tr>
+<tr>
+<td><strong>Guard</strong></td>
+<td>The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. (PR 3+.)</td>
+</tr>
+<tr>
+<td><strong>Event</strong></td>
+<td>A record of detected drift, attempted remediation, or agent sync activity. Queried via <code>/api/v1/guaranteed-state/events</code>.</td>
+</tr>
+<tr>
+<td><strong>Push</strong></td>
+<td>An operator-initiated distribution of the active rule set to a scope of agents. Separates deploy authority (<code>Push</code>) from authoring authority (<code>Write</code>).</td>
+</tr>
+<tr>
+<td><strong>Enforcement mode</strong></td>
+<td><code>enforce</code> (remediate on drift) or <code>audit</code> (log drift, do not remediate).</td>
+</tr>
+<tr>
+<td><strong>Scope expression</strong></td>
+<td>A Scope DSL expression (same engine as Instructions) selecting which agents a rule applies to.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="permissions">Permissions</h2>
+<p>Guardian introduces a new securable type (<code>GuaranteedState</code>) and a new operation (<code>Push</code>). Seeded role grants:</p>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Read</th>
+<th>Write</th>
+<th>Execute</th>
+<th>Delete</th>
+<th>Approve</th>
+<th>Push</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Administrator</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>ITServiceOwner</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>PlatformEngineer</td>
+<td>✓</td>
+<td>✓</td>
+<td></td>
+<td>✓</td>
+<td></td>
+<td>✓</td>
+</tr>
+<tr>
+<td>Operator</td>
+<td>✓</td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td>✓</td>
+</tr>
+<tr>
+<td>Viewer</td>
+<td>✓</td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>Administrator and ITServiceOwner inherit Execute and Approve on <code>GuaranteedState</code> from the cross-type CRUD seed in <code>rbac_store.cpp</code> — neither operation has an active handler on Guardian today, but the grants exist in the database and will surface in any role-permission export. PlatformEngineer's grants are explicit and narrower (Read/Write/Delete/Push only). <code>Push</code> is deliberately separated from <code>Write</code> so an operator can deploy a rule set authored by a platform engineer without being able to modify the rule body. See <a href="rbac.html">RBAC</a> for the full securable-types matrix.</p>
+<h2 id="rule-yaml-schema">Rule YAML schema</h2>
+<p>Guardian rules use the DSL framework documented in <a href="../yaml-dsl-spec.html" class="doc-ref"><code>docs/yaml-dsl-spec.md</code></a>:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">GuaranteedStateRule</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">block-rdp-outbound</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Block</span><span class="nv"> </span><span class="s">outbound</span><span class="nv"> </span><span class="s">RDP&quot;</span>
+<span class="w">  </span><span class="nt">severity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">high</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">os_target</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows</span>
+<span class="w">  </span><span class="nt">enforcement_mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enforce</span>
+<span class="w">  </span><span class="nt">scope</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;tag:env=prod&quot;</span>
+<span class="w">  </span><span class="nt">guard</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows_registry</span>
+<span class="w">    </span><span class="nt">hive</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">HKLM</span>
+<span class="w">    </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;SYSTEM\\CurrentControlSet\\Services\\TermService&quot;</span>
+<span class="w">    </span><span class="nt">value_name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Start</span>
+<span class="w">    </span><span class="nt">expected</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span><span class="w">   </span><span class="c1"># Disabled</span>
+<span class="w">  </span><span class="nt">remediation</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">registry_set</span>
+<span class="w">    </span><span class="nt">hive</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">HKLM</span>
+<span class="w">    </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;SYSTEM\\CurrentControlSet\\Services\\TermService&quot;</span>
+<span class="w">    </span><span class="nt">value_name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Start</span>
+<span class="w">    </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
+<span class="w">    </span><span class="nt">value_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">REG_DWORD</span>
+</code></pre></div>
+<p>Only the Windows <code>registry</code> guard ships in PR 3. Linux (inotify/netlink/D-Bus) and macOS (Endpoint Security) guards are on the roadmap.</p>
+<h2 id="workflow">Workflow</h2>
+<h3 id="1-author-a-rule">1. Author a rule</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>https://yuzu.example.com/api/v1/guaranteed-state/rules<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$YUZU_TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;rule_id&quot;: &quot;block-rdp-outbound&quot;,</span>
+<span class="s1">    &quot;name&quot;: &quot;Block outbound RDP&quot;,</span>
+<span class="s1">    &quot;yaml_source&quot;: &quot;apiVersion: yuzu.io/v1alpha1\nkind: GuaranteedStateRule\n...&quot;,</span>
+<span class="s1">    &quot;severity&quot;: &quot;high&quot;,</span>
+<span class="s1">    &quot;os_target&quot;: &quot;windows&quot;,</span>
+<span class="s1">    &quot;scope_expr&quot;: &quot;tag:env=prod&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Requires <code>GuaranteedState:Write</code>. Response: <code>201 Created</code> with <code>data.rule_id</code>. Audits <code>guaranteed_state.rule.create</code>.</p>
+<h3 id="2-list-or-fetch-rules">2. List or fetch rules</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$YUZU_TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>https://yuzu.example.com/api/v1/guaranteed-state/rules
+</code></pre></div>
+<p>Requires <code>GuaranteedState:Read</code>.</p>
+<h3 id="3-update-a-rule">3. Update a rule</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-X<span class="w"> </span>PUT<span class="w"> </span>https://yuzu.example.com/api/v1/guaranteed-state/rules/block-rdp-outbound<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$YUZU_TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;enabled&quot;: false}&#39;</span>
+</code></pre></div>
+<p>Version is auto-incremented on every successful update. Requires <code>GuaranteedState:Write</code>. Audits <code>guaranteed_state.rule.update</code>.</p>
+<h3 id="4-push-to-agents">4. Push to agents</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>https://yuzu.example.com/api/v1/guaranteed-state/push<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$YUZU_TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;scope&quot;: &quot;tag:env=prod&quot;, &quot;full_sync&quot;: true}&#39;</span>
+</code></pre></div>
+<p>Requires <code>GuaranteedState:Push</code>. Returns <code>202 Accepted</code>. Audits <code>guaranteed_state.push</code> with <code>result=success</code> and <code>detail=rules=&lt;N&gt; full_sync=&lt;bool&gt; scope="&lt;expr&gt;" fan_out_deferred_pr3=true</code>.</p>
+<p><strong>While PR 2 is in effect, no agent will actually receive the push</strong> — the REST call is accepted and persisted but agent delivery is wired in Guardian PR 3. SIEM correlation rules should not infer "rules were delivered to agents" from this event until the <code>fan_out_deferred_pr3=true</code> flag disappears from the audit detail.</p>
+<h3 id="5-query-events-and-status">5. Query events and status</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Recent events, filtered by severity</span>
+curl<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$YUZU_TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;https://yuzu.example.com/api/v1/guaranteed-state/events?severity=high&amp;limit=50&quot;</span>
+
+<span class="c1"># Fleet rollup (placeholder in PR 2 — fleet aggregation lands in PR 4)</span>
+curl<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$YUZU_TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>https://yuzu.example.com/api/v1/guaranteed-state/status
+</code></pre></div>
+<p>Both require <code>GuaranteedState:Read</code>. <code>/status</code> response keys (<code>total_rules</code>, <code>compliant_rules</code>, <code>drifted_rules</code>, <code>errored_rules</code>) match the agent-side proto <code>GuaranteedStateStatus</code>.</p>
+<h2 id="retention">Retention</h2>
+<p>Guardian events are pruned on a rolling window. The default is 30 days. Override with <code>--guardian-event-retention-days</code> at server start (or set <code>YUZU_GUARDIAN_EVENT_RETENTION_DAYS</code>), or via <code>PUT /api/v1/config/guardian_event_retention_days</code> at runtime. See the <a href="server-administration.md#retention-settings">Retention Settings</a> table in the server administration guide.</p>
+<h2 id="observability">Observability</h2>
+<p>Guardian surfaces readiness and event counts via the standard observability endpoints:</p>
+<ul>
+<li><code>/healthz</code> (authenticated) now reports a <code>stores.guaranteed_state</code> key alongside the other store-health entries. If <code>guaranteed-state.db</code> fails to open, the server reports <code>status = "degraded"</code>.</li>
+<li><code>/readyz</code> includes <code>guaranteed_state_store</code> in the per-store readiness conjunction. A failed store takes the pod out of rotation.</li>
+<li>Prometheus metrics for Guardian rule push counts, agent apply latency, and parse errors will land in Guardian PR 3+ alongside real enforcement.</li>
+</ul>
+<h2 id="related-documentation">Related documentation</h2>
+<ul>
+<li><a href="../yuzu-guardian-design-v1.1.html">Design v1.1</a> — the authoritative architecture document (engineering reference).</li>
+<li><a href="../yuzu-guardian-windows-implementation-plan.html">Windows implementation plan</a> — PR-by-PR delivery plan.</li>
+<li><a href="policy-engine.html">Policy Engine</a> — server-side desired-state rules and compliance checks (complementary to Guardian, not replaced by it).</li>
+<li><a href="scope-engine.html">Scope Engine</a> — expression language used by <code>scope_expr</code>.</li>
+<li><a href="rbac.html">RBAC</a> — role seeds and the <code>Push</code> operation.</li>
+<li><a href="audit-log.html">Audit Log</a> — complete list of Guardian audit actions.</li>
+</ul>
+</main>
+</body>
+</html>

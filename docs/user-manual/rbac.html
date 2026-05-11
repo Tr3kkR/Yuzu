@@ -1,0 +1,855 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Role-Based Access Control (RBAC)</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/rbac.md</div>
+<h1 class="doc-title">Role-Based Access Control (RBAC)</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="role-based-access-control-rbac">Role-Based Access Control (RBAC)</h1>
+<p>Yuzu implements granular role-based access control with deny-overrides-allow semantics, scoped permissions via management groups, and support for both built-in and custom roles.</p>
+<h2 id="enabling-rbac">Enabling RBAC</h2>
+<p>RBAC is controlled by a global toggle. When disabled, all authenticated users have full access (with a legacy fallback: write/delete/execute/approve operations still require the <code>admin</code> session role). When enabled, every API call and UI action is checked against the caller's assigned roles.</p>
+<p>Toggle RBAC via the Settings page or the server configuration file:</p>
+<div class="highlight"><pre><span></span><code><span class="k">[rbac]</span>
+<span class="na">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">true</span>
+</code></pre></div>
+<h2 id="concepts">Concepts</h2>
+<table>
+<thead>
+<tr>
+<th>Concept</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Principal</strong></td>
+<td>A user or group identity. Matches the authenticated username or an OIDC group claim.</td>
+</tr>
+<tr>
+<td><strong>Role</strong></td>
+<td>A named collection of permissions. Can be system-defined or custom.</td>
+</tr>
+<tr>
+<td><strong>Securable type</strong></td>
+<td>A category of resource that permissions apply to (e.g., <code>Infrastructure</code>, <code>Tag</code>).</td>
+</tr>
+<tr>
+<td><strong>Operation</strong></td>
+<td>An action on a securable type (<code>Read</code>, <code>Write</code>, <code>Delete</code>, <code>Execute</code>, <code>Approve</code>, <code>Push</code>).</td>
+</tr>
+<tr>
+<td><strong>Permission</strong></td>
+<td>A single <code>(securable_type, operation, effect)</code> entry. Effect is <code>Allow</code> or <code>Deny</code>.</td>
+</tr>
+<tr>
+<td><strong>Role assignment</strong></td>
+<td>Binds a principal to a role, optionally scoped to a management group.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="system-roles">System Roles</h2>
+<p>Six roles are created automatically and cannot be deleted:</p>
+<table>
+<thead>
+<tr>
+<th>Role</th>
+<th>Permissions</th>
+<th>Use case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Administrator</strong></td>
+<td>All 5 CRUD operations on all 19 securable types, plus Push on GuaranteedState (96 permissions)</td>
+<td>Server admins, security team leads</td>
+</tr>
+<tr>
+<td><strong>PlatformEngineer</strong></td>
+<td>Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response; Read/Write/Delete/Push on GuaranteedState</td>
+<td>Authors and managers of YAML instruction definitions, sets, and Guardian rules</td>
+</tr>
+<tr>
+<td><strong>Operator</strong></td>
+<td>Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog and Response; Read and Push on GuaranteedState</td>
+<td>Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution</td>
+</tr>
+<tr>
+<td><strong>ApiTokenManager</strong></td>
+<td>Read, Write, Delete on ApiToken (3 permissions)</td>
+<td>Create, revoke, and manage API tokens for programmatic access</td>
+</tr>
+<tr>
+<td><strong>ITServiceOwner</strong></td>
+<td>All 5 CRUD operations on 16 securable types, plus Push on GuaranteedState (81 permissions). Excludes UserManagement, Security, ApiToken</td>
+<td>Service desk leads, team managers with delegated control over their IT services</td>
+</tr>
+<tr>
+<td><strong>Viewer</strong></td>
+<td>Read on 18 securable types (all except Infrastructure) (18 permissions)</td>
+<td>Helpdesk staff, auditors, read-only dashboards</td>
+</tr>
+</tbody>
+</table>
+<h2 id="securable-types">Securable Types</h2>
+<table>
+<thead>
+<tr>
+<th>Securable type</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Infrastructure</code></td>
+<td>Agent endpoints (query, command, patch)</td>
+</tr>
+<tr>
+<td><code>Tag</code></td>
+<td>Asset tags applied to devices</td>
+</tr>
+<tr>
+<td><code>InstructionDefinition</code></td>
+<td>YAML-defined instruction templates</td>
+</tr>
+<tr>
+<td><code>InstructionSet</code></td>
+<td>Grouped collections of instructions</td>
+</tr>
+<tr>
+<td><code>Execution</code></td>
+<td>Running or completed instruction instances</td>
+</tr>
+<tr>
+<td><code>Response</code></td>
+<td>Instruction response data</td>
+</tr>
+<tr>
+<td><code>Schedule</code></td>
+<td>Cron-style recurring instruction schedules</td>
+</tr>
+<tr>
+<td><code>Approval</code></td>
+<td>Approval workflow entries</td>
+</tr>
+<tr>
+<td><code>ManagementGroup</code></td>
+<td>Hierarchical device groups</td>
+</tr>
+<tr>
+<td><code>UserManagement</code></td>
+<td>User accounts and role assignments</td>
+</tr>
+<tr>
+<td><code>Security</code></td>
+<td>Security settings (TLS, enrollment)</td>
+</tr>
+<tr>
+<td><code>ApiToken</code></td>
+<td>API token lifecycle</td>
+</tr>
+<tr>
+<td><code>AuditLog</code></td>
+<td>Audit event records</td>
+</tr>
+<tr>
+<td><code>Policy</code></td>
+<td>Guaranteed State policy fragments and composed policies</td>
+</tr>
+<tr>
+<td><code>DeviceToken</code></td>
+<td>Agent device-token issuance and revocation</td>
+</tr>
+<tr>
+<td><code>SoftwareDeployment</code></td>
+<td>Software deployment campaigns</td>
+</tr>
+<tr>
+<td><code>License</code></td>
+<td>Enterprise license records</td>
+</tr>
+<tr>
+<td><code>FileRetrieval</code></td>
+<td>File upload and download operations</td>
+</tr>
+<tr>
+<td><code>GuaranteedState</code></td>
+<td>Guardian (Guaranteed State) policy rules, events, and status</td>
+</tr>
+</tbody>
+</table>
+<h2 id="operations">Operations</h2>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Typical meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Read</code></td>
+<td>View or list resources</td>
+</tr>
+<tr>
+<td><code>Write</code></td>
+<td>Create or modify a resource</td>
+</tr>
+<tr>
+<td><code>Delete</code></td>
+<td>Remove a resource</td>
+</tr>
+<tr>
+<td><code>Execute</code></td>
+<td>Run an instruction against devices</td>
+</tr>
+<tr>
+<td><code>Approve</code></td>
+<td>Approve a pending workflow item</td>
+</tr>
+<tr>
+<td><code>Push</code></td>
+<td>Distribute an existing rule set to scoped agents. Consumed <strong>only</strong> by <code>GuaranteedState</code> REST handlers and seeded <strong>only</strong> on <code>GuaranteedState</code> — separates deploy authority from authoring authority. Present in the operations catalogue so custom roles can adopt it, but the default seeds grant it on <code>GuaranteedState</code> alone.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="permission-resolution">Permission Resolution</h2>
+<p>Yuzu evaluates permissions with <strong>deny-overrides-allow</strong>:</p>
+<ol>
+<li>Collect all roles assigned to the principal (direct user assignments + group assignments).</li>
+<li>Gather all permissions from those roles for the requested <code>(securable_type, operation)</code>.</li>
+<li>If any permission has effect <code>Deny</code>, the request is <strong>denied</strong>.</li>
+<li>If at least one permission has effect <code>Allow</code>, the request is <strong>allowed</strong>.</li>
+<li>If no matching permission exists, the request is <strong>denied</strong> (implicit deny).</li>
+</ol>
+<h3 id="scoped-permissions">Scoped Permissions</h3>
+<p>When a resource belongs to a management group (e.g., a device in "London Servers"), the permission check works in two passes:</p>
+<ol>
+<li><strong>Global check</strong> -- roles assigned without a group scope (via the <code>principal_roles</code> table) are evaluated first using standard deny-overrides-allow. If the user has a global allow, the request is permitted immediately.</li>
+<li><strong>Scoped check</strong> -- the system finds the agent's management group memberships, then collects all ancestor groups (child to root). For every group in this set, it looks up scoped role assignments (stored in the <code>ManagementGroupStore</code>) that match the user directly or via RBAC group membership. All matching permissions are evaluated with deny-overrides-allow: any deny returns false; otherwise, if at least one allow is found, the request is permitted.</li>
+</ol>
+<p>This means a role scoped to a parent group automatically covers all child groups.</p>
+<h2 id="api-reference">API Reference</h2>
+<p>All REST API v1 responses are wrapped in a standard JSON envelope:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="err">...</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>List endpoints add a <code>pagination</code> field:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="err">...</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;pagination&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">6</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;start&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;page_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">50</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="check-permission">Check Permission</h3>
+<p>Verify whether the current user has a specific permission. Useful for UI feature gating or pre-flight checks in scripts.</p>
+<p><strong>Note:</strong> This endpoint uses <code>POST</code>, not <code>GET</code>, because it accepts a JSON request body.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/rbac/check<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;securable_type&quot;: &quot;Infrastructure&quot;,</span>
+<span class="s1">    &quot;operation&quot;: &quot;Execute&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;allowed&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>A denied response (the <code>allowed</code> field is <code>false</code>; no reason string is returned):</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;allowed&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="list-roles">List Roles</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>http://localhost:8080/api/v1/rbac/roles
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Administrator&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Full access to all operations&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;is_system&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1710849600</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;PlatformEngineer&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Author and manage YAML instruction definitions, sets, and schemas&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;is_system&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1710849600</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Operator&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Execute and manage instructions, schedules, and tags&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;is_system&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1710849600</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ApiTokenManager&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Create, revoke, and manage API tokens for programmatic access&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;is_system&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1710849600</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;ITServiceOwner&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Admin control over devices tagged with the same IT Service&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;is_system&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1710849600</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Viewer&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Read-only access to operational data&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;is_system&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;created_at&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1710849600</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;pagination&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;total&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">6</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;start&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;page_size&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">50</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<h3 id="get-role-permissions">Get Role Permissions</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/rbac/roles/ITServiceOwner/permissions
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;data&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;securable_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Approval&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;operation&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Approve&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;effect&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;allow&quot;</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;securable_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Approval&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;operation&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Delete&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;effect&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;allow&quot;</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;securable_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Approval&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;operation&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Execute&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;effect&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;allow&quot;</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;securable_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Approval&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;operation&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Read&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;effect&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;allow&quot;</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;securable_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Approval&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;operation&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Write&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;effect&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;allow&quot;</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;securable_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;AuditLog&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;operation&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Read&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;effect&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;allow&quot;</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;securable_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Infrastructure&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;operation&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Read&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;effect&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;allow&quot;</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;securable_type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Tag&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;operation&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Read&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;effect&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;allow&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;meta&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;api_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;v1&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+<p>(Truncated for brevity. The full ITServiceOwner role contains 50 permissions across 10 securable types.)</p>
+<h3 id="custom-roles-planned">Custom Roles (Planned)</h3>
+<p>Custom roles can be created programmatically via <code>RbacStore::create_role()</code> and permissions assigned via <code>RbacStore::set_permission()</code>. REST API endpoints for role creation and role assignment are planned but <strong>not yet implemented</strong>. Currently, custom roles must be managed through the HTMX Settings UI or directly via the SQLite database.</p>
+<p><strong>Planned endpoints (not yet available):</strong></p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Endpoint</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/v1/rbac/roles</code></td>
+<td>Create a custom role</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/v1/rbac/roles/{name}/assignments</code></td>
+<td>Assign a role to a principal</td>
+</tr>
+</tbody>
+</table>
+<h3 id="scoped-role-assignments">Scoped Role Assignments</h3>
+<p>Scoped role assignments bind a principal to a role within a specific management group. These are stored in the <code>ManagementGroupStore</code> (not in the RBAC principal_roles table) and are managed through the management group API:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Assign a role scoped to a management group</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-b<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost:8080/api/v1/management-groups/mg_london_office/roles<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;principal_type&quot;: &quot;user&quot;,</span>
+<span class="s1">    &quot;principal_id&quot;: &quot;jane.doe&quot;,</span>
+<span class="s1">    &quot;role_name&quot;: &quot;Operator&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<h2 id="examples">Examples</h2>
+<h3 id="deny-a-specific-operation">Deny a Specific Operation</h3>
+<p>Prevent a role from deleting infrastructure resources, even if other roles would allow it. This requires creating a custom role with a Deny permission (via the Settings UI or direct database access, since the role creation API is not yet available):</p>
+<div class="highlight"><pre><span></span><code><span class="c1">-- Example: create a deny role directly in the RBAC database</span>
+<span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">roles</span><span class="w"> </span><span class="p">(</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">description</span><span class="p">,</span><span class="w"> </span><span class="n">is_system</span><span class="p">,</span><span class="w"> </span><span class="n">created_at</span><span class="p">)</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="s1">&#39;NoDeletion&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;Explicit deny on infrastructure deletion&#39;</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">strftime</span><span class="p">(</span><span class="s1">&#39;%s&#39;</span><span class="p">,</span><span class="s1">&#39;now&#39;</span><span class="p">));</span>
+<span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">role_permissions</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="s1">&#39;NoDeletion&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;Infrastructure&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;Delete&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;deny&#39;</span><span class="p">);</span>
+</code></pre></div>
+<p>Assign this role alongside any other roles. Because deny overrides allow, the user will be unable to delete infrastructure resources regardless of their other role assignments.</p>
+<h2 id="api-endpoint-summary">API Endpoint Summary</h2>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Endpoint</th>
+<th>Description</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/v1/rbac/check</code></td>
+<td>Check if current user has a permission</td>
+<td>Implemented</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/v1/rbac/roles</code></td>
+<td>List all roles</td>
+<td>Implemented</td>
+</tr>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/v1/rbac/roles/{name}/permissions</code></td>
+<td>Get permissions for a role</td>
+<td>Implemented</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/v1/rbac/roles</code></td>
+<td>Create a custom role</td>
+<td>Planned</td>
+</tr>
+<tr>
+<td><code>PUT</code></td>
+<td><code>/api/v1/rbac/roles/{name}</code></td>
+<td>Update a role</td>
+<td>Planned</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/v1/rbac/roles/{name}</code></td>
+<td>Delete a custom role</td>
+<td>Planned</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/v1/rbac/roles/{name}/assignments</code></td>
+<td>Assign a role to a principal</td>
+<td>Planned</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/v1/rbac/roles/{name}/assignments</code></td>
+<td>Unassign a role</td>
+<td>Planned</td>
+</tr>
+</tbody>
+</table>
+<h2 id="planned-features">Planned Features</h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Phase</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>REST API for role creation and assignment</td>
+<td>3</td>
+<td>Planned</td>
+</tr>
+<tr>
+<td>OIDC group-to-role auto-mapping refinements</td>
+<td>3</td>
+<td>Stub</td>
+</tr>
+<tr>
+<td>Role management via Settings UI matrix</td>
+<td>3</td>
+<td>Planned</td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

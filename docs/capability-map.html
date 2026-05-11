@@ -1,0 +1,1584 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuzu Capability Map</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/capability-map.md</div>
+<h1 class="doc-title">Yuzu Capability Map</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="yuzu-capability-map">Yuzu Capability Map</h1>
+<p><strong>Version:</strong> 3.0 | <strong>Date:</strong> 2026-03-30 | <strong>Status:</strong> Draft</p>
+<hr>
+<h2 id="how-to-read-this-document">How to Read This Document</h2>
+<p>Each capability is rated on two axes:</p>
+<p><strong>Implementation Status</strong>
+| Icon | Status | Meaning |
+|:----:|--------|---------|
+| :white_check_mark: | <strong>Done</strong> | Implemented and functional |
+| :large_orange_diamond: | <strong>Partial</strong> | Some coverage exists; gaps remain |
+| :x: | <strong>Not Started</strong> | No implementation yet |</p>
+<p><strong>Delivery Tier</strong>
+| Tier | Label | Meaning |
+|------|-------|---------|
+| <strong>T1</strong> | Foundation | Core capabilities for a viable endpoint management platform |
+| <strong>T2</strong> | Advanced | Enterprise-grade features for production deployments at scale |
+| <strong>T3</strong> | Future | Aspirational capabilities for competitive parity with top-tier platforms |</p>
+<hr>
+<h2 id="progress-at-a-glance">Progress at a Glance</h2>
+<div class="highlight"><pre><span></span><code>Foundation   [================================]  33/33 done  (100%)
+Advanced     [================================]  101/101 done (100%)
+Future       [=====================-----------]  33/50 done  (66%)
+New (Ph 8-16)[=---------------------------]     2/41 done   (5%) (3 partial — Guardian PRs 1-2 + Guardian pre-login activation done; 15.A + 28.4 + 28.6 in flight)
+─────────────────────────────────────────────────────────────────
+Overall      [======================---------]   169/225 done (75%)
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Domain</th>
+<th style="text-align: center;">Total</th>
+<th style="text-align: center;">Done</th>
+<th style="text-align: center;">Partial</th>
+<th style="text-align: center;">Not Started</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1. Agent Lifecycle</td>
+<td style="text-align: center;">9</td>
+<td style="text-align: center;">9</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>2. Command Execution</td>
+<td style="text-align: center;">13</td>
+<td style="text-align: center;">13</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>3. Device &amp; Endpoint Info</td>
+<td style="text-align: center;">10</td>
+<td style="text-align: center;">8</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">2</td>
+</tr>
+<tr>
+<td>4. Network Info &amp; Discovery</td>
+<td style="text-align: center;">11</td>
+<td style="text-align: center;">9</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">2</td>
+</tr>
+<tr>
+<td>5. Process &amp; Service Mgmt</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">1</td>
+</tr>
+<tr>
+<td>6. User &amp; Session Mgmt</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>7. Software &amp; App Mgmt</td>
+<td style="text-align: center;">6</td>
+<td style="text-align: center;">6</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>8. Patch &amp; Update Mgmt</td>
+<td style="text-align: center;">9</td>
+<td style="text-align: center;">8</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">1</td>
+</tr>
+<tr>
+<td>9. Security &amp; Compliance</td>
+<td style="text-align: center;">10</td>
+<td style="text-align: center;">9</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">1</td>
+</tr>
+<tr>
+<td>10. File System Operations</td>
+<td style="text-align: center;">15</td>
+<td style="text-align: center;">14</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">1</td>
+</tr>
+<tr>
+<td>11. Script &amp; Command Exec</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>12. Registry &amp; System Config</td>
+<td style="text-align: center;">7</td>
+<td style="text-align: center;">7</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>13. Content Distribution</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>14. User Interaction</td>
+<td style="text-align: center;">6</td>
+<td style="text-align: center;">3</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">3</td>
+</tr>
+<tr>
+<td>15. Inventory &amp; Data Collection</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">1</td>
+</tr>
+<tr>
+<td>16. Policy &amp; Compliance Engine</td>
+<td style="text-align: center;">8</td>
+<td style="text-align: center;">8</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>17. Triggers &amp; Automation</td>
+<td style="text-align: center;">7</td>
+<td style="text-align: center;">7</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>18. Auth &amp; Authorization</td>
+<td style="text-align: center;">10</td>
+<td style="text-align: center;">9</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">1</td>
+</tr>
+<tr>
+<td>19. Device &amp; Group Mgmt</td>
+<td style="text-align: center;">7</td>
+<td style="text-align: center;">7</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>20. Response Collection</td>
+<td style="text-align: center;">7</td>
+<td style="text-align: center;">7</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>21. Notifications &amp; Audit</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">1</td>
+</tr>
+<tr>
+<td>22. System &amp; Infrastructure</td>
+<td style="text-align: center;">10</td>
+<td style="text-align: center;">7</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">3</td>
+</tr>
+<tr>
+<td>23. Agent Key-Value Storage</td>
+<td style="text-align: center;">3</td>
+<td style="text-align: center;">3</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+</tr>
+<tr>
+<td>24. Integration &amp; Extensibility</td>
+<td style="text-align: center;">10</td>
+<td style="text-align: center;">8</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">2</td>
+</tr>
+<tr>
+<td>25. Connector Framework</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">5</td>
+</tr>
+<tr>
+<td>26. Inventory Repositories</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">4</td>
+</tr>
+<tr>
+<td>27. Software Catalog &amp; Licensing</td>
+<td style="text-align: center;">5</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">5</td>
+</tr>
+<tr>
+<td>28. Response Visualization</td>
+<td style="text-align: center;">6</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">2</td>
+<td style="text-align: center;">4</td>
+</tr>
+<tr>
+<td>29. Consumer Applications</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">4</td>
+</tr>
+<tr>
+<td>30. Scope Walking &amp; Result Sets</td>
+<td style="text-align: center;">4</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">0</td>
+<td style="text-align: center;">4</td>
+</tr>
+<tr>
+<td>31. System Guardian</td>
+<td style="text-align: center;">10</td>
+<td style="text-align: center;">1</td>
+<td style="text-align: center;">2</td>
+<td style="text-align: center;">7</td>
+</tr>
+<tr>
+<td><strong>TOTAL</strong></td>
+<td style="text-align: center;"><strong>225</strong></td>
+<td style="text-align: center;"><strong>169</strong></td>
+<td style="text-align: center;"><strong>3</strong></td>
+<td style="text-align: center;"><strong>53</strong></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>Scaffolded vs production-quality.</strong> The percentages above measure feature presence, not enterprise hardening. Foundation and Advanced tiers reach 100% on the "implemented and functional" bar — they do not yet reach "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The <a href="capability-agentic-audit-2026-05.html" class="doc-ref"><code>docs/capability-agentic-audit-2026-05.md</code></a> audit is the source for the production-quality dimension; subsequent reviews should keep it current.</p>
+</blockquote>
+<hr>
+<h2 id="1-agent-lifecycle-management">1. Agent Lifecycle Management</h2>
+<p><em>Agent registration, health monitoring, self-diagnostics, and remote control.</em></p>
+<h3 id="11-agent-registration-and-enrollment-white_check_mark-t1">1.1 Agent Registration and Enrollment :white_check_mark: <code>T1</code></h3>
+<p>3-tier enrollment model: manual approval (Tier 1), pre-shared tokens (Tier 2), and platform trust (Tier 3, reserved). gRPC <code>Register</code> RPC with enrollment token support.</p>
+<blockquote>
+<p><strong>Gap:</strong> Tier 3 server-side certificate validation not implemented.</p>
+</blockquote>
+<h3 id="12-heartbeat-and-session-keepalive-white_check_mark-t1">1.2 Heartbeat and Session Keepalive :white_check_mark: <code>T1</code></h3>
+<p><code>Heartbeat</code> RPC with pending command delivery and <code>status_tags</code> for lightweight state reporting.</p>
+<blockquote>
+<p><strong>Gap:</strong> No configurable heartbeat interval from server side.</p>
+</blockquote>
+<h3 id="13-agent-summary-and-diagnostics-white_check_mark-t1">1.3 Agent Summary and Diagnostics :white_check_mark: <code>T1</code></h3>
+<p><code>diagnostics</code> and <code>status</code> plugins report agent health, uptime, and resource usage. <code>agent_actions</code> plugin for self-management.</p>
+<blockquote>
+<p><strong>Gap:</strong> No unified diagnostics bundle download (key files, logs).</p>
+</blockquote>
+<h3 id="14-agent-version-and-update-management-white_check_mark-t1">1.4 Agent Version and Update Management :white_check_mark: <code>T1</code></h3>
+<p><code>CheckForUpdate</code>/<code>DownloadUpdate</code> RPCs in agent.proto. Full updater implementation (<code>agents/core/src/updater.cpp</code>) with hash verification and platform-specific self-update.</p>
+<h3 id="15-agent-extensibility-introspection-white_check_mark-t1">1.5 Agent Extensibility Introspection :white_check_mark: <code>T1</code></h3>
+<p>Plugins reported in <code>RegisterRequest.AgentInfo.plugins</code> with name, version, description, and capabilities list.</p>
+<blockquote>
+<p><strong>Gap:</strong> No runtime plugin install/uninstall from server.</p>
+</blockquote>
+<h3 id="16-agent-sleep-and-stagger-control-white_check_mark-t2">1.6 Agent Sleep and Stagger Control :white_check_mark: <code>T2</code></h3>
+<p>Stagger control via <code>CommandRequest.stagger</code> field. Agents introduce random delay before executing, preventing thundering herd on broadcast.</p>
+<h3 id="17-agent-logging-and-log-retrieval-white_check_mark-t2">1.7 Agent Logging and Log Retrieval :white_check_mark: <code>T2</code></h3>
+<p>spdlog-based local logging on the agent. <code>agent_logging</code> plugin provides remote log retrieval (<code>get_log</code> action, configurable 1-500 lines) and key file listing (<code>get_key_files</code> action). Log file discovery from agent config with platform default fallbacks.</p>
+<h3 id="18-connection-and-session-info-white_check_mark-t1">1.8 Connection and Session Info :white_check_mark: <code>T1</code></h3>
+<p>Session ID returned on registration. <code>WatchEvents</code> tracks connect/disconnect events. <code>connection_info</code> action in diagnostics plugin reports server address, TLS status, session ID, gRPC channel state, reconnect count, latency, uptime.</p>
+<h3 id="19-instruction-execution-statistics-white_check_mark-t2">1.9 Instruction Execution Statistics :white_check_mark: <code>T2</code></h3>
+<p><code>ExecutionTracker</code> aggregation methods: per-agent stats, per-definition stats, fleet summary. REST endpoints: <code>GET /api/v1/execution-statistics</code>, <code>/agents</code>, <code>/definitions</code>. HTMX fragment for dashboard card.</p>
+<hr>
+<h2 id="2-command-execution-and-orchestration">2. Command Execution and Orchestration</h2>
+<p><em>Dispatching instructions to agents, collecting results, and workflow coordination.</em></p>
+<h3 id="21-single-agent-command-dispatch-white_check_mark-t1">2.1 Single-Agent Command Dispatch :white_check_mark: <code>T1</code></h3>
+<p><code>ExecuteCommand</code> RPC with streaming response. <code>SendCommand</code> in the management API.</p>
+<h3 id="22-multi-agent-broadcast-white_check_mark-t1">2.2 Multi-Agent Broadcast :white_check_mark: <code>T1</code></h3>
+<p><code>SendCommandRequest.agent_ids</code> supports broadcast (empty = all agents). Scope/filter targeting is also supported: <code>AgentRegistry::evaluate_scope</code> (<code>server/core/src/agent_registry.cpp:820-861</code>) instantiates an <code>AttributeResolver</code> lambda that resolves <code>ostype</code>, <code>hostname</code>, <code>arch</code>, <code>agent_version</code>, <code>tag:X</code> (in-memory <code>scopable_tags</code> plus persistent <code>TagStore</code> fallback), and <code>props.X</code> (custom properties), composed via the scope DSL's <code>AND</code> / <code>OR</code> / <code>NOT</code>. See <a href="asset-tagging-guide.html" class="doc-ref"><code>docs/asset-tagging-guide.md</code></a> and <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> for operator-level usage.</p>
+<h3 id="23-streaming-command-output-white_check_mark-t1">2.3 Streaming Command Output :white_check_mark: <code>T1</code></h3>
+<p><code>CommandResponse</code> streams via gRPC and SSE to the dashboard.</p>
+<h3 id="24-command-timeout-and-expiry-white_check_mark-t1">2.4 Command Timeout and Expiry :white_check_mark: <code>T1</code></h3>
+<p><code>CommandRequest.expires_at</code> and <code>SendCommandRequest.timeout_seconds</code>.</p>
+<blockquote>
+<p><strong>Gap:</strong> No server-side command cancellation mid-execution.</p>
+</blockquote>
+<h3 id="25-bidirectional-command-channel-white_check_mark-t1">2.5 Bidirectional Command Channel :white_check_mark: <code>T1</code></h3>
+<p><code>Subscribe</code> bidi-streaming RPC as alternative to polling.</p>
+<h3 id="26-instruction-templates-definitions-white_check_mark-t2">2.6 Instruction Templates / Definitions :white_check_mark: <code>T2</code></h3>
+<p><code>InstructionStore</code> with full CRUD. Named, versioned definitions with YAML source, parameter schema (JSON Schema), result schema (typed columns), approval mode, concurrency mode, platform constraints. JSON import/export. Stored in SQLite.</p>
+<h3 id="27-instruction-sets-grouping-white_check_mark-t2">2.7 Instruction Sets (Grouping) :white_check_mark: <code>T2</code></h3>
+<p><code>InstructionSet</code> CRUD in <code>InstructionStore</code>. Named logical groupings with cascade delete. Definitions belong to at most one set. RBAC permissions scoped at set level.</p>
+<h3 id="28-instruction-hierarchies-workflows-white_check_mark-t2">2.8 Instruction Hierarchies (Workflows) :white_check_mark: <code>T2</code></h3>
+<p><code>ExecutionTracker</code> supports parent/child execution hierarchy via <code>parent_execution_id</code>. Query children by parent. Follow-up instructions use parent response data as scope input.</p>
+<h3 id="29-instruction-scheduling-white_check_mark-t2">2.9 Instruction Scheduling :white_check_mark: <code>T2</code></h3>
+<p><code>ScheduleEngine</code> with frequency types (daily, weekly, monthly, sub-day), scope expressions evaluated dynamically at dispatch, enable/disable toggle, execution history tracking. REST CRUD via <code>/api/schedules</code>.</p>
+<h3 id="210-instruction-approval-workflows-white_check_mark-t2">2.10 Instruction Approval Workflows :white_check_mark: <code>T2</code></h3>
+<p><code>ApprovalManager</code> with submit/approve/reject, ownership validation (reviewer != submitter), pending count, scope expression, and full audit trail. Per-definition approval mode (auto/role-gated/always).</p>
+<h3 id="211-target-estimation-white_check_mark-t2">2.11 Target Estimation :white_check_mark: <code>T2</code></h3>
+<p><code>ScopeEngine</code> with <code>/api/scope/estimate</code> endpoint. Evaluates scope expression against connected agents and returns matching count and agent list before execution.</p>
+<h3 id="212-instruction-progress-tracking-white_check_mark-t2">2.12 Instruction Progress Tracking :white_check_mark: <code>T2</code></h3>
+<p><code>ExecutionTracker</code> with per-agent status tracking (dispatched, responded, success, failure), aggregate progress percentage, summary with agent state counts. Dashboard progress bars via REST API.</p>
+<h3 id="213-instruction-rerun-and-cancellation-white_check_mark-t2">2.13 Instruction Rerun and Cancellation :white_check_mark: <code>T2</code></h3>
+<p><code>ExecutionTracker</code> supports rerun (clone with same parameters, optional failed-only targeting) and cancellation with user attribution. REST endpoints: <code>POST /api/executions/{id}/rerun</code>, <code>POST /api/executions/{id}/cancel</code>.</p>
+<hr>
+<h2 id="3-device-and-endpoint-information">3. Device and Endpoint Information</h2>
+<p><em>Hardware, OS, identity, and classification data from managed endpoints.</em></p>
+<h3 id="31-os-summary-white_check_mark-t1">3.1 OS Summary :white_check_mark: <code>T1</code></h3>
+<p><code>os_info</code> plugin (cross-platform). Platform reported in registration.</p>
+<h3 id="32-hardware-inventory-white_check_mark-t1">3.2 Hardware Inventory :white_check_mark: <code>T1</code></h3>
+<p><code>hardware</code> plugin (cross-platform) covers CPU, RAM, and disks.</p>
+<h3 id="33-device-identity-white_check_mark-t1">3.3 Device Identity :white_check_mark: <code>T1</code></h3>
+<p><code>device_identity</code> plugin. <code>agent_id</code> (UUID) in protocol.</p>
+<blockquote>
+<p><strong>Gap:</strong> No FQDN-based server-side lookup.</p>
+</blockquote>
+<h3 id="34-disk-information-white_check_mark-t1">3.4 Disk Information :white_check_mark: <code>T1</code></h3>
+<p>Covered by the <code>hardware</code> plugin.</p>
+<h3 id="35-processor-details-white_check_mark-t1">3.5 Processor Details :white_check_mark: <code>T1</code></h3>
+<p>Covered by the <code>hardware</code> plugin.</p>
+<h3 id="36-device-criticality-classification-white_check_mark-t2">3.6 Device Criticality Classification :white_check_mark: <code>T2</code></h3>
+<p>Implemented as a special-purpose tag via the device tagging system (<code>TagStore</code>). Set/get criticality per device using key-value tags.</p>
+<h3 id="37-device-location-tracking-white_check_mark-t2">3.7 Device Location Tracking :white_check_mark: <code>T2</code></h3>
+<p>Implemented as a special-purpose tag via the device tagging system (<code>TagStore</code>). Set/get location per device using key-value tags.</p>
+<h3 id="38-mapped-drive-history-x-t3">3.8 Mapped Drive History :x: <code>T3</code></h3>
+<p>Not implemented. Tracks inbound mapped drive connections for lateral movement analysis. Windows-specific.</p>
+<h3 id="39-printer-inventory-x-t3">3.9 Printer Inventory :x: <code>T3</code></h3>
+<p>Not implemented. Enumerate connected printers for asset tracking.</p>
+<h3 id="310-device-tagging-key-value-metadata-white_check_mark-t2">3.10 Device Tagging (Key-Value Metadata) :white_check_mark: <code>T2</code></h3>
+<p><code>TagStore</code> with SQLite backend. Full CRUD: set, get, get_all, delete, check, clear, count. Agent-side <code>tags</code> plugin with server-side sync via heartbeat. Validation: key max 64 chars, value max 448 bytes. <code>agents_with_tag()</code> for scope queries.</p>
+<hr>
+<h2 id="4-network-information-and-discovery">4. Network Information and Discovery</h2>
+<p><em>Network configuration, connection state, and active discovery.</em></p>
+<h3 id="41-ip-address-and-interface-enumeration-white_check_mark-t1">4.1 IP Address and Interface Enumeration :white_check_mark: <code>T1</code></h3>
+<p><code>network_config</code> plugin (cross-platform).</p>
+<h3 id="42-tcp-connection-listing-white_check_mark-t1">4.2 TCP Connection Listing :white_check_mark: <code>T1</code></h3>
+<p><code>netstat</code> plugin (cross-platform).</p>
+<h3 id="43-listening-endpoint-enumeration-white_check_mark-t1">4.3 Listening Endpoint Enumeration :white_check_mark: <code>T1</code></h3>
+<p><code>netstat</code> and <code>sockwho</code> plugins.</p>
+<h3 id="44-arp-table-white_check_mark-t1">4.4 ARP Table :white_check_mark: <code>T1</code></h3>
+<p><code>network_config</code> plugin.</p>
+<h3 id="45-dns-cache-retrieval-white_check_mark-t1">4.5 DNS Cache Retrieval :white_check_mark: <code>T1</code></h3>
+<p><code>network_actions</code> plugin has flush DNS. <code>dns_cache</code> action in <code>network_config</code> plugin dumps DNS cache (Windows: <code>DnsGetCacheDataTable</code> via dnsapi.dll, Linux: systemd-resolved query).</p>
+<h3 id="46-wifi-network-enumeration-white_check_mark-t2">4.6 WiFi Network Enumeration :white_check_mark: <code>T2</code></h3>
+<p><code>wifi</code> plugin (cross-platform). <code>list_networks</code> scans for visible WiFi networks with SSID, signal strength, security type, channel, and BSSID. <code>connected</code> reports the currently connected network. Windows: WlanAPI, Linux: nmcli, macOS: airport.</p>
+<h3 id="47-wake-on-lan-white_check_mark-t2">4.7 Wake-on-LAN :white_check_mark: <code>T2</code></h3>
+<p><code>wol</code> plugin (cross-platform). <code>wake</code> sends magic packet (UDP broadcast, 6×0xFF + 16×MAC) to a target MAC address. <code>check</code> pings the host to verify wake. Windows: Winsock2, Linux/macOS: POSIX sockets.</p>
+<h3 id="48-network-diagnostics-white_check_mark-t1">4.8 Network Diagnostics :white_check_mark: <code>T1</code></h3>
+<p><code>network_diag</code> plugin (cross-platform). <code>network_actions</code> for ping.</p>
+<h3 id="49-netbios-name-lookup-x-t3">4.9 NetBIOS / Name Lookup :x: <code>T3</code></h3>
+<p>Not implemented. Legacy reverse lookup on IP addresses.</p>
+<h3 id="410-arp-scanning-subnet-discovery-white_check_mark-t3">4.10 ARP Scanning (Subnet Discovery) :white_check_mark: <code>T3</code></h3>
+<p><code>discovery</code> plugin with <code>scan_subnet</code> action. ARP scan + ping sweep of a CIDR subnet to find hosts. Returns IP, MAC address, hostname, and managed/unmanaged status. Cross-platform: arp table parsing + ping sweep via subprocess. Input validation prevents command injection on CIDR parameter.</p>
+<h3 id="411-port-scanning-x-t3">4.11 Port Scanning :x: <code>T3</code></h3>
+<p>Not implemented. Probe specified ports on target devices for service discovery.</p>
+<hr>
+<h2 id="5-process-and-service-management">5. Process and Service Management</h2>
+<p><em>Enumerate, inspect, and control running processes and system services.</em></p>
+<h3 id="51-process-enumeration-white_check_mark-t1">5.1 Process Enumeration :white_check_mark: <code>T1</code></h3>
+<p><code>processes</code> plugin (cross-platform). <code>procfetch</code> for formatted view with executable hash.</p>
+<h3 id="52-process-termination-white_check_mark-t1">5.2 Process Termination :white_check_mark: <code>T1</code></h3>
+<p><code>processes</code> plugin supports kill.</p>
+<blockquote>
+<p><strong>Gap:</strong> No multi-process kill by pattern or batch.</p>
+</blockquote>
+<h3 id="53-service-enumeration-white_check_mark-t1">5.3 Service Enumeration :white_check_mark: <code>T1</code></h3>
+<p><code>services</code> plugin (cross-platform).</p>
+<h3 id="54-service-control-white_check_mark-t1">5.4 Service Control :white_check_mark: <code>T1</code></h3>
+<p><code>services</code> plugin supports start/stop/restart.</p>
+<h3 id="55-open-windows-enumeration-x-t3">5.5 Open Windows Enumeration :x: <code>T3</code></h3>
+<p>Not implemented. Desktop interaction to enumerate visible application windows.</p>
+<hr>
+<h2 id="6-user-and-session-management">6. User and Session Management</h2>
+<p><em>Enumerate users, sessions, and group membership on managed endpoints.</em></p>
+<h3 id="61-logged-on-user-enumeration-white_check_mark-t1">6.1 Logged-On User Enumeration :white_check_mark: <code>T1</code></h3>
+<p><code>users</code> plugin (cross-platform).</p>
+<h3 id="62-primary-user-determination-white_check_mark-t2">6.2 Primary User Determination :white_check_mark: <code>T2</code></h3>
+<p><code>users</code> plugin <code>primary_user</code> action. Identifies primary user via most-frequent-login heuristic. Linux: parses <code>last</code> output. macOS: parses <code>last</code> output. Windows: queries Event Log 4624 logon events, falls back to registry ProfileList.</p>
+<h3 id="63-local-group-membership-white_check_mark-t2">6.3 Local Group Membership :white_check_mark: <code>T2</code></h3>
+<p><code>users</code> plugin <code>local_admins</code> action lists Administrators group members. <code>group_members</code> action enumerates members of any specified local group. Linux: parses <code>/etc/group</code> + checks sudo/wheel. Windows: NetLocalGroupGetMembers API. macOS: dscl.</p>
+<h3 id="64-user-connection-history-white_check_mark-t2">6.4 User Connection History :white_check_mark: <code>T2</code></h3>
+<p><code>users</code> plugin <code>session_history</code> action. Historical login/logout records with configurable count (default 50). Cross-platform: parses <code>last</code> (Linux/macOS), Windows Event Log logon/logoff events.</p>
+<h3 id="65-active-session-enumeration-white_check_mark-t2">6.5 Active Session Enumeration :white_check_mark: <code>T2</code></h3>
+<p><code>users</code> plugin <code>sessions</code> action. Lists active interactive sessions (console, RDP, SSH) with user, session type, login time, and state. Cross-platform.</p>
+<hr>
+<h2 id="7-software-and-application-management">7. Software and Application Management</h2>
+<p><em>Inventory installed software, manage installations, and control applications.</em></p>
+<h3 id="71-installed-application-inventory-white_check_mark-t1">7.1 Installed Application Inventory :white_check_mark: <code>T1</code></h3>
+<p><code>installed_apps</code> plugin (cross-platform).</p>
+<h3 id="72-windows-installer-msi-package-inventory-white_check_mark-t1">7.2 Windows Installer (MSI) Package Inventory :white_check_mark: <code>T1</code></h3>
+<p><code>msi_packages</code> plugin (Windows).</p>
+<h3 id="73-sccm-integration-white_check_mark-t2">7.3 SCCM Integration :white_check_mark: <code>T2</code></h3>
+<p><code>sccm</code> plugin (Windows).</p>
+<h3 id="74-software-uninstall-white_check_mark-t2">7.4 Software Uninstall :white_check_mark: <code>T2</code></h3>
+<p><code>software_actions</code> plugin.</p>
+<h3 id="75-per-user-application-inventory-white_check_mark-t2">7.5 Per-User Application Inventory :white_check_mark: <code>T2</code></h3>
+<p><code>installed_apps</code> plugin extended with per-user hive enumeration (HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall for each user profile). Distinguishes system-wide from user-specific installs in output.</p>
+<h3 id="76-software-deployment-installupgrade-white_check_mark-t2">7.6 Software Deployment (Install/Upgrade) :white_check_mark: <code>T2</code></h3>
+<p><code>SoftwareDeploymentStore</code> (SQLite) with package registration, deployment lifecycle (staged/deploying/verifying/completed/rolled_back/failed), per-agent status tracking. REST endpoints: <code>GET/POST /api/v1/software-packages</code>, <code>GET/POST /api/v1/software-deployments</code>, <code>/start</code>, <code>/rollback</code>, <code>/cancel</code>.</p>
+<hr>
+<h2 id="8-patch-and-update-management">8. Patch and Update Management</h2>
+<p><em>Detect, deploy, and track operating system and application patches.</em></p>
+<h3 id="81-installed-update-enumeration-white_check_mark-t1">8.1 Installed Update Enumeration :white_check_mark: <code>T1</code></h3>
+<p><code>windows_updates</code> plugin with <code>installed</code> action. Cross-platform: Windows (Get-HotFix), Linux (rpm/apt), macOS (system_profiler).</p>
+<h3 id="82-pending-reboot-detection-white_check_mark-t1">8.2 Pending Reboot Detection :white_check_mark: <code>T1</code></h3>
+<p><code>windows_updates</code> plugin <code>pending_reboot</code> action. Cross-platform reboot-pending detection:
+Windows (3 registry keys: WindowsUpdate RebootRequired, CBS RebootPending, Session Manager PendingFileRenameOperations),
+Linux (reboot-required file + kernel version comparison + needs-restarting fallback),
+macOS (softwareupdate restart flag). Reports per-source status and aggregate boolean.</p>
+<h3 id="83-patch-deployment-white_check_mark-t2">8.3 Patch Deployment :white_check_mark: <code>T2</code></h3>
+<p><code>PatchManager</code> (794 LOC) with <code>deploy_patch()</code> orchestration: scan → download → install → verify → optional reboot. Per-target status tracking (pending, scanning, downloading, installing, verifying, completed, failed, skipped). REST endpoints for deployment CRUD and cancellation.</p>
+<h3 id="84-patch-status-tracking-white_check_mark-t2">8.4 Patch Status Tracking :white_check_mark: <code>T2</code></h3>
+<p><code>PatchManager</code> tracks per-device deployment status via <code>PatchDeploymentTarget</code>. Per-agent status, error messages, start/complete timestamps. <code>recalculate_deployment_progress()</code> maintains aggregate counts. Queryable via REST API.</p>
+<h3 id="85-patch-metadata-retrieval-white_check_mark-t2">8.5 Patch Metadata Retrieval :white_check_mark: <code>T2</code></h3>
+<p><code>PatchInfo</code> stores KB ID, title, severity (Critical/Important/Moderate/Low/Unspecified), release date, and scan timestamp. <code>get_fleet_patch_summary()</code> returns per-KB missing counts. <code>get_missing_patches()</code> and <code>get_installed_patches()</code> support severity and agent filtering.</p>
+<h3 id="86-reboot-management-post-patch-white_check_mark-t2">8.6 Reboot Management (Post-Patch) :white_check_mark: <code>T2</code></h3>
+<p>Full reboot orchestration in <code>PatchManager::execute_deployment()</code>. Configurable <code>reboot_delay_seconds</code> (default 300, clamped [60, 86400]) and optional <code>reboot_at</code> epoch timestamp for maintenance windows. Pre-reboot user notification via <code>device.interaction.notify</code> (best-effort). Cross-platform reboot commands: Windows <code>shutdown /r /t N /c</code>, Linux/macOS <code>shutdown -r +N</code>. Target status lifecycle includes <code>"rebooting"</code> state. REST API accepts <code>reboot_delay_seconds</code> and <code>reboot_at</code> in <code>POST /api/patches/deploy</code>.</p>
+<h3 id="87-update-summary-and-compliance-reporting-white_check_mark-t2">8.7 Update Summary and Compliance Reporting :white_check_mark: <code>T2</code></h3>
+<p><code>PatchManager::get_fleet_patch_summary()</code> returns fleet-wide patch compliance (per-KB missing agent counts). <code>get_missing_patches()</code> with <code>PatchQuery</code> filters by agent, severity, status. Deployment tracking with aggregate progress.</p>
+<h3 id="88-patch-connectivity-testing-white_check_mark-t2">8.8 Patch Connectivity Testing :white_check_mark: <code>T2</code></h3>
+<p><code>patch_connectivity</code> action in <code>windows_updates</code> plugin. Per-target DNS resolution (getaddrinfo), TCP connect (non-blocking socket), latency measurement. Platform-specific defaults: Windows Update/WSUS, apt/yum repos, Apple SWUpdate.</p>
+<h3 id="89-patch-inventory-event-generation-x-t3">8.9 Patch Inventory Event Generation :x: <code>T3</code></h3>
+<p>Not implemented. Event emission for SIEM/compliance integration.</p>
+<hr>
+<h2 id="9-security-and-compliance">9. Security and Compliance</h2>
+<p><em>Antivirus, firewall, encryption, vulnerability scanning, and device quarantine.</em></p>
+<h3 id="91-antivirus-status-and-product-detection-white_check_mark-t1">9.1 Antivirus Status and Product Detection :white_check_mark: <code>T1</code></h3>
+<p><code>antivirus</code> plugin (cross-platform).</p>
+<h3 id="92-firewall-status-and-rule-enumeration-white_check_mark-t1">9.2 Firewall Status and Rule Enumeration :white_check_mark: <code>T1</code></h3>
+<p><code>firewall</code> plugin (cross-platform).</p>
+<h3 id="93-disk-encryption-status-white_check_mark-t1">9.3 Disk Encryption Status :white_check_mark: <code>T1</code></h3>
+<p><code>bitlocker</code> plugin (Windows).</p>
+<blockquote>
+<p><strong>Gap:</strong> No macOS FileVault or Linux LUKS coverage.</p>
+</blockquote>
+<h3 id="94-vulnerability-scanning-white_check_mark-t1">9.4 Vulnerability Scanning :white_check_mark: <code>T1</code></h3>
+<p><code>vuln_scan</code> plugin + NVD database sync on server.</p>
+<h3 id="95-event-log-collection-white_check_mark-t1">9.5 Event Log Collection :white_check_mark: <code>T1</code></h3>
+<p><code>event_logs</code> plugin (cross-platform).</p>
+<h3 id="96-device-quarantine-network-isolation-white_check_mark-t2">9.6 Device Quarantine (Network Isolation) :white_check_mark: <code>T2</code></h3>
+<p><code>quarantine</code> plugin (cross-platform). <code>quarantine</code> action isolates device from network, whitelisting management server and optional IPs via firewall rules (prefixed <code>YuzuQuarantine_</code>). <code>unquarantine</code> removes rules and restores access. <code>status</code> checks active quarantine state. <code>whitelist</code> adds/removes IPs from active quarantine.</p>
+<h3 id="97-indicator-of-compromise-ioc-checking-white_check_mark-t2">9.7 Indicator of Compromise (IOC) Checking :white_check_mark: <code>T2</code></h3>
+<p><code>ioc</code> plugin with <code>check</code> action. Matches indicators against local endpoint state: <code>ip_addresses</code> checked against active TCP/UDP connections, <code>domains</code> against DNS cache, <code>file_hashes</code> (SHA-256) against files on disk, <code>file_paths</code> for existence, <code>ports</code> for listening services. Cross-platform: Windows (GetExtendedTcpTable, DnsGetCacheDataTable), Linux (/proc/net/tcp), macOS (lsof).</p>
+<h3 id="98-certificate-inventory-getdelete-white_check_mark-t2">9.8 Certificate Inventory (Get/Delete) :white_check_mark: <code>T2</code></h3>
+<p><code>certificates</code> plugin with <code>list</code>, <code>details</code>, and <code>delete</code> actions. Enumerates certificates in system stores with thumbprint, subject, issuer, expiry, and key usage. Windows: CryptoAPI (CertOpenStore, CertEnumCertificatesInStore). Linux: PEM files in /etc/ssl/certs/. macOS: security find-certificate.</p>
+<h3 id="99-quarantine-status-tracking-white_check_mark-t2">9.9 Quarantine Status Tracking :white_check_mark: <code>T2</code></h3>
+<p><code>QuarantineStore</code> (SQLite backend). Server-side quarantine records with agent_id, status (active/released), quarantined_by, timestamps, whitelist, and reason. <code>list_quarantined()</code> for active quarantines, <code>get_history()</code> for per-agent quarantine history. REST API endpoints for quarantine/release/status.</p>
+<h3 id="910-application-whitelisting-x-t3">9.10 Application Whitelisting :x: <code>T3</code></h3>
+<p>Not implemented. Modify allow/block lists on endpoint security products.</p>
+<hr>
+<h2 id="10-file-system-operations">10. File System Operations</h2>
+<p><em>Browse, search, inspect, and manipulate files on managed endpoints.</em></p>
+<h3 id="101-file-and-directory-listing-white_check_mark-t1">10.1 File and Directory Listing :white_check_mark: <code>T1</code></h3>
+<p><code>filesystem</code> plugin (cross-platform, admin-required).</p>
+<h3 id="102-file-search-by-name-white_check_mark-t1">10.2 File Search by Name :white_check_mark: <code>T1</code></h3>
+<p><code>filesystem</code> plugin.</p>
+<h3 id="103-file-content-read-by-line-white_check_mark-t1">10.3 File Content Read (by Line) :white_check_mark: <code>T1</code></h3>
+<p><code>filesystem</code> plugin <code>read</code> action with <code>offset</code> (1-based line number) and <code>limit</code> (max lines, configurable) parameters for line-range access.</p>
+<h3 id="104-file-hash-computation-white_check_mark-t1">10.4 File Hash Computation :white_check_mark: <code>T1</code></h3>
+<p><code>filesystem</code> plugin.</p>
+<h3 id="105-file-deletion-white_check_mark-t1">10.5 File Deletion :white_check_mark: <code>T1</code></h3>
+<p><code>filesystem</code> plugin.</p>
+<h3 id="106-path-existence-check-white_check_mark-t1">10.6 Path Existence Check :white_check_mark: <code>T1</code></h3>
+<p><code>filesystem</code> plugin.</p>
+<h3 id="107-file-permissions-inspection-white_check_mark-t2">10.7 File Permissions Inspection :white_check_mark: <code>T2</code></h3>
+<p><code>filesystem</code> plugin <code>get_acl</code> action. Windows: full DACL enumeration via GetNamedSecurityInfo — returns each ACE with trustee, access mask, and ace type. Linux/macOS: POSIX <code>stat()</code> permissions (owner, group, other, special bits).</p>
+<h3 id="108-digital-signature-verification-white_check_mark-t2">10.8 Digital Signature Verification :white_check_mark: <code>T2</code></h3>
+<p><code>filesystem</code> plugin <code>get_signature</code> action. Windows: Authenticode verification via WinVerifyTrust — reports signature status (valid, invalid, unsigned, untrusted), signer name, and timestamp. Linux/macOS: returns platform-unsupported status.</p>
+<h3 id="109-file-version-info-white_check_mark-t2">10.9 File Version Info :white_check_mark: <code>T2</code></h3>
+<p><code>get_version_info</code> action in <code>filesystem</code> plugin. Windows: GetFileVersionInfoW/VerQueryValueW for VS_FIXEDFILEINFO + string table. Returns file_version, product_version, company_name, file_description, etc. Returns platform-unsupported on Linux/macOS.</p>
+<h3 id="1010-file-content-search-and-replace-white_check_mark-t2">10.10 File Content Search and Replace :white_check_mark: <code>T2</code></h3>
+<p>Five new actions in <code>filesystem</code> plugin: <code>search</code> (line-by-line pattern matching, literal or regex), <code>replace</code> (atomic temp+rename), <code>write_content</code>, <code>append</code>, <code>delete_lines</code>. All enforce base_dir restrictions. Pattern capped at 256 chars. Binary detection.</p>
+<h3 id="1011-directory-hash-recursive-x-t3">10.11 Directory Hash (Recursive) :x: <code>T3</code></h3>
+<p>Not implemented. Integrity verification of directory trees.</p>
+<h3 id="1012-temp-file-creation-white_check_mark-t1">10.12 Temp File Creation :white_check_mark: <code>T1</code></h3>
+<p><code>yuzu_create_temp_file()</code> and <code>yuzu_create_temp_dir()</code> in SDK with secure permissions (POSIX mkstemps 0600, Windows owner-only DACL). Exposed via filesystem plugin <code>create_temp</code>/<code>create_temp_dir</code> actions.</p>
+<h3 id="1013-file-retrieval-upload-to-server-white_check_mark-t2">10.13 File Retrieval (Upload to Server) :white_check_mark: <code>T2</code></h3>
+<p><code>upload_file</code> action in <code>content_dist</code> plugin. Agent-side: SHA-256 hash, multipart POST to server. Server-side: <code>POST /api/v1/file-retrieval</code> endpoint. File stored in <code>{data_dir}/file-retrieval/</code>. <code>GET/DELETE</code> endpoints for management.</p>
+<h3 id="1014-find-file-by-size-and-hash-white_check_mark-t2">10.14 Find File by Size and Hash :white_check_mark: <code>T2</code></h3>
+<p><code>filesystem</code> plugin <code>find_by_hash</code> action. Searches directory trees for files matching a SHA-256 hash. Used for malware hunting and file integrity verification. Recursive search with configurable root path.</p>
+<h3 id="1015-directory-search-by-name-white_check_mark-t2">10.15 Directory Search by Name :white_check_mark: <code>T2</code></h3>
+<p><code>search_dir</code> action in <code>filesystem</code> plugin. <code>fs::recursive_directory_iterator</code> with glob or regex name matching. Parameters: root, pattern, match_type (directories/files/both), max_depth, max_results. Respects base_dir.</p>
+<hr>
+<h2 id="11-script-and-command-execution">11. Script and Command Execution</h2>
+<p><em>Execute arbitrary scripts and commands on managed endpoints.</em></p>
+<h3 id="111-script-execution-file-based-white_check_mark-t1">11.1 Script Execution (File-Based) :white_check_mark: <code>T1</code></h3>
+<p><code>script_exec</code> plugin (cross-platform).</p>
+<h3 id="112-inline-script-execution-white_check_mark-t1">11.2 Inline Script Execution :white_check_mark: <code>T1</code></h3>
+<p><code>script_exec</code> plugin accepts inline text.</p>
+<h3 id="113-os-command-execution-white_check_mark-t1">11.3 OS Command Execution :white_check_mark: <code>T1</code></h3>
+<p><code>script_exec</code> covers this.</p>
+<h3 id="114-execution-output-streaming-white_check_mark-t1">11.4 Execution Output Streaming :white_check_mark: <code>T1</code></h3>
+<p>gRPC streaming delivers output in real time.</p>
+<hr>
+<h2 id="12-registry-and-system-configuration-windows">12. Registry and System Configuration (Windows)</h2>
+<p><em>Read and modify Windows registry, WMI, and system configuration.</em></p>
+<h3 id="121-wmi-query-execution-white_check_mark-t2">12.1 WMI Query Execution :white_check_mark: <code>T2</code></h3>
+<p><code>wmi</code> plugin with <code>query</code> action. Execute WQL SELECT statements against any WMI namespace with structured property/value output.</p>
+<h3 id="122-wmi-method-invocation-white_check_mark-t2">12.2 WMI Method Invocation :white_check_mark: <code>T2</code></h3>
+<p><code>wmi</code> plugin with <code>get_instance</code> action. Get all properties of a WMI class instance.</p>
+<h3 id="123-wmi-namespace-enumeration-white_check_mark-t3">12.3 WMI Namespace Enumeration :white_check_mark: <code>T3</code></h3>
+<p><code>wmi</code> plugin supports configurable namespace parameter (default <code>root\cimv2</code>).</p>
+<h3 id="124-registry-keyvalue-read-white_check_mark-t2">12.4 Registry Key/Value Read :white_check_mark: <code>T2</code></h3>
+<p><code>registry</code> plugin with <code>get_value</code> action. Read values from HKLM, HKCU, HKCR, HKU hives with structured type/value output.</p>
+<h3 id="125-registry-keyvalue-writedelete-white_check_mark-t2">12.5 Registry Key/Value Write/Delete :white_check_mark: <code>T2</code></h3>
+<p><code>registry</code> plugin with <code>set_value</code>, <code>delete_value</code>, and <code>delete_key</code> actions. Support REG_SZ and REG_DWORD types.</p>
+<h3 id="126-registry-enumeration-white_check_mark-t2">12.6 Registry Enumeration :white_check_mark: <code>T2</code></h3>
+<p><code>registry</code> plugin with <code>enumerate_keys</code> and <code>enumerate_values</code> actions. <code>key_exists</code> for existence checks.</p>
+<h3 id="127-per-user-registry-operations-white_check_mark-t2">12.7 Per-User Registry Operations :white_check_mark: <code>T2</code></h3>
+<p><code>registry</code> plugin with <code>get_user_value</code> action. Loads NTUSER.DAT hive via <code>RegLoadKey</code> for offline users. Requires SE_RESTORE_NAME and SE_BACKUP_NAME privileges.</p>
+<hr>
+<h2 id="13-content-distribution">13. Content Distribution</h2>
+<p><em>Stage and distribute files, packages, and content to endpoints.</em></p>
+<h3 id="131-server-to-agent-content-staging-white_check_mark-t2">13.1 Server-to-Agent Content Staging :white_check_mark: <code>T2</code></h3>
+<p><code>content_dist</code> plugin with <code>stage</code> action. Download files to agent staging directory with SHA256 hash verification. <code>list_staged</code> to inventory staged content. <code>cleanup</code> to remove staged files.</p>
+<h3 id="132-stage-and-execute-deploy-run-white_check_mark-t2">13.2 Stage and Execute (Deploy + Run) :white_check_mark: <code>T2</code></h3>
+<p><code>content_dist</code> plugin with <code>execute_staged</code> action. Execute previously staged files with optional arguments. Returns exit code and output.</p>
+<h3 id="133-http-file-download-agent-initiated-white_check_mark-t2">13.3 HTTP File Download (Agent-Initiated) :white_check_mark: <code>T2</code></h3>
+<p><code>http_client</code> plugin with <code>download</code> action. Download files from arbitrary URLs with optional SHA256 hash verification. <code>get</code> and <code>head</code> actions for HTTP requests.</p>
+<h3 id="134-http-post-agent-initiated-white_check_mark-t3">13.4 HTTP POST (Agent-Initiated) :white_check_mark: <code>T3</code></h3>
+<p><code>http_client</code> plugin supports HTTP operations. Agent can fetch content from external URLs.</p>
+<h3 id="135-peer-to-peer-content-distribution-x-t3">13.5 Peer-to-Peer Content Distribution :x: <code>T3</code></h3>
+<p>Not implemented. P2P caching to reduce WAN bandwidth. Requires agent mesh networking.</p>
+<hr>
+<h2 id="14-user-interaction">14. User Interaction</h2>
+<p><em>Display notifications, surveys, and dialogs on endpoint desktops.</em></p>
+<h3 id="141-desktop-notification-white_check_mark-t2">14.1 Desktop Notification :white_check_mark: <code>T2</code></h3>
+<p><code>interaction</code> plugin with <code>notify</code> action. Toast/balloon notifications with info/warning/error severity. Cross-platform: ShellNotifyIcon (Windows), notify-send (Linux), osascript (macOS).</p>
+<h3 id="142-announcement-dialog-white_check_mark-t2">14.2 Announcement Dialog :white_check_mark: <code>T2</code></h3>
+<p><code>interaction</code> plugin with <code>message_box</code> action. Modal message box with configurable buttons (ok, okcancel, yesno). Returns user response.</p>
+<h3 id="143-question-confirmation-dialog-white_check_mark-t2">14.3 Question / Confirmation Dialog :white_check_mark: <code>T2</code></h3>
+<p><code>interaction</code> plugin with <code>input</code> action. Text input dialog with configurable prompt and default value. Returns entered text or cancellation. MessageBoxW (Windows), zenity (Linux), osascript (macOS).</p>
+<h3 id="144-survey-dialog-x-t3">14.4 Survey Dialog :x: <code>T3</code></h3>
+<p>Not implemented. Multi-question form with response aggregation.</p>
+<h3 id="145-do-not-disturb-mode-x-t3">14.5 Do-Not-Disturb Mode :x: <code>T3</code></h3>
+<p>Not implemented. Suppress notifications during user-defined windows.</p>
+<h3 id="146-active-response-tracking-x-t3">14.6 Active Response Tracking :x: <code>T3</code></h3>
+<p>Not implemented. List all active survey/question responses waiting for user input.</p>
+<hr>
+<h2 id="15-inventory-and-data-collection">15. Inventory and Data Collection</h2>
+<p><em>Structured inventory collection, storage, querying, and replication.</em></p>
+<h3 id="151-plugin-based-inventory-reporting-white_check_mark-t1">15.1 Plugin-Based Inventory Reporting :white_check_mark: <code>T1</code></h3>
+<p><code>ReportInventory</code> RPC with per-plugin data blobs.</p>
+<h3 id="152-inventory-persistence-and-query-white_check_mark-t1">15.2 Inventory Persistence and Query :white_check_mark: <code>T1</code></h3>
+<p><code>QueryInventory</code> RPC on management API. Server stores inventory.</p>
+<blockquote>
+<p><strong>Gap:</strong> No advanced query language (filtering, joins).</p>
+</blockquote>
+<h3 id="153-inventory-table-enumeration-white_check_mark-t2">15.3 Inventory Table Enumeration :white_check_mark: <code>T2</code></h3>
+<p><code>InventoryStore::list_tables()</code> returns all distinct inventory "tables" (one per plugin) with agent count and last collection timestamp. REST API endpoint and MCP <code>list_inventory_tables</code> tool expose this data.</p>
+<h3 id="154-inventory-evaluation-item-lookup-white_check_mark-t2">15.4 Inventory Evaluation (Item Lookup) :white_check_mark: <code>T2</code></h3>
+<p><code>inventory_eval.hpp/cpp</code> evaluation engine. JSON dot-path field extraction, 10 comparison operators including version_gte/version_lte (semver-aware). REST: <code>POST /api/v1/inventory/evaluate</code> with conditions array and AND/OR combine.</p>
+<h3 id="155-inventory-replication-local-replica-x-t3">15.5 Inventory Replication (Local Replica) :x: <code>T3</code></h3>
+<p>Not implemented. Agent-side cache with delta sync.</p>
+<hr>
+<h2 id="16-policy-and-compliance-engine-server-side-guaranteed-state">16. Policy and Compliance Engine (Server-Side Guaranteed State)</h2>
+<p><em>Define desired-state policies, evaluate compliance on a poll-based schedule, and auto-remediate. This domain covers the </em><em>server-side</em><em> half of guaranteed state — definition, fleet-wide compliance evaluation, history, drill-down. Real-time </em><em>agent-side</em><em> enforcement (kernel-event-driven, millisecond-level, pre-login, offline-capable) lives in §31 (System Guardian) and is the operational primitive that makes "this setting must never be in a non-compliant state" actually true on disk. A complete guaranteed-state implementation requires both halves — §16 alone has a 5-minute poll cycle that is unacceptable for security-sensitive settings (firewall, registry, EDR process running, SSH config).</em></p>
+<h3 id="161-policy-rules-definition-white_check_mark-t2">16.1 Policy Rules Definition :white_check_mark: <code>T2</code></h3>
+<p><code>PolicyStore</code> with <code>PolicyFragment</code> (check/fix/postCheck pattern) and <code>Policy</code> kinds. YAML-defined with CEL compliance expressions. CRUD via REST API.</p>
+<h3 id="162-policy-evaluation-and-enforcement-white_check_mark-t2">16.2 Policy Evaluation and Enforcement :white_check_mark: <code>T2</code></h3>
+<p><code>PolicyStore</code> tracks per-agent compliance status (compliant, non_compliant, unknown, fixing, error). Trigger-based evaluation with configurable trigger types (interval, file_change, service_status, event_log, registry, startup).</p>
+<h3 id="163-policy-assignment-to-device-groups-white_check_mark-t2">16.3 Policy Assignment to Device Groups :white_check_mark: <code>T2</code></h3>
+<p>Policies support management group bindings via <code>PolicyGroupBinding</code>. Scope expressions for device targeting.</p>
+<h3 id="164-compliance-summary-and-statistics-white_check_mark-t2">16.4 Compliance Summary and Statistics :white_check_mark: <code>T2</code></h3>
+<p><code>FleetCompliance</code> aggregate with compliance percentage. Per-policy <code>ComplianceSummary</code>. Compliance dashboard with fleet-level and per-policy drill-down to agent-level detail.</p>
+<h3 id="165-evaluation-history-and-audit-trail-white_check_mark-t2">16.5 Evaluation History and Audit Trail :white_check_mark: <code>T2</code></h3>
+<p><code>PolicyAgentStatus</code> tracks last_check_at, last_fix_at, and check_result per agent per policy. Queryable via REST API.</p>
+<h3 id="166-policy-event-subscriptions-white_check_mark-t3">16.6 Policy Event Subscriptions :white_check_mark: <code>T3</code></h3>
+<p>Policy status changes tracked in compliance store. REST API endpoints expose compliance data for external consumption.</p>
+<h3 id="167-cache-invalidation-and-force-re-evaluation-white_check_mark-t2">16.7 Cache Invalidation and Force Re-Evaluation :white_check_mark: <code>T2</code></h3>
+<p><code>invalidate_policy()</code> resets all agent statuses to pending for a specific policy. <code>invalidate_all_policies()</code> for fleet-wide reset. REST endpoints: <code>POST /api/policies/{id}/invalidate</code> and <code>POST /api/policies/invalidate-all</code>.</p>
+<h3 id="168-pending-policy-changes-review-white_check_mark-t2">16.8 Pending Policy Changes Review :white_check_mark: <code>T2</code></h3>
+<p>Policies support enable/disable toggle for staged deployment. REST endpoints: <code>POST /api/policies/{id}/enable</code> and <code>POST /api/policies/{id}/disable</code>.</p>
+<hr>
+<h2 id="17-triggers-and-event-driven-automation">17. Triggers and Event-Driven Automation</h2>
+<p><em>React to endpoint events in real time: file changes, service state, intervals.</em></p>
+<h3 id="171-interval-based-trigger-white_check_mark-t2">17.1 Interval-Based Trigger :white_check_mark: <code>T2</code></h3>
+<p>Trigger engine with <code>interval</code> type. Timer-based execution with configurable seconds/minutes/hours.</p>
+<h3 id="172-file-directory-change-trigger-white_check_mark-t2">17.2 File / Directory Change Trigger :white_check_mark: <code>T2</code></h3>
+<p>Trigger engine with <code>file_change</code> and <code>directory_change</code> types. Filesystem watcher using inotify (Linux), FSEvents (macOS), ReadDirectoryChangesW (Windows).</p>
+<h3 id="173-service-status-change-trigger-white_check_mark-t2">17.3 Service Status Change Trigger :white_check_mark: <code>T2</code></h3>
+<p>Trigger engine with <code>service_status_change</code> type. React to service start/stop/crash via Windows SCM or systemd on Linux.</p>
+<h3 id="174-windows-event-log-trigger-white_check_mark-t2">17.4 Windows Event Log Trigger :white_check_mark: <code>T2</code></h3>
+<p>Trigger engine with <code>event_log</code> type. React to Windows Event Log entries matching XPath filters.</p>
+<h3 id="175-registry-change-trigger-white_check_mark-t3">17.5 Registry Change Trigger :white_check_mark: <code>T3</code></h3>
+<p>Trigger engine with <code>registry</code> type. React to registry key modifications on Windows.</p>
+<h3 id="176-agent-startup-trigger-white_check_mark-t2">17.6 Agent Startup Trigger :white_check_mark: <code>T2</code></h3>
+<p>Trigger engine with <code>agent_startup</code> type. Execute actions on agent boot.</p>
+<h3 id="177-trigger-templates-server-side-white_check_mark-t2">17.7 Trigger Templates (Server-Side) :white_check_mark: <code>T2</code></h3>
+<p><code>TriggerTemplate</code> YAML kind (<code>yuzu.io/v1alpha1</code>) for server-defined trigger configurations. Pre-configured trigger variants managed server-side and pushed to agents.</p>
+<hr>
+<h2 id="18-server-authentication-and-authorization">18. Server: Authentication and Authorization</h2>
+<p><em>User authentication, role-based access control, and session management.</em></p>
+<h3 id="181-session-based-authentication-white_check_mark-t1">18.1 Session-Based Authentication :white_check_mark: <code>T1</code></h3>
+<p>Session-cookie auth with PBKDF2-hashed passwords.</p>
+<h3 id="182-role-based-access-control-two-roles-white_check_mark-t1">18.2 Role-Based Access Control (Two Roles) :white_check_mark: <code>T1</code></h3>
+<p><code>admin</code> (full access) and <code>user</code> (read-only).</p>
+<h3 id="183-granular-rbac-white_check_mark-t2">18.3 Granular RBAC :white_check_mark: <code>T2</code></h3>
+<p><code>RBACStore</code> (777 LOC): principals, custom roles, 10 securable types (Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response), 5 operations (Read, Write, Execute, Delete, Approve). Deny-override, system roles, group-based assignments. Global enable/disable toggle.</p>
+<h3 id="184-management-group-scoped-roles-white_check_mark-t2">18.4 Management-Group-Scoped Roles :white_check_mark: <code>T2</code></h3>
+<p><code>ManagementGroupStore</code> supports group-scoped role assignments. <code>assign_role()</code> / <code>unassign_role()</code> bind principals to roles within a specific group. <code>get_visible_agents()</code> resolves which agents a user can see based on their group-scoped roles. REST endpoints at <code>/api/v1/management-groups/{id}/roles</code> (GET/POST/DELETE). RBAC integration filters agent lists to respect group-scoped visibility.</p>
+<h3 id="185-oidc-sso-integration-white_check_mark-t2">18.5 OIDC / SSO Integration :white_check_mark: <code>T2</code></h3>
+<p><code>OidcProvider</code> (575 LOC): PKCE authorization code flow, OpenID Connect discovery, JWT validation (iss, aud, nonce, exp), Entra ID group claim parsing, group-to-role mapping (<code>--oidc-admin-group</code>), token exchange via platform HTTP (WinHTTP/httplib). Login page SSO button active. Runtime-configurable via Settings UI (<code>POST /api/settings/oidc</code>) — admin can enter issuer, client_id, client_secret, redirect_uri, and admin_group from the dashboard without server restart. "Test Connection" button validates OIDC discovery endpoint. TLS cert verification configurable (<code>--oidc-skip-tls-verify</code>).</p>
+<h3 id="186-active-directory-entra-integration-white_check_mark-t2">18.6 Active Directory / Entra Integration :white_check_mark: <code>T2</code></h3>
+<p><code>DirectorySync</code> (1013 LOC). Entra ID sync via Microsoft Graph API (OAuth2 client credentials flow). Fetches <code>/users</code> and <code>/groups</code>, stores in SQLite. Group-to-role mapping (<code>configure_group_role_mapping</code>) maps directory groups to RBAC roles. LDAP sync stub for on-prem AD (full LDAP support planned). REST API endpoints for sync trigger, status, and mapping CRUD. Settings UI section active.</p>
+<h3 id="187-token-based-api-authentication-white_check_mark-t2">18.7 Token-Based API Authentication :white_check_mark: <code>T2</code></h3>
+<p><code>ApiTokenStore</code> with SQLite backend. Tokens generated via <code>POST /api/v1/tokens</code> with optional expiry. Auth via <code>Authorization: Bearer</code> header or <code>X-Yuzu-Token</code> header. RBAC permissions: <code>ApiToken:Read</code>, <code>ApiToken:Write</code>, <code>ApiToken:Delete</code>. Tokens support optional <code>mcp_tier</code> field for MCP integration (readonly/operator/supervised). Settings UI token management with create/revoke.</p>
+<h3 id="188-device-authorization-tokens-white_check_mark-t2">18.8 Device Authorization Tokens :white_check_mark: <code>T2</code></h3>
+<p><code>DeviceTokenStore</code> (SQLite) with SHA-256 hashed tokens, device_id and definition_id scoping. REST: <code>GET/POST/DELETE /api/v1/device-tokens</code>. Integrated into auth chain.</p>
+<h3 id="189-https-for-web-dashboard-white_check_mark-t1">18.9 HTTPS for Web Dashboard :white_check_mark: <code>T1</code></h3>
+<p><code>httplib::SSLServer</code> with OpenSSL. CLI flags: <code>--https</code>, <code>--https-port</code>, <code>--https-cert</code>, <code>--https-key</code>, <code>--no-https-redirect</code>. HTTP-to-HTTPS 301 redirect. Secure cookie flag. Settings UI TLS configuration section.</p>
+<h3 id="1810-two-factor-authentication-for-approvals-x-t2">18.10 Two-Factor Authentication for Approvals :x: <code>T2</code></h3>
+<p>Not implemented. TOTP (RFC 6238) second factor for instruction approval workflows. Per-user TOTP enrollment with QR code, email-based OTP fallback.</p>
+<hr>
+<h2 id="19-server-device-and-group-management">19. Server: Device and Group Management</h2>
+<p><em>Organize endpoints into groups, scope operations, and manage device metadata.</em></p>
+<h3 id="191-agent-listing-and-detail-view-white_check_mark-t1">19.1 Agent Listing and Detail View :white_check_mark: <code>T1</code></h3>
+<p><code>ListAgents</code>, <code>GetAgent</code> RPCs. Web dashboard shows agent list.</p>
+<h3 id="192-agent-lifecycle-events-white_check_mark-t1">19.2 Agent Lifecycle Events :white_check_mark: <code>T1</code></h3>
+<p><code>WatchEvents</code> RPC streams connect/disconnect/plugin-load events.</p>
+<h3 id="193-scope-filter-based-device-selection-white_check_mark-t2">19.3 Scope / Filter-Based Device Selection :white_check_mark: <code>T2</code></h3>
+<p>750-line recursive-descent <code>ScopeEngine</code> parser. 10 binary operators (<code>==</code>, <code>!=</code>, <code>LIKE</code>, <code>MATCHES</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>IN</code>, <code>CONTAINS</code>) plus 3 extended operators/functions (<code>EXISTS</code>, <code>LEN()</code>, <code>STARTSWITH()</code>), AND/OR/NOT combinators. <code>MATCHES</code> uses ECMAScript regex with safe error handling. Attributes: ostype, osver, hostname, arch, fqdn, <code>tag:*</code>. Target estimation via <code>/api/scope/estimate</code>.</p>
+<h3 id="194-hierarchical-management-groups-white_check_mark-t2">19.4 Hierarchical Management Groups :white_check_mark: <code>T2</code></h3>
+<p><code>ManagementGroupStore</code> with <code>parent_id</code> for nesting. <code>get_children()</code> returns direct children. <code>get_ancestor_ids()</code> / <code>get_descendant_ids()</code> traverse the hierarchy. Static membership (manual add/remove) and dynamic membership (scope expression evaluation via <code>refresh_dynamic_membership()</code>). Well-known root group. REST CRUD + hierarchy endpoints. Group-scoped role assignments for access control.</p>
+<h3 id="195-device-discovery-unmanaged-endpoints-white_check_mark-t2">19.5 Device Discovery (Unmanaged Endpoints) :white_check_mark: <code>T2</code></h3>
+<p><code>discovery</code> agent plugin (<code>scan_subnet</code> action) performs ARP scan + ping sweep of CIDR subnets. Server-side <code>DiscoveryStore</code> persists discovered devices with IP, MAC, hostname, managed status, discovering agent, and subnet. <code>mark_managed()</code> links discovered IPs to enrolled agents. REST API for listing and clearing results.</p>
+<h3 id="196-custom-properties-on-devices-white_check_mark-t2">19.6 Custom Properties on Devices :white_check_mark: <code>T2</code></h3>
+<p><code>CustomPropertiesStore</code> (462 LOC). Typed key-value properties per device: string, int, bool, datetime. Schema CRUD with validation regex. Usable in scope expressions via <code>props.&lt;key&gt;</code>. Property validation against schemas. REST API for property and schema CRUD. Key validation (1-64 chars, <code>[a-zA-Z0-9_.-:]</code>), value limit 1024 bytes.</p>
+<h3 id="197-agent-deployment-jobs-white_check_mark-t2">19.7 Agent Deployment Jobs :white_check_mark: <code>T2</code></h3>
+<p><code>DeploymentStore</code> with job management. Create deployment jobs targeting discovered hosts by IP, OS, and method (ssh, group_policy, manual). Job lifecycle: pending → running → completed/failed/cancelled. REST API for job CRUD, status updates, and cancellation.</p>
+<hr>
+<h2 id="20-server-response-collection-and-reporting">20. Server: Response Collection and Reporting</h2>
+<p><em>Aggregate, filter, paginate, and export command results.</em></p>
+<h3 id="201-real-time-response-streaming-white_check_mark-t1">20.1 Real-Time Response Streaming :white_check_mark: <code>T1</code></h3>
+<p>SSE-based streaming to dashboard. gRPC streaming for programmatic access.</p>
+<h3 id="202-response-filtering-and-pagination-white_check_mark-t2">20.2 Response Filtering and Pagination :white_check_mark: <code>T2</code></h3>
+<p><code>ResponseStore</code> with SQLite backend. <code>ResponseQuery</code> struct: agent_id, status, time range (since/until), limit/offset pagination. Exposed via <code>GET /api/responses/{instruction_id}</code> with query parameters.</p>
+<h3 id="203-response-aggregation-white_check_mark-t2">20.3 Response Aggregation :white_check_mark: <code>T2</code></h3>
+<p><code>ResponseStore</code> aggregation engine with COUNT, SUM, AVG, MIN, MAX. Multi-column GROUP BY, incremental computation as responses arrive. REST endpoint with drill-down from aggregate to raw rows.</p>
+<h3 id="204-per-device-error-tracking-white_check_mark-t2">20.4 Per-Device Error Tracking :white_check_mark: <code>T2</code></h3>
+<p><code>ResponseStore</code> persists per-response <code>error_detail</code> alongside status. Queryable by agent_id, status code, and time range for error history.</p>
+<h3 id="205-csv-data-export-white_check_mark-t2">20.5 CSV / Data Export :white_check_mark: <code>T2</code></h3>
+<p>CSV and JSON export endpoints for responses, audit, and inventory data. RFC 4180-compliant CSV with streaming via chunked transfer encoding. Generic JSON-to-CSV conversion.</p>
+<h3 id="206-response-templates-white_check_mark-t2">20.6 Response Templates :white_check_mark: <code>T2</code></h3>
+<p>Named response-view configurations (column subset, sort order, filter presets) attached to an <code>InstructionDefinition</code>. Synthesised <code>__default__</code> view derived from <code>spec.result.columns</code> (or the plugin's column schema) so every definition has at least one selectable view. REST CRUD at <code>/api/v1/definitions/{id}/response-templates[/{template_id}]</code> gated on <code>InstructionDefinition:Read</code> (List/Get) and <code>InstructionDefinition:Write</code> (POST/PUT/DELETE). Dashboard surfaces the templates as a <strong>View</strong> dropdown in the filter bar; selecting one re-renders the table with the template's column subset, sort order, and equals-op filters auto-applied. YAML authoring via <code>spec.responseTemplates</code>. Phase 8.2, issue #254.</p>
+<h3 id="207-response-offloading-white_check_mark-t3">20.7 Response Offloading :white_check_mark: <code>T3</code></h3>
+<p>Operator-registered external HTTP endpoints (<em>offload targets</em>) that receive a copy of <code>agent.registered</code> and <code>execution.completed</code> events as they fire. Sibling <code>OffloadTargetStore</code> (<code>offload_targets.db</code>, migration v1) wired into <code>AgentServiceImpl</code> next to the existing webhook fan-out — every event that fires a webhook also fans out to every enabled offload target whose <code>event_types</code> filter matches. Typed auth: none / bearer / basic / hmac (Authorization headers are CRLF-guarded against header injection). Server-side batching: <code>batch_size &gt; 1</code> accumulates events into a per-target buffer and flushes on threshold; flush body is JSON of shape <code>{"events":[…]}</code>. REST CRUD at <code>/api/v1/offload-targets</code> gated on <code>Infrastructure:Read</code>/<code>Write</code>. <code>auth_credential</code> is persisted but never returned by any read endpoint (paranoia-double-check assertion in REST tests). YAML authoring via <code>spec.offload.targets</code> is documented; dispatcher-side correlation (per-instruction filter honouring) deferred to a follow-up. Phase 8.3, issue #255.</p>
+<hr>
+<h2 id="21-server-notifications-and-audit">21. Server: Notifications and Audit</h2>
+<p><em>System events, audit trails, and external notification delivery.</em></p>
+<h3 id="211-agent-lifecycle-event-streaming-white_check_mark-t1">21.1 Agent Lifecycle Event Streaming :white_check_mark: <code>T1</code></h3>
+<p><code>WatchEvents</code> RPC.</p>
+<h3 id="212-audit-trail-of-user-actions-white_check_mark-t2">21.2 Audit Trail of User Actions :white_check_mark: <code>T2</code></h3>
+<p><code>AuditStore</code> with SQLite WAL backend. Structured events: timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, result. Query with filtering and pagination via <code>/api/audit</code>. Default 365-day retention.</p>
+<h3 id="213-system-notifications-white_check_mark-t2">21.3 System Notifications :white_check_mark: <code>T2</code></h3>
+<p><code>NotificationStore</code> (SQLite backend). Create notifications with level (info/warn/error/success), title, and message. List unread/all, mark as read, dismiss (soft-delete), count unread. Server generates notifications for system events (agent registration, policy violations, deployment completions). REST API and dashboard bell icon integration.</p>
+<h3 id="214-event-subscriptions-webhook-email-white_check_mark-t3">21.4 Event Subscriptions (Webhook / Email) :white_check_mark: <code>T3</code></h3>
+<p><code>WebhookStore</code> (437 LOC). Register webhooks with URL, event type filter (comma-separated), and HMAC-SHA256 signing secret. Async delivery on detached threads with 10-concurrent-delivery semaphore. Delivery history with status codes and errors. <code>fire_event()</code> dispatches matching webhooks automatically. REST API for webhook CRUD and delivery log.</p>
+<h3 id="215-event-source-management-x-t3">21.5 Event Source Management :x: <code>T3</code></h3>
+<p>Not implemented. Configure which events generate notifications.</p>
+<hr>
+<h2 id="22-server-system-and-infrastructure">22. Server: System and Infrastructure</h2>
+<p><em>Monitoring, licensing, configuration, and multi-node scaling.</em></p>
+<h3 id="221-system-health-monitoring-white_check_mark-t2">22.1 System Health Monitoring :white_check_mark: <code>T2</code></h3>
+<p>Kubernetes-style health probes: <code>/livez</code> (always 200) and <code>/readyz</code> (checks store connectivity). Gateway health endpoint with circuit breaker status. Prometheus <code>/metrics</code> endpoint exposes server/agent/gateway metrics. <code>ProcessHealthSampler</code> provides cross-platform (Linux <code>/proc/self</code>, macOS <code>mach_task_info</code>/<code>getrusage</code>, Windows <code>GetProcessMemoryInfo</code>/<code>GetProcessTimes</code>) process telemetry sampled every 15s. New Prometheus metrics: <code>yuzu_server_cpu_usage_percent</code>, <code>yuzu_server_memory_bytes{type=rss|vss}</code>, <code>yuzu_server_open_connections</code>, <code>yuzu_server_command_queue_depth</code>, <code>yuzu_server_uptime_seconds</code>. <code>/health</code> endpoint includes <code>system</code> object with CPU, memory, connections, queue depth. Health dashboard strip shows CPU% and memory.</p>
+<h3 id="222-system-topology-view-white_check_mark-t2">22.2 System Topology View :white_check_mark: <code>T2</code></h3>
+<p><code>topology_ui.cpp</code> dashboard page at <code>/topology</code>. HTMX fragment <code>/frag/topology-data</code> (30s poll). Shows server node, gateway badges, management group tree, OS breakdown. REST: <code>GET /api/v1/topology</code>.</p>
+<h3 id="223-license-management-white_check_mark-t2">22.3 License Management :white_check_mark: <code>T2</code></h3>
+<p><code>LicenseStore</code> (SQLite) with seat-based licensing, expiry, edition, feature flags. Soft enforcement with alerts at 90% seats / 30 days to expiry. REST: <code>GET/POST/DELETE /api/v1/license</code>, <code>GET /api/v1/license/alerts</code>.</p>
+<h3 id="224-platform-configuration-ttls-limits-white_check_mark-t2">22.4 Platform Configuration (TTLs, Limits) :white_check_mark: <code>T2</code></h3>
+<p><code>RuntimeConfigStore</code> (219 LOC). Persistent runtime configuration overrides in SQLite. Allow-listed safe keys only (no secrets). Set/get/remove with <code>updated_by</code> attribution. Changes take effect without restart. REST API for configuration CRUD. Startup defaults overridden by stored values.</p>
+<h3 id="225-gateway-scale-out-architecture-white_check_mark-t2">22.5 Gateway / Scale-Out Architecture :white_check_mark: <code>T2</code></h3>
+<p>Full Erlang/OTP gateway (<code>gateway/</code> rebar3 project). <code>yuzu_gw_agent</code> manages agent connections, <code>yuzu_gw_upstream</code> handles server-side gRPC (batch heartbeat, proxy register, command forwarding). <code>yuzu_gw_heartbeat_buffer</code> batches heartbeats for efficiency. Circuit breaker for upstream resilience. Health endpoint with metrics. Supervision tree with restart strategies. EUnit + Common Test suites including scale tests (10K+ agents).</p>
+<h3 id="226-statistics-dashboard-white_check_mark-t2">22.6 Statistics Dashboard :white_check_mark: <code>T2</code></h3>
+<p><code>statistics_ui.cpp</code> dashboard page at <code>/statistics</code>. Six HTMX cards (fleet, executions, compliance, top instructions, license, system health) each with independent 60s polling. REST: <code>GET /api/v1/statistics</code>.</p>
+<h3 id="227-binary-resource-distribution-x-t3">22.7 Binary Resource Distribution :x: <code>T3</code></h3>
+<p>Not implemented. Distribute versioned binary resources via server.</p>
+<h3 id="228-product-packs-bundled-definitions-white_check_mark-t3">22.8 Product Packs (Bundled Definitions) :white_check_mark: <code>T3</code></h3>
+<p><code>ProductPackStore</code> (680 LOC). Install multi-document YAML bundles containing InstructionDefinitions, PolicyFragments, Policies, TriggerTemplates. Ed25519 signature verification (OpenSSL on Unix, BCrypt on Windows). Install/uninstall with callback delegation to origin stores. Pack metadata, item tracking, and version management. REST API for pack CRUD.</p>
+<h3 id="229-database-sharding-response-partitioning-x-t3">22.9 Database Sharding (Response Partitioning) :x: <code>T3</code></h3>
+<p>Not implemented. Time-partitioned response storage (monthly SQLite files) with automatic rotation, TTL cleanup, and transparent cross-partition query routing.</p>
+<h3 id="2210-high-availability-active-passive-x-t3">22.10 High Availability (Active-Passive) :x: <code>T3</code></h3>
+<p>Not implemented. Active-passive failover with shared storage, inter-server heartbeat, automatic failover on primary health check failure, and gateway re-registration.</p>
+<hr>
+<h2 id="23-agent-side-key-value-storage">23. Agent-Side Key-Value Storage</h2>
+<p><em>Persistent key-value store on the agent for cross-instruction state.</em></p>
+<h3 id="231-local-key-value-storage-white_check_mark-t2">23.1 Local Key-Value Storage :white_check_mark: <code>T2</code></h3>
+<p><code>storage</code> plugin with <code>set</code>, <code>get</code>, <code>delete</code>, <code>list</code>, <code>clear</code> actions. SQLite-backed persistent key-value store on the agent. Keys namespaced per plugin. Survives agent restarts and upgrades.</p>
+<h3 id="232-remote-key-value-access-white_check_mark-t3">23.2 Remote Key-Value Access :white_check_mark: <code>T3</code></h3>
+<p><code>storage</code> plugin actions are dispatchable via server instructions. Server can remotely read/write agent storage via standard command dispatch.</p>
+<h3 id="233-key-existence-check-white_check_mark-t2">23.3 Key Existence Check :white_check_mark: <code>T2</code></h3>
+<p><code>storage</code> plugin <code>list</code> action with optional prefix filter. <code>get</code> returns empty result for non-existent keys.</p>
+<hr>
+<h2 id="24-integration-and-extensibility">24. Integration and Extensibility</h2>
+<p><em>External system integration, data exchange, and API surface.</em></p>
+<h3 id="241-plugin-sdk-c-abi-c-wrapper-white_check_mark-t1">24.1 Plugin SDK (C ABI + C++ Wrapper) :white_check_mark: <code>T1</code></h3>
+<p>Stable <code>plugin.h</code> C ABI with <code>plugin.hpp</code> CRTP wrapper. <code>YUZU_PLUGIN_EXPORT</code> macro.</p>
+<h3 id="242-grpc-management-api-white_check_mark-t1">24.2 gRPC Management API :white_check_mark: <code>T1</code></h3>
+<p><code>ManagementService</code> with list/get/send/watch/query.</p>
+<h3 id="243-rest-http-management-api-white_check_mark-t2">24.3 REST / HTTP Management API :white_check_mark: <code>T2</code></h3>
+<p>70+ JSON endpoints under versioned <code>/api/v1/</code> prefix. Full CRUD for instructions, executions, schedules, approvals, responses, audit, tags, scope, management groups, policies, tokens, inventory, patches, webhooks, notifications, discovery, and custom properties. Session cookie, OIDC, and API token auth. CORS origin allowlist. OpenAPI spec at <code>/api/v1/openapi.json</code>. Consistent JSON error envelopes.</p>
+<h3 id="244-consumer-external-system-registration-x-t3">24.4 Consumer (External System) Registration :x: <code>T3</code></h3>
+<p>Not implemented. Register external systems to receive data feeds.</p>
+<h3 id="245-data-export-to-external-formats-white_check_mark-t2">24.5 Data Export to External Formats :white_check_mark: <code>T2</code></h3>
+<p>CSV and JSON export endpoints. RFC 4180-compliant CSV with streaming via chunked transfer encoding. Generic <code>json_array_to_csv</code> converter at <code>/api/export/json-to-csv</code>. Response data export with Content-Disposition headers. Audit log and inventory data also exportable via REST API JSON endpoints.</p>
+<h3 id="246-utility-functions-jsontable-conversion-white_check_mark-t1">24.6 Utility Functions (JSON/Table Conversion) :white_check_mark: <code>T1</code></h3>
+<p><code>yuzu_table_to_json()</code>, <code>yuzu_json_to_table()</code>, <code>yuzu_split_lines()</code>, <code>yuzu_generate_sequence()</code>, <code>yuzu_free_string()</code> in <code>sdk/include/yuzu/plugin.h</code> C ABI.</p>
+<h3 id="247-sdk-libraries-for-external-integrations-x-t3">24.7 SDK Libraries for External Integrations :x: <code>T3</code></h3>
+<p>Not implemented. Client libraries wrapping the management API for third-party integration.</p>
+<h3 id="248-mcp-server-model-context-protocol-white_check_mark-t2">24.8 MCP Server (Model Context Protocol) :white_check_mark: <code>T2</code></h3>
+<p>Embedded MCP server at <code>POST /mcp/v1/</code> using JSON-RPC 2.0 transport. Enables AI models (e.g., Claude Desktop) to query fleet status, check compliance, and investigate agents. Phase 1: 22 read-only tools (<code>list_agents</code>, <code>get_agent_details</code>, <code>query_audit_log</code>, <code>list_definitions</code>, <code>get_definition</code>, <code>query_responses</code>, <code>aggregate_responses</code>, <code>query_inventory</code>, <code>list_inventory_tables</code>, <code>get_agent_inventory</code>, <code>get_tags</code>, <code>search_agents_by_tag</code>, <code>list_policies</code>, <code>get_compliance_summary</code>, <code>get_fleet_compliance</code>, <code>list_management_groups</code>, <code>get_execution_status</code>, <code>list_executions</code>, <code>list_schedules</code>, <code>validate_scope</code>, <code>preview_scope_targets</code>, <code>list_pending_approvals</code>), 3 resources (<code>yuzu://server/health</code>, <code>yuzu://compliance/fleet</code>, <code>yuzu://audit/recent</code>), 4 prompts (<code>fleet_overview</code>, <code>investigate_agent</code>, <code>compliance_report</code>, <code>audit_investigation</code>).</p>
+<h3 id="249-mcp-authorization-tiers-white_check_mark-t2">24.9 MCP Authorization Tiers :white_check_mark: <code>T2</code></h3>
+<p>Three-tier authorization model enforced before RBAC: <code>readonly</code> (read-only tools), <code>operator</code> (+ tag writes, auto-approved executions), <code>supervised</code> (all operations via approval workflow). MCP tokens use existing API token system with <code>mcp_tier</code> column. Mandatory expiration (max 90 days). Kill switch: <code>--mcp-disable</code> rejects all MCP requests, <code>--mcp-read-only</code> blocks non-read tools.</p>
+<h3 id="2410-mcp-settings-ui-white_check_mark-t2">24.10 MCP Settings UI :white_check_mark: <code>T2</code></h3>
+<p>Settings page section for MCP configuration: enable/disable toggle, read-only mode toggle. API token creation supports MCP tier dropdown for creating MCP-scoped tokens.</p>
+<hr>
+<h2 id="25-connector-framework">25. Connector Framework</h2>
+<p><em>Bidirectional data sync with external management systems.</em></p>
+<h3 id="251-connector-registry-and-configuration-x-t2">25.1 Connector Registry and Configuration :x: <code>T2</code></h3>
+<p>Not implemented. Pluggable connector architecture for syncing inventory data from external systems. ConnectorStore with encrypted credentials, sync scheduling, and connection testing.</p>
+<h3 id="252-connector-sync-engine-x-t2">25.2 Connector Sync Engine :x: <code>T2</code></h3>
+<p>Not implemented. Background sync execution with lifecycle management (NotStarted → Pending → InProgress → Completed/Failed/Cancelled).</p>
+<h3 id="253-sccm-configmgr-connector-x-t2">25.3 SCCM / ConfigMgr Connector :x: <code>T2</code></h3>
+<p>Not implemented. SQL query integration with ConfigMgr database for hardware, software, user, and patch inventory.</p>
+<h3 id="254-intune-connector-x-t2">25.4 Intune Connector :x: <code>T2</code></h3>
+<p>Not implemented. Microsoft Graph API integration for managed device inventory and compliance state.</p>
+<h3 id="255-servicenow-connector-x-t2">25.5 ServiceNow Connector :x: <code>T2</code></h3>
+<p>Not implemented. REST API integration with ServiceNow CMDB for CI records, incidents, and change requests.</p>
+<hr>
+<h2 id="26-inventory-repositories">26. Inventory Repositories</h2>
+<p><em>Named, multi-source inventory partitions with consolidation and normalization.</em></p>
+<h3 id="261-repository-model-x-t2">26.1 Repository Model :x: <code>T2</code></h3>
+<p>Not implemented. Named repositories per type (inventory, compliance, entitlement) with connector bindings and default repository.</p>
+<h3 id="262-inventory-consolidation-x-t2">26.2 Inventory Consolidation :x: <code>T2</code></h3>
+<p>Not implemented. Multi-source deduplication by device identity (hostname + MAC + serial). Consolidation reports showing matched vs. unmatched records.</p>
+<h3 id="263-software-normalization-x-t2">26.3 Software Normalization :x: <code>T2</code></h3>
+<p>Not implemented. Vendor/title/version canonicalization pipeline. Normalize raw inventory entries to canonical software identities.</p>
+<h3 id="264-wsus-csv-file-upload-connectors-x-t2">26.4 WSUS / CSV / File Upload Connectors :x: <code>T2</code></h3>
+<p>Not implemented. WSUS database connector for patch compliance. CSV/TSV file upload connector with configurable column mapping.</p>
+<hr>
+<h2 id="27-software-catalog-licensing">27. Software Catalog &amp; Licensing</h2>
+<p><em>Normalized software identification and license compliance management.</em></p>
+<h3 id="271-software-catalog-store-x-t2">27.1 Software Catalog Store :x: <code>T2</code></h3>
+<p>Not implemented. Canonical software registry (vendor, title, version, edition, platform) with manual curation and automatic matching from raw inventory.</p>
+<h3 id="272-software-usage-tracking-x-t2">27.2 Software Usage Tracking :x: <code>T2</code></h3>
+<p>Not implemented. Agent-side application usage metering (launch tracking, run time, last-used timestamp). Categorization: Used, Rarely Used, Unused, Unreported.</p>
+<h3 id="273-license-entitlements-compliance-x-t2">27.3 License Entitlements &amp; Compliance :x: <code>T2</code></h3>
+<p>Not implemented. Entitlement records (product, purchased_seats, license_type). Compliance calculation: installed vs. entitled with over/under-licensed reporting.</p>
+<h3 id="274-software-tags-x-t2">27.4 Software Tags :x: <code>T2</code></h3>
+<p>Not implemented. Server-side tags on software catalog entries for categorization (approved, prohibited, eval). Usable in Management Group rules.</p>
+<h3 id="275-license-compliance-dashboard-x-t2">27.5 License Compliance Dashboard :x: <code>T2</code></h3>
+<p>Not implemented. Per-product compliance summary with drill-down to device-level detail. Reclamation candidate identification from usage data.</p>
+<hr>
+<h2 id="28-response-visualization">28. Response Visualization</h2>
+<p><em>Chart rendering, data processing, and template management for instruction responses.</em></p>
+<h3 id="281-response-visualization-engine-white_check_mark-t2">28.1 Response Visualization Engine :white_check_mark: <code>T2</code></h3>
+<p>Implemented. Server-side data transformation with built-in processors (<code>single_series</code>, <code>multi_series</code>, <code>datetime_series</code>) and an optional row pre-filter (<code>whereField</code> / <code>whereEquals</code>). Chart types: pie, bar, column, line, area. Configured via <code>spec.visualization</code> (singular) or <code>spec.visualizations</code> (plural for multi-chart). REST: <code>GET /api/v1/executions/{id}/visualization?definition_id=&lt;id&gt;&amp;index=&lt;N&gt;</code> gated on <code>Response:Read</code>. Renderer is Apache ECharts 5 (vendored at <code>/static/echarts.min.js</code>) wrapped by a thin adapter at <code>/static/yuzu-charts.js</code> that reads <code>--mds-color-chart-*</code> Yuzu design tokens at render time. Six chart-bearing demo definitions (vuln_scan, antivirus, bitlocker, firewall, certificates, os_info) ship as <code>InstructionSet demo.visualization.fleet-posture</code>, auto-imported on server startup.</p>
+<h3 id="282-response-templates-white_check_mark-t2">28.2 Response Templates :white_check_mark: <code>T2</code></h3>
+<p>Implemented. Named response view configurations stored per <code>InstructionDefinition</code> in a <code>response_templates_spec</code> JSON column. Synthesised <code>__default__</code> view from <code>spec.result.columns</code> or plugin schema. REST CRUD + dashboard View dropdown. See §20.6 for the full contract. Phase 8.2, issue #254.</p>
+<h3 id="283-response-offloading-x-t2">28.3 Response Offloading :x: <code>T2</code></h3>
+<p>Not implemented. Configure external HTTP endpoints to receive response data in real time. OffloadTarget model with auth, event filtering, and batch delivery.</p>
+<h3 id="284-tar-dashboard-page-large_orange_diamond-t2">28.4 TAR Dashboard Page :large_orange_diamond: <code>T2</code></h3>
+<p>In progress (Phase 15.A and 15.D). A dedicated <code>/tar</code> page off the main dashboard nav. Surfaces, in one place, every operator-facing TAR affordance: ad-hoc SQL against agent warehouses with scope-walking-aware results (<code>save as result set</code> for downstream narrowing), retention awareness across the fleet, and the process tree viewer. The consolidation makes TAR — the headline forensics + inventory capability — a discoverable destination rather than a fragment scattered across other pages. Design: <a href="tar-dashboard.html" class="doc-ref"><code>docs/tar-dashboard.md</code></a>.</p>
+<h3 id="285-tar-process-tree-viewer-x-t2">28.5 TAR Process Tree Viewer :x: <code>T2</code></h3>
+<p>Not implemented (Phase 15.H). Reconstructs the per-device process tree from <code>process_live</code> — a seed snapshot taken at agent install / first start (walks <code>/proc</code> on Linux, <code>CreateToolhelp32Snapshot</code> + <code>Process32FirstW</code>/<code>NextW</code> on Windows, <code>proc_listallpids</code> + <code>proc_pidinfo</code> on macOS) plus subsequent <code>started</code> / <code>stopped</code> events from the regular <code>collect_fast</code> cycle. Renders as a collapsible tree with honest "as observed since <code>&lt;seed_ts&gt;</code>" framing — orphans whose parents died before the seed appear reparented to PID 1, exactly as in a live <code>ps</code>. Time-slicing via <code>?as_of=&lt;ts&gt;</code>. Cmdline redaction reuses the existing TAR redaction patterns. Data quality depends on agent uptime and tamper-resistance — that hardening pillar is the parallel Guardian PR ladder and does not block the viewer. Design: <a href="tar-dashboard.html" class="doc-ref"><code>docs/tar-dashboard.md</code></a> §5.</p>
+<h3 id="286-retention-awareness-surface-large_orange_diamond-t2">28.6 Retention Awareness Surface :large_orange_diamond: <code>T2</code></h3>
+<p>In progress (Phase 15.A). Operator-facing aggregate view of every device × source pair where <code>&lt;source&gt;_enabled=false</code> — the operational consequence of issue #539's per-source retention pause. Surfaces "paused since" timestamp, live-row count, oldest timestamp; supports one-click re-enable (per-source, the #539 invariant) and a typed-confirmation purge for the "we have what we need, drop the rows but keep the collector paused" case. Without this surface, operators who disabled a collector for forensic preservation have no way to know which boxes are accumulating non-aging data. Design: <a href="tar-dashboard.html" class="doc-ref"><code>docs/tar-dashboard.md</code></a> §3.</p>
+<hr>
+<h2 id="29-consumer-applications">29. Consumer Applications</h2>
+<p><em>Formal registration and management of external systems consuming Yuzu data.</em></p>
+<h3 id="291-consumer-application-registration-x-t2">29.1 Consumer Application Registration :x: <code>T2</code></h3>
+<p>Not implemented. ConsumerStore for registering third-party applications with scoped API tokens, rate limits, and custom data fields.</p>
+<h3 id="292-event-source-management-x-t2">29.2 Event Source Management :x: <code>T2</code></h3>
+<p>Not implemented. Configure which system events generate notifications and webhook deliveries. Per-category enable/disable with severity thresholds.</p>
+<h3 id="293-powershell-module-x-t3">29.3 PowerShell Module :x: <code>T3</code></h3>
+<p>Not implemented. <code>Yuzu.Management</code> PowerShell module wrapping REST API v1 with cmdlets for fleet management, instruction execution, and compliance queries.</p>
+<h3 id="294-python-sdk-x-t3">29.4 Python SDK :x: <code>T3</code></h3>
+<p>Not implemented. <code>yuzu-sdk</code> Python package wrapping REST API v1 with async support and typed models.</p>
+<hr>
+<h2 id="30-scope-walking-result-sets">30. Scope Walking &amp; Result Sets</h2>
+<p><em>The Yuzu product differentiator. Operator working memory is finite; the IT estate is a finite-state automaton with mutating state-table size and mutating per-row state. Real-time discovery via iterative scope narrowing — every query produces a device set that becomes the input scope for the next query or action — is the only realistic interaction model at fleet scale. Reference walkthrough: the Chrome incident-response scenario in <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §10.</em></p>
+<h3 id="301-result-set-persistence-and-lineage-x-t2">30.1 Result Set Persistence and Lineage :x: <code>T2</code></h3>
+<p>Not implemented (Phase 15.B). A named, TTL-bounded set of device IDs produced by a query, action result, or operator-curated list — the unit of composable scope. Stable identity (<code>rs_&lt;ulid&gt;</code>), optional human-readable per-operator alias, immutable lineage edges that record the chain of <code>(parent_result_set, narrowing_query)</code> back to a ground set, source-payload JSON sufficient to live-re-evaluate the producing query without operator re-input. Persisted in <code>result_sets.db</code> with <code>ON DELETE CASCADE</code> member rows; pinning extends TTL beyond the default 1 hour for incident-response sessions; per-operator quotas (10K result sets, 50 pins) and a 5-minute background GC sweep prevent runaway scripts from filling the table. REST: <code>/api/v1/result-sets/...</code> covering create-from-inventory/tar/instruction, members, lineage, pin/unpin/re-eval, delete. Audit row per state transition for forensic reconstruction. Design: <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §3, §6, §9.</p>
+<h3 id="302-composable-scope-from-previous-query-x-t2">30.2 Composable Scope from Previous Query :x: <code>T2</code></h3>
+<p>Not implemented (Phase 15.C). The Scope Engine grammar gains a third short-circuit kind, <code>from_result_set:&lt;id-or-alias&gt;</code>, alongside the existing <code>__all__</code> and <code>group:&lt;name&gt;</code>. Composes with attribute predicates via <code>AND</code>/<code>OR</code>/<code>NOT</code> so a result set can be the candidate set and the predicate is a real-time refinement against current device attributes. Stale members (offline &gt; 24h, decommissioned, removed from management group) are silently dropped at resolve time with a dashboard-surfaced warning rather than failing the query — operators iterating an IR chain need progress, not a stop, and the audit row records the dropped IDs for forensic completeness. Dashboard surfacing: persistent left-rail sidebar of the operator's active result sets, chain breadcrumb above every query frame mirroring the lineage, scope chip in every query/instruction/policy frame for one-click rebinding. Design: <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §4, §8.</p>
+<h3 id="303-yaml-dsl-fromresultset-surface-x-t2">30.3 YAML DSL <code>fromResultSet:</code> Surface :x: <code>T2</code></h3>
+<p>Not implemented (Phase 15.E). The <code>scope:</code> block in <code>InstructionDefinition</code>, <code>InstructionSet</code>, and <code>Policy</code> gains <code>fromResultSet:</code> as a mutually-exclusive (or composable-with-<code>selector:</code>) alternative form so YAML-defined automation can target the device set produced by a previous query. Validation rules: <code>fromResultSet + assignment.managementGroups</code> rejected at YAML load (a result set already has a fixed device set, layering management-group filtering on top is redundant); <code>fromResultSet</code> requires <code>assignment.mode = static</code> (the whole point of a result set is a fixed target — <code>dynamic</code> re-evaluation against management groups would defeat it). Resolution at instruction <em>invocation</em> time, not YAML load time, so a definition carrying <code>fromResultSet:</code> is valid YAML even if the referenced set has expired by invocation. Resolution failure surfaces as <code>INSTRUCTION_SCOPE_RESOLUTION_FAILED</code> with the result-set ID and reason in the audit row. Design: <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §7.</p>
+<h3 id="304-result-set-operational-hardening-x-t2">30.4 Result Set Operational Hardening :x: <code>T2</code></h3>
+<p>Not implemented (Phase 15.G). Live re-evaluation produces a <em>new</em> result set ID rooted at the original's parent (sibling, not child) — operators can refresh a stale set against current estate state without breaking lineage. Background GC sweep every 5 minutes removes unpinned sets past TTL, cascading to member rows. Per-operator quotas enforced with <code>429 RESULT_SET_QUOTA</code> and <code>409 PIN_LIMIT</code>. Prometheus metrics — <code>yuzu_result_sets_total</code>, <code>yuzu_result_sets_alive</code>, <code>yuzu_result_set_resolve_seconds</code> histogram by cardinality bucket, GC counter, quota-rejection counter — surface health and runaway-script detection. Audit polish on every state transition. Design: <a href="scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a> §3.3, §9.</p>
+<hr>
+<h2 id="31-system-guardian-real-time-agent-side-guaranteed-state">31. System Guardian — Real-Time Agent-Side Guaranteed State</h2>
+<p><em>The agent-side primitive that makes guaranteed state </em><em>operationally true</em><em> rather than approximately true. PolicyStore (§16) evaluates desired-state rules on a poll-based schedule — typical 5-minute cadence. For security-sensitive settings ("this firewall port must never be open," "this registry value must never change," "this EDR process must always run") a 5-minute window is unacceptable. System Guardian uses </em><em>kernel-backed user-mode notification APIs</em><em> to detect drift within microseconds of it occurring, remediate it, and journal the event — even when the server is unreachable, even before any user has logged in. This is the headline parity feature against the leading commercial endpoint-management platforms' real-time enforcement engines. Agent runs in user space as SYSTEM (Windows) / root (Linux) / privileged daemon (macOS); no kernel drivers required. Design: <a href="yuzu-guardian-design-v1.1.html" class="doc-ref"><code>docs/yuzu-guardian-design-v1.1.md</code></a>. Windows-first delivery: <a href="yuzu-guardian-windows-implementation-plan.html" class="doc-ref"><code>docs/yuzu-guardian-windows-implementation-plan.md</code></a>.</em></p>
+<h3 id="311-guardian-engine-and-wire-protocol-large_orange_diamond-t2">31.1 Guardian Engine and Wire Protocol :large_orange_diamond: <code>T2</code></h3>
+<p>In progress (PRs 1-2 shipped). Agent-side <code>GuardianEngine</code> (<code>agents/core/src/guardian_engine.{hpp,cpp}</code>) with two-phase startup — <code>start_local()</code> pre-network so enforcement is active before the Register RPC, then <code>sync_with_server()</code> post-Register. KV namespace <code>__guardian__</code> for cached policy. Reserved plugin name <code>__guard__</code> intercepted in <code>agent.cpp</code> before the plugin match loop (load-time rejection in <code>plugin_loader.cpp</code> for defence in depth). Wire contract: <code>proto/yuzu/guardian/v1/guaranteed_state.proto</code> with <code>GuaranteedStateRule</code>, <code>GuaranteedStatePush</code>, <code>GuaranteedStateEvent</code>, <code>GuaranteedStateStatus</code>, <code>GuaranteedStateRuleStatus</code>. Server store <code>guaranteed-state.db</code> with immutable event log. Actions: <code>push_rules</code>, <code>get_status</code>. Every rule reports <code>errored</code> until guard implementations land in PR 3+.</p>
+<h3 id="312-event-guards-kernel-event-driven-enforcement-windows-x-t2">31.2 Event Guards — Kernel-Event-Driven Enforcement (Windows) :x: <code>T2</code></h3>
+<p>Not implemented (PRs 3, 5, 6, 7, 10). Real-time enforcement via four Windows kernel-backed user-mode APIs:
+- <strong>Registry Guard</strong> — <code>RegNotifyChangeKeyValue</code> + <code>WaitForMultipleObjects</code> (~0 ms latency); the canonical "registry value must equal X" enforcer.
+- <strong>SCM Guard</strong> — <code>NotifyServiceStatusChange</code> (~0 ms latency); enforces "service must remain running/stopped/disabled."
+- <strong>WFP Guard</strong> — <code>FwpmFilterSubscribeChanges0</code> (~0 ms latency); defence-in-depth filter monitor for firewall posture.
+- <strong>ETW Guard</strong> — <code>OpenTrace</code> / <code>ProcessTrace</code> (~1-5 ms latency); the multiplexed event provider with shared-session pooling per <a href="yuzu-guardian-design-v1.1.html" class="doc-ref"><code>docs/yuzu-guardian-design-v1.1.md</code></a> §8.3 (mandatory because Windows caps system-wide ETW sessions at 64, shared with Defender / EDR).</p>
+<p>Each guard implements <code>self_test()</code> on start to prove kernel wiring (sentinel write → expected callback within 500 ms → pass / <code>errored</code> mark). Resilience strategies (<code>Fixed</code>, <code>Backoff</code>, <code>Escalation</code>) and <code>RaceDetector</code> (sliding-window drifts/second) surface at PR 4.</p>
+<h3 id="313-condition-guards-periodic-evaluation-all-platforms-x-t2">31.3 Condition Guards — Periodic Evaluation (All Platforms) :x: <code>T2</code></h3>
+<p>Not implemented (PRs 8, 9). Time-based compliance — "process X must be running," "AV scan must have run within last 7 days," "software must have been updated within 30 days." Configurable interval per type. Hybrid Process Guard combines <code>Microsoft-Windows-Kernel-Process</code> ETW (events 1/2 for start/stop, near-real-time) with periodic <code>CreateToolhelp32Snapshot</code> poll (safety net). WMI Guard runs arbitrary WMI queries against an evaluator. Software Guard reads Registry Uninstall keys + WMI for installed-software freshness. Compliance Guard runs Event Log queries.</p>
+<h3 id="314-event-guards-linux-x-t3">31.4 Event Guards — Linux :x: <code>T3</code></h3>
+<p>Not implemented (PR 16). Linux equivalents of the Windows event-guard primitives:
+- <strong>Inotify Guard</strong> — <code>inotify_add_watch</code> for file/directory state assertions (config files, certificate files, sshd config).
+- <strong>Netlink Guard</strong> — <code>NETLINK_KOBJECT_UEVENT</code> for process-tree and device-event monitoring.
+- <strong>D-Bus Guard</strong> — <code>org.freedesktop.systemd1</code> signal subscriptions for service state ("sshd.service must remain running").
+- <strong>Audit Guard</strong> — Linux audit subsystem (<code>auditd</code>) consumer for syscall-level assertions.
+- <strong>Sysctl Guard</strong> — periodic check + <code>/proc/sys/...</code> write remediation; monitors kernel parameters that drift would indicate compromise.</p>
+<p>Phase 16 Linux delivery is gated on Windows track soaking in production.</p>
+<h3 id="315-event-guards-macos-x-t3">31.5 Event Guards — macOS :x: <code>T3</code></h3>
+<p>Not implemented (PR 17). macOS equivalents using Apple's Endpoint Security (ES) framework — <em>requires the ES entitlement</em>, which is a notarised-build / DDM-distributed entitlement that Apple grants per-bundle-ID. Without ES, the macOS guard surface is reduced to <code>fseventsd</code>, <code>launchd</code> plist polling, and <code>kqueue</code> file-watch. Phase 16 macOS delivery is gated on (a) Windows + Linux soak and (b) ES entitlement availability.</p>
+<h3 id="316-state-evaluator-and-remediation-engine-x-t2">31.6 State Evaluator and Remediation Engine :x: <code>T2</code></h3>
+<p>Not implemented (PRs 3, 5+). Assertion registry (<code>registry-value-equals</code>, <code>registry-value-absent</code>, <code>service-running</code>, <code>service-stopped</code>, <code>firewall-port-blocked</code>, <code>process-running</code>, <code>file-hash-equals</code>, <code>kernel-param-equals</code>, <code>plist-key-equals</code>, etc.) returns <code>compliant | drift | exempt</code> for a <code>StateSnapshot</code>. Remediation methods are <strong>system calls only — no shell-out</strong> (per design §14): <code>RegSetValueExW</code> / <code>RegDeleteValueW</code> (Win), <code>INetFwPolicy2</code> COM (Win firewall), service control via SCM (Win) / systemd D-Bus (Linux) / launchctl (macOS), <code>/proc/sys</code> writes (Linux), <code>defaults write</code> equivalent via plist serialisation (macOS). Re-entrancy guard per rule with 5 ms suppression window prevents the remediation from triggering its own watch callback.</p>
+<h3 id="317-audit-journal-and-server-store-large_orange_diamond-t2">31.7 Audit Journal and Server Store :large_orange_diamond: <code>T2</code></h3>
+<p>Server store shipped (PR 1 — <code>server/core/src/guaranteed_state_store.{hpp,cpp}</code>, <code>guaranteed-state.db</code>, immutable event log, no FK cascade on rule delete so historical events persist for forensic review). Agent-side journal (<code>agents/core/src/guard_audit.{hpp,cpp}</code>) lands with PR 3: MPSC queue + dedicated writer thread, SQLite journal table inside <code>kv_store.db</code> keyed by monotonic <code>event_seq</code>, drained by <code>GuardianEngine::sync_with_server</code> into <code>CommandResponse { plugin: "__guard__", action: "event" }</code>. Every detection and remediation journaled locally first, synced to server when online.</p>
+<h3 id="318-pre-login-activation-and-offline-capability-white_check_mark-t2">31.8 Pre-Login Activation and Offline Capability :white_check_mark: <code>T2</code></h3>
+<p>Pre-login activation works by construction today: the agent runs as a Windows service with <code>SERVICE_AUTO_START</code> + <code>FailureActions</code> configured at install time (<code>agents/core/src/main.cpp:136-200</code>); systemd unit on Linux with <code>Type=notify</code> + <code>Restart=always</code>; launchd <code>KeepAlive=true</code> + <code>RunAtLoad=true</code> on macOS. <code>GuardianEngine::start_local()</code> runs before the Register RPC, so once guard implementations land in PR 3+, enforcement begins as soon as the service starts — before any user can log in. Offline capability comes from caching policy in <code>kv_store.db</code> under <code>__guardian__</code> namespace; enforcement continues with last-known-good rules when the server is unreachable, and queued events flush when the server returns. Marked <code>:white_check_mark:</code> because the service-install side is operational; the <em>enforcement</em> half is gated on PR 3+ landing real guards.</p>
+<h3 id="319-dashboard-and-approval-workflow-x-t2">31.9 Dashboard and Approval Workflow :x: <code>T2</code></h3>
+<p>Not implemented (PRs 4, 11, 14). Dashboard page at <code>/guaranteed-state</code> listing rules (with kernel-wiring health indicator — <code>guard_healthy</code> + <code>last_notification</code> timestamp surface "deaf because subscription silently went nowhere" vs. "compliant because nothing's happening"), event timeline, summary cards, fragments per <a href="yuzu-guardian-design-v1.1.html" class="doc-ref"><code>docs/yuzu-guardian-design-v1.1.md</code></a> §10. Approval workflow reuses the existing <code>ApprovalManager</code> with <code>definition_id = "guaranteed_state_rule_*"</code> — no manager code changes (already generic). HTMX rule editor (CRUD + YAML validation + conflict detection) at PR 14.</p>
+<h3 id="3110-rule-signing-and-quarantine-integration-x-t2">31.10 Rule Signing and Quarantine Integration :x: <code>T2</code></h3>
+<p>Not implemented (PRs 12, 15). HMAC rule signing (HKDF per design §11.2) with per-tenant key stored in <code>CredWrite</code>/<code>CredRead</code> (Windows), Linux Secret Service / kernel keyring (Linux), Keychain (macOS); agent-side signature validation before activating a rule prevents unauthenticated rule injection. Quarantine integration: WFP block-all filter at weight 65535 (Windows) or <code>iptables</code> / <code>nftables</code> rule (Linux) drops all traffic except Yuzu's own; instruction handlers <code>quarantine.add_exception | remove_exception | lift</code>; server-side DNS resolution; resilience reset on lift so a remediation storm doesn't carry over.</p>
+<hr>
+<h2 id="appendix-a-plugin-coverage-matrix">Appendix A: Plugin Coverage Matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Plugin</th>
+<th style="text-align: center;">Win</th>
+<th style="text-align: center;">Linux</th>
+<th style="text-align: center;">macOS</th>
+<th>Category</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>os_info</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>System Info</td>
+</tr>
+<tr>
+<td>hardware</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>System Info</td>
+</tr>
+<tr>
+<td>device_identity</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>System Info</td>
+</tr>
+<tr>
+<td>status</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>System Info</td>
+</tr>
+<tr>
+<td>processes</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Process/Service</td>
+</tr>
+<tr>
+<td>procfetch</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Process/Service</td>
+</tr>
+<tr>
+<td>services</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Process/Service</td>
+</tr>
+<tr>
+<td>users</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>User</td>
+</tr>
+<tr>
+<td>network_config</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Network</td>
+</tr>
+<tr>
+<td>netstat</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Network</td>
+</tr>
+<tr>
+<td>sockwho</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Network</td>
+</tr>
+<tr>
+<td>network_diag</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Network</td>
+</tr>
+<tr>
+<td>network_actions</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Network</td>
+</tr>
+<tr>
+<td>wifi</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Network</td>
+</tr>
+<tr>
+<td>wol</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Network</td>
+</tr>
+<tr>
+<td>discovery</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Network</td>
+</tr>
+<tr>
+<td>installed_apps</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Software</td>
+</tr>
+<tr>
+<td>msi_packages</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Software</td>
+</tr>
+<tr>
+<td>windows_updates</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Patch</td>
+</tr>
+<tr>
+<td>software_actions</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Software</td>
+</tr>
+<tr>
+<td>sccm</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Software</td>
+</tr>
+<tr>
+<td>antivirus</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Security</td>
+</tr>
+<tr>
+<td>firewall</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Security</td>
+</tr>
+<tr>
+<td>bitlocker</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Security</td>
+</tr>
+<tr>
+<td>event_logs</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Security</td>
+</tr>
+<tr>
+<td>vuln_scan</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Security</td>
+</tr>
+<tr>
+<td>ioc</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Security</td>
+</tr>
+<tr>
+<td>quarantine</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Security</td>
+</tr>
+<tr>
+<td>certificates</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Security</td>
+</tr>
+<tr>
+<td>filesystem</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>File System</td>
+</tr>
+<tr>
+<td>registry</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>System Config</td>
+</tr>
+<tr>
+<td>wmi</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>System Config</td>
+</tr>
+<tr>
+<td>script_exec</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Execution</td>
+</tr>
+<tr>
+<td>content_dist</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Content Dist</td>
+</tr>
+<tr>
+<td>http_client</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Content Dist</td>
+</tr>
+<tr>
+<td>interaction</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>User Interaction</td>
+</tr>
+<tr>
+<td>storage</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Agent KV</td>
+</tr>
+<tr>
+<td>asset_tags</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Device Mgmt</td>
+</tr>
+<tr>
+<td>agent_logging</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Agent Mgmt</td>
+</tr>
+<tr>
+<td>agent_actions</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Agent Mgmt</td>
+</tr>
+<tr>
+<td>diagnostics</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Agent Mgmt</td>
+</tr>
+<tr>
+<td>tar</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Monitoring</td>
+</tr>
+<tr>
+<td>chargen</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Test/Debug</td>
+</tr>
+<tr>
+<td>example</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Test/Debug</td>
+</tr>
+</tbody>
+</table>
+<p>| software_usage | Y | Y | Y | Software | <em>Planned (Phase 12)</em> |
+| app_control | Y | Y | - | Security | <em>Planned (Phase 12)</em> |</p>
+<p><strong>44 plugins</strong> (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform, Windows-only, and test/debug plugins.</p>
+<hr>
+<h2 id="appendix-b-foundation-tier-status">Appendix B: Foundation Tier Status</h2>
+<p><strong>Foundation tier: 33/33 done (100%)</strong></p>
+<p>All Foundation-tier gaps have been closed as of 2026-03-18:</p>
+<ul>
+<li><strong>1.4</strong> Agent OTA updates -- <code>agents/core/src/updater.cpp</code></li>
+<li><strong>1.8</strong> Connection diagnostics -- <code>connection_info</code> action in diagnostics plugin</li>
+<li><strong>4.5</strong> DNS cache dump -- <code>dns_cache</code> action in network_config plugin</li>
+<li><strong>10.3</strong> File read by line range -- <code>offset</code>/<code>limit</code> params in filesystem plugin</li>
+<li><strong>10.12</strong> Temp file creation -- <code>yuzu_create_temp_file()</code> in SDK</li>
+<li><strong>18.9</strong> HTTPS for dashboard -- <code>httplib::SSLServer</code> with OpenSSL</li>
+<li><strong>24.6</strong> SDK utility functions -- 4 conversion functions in plugin.h</li>
+</ul>
+</main>
+</body>
+</html>

@@ -1,0 +1,612 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capability &amp;amp; Agentic-Readiness Audit — Refined Plan</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/plans/capability-agentic-audit-plan-2026-05-01.md</div>
+<h1 class="doc-title">Capability &amp;amp; Agentic-Readiness Audit — Refined Plan</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="capability-agentic-readiness-audit-refined-plan">Capability &amp; Agentic-Readiness Audit — Refined Plan</h1>
+<p><strong>Date:</strong> 2026-05-01
+<strong>Scope:</strong> Refine the supplied draft into an actionable audit deliverable, grounded in verified code/doc state. The user's framing is <strong>agentic-first</strong>: every operation a human can perform via the dashboard must be performable by an LLM-driven worker through a documented, discoverable, machine-readable surface.</p>
+<h2 id="context">Context</h2>
+<p>The supplied draft was written from memory and contains several factually wrong claims that, if used to drive doc/roadmap edits, would propagate noise. Verified during plan exploration:</p>
+<table>
+<thead>
+<tr>
+<th>Draft claim</th>
+<th>Actual state (verified)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>capability-map says 225 / 166 / <strong>74%</strong></td>
+<td>capability-map.md:35 says <strong>208 / 165 / 79%</strong></td>
+</tr>
+<tr>
+<td>README says 184 / 150 / <strong>82%</strong></td>
+<td>README.md:239 says <strong>184 / 150 / 82%</strong> ← stale, but draft's number is right</td>
+</tr>
+<tr>
+<td>"Phase 15 TAR + Scope Walking"</td>
+<td>TAR is roadmap <strong>Issue 7.19 — Done</strong>; no Phase 15 exists</td>
+</tr>
+<tr>
+<td>"Phase 16 Guardian (2 of 15 PRs)"</td>
+<td>No numbered phase; Guardian is tracked separately in CLAUDE.md PR ladder</td>
+</tr>
+<tr>
+<td>"Phase 17" hole</td>
+<td>Roadmap stops at <strong>Phase 14</strong>; Phase 17 would be net-new</td>
+</tr>
+<tr>
+<td><a href="../scope-walking-design.html" class="doc-ref"><code>docs/scope-walking-design.md</code></a>, <a href="../tar-dashboard.html" class="doc-ref"><code>docs/tar-dashboard.md</code></a>, <a href="../tar-implementer.html" class="doc-ref"><code>docs/tar-implementer.md</code></a></td>
+<td>None of these files exist</td>
+</tr>
+<tr>
+<td>"MCP Phase 2 not on roadmap"</td>
+<td><strong>Issue 13.5</strong> already plans <code>set_tag</code>, <code>delete_tag</code>, <code>approve_request</code>, <code>reject_request</code>, <code>quarantine_device</code> + SSE for execution progress</td>
+</tr>
+<tr>
+<td>"capability-map §2.2: scope/filter targeting NOT implemented" vs "asset-tagging-guide says it works"</td>
+<td><strong>Code wins</strong> — <code>agent_registry.cpp:838-847</code> resolves <code>tag:X</code>, <code>props.X</code>, <code>ostype</code>, <code>hostname</code>, <code>arch</code>, <code>agent_version</code>. capability-map §2.2 is wrong; asset-tagging-guide is right</td>
+</tr>
+<tr>
+<td>"set_tag, delete_tag implemented as MCP write tools"</td>
+<td><code>mcp_server.cpp</code> has them in <code>kToolSecurity</code>/<code>kWriteTools</code> and a misleading "Implemented:" comment, but <strong>no dispatch handler</strong> — only <code>execute_instruction</code> is wired (line 1313). They fall through to "Unknown tool"</td>
+</tr>
+<tr>
+<td>"230 markdown files, 15 unrouted"</td>
+<td><code>docs/</code> tree contains <strong>59 files</strong>; the user-manual subset is correctly out of CLAUDE.md scope (it's user-facing). Real unrouted set is ~12 files</td>
+</tr>
+<tr>
+<td>MCP token / OpenAPI / discovery surfaces</td>
+<td>OpenAPI 3.0 spec exists at <code>/api/v1/openapi.json</code> (rest_api_v1.cpp:487); MCP discovery via <code>tools/list</code> works; <strong>no introspection for routes / plugins / scope-kinds / RBAC catalog</strong></td>
+</tr>
+<tr>
+<td><code>/events</code> SSE</td>
+<td>Exists (server.cpp:2200) but emits HTMX-friendly events to drive <code>sse-swap</code> HTML targets, <strong>and is unauthenticated</strong> — separate security concern worth flagging</td>
+</tr>
+<tr>
+<td>44 plugins / 65 YAML defs</td>
+<td>45 plugin dirs / 65 <code>content/definitions/*.yaml</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Conclusion of exploration:</strong> the draft's structural insights are mostly right (agentic-first thesis, dashboard-only admin surfaces, error-envelope gaps, no introspection) but its facts and phase numbering are unreliable. The refined deliverable is one <strong>audit report</strong> plus a small set of <strong>doc reconciliations</strong> plus a <strong>list of proposed roadmap items</strong> (not implementations).</p>
+<h2 id="deliverable-shape">Deliverable shape</h2>
+<div class="highlight"><pre><span></span><code>┌────────────────────────────────────────────────┐
+│  PR contents                                   │
+├────────────────────────────────────────────────┤
+│  NEW  docs/capability-agentic-audit-2026-05.md │  ← the report
+│  NEW  docs/agentic-first-principle.md          │  ← architectural principle
+│  EDIT README.md:239                            │  ← stale capability count
+│  EDIT docs/capability-map.md (header + §2.2)   │  ← honest tiering + remove false gap
+│  EDIT CLAUDE.md (routed concerns + glossary)   │  ← agent disambiguation, missing routes
+│  EDIT docs/roadmap.md (&quot;Future Phase&quot; tail)    │  ← add proposed Phase 15-17 candidates
+│  EDIT server/core/src/mcp_server.cpp:227       │  ← false &quot;Implemented:&quot; comment
+└────────────────────────────────────────────────┘
+</code></pre></div>
+<p>No code changes that affect runtime behaviour. The MCP comment fix is doc-only (a <code>//</code> comment that misrepresents implementation status).</p>
+<div class="highlight"><pre><span></span><code>flowchart LR
+    A[Audit Report&lt;br/&gt;docs/capability-agentic-audit-2026-05.md]
+    P[Agentic-First Principle Doc&lt;br/&gt;docs/agentic-first-principle.md]
+    A --&gt;|cites| P
+    A --&gt;|prescribes| R[README.md count fix]
+    A --&gt;|prescribes| CM[capability-map.md tiering + §2.2 fix]
+    A --&gt;|prescribes| CL[CLAUDE.md routing + glossary]
+    A --&gt;|prescribes| RM[roadmap.md proposed Ph 15-17]
+    A --&gt;|prescribes| MC[mcp_server.cpp comment fix]
+    P --&gt;|referenced from| CL
+    P --&gt;|referenced from| RM
+</code></pre></div>
+<h2 id="file-by-file-specification">File-by-file specification</h2>
+<h3 id="1-docscapability-agentic-audit-2026-05md-new">1. <a href="../capability-agentic-audit-2026-05.html" class="doc-ref"><code>docs/capability-agentic-audit-2026-05.md</code></a> (NEW)</h3>
+<p>Single audit deliverable. Sections:</p>
+<ol>
+<li><strong>Executive summary</strong> — verified numbers (208 / 165 / 79% per cap map, README stale at 184), three top gaps (Connectors 0%, Software Catalog 0%, Guardian Windows PRs 1–2 / 15), three top agentic gaps (no introspection surface, dashboard HTML-only, MCP write tools unwired).</li>
+<li><strong>Capability tier honesty</strong> — restate per-tier numbers from capability-map.md: T1 33/33, T2 101/101 (with the §2.2 false gap removed → still 101/101), T3 31/50, New 0/24, Overall 165/208. Add a "scaffolded vs production-quality" overlay column for T2 (e.g. <code>2.4</code> no command cancellation, <code>2.7</code> no inventory delta plugin).</li>
+<li><strong>Verified inconsistencies</strong> (the table from this plan's Context section, with file:line cites).</li>
+<li><strong>Agentic-readiness scorecard</strong> — for each surface (REST, MCP, dashboard, SSE), what an authenticated machine worker can vs cannot do today. Cite the actual <code>kTools[]</code> array, <code>/api/v1/openapi.json</code>, and <code>dashboard_routes.cpp</code> fragments.</li>
+<li><strong>Agentic-first invariants (A1–A4)</strong> — point to <a href="../agentic-first-principle.html" class="doc-ref"><code>docs/agentic-first-principle.md</code></a> for the rules; restate them inline in one paragraph.</li>
+<li><strong>Doc routing gaps</strong> — list the actual ~12 unrouted docs (not the draft's fabricated 15). Real list to verify by walking <code>docs/*.md</code> against CLAUDE.md "Routed concerns" + agent <code>.md</code> references.</li>
+<li><strong>Recommendations P0–P3</strong> — keep the draft's structure but renumbered against the <em>real</em> roadmap:
+   - <strong>P0 doc reconciliation</strong> (this PR's edits)
+   - <strong>P1 unblock agentic operation</strong> — accelerate Issue 13.5 (MCP Phase 2) since it already plans the missing write tools + SSE; add new issues for: (a) introspection endpoints (<code>/api/v1/discover/{routes,plugins,scope-kinds,permissions,instructions}</code>), (b) dashboard JSON content negotiation on <code>/fragments/*</code>, (c) authenticated agent-facing SSE channel parallel to <code>/events</code>, (d) service-account principal type, (e) structured error envelope rev (<code>retry_after_ms</code>, <code>remediation</code>, <code>correlation_id</code>).
+   - <strong>P2 capability completion</strong> — Phases 9, 10, 12 acceleration; Guardian PR cadence; Issue 7.19 already done; no fabricated Phase 15.
+   - <strong>P3 roadmap holes</strong> — propose new Phase 15 (Agentic Surface Hardening), Phase 16 (Vulnerability/Compliance/Cert/Secrets/SBOM), explicit out-of-scope list (MDM, OS imaging, EDR-at-agent).</li>
+<li><strong>Verification checklist</strong> — see "Verification" section below.</li>
+</ol>
+<p>The report must cite file:line for every code claim (the draft did not). When the report makes a claim like "scope tag-filter targeting works", it cites <code>agent_registry.cpp:838-847</code>.</p>
+<h3 id="2-docsagentic-first-principlemd-new">2. <a href="../agentic-first-principle.html" class="doc-ref"><code>docs/agentic-first-principle.md</code></a> (NEW)</h3>
+<p>Short doc (~150 lines) stating the four invariants. These are the <strong>only</strong> new architectural rules introduced by this audit — keep them tight.</p>
+<ul>
+<li><strong>A1 Dashboard parity</strong> — every new <code>/fragments/*</code> route ships with either a parallel JSON variant (Accept negotiation) or a sibling REST endpoint. Existing fragments are not retroactively required to comply, but the audit lists which admin surfaces are dashboard-only today and earmarks them for P1.</li>
+<li><strong>A2 Discovery</strong> — every MCP tool, REST route, plugin action, scope kind, RBAC permission, and instruction definition is enumerable from a single discovery endpoint. (Today: only MCP <code>tools/list</code> and <code>/api/v1/openapi.json</code> partially satisfy this.)</li>
+<li><strong>A3 Observability</strong> — every long-running operation emits SSE events on a documented agent-accessible channel (separate from the HTMX-driven <code>/events</code> which exists today and remains as the dashboard channel).</li>
+<li><strong>A4 Error envelope</strong> — every failure response includes <code>code</code>, <code>message</code>, <code>correlation_id</code>, <code>retry_after_ms</code> (nullable), <code>remediation</code> (URL or hint, nullable). On <code>kPermissionDenied</code> the envelope names the missing <code>securable_type:operation</code>. On <code>kApprovalRequired</code> the envelope returns <code>approval_id</code> + <code>status_url</code>.</li>
+</ul>
+<p>Each invariant gets one paragraph + an "enforced by" pointer. <code>consistency-auditor</code> agent gets a one-line addition to its trigger list.</p>
+<h3 id="3-readmemd239-edit">3. <code>README.md:239</code> (EDIT)</h3>
+<p>Replace:
+<div class="highlight"><pre><span></span><code>See [`docs/capability-map.md`](docs/capability-map.md) for the complete capability inventory (184 capabilities across 24 domains, 150 done — 82%).
+</code></pre></div></p>
+<p>With a pointer that doesn't restate numbers (numbers drift; the cap map is authoritative):
+<div class="highlight"><pre><span></span><code>See [`docs/capability-map.md`](docs/capability-map.md) for the live capability inventory and progress.
+</code></pre></div></p>
+<h3 id="4-docscapability-mapmd-edit">4. <a href="../capability-map.html" class="doc-ref"><code>docs/capability-map.md</code></a> (EDIT)</h3>
+<p>Two changes only:</p>
+<ul>
+<li><strong>§2.2 (line 131-135)</strong>: remove the false "Gap: No scope/filter-based targeting" — the AttributeResolver in <code>agent_registry.cpp:827-855</code> resolves <code>tag:X</code>, <code>props.X</code>, <code>ostype</code>, <code>hostname</code>, <code>arch</code>, <code>agent_version</code>. Cite the file:line in the surviving paragraph so future readers see the evidence.</li>
+<li><strong>Header note (after line 33)</strong>: add a one-paragraph "scaffolded vs production-quality" caveat — T1/T2 percentages reflect feature presence, not enterprise hardening; the audit report is the source for known gaps. Recompute the "New (Ph 8-14)" line if §2.2's fix shifts the numerator (it doesn't, but check Foundation/Advanced denominators too).</li>
+</ul>
+<h3 id="5-claudemd-edit">5. <code>CLAUDE.md</code> (EDIT)</h3>
+<p>Two additions:</p>
+<ul>
+<li><strong>Glossary block</strong> (insert after the architecture diagram, before "Agent Team &amp; Governance"). Three definitions:</li>
+<li><strong>Agent daemon</strong> — the C++ binary in <code>agents/core/</code></li>
+<li><strong>Governance agent</strong> — the <code>.claude/agents/*.md</code> review actors</li>
+<li><strong>Agentic worker</strong> — an external LLM-driven client of MCP / REST / dashboard</li>
+<li><strong>Routed concerns table</strong> — append rows for the four most consequential currently-unrouted docs:</li>
+<li><a href="../architecture.html" class="doc-ref"><code>docs/architecture.md</code></a> → loaded by <code>architect</code> on cross-cutting design changes</li>
+<li><a href="../asset-tagging-guide.html" class="doc-ref"><code>docs/asset-tagging-guide.md</code></a> → loaded by <code>dsl-engineer</code> on scope/tag-DSL changes</li>
+<li><a href="../agentic-first-principle.html" class="doc-ref"><code>docs/agentic-first-principle.md</code></a> → loaded by <code>consistency-auditor</code> on every PR (new invariant gate)</li>
+<li><code>docs/tachyon-parity-plan.md</code> → loaded by <code>architect</code> on capability-map / roadmap changes</li>
+</ul>
+<p>Do <strong>not</strong> add the user-manual docs to routing — they're user-facing and load via <code>docs-writer</code> already.</p>
+<h3 id="6-docsroadmapmd-edit-append-only">6. <a href="../roadmap.html" class="doc-ref"><code>docs/roadmap.md</code></a> (EDIT — append-only)</h3>
+<p>After "Phase 14: Scale &amp; Enterprise Readiness" and before "Open Decisions" (line 1483), add a <code>## Proposed Phase 15+: Agentic Surface &amp; Compliance Tracks</code> section with:</p>
+<ul>
+<li><strong>Phase 15 Agentic Surface Hardening</strong> — items extracted from the audit's P1 list:</li>
+<li>15.1 Introspection endpoints (<code>/api/v1/discover/*</code>)</li>
+<li>15.2 Dashboard JSON content negotiation</li>
+<li>15.3 Agent-facing authenticated SSE</li>
+<li>15.4 Service-account principal type</li>
+<li>15.5 Structured error envelope rev</li>
+<li><strong>Phase 16 Compliance &amp; Lifecycle</strong> — capabilities currently absent:</li>
+<li>16.1 Vulnerability lifecycle (CVE → CVSS → remediation owner → SLA)</li>
+<li>16.2 CIS / NIST / SOC 2 evidence-pack templates</li>
+<li>16.3 Certificate lifecycle (auto-renewal, expiry alerts)</li>
+<li>16.4 Secrets-vault integration (HashiCorp / Azure KV / AWS SM)</li>
+<li>16.5 SBOM ingest &amp; component-level vuln linkage</li>
+<li>16.6 Hardware attestation (TPM / Secure Boot / UEFI)</li>
+<li><strong>Out of scope</strong> — short list with rationale: MDM (mobile), OS imaging / PXE, EDR-class telemetry at the agent (integrate via Phase 9 connectors instead).</li>
+</ul>
+<p>Mark every item Status: <strong>Proposed</strong> so they aren't conflated with planned work.</p>
+<h3 id="7-servercoresrcmcp_servercpp227-edit">7. <code>server/core/src/mcp_server.cpp:227</code> (EDIT)</h3>
+<p>Fix the misleading comment. Currently:
+<div class="highlight"><pre><span></span><code>//   Implemented: set_tag, delete_tag, execute_instruction
+//   Planned:     approve_request, reject_request, quarantine_device
+</code></pre></div>
+Replace with:
+<div class="highlight"><pre><span></span><code>//   Implemented dispatch: execute_instruction (line 1313)
+//   Security-mapped but no dispatch yet (Issue 13.5): set_tag, delete_tag,
+//   approve_request, reject_request, quarantine_device
+</code></pre></div>
+This is the only change to a <code>.cpp</code> file in this PR. It makes the static map's reality match the runtime dispatch chain.</p>
+<h2 id="order-of-operations">Order of operations</h2>
+<ol>
+<li>Write <a href="../agentic-first-principle.html" class="doc-ref"><code>docs/agentic-first-principle.md</code></a> first (it's referenced by the audit and the routing table).</li>
+<li>Write <a href="../capability-agentic-audit-2026-05.html" class="doc-ref"><code>docs/capability-agentic-audit-2026-05.md</code></a> second (cites the principle doc).</li>
+<li>Apply the four edit-files in any order: README, capability-map, CLAUDE.md, roadmap, mcp_server.cpp comment.</li>
+<li>Verify per the checklist below, then commit + push to <code>claude/refine-local-plan-0io2A</code>.</li>
+</ol>
+<h2 id="critical-files-functions-to-reuse-do-not-duplicate">Critical files / functions to reuse (do not duplicate)</h2>
+<ul>
+<li><code>kTools[]</code> and <code>kToolSecurity</code> (<code>server/core/src/mcp_server.cpp:120-274</code>) — cite, don't reimplement.</li>
+<li><code>AttributeResolver</code> (<code>server/core/src/scope_engine.hpp:60</code>) and its agent_registry instantiation (<code>agent_registry.cpp:827-855</code>) — the canonical proof that <code>tag:X</code> works.</li>
+<li><code>openapi_spec()</code> (<code>server/core/src/rest_api_v1.cpp:165</code>) — already exposes the REST surface; future P1.3 introspection endpoints should source from this rather than re-walking handlers.</li>
+<li><code>SseEvent</code> / <code>event_bus_</code> (<code>server/core/src/server.cpp:2200-2228</code>) — agent-facing SSE in P1 should reuse this bus rather than introducing a parallel one.</li>
+<li><code>consistency-auditor</code> agent (<a href="../../.claude/agents/consistency-auditor.html" class="doc-ref"><code>.claude/agents/consistency-auditor.md</code></a>) — the audit's A1–A4 invariants extend its existing remit; do not create a new agent.</li>
+</ul>
+<h2 id="verification">Verification</h2>
+<p>End-to-end checks before committing:</p>
+<ol>
+<li><code>grep -E "184|82%" README.md</code> returns 0 matches outside the version-history section.</li>
+<li><code>grep -E "No scope/filter" docs/capability-map.md</code> returns 0 matches.</li>
+<li><code>grep -nE "agent daemon|governance agent|agentic worker" CLAUDE.md</code> returns ≥3 hits in the new glossary block.</li>
+<li><code>grep -E "Phase 15|Phase 16" docs/roadmap.md</code> returns the new "Proposed" entries.</li>
+<li><code>grep -nE "Implemented:" server/core/src/mcp_server.cpp</code> returns the corrected comment with no claim of <code>set_tag</code>/<code>delete_tag</code> dispatch.</li>
+<li>Every claim in the audit report that says "code does X" is followed by <code>(file.cpp:LINE)</code> — spot-check 5 random claims to confirm.</li>
+<li><code>meson compile -C build-linux</code> succeeds (the only code edit is a comment; this should be trivially true, but verify because comment edits can still trip ccache invalidation).</li>
+<li>No new test failures: <code>meson test -C build-linux --suite server --print-errorlogs</code> passes (also expected to be a no-op given the change set, but run it to be sure).</li>
+<li><a href="../agentic-first-principle.html" class="doc-ref"><code>docs/agentic-first-principle.md</code></a> is reachable from <code>CLAUDE.md</code> routed-concerns table.</li>
+<li>The audit report's "Verified inconsistencies" table file:line citations all resolve (open each one to confirm).</li>
+</ol>
+<p>End-to-end semantic check: a fresh reader who reads only the new audit report should be able to (a) identify the three highest-impact agentic gaps, (b) find the existing Issue 13.5 covering MCP Phase 2, (c) understand which capability-map gap claims are doc bugs vs real gaps, and (d) recognise the four agentic-first invariants without needing to read the principle doc.</p>
+<h2 id="out-of-scope-for-this-pr">Out of scope for this PR</h2>
+<ul>
+<li>Implementing any of the P1 items (introspection, dashboard JSON, agent SSE, service accounts, error envelope) — those become roadmap issues 15.1–15.5.</li>
+<li>Implementing Phase 13.5 MCP write tools — already a roadmap issue.</li>
+<li>Filing the actual GitHub issues for proposed Phases 15–16 — list them in the audit; let the user decide when to file.</li>
+<li>Securing the unauthenticated <code>/events</code> endpoint — note in the audit as a security follow-up, do not fix here.</li>
+<li>Reconciling the README's broader content beyond the capability count line.</li>
+<li>Editing user-manual docs.</li>
+</ul>
+</main>
+</body>
+</html>

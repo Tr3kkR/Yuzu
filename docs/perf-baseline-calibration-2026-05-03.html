@@ -1,0 +1,687 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gateway perf baseline calibration — N=300 (2026-05-03)</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/perf-baseline-calibration-2026-05-03.md</div>
+<h1 class="doc-title">Gateway perf baseline calibration — N=300 (2026-05-03)</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="gateway-perf-baseline-calibration-n300-2026-05-03">Gateway perf baseline calibration — N=300 (2026-05-03)</h1>
+<p><strong>Status:</strong> evidence captured; gate moved to measure-and-report;
+percentile-based redesign deferred. The data shows that algorithmic
+σ-bounding is the wrong tool for 3 of the 4 gateway perf metrics.
+Until the gate is rebuilt around the right primitives (percentile
+floors for ceiling-bounded metrics, deterministic measurement for
+the cleanup race), <code>scripts/test/perf-gate.sh</code> records <code>perf_*</code>
+metrics into the test-runs DB and exits PASS — no baseline file, no
+regression check. Operators inspect the numbers in context: trend
+via <code>bash scripts/test/test-db-query.sh --trend timing=phase7.perf</code>,
+shape via <code>python3 scripts/test/perf-histograms.py</code> (gitignored
+scratch tool) against a fresh capture, and the inline histograms
+below for the empirical reference distributions.</p>
+<h2 id="method">Method</h2>
+<ul>
+<li>300 sequential runs of <code>scripts/test/perf-sample.sh</code>, label
+  <code>v0.12.0-baseline-calibration</code>, on Shulgi (5950X, 47 GB).</li>
+<li>Wall clock: 2026-05-02T23:00:00Z → 2026-05-03T04:16:51Z (5h 17min).</li>
+<li>Box held quiet — CI cancelled, UAT down, no overlapping load.</li>
+<li>Stage gate: <code>tests/perf-baseline-provenance-N300.jsonl.done</code>
+  records exit=0, n=300/300.</li>
+<li>Raw data: <code>tests/perf-baseline-provenance-N300.jsonl</code>
+  (one JSON object per run).</li>
+<li>Derived stats: <code>tests/perf-baseline-provenance-N300.json</code>
+  (perf-stats.py output).</li>
+</ul>
+<h2 id="distributions">Distributions</h2>
+<div class="highlight"><pre><span></span><code>┌─ burst_registration_ops_sec  n=300  μ=16,777  σ=1,659  CV=9.89%  skew=-0.77  kurt-3=-0.26  range=[10,661, 18,868]
+│   35 │                                                      █▃    │
+│   32 │                                                      ██    │
+│   29 │                                                      ██    │
+│   25 │                                                      ██    │
+│   22 │                                                      ██▂   │
+│   19 │                                                     ▃███   │
+│   16 │                                                    ▁████   │
+│   13 │                                                    █████▄  │
+│   10 │                        ▄   ▇   ▄▄ ▄ ▇▂       ▂     ██████▂ │
+│    6 │                     ▅ ▂█▇ ▂█▇  ██▂█ ██▅ ▅▅▇▅▂█▂▇   ███████ │
+│    3 │▃    ▃ ▃          ▃  █▅███▃█████████████████████████████████│
+│      └────────────────────────────────────────────────────────────┘
+│       10,661                        14,764                  18,868
+└─────────────────────────────────────────────────────────────────────
+
+┌─ heartbeat_queue_ops_sec  n=300  μ=2,725,650  σ=175,783  CV=6.45%  skew=+0.11  kurt-3=-0.33  range=[2,255,300, 3,231,018]
+│   17 │                            █                               │
+│   15 │                            █                               │
+│   14 │                          ▃ █                               │
+│   12 │                  ▁  ▆  ▁ █▁█▆ ▆  ▆                         │
+│   11 │                 ▄█  █  █ ████ █▄ █                         │
+│    9 │             ▁   ██▇▁█▁ █ ████▁██ █ ▇▁    ▇  ▇              │
+│    8 │             █   ██████ █ ███████ █ ██   ▄█  █              │
+│    6 │          ▂  █▂  ██████▂█ ███████▇█▂██▇▇ ██  █              │
+│    5 │        ▅ █ ▅██  ████████▅██████████████ ██▅ █  ▅           │
+│    3 │      ▂ █ █ ██████████████████████████████████  ██  █       │
+│    2 │▅ ▅ ▅ █ █ █ ██████████████████████████████████ ▅██▅▅█    ▅ ▅│
+│      └────────────────────────────────────────────────────────────┘
+│       2,255,300                     2,743,159            3,231,018
+└─────────────────────────────────────────────────────────────────────
+
+┌─ registration_ops_sec  n=300  μ=18,546  σ=980.356  CV=5.29%  skew=-1.74  kurt-3=+2.18  range=[14,925, 19,608]
+│   26 │                                                   █  █     │
+│   24 │                                                  ▆█ ▂█     │
+│   21 │                                                  ██▁██▇    │
+│   19 │                                                ▂ ██████    │
+│   17 │                                                █ ██████    │
+│   14 │                                                █ ██████▁   │
+│   12 │                                              ▅ █▅███████▅  │
+│    9 │                                              █▃██████████▆ │
+│    7 │                                        ▁    ▁█████████████▄│
+│    5 │         ▂  ▆         ▆          ▂   ▂ ▂█ ▂▂▂███████████████│
+│    2 │▃    ▃▃▃▃█ ▃█▃▃▃▃▇ ▃▇▇█▃▇▃▇▇▇▇▃ ▃█▃▇▇█▇██▃██████████████████│
+│      └────────────────────────────────────────────────────────────┘
+│       14,925                        17,266                  19,608
+└─────────────────────────────────────────────────────────────────────
+
+┌─ session_cleanup_ms_per_agent  n=300  μ=0.05066  σ=0.00580  CV=11.45%  skew=-8.44  kurt-3=+69.47  range=[0.00084, 0.05224]
+│  170 │                                                          █ │
+│  155 │                                                          █ │
+│  139 │                                                          █▁│
+│  124 │                                                          ██│
+│  108 │                                                          ██│
+│   93 │                                                          ██│
+│   77 │                                                          ██│
+│   62 │                                                          ██│
+│   46 │                                                          ██│
+│   31 │                                                          ██│
+│   15 │▂                                                        ▁██│
+│      └────────────────────────────────────────────────────────────┘
+│       0.00084                       0.02654                0.05224
+└─────────────────────────────────────────────────────────────────────
+</code></pre></div>
+<h2 id="per-metric-reading">Per-metric reading</h2>
+<table>
+<thead>
+<tr>
+<th>metric</th>
+<th style="text-align: right;">within 5% of max</th>
+<th>shape</th>
+<th>character</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>burst_registration_ops_sec</code></td>
+<td style="text-align: right;">40%</td>
+<td>loose ceiling, mild left tail</td>
+<td>mostly ceiling-bounded</td>
+</tr>
+<tr>
+<td><code>heartbeat_queue_ops_sec</code></td>
+<td style="text-align: right;">2.3%</td>
+<td>symmetric, smooth shoulders</td>
+<td><strong>genuinely Gaussian</strong></td>
+</tr>
+<tr>
+<td><code>registration_ops_sec</code></td>
+<td style="text-align: right;">70%</td>
+<td>sharp peak right of mean, long sparse left tail</td>
+<td><strong>hard ceiling at ~19,200</strong></td>
+</tr>
+<tr>
+<td><code>session_cleanup_ms_per_agent</code></td>
+<td style="text-align: right;">98.7%</td>
+<td>floor-bounded (smaller=better) plus a single race outlier</td>
+<td><strong>measurement bug</strong></td>
+</tr>
+</tbody>
+</table>
+<h3 id="heartbeat_queue_ops_sec-gaussian"><code>heartbeat_queue_ops_sec</code> — Gaussian</h3>
+<p>280 distinct values out of 300, near-symmetric, well within the
+normality bands (|skew| &lt; 3·SE_skew = 0.42, |kurt-3| &lt; 3·SE_kurt =
+0.84). The bucket-fix <code>c9e6b0f</code> is doing what it was supposed to —
+the metric used to quantize into 3 buckets ({2.22M, 2.5M, 2.86M}) and
+now spans the full range smoothly. This metric is the only one where
+σ-bounding is statistically defensible.</p>
+<h3 id="registration_ops_sec-ceiling-bounded-not-gaussian"><code>registration_ops_sec</code> — ceiling-bounded, NOT Gaussian</h3>
+<p>70% of samples within 5% of max, modal cluster at 18,940-19,230
+operations/sec. The system has a structural ceiling around 19,200 ops/sec
+under this benchmark configuration; the long left tail isn't a feature
+of the underlying performance distribution, it's a record of how often
+something interrupted (GC, scheduler tick, OS noise). σ-bounding here
+would conflate "system capability" with "frequency of contention" and
+produce an upper band that is unreachable. The right way to gate this
+is on a percentile floor: <code>p5 ≥ baseline_p5 × (1 - tolerance)</code> catches
+ceiling drops without false-positive flapping from noise.</p>
+<h3 id="burst_registration_ops_sec-loose-ceiling"><code>burst_registration_ops_sec</code> — loose ceiling</h3>
+<p>Less concentrated than <code>registration</code> (40% within 5% of max vs 70%)
+but the same shape: right-side peak, asymmetric left tail. Skew -0.77
+is ~5× SE, outside the normality band but mild. CV is 9.9% — broad
+enough that σ-bounds wouldn't be tight anyway. Same percentile-floor
+treatment as <code>registration</code>.</p>
+<h3 id="session_cleanup_ms_per_agent-measurement-race"><code>session_cleanup_ms_per_agent</code> — measurement race</h3>
+<p>98.7% of samples within 5% of the maximum (which is the modal
+"normal" value of ~0.05 ms/agent). The single outlier at 0.00084 ms
+(50× lower than every other sample) drives skew=-8.44, kurt=+70.2.
+This is not the distribution of cleanup time — it is the distribution
+of one race condition firing once in 300 trials. Diagnosed in the
+N=20 trial: <code>wait_for_registry_count(0, _)</code> polls the global ETS
+table size, which has an <code>undefined → 0</code> fallback path that returns
+instantly if the table is briefly inaccessible at test boundaries.
+Fix design (per-pid <code>monitor</code>s + <code>wait_for_n_downs/1</code> + a
+<code>gen_server:call(yuzu_gw_registry, sync, infinity)</code> barrier) is
+documented in the previous-session handover. This metric should not
+be gated until that fix lands.</p>
+<h2 id="why-bounding-is-wrong-for-ceiling-bounded-metrics">Why σ-bounding is wrong for ceiling-bounded metrics</h2>
+<p>A ceiling-bounded distribution is the joint of two things: a
+deterministic upper bound (system capability under no contention)
+and a stochastic process (how often something contends). The
+standard <code>mean ± k·σ</code> interval models neither well:</p>
+<ol>
+<li><strong>Mean is biased downward</strong> by the noise tail and is not the
+   number anyone cares about — ideal-conditions throughput is the
+   modal value, not the average.</li>
+<li><strong>σ encodes noise frequency, not system performance.</strong> A
+   regression that lowers the ceiling 5% can leave the mean almost
+   unchanged if the long tail still dominates the variance —
+   exactly the regression the gate is supposed to catch.</li>
+<li><strong>The upper k·σ bound is unreachable.</strong> The system cannot
+   exceed the ceiling, so the upper half of the band is dead weight.</li>
+</ol>
+<p>The right primitive for ceiling-bounded throughput is a <strong>percentile
+floor</strong>: <code>assert pNN &gt;= baseline_pNN * (1 - tolerance)</code>. p5 catches
+"the system got slower under contention"; p99 catches "the ceiling
+itself moved." Both are robust to single-sample outliers.</p>
+<p>For floor-bounded latency (smaller=better, like
+<code>session_cleanup_ms_per_agent</code>), the symmetric primitive is a
+<strong>percentile ceiling</strong>: <code>assert pNN &lt;= baseline_pNN * (1 + tolerance)</code>.</p>
+<h2 id="deferred-deterministic-measurement-design-for-session_cleanup">Deferred: deterministic-measurement design for <code>session_cleanup</code></h2>
+<p>The current <code>session_cleanup_latency</code> test polls
+<code>yuzu_gw_registry:agent_count() = ets:info(?TABLE, size)</code> and waits for
+the global aggregate to drop to zero. Two known failure modes:</p>
+<ol>
+<li><code>agent_count/0</code> has an <code>undefined → 0</code> silent fallback. If the ETS
+   table is briefly inaccessible at a CT init/teardown boundary, the
+   first poll reads 0 and the wait returns instantly — measured time
+   ~1 µs, physically impossible for 1000 processes.</li>
+<li>The 50 ms polling granularity coarsens the measurement, and the
+   global counter doesn't tell us <em>our</em> N agents specifically were
+   cleaned up — only that the size happens to read 0.</li>
+</ol>
+<p>Replacement design — set up our own monitors so the signal is private
+to this test, drain N DOWN messages directly, then sync with the
+registry's mailbox via <code>gen_server:call</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="nf">session_cleanup_latency</span><span class="p">(_</span><span class="nv">Config</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">    </span><span class="nv">N</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">min</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span><span class="w"> </span><span class="nn">yuzu_gw_perf_helpers</span><span class="p">:</span><span class="nf">get_env</span><span class="p">(</span><span class="s">&quot;YUZU_PERF_CHURN_AGENTS&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">5000</span><span class="p">)),</span>
+<span class="w">    </span><span class="p">{</span><span class="nv">Pids</span><span class="p">,</span><span class="w"> </span><span class="nv">Ids</span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">yuzu_gw_perf_helpers</span><span class="p">:</span><span class="nf">spawn_and_register</span><span class="p">(</span><span class="nv">N</span><span class="p">,</span><span class="w"> </span><span class="p">...),</span>
+<span class="w">    </span><span class="o">?</span><span class="n">assertEqual</span><span class="p">(</span><span class="nv">N</span><span class="p">,</span><span class="w"> </span><span class="nn">yuzu_gw_registry</span><span class="p">:</span><span class="nf">agent_count</span><span class="p">()),</span>
+
+<span class="w">    </span><span class="c">%% 1. Set up our own monitors so we have a private signal</span>
+<span class="w">    </span><span class="c">%%    independent of the registry&#39;s monitor_refs map.</span>
+<span class="w">    </span><span class="nv">Refs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[{</span><span class="nn">erlang</span><span class="p">:</span><span class="nb">monitor</span><span class="p">(</span><span class="n">process</span><span class="p">,</span><span class="w"> </span><span class="nv">Pid</span><span class="p">),</span><span class="w"> </span><span class="nv">Pid</span><span class="p">}</span><span class="w"> </span><span class="p">||</span><span class="w"> </span><span class="nv">Pid</span><span class="w"> </span><span class="o">&lt;-</span><span class="w"> </span><span class="nv">Pids</span><span class="p">],</span>
+
+<span class="w">    </span><span class="p">{</span><span class="nv">CleanupUs</span><span class="p">,</span><span class="w"> </span><span class="p">_}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">yuzu_gw_perf_helpers</span><span class="p">:</span><span class="nf">measure_wall_clock_us</span><span class="p">(</span><span class="k">fun</span><span class="p">()</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">        </span><span class="c">%% 2. Fire the kills (async signals).</span>
+<span class="w">        </span><span class="nn">lists</span><span class="p">:</span><span class="nf">foreach</span><span class="p">(</span><span class="k">fun</span><span class="p">(</span><span class="nv">Pid</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="nb">exit</span><span class="p">(</span><span class="nv">Pid</span><span class="p">,</span><span class="w"> </span><span class="n">kill</span><span class="p">)</span><span class="w"> </span><span class="k">end</span><span class="p">,</span><span class="w"> </span><span class="nv">Pids</span><span class="p">),</span>
+
+<span class="w">        </span><span class="c">%% 3. Wait for OUR N DOWNs — proves every agent process has</span>
+<span class="w">        </span><span class="c">%%    terminated from the BEAM&#39;s perspective.</span>
+<span class="w">        </span><span class="n">wait_for_n_downs</span><span class="p">(</span><span class="nb">length</span><span class="p">(</span><span class="nv">Refs</span><span class="p">)),</span>
+
+<span class="w">        </span><span class="c">%% 4. Sync barrier with the registry. gen_server:call queues</span>
+<span class="w">        </span><span class="c">%%    behind every prior info/cast, so once this returns the</span>
+<span class="w">        </span><span class="c">%%    registry has processed every DOWN that arrived before</span>
+<span class="w">        </span><span class="c">%%    our call. (Requires a one-line `handle_call(sync, ...)`</span>
+<span class="w">        </span><span class="c">%%    on yuzu_gw_registry.)</span>
+<span class="w">        </span><span class="n">ok</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">gen_server</span><span class="p">:</span><span class="nf">call</span><span class="p">(</span><span class="n">yuzu_gw_registry</span><span class="p">,</span><span class="w"> </span><span class="n">sync</span><span class="p">,</span><span class="w"> </span><span class="n">infinity</span><span class="p">),</span>
+
+<span class="w">        </span><span class="c">%% 5. Confirm every Id we registered is gone from ETS — via a</span>
+<span class="w">        </span><span class="c">%%    direct read that bypasses lookup/1&#39;s is_process_alive</span>
+<span class="w">        </span><span class="c">%%    filter (which can fool us when the entry exists but the</span>
+<span class="w">        </span><span class="c">%%    pid is dead).</span>
+<span class="w">        </span><span class="o">?</span><span class="n">assert</span><span class="p">(</span><span class="nn">lists</span><span class="p">:</span><span class="nf">all</span><span class="p">(</span><span class="k">fun</span><span class="p">(</span><span class="nv">Id</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">            </span><span class="nn">ets</span><span class="p">:</span><span class="nf">lookup</span><span class="p">(</span><span class="n">yuzu_gw_registry_table</span><span class="p">,</span><span class="w"> </span><span class="nv">Id</span><span class="p">)</span><span class="w"> </span><span class="o">=:=</span><span class="w"> </span><span class="p">[]</span>
+<span class="w">        </span><span class="k">end</span><span class="p">,</span><span class="w"> </span><span class="nv">Ids</span><span class="p">))</span>
+<span class="w">    </span><span class="k">end</span><span class="p">),</span>
+
+<span class="w">    </span><span class="nv">MsPerAgent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="nv">CleanupUs</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1000</span><span class="p">.</span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="nv">N</span><span class="p">,</span>
+<span class="w">    </span><span class="nn">ct</span><span class="p">:</span><span class="nf">pal</span><span class="p">(</span><span class="s">&quot;Cleanup </span><span class="si">~B</span><span class="s"> agents: </span><span class="si">~B</span><span class="s"> us (</span><span class="si">~.5f</span><span class="s"> ms/agent)&quot;</span><span class="p">,</span>
+<span class="w">           </span><span class="p">[</span><span class="nv">N</span><span class="p">,</span><span class="w"> </span><span class="nv">CleanupUs</span><span class="p">,</span><span class="w"> </span><span class="nv">MsPerAgent</span><span class="p">]).</span>
+
+<span class="nf">wait_for_n_downs</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">ok</span><span class="p">;</span>
+<span class="nf">wait_for_n_downs</span><span class="p">(</span><span class="nv">N</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">    </span><span class="k">receive</span>
+<span class="w">        </span><span class="p">{</span><span class="n">&#39;DOWN&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">_</span><span class="nv">Ref</span><span class="p">,</span><span class="w"> </span><span class="n">process</span><span class="p">,</span><span class="w"> </span><span class="p">_</span><span class="nv">Pid</span><span class="p">,</span><span class="w"> </span><span class="p">_</span><span class="nv">Reason</span><span class="p">}</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">            </span><span class="n">wait_for_n_downs</span><span class="p">(</span><span class="nv">N</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span>
+<span class="w">    </span><span class="k">after</span><span class="w"> </span><span class="mi">30000</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">        </span><span class="nn">erlang</span><span class="p">:</span><span class="nf">error</span><span class="p">({</span><span class="n">timeout</span><span class="p">,</span><span class="w"> </span><span class="n">awaiting_downs</span><span class="p">,</span><span class="w"> </span><span class="nv">N</span><span class="p">})</span>
+<span class="w">    </span><span class="k">end</span><span class="p">.</span>
+</code></pre></div>
+<p>Required complementary changes:</p>
+<ul>
+<li><code>yuzu_gw_registry:handle_call(sync, _, S) -&gt; {reply, ok, S}</code> —
+  one line, no functional change. Canonical Erlang flush-mailbox
+  idiom; consider exporting a <code>sync/0</code> helper for clarity.</li>
+<li>Optional: split the timing into two metrics — "BEAM termination"
+  (kill to our DOWN) vs "registry mailbox latency" (our DOWN to
+  sync reply). Useful for diagnosing future regressions.</li>
+<li>Optional but desirable: fix <code>agent_count/0</code> to remove the
+  <code>undefined → 0</code> silent fallback. If the table genuinely doesn't
+  exist, that's a programming error and should crash, not return 0.</li>
+</ul>
+<h2 id="deferred-work">Deferred work</h2>
+<p>When perf gates are revisited:</p>
+<ol>
+<li><strong>Land the deterministic-measurement fix above first</strong>, then
+   re-capture N=300 for <code>session_cleanup_ms_per_agent</code>. The other
+   3 metrics don't need re-capture — their distributions are
+   characterised.</li>
+<li><strong>Add a percentile method to <code>tests/perf-baselines.json</code>.</strong> The
+   schema currently supports <code>sigma</code> and percentage; add <code>percentile</code>
+   with <code>pct</code>, <code>direction</code> (<code>&gt;=</code>/<code>&lt;=</code>), and <code>tolerance_pct</code>. Migrate
+   <code>registration_ops_sec</code> and <code>burst_registration_ops_sec</code> to it.</li>
+<li><strong>Keep <code>heartbeat_queue_ops_sec</code> on σ-bound</strong> — it's the only one
+   that fits the Gaussian assumption.</li>
+<li><strong>Keep the histogram tool gitignored unless we wire it into the
+   perf gate output.</strong> If the gate ever runs N≥30 samples per
+   invocation, <code>scripts/test/perf-histograms.py</code> should print the
+   shape so the operator can eyeball regressions; until then it's a
+   manual diagnostic.</li>
+</ol>
+<h2 id="references">References</h2>
+<ul>
+<li>Issue #530 — single-sample baseline + 10% tolerance produces spurious FAILs</li>
+<li>Issue #738 — establish academically credible distribution for gateway perf</li>
+<li>Commit <code>c9e6b0f</code> — heartbeat_queue / session_cleanup metric resolution fix</li>
+<li>Commit <code>199bb4b</code> — initial σ-tolerance for <code>burst_registration</code> (revisit
+  per the deferred-work item above; σ is not the right primitive for it)</li>
+<li><code>scripts/test/perf-sample.sh</code> — sampler</li>
+<li><code>scripts/test/perf-stats.py</code> — distributional stats from JSONL</li>
+<li><code>scripts/test/perf-histograms.py</code> — ASCII histograms (gitignored,
+  reproduce locally as needed)</li>
+</ul>
+</main>
+</body>
+</html>

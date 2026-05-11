@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>release</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">.claude/skills/release/SKILL.md</div>
+<h1 class="doc-title">release</h1>
+<nav class="doc-nav"><a href="../../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<details open class="frontmatter"><summary>Frontmatter</summary><pre><code>name: release
+description: Cut a Yuzu release end-to-end. Runs preflight checks, validates compose-file version pins, pushes the tag, monitors the release workflow until artifacts publish, troubleshoots known failure modes (artifact download bugs, version mismatch, Windows signing, macOS notarization), verifies the GitHub Releases page has every expected asset including the Compose Wizard zip, and produces a release record. Use when the user says &quot;/release vX.Y.Z&quot; or asks to cut a release.</code></pre></details>
+<h1 id="release">release</h1>
+<p>Runbook for cutting a Yuzu release. Like <code>/test</code>, this skill is a <strong>bash-first orchestrator</strong> — each phase is one or more shell invocations the LLM executes via <code>Bash</code>. The LLM's job is to interpret failures, decide whether to continue or roll back, and produce the consolidated release report at the end.</p>
+<p>Releases publish to two destinations from one tag push:
+1. <strong>GitHub Releases page</strong> — platform tarballs/zips, .deb/.rpm packages, Windows/.macOS installers, SHA256SUMS + cosign signature, and the Compose Wizard zip
+2. <strong>GHCR</strong> — <code>ghcr.io/&lt;owner&gt;/yuzu-server:X.Y.Z</code> and <code>:yuzu-gateway:X.Y.Z</code> Docker images. <strong>NOTE: GHCR tags strip the leading <code>v</code></strong> — git tag is <code>v0.12.0-rc0</code>, GHCR image tag is <code>0.12.0-rc0</code>. The release workflow's <code>docker buildx push</code> step strips the prefix; verification commands must match.</p>
+<p>Both go out from <code>.github/workflows/release.yml</code>, triggered by <code>git push origin vX.Y.Z</code>.</p>
+<h2 id="usage">Usage</h2>
+<div class="highlight"><pre><span></span><code>/release vX.Y.Z              # stable release (e.g. v0.11.0)
+/release vX.Y.Z-rcN          # release candidate (e.g. v0.11.0-rc1)
+/release --watch vX.Y.Z      # only monitor an in-flight release
+/release --verify vX.Y.Z     # only verify a published release
+/release --resume vX.Y.Z     # tag exists and CI started — pick up where workflow stalled
+</code></pre></div>
+<p>Default mode (no flag): full pipeline from preflight → tag push → workflow monitor → verification.</p>
+<h2 id="pre-conditions-the-operator-must-confirm">Pre-conditions the operator must confirm</h2>
+<p>Before invoking the skill, the operator should already have:
+- All commits intended for this release merged to <code>main</code> (releases tag from main, not dev — confirm <code>git log origin/main..origin/dev</code> is empty or only contains intentional dev-only changes).
+- CHANGELOG <code>[Unreleased]</code> section content moved to <code>## [X.Y.Z] - YYYY-MM-DD</code>.
+- <code>meson.build</code> <code>version: 'X.Y.Z'</code> updated.
+- All tracked compose files updated to <code>${YUZU_VERSION:-&lt;BASE_VERSION&gt;}</code> defaults — the <strong>base</strong> version with any <code>-rcN</code>/<code>-betaN</code> suffix stripped (e.g., for tag <code>v0.12.0-rc0</code> the default is <code>0.12.0</code>, NOT <code>0.12.0-rc0</code>). The workflow's <code>Validate docker-compose image versions</code> gate inside the <code>Create Release</code> job invokes <code>bash scripts/check-compose-versions.sh "$BASE_VERSION"</code> and will hard-fail the release after the full build matrix has run if the defaults don't match. Local dry-run <strong>must use the same base version</strong>: <code>bash scripts/check-compose-versions.sh 0.12.0</code> (NOT <code>0.12.0-rc0</code>) — the script accepts whatever you pass and is happy with consistent garbage, so passing the rc-suffixed version locally green-lights a doomed release. Preflight (<code>scripts/release-preflight.sh</code>) does the right thing automatically because it strips the suffix internally; the lesson from v0.12.0-rc0's first cut was that local one-off <code>check-compose-versions.sh</code> invocations are misleading on RC tags.</p>
+<p>If any of these are missing, the skill prompts the operator to fix-and-commit-and-push before continuing. <strong>It does NOT auto-bump versions</strong> — bumping is a deliberate decision (which X, which Y, which Z) the operator owns.</p>
+<h2 id="phase-0-preflight-30-sec">Phase 0 — Preflight (~30 sec)</h2>
+<p>Run from the repo root on <code>main</code> (or whatever branch is being tagged):</p>
+<div class="highlight"><pre><span></span><code>git<span class="w"> </span>fetch<span class="w"> </span>origin
+git<span class="w"> </span>status<span class="w"> </span>-sb<span class="w">                                    </span><span class="c1"># confirm branch + clean tree</span>
+bash<span class="w"> </span>scripts/release-preflight.sh<span class="w"> </span>vX.Y.Z<span class="w">          </span><span class="c1"># CRLF, version, CHANGELOG, compose pins</span>
+bash<span class="w"> </span>scripts/check-compose-versions.sh<span class="w"> </span>X.Y.Z<span class="w">      </span><span class="c1"># explicit compose check (preflight wraps this too)</span>
+</code></pre></div>
+<p>Preflight checks:
+1. No CRLF in scripts or gateway config
+2. <code>meson.build</code> version matches the base version of the tag (rc/beta suffix stripped)
+3. CHANGELOG has a <code>## [X.Y.Z]</code> section with non-empty content
+4. Working tree is clean
+5. <code>Dockerfile.server</code> includes <code>--data-dir</code>
+6. All <code>actions/cache@v*</code> steps in release.yml have <code>save-always: true</code>
+7. <code>docker-compose.full-uat.yml</code> includes <code>--data-dir</code>
+8. <code>origin/dev</code> and <code>origin/main</code> are reconciled (no divergence either direction)</p>
+<p>Optional <code>--full</code> adds a local C++ + Erlang compile (~2 min).</p>
+<p><strong>Stop</strong> if preflight fails. Surface the failures and ask the operator how to proceed (commit fixes? bump versions? abort?).</p>
+<h2 id="phase-05-branch-reconciliation-only-when-preflight-check-8-fails">Phase 0.5 — Branch reconciliation (only when preflight check #8 fails)</h2>
+<p>Releases tag from <code>main</code>, but ongoing development happens on <code>dev</code>. Every prior release has hit the same trap: <code>dev</code> accumulates dozens of merged commits, and the prior release's prep commits (CHANGELOG bump, version stamp) land directly on <code>main</code> without being cherry-picked back to <code>dev</code>. By the time the next release is cut, both branches are diverged in both directions and the operator has to remember to reconcile.</p>
+<p>The preflight's check #8 surfaces this as a hard FAIL with the exact ahead/behind counts. Reconciliation flow:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Diagnose what&#39;s where</span>
+git<span class="w"> </span>log<span class="w"> </span>--oneline<span class="w"> </span>origin/dev..origin/main<span class="w">    </span><span class="c1"># commits on main, not on dev (usually 1-3 release-prep commits)</span>
+git<span class="w"> </span>log<span class="w"> </span>--oneline<span class="w"> </span>origin/main..origin/dev<span class="w">    </span><span class="c1"># commits on dev, not on main (usually all the merged work)</span>
+
+<span class="c1"># Step 1 — apply main&#39;s missing commits to dev (cherry-pick or merge).</span>
+<span class="c1"># Cherry-pick is usually right when main only has a CHANGELOG bump from the prior release:</span>
+git<span class="w"> </span>checkout<span class="w"> </span>dev
+git<span class="w"> </span>cherry-pick<span class="w"> </span>origin/dev..origin/main
+<span class="c1"># Resolve any CHANGELOG conflicts; commit; push:</span>
+git<span class="w"> </span>push<span class="w"> </span>origin<span class="w"> </span>dev
+
+<span class="c1"># Step 2 — fast-forward main to the new dev tip (now contains both halves).</span>
+<span class="c1"># This is the safer path than `git checkout main &amp;&amp; git merge dev` because it</span>
+<span class="c1"># refuses if main ever diverges from dev again. After step 1, the FF should</span>
+<span class="c1"># succeed cleanly:</span>
+git<span class="w"> </span>checkout<span class="w"> </span>main
+git<span class="w"> </span>merge<span class="w"> </span>--ff-only<span class="w"> </span>origin/dev
+git<span class="w"> </span>push<span class="w"> </span>origin<span class="w"> </span>main
+
+<span class="c1"># Step 3 — re-run preflight. Check #8 should now PASS.</span>
+bash<span class="w"> </span>scripts/release-preflight.sh<span class="w"> </span>vX.Y.Z
+</code></pre></div>
+<p>If step 2's <code>--ff-only</code> refuses, check #1 was incomplete — there are still commits on dev that aren't on main, OR the cherry-picks on dev didn't apply cleanly. Inspect with <code>git log --oneline origin/main..origin/dev</code> and resolve before continuing. Don't fall back to a non-FF merge; keeping <code>main</code> strictly fast-forward off <code>dev</code> is the invariant that keeps future releases honest.</p>
+<p>After both branches are reconciled, the operator tags from <code>main</code> (which is now the same SHA as <code>dev</code> plus the prior release prep) and Phase 1 proceeds normally.</p>
+<h2 id="phase-1-tag-and-push-5-sec">Phase 1 — Tag and push (~5 sec)</h2>
+<div class="highlight"><pre><span></span><code>git<span class="w"> </span>tag<span class="w"> </span>-a<span class="w"> </span>vX.Y.Z<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;Release vX.Y.Z&quot;</span>
+git<span class="w"> </span>push<span class="w"> </span>origin<span class="w"> </span>vX.Y.Z
+</code></pre></div>
+<p>This is the irreversible point. Once the tag is pushed, the release workflow starts. <code>git tag -d vX.Y.Z &amp;&amp; git push --delete origin vX.Y.Z</code> can untag, but if any consumer has already pulled the GHCR image or downloaded an asset, untagging is socially expensive — confirm with the operator before doing it.</p>
+<p>Capture the workflow run ID immediately:</p>
+<div class="highlight"><pre><span></span><code>sleep<span class="w"> </span><span class="m">10</span><span class="w">  </span><span class="c1"># give GitHub a moment to start the workflow</span>
+<span class="nv">RUN_ID</span><span class="o">=</span><span class="k">$(</span>gh<span class="w"> </span>run<span class="w"> </span>list<span class="w"> </span>--workflow<span class="o">=</span>release.yml<span class="w"> </span>--branch<span class="o">=</span><span class="s2">&quot;vX.Y.Z&quot;</span><span class="w"> </span>--limit<span class="o">=</span><span class="m">1</span><span class="w"> </span>--json<span class="w"> </span>databaseId<span class="w"> </span>--jq<span class="w"> </span><span class="s1">&#39;.[0].databaseId&#39;</span><span class="k">)</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;Release workflow: https://github.com/Tr3kkR/Yuzu/actions/runs/</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span>
+</code></pre></div>
+<h2 id="phase-2-monitor-the-workflow-30-60-min">Phase 2 — Monitor the workflow (~30-60 min)</h2>
+<p>Six jobs run with a partial DAG:</p>
+<div class="highlight"><pre><span></span><code>build-linux ─┬─ build-gateway ─┐
+             │                  ├─ docker-publish ─┐
+build-windows (parallel)        │                   │
+build-macos (parallel)          │                   ├─ release
+build-linux ────────────────────┴───────────────────┘
+</code></pre></div>
+<ul>
+<li><strong>build-linux</strong> (self-hosted Linux, ~25 min) — meson release + .deb + .rpm</li>
+<li><strong>build-gateway</strong> (self-hosted Linux, ~10 min, needs build-linux) — rebar3 release + .deb + .rpm</li>
+<li><strong>build-windows</strong> (self-hosted Windows, ~40 min, parallel) — MSVC + InnoSetup + signtool</li>
+<li><strong>build-macos</strong> (macos-14 GitHub-hosted, ~30 min, parallel) — clang + codesign + notary</li>
+<li><strong>docker-publish</strong> (matrix server+gateway, ~15 min each, needs build-linux + build-gateway) — buildx + GHCR push</li>
+<li><strong>release</strong> (ubuntu-24.04, ~3 min, needs all of the above) — assemble artifacts, generate SHA256SUMS, cosign-sign, gh release create</li>
+</ul>
+<p>Watch with <code>gh run watch</code> (interactive), or poll-until-done from the LLM:</p>
+<div class="highlight"><pre><span></span><code>gh<span class="w"> </span>run<span class="w"> </span>watch<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--exit-status<span class="w">   </span><span class="c1"># blocks until terminal state, exit 0 if all green</span>
+</code></pre></div>
+<p>If <code>gh run watch</code> is unsuitable (long-running terminal session), poll every 60s:</p>
+<div class="highlight"><pre><span></span><code><span class="k">while</span><span class="w"> </span>:<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">  </span><span class="nv">STATUS</span><span class="o">=</span><span class="k">$(</span>gh<span class="w"> </span>run<span class="w"> </span>view<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--json<span class="w"> </span>status,conclusion<span class="w"> </span>--jq<span class="w"> </span><span class="s1">&#39;.status + &quot;/&quot; + (.conclusion // &quot;&quot;)&#39;</span><span class="k">)</span>
+<span class="w">  </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="k">$(</span>date<span class="w"> </span>-u<span class="w"> </span>+%H:%M:%S<span class="k">)</span><span class="s2"> </span><span class="nv">$STATUS</span><span class="s2">&quot;</span>
+<span class="w">  </span><span class="k">case</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$STATUS</span><span class="s2">&quot;</span><span class="w"> </span><span class="k">in</span>
+<span class="w">    </span>completed/success<span class="o">)</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;RELEASE WORKFLOW PASSED&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">break</span><span class="w"> </span><span class="p">;;</span>
+<span class="w">    </span>completed/*<span class="o">)</span><span class="w">       </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;RELEASE WORKFLOW FAILED: </span><span class="nv">$STATUS</span><span class="s2">&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">break</span><span class="w"> </span><span class="p">;;</span>
+<span class="w">  </span><span class="k">esac</span>
+<span class="w">  </span>sleep<span class="w"> </span><span class="m">60</span>
+<span class="k">done</span>
+</code></pre></div>
+<p>Phase 2 produces: workflow URL, terminal status, per-job timing, and (on failure) the failing job ID for Phase 3.</p>
+<h2 id="phase-3-troubleshoot-known-failure-modes">Phase 3 — Troubleshoot known failure modes</h2>
+<p>Look up the failing job and pull the last 50 lines of its log:</p>
+<div class="highlight"><pre><span></span><code>gh<span class="w"> </span>run<span class="w"> </span>view<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--log-failed<span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-100
+</code></pre></div>
+<p>Match the failure against this table. <strong>All entries have happened in real Yuzu releases</strong> — the <code>v0.10.0 manual release</code> documented in the v0.10.0 release notes is the canonical example.</p>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Validate docker-compose image versions</code> fails on the <code>Create Release</code> job</td>
+<td>A tracked compose file's <code>${YUZU_VERSION:-...}</code> default doesn't equal the <strong>base</strong> version (rc/beta suffix stripped). E.g. for <code>v0.12.0-rc0</code> the default must be <code>0.12.0</code>, not <code>0.12.0-rc0</code>.</td>
+<td>Bump the default in the offending file to BASE version, commit, retag with <code>git tag -fa vX.Y.Z</code> + <code>git push --force origin vX.Y.Z</code>. <strong>Confirm with the operator before force-pushing the tag</strong> — auto mode treats tag rewrites as destructive even mid-recovery. <strong>All matrix jobs re-run</strong> — costs ~30–60 min wall clock. Better: catch in preflight (it does the right thing because it strips the suffix internally).</td>
+</tr>
+<tr>
+<td><code>Artifact download failed after 5 retries</code> on the <code>release</code> job, complaining about a <code>*.dockerbuild</code> file</td>
+<td>Docker buildx provenance/attestation artifacts have unstable names that download-artifact occasionally cannot resolve</td>
+<td>Already filtered in workflow with <code>pattern: 'yuzu-*'</code> — if regression, re-add filter. v0.10.0 hit this and was assembled manually.</td>
+</tr>
+<tr>
+<td><code>ccache stats: 0 hits</code> on a re-run that should have been cached</td>
+<td>ccache key changed (any C++ file edit invalidates)</td>
+<td>Normal; subsequent build hits. If repeated 0% on identical input, check <code>~/.cache/ccache</code> writability on the runner.</td>
+</tr>
+<tr>
+<td><code>signtool sign /f</code> fails on Windows</td>
+<td><code>WINDOWS_SIGNING_CERT</code> secret missing or expired</td>
+<td>The signing step is conditional on <code>env.HAS_SIGNING_CERT == 'true'</code> — release proceeds unsigned if absent. Confirm with operator whether unsigned is acceptable for this release; if not, refresh secret and retag.</td>
+</tr>
+<tr>
+<td><code>xcrun notarytool submit</code> times out (15 min) on macOS</td>
+<td>Apple notary backlog</td>
+<td>Re-run the macOS job — <code>staple</code> step is idempotent. If consistently failing, post-process: download the .pkg, run <code>notarytool submit + staple</code> locally, then upload via <code>gh release upload</code>.</td>
+</tr>
+<tr>
+<td><code>Build and push</code> fails with <code>unauthorized</code> on GHCR</td>
+<td><code>GITHUB_TOKEN</code> <code>packages: write</code> scope missing</td>
+<td>Verify <code>permissions: packages: write</code> at workflow root.</td>
+</tr>
+<tr>
+<td><code>vcpkg install</code> fails with version baseline mismatch</td>
+<td><code>VCPKG_COMMIT</code> env var in workflow drift from <code>vcpkg.json</code> baseline</td>
+<td>Sync both — workflow env + manifest baseline must match. Tracked by <code>.github/workflows/vcpkg-baseline-update.yml</code>.</td>
+</tr>
+<tr>
+<td><code>Run EUnit tests</code> fails with non-zero exit + "Failed: 0" in log</td>
+<td>meck fixture cancellation false-positive (known #336/#337 class)</td>
+<td>Workflow already has the <code>if grep -q "Failed: 0"</code> workaround — should pass with warning. If it doesn't, paste the eunit.log tail and check if a new module is leaking processes.</td>
+</tr>
+<tr>
+<td><code>actions/cache</code> save fails with EOF</td>
+<td>GitHub cache backend transient</td>
+<td><code>save-always: true</code> ensures partial saves; retry the workflow.</td>
+</tr>
+<tr>
+<td><code>Linking target server/core/yuzu-server</code> fails with LNK2038 on Windows</td>
+<td>vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373)</td>
+<td>Bust the Windows vcpkg cache, re-run. Long-form: see <a href="../../agents/build-ci.html" class="doc-ref"><code>.claude/agents/build-ci.md</code></a> "Windows MSVC static-link history and #375".</td>
+</tr>
+</tbody>
+</table>
+<p>For any failure not in the table: pull <code>gh run view "$RUN_ID" --log-failed</code> in full, summarize the error, and ask the operator how to proceed (re-run? skip? abort?).</p>
+<h2 id="phase-4-post-release-verification-2-min">Phase 4 — Post-release verification (~2 min)</h2>
+<p>The workflow's <code>release</code> job creates the GitHub Release and uploads assets. Verify it actually did so:</p>
+<div class="highlight"><pre><span></span><code>gh<span class="w"> </span>release<span class="w"> </span>view<span class="w"> </span><span class="s2">&quot;vX.Y.Z&quot;</span><span class="w"> </span>--json<span class="w"> </span>assets,isDraft,isPrerelease,publishedAt<span class="w"> </span>--jq<span class="w"> </span><span class="s1">&#39;{published: .publishedAt, draft: .isDraft, pre: .isPrerelease, asset_count: (.assets | length), assets: [.assets[].name]}&#39;</span>
+</code></pre></div>
+<p>Required assets (the <code>--verify</code> mode of this skill checks each):</p>
+<div class="highlight"><pre><span></span><code>yuzu-linux-x64.tar.gz
+yuzu-gateway-linux-x64.tar.gz
+yuzu-windows-x64.zip
+YuzuAgentSetup-X.Y.Z.exe
+YuzuServerSetup-X.Y.Z.exe
+yuzu-macos-arm64.tar.gz
+YuzuAgent-X.Y.Z-macos-arm64.pkg
+yuzu-server_X.Y.Z_amd64.deb
+yuzu-server-X.Y.Z-1.x86_64.rpm
+yuzu-gateway_X.Y.Z_amd64.deb
+yuzu-gateway-X.Y.Z-1.x86_64.rpm
+yuzu-agent_X.Y.Z_amd64.deb
+yuzu-agent-X.Y.Z-1.x86_64.rpm
+yuzu-compose-wizard-X.Y.Z.zip       ← Compose Wizard bundle (PR #405, fjarvis)
+SHA256SUMS
+SHA256SUMS.sigstore                   ← cosign keyless signature (v0.12.0+; legacy releases shipped this as SHA256SUMS.bundle)
+&lt;artifact&gt;.intoto.jsonl × N           ← SLSA provenance, one per binary archive/installer (v0.12.0+)
+</code></pre></div>
+<p>If any expected asset is missing, the workflow's <code>Create GitHub Release</code> step likely failed silently on a single asset (the <code>gh release create</code> call is one big command and a single missing asset returns non-zero). Re-upload the missing one:</p>
+<div class="highlight"><pre><span></span><code>gh<span class="w"> </span>release<span class="w"> </span>upload<span class="w"> </span><span class="s2">&quot;vX.Y.Z&quot;</span><span class="w"> </span>path/to/missing-asset.tar.gz
+</code></pre></div>
+<p>The artifacts are still in the workflow run — <code>gh run download "$RUN_ID"</code> retrieves them.</p>
+<p>Verify the GHCR images:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># GHCR tags strip the leading `v` — git tag is vX.Y.Z, image tag is X.Y.Z.</span>
+<span class="nv">OWNER</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;Tr3kkR&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tr<span class="w"> </span><span class="s1">&#39;[:upper:]&#39;</span><span class="w"> </span><span class="s1">&#39;[:lower:]&#39;</span><span class="k">)</span>
+docker<span class="w"> </span>pull<span class="w"> </span><span class="s2">&quot;ghcr.io/</span><span class="nv">$OWNER</span><span class="s2">/yuzu-server:X.Y.Z&quot;</span>
+docker<span class="w"> </span>pull<span class="w"> </span><span class="s2">&quot;ghcr.io/</span><span class="nv">$OWNER</span><span class="s2">/yuzu-gateway:X.Y.Z&quot;</span>
+docker<span class="w"> </span>image<span class="w"> </span>inspect<span class="w"> </span><span class="s2">&quot;ghcr.io/</span><span class="nv">$OWNER</span><span class="s2">/yuzu-server:X.Y.Z&quot;</span><span class="w"> </span>--format<span class="w"> </span><span class="s1">&#39;{{.Config.Labels}}&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s2">&quot;version|revision&quot;</span>
+</code></pre></div>
+<p>For non-prerelease tags, also verify the floating tags moved:</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span>pull<span class="w"> </span><span class="s2">&quot;ghcr.io/</span><span class="nv">$OWNER</span><span class="s2">/yuzu-server:latest&quot;</span>
+docker<span class="w"> </span>image<span class="w"> </span>inspect<span class="w"> </span><span class="s2">&quot;ghcr.io/</span><span class="nv">$OWNER</span><span class="s2">/yuzu-server:latest&quot;</span><span class="w"> </span>--format<span class="w"> </span><span class="s1">&#39;{{.RepoDigests}}&#39;</span>
+<span class="c1"># Expect the same digest as :X.Y.Z</span>
+</code></pre></div>
+<p>Verify the cosign signature + GitHub attestation provenance. <strong>Before running either command, gate on the client being installed</strong> — first-time runs on a fresh dev box will hit one or both missing, and burning 30 min to discover "oh, I need cosign" post-release is exactly the gap v0.11.0-rc2 surfaced:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Preflight: require cosign + gh 2.50+ for attestation verify.</span>
+<span class="k">if</span><span class="w"> </span>!<span class="w"> </span><span class="nb">command</span><span class="w"> </span>-v<span class="w"> </span>cosign<span class="w"> </span>&gt;/dev/null<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">  </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;WARN: cosign not installed — Sigstore signature round-trip skipped&quot;</span>
+<span class="w">  </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;     install: curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o ~/.local/bin/cosign &amp;&amp; chmod +x ~/.local/bin/cosign&quot;</span>
+<span class="k">fi</span>
+<span class="nv">GH_MAJOR</span><span class="o">=</span><span class="k">$(</span>gh<span class="w"> </span>--version<span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">&#39;NR==1{split($3,a,&quot;.&quot;); print a[1]}&#39;</span><span class="k">)</span>
+<span class="nv">GH_MINOR</span><span class="o">=</span><span class="k">$(</span>gh<span class="w"> </span>--version<span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">&#39;NR==1{split($3,a,&quot;.&quot;); print a[2]}&#39;</span><span class="k">)</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$GH_MAJOR</span><span class="s2">&quot;</span><span class="w"> </span>-lt<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="o">(</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$GH_MAJOR</span><span class="s2">&quot;</span><span class="w"> </span>-eq<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$GH_MINOR</span><span class="s2">&quot;</span><span class="w"> </span>-lt<span class="w"> </span><span class="m">50</span><span class="w"> </span><span class="o">)</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">  </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;WARN: gh </span><span class="nv">$GH_MAJOR</span><span class="s2">.</span><span class="nv">$GH_MINOR</span><span class="s2"> predates attestation subcommand (need 2.50+)&quot;</span>
+<span class="w">  </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;     upgrade: curl -sSL https://github.com/cli/cli/releases/latest/download/gh_\$(gh api repos/cli/cli/releases/latest --jq .tag_name | sed s/v//)_linux_amd64.tar.gz -o /tmp/gh.tgz &amp;&amp; tar xzf /tmp/gh.tgz -C /tmp &amp;&amp; install -m755 /tmp/gh_*_linux_amd64/bin/gh ~/.local/bin/gh&quot;</span>
+<span class="k">fi</span>
+
+gh<span class="w"> </span>release<span class="w"> </span>download<span class="w"> </span><span class="s2">&quot;vX.Y.Z&quot;</span><span class="w"> </span>--pattern<span class="w"> </span><span class="s1">&#39;SHA256SUMS*&#39;</span>
+sha256sum<span class="w"> </span>-c<span class="w"> </span>SHA256SUMS
+
+<span class="c1"># cosign: verify the keyless signature on SHA256SUMS + both images</span>
+<span class="k">if</span><span class="w"> </span><span class="nb">command</span><span class="w"> </span>-v<span class="w"> </span>cosign<span class="w"> </span>&gt;/dev/null<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">  </span>cosign<span class="w"> </span>verify-blob<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--bundle<span class="w"> </span>SHA256SUMS.sigstore<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--certificate-identity-regexp<span class="w"> </span><span class="s1">&#39;.*&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--certificate-oidc-issuer<span class="w"> </span>https://token.actions.githubusercontent.com<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>SHA256SUMS
+<span class="w">  </span><span class="k">for</span><span class="w"> </span>img<span class="w"> </span><span class="k">in</span><span class="w"> </span>yuzu-server<span class="w"> </span>yuzu-gateway<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span>cosign<span class="w"> </span>verify<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>--certificate-identity-regexp<span class="w"> </span><span class="s1">&#39;.*&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>--certificate-oidc-issuer<span class="w"> </span>https://token.actions.githubusercontent.com<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span><span class="s2">&quot;ghcr.io/</span><span class="nv">$OWNER</span><span class="s2">/</span><span class="nv">$img</span><span class="s2">:X.Y.Z&quot;</span>
+<span class="w">  </span><span class="k">done</span>
+<span class="k">fi</span>
+
+<span class="c1"># gh attestation: verifies SLSA build provenance bound to the exact workflow run</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$GH_MAJOR</span><span class="s2">&quot;</span><span class="w"> </span>-gt<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="o">(</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$GH_MAJOR</span><span class="s2">&quot;</span><span class="w"> </span>-eq<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$GH_MINOR</span><span class="s2">&quot;</span><span class="w"> </span>-ge<span class="w"> </span><span class="m">50</span><span class="w"> </span><span class="o">)</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">  </span>gh<span class="w"> </span>attestation<span class="w"> </span>verify<span class="w"> </span>yuzu-linux-x64.tar.gz<span class="w"> </span>--repo<span class="w"> </span>Tr3kkR/Yuzu
+<span class="w">  </span>gh<span class="w"> </span>attestation<span class="w"> </span>verify<span class="w"> </span><span class="s2">&quot;oci://ghcr.io/</span><span class="nv">$OWNER</span><span class="s2">/yuzu-server:X.Y.Z&quot;</span><span class="w"> </span>--repo<span class="w"> </span>Tr3kkR/Yuzu
+<span class="k">fi</span>
+</code></pre></div>
+<p><strong>Tighten the identity regex for an auditor-grade check</strong> (optional but recommended once you trust the infra): replace <code>'.*'</code> with <code>'https://github\.com/Tr3kkR/Yuzu/\.github/workflows/release\.yml@refs/tags/vX\.Y\.Z'</code> — that assertion fails if the signer was anything other than this repo's release workflow on this exact tag.</p>
+<h2 id="phase-5-compose-wizard-verification">Phase 5 — Compose Wizard verification</h2>
+<p>The release workflow includes a <code>Package Compose Wizard</code> step that zips <code>tools/compose-wizard/</code> into <code>yuzu-compose-wizard-X.Y.Z.zip</code> and includes it in the release assets + SHA256SUMS.</p>
+<p>The wizard is a browser-based step-by-step generator for <code>docker-compose.yml</code> + <code>.env</code>, contributed by @fjarvis in PR #405. Zero dependencies — extract, open <code>index.html</code>, walk the wizard.</p>
+<p>Smoke-check the bundle:</p>
+<div class="highlight"><pre><span></span><code>gh<span class="w"> </span>release<span class="w"> </span>download<span class="w"> </span><span class="s2">&quot;vX.Y.Z&quot;</span><span class="w"> </span>--pattern<span class="w"> </span><span class="s1">&#39;yuzu-compose-wizard-*.zip&#39;</span>
+unzip<span class="w"> </span>-l<span class="w"> </span><span class="s2">&quot;yuzu-compose-wizard-X.Y.Z.zip&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-20
+<span class="c1"># Expect: index.html, css/style.css, js/wizard.js, js/generate.js, README.md</span>
+</code></pre></div>
+<p>If the wizard zip is <strong>missing</strong>, two causes are likely:
+1. The tag's commit doesn't have <code>tools/compose-wizard/</code> (wizard was on <code>main</code> only post-PR #405; if cutting from a stale branch, it won't be there). Fix: tag from a commit that includes the wizard.
+2. The workflow's <code>Package Compose Wizard</code> step emitted a warning and skipped (check the run log). Same fix.</p>
+<h2 id="phase-6-cleanup-and-announce-5-min">Phase 6 — Cleanup and announce (~5 min)</h2>
+<p>After all verification passes:</p>
+<ol>
+<li><strong>Bump dev branch to next dev version.</strong> On <code>dev</code>:
+   <div class="highlight"><pre><span></span><code><span class="c1"># Update meson.build version to X.Y.(Z+1)-dev or (X+1).Y.0-dev (operator&#39;s call)</span>
+<span class="c1"># Add new ## [Unreleased] section to CHANGELOG.md</span>
+git<span class="w"> </span>commit<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;chore(post-release): bump dev to X.Y.Z+1-dev&quot;</span>
+git<span class="w"> </span>push<span class="w"> </span>origin<span class="w"> </span>dev
+</code></pre></div></li>
+<li><strong>Reconcile main → dev</strong> if the release tag was on a main commit not yet merged into dev (rare on this project — usually dev → main first).</li>
+<li><strong>Close any release-blocker issues</strong> in the milestone.</li>
+<li><strong>Update the rollout doc</strong> if relevant (<code>docs/dependency-rollout-*.md</code>, <a href="../../../docs/roadmap.html" class="doc-ref"><code>docs/roadmap.md</code></a>).</li>
+<li><strong>Announce.</strong> Yuzu doesn't (currently) have an automated announcement channel. If applicable, post the release URL.</li>
+</ol>
+<h2 id="phase-7-produce-the-release-report">Phase 7 — Produce the release report</h2>
+<p>End-of-skill output to the operator:</p>
+<div class="highlight"><pre><span></span><code>Release vX.Y.Z
+
+Workflow:    https://github.com/Tr3kkR/Yuzu/actions/runs/&lt;RUN_ID&gt;
+Release page: https://github.com/Tr3kkR/Yuzu/releases/tag/vX.Y.Z
+
+Assets:      &lt;N&gt;/&lt;expected&gt; present
+GHCR:        ghcr.io/&lt;owner&gt;/yuzu-server:vX.Y.Z + :yuzu-gateway:vX.Y.Z (linux/amd64)
+Floating tags: :latest moved (or N/A for prerelease)
+Signature:   cosign verified (or N/A if SIGNING absent)
+SHA256SUMS:  verified
+
+Compose Wizard: bundled (or absent — see Phase 5)
+
+Next dev version: X.Y.(Z+1)-dev (operator: bump on dev branch)
+</code></pre></div>
+<p>If anything failed, list the failures + the fix attempted + final status, and explicitly state whether the release is shippable as-is or requires a follow-up patch release.</p>
+<h2 id="resume-re-entry">Resume / re-entry</h2>
+<p>Releases occasionally stall partway. The skill supports re-entry without redoing completed phases:</p>
+<ul>
+<li><code>/release --resume vX.Y.Z</code> — assume tag exists and workflow ran (or is running). Skip preflight + tag push, jump to Phase 2 monitor with the existing run ID, then continue normally.</li>
+<li><code>/release --watch vX.Y.Z</code> — only monitor (Phase 2). Useful when the operator pushed the tag manually and just wants the skill to babysit.</li>
+<li><code>/release --verify vX.Y.Z</code> — only verify (Phases 4-5). Useful for an old release the operator wants to confirm.</li>
+</ul>
+<p>In all resume modes, the skill discovers state via <code>gh release view</code> and <code>gh run list --workflow=release.yml</code>, so it works correctly even on a fresh shell with no in-skill memory.</p>
+<h2 id="cost-roi">Cost / ROI</h2>
+<p>A successful release run is ~5 sec of operator work (push tag) + 30-60 min wall clock for the workflow + ~2 min of verification. The skill collapses the operator's work into one invocation and turns the 30-60 min wait into supervised waiting where every known failure mode has a documented response.</p>
+<p>Releases that hit unfamiliar failure modes (the v0.10.0 download-artifact bug) have historically taken ~2 hours of manual artifact assembly + manual gh release create. The skill cannot prevent novel failures but documents them as they're solved so the runbook captures every known incident — see Phase 3 table.</p>
+<h2 id="known-limitations">Known limitations</h2>
+<ul>
+<li><strong>Self-hosted runner required for Linux + Windows + gateway.</strong> macOS uses a GitHub-hosted runner. The workflow assumes both self-hosted runners (<code>yuzu-wsl2-linux</code>, <code>yuzu-local-windows</code>) are online; the runner-inventory-sentinel workflow gates this separately. If a runner is offline at tag-push time, the build matrix will queue indefinitely. Phase 2 monitor will surface this as <code>status=queued</code> for &gt;5 min — escalate by waking the runner.</li>
+<li><strong>No rollback.</strong> Once <code>gh release create</code> runs, the release is public. Untagging is technically possible but discouraged once consumers exist. Prefer a follow-up patch release (vX.Y.Z+1) over rollback.</li>
+<li><strong>Compose Wizard requires the tag's commit to have <code>tools/compose-wizard/</code>.</strong> PR #405 merged to <code>main</code> directly. If a future release is cut from a branch that hasn't reconciled with main, the wizard won't be in the source tree and the workflow step will skip it. Preflight does NOT currently check for this — consider adding.</li>
+<li><strong>Cosign keyless signing requires GitHub Actions OIDC.</strong> Manual asset uploads via <code>gh release upload</code> are NOT signed. If a release was assembled manually (per Phase 3 table), <code>SHA256SUMS.sigstore</code> will be missing and operators must verify integrity via <code>sha256sum -c SHA256SUMS</code> only.</li>
+</ul>
+<h2 id="files-this-skill-touches">Files this skill touches</h2>
+<p>The skill itself is read-only on the repo and write-only on:
+- The git remote (<code>git push origin vX.Y.Z</code> — irreversible)
+- GitHub Releases page (via <code>gh release create</code> triggered by workflow, or <code>gh release upload</code> for repairs)
+- GHCR (via the workflow's <code>docker buildx push</code>)</p>
+<p>The local repo state is unchanged unless preflight failed and the operator chose to commit version bumps; those are explicit operator commits, not skill-driven.</p>
+</main>
+</body>
+</html>

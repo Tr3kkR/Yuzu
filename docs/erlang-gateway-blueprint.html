@@ -1,0 +1,1290 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Erlang Gateway Blueprint for Yuzu</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/erlang-gateway-blueprint.md</div>
+<h1 class="doc-title">Erlang Gateway Blueprint for Yuzu</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="erlang-gateway-blueprint-for-yuzu">Erlang Gateway Blueprint for Yuzu</h1>
+<h2 id="problem-statement">Problem Statement</h2>
+<p>The current <code>yuzu-server</code> runs command dispatch and response aggregation in a
+single C++ process. Every <code>Subscribe()</code> bidi stream holds a per-agent
+<code>stream_mu</code> mutex; <code>send_to_all()</code> iterates all agents serially, acquiring each
+lock in turn. At millions of agents this creates:</p>
+<ol>
+<li><strong>Lock convoy</strong> — a single slow agent write stalls the broadcast loop.</li>
+<li><strong>Thread exhaustion</strong> — each incoming command thread contends on a shared
+   mutex (<code>mu_</code>) protecting <code>std::unordered_map&lt;agent_id, AgentSession&gt;</code>.</li>
+<li><strong>Single-box ceiling</strong> — one gRPC server process cannot hold millions of
+   persistent bidi streams.</li>
+</ol>
+<p>The Erlang gateway ("yuzu-gateway") sits between operators/dashboards and the
+C++ server, owning the <em>command fanout plane</em> and <em>response aggregation plane</em>
+while the C++ server retains the <em>control plane</em> (enrollment, auth, inventory,
+dashboard).</p>
+<hr>
+<h2 id="architecture-overview">Architecture Overview</h2>
+<div class="highlight"><pre><span></span><code>                  ┌─────────────────────────────────────────────────────────┐
+                  │                   Operator / Dashboard                  │
+                  │           (ManagementService.SendCommand)               │
+                  └────────────────────────┬────────────────────────────────┘
+                                           │ gRPC (or HTTP/2)
+                                           ▼
+                ┌──────────────────────────────────────────────────────────┐
+                │              yuzu-gateway  (Erlang/OTP cluster)          │
+                │                                                          │
+                │   ┌──────────┐  ┌──────────┐       ┌──────────┐        │
+                │   │ gw_node1 │  │ gw_node2 │  ...  │ gw_nodeN │        │
+                │   └──────────┘  └──────────┘       └──────────┘        │
+                │        │              │                   │              │
+                │    agent_proc     agent_proc         agent_proc          │
+                │    agent_proc     agent_proc         agent_proc          │
+                │    agent_proc     agent_proc         agent_proc          │
+                └──────┬───────────────┬───────────────────┬──────────────┘
+                       │               │                   │
+                       ▼               ▼                   ▼
+                  ┌─────────┐    ┌─────────┐         ┌─────────┐
+                  │ Agent 1 │    │ Agent 2 │   ...   │ Agent M │
+                  └─────────┘    └─────────┘         └─────────┘
+                       │               │                   │
+                       └───────────────┼───────────────────┘
+                                       │ Register, Heartbeat,
+                                       │ Inventory, Enrollment
+                                       ▼
+                              ┌──────────────────┐
+                              │  yuzu-server     │
+                              │  (C++ control    │
+                              │   plane)         │
+                              └──────────────────┘
+</code></pre></div>
+<p><strong>Key split:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Plane</th>
+<th>Owner</th>
+<th>Responsibilities</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Control</td>
+<td><code>yuzu-server</code> (C++)</td>
+<td>Register, Heartbeat, enrollment tiers, auth, inventory, dashboard, mTLS termination</td>
+</tr>
+<tr>
+<td>Command</td>
+<td><code>yuzu-gateway</code> (Erlang)</td>
+<td>Subscribe bidi streams to agents, SendCommand fanout, response aggregation, streaming relay</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="otp-application-structure">OTP Application Structure</h2>
+<div class="highlight"><pre><span></span><code>yuzu_gateway/
+├── rebar.config
+├── config/
+│   └── sys.config              % Node name, gRPC listen port, C++ upstream,
+│                               % Erlang distribution cookie, telemetry sinks
+├── apps/
+│   └── yuzu_gw/
+│       ├── src/
+│       │   ├── yuzu_gw_app.erl            % application behaviour
+│       │   ├── yuzu_gw_sup.erl            % top-level supervisor
+│       │   │
+│       │   ├── %% ── Agent Connection Layer ──
+│       │   ├── yuzu_gw_agent_sup.erl      % simple_one_for_one for agent procs
+│       │   ├── yuzu_gw_agent.erl          % gen_statem: one per agent bidi stream
+│       │   │
+│       │   ├── %% ── Routing / Registry ──
+│       │   ├── yuzu_gw_registry.erl       % pg (process groups) + ETS routing table
+│       │   ├── yuzu_gw_router.erl         % gen_server: command fanout coordinator
+│       │   │
+│       │   ├── %% ── Upstream (C++ server) ──
+│       │   ├── yuzu_gw_upstream.erl       % gen_server: gRPC client pool to yuzu-server
+│       │   │
+│       │   ├── %% ── Operator-facing gRPC ──
+│       │   ├── yuzu_gw_mgmt_service.erl   % grpc server: ManagementService.SendCommand
+│       │   ├── yuzu_gw_agent_service.erl  % grpc server: AgentService proxy (Register→upstream)
+│       │   │
+│       │   ├── %% ── Telemetry ──
+│       │   ├── yuzu_gw_telemetry.erl      % telemetry event definitions + handlers
+│       │   │
+│       │   └── %% ── Proto helpers ──
+│       │       └── yuzu_gw_proto.erl      % encode/decode wrappers (gpb or grpc_client)
+│       │
+│       └── priv/
+│           └── proto/                     % Symlink or copy of proto/ from repo root
+│               ├── yuzu/agent/v1/agent.proto
+│               ├── yuzu/common/v1/common.proto
+│               └── yuzu/server/v1/management.proto
+</code></pre></div>
+<h3 id="dependencies">Dependencies</h3>
+<div class="highlight"><pre><span></span><code><span class="c">%% rebar.config</span>
+<span class="p">{</span><span class="n">deps</span><span class="p">,</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="n">grpcbox</span><span class="p">,</span><span class="w">   </span><span class="s">&quot;0.17.1&quot;</span><span class="p">},</span><span class="w">     </span><span class="c">% gRPC server + client (HTTP/2, protobuf)</span>
+<span class="w">    </span><span class="p">{</span><span class="n">gpb</span><span class="p">,</span><span class="w">       </span><span class="s">&quot;4.21.2&quot;</span><span class="p">},</span><span class="w">     </span><span class="c">% Protobuf compiler/runtime (grpcbox dep)</span>
+<span class="w">    </span><span class="p">{</span><span class="n">telemetry</span><span class="p">,</span><span class="w">  </span><span class="s">&quot;1.3.0&quot;</span><span class="p">},</span><span class="w">     </span><span class="c">% Metrics event API</span>
+<span class="w">    </span><span class="p">{</span><span class="n">prometheus</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;4.11.0&quot;</span><span class="p">},</span><span class="w">    </span><span class="c">% Prometheus exposition (telemetry handler)</span>
+<span class="w">    </span><span class="p">{</span><span class="n">recon</span><span class="p">,</span><span class="w">      </span><span class="s">&quot;2.5.5&quot;</span><span class="p">}</span><span class="w">      </span><span class="c">% Production introspection</span>
+<span class="p">]}.</span>
+</code></pre></div>
+<hr>
+<h2 id="process-model">Process Model</h2>
+<h3 id="1-yuzu_gw_agent-one-erlang-process-per-agent-gen_statem">1. <code>yuzu_gw_agent</code> — One Erlang Process per Agent (gen_statem)</h3>
+<p>This is the core scaling insight: Erlang can sustain <strong>millions of lightweight
+processes</strong>, each holding the state for one agent's bidi stream. No mutexes —
+message passing provides serialization.</p>
+<div class="highlight"><pre><span></span><code>States:
+  ┌──────────────┐
+  │  connecting   │  Agent called Register → upstream forwarded → got session_id
+  └──────┬───────┘
+         │ Subscribe stream established
+         ▼
+  ┌──────────────┐
+  │   streaming   │  Bidi stream active; agent_proc owns the stream writer
+  └──────┬───────┘
+         │ stream broken / heartbeat timeout
+         ▼
+  ┌──────────────┐
+  │ disconnected  │  Cleanup, deregister from routing table, terminate
+  └──────────────┘
+</code></pre></div>
+<p><strong>Key properties:</strong></p>
+<ul>
+<li>The process <strong>owns</strong> the gRPC stream writer handle. All writes to this agent
+  go through its mailbox — no mutex needed.</li>
+<li>Incoming <code>CommandRequest</code> messages are delivered via <code>gen_statem:cast/2</code>.
+  The process writes to the stream immediately; backpressure is handled by
+  the HTTP/2 flow control window.</li>
+<li>Incoming <code>CommandResponse</code> frames from the agent are read in the process's
+  receive loop and forwarded to the originating <code>yuzu_gw_router</code> request.</li>
+</ul>
+<div class="highlight"><pre><span></span><code><span class="c">%% Simplified state machine sketch</span>
+<span class="p">-</span><span class="ni">module</span><span class="p">(</span><span class="n">yuzu_gw_agent</span><span class="p">).</span>
+<span class="p">-</span><span class="ni">behaviour</span><span class="p">(</span><span class="n">gen_statem</span><span class="p">).</span>
+
+<span class="p">-</span><span class="ni">record</span><span class="p">(</span><span class="nl">data</span><span class="p">,</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">agent_id</span><span class="w">    </span><span class="p">::</span><span class="w"> </span><span class="n">binary</span><span class="p">(),</span>
+<span class="w">    </span><span class="n">session_id</span><span class="w">  </span><span class="p">::</span><span class="w"> </span><span class="n">binary</span><span class="p">(),</span>
+<span class="w">    </span><span class="n">stream_ref</span><span class="w">  </span><span class="p">::</span><span class="w"> </span><span class="nn">grpcbox</span><span class="p">:</span><span class="nf">stream_ref</span><span class="p">(),</span>
+<span class="w">    </span><span class="n">plugins</span><span class="w">     </span><span class="p">::</span><span class="w"> </span><span class="p">[</span><span class="n">binary</span><span class="p">()],</span>
+<span class="w">    </span><span class="n">pending</span><span class="w">     </span><span class="p">::</span><span class="w"> </span><span class="p">#{</span><span class="n">command_id</span><span class="p">()</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">from</span><span class="p">()}</span><span class="w">   </span><span class="c">% who to send responses to</span>
+<span class="p">}).</span>
+
+<span class="c">%% In &#39;streaming&#39; state, handle command dispatch:</span>
+<span class="nf">streaming</span><span class="p">(</span><span class="n">cast</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="n">dispatch</span><span class="p">,</span><span class="w"> </span><span class="nv">CommandReq</span><span class="p">,</span><span class="w"> </span><span class="nv">ReplyTo</span><span class="p">},</span><span class="w"> </span><span class="nv">Data</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">    </span><span class="nv">CmdId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">maps</span><span class="p">:</span><span class="nb">get</span><span class="p">(</span><span class="n">command_id</span><span class="p">,</span><span class="w"> </span><span class="nv">CommandReq</span><span class="p">),</span>
+<span class="w">    </span><span class="n">ok</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">grpcbox_client</span><span class="p">:</span><span class="nb">send</span><span class="p">(</span><span class="nv">Data</span><span class="nl">#data.stream_ref</span><span class="p">,</span><span class="w"> </span><span class="nv">CommandReq</span><span class="p">),</span>
+<span class="w">    </span><span class="nn">telemetry</span><span class="p">:</span><span class="nf">execute</span><span class="p">([</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">command</span><span class="p">,</span><span class="w"> </span><span class="n">dispatched</span><span class="p">],</span>
+<span class="w">                      </span><span class="p">#{</span><span class="n">count</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="mi">1</span><span class="p">},</span>
+<span class="w">                      </span><span class="p">#{</span><span class="n">agent_id</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="nv">Data</span><span class="nl">#data.agent_id</span><span class="p">,</span><span class="w"> </span><span class="n">plugin</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="nn">maps</span><span class="p">:</span><span class="nb">get</span><span class="p">(</span><span class="n">plugin</span><span class="p">,</span><span class="w"> </span><span class="nv">CommandReq</span><span class="p">)}),</span>
+<span class="w">    </span><span class="p">{</span><span class="n">keep_state</span><span class="p">,</span><span class="w"> </span><span class="nv">Data</span><span class="nl">#data</span><span class="p">{</span><span class="n">pending</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">maps</span><span class="p">:</span><span class="nb">put</span><span class="p">(</span><span class="nv">CmdId</span><span class="p">,</span><span class="w"> </span><span class="nv">ReplyTo</span><span class="p">,</span><span class="w"> </span><span class="nv">Data</span><span class="nl">#data.pending</span><span class="p">)}};</span>
+
+<span class="c">%% Incoming response from agent stream:</span>
+<span class="nf">streaming</span><span class="p">(</span><span class="n">info</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="n">grpc_data</span><span class="p">,</span><span class="w"> </span><span class="p">_</span><span class="nv">StreamRef</span><span class="p">,</span><span class="w"> </span><span class="nv">ResponseFrame</span><span class="p">},</span><span class="w"> </span><span class="nv">Data</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">    </span><span class="nv">CmdId</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="nn">maps</span><span class="p">:</span><span class="nb">get</span><span class="p">(</span><span class="n">command_id</span><span class="p">,</span><span class="w"> </span><span class="nv">ResponseFrame</span><span class="p">),</span>
+<span class="w">    </span><span class="nv">Status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">maps</span><span class="p">:</span><span class="nb">get</span><span class="p">(</span><span class="n">status</span><span class="p">,</span><span class="w"> </span><span class="nv">ResponseFrame</span><span class="p">),</span>
+<span class="w">    </span><span class="k">case</span><span class="w"> </span><span class="nn">maps</span><span class="p">:</span><span class="nf">find</span><span class="p">(</span><span class="nv">CmdId</span><span class="p">,</span><span class="w"> </span><span class="nv">Data</span><span class="nl">#data.pending</span><span class="p">)</span><span class="w"> </span><span class="k">of</span>
+<span class="w">        </span><span class="p">{</span><span class="n">ok</span><span class="p">,</span><span class="w"> </span><span class="nv">ReplyTo</span><span class="p">}</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">            </span><span class="nv">ReplyTo</span><span class="w"> </span><span class="o">!</span><span class="w"> </span><span class="p">{</span><span class="n">command_response</span><span class="p">,</span><span class="w"> </span><span class="nv">Data</span><span class="nl">#data.agent_id</span><span class="p">,</span><span class="w"> </span><span class="nv">ResponseFrame</span><span class="p">},</span>
+<span class="w">            </span><span class="nv">Pending2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">case</span><span class="w"> </span><span class="nv">Status</span><span class="w"> </span><span class="k">of</span>
+<span class="w">                </span><span class="n">&#39;RUNNING&#39;</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="nv">Data</span><span class="nl">#data.pending</span><span class="p">;</span><span class="w">          </span><span class="c">% keep tracking</span>
+<span class="w">                </span><span class="p">_</span><span class="nv">Final</span><span class="w">    </span><span class="o">-&gt;</span><span class="w"> </span><span class="nn">maps</span><span class="p">:</span><span class="nf">remove</span><span class="p">(</span><span class="nv">CmdId</span><span class="p">,</span><span class="w"> </span><span class="nv">Data</span><span class="nl">#data.pending</span><span class="p">)</span>
+<span class="w">            </span><span class="k">end</span><span class="p">,</span>
+<span class="w">            </span><span class="p">{</span><span class="n">keep_state</span><span class="p">,</span><span class="w"> </span><span class="nv">Data</span><span class="nl">#data</span><span class="p">{</span><span class="n">pending</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nv">Pending2</span><span class="p">}};</span>
+<span class="w">        </span><span class="n">error</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">            </span><span class="c">%% Orphaned response — log and drop</span>
+<span class="w">            </span><span class="p">{</span><span class="n">keep_state</span><span class="p">,</span><span class="w"> </span><span class="nv">Data</span><span class="p">}</span>
+<span class="w">    </span><span class="k">end</span><span class="p">;</span>
+
+<span class="nf">streaming</span><span class="p">(</span><span class="n">info</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="n">grpc_closed</span><span class="p">,</span><span class="w"> </span><span class="p">_</span><span class="nv">StreamRef</span><span class="p">},</span><span class="w"> </span><span class="nv">Data</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">    </span><span class="p">{</span><span class="n">next_state</span><span class="p">,</span><span class="w"> </span><span class="n">disconnected</span><span class="p">,</span><span class="w"> </span><span class="nv">Data</span><span class="p">}.</span>
+</code></pre></div>
+<p><strong>Memory per process:</strong> ~2 KB base + pending command map. At 1M agents ≈ 2–4 GB
+(trivially shardable across a cluster).</p>
+<h3 id="2-yuzu_gw_agent_sup-simple_one_for_one">2. <code>yuzu_gw_agent_sup</code> — simple_one_for_one</h3>
+<div class="highlight"><pre><span></span><code><span class="c">%% Child spec</span>
+<span class="p">#{</span><span class="n">id</span><span class="w">       </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">agent</span><span class="p">,</span>
+<span class="w">  </span><span class="n">start</span><span class="w">    </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">{</span><span class="n">yuzu_gw_agent</span><span class="p">,</span><span class="w"> </span><span class="n">start_link</span><span class="p">,</span><span class="w"> </span><span class="p">[]},</span>
+<span class="w">  </span><span class="n">restart</span><span class="w">  </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">temporary</span><span class="p">,</span><span class="w">       </span><span class="c">% agent procs are ephemeral</span>
+<span class="w">  </span><span class="n">shutdown</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="mi">5000</span><span class="p">,</span>
+<span class="w">  </span><span class="n">type</span><span class="w">     </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">worker</span><span class="p">}.</span>
+</code></pre></div>
+<p><code>temporary</code> restart: if an agent process crashes, the agent will reconnect
+naturally via a new Register → Subscribe cycle. No point restarting a process
+whose stream is already broken.</p>
+<h3 id="3-yuzu_gw_router-command-fanout-coordinator">3. <code>yuzu_gw_router</code> — Command Fanout Coordinator</h3>
+<div class="highlight"><pre><span></span><code><span class="p">-</span><span class="ni">module</span><span class="p">(</span><span class="n">yuzu_gw_router</span><span class="p">).</span>
+<span class="p">-</span><span class="ni">behaviour</span><span class="p">(</span><span class="n">gen_server</span><span class="p">).</span>
+
+<span class="c">%% Called by yuzu_gw_mgmt_service when operator sends SendCommand</span>
+<span class="nf">handle_call</span><span class="p">({</span><span class="n">send_command</span><span class="p">,</span><span class="w"> </span><span class="nv">AgentIds</span><span class="p">,</span><span class="w"> </span><span class="nv">CommandReq</span><span class="p">,</span><span class="w"> </span><span class="nv">Timeout</span><span class="p">},</span><span class="w"> </span><span class="nv">From</span><span class="p">,</span><span class="w"> </span><span class="nv">State</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">    </span><span class="nv">Targets</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">case</span><span class="w"> </span><span class="nv">AgentIds</span><span class="w"> </span><span class="k">of</span>
+<span class="w">        </span><span class="p">[]</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="nn">yuzu_gw_registry</span><span class="p">:</span><span class="nf">all_agents</span><span class="p">();</span><span class="w">   </span><span class="c">% broadcast</span>
+<span class="w">        </span><span class="p">_</span><span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="nv">AgentIds</span>
+<span class="w">    </span><span class="k">end</span><span class="p">,</span>
+<span class="w">    </span><span class="c">%% Fan out: cast to each agent process in parallel</span>
+<span class="w">    </span><span class="nv">FanoutRef</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">make_ref</span><span class="p">(),</span>
+<span class="w">    </span><span class="nn">lists</span><span class="p">:</span><span class="nf">foreach</span><span class="p">(</span><span class="k">fun</span><span class="p">(</span><span class="nv">AgentId</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">        </span><span class="k">case</span><span class="w"> </span><span class="nn">yuzu_gw_registry</span><span class="p">:</span><span class="nf">lookup</span><span class="p">(</span><span class="nv">AgentId</span><span class="p">)</span><span class="w"> </span><span class="k">of</span>
+<span class="w">            </span><span class="p">{</span><span class="n">ok</span><span class="p">,</span><span class="w"> </span><span class="nv">Pid</span><span class="p">}</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">                </span><span class="nn">gen_statem</span><span class="p">:</span><span class="nf">cast</span><span class="p">(</span><span class="nv">Pid</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="n">dispatch</span><span class="p">,</span><span class="w"> </span><span class="nv">CommandReq</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="n">self</span><span class="p">(),</span><span class="w"> </span><span class="nv">FanoutRef</span><span class="p">,</span><span class="w"> </span><span class="nv">AgentId</span><span class="p">}});</span>
+<span class="w">            </span><span class="n">error</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">                </span><span class="n">self</span><span class="p">()</span><span class="w"> </span><span class="o">!</span><span class="w"> </span><span class="p">{</span><span class="n">command_response_skip</span><span class="p">,</span><span class="w"> </span><span class="nv">FanoutRef</span><span class="p">,</span><span class="w"> </span><span class="nv">AgentId</span><span class="p">}</span>
+<span class="w">        </span><span class="k">end</span>
+<span class="w">    </span><span class="k">end</span><span class="p">,</span><span class="w"> </span><span class="nv">Targets</span><span class="p">),</span>
+<span class="w">    </span><span class="c">%% Aggregation happens async — responses stream back via the mgmt gRPC stream</span>
+<span class="w">    </span><span class="p">{</span><span class="n">noreply</span><span class="p">,</span><span class="w"> </span><span class="nv">State</span><span class="p">#{</span><span class="nv">FanoutRef</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="p">#{</span><span class="n">from</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="nv">From</span><span class="p">,</span>
+<span class="w">                                     </span><span class="n">targets</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="nb">length</span><span class="p">(</span><span class="nv">Targets</span><span class="p">),</span>
+<span class="w">                                     </span><span class="n">received</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                                     </span><span class="n">timeout_ref</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="nn">erlang</span><span class="p">:</span><span class="nb">send_after</span><span class="p">(</span><span class="nv">Timeout</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1000</span><span class="p">,</span><span class="w"> </span><span class="n">self</span><span class="p">(),</span>
+<span class="w">                                                                       </span><span class="p">{</span><span class="n">fanout_timeout</span><span class="p">,</span><span class="w"> </span><span class="nv">FanoutRef</span><span class="p">})}}}.</span>
+</code></pre></div>
+<p>The router does <strong>not</strong> wait for all responses synchronously. It tracks a
+<code>FanoutRef</code>, counts terminal responses, and streams each
+<code>SendCommandResponse</code> back to the operator's gRPC stream as they arrive. This
+means the operator sees progressive results — identical to the current
+server-streaming <code>SendCommand</code> contract.</p>
+<h3 id="4-supervision-tree">4. Supervision Tree</h3>
+<div class="highlight"><pre><span></span><code>yuzu_gw_sup (one_for_one)
+  ├── yuzu_gw_registry          (gen_server — ETS owner, pg coordinator)
+  ├── yuzu_gw_upstream          (gen_server — gRPC client pool to C++ server)
+  ├── yuzu_gw_router            (gen_server — fanout coordinator)
+  ├── yuzu_gw_agent_sup         (simple_one_for_one — agent processes)
+  ├── yuzu_gw_mgmt_service      (grpcbox service — operator-facing)
+  └── yuzu_gw_agent_service     (grpcbox service — agent-facing proxy)
+</code></pre></div>
+<hr>
+<h2 id="routing-table">Routing Table</h2>
+<h3 id="design-ets-pg-process-groups">Design: ETS + pg (Process Groups)</h3>
+<p>Two complementary mechanisms:</p>
+<p><strong>ETS table (<code>yuzu_gw_agents</code>)</strong> — fast single-agent lookup:</p>
+<div class="highlight"><pre><span></span><code><span class="c">%% Table: set, {agent_id, pid, node, session_id, plugins, connected_at}</span>
+<span class="nn">ets</span><span class="p">:</span><span class="nf">new</span><span class="p">(</span><span class="n">yuzu_gw_agents</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="n">named_table</span><span class="p">,</span><span class="w"> </span><span class="n">set</span><span class="p">,</span><span class="w"> </span><span class="n">public</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="n">read_concurrency</span><span class="p">,</span><span class="w"> </span><span class="n">true</span><span class="p">}]).</span>
+
+<span class="c">%% Register</span>
+<span class="nn">ets</span><span class="p">:</span><span class="nf">insert</span><span class="p">(</span><span class="n">yuzu_gw_agents</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="nv">AgentId</span><span class="p">,</span><span class="w"> </span><span class="n">self</span><span class="p">(),</span><span class="w"> </span><span class="nb">node</span><span class="p">(),</span><span class="w"> </span><span class="nv">SessionId</span><span class="p">,</span><span class="w"> </span><span class="nv">Plugins</span><span class="p">,</span><span class="w"> </span><span class="nn">os</span><span class="p">:</span><span class="nf">timestamp</span><span class="p">()}).</span>
+
+<span class="c">%% Lookup</span>
+<span class="p">[{_,</span><span class="w"> </span><span class="nv">Pid</span><span class="p">,</span><span class="w"> </span><span class="p">_,</span><span class="w"> </span><span class="p">_,</span><span class="w"> </span><span class="p">_,</span><span class="w"> </span><span class="p">_}]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">ets</span><span class="p">:</span><span class="nf">lookup</span><span class="p">(</span><span class="n">yuzu_gw_agents</span><span class="p">,</span><span class="w"> </span><span class="nv">AgentId</span><span class="p">).</span>
+
+<span class="c">%% Remove (on agent disconnect)</span>
+<span class="nn">ets</span><span class="p">:</span><span class="nf">delete</span><span class="p">(</span><span class="n">yuzu_gw_agents</span><span class="p">,</span><span class="w"> </span><span class="nv">AgentId</span><span class="p">).</span>
+</code></pre></div>
+<p><strong>pg (process groups)</strong> — efficient broadcast/multicast:</p>
+<div class="highlight"><pre><span></span><code><span class="c">%% Every agent process joins the &#39;all_agents&#39; group</span>
+<span class="nn">pg</span><span class="p">:</span><span class="nf">join</span><span class="p">(</span><span class="n">yuzu_gw</span><span class="p">,</span><span class="w"> </span><span class="n">all_agents</span><span class="p">,</span><span class="w"> </span><span class="n">self</span><span class="p">()).</span>
+
+<span class="c">%% Plugin-specific groups for targeted fanout</span>
+<span class="nn">pg</span><span class="p">:</span><span class="nf">join</span><span class="p">(</span><span class="n">yuzu_gw</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="n">plugin</span><span class="p">,</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="s">&quot;inventory&quot;</span><span class="o">&gt;&gt;</span><span class="p">},</span><span class="w"> </span><span class="n">self</span><span class="p">()).</span>
+<span class="nn">pg</span><span class="p">:</span><span class="nf">join</span><span class="p">(</span><span class="n">yuzu_gw</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="n">plugin</span><span class="p">,</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="s">&quot;patch&quot;</span><span class="o">&gt;&gt;</span><span class="p">},</span><span class="w"> </span><span class="n">self</span><span class="p">()).</span>
+
+<span class="c">%% Broadcast to all agents (returns list of pids across the cluster)</span>
+<span class="nv">Pids</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">pg</span><span class="p">:</span><span class="nf">get_members</span><span class="p">(</span><span class="n">yuzu_gw</span><span class="p">,</span><span class="w"> </span><span class="n">all_agents</span><span class="p">).</span>
+
+<span class="c">%% Plugin-targeted command</span>
+<span class="nv">Pids</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nn">pg</span><span class="p">:</span><span class="nf">get_members</span><span class="p">(</span><span class="n">yuzu_gw</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="n">plugin</span><span class="p">,</span><span class="w"> </span><span class="nv">Plugin</span><span class="p">}).</span>
+</code></pre></div>
+<p><strong>Why both?</strong></p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Mechanism</th>
+<th>Time complexity</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Send to one agent by ID</td>
+<td>ETS lookup</td>
+<td>O(1)</td>
+</tr>
+<tr>
+<td>Broadcast to all agents</td>
+<td>pg group</td>
+<td>O(1) to get member list</td>
+</tr>
+<tr>
+<td>Send to agents with plugin X</td>
+<td>pg group</td>
+<td>O(1) to get member list</td>
+</tr>
+<tr>
+<td>List all agents (dashboard)</td>
+<td>ETS <code>select</code></td>
+<td>O(n) but paginated via cursor</td>
+</tr>
+<tr>
+<td>Cross-node fanout</td>
+<td>pg (cluster-aware)</td>
+<td>Automatic via Erlang distribution</td>
+</tr>
+</tbody>
+</table>
+<h3 id="cross-node-routing-clustering">Cross-Node Routing (Clustering)</h3>
+<p>pg is cluster-aware out of the box. When a gateway node joins the Erlang
+cluster, its agent processes automatically appear in pg groups visible to all
+other nodes. No external service discovery needed.</p>
+<div class="highlight"><pre><span></span><code><span class="c">%% In sys.config — Erlang distribution</span>
+<span class="p">[{</span><span class="n">kernel</span><span class="p">,</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="n">connect_all</span><span class="p">,</span><span class="w"> </span><span class="n">false</span><span class="p">},</span><span class="w">          </span><span class="c">% Don&#39;t auto-mesh; use explicit connections</span>
+<span class="w">    </span><span class="p">{</span><span class="n">net_ticktime</span><span class="p">,</span><span class="w"> </span><span class="mi">30</span><span class="p">}</span><span class="w">             </span><span class="c">% Failure detection: 30s × 4 = 120s</span>
+<span class="p">]}].</span>
+
+<span class="c">%% Node discovery (choose one):</span>
+<span class="c">%% Option A: Static seed nodes</span>
+<span class="c">%% Option B: Kubernetes headless service via inet_res</span>
+<span class="c">%% Option C: AWS Cloud Map / Consul via a discovery module</span>
+</code></pre></div>
+<h3 id="routing-table-for-partitioned-agents">Routing Table for Partitioned Agents</h3>
+<p>For millions of agents across N gateway nodes, agents are distributed by
+consistent hashing on <code>agent_id</code>. This determines which gateway node an agent
+<em>should</em> connect to (for rebalancing), but any node <em>can</em> accept any agent.</p>
+<div class="highlight"><pre><span></span><code><span class="c">%% Ring: 256 virtual nodes per physical node</span>
+<span class="c">%% Agent assignment: hash(agent_id) mod ring → owning node</span>
+<span class="c">%% Used only for:</span>
+<span class="c">%%   1. DNS-based connection routing (return preferred node IP)</span>
+<span class="c">%%   2. Rebalancing after node add/remove</span>
+<span class="c">%% NOT used for command routing — pg handles that transparently.</span>
+</code></pre></div>
+<h3 id="gateway-adjacency-and-latency-based-agent-redistribution">Gateway Adjacency and Latency-Based Agent Redistribution</h3>
+<p>Each gateway node must maintain an awareness of its <strong>peers</strong> (adjacent gateway
+nodes in the cluster) and be able to dynamically redistribute agents across the
+cluster based on measured latency and load. The consistent hash ring determines
+an agent's <em>preferred</em> node, but the actual placement must adapt at runtime.</p>
+<h4 id="adjacency-table">Adjacency Table</h4>
+<p>Every gateway node maintains a live adjacency table of all peer nodes:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Source</th>
+<th>Update frequency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Node name</td>
+<td>Erlang distribution (<code>net_kernel</code>)</td>
+<td>On connect/disconnect</td>
+</tr>
+<tr>
+<td>Agent count</td>
+<td>Periodic exchange (or pg group size)</td>
+<td>Every 10s</td>
+</tr>
+<tr>
+<td>CPU / scheduler utilisation</td>
+<td><code>scheduler:utilization/1</code> shared via <code>gen_server:call</code> or gossip</td>
+<td>Every 10s</td>
+</tr>
+<tr>
+<td>Memory pressure</td>
+<td><code>erlang:memory/0</code></td>
+<td>Every 10s</td>
+</tr>
+<tr>
+<td>RTT to this node</td>
+<td><code>net_adm:ping</code> latency or distribution heartbeat</td>
+<td>Every 30s</td>
+</tr>
+<tr>
+<td>Agent→node latency histogram</td>
+<td>Aggregated from heartbeat RTTs per agent</td>
+<td>Rolling 5 min window</td>
+</tr>
+<tr>
+<td>Drain state</td>
+<td>Explicit flag (set via admin API or SIGTERM handler)</td>
+<td>Event-driven</td>
+</tr>
+</tbody>
+</table>
+<p>The adjacency table is held in an ETS table owned by a new <code>yuzu_gw_cluster</code>
+gen_server, which publishes changes as telemetry events.</p>
+<h4 id="load-shedding-outbound">Load Shedding (Outbound)</h4>
+<p>A gateway node sheds agents when it is overloaded or draining. Shedding is
+cooperative — the node sends a gRPC <code>GOAWAY</code> frame to selected agents, which
+triggers agent reconnection. The reconnecting agent is steered to a less-loaded
+peer via one of:</p>
+<ol>
+<li><strong>DNS steering</strong> — the gateway updates a DNS record (or health-check weight)
+   so the agent's next resolution returns a different node.</li>
+<li><strong>Redirect hint</strong> — a new field in the <code>RegisterResponse</code> or a custom gRPC
+   trailing metadata entry tells the agent which address to connect to next.</li>
+</ol>
+<p>Shedding triggers:</p>
+<table>
+<thead>
+<tr>
+<th>Trigger</th>
+<th>Threshold (configurable)</th>
+<th>Action</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Scheduler utilisation</td>
+<td>&gt; 85% sustained 60s</td>
+<td>Shed 10% of agents to least-loaded peer</td>
+</tr>
+<tr>
+<td>Memory</td>
+<td>&gt; 80% of configured ceiling</td>
+<td>Shed agents with largest pending maps first</td>
+</tr>
+<tr>
+<td>Admin drain</td>
+<td>Explicit API call or SIGTERM</td>
+<td>Shed all agents over a configurable ramp-down window (default 5 min)</td>
+</tr>
+<tr>
+<td>Node joining</td>
+<td>New node enters cluster with 0 agents</td>
+<td>Existing nodes shed proportionally to rebalance</td>
+</tr>
+</tbody>
+</table>
+<p>Shedding must be <strong>rate-limited</strong> (e.g., max 1000 GOAWAYs/sec) to prevent a
+reconnection storm that overwhelms the receiving nodes.</p>
+<h4 id="agent-absorption-inbound">Agent Absorption (Inbound)</h4>
+<p>When a gateway node has capacity and peers are shedding, it absorbs agents by
+accepting their reconnections. Absorption is passive — the node simply accepts
+<code>Register</code> + <code>Subscribe</code> calls as normal — but the node advertises its
+willingness to absorb by broadcasting its load state via the adjacency table.</p>
+<p>A node may also <strong>proactively pull</strong> agents by requesting a peer to shed specific
+agents toward it. This is useful when a new node joins and wants to ramp up
+quickly rather than waiting for organic reconnections.</p>
+<h4 id="latency-based-redistribution">Latency-Based Redistribution</h4>
+<p>Static hash-based placement ignores network topology. An agent in a Sydney
+branch office routed by hash to a Frankfurt gateway incurs unnecessary latency.
+Latency-aware redistribution addresses this:</p>
+<ol>
+<li>
+<p><strong>Measurement:</strong> Each gateway node measures RTT to its connected agents via
+   heartbeat round-trip times (already available — heartbeat response latency).
+   These are bucketed per agent into a rolling P50/P99 window.</p>
+</li>
+<li>
+<p><strong>Peer latency:</strong> Gateways exchange inter-node RTT measurements via the
+   adjacency table, so each node knows latency to every other node.</p>
+</li>
+<li>
+<p><strong>Affinity score:</strong> For each agent, the system computes an affinity score
+   combining:
+   - Agent→current node RTT (measured)
+   - Agent→alternative node RTT (estimated: agent→current + current→peer,
+     refined by actual measurement after migration)
+   - Current node load (from adjacency table)
+   - Peer node load (from adjacency table)</p>
+</li>
+<li>
+<p><strong>Migration decision:</strong> If an agent's estimated RTT to a peer is
+   significantly lower (configurable threshold, e.g., &gt; 30% improvement) <em>and</em>
+   the peer has capacity, the current node sheds that agent toward the peer.
+   The agent reconnects and the peer measures actual RTT to confirm improvement.</p>
+</li>
+<li>
+<p><strong>Stability:</strong> To prevent oscillation, an agent that was recently migrated
+   (configurable cooldown, e.g., 10 min) is exempt from further redistribution.
+   Decisions use hysteresis — migrate only when the improvement exceeds a
+   threshold, not on marginal differences.</p>
+</li>
+</ol>
+<h4 id="telemetry-events">Telemetry Events</h4>
+<div class="highlight"><pre><span></span><code><span class="c">%% ── Adjacency / redistribution ──</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">cluster</span><span class="p">,</span><span class="w"> </span><span class="n">adjacency_update</span><span class="p">]</span><span class="w">   </span><span class="c">% meta: #{peer, agent_count, cpu, memory, rtt_ms}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">cluster</span><span class="p">,</span><span class="w"> </span><span class="n">shed_started</span><span class="p">]</span><span class="w">       </span><span class="c">% #{count, reason} meta: #{target_peer}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">cluster</span><span class="p">,</span><span class="w"> </span><span class="n">shed_completed</span><span class="p">]</span><span class="w">     </span><span class="c">% #{count, duration_ms}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">cluster</span><span class="p">,</span><span class="w"> </span><span class="n">absorbed</span><span class="p">]</span><span class="w">           </span><span class="c">% #{count} meta: #{from_peer}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">cluster</span><span class="p">,</span><span class="w"> </span><span class="n">latency_migration</span><span class="p">]</span><span class="w">  </span><span class="c">% #{agent_id, old_rtt_ms, estimated_new_rtt_ms, target_peer}</span>
+</code></pre></div>
+<h4 id="prometheus-metrics">Prometheus Metrics</h4>
+<div class="highlight"><pre><span></span><code>yuzu_gw_cluster_peer_rtt_ms{peer=&quot;gw2@10.0.1.2&quot;}              12
+yuzu_gw_cluster_peer_agent_count{peer=&quot;gw2@10.0.1.2&quot;}         342819
+yuzu_gw_cluster_shed_total{reason=&quot;overload&quot;}                  1500
+yuzu_gw_cluster_absorbed_total{from_peer=&quot;gw3@10.0.1.3&quot;}      1200
+yuzu_gw_agent_rtt_ms{quantile=&quot;0.99&quot;}                          45
+yuzu_gw_redistribution_decisions_total{action=&quot;migrate&quot;}       320
+yuzu_gw_redistribution_decisions_total{action=&quot;keep&quot;}          980000
+</code></pre></div>
+<hr>
+<h2 id="wire-protocol-integration">Wire Protocol Integration</h2>
+<h3 id="agent-facing-proxy-the-existing-protobuf-contract">Agent-Facing: Proxy the Existing Protobuf Contract</h3>
+<p>The gateway speaks the <strong>exact same</strong> <code>AgentService</code> proto that agents already
+use. Zero agent-side changes required.</p>
+<div class="highlight"><pre><span></span><code>Agent                          Gateway                        C++ Server
+  │                              │                              │
+  │── Register(RegisterReq) ────▶│── Register(RegisterReq) ────▶│
+  │◀── RegisterResponse ────────│◀── RegisterResponse ─────────│
+  │                              │                              │
+  │  (gateway records session_id, spawns yuzu_gw_agent proc)   │
+  │                              │                              │
+  │── Subscribe(bidi stream) ──▶│  (stream terminates at       │
+  │                              │   gateway; NOT proxied to    │
+  │                              │   C++ server)                │
+  │◀── CommandRequest ──────────│                              │
+  │── CommandResponse ─────────▶│                              │
+  │                              │                              │
+  │── Heartbeat ────────────────▶│── Heartbeat (batched) ──────▶│
+  │◀── HeartbeatResponse ───────│◀── HeartbeatResponse ────────│
+  │                              │                              │
+  │── ReportInventory ─────────▶│── ReportInventory (proxy) ──▶│
+  │◀── InventoryAck ────────────│◀── InventoryAck ─────────────│
+</code></pre></div>
+<p><strong>Key insight:</strong> The Subscribe bidi stream terminates at the gateway. The C++
+server never holds agent streams at scale — the gateway owns them. Register,
+Heartbeat, and ReportInventory are proxied upstream to the C++ server so it
+retains enrollment authority and inventory storage.</p>
+<h3 id="operator-facing-gateway-implements-sendcommand-directly">Operator-Facing: Gateway Implements SendCommand Directly</h3>
+<div class="highlight"><pre><span></span><code>Dashboard                      Gateway                        C++ Server
+  │                              │                              │
+  │── SendCommand(req) ────────▶│  (fan out to agent procs     │
+  │                              │   via pg/ETS)                │
+  │◀── stream SendCommandResp ──│◀── responses from agents ───│
+  │                              │                              │
+  │── ListAgents ──────────────▶│  (answered from ETS table)   │
+  │◀── ListAgentsResponse ──────│                              │
+  │                              │                              │
+  │── WatchEvents ─────────────▶│  (gateway-native; monitors   │
+  │◀── stream AgentEvent ───────│   agent process lifecycle)   │
+</code></pre></div>
+<p><code>ListAgents</code>, <code>GetAgent</code>, and <code>WatchEvents</code> can be served entirely by the
+gateway (it knows which agents are connected). <code>QueryInventory</code> is proxied
+to the C++ server (which owns the SQLite store).</p>
+<h3 id="heartbeat-batching">Heartbeat Batching</h3>
+<p>Instead of proxying every individual heartbeat to the C++ server, the gateway
+batches them:</p>
+<div class="highlight"><pre><span></span><code><span class="c">%% yuzu_gw_upstream batches heartbeats every 10 seconds</span>
+<span class="c">%% Sends a single BatchHeartbeat (new internal-only RPC) to C++ server</span>
+<span class="c">%% containing [{session_id, timestamp, status_tags}] for all agents on this node.</span>
+<span class="c">%%</span>
+<span class="c">%% The C++ server updates last_seen timestamps in bulk.</span>
+<span class="c">%% This reduces upstream RPC volume from O(agents/interval) to O(nodes/interval).</span>
+</code></pre></div>
+<p>This requires a small addition to the C++ server — a <code>BatchHeartbeat</code> RPC on an
+internal service. Alternatively, the gateway can simply call <code>Heartbeat</code> in a
+pooled fashion with a configurable concurrency limit.</p>
+<hr>
+<h2 id="telemetry">Telemetry</h2>
+<h3 id="event-definitions">Event Definitions</h3>
+<p>All events use the standard Erlang <code>telemetry</code> library (compatible with
+Prometheus, StatsD, OpenTelemetry exporters).</p>
+<div class="highlight"><pre><span></span><code><span class="c">%% ── Connection lifecycle ──</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">agent</span><span class="p">,</span><span class="w"> </span><span class="n">connected</span><span class="p">]</span><span class="w">        </span><span class="c">% #{agent_id, node, session_id}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">agent</span><span class="p">,</span><span class="w"> </span><span class="n">disconnected</span><span class="p">]</span><span class="w">     </span><span class="c">% #{agent_id, reason, duration_ms}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">agent</span><span class="p">,</span><span class="w"> </span><span class="n">count</span><span class="p">]</span><span class="w">            </span><span class="c">% #{count}  (gauge, emitted every 10s)</span>
+
+<span class="c">%% ── Command plane ──</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">command</span><span class="p">,</span><span class="w"> </span><span class="n">dispatched</span><span class="p">]</span><span class="w">     </span><span class="c">% #{count =&gt; 1}  meta: #{agent_id, plugin, command_id}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">command</span><span class="p">,</span><span class="w"> </span><span class="n">completed</span><span class="p">]</span><span class="w">      </span><span class="c">% #{duration_ms} meta: #{agent_id, plugin, status}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">command</span><span class="p">,</span><span class="w"> </span><span class="n">timeout</span><span class="p">]</span><span class="w">        </span><span class="c">% #{count =&gt; 1}  meta: #{agent_id, command_id}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">command</span><span class="p">,</span><span class="w"> </span><span class="n">fanout</span><span class="p">]</span><span class="w">         </span><span class="c">% #{target_count, duration_ms} meta: #{command_id}</span>
+
+<span class="c">%% ── Stream health ──</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">stream</span><span class="p">,</span><span class="w"> </span><span class="n">backpressure</span><span class="p">]</span><span class="w">    </span><span class="c">% #{queue_len} meta: #{agent_id}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">stream</span><span class="p">,</span><span class="w"> </span><span class="n">write_error</span><span class="p">]</span><span class="w">     </span><span class="c">% #{count =&gt; 1} meta: #{agent_id, error}</span>
+
+<span class="c">%% ── Upstream (C++ server) ──</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">upstream</span><span class="p">,</span><span class="w"> </span><span class="n">rpc_latency</span><span class="p">]</span><span class="w">   </span><span class="c">% #{duration_ms} meta: #{rpc_name}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">upstream</span><span class="p">,</span><span class="w"> </span><span class="n">rpc_error</span><span class="p">]</span><span class="w">     </span><span class="c">% #{count =&gt; 1}  meta: #{rpc_name, code}</span>
+
+<span class="c">%% ── Cluster ──</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">cluster</span><span class="p">,</span><span class="w"> </span><span class="n">node_up</span><span class="p">]</span><span class="w">        </span><span class="c">% meta: #{node}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">cluster</span><span class="p">,</span><span class="w"> </span><span class="n">node_down</span><span class="p">]</span><span class="w">      </span><span class="c">% meta: #{node}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">cluster</span><span class="p">,</span><span class="w"> </span><span class="n">rebalance</span><span class="p">]</span><span class="w">      </span><span class="c">% #{moved_agents} meta: #{from, to}</span>
+
+<span class="c">%% ── BEAM VM ──</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">vm</span><span class="p">,</span><span class="w"> </span><span class="n">process_count</span><span class="p">]</span><span class="w">       </span><span class="c">% #{count}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">vm</span><span class="p">,</span><span class="w"> </span><span class="nb">memory</span><span class="p">]</span><span class="w">              </span><span class="c">% #{total, processes, ets, binary}</span>
+<span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">vm</span><span class="p">,</span><span class="w"> </span><span class="n">scheduler_util</span><span class="p">]</span><span class="w">      </span><span class="c">% #{weighted_avg}</span>
+</code></pre></div>
+<h3 id="prometheus-exposition">Prometheus Exposition</h3>
+<div class="highlight"><pre><span></span><code><span class="c">%% Attach handler in yuzu_gw_app:start/2</span>
+<span class="nn">telemetry</span><span class="p">:</span><span class="nf">attach_many</span><span class="p">(</span><span class="n">prometheus_handler</span><span class="p">,</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">agent</span><span class="p">,</span><span class="w"> </span><span class="n">connected</span><span class="p">],</span>
+<span class="w">    </span><span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">agent</span><span class="p">,</span><span class="w"> </span><span class="n">disconnected</span><span class="p">],</span>
+<span class="w">    </span><span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">command</span><span class="p">,</span><span class="w"> </span><span class="n">dispatched</span><span class="p">],</span>
+<span class="w">    </span><span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">command</span><span class="p">,</span><span class="w"> </span><span class="n">completed</span><span class="p">],</span>
+<span class="w">    </span><span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">command</span><span class="p">,</span><span class="w"> </span><span class="n">fanout</span><span class="p">],</span>
+<span class="w">    </span><span class="p">[</span><span class="n">yuzu</span><span class="p">,</span><span class="w"> </span><span class="n">gw</span><span class="p">,</span><span class="w"> </span><span class="n">upstream</span><span class="p">,</span><span class="w"> </span><span class="n">rpc_latency</span><span class="p">]</span>
+<span class="p">],</span><span class="w"> </span><span class="k">fun</span><span class="w"> </span><span class="nn">yuzu_gw_telemetry</span><span class="p">:</span><span class="n">handle_event</span><span class="o">/</span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="p">#{}).</span>
+
+<span class="c">%% Metrics exposed on :9568/metrics (prometheus_httpd)</span>
+<span class="c">%% Example output:</span>
+<span class="c">%%   yuzu_gw_agents_connected_total{node=&quot;gw1@10.0.1.1&quot;} 342819</span>
+<span class="c">%%   yuzu_gw_command_dispatch_duration_ms{plugin=&quot;inventory&quot;,quantile=&quot;0.99&quot;} 12</span>
+<span class="c">%%   yuzu_gw_fanout_target_count{quantile=&quot;0.5&quot;} 50000</span>
+<span class="c">%%   yuzu_gw_upstream_rpc_duration_ms{rpc=&quot;Register&quot;,quantile=&quot;0.99&quot;} 45</span>
+<span class="c">%%   yuzu_gw_beam_process_count{node=&quot;gw1@10.0.1.1&quot;} 1048832</span>
+</code></pre></div>
+<h3 id="dashboard-integration">Dashboard Integration</h3>
+<p>The existing SSE <code>EventBus</code> in the C++ server can subscribe to a
+<code>WatchEvents</code> stream from the gateway to continue powering the web dashboard
+without changes. The gateway emits <code>AgentConnected</code>/<code>AgentDisconnected</code>
+events natively from process lifecycle monitoring.</p>
+<hr>
+<h2 id="capacity-planning">Capacity Planning</h2>
+<table>
+<thead>
+<tr>
+<th>Resource</th>
+<th>Per Agent</th>
+<th>At 1M Agents</th>
+<th>At 5M Agents (clustered)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Erlang process</td>
+<td>~2 KB</td>
+<td>2 GB</td>
+<td>10 GB (across 5 nodes)</td>
+</tr>
+<tr>
+<td>ETS row</td>
+<td>~200 B</td>
+<td>200 MB</td>
+<td>1 GB</td>
+</tr>
+<tr>
+<td>pg membership</td>
+<td>~64 B</td>
+<td>64 MB</td>
+<td>320 MB</td>
+</tr>
+<tr>
+<td>File descriptors</td>
+<td>1</td>
+<td>1M (set <code>ulimit -n 2000000</code>)</td>
+<td>1M per node</td>
+</tr>
+<tr>
+<td>TCP buffers (kernel)</td>
+<td>~8 KB</td>
+<td>8 GB</td>
+<td>8 GB per node</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Recommended node sizing:</strong> 1M agents per gateway node on a 16-core / 32 GB
+machine. The BEAM scheduler pins one scheduler thread per core; all agent
+processes are multiplexed across them without thread-per-connection overhead.</p>
+<p><strong>Cluster topology for 5M agents:</strong></p>
+<div class="highlight"><pre><span></span><code>               ┌─── gw1 (1M agents) ───┐
+               ├─── gw2 (1M agents) ───┤
+LB/DNS ────────├─── gw3 (1M agents) ───├──── yuzu-server (C++)
+               ├─── gw4 (1M agents) ───┤
+               └─── gw5 (1M agents) ───┘
+</code></pre></div>
+<hr>
+<h2 id="migration-steps">Migration Steps</h2>
+<h3 id="phase-0-proto-preparation-no-runtime-changes">Phase 0: Proto Preparation (no runtime changes)</h3>
+<ol>
+<li><strong>Add a <code>gateway</code> package</strong> to the proto directory:</li>
+</ol>
+<div class="highlight"><pre><span></span><code>proto/yuzu/gateway/v1/gateway.proto
+</code></pre></div>
+<p>Define an internal-only service for gateway ↔ C++ server communication:</p>
+<div class="highlight"><pre><span></span><code><span class="k">syntax</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;proto3&quot;</span><span class="p">;</span>
+<span class="kn">package</span><span class="w"> </span><span class="nn">yuzu</span><span class="o">.</span><span class="n">gateway.v1</span><span class="p">;</span>
+
+<span class="k">import</span><span class="w"> </span><span class="s">&quot;yuzu/agent/v1/agent.proto&quot;</span><span class="p">;</span>
+
+<span class="c1">// Internal service: gateway → C++ server (not exposed to agents)</span>
+<span class="kd">service</span><span class="w"> </span><span class="n">GatewayUpstream</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="c1">// Proxy registration to the control plane</span>
+<span class="w">  </span><span class="k">rpc</span><span class="w"> </span><span class="n">ProxyRegister</span><span class="p">(</span><span class="n">yuzu.agent.v1.RegisterRequest</span><span class="p">)</span>
+<span class="w">      </span><span class="k">returns</span><span class="w"> </span><span class="p">(</span><span class="n">yuzu.agent.v1.RegisterResponse</span><span class="p">);</span>
+
+<span class="w">  </span><span class="c1">// Batch heartbeat (reduces per-agent RPC overhead)</span>
+<span class="w">  </span><span class="k">rpc</span><span class="w"> </span><span class="n">BatchHeartbeat</span><span class="p">(</span><span class="n">BatchHeartbeatRequest</span><span class="p">)</span>
+<span class="w">      </span><span class="k">returns</span><span class="w"> </span><span class="p">(</span><span class="n">BatchHeartbeatResponse</span><span class="p">);</span>
+
+<span class="w">  </span><span class="c1">// Proxy inventory reports</span>
+<span class="w">  </span><span class="k">rpc</span><span class="w"> </span><span class="n">ProxyInventory</span><span class="p">(</span><span class="n">yuzu.agent.v1.InventoryReport</span><span class="p">)</span>
+<span class="w">      </span><span class="k">returns</span><span class="w"> </span><span class="p">(</span><span class="n">yuzu.agent.v1.InventoryAck</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kd">message</span><span class="w"> </span><span class="nc">BatchHeartbeatRequest</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">repeated</span><span class="w"> </span><span class="n">yuzu.agent.v1.HeartbeatRequest</span><span class="w"> </span><span class="na">heartbeats</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kd">message</span><span class="w"> </span><span class="nc">BatchHeartbeatResponse</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kt">int32</span><span class="w"> </span><span class="na">acknowledged_count</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+<ol start="2">
+<li>
+<p><strong>Implement <code>GatewayUpstream</code> in the C++ server</strong> — thin wrappers around
+   existing <code>AgentServiceImpl</code> logic. <code>BatchHeartbeat</code> iterates the heartbeat
+   list and updates <code>last_seen</code> in bulk.</p>
+</li>
+<li>
+<p><strong>Add the Erlang OTP project</strong> under <code>gateway/</code> (or a separate repo).
+   Wire up <code>grpcbox</code> with the proto files using <code>gpb</code> for code generation.</p>
+</li>
+</ol>
+<h3 id="phase-1-shadow-mode-read-only-gateway-agents-still-connect-to-c">Phase 1: Shadow Mode (read-only gateway, agents still connect to C++)</h3>
+<ol>
+<li>Deploy the gateway alongside the C++ server.</li>
+<li>Gateway connects to <code>GatewayUpstream</code> and calls <code>ListAgents</code> periodically to
+   build its routing table from the C++ server's ground truth.</li>
+<li>Operators can issue <code>SendCommand</code> to <strong>either</strong> the gateway or the C++ server.
+   The gateway proxies to the C++ server's <code>Subscribe</code> streams (no direct agent
+   connections yet).</li>
+<li>Validate telemetry, latency, and correctness by comparing results.</li>
+</ol>
+<h3 id="phase-2-agent-cutover-gateway-owns-subscribe-streams">Phase 2: Agent Cutover (gateway owns Subscribe streams)</h3>
+<ol>
+<li><strong>DNS / load balancer change</strong>: point agents' gRPC target to the gateway
+   cluster instead of the C++ server directly.</li>
+<li>Agents call <code>Register</code> → gateway proxies to C++ server via <code>ProxyRegister</code>.</li>
+<li>Agents call <code>Subscribe</code> → gateway <strong>terminates</strong> the bidi stream locally,
+   spawning a <code>yuzu_gw_agent</code> process. Stream is NOT forwarded to C++.</li>
+<li>Agents call <code>Heartbeat</code> → gateway batches and sends via <code>BatchHeartbeat</code>.</li>
+<li><code>SendCommand</code> from operators hits the gateway's <code>ManagementService</code>, which
+   fans out via the local agent processes.</li>
+<li>The C++ server's <code>AgentRegistry</code> is no longer populated (no direct Subscribe
+   streams). Its <code>send_to</code>/<code>send_to_all</code> become dead code for command dispatch.</li>
+</ol>
+<h3 id="phase-3-cleanup-optimization">Phase 3: Cleanup &amp; Optimization</h3>
+<ol>
+<li><strong>Remove stream_mu and send_to/send_to_all from C++ server</strong> — no longer
+   needed. The C++ server becomes a pure control-plane + dashboard server.</li>
+<li><strong>Implement cross-node fanout</strong> — scale the gateway cluster horizontally.
+   pg handles routing transparently; add consistent hashing for connection
+   balancing.</li>
+<li><strong>Add circuit breakers</strong> in <code>yuzu_gw_upstream</code> for C++ server calls.</li>
+<li><strong>Implement graceful agent migration</strong> — when a gateway node is drained,
+   its agent processes send a <code>GOAWAY</code> frame, causing agents to reconnect
+   (likely to a different node).</li>
+</ol>
+<h3 id="phase-4-advanced-features">Phase 4: Advanced Features</h3>
+<ol>
+<li><strong>Command deduplication</strong> — the gateway can deduplicate identical broadcast
+   commands (same plugin + action + parameters) within a time window.</li>
+<li><strong>Priority queues</strong> — high-priority commands skip the agent process mailbox
+   queue (Erlang process priorities or a two-mailbox pattern).</li>
+<li><strong>Response caching</strong> — cache inventory-like responses at the gateway to
+   reduce agent round-trips.</li>
+<li><strong>OIDC token validation at the gateway</strong> — offload auth for operator-facing
+   RPCs from the C++ server.</li>
+</ol>
+<hr>
+<h2 id="agent-side-changes">Agent-Side Changes</h2>
+<p><strong>None required for Phase 1–2.</strong> The gateway speaks the identical <code>AgentService</code>
+proto. The agent's <code>--server</code> flag simply points to the gateway's address
+instead of the C++ server's.</p>
+<p>The only agent-visible difference: the TLS certificate presented by the gateway
+must be trusted. If using mTLS, the gateway's server certificate must be signed
+by the same CA, and the gateway must validate agent client certificates the same
+way (or proxy the raw TLS peer identity to the C++ server in <code>ProxyRegister</code>).</p>
+<hr>
+<h2 id="c-server-changes-summary">C++ Server Changes Summary</h2>
+<table>
+<thead>
+<tr>
+<th>Change</th>
+<th>Scope</th>
+<th>Effort</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Implement <code>GatewayUpstream</code> service</td>
+<td>New gRPC service in <code>server/core/</code></td>
+<td>Medium</td>
+</tr>
+<tr>
+<td><code>BatchHeartbeat</code> handler</td>
+<td>Iterate + update <code>last_seen</code></td>
+<td>Small</td>
+</tr>
+<tr>
+<td><code>ProxyRegister</code> handler</td>
+<td>Delegate to existing enrollment logic</td>
+<td>Small</td>
+</tr>
+<tr>
+<td><code>ProxyInventory</code> handler</td>
+<td>Delegate to existing inventory store</td>
+<td>Small</td>
+</tr>
+<tr>
+<td>Expose <code>GatewayUpstream</code> on a separate port or with interceptor auth</td>
+<td>Config</td>
+<td>Small</td>
+</tr>
+<tr>
+<td>Remove <code>stream_mu</code>, <code>send_to</code>, <code>send_to_all</code> (Phase 3)</td>
+<td>Delete code</td>
+<td>Small</td>
+</tr>
+<tr>
+<td>Update dashboard SSE to source events from gateway <code>WatchEvents</code></td>
+<td><code>server.cpp</code> EventBus</td>
+<td>Medium</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="why-erlang-vs-alternatives">Why Erlang (vs. alternatives)</h2>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Erlang/OTP</th>
+<th>Alternatives considered</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Millions of concurrent connections</td>
+<td>BEAM VM: 1M+ processes per node, each ~2 KB. Purpose-built for telecom switches.</td>
+<td>Go goroutines (similar scale, but no supervision trees, no hot code reload). Rust async (similar scale, harder to express the actor model).</td>
+</tr>
+<tr>
+<td>Fault isolation</td>
+<td>Process crash kills only that agent's session. Supervisor restarts are automatic.</td>
+<td>Go/Rust: a panic or deadlock in one connection handler can cascade without careful engineering.</td>
+</tr>
+<tr>
+<td>Hot code upgrade</td>
+<td>OTP release upgrades allow deploying new routing logic without dropping agent connections.</td>
+<td>Go/Rust: rolling restart required, causing mass agent reconnection storms.</td>
+</tr>
+<tr>
+<td>Cluster-native</td>
+<td>Erlang distribution + pg gives transparent cross-node process groups.</td>
+<td>Go/Rust: requires external service mesh (Consul, etcd) for cluster membership.</td>
+</tr>
+<tr>
+<td>Backpressure</td>
+<td>Mailbox-per-process provides natural backpressure; slow agents don't block fast ones.</td>
+<td>Go channels (similar). C++ shared mutex (current problem).</td>
+</tr>
+<tr>
+<td>Operational maturity for this workload</td>
+<td>30+ years in telecom; WhatsApp ran 2M connections/server on BEAM.</td>
+<td>Proven but less specifically optimized for this pattern.</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="file-placement-in-yuzu-repo">File Placement in Yuzu Repo</h2>
+<div class="highlight"><pre><span></span><code>Yuzu/
+├── gateway/
+│   └── erlang/                    % New: Erlang OTP application
+│       ├── rebar.config
+│       ├── rebar.lock
+│       ├── config/
+│       │   ├── sys.config
+│       │   └── vm.args
+│       └── apps/
+│           └── yuzu_gw/
+│               └── src/
+│                   └── (modules listed above)
+├── proto/
+│   └── yuzu/
+│       ├── gateway/
+│       │   └── v1/
+│       │       └── gateway.proto  % New: internal gateway↔server proto
+│       ├── agent/v1/agent.proto   % Unchanged
+│       ├── common/v1/common.proto % Unchanged
+│       └── server/v1/management.proto % Unchanged
+└── server/
+    └── core/
+        └── src/
+            └── server.cpp         % Add GatewayUpstream service impl
+</code></pre></div>
+</main>
+</body>
+</html>

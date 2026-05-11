@@ -1,0 +1,2929 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuzu Instruction Engine — Design &amp;amp; Architecture</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/Instruction-Engine.md</div>
+<h1 class="doc-title">Yuzu Instruction Engine — Design &amp;amp; Architecture</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="yuzu-instruction-engine-design-architecture">Yuzu Instruction Engine — Design &amp; Architecture</h1>
+<p><strong>Document status:</strong> Living design document — implementation guide
+<strong>Basis:</strong> <code>dev</code> branch at commit <code>dce7f7c</code> (2026-03-18)
+<strong>Audience:</strong> Yuzu contributors and integrators</p>
+<hr>
+<h2 id="1-epistemic-status">1. Epistemic Status</h2>
+<h3 id="verified-from-implementation">Verified from implementation</h3>
+<ul>
+<li><strong>Phase 0</strong> complete — HTTPS, OTA updates (<code>agents/core/src/updater.cpp</code>), secure temp files (<code>sdk/include/yuzu/plugin.h</code>), SDK utilities (<code>yuzu_table_to_json</code>, <code>yuzu_json_to_table</code>, <code>yuzu_split_lines</code>, <code>yuzu_generate_sequence</code>).</li>
+<li><strong>Phase 1</strong> data infrastructure complete — <code>ResponseStore</code> (SQLite, TTL-based cleanup, query with filtering/pagination, <strong>aggregation engine</strong> with GROUP BY + COUNT/SUM/AVG/MIN/MAX), <code>AuditStore</code> (structured events with principal/action/target/result), <code>TagStore</code> (agent-synced and server-set tags, validation), <code>ScopeEngine</code> (494 LOC recursive-descent parser, 9 operators, AND/OR/NOT combinators, wildcard LIKE, case-insensitive matching), <strong>data export</strong> (CSV/JSON export with RFC 4180 compliance, generic JSON-to-CSV conversion). All in <code>server/core/src/</code>.</li>
+<li><strong>Phase 2</strong> implemented — <code>InstructionStore</code> (full CRUD with YAML source storage, parameter/result schema fields, JSON import/export, InstructionSet CRUD with cascade delete), <code>ExecutionTracker</code> (create/query/get executions, per-agent status tracking with UPSERT, aggregate count refresh, auto-status transitions, rerun with failed-only targeting, cancel), <code>ApprovalManager</code> (submit/approve/reject with ownership validation — reviewer != submitter, pending count), <code>ScheduleEngine</code> (CRUD with frequency validation, evaluate_due for firing, advance_schedule with per-type next-execution computation). All methods backed by SQLite with WAL mode.</li>
+<li><strong>30 plugins</strong> across <code>agents/plugins/</code>: 24 cross-platform, 4 Windows-only (<code>bitlocker</code>, <code>msi_packages</code>, <code>sccm</code>, <code>windows_updates</code>), 2 test/debug (<code>chargen</code>, <code>example</code>).</li>
+<li><strong>Plugin ABI</strong> v1 stable: <code>YuzuPluginDescriptor</code> with <code>abi_version</code>, <code>name</code>, <code>version</code>, <code>description</code>, <code>actions[]</code>, <code>init</code>, <code>shutdown</code>, <code>execute</code>.</li>
+<li><strong>Wire protocol</strong>: gRPC/Protobuf — <code>CommandRequest</code> (plugin + action + parameters + expires_at), <code>CommandResponse</code> (status enum: RUNNING/SUCCESS/FAILURE/TIMEOUT/REJECTED, streaming output).</li>
+<li><strong>Scope DSL grammar</strong>: <code>expr → or_expr → and_expr → not_expr → primary → condition</code>. Operators: <code>==</code>, <code>!=</code>, <code>LIKE</code>, <code>&lt;</code>, <code>&gt;</code>, <code>&lt;=</code>, <code>&gt;=</code>, <code>IN</code>, <code>CONTAINS</code>. Max nesting depth 10.</li>
+<li><strong>Dashboard</strong> — HTMX-based instruction management page (<code>instruction_ui.cpp</code>) with tabs for Definitions, Executions, Schedules, Approvals. All load fragments via <code>hx-get</code>.</li>
+</ul>
+<h3 id="proposed-in-this-document">Proposed in this document</h3>
+<ul>
+<li>Unified substrate primitive table (Section 7) — consolidation of per-OS tables.</li>
+<li>Expression language evolution path (Section 8) — extend scope DSL now, adopt CEL for policy in Phase 5.</li>
+<li>Error model with 4-category taxonomy (Section 9).</li>
+<li>Concurrency model with 5 modes (Section 10).</li>
+<li>YAML authoring in dashboard (Section 11).</li>
+<li>File upload patterns (Section 12).</li>
+<li>ProductPack Ed25519 trust chain (Section 13).</li>
+<li>Agent compatibility and rollback (Section 14).</li>
+<li>Legacy command shim (Section 15).</li>
+<li><code>service.set_start_mode</code> primitive (Section 16).</li>
+<li>Scale design for 100K+ agents (Section 17).</li>
+</ul>
+<hr>
+<h2 id="2-executive-summary">2. Executive Summary</h2>
+<p>Yuzu's <strong>execution substrate is strong</strong>: 30 plugins, stable C ABI, gRPC streaming, mTLS, and OTA updates are production-ready. The <strong>data infrastructure is built</strong>: response storage, audit logging, device tagging, and scope-based targeting are implemented and tested. The <strong>content plane is scaffolded</strong>: instruction definitions, execution tracking, approvals, and scheduling have struct definitions and DDL but no business logic.</p>
+<p>The next step is to wire the scaffolded components into a governed instruction lifecycle — YAML-defined instruction definitions with typed parameter and result schemas, executed through the existing <code>CommandRequest</code> wire protocol, tracked by <code>ExecutionTracker</code>, stored by <code>ResponseStore</code>, and audited by <code>AuditStore</code>.</p>
+<p>This document is the architectural blueprint for that work.</p>
+<hr>
+<h2 id="3-current-state-assessment">3. Current-State Assessment</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>File(s)</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>InstructionStore</strong></td>
+<td><code>instruction_store.hpp</code></td>
+<td>Stub</td>
+<td>DDL, CRUD signatures, <code>InstructionDefinition</code> struct (id, name, version, type, plugin, action, description, enabled, instruction_set_id, gather_ttl, response_ttl, created_by, timestamps). Import/export JSON signatures defined.</td>
+</tr>
+<tr>
+<td><strong>ExecutionTracker</strong></td>
+<td><code>execution_tracker.hpp</code></td>
+<td>Stub</td>
+<td><code>Execution</code> struct (id, definition_id, status, scope_expression, parameter_values, dispatched_by, agent counts, parent_id, rerun_of). <code>AgentExecStatus</code> struct (agent_id, status, timestamps, exit_code, error_detail). <code>ExecutionSummary</code> with progress_pct. Rerun and cancel signatures.</td>
+</tr>
+<tr>
+<td><strong>ApprovalManager</strong></td>
+<td><code>approval_manager.hpp</code></td>
+<td>Stub</td>
+<td><code>Approval</code> struct (id, definition_id, status, submitted_by, reviewed_by, review_comment, scope_expression). Query, approve, reject, pending_count signatures.</td>
+</tr>
+<tr>
+<td><strong>ScheduleEngine</strong></td>
+<td><code>schedule_engine.hpp</code></td>
+<td>Stub</td>
+<td><code>InstructionSchedule</code> struct (id, name, definition_id, frequency_type, interval_minutes, time_of_day, day_of_week, day_of_month, scope_expression, requires_approval, enabled, next/last execution, execution_count). CRUD + enable/disable signatures.</td>
+</tr>
+<tr>
+<td><strong>ScopeEngine</strong></td>
+<td><code>scope_engine.cpp</code> (494 LOC)</td>
+<td><strong>Real</strong></td>
+<td>Full recursive-descent parser. 9 comparison operators. AND/OR/NOT combinators. Wildcard LIKE matching. Numeric comparison with fallback. <code>AttributeResolver</code> callback for evaluation.</td>
+</tr>
+<tr>
+<td><strong>ResponseStore</strong></td>
+<td><code>response_store.hpp</code></td>
+<td><strong>Real</strong></td>
+<td>SQLite-backed. <code>StoredResponse</code> with instruction_id, agent_id, timestamp, status, output, error_detail, ttl_expires_at. Query with agent/status/time filtering and pagination. Configurable retention (default 90 days). Background cleanup thread.</td>
+</tr>
+<tr>
+<td><strong>AuditStore</strong></td>
+<td><code>audit_store.hpp</code></td>
+<td><strong>Real</strong></td>
+<td>SQLite-backed. <code>AuditEvent</code> with timestamp, principal, principal_role, action, target_type, target_id, detail, source_ip, user_agent, session_id, result. Query with filtering. Retention default 365 days. Background cleanup.</td>
+</tr>
+<tr>
+<td><strong>TagStore</strong></td>
+<td><code>tag_store.hpp</code></td>
+<td><strong>Real</strong></td>
+<td>SQLite-backed. <code>DeviceTag</code> with agent_id, key, value, source ("agent"/"server"/"api"), updated_at. CRUD, sync from agent heartbeat, validation (key 64 chars, value 448 bytes). <code>agents_with_tag</code> for scope queries.</td>
+</tr>
+<tr>
+<td><strong>Instruction UI</strong></td>
+<td><code>instruction_ui.cpp</code></td>
+<td><strong>Real</strong></td>
+<td>HTMX page with 4 tabs (Definitions, Executions, Schedules, Approvals). Loads fragments via <code>hx-get</code>. Dark theme consistent with dashboard.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Overall progress:</strong> 150/184 capabilities done (82%). All 7 phases complete (72/72 issues). Instruction engine fully implemented.</p>
+<hr>
+<h2 id="4-design-principles">4. Design Principles</h2>
+<ol>
+<li>
+<p><strong>Substrate, not scripts.</strong> Expose stable builtin primitives; keep OS-specific syscalls inside plugin adapters. Content authors should never need to write shell commands.</p>
+</li>
+<li>
+<p><strong>Everything is an InstructionDefinition.</strong> Ad-hoc commands, scheduled tasks, policy checks, and remediation actions all flow through the same definition → execution → response pipeline.</p>
+</li>
+<li>
+<p><strong>Cross-platform by default.</strong> Primitives target all three OSes. Platform-specific behavior is declared in the definition's <code>platforms</code> field and handled by the plugin layer.</p>
+</li>
+<li>
+<p><strong>Typed end-to-end.</strong> Parameter schemas validate input before dispatch. Result schemas type output for downstream consumption (ClickHouse, Splunk, CSV export). No untyped string bags at the content layer.</p>
+</li>
+<li>
+<p><strong>Governed execution.</strong> Every state-changing action can require approval. Every execution is audited. Every response is persisted. The platform enforces organizational policy, not just technical capability.</p>
+</li>
+<li>
+<p><strong>Composition over complexity.</strong> InstructionSets group definitions. PolicyFragments compose check+fix. Policies bind fragments to triggers. ProductPacks bundle everything for distribution. Each layer adds governance without adding new execution semantics.</p>
+</li>
+<li>
+<p><strong>Plugin ABI is sacred.</strong> The C boundary in <code>plugin.h</code> must remain stable across compiler and platform upgrades. All content-layer evolution happens above this line.</p>
+</li>
+</ol>
+<hr>
+<h2 id="5-content-model">5. Content Model</h2>
+<div class="highlight"><pre><span></span><code>ProductPack
+ └── InstructionSet[]
+      └── InstructionDefinition[]
+           ├── Parameter Schema
+           ├── Result Schema
+           └── Execution Spec (plugin + action + defaults)
+
+PolicyFragment
+ ├── Check: ref → InstructionDefinition
+ ├── Compliance expression
+ ├── Fix: ref → InstructionDefinition
+ └── PostCheck: ref → InstructionDefinition
+
+Policy
+ ├── Scope (device targeting)
+ ├── Fragment ref + parameter bindings
+ ├── Trigger refs
+ └── Rollout strategy
+
+TriggerTemplate
+ ├── Source type (interval, file, service, event_log, registry, startup)
+ ├── Parameter schema
+ └── Debounce config
+</code></pre></div>
+<p><strong>Hierarchy:</strong> <code>ProductPack</code> → <code>InstructionSet</code> → <code>InstructionDefinition</code>. A definition can exist without a set (standalone) and without a pack (user-created). Sets are the permission boundary. Packs are the distribution boundary.</p>
+<hr>
+<h2 id="6-yaml-schemas">6. YAML Schemas</h2>
+<h3 id="61-instructiondefinition">6.1 InstructionDefinition</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionDefinition</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.inspect</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Inspect Service Status</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.2.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Returns the current state, startup type, and PID of a named service.</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">operations</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">question</span><span class="w">                         </span><span class="c1"># question (read-only) | action (may modify state)</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">linux</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">darwin</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugin</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span>
+<span class="w">    </span><span class="nt">action</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">inspect</span>
+<span class="w">    </span><span class="nt">concurrency</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">per-device</span><span class="w">              </span><span class="c1"># per-device | per-definition | per-set | global:&lt;N&gt; | unlimited</span>
+<span class="w">    </span><span class="nt">stagger</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">maxDelaySeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0</span><span class="w">                 </span><span class="c1"># 0 = no stagger</span>
+<span class="w">  </span><span class="nt">parameters</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">    </span><span class="nt">required</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serviceName</span>
+<span class="w">    </span><span class="nt">properties</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">serviceName</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">        </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service Name</span>
+<span class="w">        </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">The name of the service to inspect.</span>
+<span class="w">        </span><span class="nt">validation</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">maxLength</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
+<span class="w">      </span><span class="nt">verbose</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">boolean</span>
+<span class="w">        </span><span class="nt">default</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">  </span><span class="nt">result</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">columns</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serviceName</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">state</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">startupType</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pid</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">int32</span>
+<span class="w">    </span><span class="nt">aggregation</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">groupBy</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">state</span>
+<span class="w">      </span><span class="nt">operations</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">count</span>
+<span class="w">  </span><span class="nt">readablePayload</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Inspect</span><span class="nv"> </span><span class="s">service</span><span class="nv"> </span><span class="s">&#39;${serviceName}&#39;&quot;</span>
+<span class="w">  </span><span class="nt">gather</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">ttlSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">300</span><span class="w">                      </span><span class="c1"># agent must respond within this window</span>
+<span class="w">  </span><span class="nt">response</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">retentionDays</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">90</span>
+<span class="w">  </span><span class="nt">approval</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">auto</span><span class="w">                           </span><span class="c1"># auto | role-gated | always</span>
+<span class="w">  </span><span class="nt">permissions</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">executeRoles</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-operator</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-admin</span>
+<span class="w">    </span><span class="nt">authorRoles</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">content-author</span>
+<span class="w">  </span><span class="nt">compatibility</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">minAgentVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.9.0</span>
+<span class="w">    </span><span class="nt">requiredPlugins</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span>
+<span class="w">  </span><span class="nt">legacy_shim</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">                        </span><span class="c1"># auto-generate from plugin descriptor if true</span>
+<span class="nt">status</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">phase</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">proposed</span>
+</code></pre></div>
+<h3 id="62-instructionset">6.2 InstructionSet</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionSet</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">core.crossplatform.services</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Cross-Platform Service Management</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Inspect, start, stop, and restart services across all platforms.</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">linux</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">darwin</span>
+<span class="w">  </span><span class="nt">permissions</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">executeRoles</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-operator</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-admin</span>
+<span class="w">    </span><span class="nt">authorRoles</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">content-author</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-admin</span>
+<span class="w">    </span><span class="nt">approveRoles</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">endpoint-admin</span>
+<span class="w">  </span><span class="nt">contents</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">instructionDefinitions</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.inspect</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.start</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.stop</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.restart</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.set_start_mode</span>
+<span class="w">    </span><span class="nt">policyFragments</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fragment.service.must_be_running</span>
+<span class="w">    </span><span class="nt">workflowTemplates</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">workflow.restart_then_verify</span>
+<span class="w">  </span><span class="nt">defaults</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">approvalMode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">role-gated</span>
+<span class="w">    </span><span class="nt">responseRetentionDays</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">30</span>
+<span class="w">    </span><span class="nt">targetEstimationRequiredAbove</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">500</span>
+<span class="w">  </span><span class="nt">publishing</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">signed</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">    </span><span class="nt">visibility</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">org</span>
+<span class="nt">status</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">phase</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">proposed</span>
+</code></pre></div>
+<h3 id="63-policyfragment">6.3 PolicyFragment</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">PolicyFragment</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fragment.service.must_be_running</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Service must be running</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Reusable fragment that checks a service and optionally restarts it.</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">linux</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">darwin</span>
+<span class="w">  </span><span class="nt">inputs</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">    </span><span class="nt">required</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serviceName</span>
+<span class="w">    </span><span class="nt">properties</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">serviceName</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="nt">autoRemediate</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">boolean</span>
+<span class="w">        </span><span class="nt">default</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">check</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">ref</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.inspect</span>
+<span class="w">    </span><span class="nt">with</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">serviceName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">${inputs.serviceName}</span>
+<span class="w">  </span><span class="nt">compliance</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">result.state == &quot;running&quot;</span>
+<span class="w">    </span><span class="nt">states</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">compliant</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">result.state == &quot;running&quot;</span>
+<span class="w">      </span><span class="nt">noncompliant</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">result.state != &quot;running&quot;</span>
+<span class="w">      </span><span class="nt">error</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">result.error != null</span>
+<span class="w">  </span><span class="nt">fix</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">when</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">${inputs.autoRemediate} == true</span>
+<span class="w">    </span><span class="nt">ref</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.restart</span>
+<span class="w">    </span><span class="nt">with</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">serviceName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">${inputs.serviceName}</span>
+<span class="w">  </span><span class="nt">postCheck</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">ref</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.inspect</span>
+<span class="w">    </span><span class="nt">with</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">serviceName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">${inputs.serviceName}</span>
+<span class="w">  </span><span class="nt">debounce</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">minIntervalSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">300</span>
+<span class="w">  </span><span class="nt">exceptionModel</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">allowTemporarySuppressions</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="nt">status</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">phase</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">proposed</span>
+</code></pre></div>
+<h3 id="64-policy">6.4 Policy</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Policy</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policy.windows.spooler.running</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Windows Print Spooler must be running</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Ensures the Spooler service remains in the running state.</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">scope</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">selector</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">platform</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows</span>
+<span class="w">      </span><span class="nt">tags</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">print-enabled</span>
+<span class="w">  </span><span class="nt">assignment</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">dynamic</span>
+<span class="w">    </span><span class="nt">managementGroups</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">workstations</span>
+<span class="w">  </span><span class="nt">fragment</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">ref</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fragment.service.must_be_running</span>
+<span class="w">    </span><span class="nt">with</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">serviceName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Spooler</span>
+<span class="w">      </span><span class="nt">autoRemediate</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">triggers</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">ref</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">trigger.interval.five_minutes</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">ref</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">trigger.service_status_changed</span>
+<span class="w">      </span><span class="nt">with</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">serviceName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Spooler</span>
+<span class="w">  </span><span class="nt">schedule</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">cron</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;*/15</span><span class="nv"> </span><span class="s">*</span><span class="nv"> </span><span class="s">*</span><span class="nv"> </span><span class="s">*</span><span class="nv"> </span><span class="s">*&quot;</span>
+<span class="w">    </span><span class="nt">timezone</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">UTC</span>
+<span class="w">  </span><span class="nt">rollout</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">strategy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gradual</span>
+<span class="w">    </span><span class="nt">maxConcurrentPercent</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10</span>
+<span class="w">  </span><span class="nt">approvals</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">requiredForInitialDeploy</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">    </span><span class="nt">requiredForRemediationChange</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">compliance</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">cacheTtlSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">300</span>
+<span class="w">    </span><span class="nt">responseRetentionDays</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">90</span>
+<span class="w">    </span><span class="nt">emitEventsOnStateChange</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">exceptions</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">allowDeviceLevelExemption</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">    </span><span class="nt">exemptionMaxDays</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">14</span>
+<span class="nt">status</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">phase</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">proposed</span>
+</code></pre></div>
+<h3 id="65-triggertemplate">6.5 TriggerTemplate</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TriggerTemplate</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">trigger.windows.eventlog.pattern</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Windows Event Log Pattern Trigger</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Fires when a matching Windows event log record appears.</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">platforms</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows</span>
+<span class="w">  </span><span class="nt">source</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows-event-log</span><span class="w">    </span><span class="c1"># interval | filesystem | service | windows-event-log | registry | agent-startup</span>
+<span class="w">  </span><span class="nt">parameters</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">    </span><span class="nt">required</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">channel</span>
+<span class="w">    </span><span class="nt">properties</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">channel</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="nt">provider</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="nt">eventIds</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">array</span>
+<span class="w">        </span><span class="nt">items</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">integer</span>
+<span class="w">      </span><span class="nt">messageRegex</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">  </span><span class="nt">debounce</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">keyed</span>
+<span class="w">    </span><span class="nt">keyExpression</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;${channel}:${provider}:${eventId}&quot;</span>
+<span class="w">    </span><span class="nt">minIntervalSeconds</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">60</span>
+<span class="w">  </span><span class="nt">delivery</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">local-agent</span>
+<span class="w">    </span><span class="nt">persistTriggerEvents</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">outputs</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">    </span><span class="nt">properties</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">timestamp</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="nt">channel</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="nt">provider</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="nt">eventId</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">integer</span>
+<span class="w">      </span><span class="nt">computer</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="nt">message</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="nt">status</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">phase</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">proposed</span>
+</code></pre></div>
+<h3 id="66-productpack">6.6 ProductPack</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ProductPack</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pack.core.endpoint-ops</span>
+<span class="w">  </span><span class="nt">displayName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Core Endpoint Operations Pack</span>
+<span class="w">  </span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1.0.0</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Signed bundle of baseline operational content for core endpoint management.</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">publisher</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Yuzu Core</span>
+<span class="w">    </span><span class="nt">contact</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">platform@example.invalid</span>
+<span class="w">  </span><span class="nt">compatibility</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">minServerVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.9.0</span>
+<span class="w">    </span><span class="nt">minAgentVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.9.0</span>
+<span class="w">    </span><span class="nt">requiredApiVersions</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="w">  </span><span class="nt">contents</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">instructionSets</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">core.crossplatform.services</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">core.crossplatform.processes</span>
+<span class="w">    </span><span class="nt">instructionDefinitions</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.inspect</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.restart</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.process.list</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.process.kill</span>
+<span class="w">    </span><span class="nt">policyFragments</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fragment.service.must_be_running</span>
+<span class="w">    </span><span class="nt">policies</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policy.windows.spooler.running</span>
+<span class="w">    </span><span class="nt">triggerTemplates</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">trigger.interval.five_minutes</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">trigger.windows.eventlog.pattern</span>
+<span class="w">    </span><span class="nt">dashboards</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">compliance.overview</span>
+<span class="w">    </span><span class="nt">docs</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">docs/pack-overview.md</span>
+<span class="w">  </span><span class="nt">dependencies</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">plugins</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">processes</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">event_logs</span>
+<span class="w">    </span><span class="nt">packs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[]</span>
+<span class="w">  </span><span class="nt">security</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">signing</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ed25519</span>
+<span class="w">      </span><span class="nt">keyId</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu-core-release-2026</span>
+<span class="w">      </span><span class="nt">keyFingerprint</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;SHA256:...&quot;</span>
+<span class="w">    </span><span class="nt">signature</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">manifestHash</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;sha256-of-manifest&gt;</span>
+<span class="w">      </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;base64-ed25519-signature&gt;</span>
+<span class="w">    </span><span class="nt">checksums</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">manifestSha256</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;sha256&gt;</span>
+<span class="w">    </span><span class="nt">trustChain</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">rootKeyFingerprint</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;SHA256:...&quot;</span>
+<span class="w">      </span><span class="nt">signingKeyCertificate</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;base64-der&gt;</span>
+<span class="w">    </span><span class="nt">revocationListUrl</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;https://packs.yuzu.example/crl.json&quot;</span>
+<span class="w">  </span><span class="nt">distribution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">format</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tar.zst</span>
+<span class="w">    </span><span class="nt">importMode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">staged</span>
+<span class="w">    </span><span class="nt">allowPartialImport</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="nt">status</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">phase</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">proposed</span>
+</code></pre></div>
+<hr>
+<h2 id="7-unified-substrate-primitive-table">7. Unified Substrate Primitive Table</h2>
+<p>This table replaces the previous per-OS tables (Sections 9, 10, 11 of the original document) with a single cross-platform view. Each row is a stable builtin name that content authors target. Platform availability is marked per-column.</p>
+<p><strong>Status key:</strong>
+- <strong>Verified</strong> — grounded in existing plugin code in <code>agents/plugins/</code>
+- <strong>Planned</strong> — in roadmap with GitHub issue
+- <strong>Proposed</strong> — recommended in this document</p>
+<h3 id="71-system-and-identity">7.1 System and Identity</h3>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Backing Plugin</th>
+<th style="text-align: center;">Win</th>
+<th style="text-align: center;">Linux</th>
+<th style="text-align: center;">macOS</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>system.info</code></td>
+<td><code>os_info</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>OS name, version, build, kernel</td>
+</tr>
+<tr>
+<td><code>system.status</code></td>
+<td><code>status</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Agent uptime, resource usage</td>
+</tr>
+<tr>
+<td><code>device.identity</code></td>
+<td><code>device_identity</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>UUID, hostname, domain, FQDN</td>
+</tr>
+<tr>
+<td><code>hardware.inventory</code></td>
+<td><code>hardware</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>CPU, RAM, disk geometry</td>
+</tr>
+<tr>
+<td><code>device.tags.get</code></td>
+<td><code>tags</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Read scopable/freeform tags</td>
+</tr>
+<tr>
+<td><code>device.tags.set</code></td>
+<td><code>tags</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Write scopable/freeform tags</td>
+</tr>
+<tr>
+<td><code>agent.health</code></td>
+<td><code>diagnostics</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Plugin list, uptime, resource stats</td>
+</tr>
+<tr>
+<td><code>agent.restart</code></td>
+<td><code>agent_actions</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Self-restart</td>
+</tr>
+<tr>
+<td><code>agent.sleep</code></td>
+<td>agent core</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Pause agent for N seconds</td>
+</tr>
+<tr>
+<td><code>agent.log.read</code></td>
+<td><code>diagnostics</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Tail agent log, set log level</td>
+</tr>
+</tbody>
+</table>
+<h3 id="72-process-and-execution">7.2 Process and Execution</h3>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Backing Plugin</th>
+<th style="text-align: center;">Win</th>
+<th style="text-align: center;">Linux</th>
+<th style="text-align: center;">macOS</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>process.list</code></td>
+<td><code>processes</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>PID, name, user, CPU, memory</td>
+</tr>
+<tr>
+<td><code>process.inspect</code></td>
+<td><code>procfetch</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Formatted view with exe hash</td>
+</tr>
+<tr>
+<td><code>process.kill</code></td>
+<td><code>processes</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Signal/terminate by PID</td>
+</tr>
+<tr>
+<td><code>process.start</code></td>
+<td><code>script_exec</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Proposed</td>
+<td>Spawn process (wraps script_exec)</td>
+</tr>
+<tr>
+<td><code>script.run</code></td>
+<td><code>script_exec</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Inline or file-based script execution</td>
+</tr>
+<tr>
+<td><code>command.run</code></td>
+<td><code>script_exec</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>OS command execution</td>
+</tr>
+</tbody>
+</table>
+<h3 id="73-services-and-daemons">7.3 Services and Daemons</h3>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Backing Plugin</th>
+<th style="text-align: center;">Win</th>
+<th style="text-align: center;">Linux</th>
+<th style="text-align: center;">macOS</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>service.list</code></td>
+<td><code>services</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Name, state, startup type</td>
+</tr>
+<tr>
+<td><code>service.inspect</code></td>
+<td><code>services</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Proposed</td>
+<td>Detail view for single service</td>
+</tr>
+<tr>
+<td><code>service.start</code></td>
+<td><code>services</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Start named service</td>
+</tr>
+<tr>
+<td><code>service.stop</code></td>
+<td><code>services</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Stop named service</td>
+</tr>
+<tr>
+<td><code>service.restart</code></td>
+<td><code>services</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Restart named service</td>
+</tr>
+<tr>
+<td><code>service.set_start_mode</code></td>
+<td><code>services</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Proposed</td>
+<td>See Section 16 for details</td>
+</tr>
+</tbody>
+</table>
+<h3 id="74-user-session-and-identity">7.4 User, Session, and Identity</h3>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Backing Plugin</th>
+<th style="text-align: center;">Win</th>
+<th style="text-align: center;">Linux</th>
+<th style="text-align: center;">macOS</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>user.list</code></td>
+<td><code>users</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Local user accounts</td>
+</tr>
+<tr>
+<td><code>user.logged_on</code></td>
+<td><code>users</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Currently logged-on users</td>
+</tr>
+<tr>
+<td><code>user.group_membership</code></td>
+<td><code>users</code> (ext)</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Local group members</td>
+</tr>
+<tr>
+<td><code>session.list</code></td>
+<td><code>users</code> (ext)</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>RDP, console, SSH sessions</td>
+</tr>
+<tr>
+<td><code>session.active_user</code></td>
+<td><code>users</code> (ext)</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Primary/console user</td>
+</tr>
+<tr>
+<td><code>session.notify</code></td>
+<td><code>interaction</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Planned</td>
+<td>Toast notification to user</td>
+</tr>
+<tr>
+<td><code>session.prompt</code></td>
+<td><code>interaction</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Planned</td>
+<td>Yes/No dialog</td>
+</tr>
+</tbody>
+</table>
+<h3 id="75-network">7.5 Network</h3>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Backing Plugin</th>
+<th style="text-align: center;">Win</th>
+<th style="text-align: center;">Linux</th>
+<th style="text-align: center;">macOS</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>network.config.get</code></td>
+<td><code>network_config</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Interfaces, IPs, ARP table</td>
+</tr>
+<tr>
+<td><code>network.route.list</code></td>
+<td><code>network_config</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Routing table</td>
+</tr>
+<tr>
+<td><code>network.connection.list</code></td>
+<td><code>netstat</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>TCP/UDP connections</td>
+</tr>
+<tr>
+<td><code>network.socket.owner</code></td>
+<td><code>sockwho</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Socket → process mapping</td>
+</tr>
+<tr>
+<td><code>network.dns.flush</code></td>
+<td><code>network_actions</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Flush DNS cache</td>
+</tr>
+<tr>
+<td><code>network.diagnostics.run</code></td>
+<td><code>network_diag</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Ping, traceroute</td>
+</tr>
+<tr>
+<td><code>network.adapter.enable</code></td>
+<td><code>network_actions</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Enable network adapter</td>
+</tr>
+<tr>
+<td><code>network.adapter.disable</code></td>
+<td><code>network_actions</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Disable network adapter</td>
+</tr>
+<tr>
+<td><code>network.quarantine</code></td>
+<td><code>quarantine</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td>Planned</td>
+<td>Isolate device (Phase 3)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="76-software-and-patching">7.6 Software and Patching</h3>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Backing Plugin</th>
+<th style="text-align: center;">Win</th>
+<th style="text-align: center;">Linux</th>
+<th style="text-align: center;">macOS</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>software.inventory</code></td>
+<td><code>installed_apps</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Installed applications</td>
+</tr>
+<tr>
+<td><code>software.package.inventory</code></td>
+<td><code>msi_packages</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Verified</td>
+<td>MSI package details</td>
+</tr>
+<tr>
+<td><code>software.uninstall</code></td>
+<td><code>software_actions</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Uninstall by identifier</td>
+</tr>
+<tr>
+<td><code>software.install</code></td>
+<td>content staging</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Stage + silent install</td>
+</tr>
+<tr>
+<td><code>software.update</code></td>
+<td>pkg adapter</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Proposed</td>
+<td>OS package manager update</td>
+</tr>
+<tr>
+<td><code>software.sccm.query</code></td>
+<td><code>sccm</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Verified</td>
+<td>SCCM client integration</td>
+</tr>
+<tr>
+<td><code>patch.inventory</code></td>
+<td><code>windows_updates</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Verified</td>
+<td>Installed/pending updates</td>
+</tr>
+<tr>
+<td><code>patch.install</code></td>
+<td><code>patch</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Orchestrated patch deploy</td>
+</tr>
+<tr>
+<td><code>patch.scan</code></td>
+<td><code>vuln_scan</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>NVD-based vulnerability scan</td>
+</tr>
+</tbody>
+</table>
+<h3 id="77-filesystem-and-content-staging">7.7 Filesystem and Content Staging</h3>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Backing Plugin</th>
+<th style="text-align: center;">Win</th>
+<th style="text-align: center;">Linux</th>
+<th style="text-align: center;">macOS</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>file.list</code></td>
+<td><code>filesystem</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Directory listing</td>
+</tr>
+<tr>
+<td><code>file.search</code></td>
+<td><code>filesystem</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Search by name pattern</td>
+</tr>
+<tr>
+<td><code>file.read</code></td>
+<td><code>filesystem</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Read file contents</td>
+</tr>
+<tr>
+<td><code>file.write</code></td>
+<td><code>filesystem</code> (ext)</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Write/append text</td>
+</tr>
+<tr>
+<td><code>file.hash</code></td>
+<td><code>filesystem</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>SHA-256 hash computation</td>
+</tr>
+<tr>
+<td><code>file.delete</code></td>
+<td><code>filesystem</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Delete file</td>
+</tr>
+<tr>
+<td><code>file.exists</code></td>
+<td><code>filesystem</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Path existence check</td>
+</tr>
+<tr>
+<td><code>file.permissions.inspect</code></td>
+<td><code>filesystem</code> (ext)</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>ACL/permission enumeration</td>
+</tr>
+<tr>
+<td><code>file.signature.verify</code></td>
+<td><code>filesystem</code> (ext)</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Authenticode / codesign</td>
+</tr>
+<tr>
+<td><code>file.temp.create</code></td>
+<td>SDK (<code>yuzu_create_temp_file</code>)</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Secure temp file (0600/owner-only DACL)</td>
+</tr>
+<tr>
+<td><code>content.download</code></td>
+<td><code>http_client</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>HTTP GET with hash verify</td>
+</tr>
+<tr>
+<td><code>content.upload</code></td>
+<td><code>http_client</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Upload file to server</td>
+</tr>
+<tr>
+<td><code>content.stage</code></td>
+<td><code>content_dist</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Download manifest to staging dir</td>
+</tr>
+<tr>
+<td><code>content.execute</code></td>
+<td><code>content_dist</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Stage + execute + cleanup</td>
+</tr>
+</tbody>
+</table>
+<h3 id="78-security-and-compliance">7.8 Security and Compliance</h3>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Backing Plugin</th>
+<th style="text-align: center;">Win</th>
+<th style="text-align: center;">Linux</th>
+<th style="text-align: center;">macOS</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>security.antivirus.status</code></td>
+<td><code>antivirus</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>AV product, definitions age</td>
+</tr>
+<tr>
+<td><code>security.firewall.status</code></td>
+<td><code>firewall</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Firewall state and rules</td>
+</tr>
+<tr>
+<td><code>security.disk_encryption.status</code></td>
+<td><code>bitlocker</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Verified</td>
+<td>BitLocker status (Windows)</td>
+</tr>
+<tr>
+<td><code>security.disk_encryption.status</code></td>
+<td>LUKS/FileVault adapter</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Proposed</td>
+<td>Linux LUKS, macOS FileVault</td>
+</tr>
+<tr>
+<td><code>security.vulnerability.scan</code></td>
+<td><code>vuln_scan</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>NVD-backed scan</td>
+</tr>
+<tr>
+<td><code>security.event_log.query</code></td>
+<td><code>event_logs</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Verified</td>
+<td>Event/journal log query</td>
+</tr>
+<tr>
+<td><code>security.ioc.check</code></td>
+<td><code>ioc</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Hash/IP/domain IOC matching</td>
+</tr>
+<tr>
+<td><code>security.certificate.inventory</code></td>
+<td><code>certificates</code></td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Enumerate system cert stores</td>
+</tr>
+</tbody>
+</table>
+<h3 id="79-workflow-primitives">7.9 Workflow Primitives</h3>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Backing</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>result.filter</code></td>
+<td>Server-side (ResponseStore)</td>
+<td>Planned</td>
+<td>Filter response rows by expression</td>
+</tr>
+<tr>
+<td><code>result.group_by</code></td>
+<td>Server-side (ResponseStore)</td>
+<td>Planned</td>
+<td>Group + aggregate</td>
+</tr>
+<tr>
+<td><code>result.sort</code></td>
+<td>Server-side (ResponseStore)</td>
+<td>Planned</td>
+<td>Multi-column sort</td>
+</tr>
+<tr>
+<td><code>result.count</code></td>
+<td>Server-side (ResponseStore)</td>
+<td>Planned</td>
+<td>Count matching rows</td>
+</tr>
+<tr>
+<td><code>workflow.if</code></td>
+<td>Server orchestrator</td>
+<td>Proposed</td>
+<td>Branch on expression</td>
+</tr>
+<tr>
+<td><code>workflow.foreach</code></td>
+<td>Server orchestrator</td>
+<td>Proposed</td>
+<td>Iterate over result rows</td>
+</tr>
+<tr>
+<td><code>workflow.retry</code></td>
+<td>Server orchestrator</td>
+<td>Proposed</td>
+<td>Retry with backoff</td>
+</tr>
+</tbody>
+</table>
+<h3 id="710-trigger-primitives">7.10 Trigger Primitives</h3>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Backing</th>
+<th style="text-align: center;">Win</th>
+<th style="text-align: center;">Linux</th>
+<th style="text-align: center;">macOS</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>trigger.interval</code></td>
+<td>Trigger engine</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Timer-based (min 30s)</td>
+</tr>
+<tr>
+<td><code>trigger.filesystem_change</code></td>
+<td>Trigger engine</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>ReadDirectoryChangesW / inotify / FSEvents</td>
+</tr>
+<tr>
+<td><code>trigger.service_change</code></td>
+<td>Trigger engine</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td>Planned</td>
+<td>SCM / systemd notifications</td>
+</tr>
+<tr>
+<td><code>trigger.windows_event_log</code></td>
+<td>Trigger engine</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Planned</td>
+<td>XPath filter on event log</td>
+</tr>
+<tr>
+<td><code>trigger.registry_change</code></td>
+<td>Trigger engine</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">-</td>
+<td style="text-align: center;">-</td>
+<td>Planned</td>
+<td>Registry key notification</td>
+</tr>
+<tr>
+<td><code>trigger.agent_startup</code></td>
+<td>Agent core</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td style="text-align: center;">Y</td>
+<td>Planned</td>
+<td>Fire on agent boot</td>
+</tr>
+</tbody>
+</table>
+<h3 id="711-governance-primitives">7.11 Governance Primitives</h3>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Backing</th>
+<th>Status</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>scope.estimate_targets</code></td>
+<td>ScopeEngine</td>
+<td>Proposed</td>
+<td>Preview device count before dispatch</td>
+</tr>
+<tr>
+<td><code>scope.resolve_devices</code></td>
+<td>ScopeEngine</td>
+<td>Proposed</td>
+<td>Return matched agent IDs</td>
+</tr>
+<tr>
+<td><code>approval.submit</code></td>
+<td>ApprovalManager</td>
+<td>Planned</td>
+<td>Submit execution for approval</td>
+</tr>
+<tr>
+<td><code>approval.approve</code></td>
+<td>ApprovalManager</td>
+<td>Planned</td>
+<td>Approve pending execution</td>
+</tr>
+<tr>
+<td><code>approval.reject</code></td>
+<td>ApprovalManager</td>
+<td>Planned</td>
+<td>Reject pending execution</td>
+</tr>
+<tr>
+<td><code>audit.emit</code></td>
+<td>AuditStore</td>
+<td>Verified</td>
+<td>Log structured audit event</td>
+</tr>
+<tr>
+<td><code>response.persist</code></td>
+<td>ResponseStore</td>
+<td>Verified</td>
+<td>Store command response</td>
+</tr>
+<tr>
+<td><code>response.aggregate</code></td>
+<td>ResponseStore</td>
+<td>Planned</td>
+<td>Aggregate across agents</td>
+</tr>
+<tr>
+<td><code>response.export</code></td>
+<td>Data export</td>
+<td>Planned</td>
+<td>CSV/JSON export</td>
+</tr>
+<tr>
+<td><code>policy.check</code></td>
+<td>Policy engine</td>
+<td>Planned</td>
+<td>Evaluate compliance</td>
+</tr>
+<tr>
+<td><code>policy.fix</code></td>
+<td>Policy engine</td>
+<td>Planned</td>
+<td>Execute remediation</td>
+</tr>
+<tr>
+<td><code>policy.evaluate</code></td>
+<td>Policy engine</td>
+<td>Planned</td>
+<td>Full check → fix → postcheck cycle</td>
+</tr>
+<tr>
+<td><code>policy.recheck</code></td>
+<td>Policy engine</td>
+<td>Planned</td>
+<td>Force re-evaluation</td>
+</tr>
+</tbody>
+</table>
+<h3 id="712-os-specific-native-adapters">7.12 OS-Specific Native Adapters</h3>
+<p>These are internal implementation details behind the stable builtins — not directly exposed to content authors.</p>
+<p><strong>Windows:</strong>
+Service Control Manager, Event Log API, Registry APIs, WMI/CIM, ReadDirectoryChangesW, Task Scheduler, Certificate Store / CryptoAPI / CNG, Firewall APIs (NetSecurity), BitLocker WMI, WinHTTP / BITS, session/notification APIs, SetupAPI / PnP.</p>
+<p><strong>Linux:</strong>
+systemd / D-Bus, inotify, procfs / sysfs, journald / syslog, package managers (apt, dnf, yum, zypper), nftables / iptables, POSIX account/group management, certificate store / OpenSSL, LUKS / dm-crypt.</p>
+<p><strong>macOS:</strong>
+launchd, FSEvents, unified logging, system profiler, softwareupdate, codesign / notarization, FileVault, Keychain, user notification frameworks.</p>
+<hr>
+<h2 id="8-expression-language">8. Expression Language</h2>
+<h3 id="81-current-state-scope-dsl">8.1 Current State: Scope DSL</h3>
+<p>The scope engine (<code>server/core/src/scope_engine.cpp</code>, 494 LOC) implements a recursive-descent parser for device targeting expressions.</p>
+<p><strong>Grammar:</strong>
+<div class="highlight"><pre><span></span><code>expr       ::= or_expr
+or_expr    ::= and_expr (&#39;OR&#39; and_expr)*
+and_expr   ::= not_expr (&#39;AND&#39; not_expr)*
+not_expr   ::= &#39;NOT&#39; not_expr | primary
+primary    ::= &#39;(&#39; expr &#39;)&#39; | condition
+condition  ::= IDENT op value
+op         ::= &#39;==&#39; | &#39;!=&#39; | &#39;LIKE&#39; | &#39;&lt;&#39; | &#39;&gt;&#39; | &#39;&lt;=&#39; | &#39;&gt;=&#39; | &#39;IN&#39; | &#39;CONTAINS&#39;
+value      ::= QUOTED_STRING | &#39;(&#39; value_list &#39;)&#39; | IDENT
+value_list ::= value (&#39;,&#39; value)*
+</code></pre></div></p>
+<p><strong>Examples:</strong>
+<div class="highlight"><pre><span></span><code>ostype == &quot;windows&quot; AND tag:env == &quot;production&quot;
+hostname LIKE &quot;web-*&quot; OR hostname LIKE &quot;api-*&quot;
+arch IN (&quot;x86_64&quot;, &quot;aarch64&quot;) AND NOT tag:quarantined == &quot;true&quot;
+agent_version &gt;= &quot;0.9.0&quot;
+</code></pre></div></p>
+<p><strong>Features:</strong>
+- Case-insensitive keyword matching (AND, OR, NOT, LIKE, IN, CONTAINS)
+- Wildcard LIKE with <code>*</code> and <code>?</code> globbing
+- Numeric comparison with <code>std::from_chars</code> fallback to <code>std::stod</code> (Apple libc++ compat)
+- Case-insensitive substring search via CONTAINS
+- Max nesting depth of 10
+- <code>AttributeResolver</code> callback decouples parsing from data access</p>
+<h3 id="82-planned-extensions-to-scope-dsl">8.2 Planned Extensions to Scope DSL</h3>
+<p>These extensions keep the current parser and add operators as needed:</p>
+<table>
+<thead>
+<tr>
+<th>Extension</th>
+<th>Syntax</th>
+<th>Use Case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MATCHES</code></td>
+<td><code>hostname MATCHES "^web-\\d+$"</code></td>
+<td>Regex matching for complex patterns</td>
+</tr>
+<tr>
+<td><code>EXISTS</code></td>
+<td><code>EXISTS tag:env</code></td>
+<td>Tag presence check (no value comparison)</td>
+</tr>
+<tr>
+<td><code>len()</code></td>
+<td><code>len(tag:name) &gt; 5</code></td>
+<td>String length for validation</td>
+</tr>
+<tr>
+<td><code>startswith()</code></td>
+<td><code>startswith(hostname, "web-")</code></td>
+<td>Prefix check (more readable than LIKE)</td>
+</tr>
+</tbody>
+</table>
+<p>Implementation: add new <code>TokenType</code> variants and <code>CompOp</code> cases. The parser architecture (tokenizer → recursive descent → AST → evaluator) supports these without structural changes.</p>
+<h3 id="83-cel-adoption-implemented">8.3 CEL Adoption — Implemented</h3>
+<p><strong>Status:</strong> Implemented. A CEL-compatible expression evaluator was built from scratch in <code>server/core/src/cel_eval.cpp</code> (~1000 LOC), following the same hand-rolled recursive-descent pattern as the existing <code>scope_engine.cpp</code> and the prior <code>compliance_eval.cpp</code>.</p>
+<p><strong>Approach:</strong> Google's <code>cel-cpp</code> library is not available as a vcpkg port and has a heavy dependency chain (abseil, protobuf, RE2, ANTLR4, FlatBuffers) that would be impractical to build from source across all 4 CI platforms. Instead, a CEL-compatible subset was implemented with zero new dependencies — only C++23 standard library facilities.</p>
+<p><strong>Capabilities:</strong> Typed evaluation (null, bool, int64, double, string, timestamp, duration, list), arithmetic operators, comparison operators, logical operators (<code>&amp;&amp;</code>/<code>||</code>/<code>!</code>), ternary (<code>?:</code>), <code>in</code> operator with list literals, string methods (<code>size</code>, <code>startsWith</code>, <code>endsWith</code>, <code>contains</code>, <code>matches</code>), timestamp/duration arithmetic, type casting functions, and <code>has()</code> for field presence. Full backward compatibility with the previous keyword-based syntax (AND/OR/NOT/contains/startswith).</p>
+<p><strong>Integration:</strong> <code>compliance_eval.cpp</code> delegates to <code>cel::evaluate_bool()</code> and <code>cel::validate()</code>. All callers (policy_store, workflow_engine, server.cpp ConditionEvalFn) work unchanged. Legacy expressions are automatically migrated to CEL syntax at fragment creation time via <code>cel::migrate_expression()</code>.</p>
+<p><strong>Where CEL applies:</strong>
+- <code>spec.compliance.expression</code> in PolicyFragments
+- <code>spec.fix.when</code> conditional expressions
+- <code>spec.rollout.condition</code> for staged rollouts
+- <code>WorkflowStep.condition</code> for conditional workflow steps</p>
+<p><strong>Where the scope DSL stays:</strong>
+- All device targeting (<code>spec.scope.selector</code>)
+- <code>ScopeEngine</code> evaluation in dispatch path
+- Dashboard filter expressions</p>
+<hr>
+<h2 id="9-error-model-and-partial-failure">9. Error Model and Partial Failure</h2>
+<h3 id="91-error-code-taxonomy">9.1 Error Code Taxonomy</h3>
+<p>Errors are categorized into four domains with non-overlapping numeric ranges:</p>
+<h4 id="1xxx-plugin-errors">1xxx — Plugin Errors</h4>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Name</th>
+<th>Description</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1001</td>
+<td><code>PLUGIN_ACTION_NOT_FOUND</code></td>
+<td>Plugin does not support the requested action</td>
+<td>Never</td>
+</tr>
+<tr>
+<td>1002</td>
+<td><code>PLUGIN_PARAM_INVALID</code></td>
+<td>Parameter validation failed</td>
+<td>Never</td>
+</tr>
+<tr>
+<td>1003</td>
+<td><code>PLUGIN_PERMISSION_DENIED</code></td>
+<td>OS-level permission denied (e.g., non-admin)</td>
+<td>Never</td>
+</tr>
+<tr>
+<td>1004</td>
+<td><code>PLUGIN_RESOURCE_MISSING</code></td>
+<td>Target resource does not exist (service, file, etc.)</td>
+<td>Never</td>
+</tr>
+<tr>
+<td>1005</td>
+<td><code>PLUGIN_OPERATION_FAILED</code></td>
+<td>Action executed but failed (non-zero exit, exception)</td>
+<td>Transient: yes; Deterministic: no</td>
+</tr>
+<tr>
+<td>1006</td>
+<td><code>PLUGIN_CRASH</code></td>
+<td>Plugin segfaulted or threw unhandled exception</td>
+<td>Never</td>
+</tr>
+<tr>
+<td>1007</td>
+<td><code>PLUGIN_TIMEOUT</code></td>
+<td>Plugin did not complete within gather TTL</td>
+<td>Yes (once)</td>
+</tr>
+</tbody>
+</table>
+<h4 id="2xxx-transport-errors">2xxx — Transport Errors</h4>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Name</th>
+<th>Description</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2001</td>
+<td><code>TRANSPORT_DISCONNECTED</code></td>
+<td>Agent lost connection during execution</td>
+<td>Always</td>
+</tr>
+<tr>
+<td>2002</td>
+<td><code>TRANSPORT_STREAM_ERROR</code></td>
+<td>gRPC stream broken mid-response</td>
+<td>Always</td>
+</tr>
+<tr>
+<td>2003</td>
+<td><code>TRANSPORT_RESPONSE_TOO_LARGE</code></td>
+<td>Response exceeds max message size</td>
+<td>Never</td>
+</tr>
+</tbody>
+</table>
+<h4 id="3xxx-orchestration-errors">3xxx — Orchestration Errors</h4>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Name</th>
+<th>Description</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3001</td>
+<td><code>ORCH_EXPIRED</code></td>
+<td>Instruction passed its <code>expires_at</code> before dispatch</td>
+<td>Never</td>
+</tr>
+<tr>
+<td>3002</td>
+<td><code>ORCH_AGENT_MISSING</code></td>
+<td>Target agent not connected at dispatch time</td>
+<td>Yes (on reconnect)</td>
+</tr>
+<tr>
+<td>3003</td>
+<td><code>ORCH_CONCURRENCY_LIMIT</code></td>
+<td>Concurrency mode blocked execution</td>
+<td>Yes (after slot frees)</td>
+</tr>
+<tr>
+<td>3004</td>
+<td><code>ORCH_APPROVAL_REQUIRED</code></td>
+<td>Execution blocked pending approval</td>
+<td>No (awaits human)</td>
+</tr>
+<tr>
+<td>3005</td>
+<td><code>ORCH_CANCELLED</code></td>
+<td>Execution cancelled by operator</td>
+<td>Never</td>
+</tr>
+</tbody>
+</table>
+<h4 id="4xxx-agent-errors">4xxx — Agent Errors</h4>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Name</th>
+<th>Description</th>
+<th>Retry</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4001</td>
+<td><code>AGENT_PLUGIN_NOT_LOADED</code></td>
+<td>Required plugin not available on agent</td>
+<td>Never</td>
+</tr>
+<tr>
+<td>4002</td>
+<td><code>AGENT_SHUTTING_DOWN</code></td>
+<td>Agent is in shutdown sequence</td>
+<td>Yes (on reconnect)</td>
+</tr>
+<tr>
+<td>4003</td>
+<td><code>AGENT_VERSION_INCOMPATIBLE</code></td>
+<td>Agent version below <code>minAgentVersion</code></td>
+<td>Never</td>
+</tr>
+</tbody>
+</table>
+<h3 id="92-retry-semantics">9.2 Retry Semantics</h3>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Default Retry</th>
+<th>Max Attempts</th>
+<th>Backoff</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transport (2xxx)</td>
+<td>Always</td>
+<td>3</td>
+<td>Exponential (1s, 2s, 4s)</td>
+</tr>
+<tr>
+<td>Transient plugin (1005, 1007)</td>
+<td>If <code>retryable: true</code> in definition</td>
+<td>2</td>
+<td>Linear (5s)</td>
+</tr>
+<tr>
+<td>Deterministic plugin (1001-1004, 1006)</td>
+<td>Never</td>
+<td>0</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Agent (4001-4003)</td>
+<td>Never (except 4002 on reconnect)</td>
+<td>1</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Orchestration (3001-3005)</td>
+<td>Per-code as noted</td>
+<td>—</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<h3 id="93-partial-failure">9.3 Partial Failure</h3>
+<p>Each InstructionDefinition can specify:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">minSuccessPercent</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">100</span><span class="w">    </span><span class="c1"># default: all agents must succeed</span>
+<span class="w">    </span><span class="c1"># or: 0 = best-effort, 80 = at least 80% must succeed</span>
+</code></pre></div>
+<p><strong>Aggregate status computation:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>All agents succeeded</td>
+<td><code>succeeded</code></td>
+</tr>
+<tr>
+<td>≥ minSuccessPercent succeeded</td>
+<td><code>completed</code></td>
+</tr>
+<tr>
+<td>&lt; minSuccessPercent succeeded, all responded</td>
+<td><code>failed</code></td>
+</tr>
+<tr>
+<td>Some agents haven't responded, TTL not expired</td>
+<td><code>running</code></td>
+</tr>
+<tr>
+<td>TTL expired, some agents never responded</td>
+<td><code>timed_out</code></td>
+</tr>
+<tr>
+<td>Operator cancelled</td>
+<td><code>cancelled</code></td>
+</tr>
+<tr>
+<td>Mixed success/failure within threshold</td>
+<td><code>partial</code></td>
+</tr>
+</tbody>
+</table>
+<p>Per-agent tracking uses the <code>AgentExecStatus</code> struct already defined in <code>execution_tracker.hpp</code>:
+<div class="highlight"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">AgentExecStatus</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">agent_id</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">status</span><span class="p">;</span><span class="w">          </span><span class="c1">// dispatched, running, success, failure, timeout, rejected</span>
+<span class="w">    </span><span class="kt">int64_t</span><span class="w">     </span><span class="n">dispatched_at</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int64_t</span><span class="w">     </span><span class="n">first_response_at</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int64_t</span><span class="w">     </span><span class="n">completed_at</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w">         </span><span class="n">exit_code</span><span class="p">;</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="n">error_detail</span><span class="p">;</span><span class="w">    </span><span class="c1">// structured error code + message</span>
+<span class="p">};</span>
+</code></pre></div></p>
+<hr>
+<h2 id="10-concurrency-model">10. Concurrency Model</h2>
+<p>Five concurrency modes control parallel execution. The default (<code>per-device</code>) requires zero server coordination and scales to any fleet size.</p>
+<h3 id="101-modes">10.1 Modes</h3>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Enforcement</th>
+<th>Scope</th>
+<th>Use Case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>per-device</code></td>
+<td>Agent-side</td>
+<td>One execution of this definition per device at a time</td>
+<td>Default. Prevents conflicting ops on same device.</td>
+</tr>
+<tr>
+<td><code>per-definition</code></td>
+<td>Server-side</td>
+<td>One fleet-wide execution of this definition at a time</td>
+<td>Dangerous global operations (schema migration, bulk delete).</td>
+</tr>
+<tr>
+<td><code>per-set</code></td>
+<td>Agent-side</td>
+<td>One execution of any definition in this set per device</td>
+<td>Set-level mutual exclusion (e.g., all patch operations).</td>
+</tr>
+<tr>
+<td><code>global:&lt;N&gt;</code></td>
+<td>Server-side</td>
+<td>At most N concurrent executions fleet-wide</td>
+<td>Patch rollouts, license-limited operations. Server maintains semaphore in SQLite.</td>
+</tr>
+<tr>
+<td><code>unlimited</code></td>
+<td>None</td>
+<td>No limits</td>
+<td>Read-only queries, diagnostic gathering.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="102-implementation">10.2 Implementation</h3>
+<p><strong>Agent-side (<code>per-device</code>, <code>per-set</code>):</strong> Agent maintains an in-memory <code>std::unordered_set</code> of active definition IDs (or set IDs). On <code>CommandRequest</code> arrival, check the set; if occupied, return <code>REJECTED</code> with error code <code>3003</code>. No server round-trip, no coordination overhead.</p>
+<p><strong>Server-side (<code>per-definition</code>, <code>global:&lt;N&gt;</code>):</strong> Server checks a <code>concurrency_locks</code> SQLite table before dispatch. If the lock is held, the execution enters a wait queue. Lock is released when execution completes or times out.</p>
+<p><strong>Configuration in YAML:</strong>
+<div class="highlight"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">execution</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">concurrency</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">per-device</span><span class="w">          </span><span class="c1"># default</span>
+<span class="w">    </span><span class="c1"># concurrency: global:50         # at most 50 concurrent across fleet</span>
+<span class="w">    </span><span class="c1"># concurrency: unlimited         # no limits</span>
+</code></pre></div></p>
+<hr>
+<h2 id="11-yaml-authoring-in-dashboard">11. YAML Authoring in Dashboard</h2>
+<h3 id="111-storage">11.1 Storage</h3>
+<p>Instruction definitions are stored in the <code>InstructionStore</code> SQLite database with:
+- <code>yaml_source</code> — <code>TEXT</code> column containing the original YAML document (source of truth)
+- Denormalized columns (<code>name</code>, <code>version</code>, <code>type</code>, <code>plugin</code>, <code>action</code>, <code>enabled</code>, etc.) parsed from YAML for efficient queries</p>
+<p>On save, the server parses <code>yaml_source</code>, validates against the JSON Schema, and populates the denormalized columns. The YAML is always preserved verbatim.</p>
+<h3 id="112-ui-modes">11.2 UI Modes</h3>
+<p>The instruction management page (<code>instruction_ui.cpp</code>) will offer two editing modes:</p>
+<p><strong>Form mode</strong> (default for simple definitions):
+- Input fields for name, description, plugin, action, type
+- Parameter builder (add/remove parameter rows with name, type, default, validation)
+- Result column builder
+- Form submission generates YAML on the server side</p>
+<p><strong>YAML mode</strong> (for power users):
+- Textarea with the full YAML document
+- Syntax highlighting via a lightweight client-side library (e.g., CodeMirror 6)
+- Server-side validation on save with error messages
+- Toggle between form and YAML mode preserves content</p>
+<h3 id="113-validation-pipeline">11.3 Validation Pipeline</h3>
+<div class="highlight"><pre><span></span><code>User input (form or YAML)
+    ↓
+YAML parse (yaml-cpp or nlohmann/json YAML mode)
+    ↓
+JSON Schema validation (nlohmann/json&#39;s json_schema_validator)
+    ↓
+Semantic validation:
+  - Plugin exists in registered plugin list
+  - Action exists in plugin&#39;s actions array
+  - Parameter types match supported set (string, bool, int32, int64, datetime, guid)
+  - Result column types match supported set
+  - Referenced InstructionSet exists (if specified)
+    ↓
+Store: YAML → yaml_source column, parsed fields → denormalized columns
+    ↓
+Audit: log &quot;definition.create&quot; or &quot;definition.update&quot; event
+</code></pre></div>
+<h3 id="114-importexport">11.4 Import/Export</h3>
+<p><strong>Import:</strong> <code>POST /api/v1/definitions/import</code> accepts <code>multipart/form-data</code> with <code>.yaml</code> or <code>.json</code> files. Each file is validated through the pipeline above. Returns success/failure per file.</p>
+<p><strong>Export:</strong> <code>GET /api/v1/definitions/{id}/export?format=yaml</code> returns the <code>yaml_source</code> verbatim. <code>format=json</code> returns the parsed JSON representation.</p>
+<p><strong>Pattern:</strong> Follow the existing HTMX fragment pattern from <code>settings_ui.cpp</code> — form submissions use <code>hx-post</code> with <code>hx-swap="innerHTML"</code> to update a feedback div without full page reload.</p>
+<hr>
+<h2 id="12-file-upload">12. File Upload</h2>
+<h3 id="121-existing-pattern">12.1 Existing Pattern</h3>
+<p>The server already handles multipart file uploads for:
+- TLS certificate PEM upload (Settings page)
+- OTA agent binary upload (Settings page)</p>
+<p>Both use cpp-httplib's built-in multipart parser via <code>server.Post()</code> with <code>req.get_file_value()</code>.</p>
+<h3 id="122-new-upload-endpoints">12.2 New Upload Endpoints</h3>
+<table>
+<thead>
+<tr>
+<th>Endpoint</th>
+<th>Purpose</th>
+<th>Max Size</th>
+<th>Validation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /api/v1/definitions/import</code></td>
+<td>YAML/JSON definition files</td>
+<td>1 MB</td>
+<td>YAML parse + JSON Schema</td>
+</tr>
+<tr>
+<td><code>POST /api/v1/packs/import</code></td>
+<td>ProductPack archives (tar.zst)</td>
+<td>100 MB (configurable)</td>
+<td>Signature verify → extract → per-file SHA-256</td>
+</tr>
+<tr>
+<td><code>POST /api/v1/content/upload</code></td>
+<td>Content files for staging</td>
+<td>500 MB (configurable)</td>
+<td>SHA-256 verification</td>
+</tr>
+</tbody>
+</table>
+<h3 id="123-implementation">12.3 Implementation</h3>
+<p>Size limits are set per-endpoint using cpp-httplib's <code>set_payload_max_length</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// In server setup, after creating the httplib::Server:</span>
+<span class="n">svr</span><span class="p">.</span><span class="n">set_payload_max_length</span><span class="p">(</span><span class="mi">1</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="p">);</span><span class="w">  </span><span class="c1">// global 1MB default</span>
+
+<span class="c1">// Override per-route by checking Content-Length in handler:</span>
+<span class="n">svr</span><span class="p">.</span><span class="n">Post</span><span class="p">(</span><span class="s">&quot;/api/v1/content/upload&quot;</span><span class="p">,</span><span class="w"> </span><span class="p">[](</span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="o">&amp;</span><span class="w"> </span><span class="n">req</span><span class="p">,</span><span class="w"> </span><span class="k">auto</span><span class="o">&amp;</span><span class="w"> </span><span class="n">res</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">req</span><span class="p">.</span><span class="n">body</span><span class="p">.</span><span class="n">size</span><span class="p">()</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">500</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1024</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">res</span><span class="p">.</span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">413</span><span class="p">;</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// ... handle upload</span>
+<span class="p">});</span>
+</code></pre></div>
+<p><strong>Validation order:</strong>
+1. Size check (reject before reading body if possible)
+2. Content-Type check (<code>multipart/form-data</code>)
+3. File extension check (<code>.yaml</code>, <code>.json</code>, <code>.tar.zst</code>, etc.)
+4. Parse/verify content
+5. Store to disk or database
+6. Audit log the upload event</p>
+<hr>
+<h2 id="13-productpack-trust-chain">13. ProductPack Trust Chain</h2>
+<h3 id="131-algorithm-choice-ed25519">13.1 Algorithm Choice: Ed25519</h3>
+<ul>
+<li><strong>Fast:</strong> ~70,000 signatures/sec on commodity hardware</li>
+<li><strong>Small:</strong> 32-byte keys, 64-byte signatures</li>
+<li><strong>No padding attacks:</strong> Unlike RSA, Ed25519 has a single valid signature per message</li>
+<li><strong>Widely supported:</strong> libsodium, OpenSSL 1.1.1+, BoringSSL</li>
+</ul>
+<h3 id="132-key-hierarchy">13.2 Key Hierarchy</h3>
+<div class="highlight"><pre><span></span><code>Org Root Key (Ed25519)
+    │
+    │  Signs pack-signing key certificates
+    │
+    ├── Pack-Signing Key A (Ed25519)
+    │       │
+    │       └── Signs pack manifests
+    │
+    └── Pack-Signing Key B (Ed25519)
+            │
+            └── Signs pack manifests (rotation)
+</code></pre></div>
+<p><strong>Org root key:</strong> Generated once, stored in HSM (PKCS#11) for production or PEM file for development. Never directly signs packs. Only signs pack-signing key certificates.</p>
+<p><strong>Pack-signing key:</strong> Used to sign pack manifests. Can be rotated by generating a new key and having the root key sign its certificate. Old keys are added to the revocation list.</p>
+<h3 id="133-pack-signing-flow">13.3 Pack Signing Flow</h3>
+<div class="highlight"><pre><span></span><code>1. Author creates pack contents (YAML definitions, policies, etc.)
+2. Build tool generates manifest.json:
+   - SHA-256 hash of each file in the pack
+   - Pack metadata (id, version, publisher, compatibility)
+3. Sign manifest hash with pack-signing key:
+   signature = Ed25519_Sign(signing_key, SHA256(manifest.json))
+4. Bundle into tar.zst:
+   manifest.json
+   manifest.sig      (64-byte Ed25519 signature)
+   signing-key.der   (pack-signing key certificate, signed by root)
+   definitions/
+   policies/
+   triggers/
+   docs/
+</code></pre></div>
+<h3 id="134-import-verification-flow">13.4 Import Verification Flow</h3>
+<div class="highlight"><pre><span></span><code>1. Extract tar.zst to temp directory
+2. Load signing-key.der
+3. Verify signing key certificate against org root key (or trust store)
+4. Check signing key not in revocation list (JSON CRL)
+5. Load manifest.sig
+6. Verify: Ed25519_Verify(signing_key, SHA256(manifest.json), manifest.sig)
+7. For each file in manifest.json:
+   - Compute SHA-256 of extracted file
+   - Compare against manifest hash
+   - Reject on mismatch
+8. If all pass: import definitions, policies, triggers into database
+9. Audit log the import event
+</code></pre></div>
+<h3 id="135-key-management">13.5 Key Management</h3>
+<p><strong>Self-signing for development:</strong>
+<div class="highlight"><pre><span></span><code>yuzu-server<span class="w"> </span>--generate-pack-key<span class="w"> </span>--self-signed
+<span class="c1"># Generates root key + signing key in server config directory</span>
+<span class="c1"># Dashboard shows warning banner: &quot;Self-signed pack keys in use&quot;</span>
+</code></pre></div></p>
+<p>Controlled by server config:
+<div class="highlight"><pre><span></span><code><span class="k">[packs]</span>
+<span class="na">require_signed</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">true</span><span class="w">          </span><span class="c1"># reject unsigned packs</span>
+<span class="na">allow_self_signed</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">true</span><span class="w">       </span><span class="c1"># allow self-signed for dev (default: false)</span>
+<span class="na">trust_store_path</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">/etc/yuzu/pack-trust/</span>
+<span class="na">revocation_list_url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">https://packs.example.com/crl.json</span>
+</code></pre></div></p>
+<p><strong>Key rotation:</strong>
+1. Generate new signing key
+2. Sign its certificate with root key
+3. Distribute new key to trust store
+4. Add old key fingerprint to revocation list with timestamp
+5. Packs signed with old key are still valid until revocation list is updated</p>
+<hr>
+<h2 id="14-agent-compatibility-and-rollback">14. Agent Compatibility and Rollback</h2>
+<h3 id="141-per-definition-compatibility">14.1 Per-Definition Compatibility</h3>
+<p>Each InstructionDefinition declares its requirements:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">compatibility</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">minAgentVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.9.0</span><span class="w">      </span><span class="c1"># agent must be at least this version</span>
+<span class="w">    </span><span class="nt">requiredPlugins</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">services</span><span class="w">                 </span><span class="c1"># agent must have these plugins loaded</span>
+</code></pre></div>
+<p><strong>Server-side check before dispatch:</strong>
+1. Compare agent's <code>agent_version</code> (from <code>RegisterRequest.AgentInfo</code>) against <code>minAgentVersion</code>
+2. Compare agent's <code>plugins[]</code> list against <code>requiredPlugins</code>
+3. If incompatible → skip agent, record <code>REJECTED(4003)</code> in <code>AgentExecStatus</code></p>
+<h3 id="142-agent-side-rejection">14.2 Agent-Side Rejection</h3>
+<p>If a <code>CommandRequest</code> arrives for a plugin or action the agent doesn't have, the agent returns <code>CommandResponse</code> with:
+- <code>status = REJECTED</code>
+- <code>error.code = "4001"</code> (plugin not loaded) or <code>"1001"</code> (action not found)</p>
+<p>This is already the current behavior — the instruction engine formalizes it.</p>
+<h3 id="143-plugin-abi-evolution">14.3 Plugin ABI Evolution</h3>
+<p>The plugin ABI (<code>plugin.h</code>) uses a single <code>abi_version</code> field (currently <code>YUZU_PLUGIN_ABI_VERSION = 1</code>).</p>
+<p><strong>Rules:</strong>
+- <code>YuzuPluginDescriptor</code> can only grow by appending new fields after <code>execute</code>
+- ABI version 1 plugins work with any agent that supports version 1
+- When ABI version 2 arrives, agents check <code>abi_version_range</code> (a new field) to determine compatibility
+- Plugins are never broken by agent upgrades — the agent checks <code>abi_version</code> at load time</p>
+<h3 id="144-mixed-version-fleet">14.4 Mixed-Version Fleet</h3>
+<p>During fleet upgrades, older agents coexist with newer agents:
+- Older agents receive ad-hoc <code>CommandRequest</code> messages (plugin + action + params) — same as today
+- Newer agents receive the same <code>CommandRequest</code> — the wire protocol doesn't change
+- InstructionDefinitions with <code>minAgentVersion</code> higher than an agent's version are simply not dispatched to that agent
+- No forced upgrades; the OTA update mechanism is opt-in per rollout configuration</p>
+<h3 id="145-ota-rollback">14.5 OTA Rollback</h3>
+<p>The existing OTA updater (<code>agents/core/src/updater.cpp</code>) already implements:
+1. Download new binary to temp location
+2. Verify SHA-256 hash
+3. Rename current binary to <code>.old</code>
+4. Move new binary into place
+5. Signal restart
+6. On startup, verify new binary works (health check)
+7. If health check fails: rename <code>.old</code> back to current, restart</p>
+<p>No changes needed for instruction engine compatibility.</p>
+<hr>
+<h2 id="15-legacy-command-shim">15. Legacy Command Shim</h2>
+<h3 id="151-design-decision-no-separate-legacy-path">15.1 Design Decision: No Separate Legacy Path</h3>
+<p>Every <code>InstructionDefinition</code> execution maps 1:1 to a <code>CommandRequest</code>:</p>
+<div class="highlight"><pre><span></span><code>InstructionDefinition.spec.execution.plugin  →  CommandRequest.plugin
+InstructionDefinition.spec.execution.action  →  CommandRequest.action
+InstructionDefinition parameter values       →  CommandRequest.parameters (map&lt;string,string&gt;)
+</code></pre></div>
+<p>There is no separate "legacy" or "ad-hoc" execution path. Ad-hoc commands sent from the dashboard or API are simply untyped InstructionDefinitions with <code>additionalProperties: {type: string}</code> parameter schemas.</p>
+<h3 id="152-auto-generation-from-plugin-descriptors">15.2 Auto-Generation from Plugin Descriptors</h3>
+<p>Every plugin exposes its capabilities via <code>YuzuPluginDescriptor</code>:
+- <code>name</code> — plugin identifier
+- <code>actions</code> — null-terminated array of action names</p>
+<p>A CLI tool generates stub InstructionDefinitions from plugin descriptors:</p>
+<div class="highlight"><pre><span></span><code>yuzu-admin<span class="w"> </span>generate-definitions<span class="w"> </span>--output<span class="w"> </span>definitions/
+<span class="c1"># For each plugin:</span>
+<span class="c1">#   For each action:</span>
+<span class="c1">#     Emit a YAML InstructionDefinition with:</span>
+<span class="c1">#       - id: &lt;plugin&gt;.&lt;action&gt;</span>
+<span class="c1">#       - plugin: &lt;plugin&gt;</span>
+<span class="c1">#       - action: &lt;action&gt;</span>
+<span class="c1">#       - parameters: { additionalProperties: { type: string } }  # open schema</span>
+<span class="c1">#       - result: { columns: [{ name: output, type: string }] }   # raw output</span>
+</code></pre></div>
+<h3 id="153-schema-inference-roadmap">15.3 Schema Inference Roadmap</h3>
+<p><strong>ABI v1 (current):</strong> Plugins don't declare their parameter schemas. Auto-generated definitions use open <code>additionalProperties</code>.</p>
+<p><strong>ABI v2 (future):</strong> Add optional <code>parameter_schema</code> and <code>result_schema</code> fields to <code>YuzuPluginDescriptor</code>. Plugins that populate these get fully typed auto-generated definitions. Plugins that don't still get open-schema stubs.</p>
+<h3 id="154-migration-path">15.4 Migration Path</h3>
+<ol>
+<li><strong>Today:</strong> All commands are ad-hoc (<code>plugin + action + params</code>). Works unchanged.</li>
+<li><strong>Phase B:</strong> InstructionDefinition CRUD added. Ad-hoc commands continue to work via auto-generated "untyped" definitions.</li>
+<li><strong>Over time:</strong> Authors create typed definitions with parameter schemas and result columns. Typed definitions gradually replace untyped stubs.</li>
+<li><strong>No breaking change:</strong> The <code>CommandRequest</code> wire protocol never changes. The agent doesn't know or care whether the command came from a typed definition or an ad-hoc dispatch.</li>
+</ol>
+<hr>
+<h2 id="16-serviceset_start_mode">16. <code>service.set_start_mode</code></h2>
+<h3 id="161-semantics">16.1 Semantics</h3>
+<p>Change the startup type of a system service.</p>
+<p><strong>Parameters:</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nt">parameters</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">object</span>
+<span class="w">  </span><span class="nt">required</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serviceName</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">mode</span>
+<span class="w">  </span><span class="nt">properties</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">serviceName</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Name of the service (e.g., &quot;Spooler&quot;, &quot;sshd&quot;, &quot;com.apple.ftp-proxy&quot;)</span>
+<span class="w">    </span><span class="nt">mode</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">      </span><span class="nt">enum</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">automatic</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">manual</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">disabled</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">masked</span>
+<span class="w">      </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">        </span><span class="no">Target startup mode. &quot;masked&quot; is Linux-only; maps to &quot;disabled&quot; on other platforms.</span>
+</code></pre></div>
+<h3 id="162-platform-implementation">16.2 Platform Implementation</h3>
+<p><strong>Windows:</strong>
+<div class="highlight"><pre><span></span><code><span class="c1">// ChangeServiceConfigW(hService, SERVICE_NO_CHANGE, startType, ...)</span>
+<span class="c1">// automatic → SERVICE_AUTO_START</span>
+<span class="c1">// manual    → SERVICE_DEMAND_START</span>
+<span class="c1">// disabled  → SERVICE_DISABLED</span>
+<span class="c1">// masked    → SERVICE_DISABLED (with warning: &quot;masked not supported on Windows&quot;)</span>
+</code></pre></div></p>
+<p><strong>Linux (systemd):</strong>
+<div class="highlight"><pre><span></span><code><span class="c1"># automatic → systemctl enable &lt;service&gt;</span>
+<span class="c1"># manual    → systemctl disable &lt;service&gt;  (still startable manually)</span>
+<span class="c1"># disabled  → systemctl disable &lt;service&gt;</span>
+<span class="c1"># masked    → systemctl mask &lt;service&gt;     (prevents any start, even manual)</span>
+</code></pre></div></p>
+<p><strong>macOS:</strong>
+<div class="highlight"><pre><span></span><code><span class="c1"># automatic → launchctl enable system/&lt;service&gt;  (or set Disabled=false in plist)</span>
+<span class="c1"># manual    → launchctl disable system/&lt;service&gt;</span>
+<span class="c1"># disabled  → launchctl disable system/&lt;service&gt;</span>
+<span class="c1"># masked    → disabled (with warning: &quot;masked not supported on macOS&quot;)</span>
+</code></pre></div></p>
+<h3 id="163-return-schema">16.3 Return Schema</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">result</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">columns</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serviceName</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">previousMode</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">newMode</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">effectiveMode</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">warning</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+</code></pre></div>
+<p><code>effectiveMode</code> may differ from <code>newMode</code> if the requested mode isn't supported (e.g., <code>masked</code> on Windows returns <code>effectiveMode: disabled</code>).</p>
+<hr>
+<h2 id="17-scale-design">17. Scale Design</h2>
+<h3 id="171-target-100k-agents">17.1 Target: 100K Agents</h3>
+<p><strong>Gateway batching:</strong> 10-50 gateway nodes, each handling 2K-10K agent connections. Gateways proxy <code>Register</code>, batch <code>Heartbeat</code> messages (reducing per-agent RPC overhead), and forward <code>Subscribe</code> streams. Defined in <code>proto/yuzu/gateway/v1/gateway.proto</code> (GatewayUpstream service).</p>
+<p><strong>Connection state:</strong> In-memory on each gateway. Gateways report stream status to the upstream server. Server maintains a <code>connected_agents</code> table with gateway_id, last_heartbeat, and connection quality.</p>
+<h3 id="172-sub-second-dispatch">17.2 Sub-Second Dispatch</h3>
+<p><strong>Scope evaluation:</strong> The scope engine evaluates expressions against all agents in memory. Complexity is O(A × E) where A = agent count and E = expression complexity.</p>
+<table>
+<thead>
+<tr>
+<th>Fleet Size</th>
+<th>Expression Nodes</th>
+<th>Estimated Eval Time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>10K agents</td>
+<td>5</td>
+<td>~10 ms</td>
+</tr>
+<tr>
+<td>100K agents</td>
+<td>5</td>
+<td>~100 ms</td>
+</tr>
+<tr>
+<td>100K agents</td>
+<td>20</td>
+<td>~400 ms</td>
+</tr>
+</tbody>
+</table>
+<p>Acceptable for interactive use. For very large fleets, scope results can be cached (expressions are deterministic for a given agent attribute snapshot).</p>
+<p><strong>gRPC dispatch:</strong> Non-blocking writes to agent streams. The server iterates matched agents and enqueues <code>CommandRequest</code> messages. With 100K matches, this takes ~50ms (gRPC protobuf serialization is fast).</p>
+<h3 id="173-response-storage-at-scale">17.3 Response Storage at Scale</h3>
+<p><strong>SQLite WAL mode:</strong> Concurrent reads don't block writes. Batch inserts (100 rows per transaction) sustain ~50K inserts/sec on commodity hardware.</p>
+<p><strong>Retention:</strong> TTL-based cleanup runs on a background thread (configurable interval, default 60 min). Expired rows are deleted in batches to avoid long transactions.</p>
+<p><strong>Optional ClickHouse export:</strong> For analytics workloads beyond what SQLite supports, responses can be forwarded to ClickHouse via:
+- Direct INSERT over HTTP (server-side batch job)
+- Prometheus remote_write (for metrics)
+- Kafka intermediate topic (for high-volume environments)</p>
+<p>SQLite remains the primary store; ClickHouse is an optional analytics sink.</p>
+<h3 id="174-definition-and-policy-caching">17.4 Definition and Policy Caching</h3>
+<p><strong>Definitions:</strong> Read-heavy, write-rare. Server maintains an in-memory LRU cache of parsed InstructionDefinitions. Cache invalidated on create/update/delete. With thousands of definitions, the cache uses ~10-50 MB.</p>
+<p><strong>Policies:</strong> Compiled policy documents are hashed and pushed to agents. Agents cache the policy locally. Re-download only when the server's policy hash changes (checked on heartbeat).</p>
+<h3 id="175-policy-evaluation-distribution">17.5 Policy Evaluation Distribution</h3>
+<p>Policy rules evaluate <strong>agent-side</strong> (distributed across the fleet). The server does not evaluate policies — it only collects compliance status in batches. This means:
+- Policy evaluation scales linearly with fleet size (no server bottleneck)
+- Compliance status is eventually consistent (agents report on trigger/interval)
+- Server aggregates compliance summaries for dashboard display</p>
+<hr>
+<h2 id="18-data-model-and-result-shaping">18. Data Model and Result Shaping</h2>
+<h3 id="181-canonical-result-envelope">18.1 Canonical Result Envelope</h3>
+<p>Every instruction execution produces results in this structured format:</p>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuzu.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">InstructionResult</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">executionId</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">exec_01J...</span>
+<span class="w">  </span><span class="nt">definitionId</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">crossplatform.service.inspect</span>
+<span class="w">  </span><span class="nt">agentId</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">28d5...</span>
+<span class="w">  </span><span class="nt">timestamp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2026-03-17T18:20:00Z</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">status</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">success</span><span class="w">        </span><span class="c1"># success | failure | partial | timeout | cancelled | rejected</span>
+<span class="w">  </span><span class="nt">errorCode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span><span class="w">        </span><span class="c1"># error code from taxonomy (Section 9) if status != success</span>
+<span class="w">  </span><span class="nt">durationMs</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">182</span>
+<span class="w">  </span><span class="nt">columns</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">serviceName</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">state</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">startupType</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">string</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pid</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">int32</span>
+<span class="w">  </span><span class="nt">rows</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">serviceName</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Spooler</span>
+<span class="w">      </span><span class="nt">state</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">running</span>
+<span class="w">      </span><span class="nt">startupType</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">automatic</span>
+<span class="w">      </span><span class="nt">pid</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4592</span>
+<span class="w">  </span><span class="nt">diagnostics</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">stdout</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&quot;</span>
+<span class="w">    </span><span class="nt">stderr</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&quot;</span>
+<span class="w">    </span><span class="nt">warnings</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[]</span>
+</code></pre></div>
+<h3 id="182-why-this-matters">18.2 Why This Matters</h3>
+<p>Without a typed result envelope:
+- <strong>Workflow chaining</strong> breaks — downstream definitions can't reference upstream output fields
+- <strong>Filtering and pagination</strong> are unreliable — column types affect sort order and comparison
+- <strong>Aggregate views</strong> are impossible — you can't <code>COUNT</code> or <code>GROUP BY</code> untyped strings
+- <strong>Policy evaluation</strong> can't compare values — <code>result.state == "running"</code> requires knowing <code>state</code> is a string
+- <strong>Data export</strong> loses fidelity — CSV/JSON export needs column types for formatting
+- <strong>Pack portability</strong> suffers — definitions can't declare their output contract</p>
+<h3 id="183-supported-column-types">18.3 Supported Column Types</h3>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Wire Format</th>
+<th>SQLite Type</th>
+<th>ClickHouse Type</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bool</code></td>
+<td><code>"true"</code> / <code>"false"</code></td>
+<td>INTEGER (0/1)</td>
+<td>UInt8</td>
+<td></td>
+</tr>
+<tr>
+<td><code>int32</code></td>
+<td>Decimal string</td>
+<td>INTEGER</td>
+<td>Int32</td>
+<td></td>
+</tr>
+<tr>
+<td><code>int64</code></td>
+<td>Decimal string</td>
+<td>INTEGER</td>
+<td>Int64</td>
+<td></td>
+</tr>
+<tr>
+<td><code>string</code></td>
+<td>UTF-8</td>
+<td>TEXT</td>
+<td>String</td>
+<td></td>
+</tr>
+<tr>
+<td><code>datetime</code></td>
+<td>ISO 8601</td>
+<td>TEXT</td>
+<td>DateTime64</td>
+<td></td>
+</tr>
+<tr>
+<td><code>guid</code></td>
+<td>UUID string</td>
+<td>TEXT</td>
+<td>UUID</td>
+<td></td>
+</tr>
+<tr>
+<td><code>clob</code></td>
+<td>UTF-8</td>
+<td>TEXT</td>
+<td>String</td>
+<td>Large text, configurable truncation</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="19-implementation-order">19. Implementation Order</h2>
+<p>Updated to reflect current state (Phase 0 and 1 complete, Phase 2 scaffolded).</p>
+<h3 id="phase-a-response-integration-remaining-phase-1-work-white_check_mark-complete">Phase A — Response Integration (remaining Phase 1 work) :white_check_mark: Complete</h3>
+<ol>
+<li><del>Wire <code>ResponseStore</code> into command dispatch path</del> — done</li>
+<li><del>Implement structured result envelope parsing</del> — done</li>
+<li><del>Response search HTTP endpoint</del> — done (<code>GET /api/responses/{id}</code> with query params)</li>
+<li><del>CSV/JSON export endpoints</del> — done (<code>GET /api/responses/{id}/export?format=csv|json</code>, <code>POST /api/export/json-to-csv</code>)</li>
+<li><del>Response aggregation engine</del> — done (<code>GET /api/responses/{id}/aggregate</code> with GROUP BY + count/sum/avg/min/max)</li>
+</ol>
+<h3 id="phase-b-instruction-plane-phase-2-core">Phase B — Instruction Plane (Phase 2 core)</h3>
+<ol start="6">
+<li><code>InstructionStore</code> business logic — CRUD with YAML source storage</li>
+<li>Parameter schema validation (JSON Schema via nlohmann-json)</li>
+<li>Result schema declaration and typed storage</li>
+<li>Legacy command shim — auto-generate definitions from plugin descriptors</li>
+<li>YAML authoring UI in dashboard (form mode + YAML mode)</li>
+<li>Import/export endpoints (<code>/api/v1/definitions/import</code>, <code>/api/v1/definitions/{id}/export</code>)</li>
+</ol>
+<h3 id="phase-c-governed-execution">Phase C — Governed Execution</h3>
+<ol start="12">
+<li><code>ScheduleEngine</code> business logic — cron evaluation, scope-based dispatch</li>
+<li><code>ApprovalManager</code> business logic — submit/approve/reject with ownership rules</li>
+<li><code>ExecutionTracker</code> business logic — progress tracking, aggregate status computation</li>
+<li>Rerun/cancel — clone completed executions, send cancel to agents</li>
+<li>Concurrency enforcement — agent-side per-device/per-set, server-side per-definition/global</li>
+</ol>
+<h3 id="phase-d-policy-and-triggers-phases-4-5">Phase D — Policy and Triggers (Phases 4-5)</h3>
+<ol start="17">
+<li>Agent-side trigger framework (interval, file, service, event_log, registry, startup)</li>
+<li>PolicyFragment CRUD — check/fix/postcheck references, compliance expressions</li>
+<li>Policy assignment to management groups</li>
+<li>Agent-side policy evaluation — trigger fire → check → fix → postcheck → report</li>
+<li>CEL adoption for typed compliance expressions</li>
+<li>Compliance dashboard — fleet posture, per-rule drill-down</li>
+</ol>
+<h3 id="phase-e-distribution-phase-7">Phase E — Distribution (Phase 7)</h3>
+<ol start="23">
+<li>ProductPack format — tar.zst with manifest.json</li>
+<li>Ed25519 signing — key generation, manifest signing, verification</li>
+<li>Trust chain — root key, signing key certificates, revocation list</li>
+<li>Import/export workflow — upload, verify, extract, store</li>
+<li>Dependency resolution — required plugins, required packs, version constraints</li>
+</ol>
+<hr>
+<h2 id="20-design-judgments-and-source-notes">20. Design Judgments and Source Notes</h2>
+<h3 id="201-what-yuzu-exposes-to-content-authors">20.1 What Yuzu Exposes to Content Authors</h3>
+<p>Expose:
+- Stable builtin primitives (Section 7)
+- Typed parameter and result schemas
+- Result-shaping operators (filter, group, sort, aggregate)
+- Trigger templates
+- Governance primitives (scope, approval, audit)
+- Content-pack metadata and distribution</p>
+<h3 id="202-what-yuzu-does-not-expose-to-content-authors">20.2 What Yuzu Does NOT Expose to Content Authors</h3>
+<p>Do not expose directly:
+- Win32 / SCM / Registry / WMI syscalls
+- Linux <code>ioctl</code> / <code>procfs</code> / <code>dbus-send</code> internals
+- macOS FSEvents / launchd / codesign invocation details
+- Arbitrary shell text as the primary authoring model</p>
+<p>These remain internal adapters behind stable builtins. Content authors target <code>service.restart</code>, not <code>systemctl restart</code> or <code>Restart-Service</code>.</p>
+<h3 id="203-permission-boundary">20.3 Permission Boundary</h3>
+<p><strong>InstructionSet</strong> is the primary operational permission boundary:
+- Users execute definitions within sets
+- Authors publish to sets
+- Approvers approve set-governed actions
+- Packs distribute sets as units of capability</p>
+<p>This is cleaner than per-plugin ACLs. The RBAC system (Phase 3) will bind <code>Principal + Role + SecurableType(InstructionSet) + Operation(Execute|Author|Approve)</code>.</p>
+<h3 id="204-minimal-viable-content-plane">20.4 Minimal Viable Content Plane</h3>
+<p>A pragmatic MVP includes only:
+- <code>InstructionDefinition</code> CRUD with YAML storage
+- <code>InstructionSet</code> grouping
+- Structured result envelope
+- Response persistence (already done)
+- Legacy command shim (auto-generated definitions)
+- YAML authoring UI</p>
+<p>This is enough to move Yuzu from "plugin executor" to "governed endpoint instruction platform". Scheduling, approvals, policies, and packs are additive — they build on the same definition model without changing the execution semantics.</p>
+<h3 id="205-key-architectural-decisions-summary">20.5 Key Architectural Decisions Summary</h3>
+<table>
+<thead>
+<tr>
+<th>Decision</th>
+<th>Choice</th>
+<th>Rationale</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Expression language</td>
+<td>Extend scope DSL now; CEL for policy in Phase 5</td>
+<td>Current 494-LOC engine is clean and sufficient for device targeting; CEL justified only for typed policy evaluation</td>
+</tr>
+<tr>
+<td>Error codes</td>
+<td>4-category 1xxx-4xxx taxonomy</td>
+<td>Clear domain separation; non-overlapping ranges; retry semantics per category</td>
+</tr>
+<tr>
+<td>Partial failure</td>
+<td>Configurable <code>minSuccessPercent</code>, default 100%</td>
+<td>Supports "all must succeed" (compliance) and "best effort" (diagnostics)</td>
+</tr>
+<tr>
+<td>YAML storage</td>
+<td>SQLite TEXT + denormalized columns</td>
+<td>Single source of truth; queryable without re-parsing</td>
+</tr>
+<tr>
+<td>Concurrency default</td>
+<td><code>per-device</code> (agent-enforced)</td>
+<td>Zero server overhead at any fleet size</td>
+</tr>
+<tr>
+<td>Pack signing</td>
+<td>Ed25519, 3-level key hierarchy</td>
+<td>Fast, small signatures; no padding attacks; HSM-compatible</td>
+</tr>
+<tr>
+<td>Agent compat</td>
+<td><code>minAgentVersion</code> per definition, graceful REJECTED</td>
+<td>No forced upgrades; mixed-version fleet support</td>
+</tr>
+<tr>
+<td>Legacy shim</td>
+<td>Every definition maps 1:1 to CommandRequest</td>
+<td>No separate path; seamless migration from ad-hoc to governed</td>
+</tr>
+</tbody>
+</table>
+<h3 id="206-source-references">20.6 Source References</h3>
+<p>This document is grounded in the following implementation files:</p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>server/core/src/scope_engine.cpp</code> (494 LOC)</td>
+<td>Expression language implementation</td>
+</tr>
+<tr>
+<td><code>server/core/src/scope_engine.hpp</code></td>
+<td>Expression AST types, parser/evaluator API</td>
+</tr>
+<tr>
+<td><code>server/core/src/instruction_store.hpp</code></td>
+<td>InstructionDefinition, InstructionSet structs</td>
+</tr>
+<tr>
+<td><code>server/core/src/execution_tracker.hpp</code></td>
+<td>Execution, AgentExecStatus, ExecutionSummary structs</td>
+</tr>
+<tr>
+<td><code>server/core/src/approval_manager.hpp</code></td>
+<td>Approval struct, ApprovalManager API</td>
+</tr>
+<tr>
+<td><code>server/core/src/schedule_engine.hpp</code></td>
+<td>InstructionSchedule struct, ScheduleEngine API</td>
+</tr>
+<tr>
+<td><code>server/core/src/response_store.hpp</code></td>
+<td>StoredResponse struct, ResponseStore API</td>
+</tr>
+<tr>
+<td><code>server/core/src/audit_store.hpp</code></td>
+<td>AuditEvent struct, AuditStore API</td>
+</tr>
+<tr>
+<td><code>server/core/src/tag_store.hpp</code></td>
+<td>DeviceTag struct, TagStore API</td>
+</tr>
+<tr>
+<td><code>server/core/src/instruction_ui.cpp</code></td>
+<td>HTMX instruction management page</td>
+</tr>
+<tr>
+<td><code>server/core/src/settings_ui.cpp</code></td>
+<td>File upload UI pattern (TLS certs, OTA binaries)</td>
+</tr>
+<tr>
+<td><code>sdk/include/yuzu/plugin.h</code></td>
+<td>Plugin ABI v1, command handler signature</td>
+</tr>
+<tr>
+<td><code>proto/yuzu/agent/v1/agent.proto</code></td>
+<td>CommandRequest/Response, RegisterRequest, AgentInfo</td>
+</tr>
+<tr>
+<td><code>proto/yuzu/common/v1/common.proto</code></td>
+<td>ScopeExpression, ErrorDetail, Platform, PluginInfo</td>
+</tr>
+<tr>
+<td><a href="capability-map.html" class="doc-ref"><code>docs/capability-map.md</code></a></td>
+<td>184 capabilities, 150 done (82%)</td>
+</tr>
+<tr>
+<td><a href="roadmap.html" class="doc-ref"><code>docs/roadmap.md</code></a></td>
+<td>72 issues across 7 phases (all complete)</td>
+</tr>
+</tbody>
+</table>
+</main>
+</body>
+</html>

@@ -1,0 +1,725 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>26-enterprise-storage-migration-plugin.md</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">github-issues/26-enterprise-storage-migration-plugin.md</div>
+<h1 class="doc-title">26-enterprise-storage-migration-plugin.md</h1>
+<nav class="doc-nav"><a href="../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<details open class="frontmatter"><summary>Frontmatter</summary><pre><code>title: &quot;[ENT] Storage migration orchestration plugin (e.g., NetApp → Pure Storage)&quot;
+labels: enhancement, enterprise, plugin, storage
+assignees: &quot;&quot;</code></pre></details>
+<h2 id="summary">Summary</h2>
+<p>Enterprise environments need the ability to safely migrate a machine's primary OS and data storage from one array to another (e.g., NetApp → Pure Storage) with minimal downtime, verification at every step, and rollback capability. Yuzu's agent+plugin architecture is uniquely positioned to orchestrate this across a fleet — the agent is already on each machine, the command dispatch supports streaming output and progress reporting, and the dashboard provides real-time visibility.</p>
+<p>This issue covers building a <code>storage-migrate</code> plugin and the supporting server-side orchestration workflow.</p>
+<h2 id="migration-methods-available">Migration Methods Available</h2>
+<p>The right method depends on virtualization layer, OS, filesystem, and array capabilities. A production plugin should support multiple strategies:</p>
+<h3 id="1-host-side-lvm-mirror-pvmove-linux-recommended-for-block-storage">1. Host-side LVM mirror + pvmove (Linux — recommended for block storage)</h3>
+<p>Best for: Linux machines with LVM, block-level LUNs (iSCSI/FC).</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Action</th>
+<th>Downtime</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Discover current PVs, VGs, LVs, mount points</td>
+<td>None</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Present new Pure LUN to host (multipath/rescan)</td>
+<td>None</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>pvcreate</code> on new LUN</td>
+<td>None</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>vgextend &lt;vg&gt; &lt;new_pv&gt;</code></td>
+<td>None</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>pvmove &lt;old_pv&gt; &lt;new_pv&gt;</code> (live block migration)</td>
+<td>None</td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>vgreduce &lt;vg&gt; &lt;old_pv&gt;</code></td>
+<td>None</td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>pvremove &lt;old_pv&gt;</code></td>
+<td>None</td>
+</tr>
+<tr>
+<td>8</td>
+<td>Verify checksums / data integrity</td>
+<td>None</td>
+</tr>
+<tr>
+<td>9</td>
+<td>Remove old NetApp LUN from host</td>
+<td>None</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Total downtime: zero</strong> (pvmove is online). One reboot may be desired to confirm boot-from-new-array if the migrated volume includes <code>/boot</code>.</p>
+<h3 id="2-pure-storage-array-level-import-pure-cloud-block-store-purity">2. Pure Storage array-level import (Pure Cloud Block Store / Purity)</h3>
+<p>Best for: When both arrays have SAN connectivity.</p>
+<p>Pure supports native volume import from NetApp (ONTAP) via:
+- <strong>Pure Purity <code>purevol import</code></strong> — copies data at the array level
+- <strong>Pure Cloud Block Store</strong> host-side migration tool</p>
+<p>Yuzu's role: trigger the import via CLI/API on the agent, monitor progress, verify, cutover multipath.</p>
+<h3 id="3-rsync-filesystem-level-copy-nfs-or-data-only-volumes">3. rsync / filesystem-level copy (NFS or data-only volumes)</h3>
+<p>Best for: NFS mounts, non-boot data volumes, file servers.</p>
+<table>
+<thead>
+<tr>
+<th>Step</th>
+<th>Action</th>
+<th>Downtime</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Mount new Pure NFS export alongside old</td>
+<td>None</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Initial <code>rsync -avHAX --progress</code></td>
+<td>None</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Quiesce application (stop writes)</td>
+<td><strong>Brief</strong></td>
+</tr>
+<tr>
+<td>4</td>
+<td>Final <code>rsync --delete</code> (delta sync)</td>
+<td><strong>Brief</strong></td>
+</tr>
+<tr>
+<td>5</td>
+<td>Remount new path, restart application</td>
+<td><strong>Brief</strong></td>
+</tr>
+<tr>
+<td>6</td>
+<td>Verify checksums</td>
+<td>None</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Total downtime: seconds to minutes</strong> (final sync + remount).</p>
+<h3 id="4-multipath-cutover-dual-fabric-san">4. Multipath cutover (dual-fabric SAN)</h3>
+<p>Best for: Machines with multipath I/O already configured.</p>
+<p>Present both NetApp and Pure LUNs simultaneously. Use <code>dm-multipath</code> to add the Pure path, verify I/O, then remove the NetApp path. Essentially a path migration, not a data migration — requires array-level replication first.</p>
+<h3 id="5-os-level-disk-cloning-boot-volume-migration">5. OS-level disk cloning (boot volume migration)</h3>
+<p>For migrating the boot/OS volume:
+- <code>dd</code> with <code>conv=sync,noerror</code> from old block device to new
+- Or <code>clonezilla</code>-style image-based
+- Requires reboot to boot from new device
+- Update GRUB/bootloader to reference new device
+- Update <code>/etc/fstab</code> with new UUIDs</p>
+<p><strong>Total downtime: one reboot</strong>.</p>
+<h3 id="6-vmware-storage-vmotion-virtualized-environments">6. VMware Storage vMotion (virtualized environments)</h3>
+<p>If machines are VMs: Storage vMotion migrates VMDK files between datastores with zero guest downtime. Yuzu agents on the VMs can verify pre/post but the migration itself is handled by vCenter. A Yuzu server-side integration could call the vSphere API.</p>
+<hr>
+<h2 id="how-yuzu-helps">How Yuzu Helps</h2>
+<h3 id="plugin-storage-migrate">Plugin: <code>storage-migrate</code></h3>
+<p>A new Yuzu plugin deployed to agents on target machines. Actions:</p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>preflight</code></td>
+<td>Discover current storage layout (LVM, mounts, multipath, array type). Report readiness.</td>
+</tr>
+<tr>
+<td><code>present_lun</code></td>
+<td>Rescan SCSI bus, discover new Pure LUN, create multipath device</td>
+</tr>
+<tr>
+<td><code>migrate_lvm</code></td>
+<td>Execute pvmove from old PV to new PV (stream progress via <code>yuzu_ctx_report_progress</code>)</td>
+</tr>
+<tr>
+<td><code>migrate_rsync</code></td>
+<td>rsync from old mount to new mount, report delta stats</td>
+</tr>
+<tr>
+<td><code>verify</code></td>
+<td>Checksum comparison (block-level or file-level) between old and new</td>
+</tr>
+<tr>
+<td><code>cutover</code></td>
+<td>Update fstab, remount, update bootloader if needed</td>
+</tr>
+<tr>
+<td><code>rollback</code></td>
+<td>Reverse cutover — remount old, remove new PV</td>
+</tr>
+<tr>
+<td><code>cleanup</code></td>
+<td>Remove old PV, unmount old NFS, remove stale multipath paths</td>
+</tr>
+<tr>
+<td><code>status</code></td>
+<td>Report current migration state for this machine</td>
+</tr>
+</tbody>
+</table>
+<h3 id="server-side-orchestration-dashboard-managementservice">Server-side orchestration (dashboard / ManagementService)</h3>
+<p>The server coordinates fleet-wide migration:</p>
+<ol>
+<li><strong>Batch scheduling</strong> — Migrate machines in rolling batches (e.g., 10 at a time)</li>
+<li><strong>Dependency awareness</strong> — Don't migrate DB replicas simultaneously; respect HA groups</li>
+<li><strong>Pre-flight gate</strong> — All machines in a batch must pass <code>preflight</code> before any begin</li>
+<li><strong>Progress dashboard</strong> — Real-time SSE events showing per-machine migration progress</li>
+<li><strong>Automatic rollback</strong> — If <code>verify</code> fails, trigger <code>rollback</code> automatically</li>
+<li><strong>Audit trail</strong> — Every action logged with timestamps (see audit logging issue)</li>
+</ol>
+<h3 id="workflow-example-lvm-migration">Workflow example (LVM migration)</h3>
+<div class="highlight"><pre><span></span><code>Operator: POST /api/command
+{
+  &quot;plugin&quot;: &quot;storage-migrate&quot;,
+  &quot;action&quot;: &quot;preflight&quot;,
+  &quot;agent_ids&quot;: [&quot;machine-01&quot;, &quot;machine-02&quot;, ..., &quot;machine-50&quot;]
+}
+
+  → All agents report: VG=data_vg, PV=/dev/sda3 (NetApp), Free PE=0
+  → All pass preflight ✓
+
+Operator: POST /api/command
+{
+  &quot;plugin&quot;: &quot;storage-migrate&quot;,
+  &quot;action&quot;: &quot;present_lun&quot;,
+  &quot;parameters&quot;: {
+    &quot;target_wwn&quot;: &quot;5001500150015001&quot;,
+    &quot;expected_size_gb&quot;: &quot;500&quot;
+  },
+  &quot;agent_ids&quot;: [&quot;machine-01&quot;, ..., &quot;machine-10&quot;]   // Batch 1
+}
+
+  → Agents rescan SCSI, find /dev/sdb (Pure), create multipath device
+  → Report: new_device=/dev/mapper/mpath1, size=500G ✓
+
+Operator: POST /api/command
+{
+  &quot;plugin&quot;: &quot;storage-migrate&quot;,
+  &quot;action&quot;: &quot;migrate_lvm&quot;,
+  &quot;parameters&quot;: {
+    &quot;source_pv&quot;: &quot;/dev/mapper/mpath0&quot;,
+    &quot;target_pv&quot;: &quot;/dev/mapper/mpath1&quot;
+  },
+  &quot;agent_ids&quot;: [&quot;machine-01&quot;, ..., &quot;machine-10&quot;]
+}
+
+  → Agents stream: &quot;pvmove: 10%... 20%... 50%... 100%&quot;
+  → Progress visible in dashboard via /events SSE
+
+Operator: POST /api/command  { action: &quot;verify&quot;, ... }
+  → Agents report: block checksums match ✓
+
+Operator: POST /api/command  { action: &quot;cutover&quot;, ... }
+  → Agents update fstab, confirm new mount
+
+Operator: POST /api/command  { action: &quot;cleanup&quot;, ... }
+  → Agents remove old NetApp PV
+</code></pre></div>
+<hr>
+<h2 id="implementation-plan">Implementation Plan</h2>
+<h3 id="phase-1-core-plugin-linux-lvm-rsync">Phase 1: Core plugin (Linux LVM + rsync)</h3>
+<ol>
+<li>Create <code>agents/plugins/storage-migrate/</code> with C ABI plugin</li>
+<li>Actions: <code>preflight</code>, <code>migrate_lvm</code>, <code>migrate_rsync</code>, <code>verify</code>, <code>status</code></li>
+<li>Use <code>yuzu_ctx_report_progress()</code> for pvmove/rsync progress streaming</li>
+<li>Use <code>yuzu_ctx_write_output()</code> for structured JSON status updates</li>
+<li>Unit tests with mock block devices (loopback + LVM)</li>
+</ol>
+<h3 id="phase-2-cutover-rollback-and-lun-management">Phase 2: Cutover, rollback, and LUN management</h3>
+<ol start="6">
+<li>Actions: <code>present_lun</code>, <code>cutover</code>, <code>rollback</code>, <code>cleanup</code></li>
+<li>fstab manipulation with backup/restore</li>
+<li>Bootloader update for boot volume migration</li>
+<li>Multipath device management (multipathd integration)</li>
+</ol>
+<h3 id="phase-3-server-side-orchestration">Phase 3: Server-side orchestration</h3>
+<ol start="10">
+<li>Batch scheduling API (<code>POST /api/migrate/start</code> with batch config)</li>
+<li>Pre-flight gate logic (all-pass-or-abort)</li>
+<li>Automatic rollback on verify failure</li>
+<li>Dashboard migration progress view</li>
+<li>InventoryReport integration (storage inventory per agent)</li>
+</ol>
+<h3 id="phase-4-platform-expansion">Phase 4: Platform expansion</h3>
+<ol start="15">
+<li>Windows support (Storage Spaces, disk management via PowerShell)</li>
+<li>VMware vMotion integration (vSphere API from server)</li>
+<li>Pure Storage REST API integration for array-level imports</li>
+</ol>
+<hr>
+<h2 id="safety-and-verification">Safety and Verification</h2>
+<p>Every step must be idempotent and reversible:</p>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Data loss</td>
+<td>Block-level or file-level checksums before and after every migration step</td>
+</tr>
+<tr>
+<td>Partial migration</td>
+<td><code>status</code> action reports exact state; <code>rollback</code> reverses to last known-good</td>
+</tr>
+<tr>
+<td>Boot failure</td>
+<td>Bootloader updated only after verified copy; old boot entry preserved</td>
+</tr>
+<tr>
+<td>Fstab corruption</td>
+<td>Backup <code>/etc/fstab</code> before modification; rollback restores backup</td>
+</tr>
+<tr>
+<td>Network partition</td>
+<td>Agent continues local migration; reports status on reconnect</td>
+</tr>
+<tr>
+<td>Concurrent access</td>
+<td>Plugin acquires advisory lock; rejects concurrent migrate commands</td>
+</tr>
+<tr>
+<td>Wrong LUN</td>
+<td><code>present_lun</code> validates expected size, WWN, and array serial number</td>
+</tr>
+</tbody>
+</table>
+<h2 id="acceptance-criteria">Acceptance Criteria</h2>
+<ul class="task-list">
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> <code>storage-migrate</code> plugin builds and loads on Linux agents</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> <code>preflight</code> reports LVM layout, mount points, multipath status</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> <code>migrate_lvm</code> executes online pvmove with progress streaming</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> <code>migrate_rsync</code> performs delta sync with progress</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> <code>verify</code> compares block checksums (SHA-256) between source and target</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> <code>cutover</code> updates fstab and optionally bootloader</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> <code>rollback</code> reverses any step back to original state</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> End-to-end test with loopback devices simulating NetApp→Pure</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Dashboard shows real-time per-machine migration progress</li>
+<li class="task-list-item"><label class="task-list-control"><input type="checkbox" disabled/><span class="task-list-indicator"></span></label> Audit log captures all migration actions with timestamps</li>
+</ul>
+<h2 id="references">References</h2>
+<ul>
+<li>Plugin ABI: <code>sdk/include/yuzu/plugin.h</code></li>
+<li>Command dispatch: <code>proto/yuzu/agent/v1/agent.proto</code></li>
+<li>Progress reporting: <code>yuzu_ctx_report_progress()</code>, <code>yuzu_ctx_write_output()</code></li>
+<li>Inventory reporting: <code>ReportInventory</code> RPC for storage layout data</li>
+</ul>
+</main>
+</body>
+</html>

@@ -1,0 +1,1019 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>test</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">.claude/skills/test/SKILL.md</div>
+<h1 class="doc-title">test</h1>
+<nav class="doc-nav"><a href="../../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<details open class="frontmatter"><summary>Frontmatter</summary><pre><code>name: test
+description: Run the Yuzu pre-commit/pre-push test pipeline. Compiles HEAD, stands up the previous release, upgrades it, runs the full standard test surface, records every result + sub-step timing into a durable SQLite test-runs DB. Use when the user says &quot;/test&quot; or asks to run the full test pipeline before commit.</code></pre></details>
+<h1 id="test">test</h1>
+<p>Runbook for the Yuzu <code>/test</code> pipeline. This skill is a <strong>bash-first orchestrator</strong>, not an agent fan-out. Each phase is one or more shell invocations the LLM executes via the <code>Bash</code> tool. The LLM's job is to interpret failures, decide whether to continue, and produce the consolidated report at the end. Every gate result + sub-step timing lands in <code>~/.local/share/yuzu/test-runs.db</code> so the operator can compare runs over time.</p>
+<h2 id="usage">Usage</h2>
+<div class="highlight"><pre><span></span><code>/test                  — default mode (~30-45 min): build + upgrade test + standard gates
+/test --quick          — sanity check (~10 min): build + unit + EUnit + dialyzer (no live stack)
+/test --full           — pre-tag (~60-120 min): adds OTA, sanitizers, perf measurement, coverage enforce
+/test --instructions   — content-suite gate (~5-15 min): exercises all 184 safe + mutating
+                         InstructionDefinitions against a live UAT stack via REST.
+                         Standalone: brings up Phase 4 stack + the new Phase 5 instructions gate
+                         only. Skips build/upgrade/sanitizers/coverage. Use when content
+                         changes (yaml under `content/definitions/`) or after touching the
+                         instruction-engine dispatch path.
+/test --instructions-quarantine
+                       — quarantine ceremony (~30-40s): exercises the security.quarantine
+                         cluster (isolate / release / status / whitelist) with the
+                         self-disconnect/auto-resume dance. DO NOT RUN ON A REMOTE / SSH-ONLY
+                         HOST — see safety section below. PR C will add hand-written
+                         semantic-correctness tests for the 25 destructive instructions
+                         (`--instructions-destructive`).
+/test --force-cleanup  — tear down THIS RUN&#39;s dangling test containers before starting
+/test --keep-stack     — leave docker stacks running after the run (debugging)
+</code></pre></div>
+<p>Modes are layered: <code>--full</code> includes everything <code>default</code> runs, <code>default</code> includes everything <code>--quick</code> runs. The most common invocation is bare <code>/test</code> before <code>git push</code>.</p>
+<p><strong><code>--quick</code> does NOT include synthetic UAT or any other test that needs a live stack.</strong> Quick mode is build + offline unit/EUnit/dialyzer only — there is no Phase 4 stack stand-up in quick mode, so no Phase 5 gate that requires HTTP to a live server. If you need stack-level confidence, use default mode.</p>
+<h2 id="cross-platform-support">Cross-platform support</h2>
+<p>The skill runs on both <strong>Linux</strong> (CI, WSL2) and <strong>macOS</strong> (operator dev box). The orchestration prefers a single OS-aware script per concern over OS-specific forks:</p>
+<ul>
+<li>Build dir is <code>build-linux</code> on Linux, <code>build-macos</code> on macOS — <code>scripts/setup.sh</code> auto-picks. The skill computes <code>BUILDDIR=build-$(host_os)</code> (with <code>darwin → macos</code>) via <code>scripts/test/_portable.sh</code> and uses <code>$BUILDDIR</code> everywhere.</li>
+<li>Stack stand-up (Phase 4) calls <code>scripts/start-UAT.sh</code> — cross-platform; the historical <code>start-UAT.sh</code> name is a back-compat shim.</li>
+<li>Port checks, disk-free, loadavg/CPU/mem fingerprints all go through <code>scripts/test/_portable.sh</code> (lsof + sysctl on macOS, ss + /proc on Linux).</li>
+</ul>
+<p><strong>macOS prerequisites:</strong> GNU bash 5+ (<code>brew install bash</code> — stock /bin/bash 3.2 doesn't support <code>mapfile</code>/<code>declare -A</code>), kerl-installed Erlang, vcpkg with <code>VCPKG_ROOT</code> set, OrbStack or Docker Desktop installed (and launched once so its CLI symlinks populate <code>~/.orbstack/bin</code>).</p>
+<p><strong>What skips on macOS without a running Docker daemon:</strong>
+- Phase 1 docker-image-build → SKIP (operator can build locally only what they need)
+- Phase 2 upgrade-test → SKIP via <code>test-upgrade-stack.sh</code>'s <code>docker_available</code> early-out, gate row records SKIP with operator-readable note
+- Phase 6 sanitizers → still dispatches to the <code>yuzu-wsl2-linux</code> self-hosted runner, unaffected by local Docker availability</p>
+<p>Everything else (Phase 0 preflight, Phase 1 C++ + Erlang build, Phase 4 native stack, Phase 5 unit/EUnit/dialyzer/CT/integration/e2e/synthetic-UAT/puppeteer, Phase 7a perf, Phase 7b coverage, Phase 8 teardown) runs natively on macOS.</p>
+<h2 id="workflow-summary">Workflow summary</h2>
+<div class="highlight"><pre><span></span><code>Phase 0 — Preflight             (toolchains, ports, disk, docker, init DB)
+Phase 1 — Build HEAD            (meson + rebar3 + docker build local :test images)
+Phase 2 — Upgrade Test          (latest release → HEAD: fixtures, migrate, verify)
+Phase 3 — OTA Agent Test        (--full only — Linux + Windows self-exec)
+Phase 7a — Perf gate            (--full only — runs HERE on a quiet box,
+                                 BEFORE Phase 4 brings up the UAT stack;
+                                 perf is fully self-contained and contention-
+                                 sensitive, so it must measure with no other
+                                 yuzu processes running)
+Phase 4 — Fresh Stack Stand-up  (full-uat at HEAD + native agent — STAYS UP
+                                 through Phase 8 so humans can poke at the
+                                 stack before /release)
+Phase 5 — Test Gates (parallel) (unit / EUnit / dialyzer / CT / integration /
+                                 e2e-api / e2e-mcp / e2e-security /
+                                 synthetic UAT / puppeteer / instructions)
+Phase 6 — Sanitizers            (--full only — dispatched to yuzu-wsl2-linux runner)
+Phase 7b — Coverage             (--full only — enforces tests/coverage-baseline.json)
+Phase 8 — Teardown + Summary    (cleans Phase 2 compose projects + scratch dir,
+                                 finalises run row; LEAVES THE UAT ALIVE on
+                                 purpose — do NOT call start-UAT.sh stop)
+</code></pre></div>
+<p><strong>Wall-clock order: 0, 1, 2, 3, 7a-perf, 4, 5, 6, 7b-coverage, 8.</strong> Perf is intentionally pulled forward of Phase 4 because it has no functional dependency on the UAT stack (every upstream RPC is meck'd inside the suite, gateway components run in-process) but its measurements are extremely sensitive to CPU/scheduler contention. Running perf on a quiet box — after Phase 1 binaries exist but before Phase 2's docker compose, Phase 4's native server+gateway+agent, and Phase 5's parallel fan-out — gives the most-isolated environment available in the pipeline. DB phase numbers stay stable (<code>phase=7</code> for both perf and coverage) so the report table groups them together at the end; the wall-clock split is purely an isolation guarantee.</p>
+<p><strong>Phase 8 leaves the UAT alive.</strong> <code>scripts/test/teardown.sh</code> only stops Docker compose projects matching <code>yuzu-test-${RUN_ID}-*</code> (Phase 2 fixtures); it does not touch the native processes started by <code>start-UAT.sh</code>. This is deliberate: a successful <code>/test --full</code> run leaves a working UAT at the tested HEAD so humans can sanity-check it before cutting <code>/release</code>. Do <strong>not</strong> add <code>bash scripts/start-UAT.sh stop</code> to your orchestration — if the operator wants the stack down they can run it themselves.</p>
+<p>Phase 1 is the only mandatory-blocking phase — if HEAD doesn't compile, nothing else can run. Every other phase runs to completion regardless of upstream failures so the operator gets a prioritized fix list in one pass.</p>
+<p><strong>Every phase emits structured timing data into the test-runs DB.</strong> Top-level gate timings land in <code>test_gates.duration_seconds</code>; sub-step timings (upgrade phases, OTA flow steps, individual command round-trips) land in <code>test_timings</code>. This is how trend analysis catches "Phase 2 upgrade got 3× slower since last week" without grepping log files.</p>
+<blockquote>
+<p><strong>PR2 status.</strong> Phases 0, 1, 2, 4, 5, 6, 7, 8 are wired. Phase 3 (cross-platform OTA self-exec) is still stubbed pending PR3; its gate rows record as <code>SKIP</code> with a "planned for PR3" note. Phase 6 (sanitizers) dispatches <code>.github/workflows/sanitizer-tests.yml</code> onto the <code>yuzu-wsl2-linux</code> self-hosted runner; if the runner is offline the gate records WARN and the rest of the run continues. Phase 7 coverage runs locally against <code>tests/coverage-baseline.json</code> (real captured numbers; the original PR2 <code>__seed: true</code> permissive baseline is gone). Phase 7 perf is <strong>measure-and-report</strong> as of 2026-05-03: the gate records <code>perf_*</code> metrics into the test-runs DB but no longer reads a baseline file or fails on regressions — see Phase 7a below and <a href="../../../docs/perf-baseline-calibration-2026-05-03.html" class="doc-ref"><code>docs/perf-baseline-calibration-2026-05-03.md</code></a>.</p>
+</blockquote>
+<h2 id="step-0-initialise-run-state">Step 0 — Initialise run state</h2>
+<p>Generate a unique run ID and start the DB record. Run these in order at the start of every invocation:</p>
+<div class="highlight"><pre><span></span><code><span class="nv">RUN_ID</span><span class="o">=</span><span class="s2">&quot;</span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span><span class="s2">-</span><span class="nv">$$</span><span class="s2">&quot;</span>
+<span class="nv">COMMIT</span><span class="o">=</span><span class="s2">&quot;</span><span class="k">$(</span>git<span class="w"> </span>rev-parse<span class="w"> </span>HEAD<span class="k">)</span><span class="s2">&quot;</span>
+<span class="nv">BRANCH</span><span class="o">=</span><span class="s2">&quot;</span><span class="k">$(</span>git<span class="w"> </span>rev-parse<span class="w"> </span>--abbrev-ref<span class="w"> </span>HEAD<span class="k">)</span><span class="s2">&quot;</span>
+<span class="nv">TEST_DIR</span><span class="o">=</span><span class="s2">&quot;/tmp/yuzu-test-</span><span class="si">${</span><span class="nv">RUN_ID</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="nv">LOG_DIR</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$HOME</span><span class="s2">/.local/share/yuzu/test-runs/</span><span class="si">${</span><span class="nv">RUN_ID</span><span class="si">}</span><span class="s2">&quot;</span>
+mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$TEST_DIR</span><span class="s2">&quot;</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG_DIR</span><span class="s2">&quot;</span>
+
+<span class="c1"># Pick mode from operator args (default if no flag)</span>
+<span class="nv">MODE</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">YUZU_TEST_MODE</span><span class="k">:-</span><span class="nv">default</span><span class="si">}</span><span class="s2">&quot;</span><span class="w">  </span><span class="c1"># quick / default / full</span>
+
+<span class="c1"># Cross-platform: BUILDDIR resolves to build-linux on Linux, build-macos</span>
+<span class="c1"># on macOS. All subsequent meson invocations use $BUILDDIR rather than a</span>
+<span class="c1"># hardcoded path. The helper file also exposes port_listening,</span>
+<span class="c1"># disk_free_gb, host_os, docker_available, ensure_docker_path.</span>
+<span class="c1"># shellcheck source=scripts/test/_portable.sh</span>
+.<span class="w"> </span>scripts/test/_portable.sh
+<span class="nv">BUILDDIR</span><span class="o">=</span><span class="k">$(</span>build_dir<span class="k">)</span>
+
+bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>run-start<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--commit<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COMMIT</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--branch<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$BRANCH</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--mode<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$MODE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<p>Record <code>RUN_ID</code> in your scratch space so every subsequent gate call can reference it. The DB row is in <code>RUNNING</code> state until Phase 8 finalizes it.</p>
+<h2 id="phase-0-preflight">Phase 0 — Preflight</h2>
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>scripts/test/preflight.sh<span class="w">                 </span><span class="c1"># sanity checks</span>
+<span class="c1"># or with cleanup:</span>
+bash<span class="w"> </span>scripts/test/preflight.sh<span class="w"> </span>--force-cleanup<span class="w"> </span><span class="c1"># tear down dangling test containers</span>
+</code></pre></div>
+<p><strong>On failure</strong>: do NOT proceed. Exit non-zero. Preflight failures are operator-fixable (free a port, clean up dangling containers, install a missing toolchain, free disk). The skill should print the preflight output verbatim and stop.</p>
+<p>The preflight script also creates the test-runs DB at <code>~/.local/share/yuzu/test-runs.db</code> if missing, so the run-start above is safe to call.</p>
+<p>Record gate result:
+<div class="highlight"><pre><span></span><code><span class="nv">PREFLIGHT_START</span><span class="o">=</span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span>
+bash<span class="w"> </span>scripts/test/preflight.sh<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nv">PRE_STATUS</span><span class="o">=</span>PASS<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nv">PRE_STATUS</span><span class="o">=</span>FAIL
+<span class="nv">PREFLIGHT_DUR</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">PREFLIGHT_START</span><span class="w"> </span><span class="k">))</span>
+bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">0</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;Preflight&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--status<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PRE_STATUS</span><span class="s2">&quot;</span><span class="w"> </span>--duration<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PREFLIGHT_DUR</span><span class="s2">&quot;</span>
+<span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PRE_STATUS</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s2">&quot;FAIL&quot;</span><span class="w"> </span><span class="o">]]</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="o">{</span><span class="w"> </span>bash<span class="w"> </span>scripts/test/teardown.sh<span class="w"> </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--status<span class="w"> </span>ABORTED<span class="p">;</span><span class="w"> </span><span class="nb">exit</span><span class="w"> </span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="o">}</span>
+</code></pre></div></p>
+<h2 id="phase-1-build-head">Phase 1 — Build HEAD</h2>
+<p>Three sub-gates that can run in parallel via <code>&amp;</code> + <code>wait</code>. Use the
+unconditional <code>meson compile -C "$BUILDDIR"</code> form rather than naming
+specific targets — the explicit-target form requires those targets to
+exist (<code>yuzu_server_tests</code> only exists when <code>-Dbuild_tests=true</code>) and
+the bare-name resolution can collide with sibling targets if multiple
+subprojects define the same name.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Build C++ binaries (server + agent + tests if enabled)</span>
+<span class="o">(</span>
+<span class="w">    </span><span class="nb">set</span><span class="w"> </span>-e
+<span class="w">    </span><span class="nv">BUILD_START</span><span class="o">=</span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>meson<span class="w"> </span>compile<span class="w"> </span>-C<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$BUILDDIR</span><span class="s2">&quot;</span><span class="w"> </span>&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG_DIR</span><span class="s2">/build-cpp.log&quot;</span><span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nv">STATUS</span><span class="o">=</span>PASS
+<span class="w">    </span><span class="k">else</span>
+<span class="w">        </span><span class="nv">STATUS</span><span class="o">=</span>FAIL
+<span class="w">    </span><span class="k">fi</span>
+<span class="w">    </span><span class="nv">DUR</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">BUILD_START</span><span class="w"> </span><span class="k">))</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">1</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;Build (C++)&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--status<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$STATUS</span><span class="s2">&quot;</span><span class="w"> </span>--duration<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DUR</span><span class="s2">&quot;</span><span class="w"> </span>--log<span class="w"> </span><span class="s2">&quot;build-cpp.log&quot;</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>timing<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--gate<span class="w"> </span>phase1<span class="w"> </span>--step<span class="w"> </span>meson-compile<span class="w"> </span>--ms<span class="w"> </span><span class="k">$((</span><span class="nv">DUR</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">1000</span><span class="k">))</span>
+<span class="o">)</span><span class="w"> </span><span class="p">&amp;</span>
+
+<span class="c1"># Build Erlang gateway. Don&#39;t swallow ensure-erlang.sh errors — if Erlang</span>
+<span class="c1"># is missing, we want the rebar3 invocation to surface the real diagnosis.</span>
+<span class="c1"># `as prod release` (not just `compile`) is required so Phase 4&#39;s</span>
+<span class="c1"># start-UAT.sh can launch the gateway from gateway/_build/prod/rel/.</span>
+<span class="o">(</span>
+<span class="w">    </span><span class="nb">set</span><span class="w"> </span>-e
+<span class="w">    </span><span class="nv">BUILD_START</span><span class="o">=</span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span>
+<span class="w">    </span><span class="nb">cd</span><span class="w"> </span>gateway
+<span class="w">    </span><span class="nb">source</span><span class="w"> </span>../scripts/ensure-erlang.sh
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>rebar3<span class="w"> </span>as<span class="w"> </span>prod<span class="w"> </span>release<span class="w"> </span>&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG_DIR</span><span class="s2">/build-erlang.log&quot;</span><span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nv">STATUS</span><span class="o">=</span>PASS
+<span class="w">    </span><span class="k">else</span>
+<span class="w">        </span><span class="nv">STATUS</span><span class="o">=</span>FAIL
+<span class="w">    </span><span class="k">fi</span>
+<span class="w">    </span><span class="nv">DUR</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">BUILD_START</span><span class="w"> </span><span class="k">))</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">1</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;Build (Erlang)&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--status<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$STATUS</span><span class="s2">&quot;</span><span class="w"> </span>--duration<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DUR</span><span class="s2">&quot;</span><span class="w"> </span>--log<span class="w"> </span><span class="s2">&quot;build-erlang.log&quot;</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>timing<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--gate<span class="w"> </span>phase1<span class="w"> </span>--step<span class="w"> </span>rebar3-release<span class="w"> </span>--ms<span class="w"> </span><span class="k">$((</span><span class="nv">DUR</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">1000</span><span class="k">))</span>
+<span class="o">)</span><span class="w"> </span><span class="p">&amp;</span>
+
+<span class="c1"># Build local docker images for the upgrade test target (skip in --quick).</span>
+<span class="c1"># Tag with the ghcr.io prefix directly so the upgrade-test compose file</span>
+<span class="c1"># picks it up without a separate `docker tag` step in Phase 2.</span>
+<span class="c1"># Cross-platform: SKIP gracefully if docker is unavailable (macOS dev box</span>
+<span class="c1"># without OrbStack/Docker Desktop running). Linux CI always has docker.</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$MODE</span><span class="s2">&quot;</span><span class="w"> </span>!<span class="o">=</span><span class="w"> </span><span class="s2">&quot;quick&quot;</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="o">(</span>
+<span class="w">        </span><span class="nb">set</span><span class="w"> </span>-e
+<span class="w">        </span><span class="nv">BUILD_START</span><span class="o">=</span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span>!<span class="w"> </span>docker_available<span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">            </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">1</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;Build (HEAD docker images)&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--status<span class="w"> </span>SKIP<span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--notes<span class="w"> </span><span class="s2">&quot;docker not available — install/start OrbStack or Docker Desktop&quot;</span>
+<span class="w">        </span><span class="k">elif</span><span class="w"> </span>docker<span class="w"> </span>build<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>-t<span class="w"> </span><span class="s2">&quot;ghcr.io/tr3kkr/yuzu-server:0.10.1-test-</span><span class="si">${</span><span class="nv">RUN_ID</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>--label<span class="w"> </span><span class="s2">&quot;yuzu.commit=</span><span class="k">$(</span>git<span class="w"> </span>rev-parse<span class="w"> </span>HEAD<span class="k">)</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>-f<span class="w"> </span>deploy/docker/Dockerfile.server<span class="w"> </span>.<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG_DIR</span><span class="s2">/build-images.log&quot;</span><span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">            </span><span class="nv">STATUS</span><span class="o">=</span>PASS
+<span class="w">            </span><span class="nv">DUR</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">BUILD_START</span><span class="w"> </span><span class="k">))</span>
+<span class="w">            </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">1</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;Build (HEAD docker images)&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--status<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$STATUS</span><span class="s2">&quot;</span><span class="w"> </span>--duration<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DUR</span><span class="s2">&quot;</span><span class="w"> </span>--log<span class="w"> </span><span class="s2">&quot;build-images.log&quot;</span>
+<span class="w">            </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>timing<span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--gate<span class="w"> </span>phase1<span class="w"> </span>--step<span class="w"> </span>docker-build<span class="w"> </span>--ms<span class="w"> </span><span class="k">$((</span><span class="nv">DUR</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">1000</span><span class="k">))</span>
+<span class="w">        </span><span class="k">else</span>
+<span class="w">            </span><span class="nv">STATUS</span><span class="o">=</span>FAIL
+<span class="w">            </span><span class="nv">DUR</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">BUILD_START</span><span class="w"> </span><span class="k">))</span>
+<span class="w">            </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">1</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;Build (HEAD docker images)&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">                </span>--status<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$STATUS</span><span class="s2">&quot;</span><span class="w"> </span>--duration<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DUR</span><span class="s2">&quot;</span><span class="w"> </span>--log<span class="w"> </span><span class="s2">&quot;build-images.log&quot;</span>
+<span class="w">        </span><span class="k">fi</span>
+<span class="w">    </span><span class="o">)</span><span class="w"> </span><span class="p">&amp;</span>
+<span class="k">fi</span>
+
+<span class="nb">wait</span>
+</code></pre></div>
+<p><strong>Detect Phase 1 failure before continuing.</strong> <code>wait</code> always exits 0 after
+all background jobs complete — individual subshell failures do NOT
+propagate via <code>wait</code>. Query the DB explicitly to detect any FAIL gate
+in Phase 1 and short-circuit:</p>
+<div class="highlight"><pre><span></span><code><span class="nv">PHASE1_FAILS</span><span class="o">=</span><span class="k">$(</span>python3<span class="w"> </span>scripts/test/test_db.py<span class="w"> </span>query<span class="w"> </span>--export<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="p">|</span><span class="w"> </span>python3<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;</span>
+<span class="s2">import sys, json</span>
+<span class="s2">d = json.load(sys.stdin)</span>
+<span class="s2">print(sum(1 for g in d.get(&#39;gates&#39;, []) if g.get(&#39;phase&#39;) == 1 and g.get(&#39;status&#39;) == &#39;FAIL&#39;))</span>
+<span class="s2">&quot;</span><span class="k">)</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PHASE1_FAILS</span><span class="s2">&quot;</span><span class="w"> </span>-gt<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;Phase 1 FAILED (</span><span class="nv">$PHASE1_FAILS</span><span class="s2"> gates) — see logs in </span><span class="nv">$LOG_DIR</span><span class="s2">/build-*.log&quot;</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/teardown.sh<span class="w"> </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--status<span class="w"> </span>ABORTED
+<span class="w">    </span><span class="nb">exit</span><span class="w"> </span><span class="m">1</span>
+<span class="k">fi</span>
+</code></pre></div>
+<p>Phase 1 is the only mandatory-blocking phase. If HEAD doesn't compile,
+nothing else can run.</p>
+<h2 id="phase-2-upgrade-test-the-users-headline-priority">Phase 2 — Upgrade Test (the user's headline priority)</h2>
+<p>Skipped in <code>--quick</code>. In default and <code>--full</code>:</p>
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>scripts/test/test-upgrade-stack.sh<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--new-version<span class="w"> </span><span class="s2">&quot;0.10.1-test-</span><span class="si">${</span><span class="nv">RUN_ID</span><span class="si">}</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--new-image-loaded<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--test-dir<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$TEST_DIR</span><span class="s2">&quot;</span>
+</code></pre></div>
+<p><code>--old-version</code> is omitted so the script resolves it from GitHub's current
+"Latest release" at runtime (<code>gh api repos/Tr3kkR/Yuzu/releases/latest</code>).
+This keeps the upgrade baseline tracking whatever the last published stable
+tag is without needing a pipeline edit each release. Pass <code>--old-version
+X.Y.Z</code> to pin an older baseline for debugging.</p>
+<p>The script records its own gate row (<code>Upgrade vOLD-&gt;vNEW</code>) and sub-step timings (<code>pull-old-images</code>, <code>stack-up-old</code>, <code>fixtures-write</code>, <code>image-swap</code>, <code>ready-after-upgrade</code>, <code>fixtures-verify</code>, <code>synthetic-uat-against-upgraded</code>). The skill doesn't need to record anything additional.</p>
+<p><strong>On failure</strong>: Phase 2 failure is informative but not blocking — continue to Phase 4. The teardown reads gate counts at the end and the operator decides whether to commit.</p>
+<h2 id="phase-3-ota-agent-test-pr3-stubbed-in-pr1">Phase 3 — OTA Agent Test (PR3, stubbed in PR1)</h2>
+<p>For <code>--full</code> only:</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$MODE</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s2">&quot;full&quot;</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">3</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;OTA Linux&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--status<span class="w"> </span>SKIP<span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--notes<span class="w"> </span><span class="s2">&quot;planned for PR3&quot;</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">3</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;OTA Windows&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--status<span class="w"> </span>SKIP<span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--notes<span class="w"> </span><span class="s2">&quot;planned for PR3&quot;</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">3</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;OTA macOS&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--status<span class="w"> </span>SKIP<span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--notes<span class="w"> </span><span class="s2">&quot;hardware pending Apple Silicon arrival&quot;</span>
+<span class="k">fi</span>
+</code></pre></div>
+<p>Once PR3 lands, replace the SKIP stubs with the real script invocations:
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>scripts/test/test-ota-agent-linux.sh<span class="w">   </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span>
+bash<span class="w"> </span>scripts/test/test-ota-agent-windows.sh<span class="w"> </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span>
+bash<span class="w"> </span>scripts/test/test-ota-agent-macos.sh<span class="w">   </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w">   </span><span class="c1"># SKIP until hardware arrives</span>
+</code></pre></div></p>
+<h2 id="phase-7a-perf-measurement-runs-here-before-phase-4">Phase 7a — Perf measurement (runs HERE, before Phase 4)</h2>
+<p><code>--full</code> only. Despite the <code>7a</code> label (rows are tagged <code>phase=7</code> in the DB so they group with coverage in the report), perf runs <strong>here</strong> in wall-clock order — after Phase 3 has finished but before Phase 4 brings up the UAT stack. This is the most-quiesced point in the pipeline:</p>
+<ul>
+<li>Phase 1 build is done (binaries exist; ccache hits stop competing).</li>
+<li>Phase 2 docker compose has been torn down.</li>
+<li>Phase 3 is just DB writes.</li>
+<li>Phase 4 hasn't started, so no native server/gateway/agent.</li>
+<li>Phase 5 hasn't started, so no parallel fan-out CPU pressure.</li>
+</ul>
+<p>The perf suite is fully self-contained (every upstream RPC meck'd, gateway components in-process), so it has no functional dependency on the live stack. Running it here keeps measurements off contended cores.</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$MODE</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s2">&quot;full&quot;</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/perf-gate.sh<span class="w"> </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span>
+<span class="k">fi</span>
+</code></pre></div>
+<p><strong>Measure-and-report, not enforce (as of 2026-05-03).</strong> <code>perf-gate.sh</code> runs <code>yuzu_gw_perf_SUITE</code>, parses throughput and latency from <code>ct:pal</code> output, records each metric into the test-runs DB as <code>perf_*</code>, and exits PASS. It does <strong>not</strong> read a baseline file or fail on a regression — the N=300 calibration found that 3 of the 4 gateway perf metrics are ceiling-bounded with long left tails (not Gaussian), so neither σ nor %-tolerance bands are statistically defensible. Until the gate is rebuilt around percentile primitives, perf is human-judgement-driven: the operator inspects trend via <code>bash scripts/test/test-db-query.sh --trend timing=phase7.perf</code> and shape via <code>tests/perf-baseline-provenance-N300.{jsonl,json}</code>. Full rationale and the deferred redesign live in <a href="../../../docs/perf-baseline-calibration-2026-05-03.html" class="doc-ref"><code>docs/perf-baseline-calibration-2026-05-03.md</code></a>. The script still scans the seven UAT-related ports (8080, 50051, 50052, 50055, 50063, 8081, 9568) and refuses to run if any are listening (contended measurements mislead the human eyeball too), with <code>--allow-busy</code> as an explicit debug bypass. Loadavg pre/post and the hardware fingerprint stay recorded as metric context.</p>
+<h2 id="phase-4-fresh-stack-stand-up">Phase 4 — Fresh Stack Stand-up</h2>
+<p>Skipped in <code>--quick</code>. Default and <code>--full</code> use the existing <code>start-UAT.sh</code> to bring up server+gateway+agent natively (faster than docker for Phase 5 e2e gates that hit the live stack):</p>
+<div class="highlight"><pre><span></span><code><span class="nv">PHASE4_START</span><span class="o">=</span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span>
+<span class="k">if</span><span class="w"> </span>bash<span class="w"> </span>scripts/start-UAT.sh<span class="w"> </span>&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG_DIR</span><span class="s2">/fresh-stack.log&quot;</span><span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nv">STATUS</span><span class="o">=</span>PASS
+<span class="k">else</span>
+<span class="w">    </span><span class="nv">STATUS</span><span class="o">=</span>FAIL
+<span class="k">fi</span>
+<span class="nv">DUR</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">PHASE4_START</span><span class="w"> </span><span class="k">))</span>
+bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">4</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;Fresh stack stand-up&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--status<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$STATUS</span><span class="s2">&quot;</span><span class="w"> </span>--duration<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DUR</span><span class="s2">&quot;</span><span class="w"> </span>--log<span class="w"> </span><span class="s2">&quot;fresh-stack.log&quot;</span>
+</code></pre></div>
+<p><strong><code>start-UAT.sh</code> correctly returns non-zero on any connectivity test failure</strong> (this is the post-PR1 behavior — earlier versions exited 0 unconditionally, see CHANGELOG <code>[Unreleased]</code>). The Phase 4 gate's PASS/FAIL accurately reflects whether the 6 inline connectivity tests passed against the fresh stack. The Phase 5 Synthetic UAT gate runs again standalone with sub-step timing capture into the test-runs DB — both gates are intentional, not a duplicate.</p>
+<h2 id="phase-5-test-gates-parallel">Phase 5 — Test Gates (parallel)</h2>
+<p>Run all gates concurrently via <code>&amp;</code> + <code>wait</code>. Each is a self-contained bash invocation that captures its own log to <code>$LOG_DIR/&lt;gate&gt;.log</code>. Don't try to collect their stdout — read the log paths in the failure summary instead.</p>
+<h3 id="race-free-parallel-rebar3-via-rebar_base_dir">Race-free parallel rebar3 via <code>REBAR_BASE_DIR</code></h3>
+<p>EUnit, CT suites, and CT real-upstream all consume <code>_build/test/lib/yuzu_gw/test/</code> for the same set of compiled <code>*_tests.beam</code> and <code>*_SUITE.beam</code> files. When run in parallel against a shared <code>_build/</code> they race on <strong>two</strong> different things:</p>
+<ol>
+<li><strong>Dep fetching.</strong> Each invocation calls <code>Verifying dependencies...</code>, decides to re-fetch <code>proper</code>/<code>meck</code>/<code>covertool</code> into <code>_build/{default,test}/lib/</code>, and concurrent extraction corrupts the partially-fetched packages — the loser sees <code>Dependency failure: source for proper does not contain a recognizable project</code>, and the post-failure <code>rm -rf</code> fails with <code>Directory not empty</code> because the writer still has open file handles. (Observed in run <code>1777704747-244808</code>.)</li>
+<li><strong>Test source compile.</strong> When any <code>test/</code> <code>.erl</code> is edited, both rebar3 processes recompile the entire test/ directory, racing on <code>.bea#</code> → <code>.beam</code> atomic-rename of every test module — manifests as <code>failed to rename .../yuzu_gw_health_nf_tests.bea# to .../yuzu_gw_health_nf_tests.beam: no such file or directory</code> (the writer's tempfile gets unlinked underneath it). Observed in run <code>1777727834-294523</code> after the first race fix landed.</li>
+</ol>
+<p>Sequential pre-warming would fix (1) but not (2) — rebar3 has no clean way to compile test/ without running tests, and any test-running pre-warm doubles the wall time of the slowest gate. The cleaner cure is to give each parallel gate <strong>its own <code>_build/</code> tree</strong> via <code>REBAR_BASE_DIR</code>. EUnit writes to <code>_build_eunit/</code>, CT suites to <code>_build_ct/</code>, CT real-upstream to <code>_build_ct_realup/</code>, Dialyzer keeps the shared <code>_build/</code>. They cannot collide because they touch different filesystem paths.</p>
+<p>The fan-out below sets <code>REBAR_BASE_DIR</code> per gate. First-run cost is one-time deps refetch into each tree (~10s); subsequent runs find both trees warm. Total Phase 5 wall time goes 60s pre-fix → 105-140s with REBAR_BASE_DIR (cold first run) → ~95s warm — comparable to the broken parallel fan-out, but actually correct.</p>
+<p>Dialyzer keeps the default <code>_build/</code> because it's the only consumer of <code>_build/default/</code> in Phase 5 — there is no race partner. Keeping its tree separate also means a <code>rebar3 dialyzer</code> run from outside <code>/test</code> reuses the same PLT cache.</p>
+<p>A pre-warm of the default <code>_build/</code> (compiling <code>src/</code> + <code>_build/default/lib/</code> deps) is no longer needed for race-correctness; it's still cheap (~17s) and shaves a few seconds off Dialyzer first-run cold starts, so we keep it as a small optimisation. It MUST NOT touch <code>_build_eunit/</code> or <code>_build_ct/</code>:</p>
+<div class="highlight"><pre><span></span><code><span class="o">(</span>
+<span class="w">    </span><span class="nb">cd</span><span class="w"> </span>gateway
+<span class="w">    </span><span class="nb">source</span><span class="w"> </span>../scripts/ensure-erlang.sh<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+<span class="w">    </span>rebar3<span class="w"> </span>compile<span class="w"> </span>&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG_DIR</span><span class="s2">/prewarm-default.log&quot;</span><span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">true</span>
+<span class="o">)</span>
+</code></pre></div>
+<p>Pre-warm failures use <code>|| true</code> because if <code>src/</code> genuinely can't compile, every gate will fail with the same error and that's the right reporting surface — the pre-warm step is just for first-run cold-start latency, not for gating.</p>
+<p>The pattern for every gate (note: <code>eval "$cmd"</code> is safe here because every
+caller below passes a literal string constructed inline in this same skill;
+the <code>cmd</code> argument is never read from operator input or external state):
+<div class="highlight"><pre><span></span><code>gate_run<span class="o">()</span><span class="w"> </span><span class="o">{</span>
+<span class="w">    </span><span class="nb">local</span><span class="w"> </span><span class="nv">gate_name</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$1</span><span class="s2">&quot;</span><span class="w"> </span><span class="nv">log_basename</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$2</span><span class="s2">&quot;</span><span class="w"> </span><span class="nv">cmd</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$3</span><span class="s2">&quot;</span><span class="w"> </span><span class="nv">phase</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">4</span><span class="k">:-</span><span class="nv">5</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="c1"># Capture project root BEFORE entering the subshell. Several gates</span>
+<span class="w">    </span><span class="c1"># eval a `cd gateway &amp;&amp; rebar3 ...` compound — that cd survives into</span>
+<span class="w">    </span><span class="c1"># the post-eval test-db-write.sh invocation, so a relative path would</span>
+<span class="w">    </span><span class="c1"># resolve against gateway/ and fail. The absolute path keeps the</span>
+<span class="w">    </span><span class="c1"># writer reachable regardless of where the gate&#39;s cmd left $PWD.</span>
+<span class="w">    </span><span class="nb">local</span><span class="w"> </span><span class="nv">project_root</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$PWD</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="o">(</span>
+<span class="w">        </span><span class="nb">local</span><span class="w"> </span><span class="nv">start</span><span class="o">=</span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span>
+<span class="w">        </span><span class="c1"># eval is intentional: cmd contains compound shell expressions like</span>
+<span class="w">        </span><span class="c1"># &#39;cd gateway &amp;&amp; source ../scripts/ensure-erlang.sh; rebar3 ...&#39;.</span>
+<span class="w">        </span><span class="c1"># All cmd strings are author-controlled constants, never user input.</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nb">eval</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$cmd</span><span class="s2">&quot;</span><span class="w"> </span>&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG_DIR</span><span class="s2">/</span><span class="nv">$log_basename</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">            </span><span class="nb">local</span><span class="w"> </span><span class="nv">status</span><span class="o">=</span>PASS
+<span class="w">        </span><span class="k">else</span>
+<span class="w">            </span><span class="nb">local</span><span class="w"> </span><span class="nv">status</span><span class="o">=</span>FAIL
+<span class="w">        </span><span class="k">fi</span>
+<span class="w">        </span><span class="nb">local</span><span class="w"> </span><span class="nv">dur</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">start</span><span class="w"> </span><span class="k">))</span>
+<span class="w">        </span>bash<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$project_root</span><span class="s2">/scripts/test/test-db-write.sh&quot;</span><span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$phase</span><span class="s2">&quot;</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$gate_name</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">            </span>--status<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$status</span><span class="s2">&quot;</span><span class="w"> </span>--duration<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$dur</span><span class="s2">&quot;</span><span class="w"> </span>--log<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$log_basename</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="o">)</span><span class="w"> </span><span class="p">&amp;</span>
+<span class="o">}</span>
+</code></pre></div></p>
+<p>The default-mode Phase 5 fan-out:</p>
+<div class="highlight"><pre><span></span><code>gate_run<span class="w"> </span><span class="s2">&quot;C++ unit (Catch2)&quot;</span><span class="w"> </span><span class="s2">&quot;unit-cpp.log&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;meson test -C \&quot;</span><span class="nv">$BUILDDIR</span><span class="s2">\&quot; --suite agent --suite server --suite tar --suite transport --suite proto --suite docs --print-errorlogs&quot;</span>
+
+gate_run<span class="w"> </span><span class="s2">&quot;EUnit&quot;</span><span class="w"> </span><span class="s2">&quot;eunit.log&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;cd gateway &amp;&amp; source ../scripts/ensure-erlang.sh 2&gt;/dev/null; REBAR_BASE_DIR=\$PWD/_build_eunit rebar3 eunit --dir apps/yuzu_gw/test&quot;</span>
+
+gate_run<span class="w"> </span><span class="s2">&quot;Dialyzer&quot;</span><span class="w"> </span><span class="s2">&quot;dialyzer.log&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;cd gateway &amp;&amp; source ../scripts/ensure-erlang.sh 2&gt;/dev/null; rebar3 dialyzer&quot;</span>
+
+gate_run<span class="w"> </span><span class="s2">&quot;CT suites&quot;</span><span class="w"> </span><span class="s2">&quot;ct.log&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;cd gateway &amp;&amp; source ../scripts/ensure-erlang.sh 2&gt;/dev/null; REBAR_BASE_DIR=\$PWD/_build_ct rebar3 ct --dir apps/yuzu_gw/test --suite=yuzu_gw_e2e_SUITE,yuzu_gw_integration_SUITE,yuzu_gw_metrics_e2e_SUITE,yuzu_gw_prometheus_SUITE&quot;</span>
+
+<span class="c1"># Real-upstream CT suite — lives under apps/yuzu_gw/integration_test/</span>
+<span class="c1"># (separate dir from the regular test/ tree so CI&#39;s `rebar3 ct --dir</span>
+<span class="c1"># apps/yuzu_gw/test` discovery does NOT pick it up). Requires:</span>
+<span class="c1">#   1. A live yuzu-server reachable on 127.0.0.1:50055 (Phase 4 brings</span>
+<span class="c1">#      this up via start-UAT.sh).</span>
+<span class="c1">#   2. YUZU_GW_TEST_TOKEN env var set to a valid enrollment token, OR</span>
+<span class="c1">#      start-UAT.sh must have just run (its scratch dir is</span>
+<span class="c1">#      probed for the token).</span>
+<span class="c1"># Failing either prerequisite, the suite reports {test_case_failed,</span>
+<span class="c1"># &quot;No enrollment token: …&quot;} per-case rather than a useful skip — file</span>
+<span class="c1"># an upstream issue if you hit that during /test.</span>
+gate_run<span class="w"> </span><span class="s2">&quot;CT real-upstream&quot;</span><span class="w"> </span><span class="s2">&quot;ct-real-upstream.log&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;cd gateway &amp;&amp; source ../scripts/ensure-erlang.sh 2&gt;/dev/null; REBAR_BASE_DIR=\$PWD/_build_ct_realup rebar3 ct --dir apps/yuzu_gw/integration_test --suite=yuzu_gw_real_upstream_SUITE&quot;</span>
+
+gate_run<span class="w"> </span><span class="s2">&quot;Integration&quot;</span><span class="w"> </span><span class="s2">&quot;integration.log&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;bash scripts/integration-test.sh&quot;</span>
+
+gate_run<span class="w"> </span><span class="s2">&quot;REST API E2E&quot;</span><span class="w"> </span><span class="s2">&quot;e2e-api.log&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;bash scripts/e2e-api-test.sh&quot;</span>
+
+gate_run<span class="w"> </span><span class="s2">&quot;MCP E2E&quot;</span><span class="w"> </span><span class="s2">&quot;e2e-mcp.log&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;bash scripts/e2e-mcp-test.sh&quot;</span>
+
+gate_run<span class="w"> </span><span class="s2">&quot;Security E2E&quot;</span><span class="w"> </span><span class="s2">&quot;e2e-security.log&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;bash scripts/e2e-security-test.sh&quot;</span>
+
+<span class="c1"># Synthetic UAT — Phase 4&#39;s start-UAT.sh already ran its own 6</span>
+<span class="c1"># tests; this gate runs them again standalone with timing capture into</span>
+<span class="c1"># the test-runs DB. Skip if Phase 4 was the source.</span>
+gate_run<span class="w"> </span><span class="s2">&quot;Synthetic UAT&quot;</span><span class="w"> </span><span class="s2">&quot;synthetic-uat.log&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;bash scripts/test/synthetic-uat-tests.sh \</span>
+<span class="s2">        --dashboard http://localhost:8080 \</span>
+<span class="s2">        --user admin --password &#39;YuzuUatAdmin1!&#39; \</span>
+<span class="s2">        --gateway-health http://localhost:8081 \</span>
+<span class="s2">        --gateway-metrics http://localhost:9568 \</span>
+<span class="s2">        --run-id </span><span class="nv">$RUN_ID</span><span class="s2"> --gate-name phase5-synthetic-uat&quot;</span>
+
+<span class="c1"># Puppeteer is warn-only — flaky on first run</span>
+<span class="o">(</span>
+<span class="w">    </span><span class="nv">start</span><span class="o">=</span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>node<span class="w"> </span>tests/puppeteer/dashboard-help-test.mjs<span class="w"> </span>&gt;<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG_DIR</span><span class="s2">/puppeteer.log&quot;</span><span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nv">STATUS</span><span class="o">=</span>PASS
+<span class="w">    </span><span class="k">else</span>
+<span class="w">        </span><span class="nv">STATUS</span><span class="o">=</span>WARN<span class="w">  </span><span class="c1"># not FAIL — puppeteer is best-effort</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="w">    </span><span class="nv">DUR</span><span class="o">=</span><span class="k">$((</span><span class="w"> </span><span class="k">$(</span>date<span class="w"> </span>+%s<span class="k">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">start</span><span class="w"> </span><span class="k">))</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">5</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;Puppeteer&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--status<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$STATUS</span><span class="s2">&quot;</span><span class="w"> </span>--duration<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$DUR</span><span class="s2">&quot;</span><span class="w"> </span>--log<span class="w"> </span><span class="s2">&quot;puppeteer.log&quot;</span>
+<span class="o">)</span><span class="w"> </span><span class="p">&amp;</span>
+
+<span class="c1"># Instructions content-suite gate — schema-driven REST exerciser.</span>
+<span class="c1"># Drives every safe + mutating InstructionDefinition (184 of 217) and</span>
+<span class="c1"># records per-instruction pass/fail/timing into the test-runs DB.</span>
+<span class="c1"># Destructive (25), interactive (5), and network-disrupting (3) classes</span>
+<span class="c1"># are opt-in via --risks; default-mode invocation excludes them.</span>
+gate_run<span class="w"> </span><span class="s2">&quot;Instructions&quot;</span><span class="w"> </span><span class="s2">&quot;instructions.log&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="s2">&quot;bash scripts/test/instructions-tests.sh \</span>
+<span class="s2">        --dashboard http://localhost:8080 \</span>
+<span class="s2">        --user admin --password &#39;YuzuUatAdmin1!&#39; \</span>
+<span class="s2">        --run-id </span><span class="nv">$RUN_ID</span><span class="s2"> --gate-name phase5-instructions \</span>
+<span class="s2">        --output </span><span class="nv">$LOG_DIR</span><span class="s2">/instructions-outcomes.json&quot;</span>
+
+<span class="nb">wait</span>
+</code></pre></div>
+<p><code>--quick</code> runs only the unit / EUnit / dialyzer subset (NO synthetic UAT — quick mode skips Phase 4 and has no live stack). <code>--full</code> adds the optional MCP agent gate (invokes <code>mcp-uat-tester</code> via the Agent tool against the live stack).</p>
+<h3 id="-instructions-mode-content-suite-standalone"><code>--instructions</code> mode (content-suite standalone)</h3>
+<p>When the operator runs <code>/test --instructions</code>, the orchestration is <strong>truncated</strong>: Phase 0 preflight, Phase 4 stack stand-up, then the Instructions gate from Phase 5, then Phase 8 teardown. No build, no upgrade test, no other Phase 5 gates, no sanitizers, no coverage. Use when:</p>
+<ul>
+<li>A YAML under <code>content/definitions/</code> changed (added/edited/removed an InstructionDefinition).</li>
+<li>The instruction-engine dispatch path (<code>workflow_routes.cpp</code> <code>POST /api/instructions/:id/execute</code>, <code>agent_service_impl.cpp</code> <code>cmd_execution_ids_</code>, response store) was touched.</li>
+<li>Investigating a content regression flagged by the trend tooling.</li>
+</ul>
+<p>Wall clock is dominated by Phase 4 (~60-90s) and the gate itself (5-15 min for 184 instructions at parallelism=4). The gate writes per-instruction timings to <code>test_timings</code> so <code>bash scripts/test/test-db-query.sh --trend timing=phase5-instructions.&lt;id&gt;</code> shows latency drift over time.</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># In --instructions mode:</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$MODE</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s2">&quot;instructions&quot;</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="c1"># Run only Phase 0, 4, the Instructions gate, and Phase 8.</span>
+<span class="w">    </span><span class="c1"># Build is not gated — operator should already have $BUILDDIR populated;</span>
+<span class="w">    </span><span class="c1"># if not, the start-UAT.sh in Phase 4 will surface the missing binary.</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/instructions-tests.sh<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--dashboard<span class="w"> </span>http://localhost:8080<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--user<span class="w"> </span>admin<span class="w"> </span>--password<span class="w"> </span><span class="s1">&#39;YuzuUatAdmin1!&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--gate-name<span class="w"> </span>instructions<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--output<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$LOG_DIR</span><span class="s2">/instructions-outcomes.json&quot;</span>
+<span class="w">    </span><span class="c1"># then jump straight to Phase 8 teardown</span>
+<span class="k">fi</span>
+</code></pre></div>
+<p>The gate's exit code is the run's overall_status: 0 → PASS, 1 → FAIL (one or more instruction fail/error), 2 → ABORTED (login or content-dir error).</p>
+<h3 id="-instructions-quarantine-mode-the-self-disconnect-ceremony"><code>--instructions-quarantine</code> mode (the self-disconnect ceremony)</h3>
+<blockquote>
+<p><strong>DO NOT RUN ON A REMOTE / SSH-ONLY HOST.</strong> The ceremony briefly cuts ALL external network. If your only access path to the box is SSH-over-the-network, you will lock yourself out until the un-quarantine fires (~25-30s) — and if the un-quarantine fails, you stay locked out until you physically reach the box. Run only on your local dev box (the one with a keyboard and a screen).</p>
+<p>Additional preconditions:
+- The agent account must have the privileges declared in <a href="../../../docs/agent-privilege-model.html" class="doc-ref"><code>docs/agent-privilege-model.md</code></a>. Run <code>sudo bash scripts/install-agent-user.sh</code> (Linux/macOS) or <code>powershell -ExecutionPolicy Bypass scripts/install-agent-user.ps1</code> from an elevated PowerShell (Windows) once per box before the first ceremony run; the install script is idempotent. Verify with <code>--check</code> / <code>-Check</code>.
+- If the agent is running as an account WITHOUT the <code>pfctl</code> / <code>iptables</code> / <code>netsh</code> grants, the survivor will dispatch isolate but the firewall won't actually close — the survivor catches that in <code>confirm-blackout</code>, dispatches emergency release, and exits FAIL/1 without locking the box. That's the <em>safe</em> failure mode; it tells you the install script hasn't been run on this host.</p>
+</blockquote>
+<p>This mode exercises the four-instruction quarantine cluster (<code>security.quarantine.{isolate,release,status,whitelist}</code>) including the part the schema-driven runner can't: <strong>the actual network blackout</strong>. Because the blackout cuts Claude Code's path to api.anthropic.com, the ceremony is driven by a detached survivor (<code>scripts/test/instructions_quarantine_survivor.py</code>) that:</p>
+<ol>
+<li>Probes preconditions (UAT reachable, plugin loaded, external connectivity present, Yuzu localhost reachable).</li>
+<li>Dispatches <code>security.quarantine.isolate</code> with <code>server_ip=127.0.0.1</code> and <code>whitelist_ips=127.0.0.1</code>. The plugin auto-whitelists loopback on every platform, so localhost endpoints stay reachable.</li>
+<li>After a 5s grace, probes external destinations (1.1.1.1, 8.8.8.8, github.com, api.anthropic.com on :443) — they MUST be unreachable. Probes Yuzu localhost (8080, 50051, 8081) — they MUST be reachable.</li>
+<li>Sleeps 10s, re-probes external to confirm sustained blackout.</li>
+<li>Dispatches <code>security.quarantine.release</code>. Probes external to confirm recovery.</li>
+<li>Writes <code>results.json</code> to the state dir.</li>
+<li>(If <code>--launch-resume</code>) Tries to spawn a new Terminal with <code>claude --resume &lt;session-id&gt;</code> via <code>osascript</code> (macOS) or <code>tmux</code> (other platforms). Always falls back to writing <code>&lt;state-dir&gt;/relaunch.sh</code> for manual use.</li>
+</ol>
+<p><strong>Operator workflow inside Claude Code</strong>:</p>
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>scripts/test/instructions-quarantine.sh<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dashboard<span class="w"> </span>http://localhost:8080<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--user<span class="w"> </span>admin<span class="w"> </span>--password<span class="w"> </span><span class="s1">&#39;YuzuUatAdmin1!&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--launch-resume<span class="w">      </span><span class="c1"># macOS only — opens a new Terminal window</span>
+</code></pre></div>
+<p>This script captures the current Claude session UUID from <code>~/.claude/projects/-Users-nathan-Yuzu/&lt;uuid&gt;.jsonl</code> (most recent), backgrounds the survivor via <code>setsid nohup</code>, prints PID + state-dir + instructions, and exits 0 immediately. The survivor runs ~30-40s asynchronously.</p>
+<p><strong>During the blackout</strong>, this Claude Code session may lose its connection to api.anthropic.com. The user has three options:
+- Type <code>/exit</code> and let the survivor's auto-resume open a new Terminal
+- Wait for the connection to recover (it usually does after un-quarantine)
+- Manually run <code>bash /tmp/yuzu-quarantine-test/relaunch.sh</code> after the survivor finishes</p>
+<p><strong>On resume, read the results</strong>:
+<div class="highlight"><pre><span></span><code>cat<span class="w"> </span>/tmp/yuzu-quarantine-test/results.json
+</code></pre></div></p>
+<p>The results document each phase, every probe (with TCP latency), the agent's responses to isolate/release, and any operator-actionable note. Exit codes:
+- 0 — full ceremony passed: blackout sustained, recovery confirmed
+- 1 — blackout incomplete or recovery probe failed (firewall partially or fully not actually closed; OR external reachable mid-blackout)
+- 2 — precondition fail (login, plugin not loaded, no external connectivity at start) — no firewall change happened
+- 3 — release dispatch failed: <strong>operator must clear firewall manually</strong> (<code>pfctl -F all</code> / <code>iptables -F</code> / <code>netsh advfirewall reset</code>). The note in <code>results.json</code> tells you which.</p>
+<p><strong>Probe-only mode</strong> (<code>--probe-only</code>) runs only the precondition checks via the schema-driven runner — verifies the quarantine plugin is loaded without any firewall side effect. Use this first if you've never run the ceremony on this box.</p>
+<h2 id="phase-6-sanitizers-pr2">Phase 6 — Sanitizers (PR2)</h2>
+<p>Sanitizer rebuilds are dispatched to the <code>yuzu-wsl2-linux</code> self-hosted runner via <code>workflow_dispatch</code>. Running them locally would pin the dev box for ~15 min of compile time each; the always-on runner absorbs that cost while the operator continues Phase 5 gates locally.</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$MODE</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s2">&quot;full&quot;</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/sanitizer-gate.sh<span class="w"> </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span>
+<span class="k">fi</span>
+</code></pre></div>
+<p>The gate script:
+1. Resolves the current commit (<code>git rev-parse HEAD</code>) and dispatches <code>.github/workflows/sanitizer-tests.yml</code> via <code>scripts/test/dispatch-runner-job.sh</code>
+2. Polls the run to completion (default 90 min budget — covers queued + compile + test)
+3. Downloads <code>sanitizer-asan*</code> and <code>sanitizer-tsan*</code> artifacts into <code>/tmp/yuzu-test-${RUN_ID}/sanitizer/</code>
+4. Parses each sanitizer log for <code>ERROR: AddressSanitizer</code>, <code>ERROR: LeakSanitizer</code>, <code>WARNING: ThreadSanitizer</code>, <code>ThreadSanitizer: data race</code>, <code>runtime error:</code>
+5. Writes two Phase 6 rows to <code>test_gates</code>: <code>Sanitizers (ASan+UBSan)</code> and <code>Sanitizers (TSan)</code></p>
+<p><strong>Runner-offline path (WARN, not FAIL).</strong> If <code>yuzu-wsl2-linux</code> is offline or the dispatch times out, both gates record <code>WARN</code> with notes explaining the operator retry path. The skill continues with the rest of the run rather than blocking on CI infrastructure that's out of reach.</p>
+<p><strong>Workflow-file requirement.</strong> <code>workflow_dispatch</code> evaluates the workflow file on the target ref. If you're dispatching against a commit that doesn't have <code>sanitizer-tests.yml</code> yet (e.g. running /test from an older branch), the dispatch will fail hard. The gate treats that as WARN per the offline-runner path.</p>
+<p><strong>Suite selection.</strong> Default runs both (ASan+UBSan and TSan). Override with <code>--suite asan</code> or <code>--suite tsan</code> on the gate script — useful when diagnosing a single finding and you don't want the second rebuild to compete for runner time.</p>
+<h2 id="phase-7b-coverage-pr2">Phase 7b — Coverage (PR2)</h2>
+<p>Coverage runs locally on the operator's dev box, at the end of the pipeline (after Phase 5 gates and Phase 6 sanitizer dispatch). It uses <code>${BUILDDIR}-coverage/</code> (separate from the main <code>${BUILDDIR}/</code> to keep ccache hit rates intact). Coverage is contention-tolerant — it's measuring code-execution coverage, not throughput, so the live UAT stack from Phase 4 doesn't affect the numbers. The earlier perf step (Phase 7a) already ran on a quiet box.</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$MODE</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s2">&quot;full&quot;</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/coverage-gate.sh<span class="w"> </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span>
+<span class="k">elif</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$MODE</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s2">&quot;default&quot;</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="c1"># Default mode: coverage in report-only (metric recorded, no enforce);</span>
+<span class="w">    </span><span class="c1"># perf skipped (default-mode budget is too tight for the ~3-5 min</span>
+<span class="w">    </span><span class="c1"># CT suite plus registry churn).</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/coverage-gate.sh<span class="w"> </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--report-only<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">true</span>
+<span class="w">    </span>bash<span class="w"> </span>scripts/test/test-db-write.sh<span class="w"> </span>gate<span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span><span class="w"> </span>--phase<span class="w"> </span><span class="m">7</span><span class="w"> </span>--gate<span class="w"> </span><span class="s2">&quot;Perf&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">        </span>--status<span class="w"> </span>SKIP<span class="w"> </span>--duration<span class="w"> </span><span class="m">0</span><span class="w"> </span>--notes<span class="w"> </span><span class="s2">&quot;perf measurement runs in --full only&quot;</span>
+<span class="k">fi</span>
+</code></pre></div>
+<p><strong>Coverage enforcement.</strong> The gate parses gcovr <code>--json-summary</code> (filter set mirrored from <code>.github/workflows/ci.yml</code> so local/CI numbers match Codecov; gate also passes <code>--native-file meson/native/linux-gcc13.ini</code> so the compiler matches CI's coverage job), records <code>branch_coverage_overall</code> and <code>line_coverage_overall</code> metrics, and compares against <code>tests/coverage-baseline.json</code>. In <code>--full</code> mode the gate fails if branch coverage drops below <code>baseline.branch_percent - slack_pp</code> (default 0.5 pp). Default mode records the metric but doesn't enforce — <code>--report-only</code> short-circuits the comparison. The default-mode invocation wraps the script in <code>|| true</code> so a transient gcovr or build failure writes its own WARN row and does not block the rest of the run; in <code>--full</code> mode the gate is called without <code>|| true</code>, so build or parse failures surface as FAIL.</p>
+<p><strong>Perf is no longer enforced (2026-05-03).</strong> Phase 7a runs <code>yuzu_gw_perf_SUITE</code> and records <code>perf_registration_ops_sec</code>, <code>perf_burst_registration_ops_sec</code>, <code>perf_heartbeat_queue_ops_sec</code>, <code>perf_fanout_*_ms</code>, <code>perf_session_cleanup_ms_per_agent</code>, and <code>perf_loadavg_pre/post</code> into the test-runs DB. There is no baseline file and no regression check. The N=300 calibration showed 3 of the 4 throughput/latency metrics are ceiling-bounded with long left tails — neither σ nor %-tolerance bands fit them — so until the gate is rebuilt around percentile primitives the operator does the inspection: <code>bash scripts/test/test-db-query.sh --trend timing=phase7.perf</code> for run-over-run movement, <code>python3 scripts/test/perf-histograms.py tests/perf-baseline-provenance-N300.jsonl</code> (gitignored scratch tool) for shape comparison against the calibration capture, and the inline histograms in <a href="../../../docs/perf-baseline-calibration-2026-05-03.html" class="doc-ref"><code>docs/perf-baseline-calibration-2026-05-03.md</code></a> for the empirical reference distributions. Full rationale and the deferred redesign live in the same doc.</p>
+<p><strong>Coverage baseline update workflow.</strong>
+1. Make a change you believe deserves a new coverage baseline (coverage up, or an accepted trade-off).
+2. <strong>Pre-flight</strong>: a clean <code>meson test -C ${BUILDDIR}-coverage</code> must pass — the gate refuses <code>--capture-baselines</code> with <code>FAIL: refused --capture-baselines: meson test exit=N</code> if it doesn't (UP-18 guard protecting you from anchoring a broken-environment baseline).
+3. Run <code>bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines</code>. The script rewrites the JSON file with current numbers + <code>captured_at</code> + <code>captured_commit</code> and prints a diff of old-vs-new values before overwrite so you can sanity-check the direction.
+4. <code>git add tests/coverage-baseline.json</code> alongside your feature commit. <code>git blame</code> is the audit trail.
+5. Do NOT capture a baseline in the middle of an unrelated change — the commit SHA recorded in the baseline becomes the receipt for "this is the code that earned these numbers."</p>
+<p><strong>Coverage baseline refresh cadence.</strong> Recapture at every <code>vX.Y.0</code> release tag on the canonical dev box (any Linux with GCC 13). Commit the updated JSON in the release-prep commit. Coverage drift between release trains is informative trend data.</p>
+<p><strong>Seed sentinel (historical, coverage only).</strong> The <code>__seed: true</code> sentinel was the PR2 mechanism that kept the coverage gate from silently green-passing while the baseline was a placeholder. The gate still honors it: <code>__seed: true</code> forces WARN regardless of measured numbers. The seed phase has concluded — current <code>tests/coverage-baseline.json</code> holds real captured numbers (branch 26.8% / line 51.8% on the 5950X) and the sentinel is absent, so enforcement is live. Do <strong>not</strong> re-add <code>__seed: true</code> as a "temporary disable" knob; to adjust thresholds, edit <code>slack_pp</code> directly and document why in the commit message.</p>
+<p><strong>Concurrent --full runs on the same ref.</strong> The sanitizer workflow's <code>concurrency: cancel-in-progress: false</code> group means a second dispatch queues behind the first until it completes (Phase 6 only — coverage/perf run locally and have their own coverage-gate race behavior). If you re-run <code>/test --full</code> immediately after a successful run on the same commit, expect Phase 6 to sit queued. Use <code>--suite asan</code> or <code>--suite tsan</code> on the gate script to halve runtime when re-running a specific finding.</p>
+<h2 id="phase-8-teardown-summary">Phase 8 — Teardown + Summary</h2>
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>scripts/test/teardown.sh<span class="w"> </span>--run-id<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$RUN_ID</span><span class="s2">&quot;</span>
+</code></pre></div>
+<p>The teardown script:
+1. Stops every <code>yuzu-test-${RUN_ID}-*</code> compose project
+2. Removes <code>/tmp/yuzu-test-${RUN_ID}/</code>
+3. Calls <code>test-db-write.sh run-finish --run-id "$RUN_ID"</code> which aggregates gate counts and computes overall status (any FAIL → FAIL, any WARN → WARN, else PASS)</p>
+<p>After teardown, print the final summary by querying the just-finished run:</p>
+<div class="highlight"><pre><span></span><code>bash<span class="w"> </span>scripts/test/test-db-query.sh<span class="w"> </span>--latest
+</code></pre></div>
+<p>The skill should also produce a markdown table in its own response (so the operator sees it inline in the chat) summarizing the same data:</p>
+<div class="highlight"><pre><span></span><code>## /test run &lt;RUN_ID&gt;
+Commit: &lt;sha&gt;  Branch: &lt;branch&gt;  Mode: &lt;mode&gt;  Duration: &lt;wall&gt;
+
+| Phase | Gate                       | Status | Duration | Log                                              | Notes |
+| ...   | ...                        | ...    | ...      | ...                                              | ...   |
+
+Overall: N FAIL, M WARN — &lt;commit decision&gt;
+</code></pre></div>
+<h2 id="querying-the-test-runs-db">Querying the test-runs DB</h2>
+<p>The DB lives at <code>~/.local/share/yuzu/test-runs.db</code> and persists across runs. Common queries:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Most recent run with full gate detail</span>
+bash<span class="w"> </span>scripts/test/test-db-query.sh<span class="w"> </span>--latest
+
+<span class="c1"># Last 10 runs (one row each)</span>
+bash<span class="w"> </span>scripts/test/test-db-query.sh<span class="w"> </span>--last<span class="w"> </span><span class="m">10</span>
+
+<span class="c1"># Side-by-side diff of two runs</span>
+bash<span class="w"> </span>scripts/test/test-db-query.sh<span class="w"> </span>--diff<span class="w"> </span>RUN_A<span class="w"> </span>RUN_B
+
+<span class="c1"># How has the upgrade-test image-swap step trended?</span>
+bash<span class="w"> </span>scripts/test/test-db-query.sh<span class="w"> </span>--trend<span class="w"> </span><span class="nv">timing</span><span class="o">=</span>phase2.image-swap
+
+<span class="c1"># How has branch coverage trended on the dev branch?</span>
+bash<span class="w"> </span>scripts/test/test-db-query.sh<span class="w"> </span>--trend<span class="w"> </span><span class="nv">metric</span><span class="o">=</span>branch_coverage_overall<span class="w"> </span>--branch<span class="w"> </span>dev
+
+<span class="c1"># Which gates have flapped PASS↔FAIL in the last 14 days?</span>
+bash<span class="w"> </span>scripts/test/test-db-query.sh<span class="w"> </span>--flaky<span class="w"> </span>--days<span class="w"> </span><span class="m">14</span>
+
+<span class="c1"># Dump a single run as JSON</span>
+bash<span class="w"> </span>scripts/test/test-db-query.sh<span class="w"> </span>--export<span class="w"> </span>RUN_ID
+
+<span class="c1"># Prune old runs (keep most recent 100)</span>
+bash<span class="w"> </span>scripts/test/test-db-query.sh<span class="w"> </span>--prune<span class="w"> </span><span class="m">100</span>
+</code></pre></div>
+<p>Power users can <code>python3 scripts/test/test_db.py query ...</code> directly, or <code>python3 -c "import sqlite3; ..."</code> against the DB for ad-hoc analysis.</p>
+<h2 id="failure-handling">Failure handling</h2>
+<p>The skill is designed so a single gate failure does NOT short-circuit the run. Goals:</p>
+<ol>
+<li><strong>Always finalize the run row.</strong> Even on a hard error or interrupt, <code>teardown.sh --run-id "$RUN_ID"</code> should be called so the DB has <code>finished_at</code> set and <code>overall_status</code> is something other than <code>RUNNING</code>. Wrap the body of the run in a <code>trap 'bash scripts/test/teardown.sh --run-id "$RUN_ID" --status ABORTED' ERR INT TERM</code> near the top.</li>
+<li><strong>Phase 1 (build) is the only hard short-circuit.</strong> Build failures mean nothing else can run.</li>
+<li><strong>All other phases run to completion.</strong> The operator gets a prioritized fix list in one pass instead of a fix-rerun loop.</li>
+<li><strong>Print failure summaries inline.</strong> When a gate fails, the skill should <code>tail -50 "$LOG_DIR/&lt;gate&gt;.log"</code> so the operator sees the actual error without having to find the log path themselves.</li>
+</ol>
+<h2 id="cost-roi">Cost / ROI</h2>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Phases</th>
+<th>Wall clock</th>
+<th>Use case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--quick</code></td>
+<td>0, 1 (no images), 5-subset, 8</td>
+<td>8-15 min</td>
+<td>"About to commit, want a fast sanity check"</td>
+</tr>
+<tr>
+<td>default</td>
+<td>0, 1, 2, 4, 5, 8</td>
+<td>25-45 min</td>
+<td>"About to push to dev"</td>
+</tr>
+<tr>
+<td><code>--full</code></td>
+<td>0-8 (PR2/PR3 features lit)</td>
+<td>60-120 min</td>
+<td>"About to tag a release"</td>
+</tr>
+<tr>
+<td><code>--instructions</code></td>
+<td>0, 4, 5-instructions, 8</td>
+<td>8-20 min</td>
+<td>"Content YAML changed / dispatch path edited"</td>
+</tr>
+<tr>
+<td><code>--instructions-quarantine</code></td>
+<td>0, 4, ceremony</td>
+<td>30-40s</td>
+<td>"Quarantine plugin / firewall behaviour edited"</td>
+</tr>
+</tbody>
+</table>
+<p>Default mode is the recommended pre-push gate. The upgrade test in Phase 2 catches the highest-stakes class of bugs (silent data loss on schema migration) which no other local gate finds.</p>
+<h2 id="known-risks">Known risks</h2>
+<ol>
+<li><strong>Port collisions</strong> from prior interrupted runs — preflight + <code>--force-cleanup</code> flag.</li>
+<li><strong>Stale Docker volumes</strong> — <code>test-upgrade-stack.sh</code> always <code>down -v</code>s its own project before <code>up</code>.</li>
+<li><strong>Disk space</strong> — preflight refuses &lt; 20 GB free.</li>
+<li><strong>WSL2 + native dockerd</strong> — preflight verifies <code>docker context show</code> is <code>default</code>, not <code>desktop-linux</code>.</li>
+<li><strong>Erlang rebar3 cache pollution</strong> — gateway gates always source <code>scripts/ensure-erlang.sh</code> first; the <code>--dir apps/yuzu_gw/test</code> flag is mandatory per bug #337.</li>
+<li><strong>Fixture write race with migrations</strong> — <code>test-fixtures-write.sh</code> polls <code>/readyz</code> for <code>{"status":"ready"}</code> (not <code>/livez</code>) before writing — uses the #339 compound-fix readiness contract.</li>
+<li><strong>Self-hosted runner availability</strong> (PR2/PR3) — sanitizers and Windows OTA depend on <code>yuzu-wsl2-linux</code> and <code>yuzu-local-windows</code> runners being online; offline → WARN, not FAIL.</li>
+<li><strong>DB grows unbounded</strong> — auto-prune kicks in after 100 runs by default (<code>YUZU_TEST_DB_RETENTION_RUNS</code>).</li>
+</ol>
+<h2 id="post-run-follow-ups">Post-run follow-ups</h2>
+<p>After a successful run, the operator typically wants to:</p>
+<ol>
+<li><strong>Commit and push</strong> — the green run is the gate. Reference <code>RUN_ID</code> in the commit message for traceability.</li>
+<li><strong>Compare to the prior run</strong> — <code>test-db-query.sh --diff &lt;prev&gt; &lt;current&gt;</code> shows what changed in gate status and timings.</li>
+<li><strong>Investigate WARN gates</strong> — these don't block but accumulate as tech debt. File issues if patterns emerge across runs.</li>
+<li><strong>Bump the coverage baseline</strong> if a legitimate drop or trade-off is intentional — <code>coverage-gate.sh --capture-baselines</code> and commit the updated <code>tests/coverage-baseline.json</code>. Perf has no enforced baseline as of 2026-05-03; perf movement is reviewed by the operator against <code>tests/perf-baseline-provenance-N300.{jsonl,json}</code> and is not blocking.</li>
+</ol>
+<p>After a failed run:</p>
+<ol>
+<li><strong>Read the failing log files</strong> under <code>~/.local/share/yuzu/test-runs/${RUN_ID}/</code>.</li>
+<li><strong>Re-run with <code>--force-cleanup</code></strong> if dangling state from the failed run is suspected.</li>
+<li><strong><code>--keep-stack</code></strong> lets you poke at the live UAT environment after the test exits.</li>
+</ol>
+</main>
+</body>
+</html>

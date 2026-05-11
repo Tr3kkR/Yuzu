@@ -1,0 +1,974 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Device Management</title>
+<style>
+:root {
+  color-scheme: light dark;
+  /* Heraldic palette — Barony of Alyth.
+     French blue / gold / silver / black / yellow / indigo / violet form the
+     decorative system; red is reserved for error/blocking/fail and green for
+     correct/proceed/success — never mixed into general chrome. */
+  --hex-french-blue:       #0072BB;
+  --hex-french-blue-light: #2E8FCF;
+  --hex-french-blue-deep:  #014E83;
+  --hex-gold:              #D4AF37;
+  --hex-gold-light:        #E6C757;
+  --hex-gold-deep:         #8E7212;
+  --hex-silver:            #C0C0C0;
+  --hex-silver-soft:       #E5E4E2;
+  --hex-silver-deep:       #8A8A8A;
+  --hex-black:             #0A0A0A;
+  --hex-yellow:            #FFD400;
+  --hex-indigo:            #4B0082;
+  --hex-indigo-light:      #6A1B9A;
+  --hex-violet:            #7F00FF;
+  --hex-violet-light:      #B39DDB;
+  --hex-red:               #C8102E;
+  --hex-red-soft:          #FDECEE;
+  --hex-red-border:        #E08089;
+  --hex-green:             #2E7D32;
+  --hex-green-soft:        #E8F5E9;
+  --hex-green-border:      #8DC891;
+
+  /* Light mode (default) */
+  --fg:             var(--hex-black);
+  --fg-muted:       var(--hex-indigo-light);
+  --bg:             #FAFAFA;
+  --bg-soft:        #F0F4F8;
+  --border:         var(--hex-silver);
+  --link:           var(--hex-french-blue);
+  --link-visited:   var(--hex-indigo);
+  --code-bg:        #F6F1DC;
+  --code-fg:        var(--hex-black);
+  --code-border:    var(--hex-gold);
+  --kbd-bg:         var(--hex-silver-soft);
+  --table-stripe:   #F0F4F8;
+  --table-header:   #E5EEF7;
+  --accent:         var(--hex-gold);
+  --accent-2:       var(--hex-violet);
+  --rule:           var(--hex-french-blue);
+  --h1-rule:        var(--hex-gold);
+  --h2-rule:        var(--hex-french-blue);
+  --h1-fg:          var(--hex-french-blue-deep);
+  --h2-fg:          var(--hex-french-blue);
+  --h3-fg:          var(--hex-indigo);
+  --h4-fg:          var(--hex-violet);
+  --h5-fg:          var(--hex-gold-deep);
+  --h6-fg:          var(--hex-silver-deep);
+  --error:          var(--hex-red);
+  --error-bg:       var(--hex-red-soft);
+  --error-border:   var(--hex-red-border);
+  --success:        var(--hex-green);
+  --success-bg:     var(--hex-green-soft);
+  --success-border: var(--hex-green-border);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg:             var(--hex-silver-soft);
+    --fg-muted:       var(--hex-violet-light);
+    --bg:             var(--hex-black);
+    --bg-soft:        #14143C;
+    --border:         var(--hex-indigo);
+    --link:           var(--hex-french-blue-light);
+    --link-visited:   var(--hex-violet-light);
+    --code-bg:        #14143C;
+    --code-fg:        var(--hex-gold-light);
+    --code-border:    var(--hex-indigo);
+    --kbd-bg:         #14143C;
+    --table-stripe:   #0F0F2A;
+    --table-header:   #1B1B47;
+    --accent:         var(--hex-yellow);
+    --accent-2:       var(--hex-violet-light);
+    --rule:           var(--hex-gold);
+    --h1-rule:        var(--hex-gold);
+    --h2-rule:        var(--hex-french-blue-light);
+    --h1-fg:          var(--hex-gold);
+    --h2-fg:          var(--hex-french-blue-light);
+    --h3-fg:          var(--hex-violet-light);
+    --h4-fg:          var(--hex-yellow);
+    --h5-fg:          var(--hex-gold-light);
+    --h6-fg:          var(--hex-silver);
+    --error:          #FF6B7A;
+    --error-bg:       #3A0A12;
+    --error-border:   #7A1A24;
+    --success:        #6FE07A;
+    --success-bg:     #0A2A14;
+    --success-border: #1F5A2C;
+  }
+}
+html { box-sizing: border-box; }
+*, *::before, *::after { box-sizing: inherit; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+  margin: 0;
+  padding: 2rem 1rem 6rem;
+}
+main {
+  max-width: 960px;
+  margin: 0 auto;
+}
+header.doc-header {
+  border-bottom: 2px solid var(--rule);
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+}
+header.doc-header .crumbs {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+header.doc-header h1.doc-title {
+  margin: 0.25rem 0 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--h1-fg);
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+nav.doc-nav {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+nav.doc-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+nav.doc-nav a:hover { text-decoration: underline; }
+h1, h2, h3, h4, h5, h6 { font-weight: 600; line-height: 1.25; margin-top: 1.8em; margin-bottom: 0.6em; }
+h1 { font-size: 2rem; color: var(--h1-fg); border-bottom: 2px solid var(--h1-rule); padding-bottom: 0.3em; }
+h2 { font-size: 1.5rem; color: var(--h2-fg); border-bottom: 1px solid var(--h2-rule); padding-bottom: 0.3em; }
+h3 { font-size: 1.25rem; color: var(--h3-fg); }
+h4 { font-size: 1rem; color: var(--h4-fg); }
+h5 { font-size: 0.9rem; color: var(--h5-fg); }
+h6 { font-size: 0.85rem; color: var(--h6-fg); }
+p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; text-decoration-color: var(--accent); }
+a:visited { color: var(--link-visited); }
+ul, ol { padding-left: 2em; }
+li + li { margin-top: 0.25em; }
+blockquote {
+  border-left: 4px solid var(--h2-rule);
+  padding: 0.1em 1em;
+  color: var(--fg);
+  background: var(--bg-soft);
+}
+code, pre, kbd, samp {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 0.9em;
+}
+p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code, h5 code, h6 code {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 0.15em 0.4em;
+  border-radius: 6px;
+  border: 1px solid var(--code-border);
+}
+pre {
+  background: var(--code-bg);
+  color: var(--code-fg);
+  padding: 1em;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--code-border);
+  line-height: 1.45;
+}
+pre code { background: transparent; border: 0; padding: 0; }
+.codehilite { background: var(--code-bg); border-radius: 6px; }
+.codehilite pre { margin: 0; border: 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+}
+table thead { background: var(--table-header); }
+table thead th { color: var(--h2-fg); }
+th, td {
+  border: 1px solid var(--border);
+  padding: 0.5em 0.75em;
+  text-align: left;
+  vertical-align: top;
+}
+tr:nth-child(even) td { background: var(--table-stripe); }
+hr {
+  border: 0;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent), var(--rule), var(--accent), transparent);
+  margin: 2em 0;
+}
+img { max-width: 100%; }
+details {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.5em 1em;
+}
+summary { cursor: pointer; font-weight: 600; color: var(--h2-fg); }
+kbd {
+  background: var(--kbd-bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  box-shadow: inset 0 -1px 0 var(--hex-silver-deep);
+}
+strong { color: var(--hex-indigo-light); }
+em { color: var(--accent-2); }
+mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em; border-radius: 2px; }
+.task-list-item { list-style: none; }
+.task-list-item input { margin-right: 0.4em; accent-color: var(--success); }
+@media (prefers-color-scheme: dark) {
+  strong { color: var(--hex-gold-light); }
+  em { color: var(--hex-violet-light); }
+}
+
+/* Admonitions — red strictly reserved for error/warning/fail/danger; green for note/tip/success. */
+.admonition {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--rule);
+  background: var(--bg-soft);
+  padding: 0.75em 1em;
+  border-radius: 6px;
+  margin: 0 0 1em;
+}
+.admonition .admonition-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.85em;
+  margin: 0 0 0.4em;
+  color: var(--h2-fg);
+}
+.admonition.warning,
+.admonition.error,
+.admonition.danger,
+.admonition.fail,
+.admonition.failure,
+.admonition.caution,
+.admonition.attention,
+.admonition.bug {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+  color: var(--fg);
+}
+.admonition.warning .admonition-title,
+.admonition.error .admonition-title,
+.admonition.danger .admonition-title,
+.admonition.fail .admonition-title,
+.admonition.failure .admonition-title,
+.admonition.caution .admonition-title,
+.admonition.attention .admonition-title,
+.admonition.bug .admonition-title { color: var(--error); }
+.admonition.note,
+.admonition.tip,
+.admonition.success,
+.admonition.hint,
+.admonition.check,
+.admonition.done {
+  border-left-color: var(--success);
+  background: var(--success-bg);
+}
+.admonition.note .admonition-title,
+.admonition.tip .admonition-title,
+.admonition.success .admonition-title,
+.admonition.hint .admonition-title,
+.admonition.check .admonition-title,
+.admonition.done .admonition-title { color: var(--success); }
+.admonition.info,
+.admonition.important,
+.admonition.summary,
+.admonition.abstract {
+  border-left-color: var(--hex-french-blue);
+}
+
+/* Heraldic flourish along the top of every page. */
+.heraldic-bar {
+  height: 4px;
+  width: 100%;
+  background: linear-gradient(to right,
+    var(--hex-french-blue) 0%,
+    var(--hex-french-blue) 14%,
+    var(--hex-gold) 14%,
+    var(--hex-gold) 28%,
+    var(--hex-silver) 28%,
+    var(--hex-silver) 42%,
+    var(--hex-black) 42%,
+    var(--hex-black) 56%,
+    var(--hex-yellow) 56%,
+    var(--hex-yellow) 70%,
+    var(--hex-indigo) 70%,
+    var(--hex-indigo) 85%,
+    var(--hex-violet) 85%,
+    var(--hex-violet) 100%);
+}
+.frontmatter { border-left-color: var(--hex-indigo); }
+
+/* Inline doc-reference linkifier — keeps the original <code> chip styling but
+   makes the surrounding anchor obvious by colouring the text french-blue. */
+a.doc-ref { text-decoration: none; }
+a.doc-ref code {
+  color: var(--link);
+  border-color: var(--link);
+}
+a.doc-ref:hover code { background: var(--bg-soft); }
+
+/* README document index — denser two-column layout when there's room. */
+ul.doc-index {
+  list-style: none;
+  padding-left: 0;
+  margin: 0 0 1.5em;
+  columns: 2 320px;
+  column-gap: 1.5em;
+}
+ul.doc-index li {
+  margin: 0 0 0.25em;
+  break-inside: avoid;
+}
+ul.doc-index a { text-decoration: none; }
+ul.doc-index a code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: var(--link);
+}
+ul.doc-index a:hover code { text-decoration: underline; }
+
+.codehilite .hll { background-color: #FFF6CC; }
+.codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #8A8A8A; font-style: italic; }
+.codehilite .err { color: #C8102E; }
+.codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #0072BB; font-weight: 600; }
+.codehilite .o, .codehilite .ow { color: #014E83; }
+.codehilite .nb, .codehilite .bp { color: #7F00FF; }
+.codehilite .nf, .codehilite .fm { color: #8E7212; font-weight: 600; }
+.codehilite .nc, .codehilite .nn, .codehilite .nt { color: #014E83; font-weight: 600; }
+.codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #4B0082; }
+.codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #7F00FF; }
+.codehilite .na { color: #6A1B9A; }
+.codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #0072BB; }
+.codehilite .ge { font-style: italic; }
+.codehilite .gs { font-weight: 700; color: #0A0A0A; }
+.codehilite .gh, .codehilite .gu { color: #014E83; font-weight: 700; }
+.codehilite .gd { background-color: #FDECEE; color: #82071E; }
+.codehilite .gi { background-color: #E8F5E9; color: #2E7D32; }
+.codehilite .gr { color: #C8102E; }
+@media (prefers-color-scheme: dark) {
+  .codehilite .hll { background-color: #2A2410; }
+  .codehilite .c, .codehilite .c1, .codehilite .ch, .codehilite .cm, .codehilite .cpf, .codehilite .cs { color: #B39DDB; font-style: italic; }
+  .codehilite .err { color: #FF6B7A; }
+  .codehilite .k, .codehilite .kc, .codehilite .kd, .codehilite .kn, .codehilite .kp, .codehilite .kr, .codehilite .kt { color: #FFD400; font-weight: 600; }
+  .codehilite .o, .codehilite .ow { color: #2E8FCF; }
+  .codehilite .nb, .codehilite .bp { color: #B39DDB; }
+  .codehilite .nf, .codehilite .fm { color: #E6C757; font-weight: 600; }
+  .codehilite .nc, .codehilite .nn, .codehilite .nt { color: #2E8FCF; font-weight: 600; }
+  .codehilite .s, .codehilite .s1, .codehilite .s2, .codehilite .sb, .codehilite .sc, .codehilite .sd, .codehilite .se, .codehilite .sh, .codehilite .si, .codehilite .sx, .codehilite .sr, .codehilite .ss { color: #C5A8FF; }
+  .codehilite .m, .codehilite .mb, .codehilite .mf, .codehilite .mh, .codehilite .mi, .codehilite .mo, .codehilite .il { color: #B39DDB; }
+  .codehilite .na { color: #D2A8FF; }
+  .codehilite .nv, .codehilite .vc, .codehilite .vg, .codehilite .vi { color: #2E8FCF; }
+  .codehilite .gs { color: #E5E4E2; }
+  .codehilite .gh, .codehilite .gu { color: #2E8FCF; }
+  .codehilite .gd { background-color: #3A0A12; color: #FFB3B3; }
+  .codehilite .gi { background-color: #0A2A14; color: #B5E6B7; }
+  .codehilite .gr { color: #FF6B7A; }
+}
+</style>
+</head>
+<body>
+<div class="heraldic-bar"></div>
+<main>
+<header class="doc-header">
+<div class="crumbs">docs/user-manual/device-management.md</div>
+<h1 class="doc-title">Device Management</h1>
+<nav class="doc-nav"><a href="../../README.html">&#8962; Repository index (README)</a></nav>
+</header>
+<h1 id="device-management">Device Management</h1>
+<p>This guide covers the full device lifecycle in Yuzu: enrolling agents, monitoring connectivity, managing device identity, and performing over-the-air agent updates.</p>
+<p><strong>Prerequisites:</strong> A running Yuzu server. All <code>curl</code> examples assume an active admin session cookie in <code>$COOKIE</code> -- replace with your session token. The server listens on <code>http://localhost:8080</code> by default.</p>
+<hr>
+<h2 id="agent-enrollment">Agent Enrollment</h2>
+<p>Yuzu uses a three-tier enrollment model. Every agent must register with the server before it can receive instructions. The tier determines how much manual intervention is required.</p>
+<h3 id="tier-1-manual-approval">Tier 1: Manual Approval</h3>
+<p>The default enrollment mode. When an agent connects without a token, it enters a <strong>pending queue</strong>. An administrator must explicitly approve or deny the agent before it can participate in the fleet.</p>
+<p><strong>Agent side:</strong></p>
+<div class="highlight"><pre><span></span><code>yuzu-agent<span class="w"> </span>--server<span class="w"> </span>server.example.com:50051
+</code></pre></div>
+<p>The agent will attempt registration, receive a "pending" status, and retry periodically until approved.</p>
+<p><strong>Server side (dashboard):</strong> Navigate to <strong>Settings &gt; Pending Agents</strong> to see the queue. Each entry shows the agent's hostname, OS, architecture, and the time it first connected. Click <strong>Approve</strong> or <strong>Deny</strong>.</p>
+<p><strong>Server side (API):</strong></p>
+<p>There is no dedicated JSON API endpoint to list pending agents. Use the HTMX fragment to retrieve the rendered HTML list:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># List pending agents (returns HTML fragment)</span>
+curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/fragments/settings/pending<span class="w"> </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># Approve a pending agent</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/settings/pending-agents/agent-001/approve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># Deny a pending agent</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/settings/pending-agents/agent-001/deny<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><span class="c1"># Remove a pending agent from the queue entirely</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>DELETE<span class="w"> </span>http://localhost:8080/api/settings/pending-agents/agent-001<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<h3 id="tier-2-pre-shared-enrollment-tokens">Tier 2: Pre-Shared Enrollment Tokens</h3>
+<p>For automated deployments, administrators generate <strong>enrollment tokens</strong> -- time-limited and use-limited secrets that agents present at registration for immediate enrollment without manual approval.</p>
+<p><strong>Generate a token (HTMX -- returns HTML fragment):</strong></p>
+<p>This endpoint is designed for the HTMX dashboard and accepts form-encoded parameters. It returns an HTML fragment containing the token list with the new token's raw value revealed once.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/settings/enrollment-tokens<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s2">&quot;label=datacenter-rollout-q1&amp;max_uses=100&amp;ttl_hours=72&quot;</span>
+</code></pre></div>
+<p>The response is an HTML fragment (the updated tokens table). The raw token value is displayed once in the fragment and cannot be retrieved again.</p>
+<p><strong>Generate tokens in batch (JSON API for scripting):</strong></p>
+<p>This endpoint accepts JSON and returns a JSON response, making it suitable for automation and scripting.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/settings/enrollment-tokens/batch<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;label&quot;: &quot;site-deploy&quot;,</span>
+<span class="s1">    &quot;count&quot;: 10,</span>
+<span class="s1">    &quot;max_uses&quot;: 50,</span>
+<span class="s1">    &quot;ttl_hours&quot;: 24</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;count&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;tokens&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;yuzu_enroll_xxx...&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;yuzu_enroll_yyy...&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;...&quot;</span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+<p><strong>Agent side:</strong></p>
+<div class="highlight"><pre><span></span><code>yuzu-agent<span class="w"> </span>--server<span class="w"> </span>server.example.com:50051<span class="w"> </span><span class="se">\</span>
+<span class="w">           </span>--enrollment-token<span class="w"> </span><span class="s2">&quot;yuzu_enroll_xxxxxxxxxxxxxxxxxxxxxxxx&quot;</span>
+</code></pre></div>
+<p>The agent includes the token in its <code>RegisterRequest</code>. If the token is valid and has remaining uses, enrollment succeeds immediately.</p>
+<p><strong>List active tokens (returns HTML fragment):</strong></p>
+<p>There is no dedicated JSON API endpoint to list enrollment tokens. Use the HTMX fragment:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/fragments/settings/tokens<span class="w"> </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<p><strong>Revoke a token:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>DELETE<span class="w"> </span>http://localhost:8080/api/settings/enrollment-tokens/tok_a1b2c3d4<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<p>Tokens are persisted in <code>enrollment-tokens.cfg</code> alongside the server configuration file. They survive server restarts.</p>
+<h3 id="tier-3-platform-trust-planned">Tier 3: Platform Trust (Planned)</h3>
+<p>Reserved for future implementation. Proto fields exist for <code>machine_certificate</code>, <code>attestation_signature</code>, and <code>attestation_provider</code> to support Windows certificate store attestation and cloud identity verification. Agents on domain-joined machines or cloud VMs will be able to prove their identity cryptographically without any shared secret.</p>
+<hr>
+<h2 id="auto-approval-policies">Auto-Approval Policies</h2>
+<p>Administrators can configure rules that automatically approve agents matching specific criteria, reducing manual toil for large deployments.</p>
+<p><strong>View current auto-approval policies (dashboard):</strong> Navigate to <strong>Settings &gt; Auto-Approve</strong>.</p>
+<p><strong>Add an auto-approval rule:</strong></p>
+<p>The auto-approve endpoints use form-encoded parameters (designed for the HTMX dashboard) and return HTML fragments.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/settings/auto-approve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s2">&quot;type=hostname_glob&amp;value=web-*.example.com&amp;label=Production+web+servers&quot;</span>
+</code></pre></div>
+<p>This rule automatically approves any agent whose hostname matches the glob pattern <code>web-*.example.com</code>.</p>
+<p>Supported rule types: <code>hostname_glob</code>, <code>trusted_ca</code>, <code>ip_subnet</code>, <code>cloud_provider</code>.</p>
+<p><strong>Set the auto-approve match mode:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/settings/auto-approve/mode<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s2">&quot;mode=any&quot;</span>
+</code></pre></div>
+<p>Supported modes:</p>
+<table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>Behavior</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>any</code></td>
+<td>First matching enabled rule auto-approves the agent (default)</td>
+</tr>
+<tr>
+<td><code>all</code></td>
+<td>All enabled rules must match for auto-approval</td>
+</tr>
+</tbody>
+</table>
+<p>Note: Auto-approval only applies when rules exist and are enabled. When no rules are configured, all agents enter the pending queue regardless of mode. To disable auto-approval entirely, remove or disable all rules.</p>
+<p><strong>Toggle a rule on/off:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/settings/auto-approve/0/toggle<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<p><strong>Delete a rule:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>DELETE<span class="w"> </span>http://localhost:8080/api/settings/auto-approve/0<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<p><strong>View the auto-approve settings fragment (HTMX):</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/fragments/settings/auto-approve<span class="w"> </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<hr>
+<h2 id="device-identity">Device Identity</h2>
+<p>Every enrolled agent reports identity attributes during registration and heartbeat:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>agent_id</code></td>
+<td>Unique identifier (UUID)</td>
+<td><code>a3f1c9e2-7b4d-4e8a-9f12-3c5d6e7f8a9b</code></td>
+</tr>
+<tr>
+<td><code>hostname</code></td>
+<td>Machine hostname</td>
+<td><code>web-prod-01</code></td>
+</tr>
+<tr>
+<td><code>os</code></td>
+<td>Operating system</td>
+<td><code>windows</code>, <code>linux</code>, <code>darwin</code></td>
+</tr>
+<tr>
+<td><code>arch</code></td>
+<td>CPU architecture</td>
+<td><code>x86_64</code>, <code>aarch64</code></td>
+</tr>
+<tr>
+<td><code>os_version</code></td>
+<td>OS version string</td>
+<td><code>Windows 11 Pro 10.0.26200</code></td>
+</tr>
+<tr>
+<td><code>agent_version</code></td>
+<td>Running agent binary version</td>
+<td><code>0.9.3</code></td>
+</tr>
+</tbody>
+</table>
+<p>These fields are used by the <a href="scope-engine.html">Scope Engine</a> for device targeting and by <a href="management-groups.html">Management Groups</a> for access scoping.</p>
+<hr>
+<h2 id="viewing-connected-agents">Viewing Connected Agents</h2>
+<h3 id="dashboard">Dashboard</h3>
+<p>The <strong>Devices</strong> page shows all enrolled agents with their status (online/offline), OS, hostname, and last heartbeat time. Click any agent row to see its detail page with tags, group membership, and recent activity.</p>
+<h3 id="rest-api">REST API</h3>
+<p><strong>List all agents (legacy endpoint):</strong></p>
+<p>This endpoint does not require authentication. It returns only currently connected agents (those with an active gRPC session).</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/api/agents
+</code></pre></div>
+<p>Response:</p>
+<div class="highlight"><pre><span></span><code><span class="p">[</span>
+<span class="w">  </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;agent_id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;a3f1c9e2-7b4d-4e8a-9f12-3c5d6e7f8a9b&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;hostname&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;web-prod-01&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;os&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;windows&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;arch&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;x86_64&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;agent_version&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;0.9.3&quot;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">]</span>
+</code></pre></div>
+<p>Note: This legacy endpoint does not include <code>status</code> or <code>last_heartbeat</code> fields. It only lists agents with active gRPC streams (implicitly online).</p>
+<hr>
+<h2 id="agent-heartbeat-and-session-keepalive">Agent Heartbeat and Session Keepalive</h2>
+<p>After registration, agents maintain a persistent gRPC bidirectional stream with the server. The heartbeat serves three purposes:</p>
+<ol>
+<li><strong>Liveness</strong> -- the server marks agents as offline if no heartbeat is received within the configured timeout.</li>
+<li><strong>Metadata refresh</strong> -- agents report updated OS version, IP address, and plugin inventory on each heartbeat.</li>
+<li><strong>Command delivery</strong> -- the server uses the open stream to push <code>CommandRequest</code> messages to the agent without polling.</li>
+</ol>
+<p>Heartbeat interval is configured agent-side (default: 30 seconds). The server's offline threshold is typically 3x the heartbeat interval.</p>
+<hr>
+<h2 id="agent-cli-flags">Agent CLI Flags</h2>
+<p>The full set of agent command-line flags:</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Description</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--server</code></td>
+<td>Server address (<code>host:port</code>)</td>
+<td><code>localhost:50051</code></td>
+</tr>
+<tr>
+<td><code>--enrollment-token</code></td>
+<td>Pre-shared token for Tier 2 enrollment</td>
+<td>(none)</td>
+</tr>
+<tr>
+<td><code>--tls-ca</code></td>
+<td>Path to CA certificate PEM file</td>
+<td>(auto-discover)</td>
+</tr>
+<tr>
+<td><code>--tls-cert</code></td>
+<td>Path to client certificate PEM file</td>
+<td>(auto-discover)</td>
+</tr>
+<tr>
+<td><code>--tls-key</code></td>
+<td>Path to client private key PEM file</td>
+<td>(auto-discover)</td>
+</tr>
+<tr>
+<td><code>--cert-store</code></td>
+<td>Windows certificate store name (e.g. <code>MY</code>)</td>
+<td>(none)</td>
+</tr>
+<tr>
+<td><code>--cert-subject</code></td>
+<td>Subject CN match for cert store lookup</td>
+<td>(none)</td>
+</tr>
+<tr>
+<td><code>--cert-thumbprint</code></td>
+<td>SHA-1 thumbprint for cert store lookup (hex)</td>
+<td>(none)</td>
+</tr>
+<tr>
+<td><code>--plugin-dir</code></td>
+<td>Directory containing plugin shared libraries</td>
+<td><code>./plugins</code></td>
+</tr>
+<tr>
+<td><code>--log-level</code></td>
+<td>Logging verbosity (<code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>)</td>
+<td><code>info</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="windows-certificate-store-integration">Windows Certificate Store Integration</h3>
+<p>On Windows, agents can read their mTLS client certificate and private key directly from the Windows certificate store instead of PEM files on disk. This uses CryptoAPI/CNG (<code>CertOpenStore</code>, <code>CertFindCertificateInStore</code>, <code>NCryptExportKey</code>) and searches the Local Machine store first, falling back to Current User.</p>
+<p><strong>By subject name:</strong></p>
+<div class="highlight"><pre><span></span><code>yuzu-agent<span class="w"> </span>--server<span class="w"> </span>server.example.com:50051<span class="w"> </span><span class="se">\</span>
+<span class="w">           </span>--cert-store<span class="w"> </span>MY<span class="w"> </span><span class="se">\</span>
+<span class="w">           </span>--cert-subject<span class="w"> </span><span class="s2">&quot;yuzu-agent&quot;</span>
+</code></pre></div>
+<p><strong>By thumbprint:</strong></p>
+<div class="highlight"><pre><span></span><code>yuzu-agent<span class="w"> </span>--server<span class="w"> </span>server.example.com:50051<span class="w"> </span><span class="se">\</span>
+<span class="w">           </span>--cert-store<span class="w"> </span>MY<span class="w"> </span><span class="se">\</span>
+<span class="w">           </span>--cert-thumbprint<span class="w"> </span><span class="s2">&quot;AB12CD34EF56...&quot;</span>
+</code></pre></div>
+<p>The agent exports the full certificate chain (leaf + intermediates) as PEM in memory. Either <code>--cert-subject</code> or <code>--cert-thumbprint</code> is required when <code>--cert-store</code> is specified.</p>
+<hr>
+<h2 id="over-the-air-agent-updates">Over-the-Air Agent Updates</h2>
+<p>Administrators can upload new agent binaries to the server and promote them to production. Connected agents will download and apply the update automatically.</p>
+<h3 id="upload-a-new-binary">Upload a New Binary</h3>
+<p><strong>Dashboard:</strong> Navigate to <strong>Settings &gt; Agent Updates</strong> and use the upload form.</p>
+<p><strong>API:</strong></p>
+<p>The upload endpoint accepts multipart form data. The version is derived automatically from the uploaded filename (with common extensions like <code>.tar.gz</code>, <code>.zip</code>, <code>.exe</code>, <code>.msi</code>, <code>.bin</code> stripped).</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/settings/updates/upload<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s2">&quot;file=@yuzu-agent-0.9.4-linux-x64.tar.gz&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s2">&quot;platform=linux&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s2">&quot;arch=x86_64&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s2">&quot;rollout_pct=100&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="s2">&quot;mandatory=true&quot;</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Required</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>file</code></td>
+<td>Yes</td>
+<td>The agent binary to upload</td>
+</tr>
+<tr>
+<td><code>platform</code></td>
+<td>Yes</td>
+<td>Target platform (<code>linux</code>, <code>windows</code>, <code>darwin</code>)</td>
+</tr>
+<tr>
+<td><code>arch</code></td>
+<td>Yes</td>
+<td>Target architecture (<code>x86_64</code>, <code>aarch64</code>)</td>
+</tr>
+<tr>
+<td><code>rollout_pct</code></td>
+<td>No</td>
+<td>Rollout percentage, 0--100 (default: <code>100</code>)</td>
+</tr>
+<tr>
+<td><code>mandatory</code></td>
+<td>No</td>
+<td>Whether agents must apply this update (<code>true</code>/<code>false</code>, default: <code>false</code>)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="view-available-updates">View Available Updates</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/fragments/settings/updates<span class="w"> </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<h3 id="set-rollout-percentage">Set Rollout Percentage</h3>
+<p>The rollout endpoint controls what percentage of eligible agents receive a given update. Set to <code>100</code> for full deployment, or use a lower value for staged rollouts.</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4/rollout<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s2">&quot;rollout_pct=100&quot;</span>
+</code></pre></div>
+<p>To do a staged rollout, set a lower percentage first and increase it over time:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Start with 10% of agents</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4/rollout<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s2">&quot;rollout_pct=10&quot;</span>
+</code></pre></div>
+<h3 id="remove-an-uploaded-binary">Remove an Uploaded Binary</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>DELETE<span class="w"> </span>http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-b<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$COOKIE</span><span class="s2">&quot;</span>
+</code></pre></div>
+<hr>
+<h2 id="settings-page-route-reference">Settings Page Route Reference</h2>
+<p>Most enrollment and device management operations are performed through the HTMX dashboard. The endpoints below are designed for the dashboard (accepting form-encoded parameters and returning HTML fragments), with the exception of the batch token endpoint which accepts and returns JSON.</p>
+<h3 id="htmx-fragments-server-rendered-html">HTMX Fragments (Server-Rendered HTML)</h3>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /fragments/settings/pending</code></td>
+<td>Pending agents queue</td>
+</tr>
+<tr>
+<td><code>GET /fragments/settings/tokens</code></td>
+<td>Enrollment tokens list</td>
+</tr>
+<tr>
+<td><code>GET /fragments/settings/auto-approve</code></td>
+<td>Auto-approval policies</td>
+</tr>
+<tr>
+<td><code>GET /fragments/settings/updates</code></td>
+<td>OTA agent updates</td>
+</tr>
+</tbody>
+</table>
+<h3 id="action-endpoints">Action Endpoints</h3>
+<p>Unless noted, these endpoints accept form-encoded parameters and return HTML fragments (designed for HTMX consumption).</p>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Route</th>
+<th>Description</th>
+<th>Format</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET</code></td>
+<td><code>/api/agents</code></td>
+<td>List all connected agents (no auth required)</td>
+<td>JSON</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/pending-agents/{agent_id}/approve</code></td>
+<td>Approve a pending agent</td>
+<td>HTMX</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/pending-agents/{agent_id}/deny</code></td>
+<td>Deny a pending agent</td>
+<td>HTMX</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/settings/pending-agents/{agent_id}</code></td>
+<td>Remove from pending queue</td>
+<td>HTMX</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/enrollment-tokens</code></td>
+<td>Generate an enrollment token (form-encoded)</td>
+<td>HTMX</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/enrollment-tokens/batch</code></td>
+<td>Generate tokens in batch (JSON in, JSON out)</td>
+<td>JSON</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/settings/enrollment-tokens/{token_id}</code></td>
+<td>Revoke a token</td>
+<td>HTMX</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/auto-approve</code></td>
+<td>Add a rule (form: <code>type</code>, <code>value</code>, <code>label</code>)</td>
+<td>HTMX</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/auto-approve/mode</code></td>
+<td>Set match mode (form: <code>mode=any\|all</code>)</td>
+<td>HTMX</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/auto-approve/{index}/toggle</code></td>
+<td>Enable/disable a rule</td>
+<td>HTMX</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/settings/auto-approve/{index}</code></td>
+<td>Delete a rule</td>
+<td>HTMX</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/updates/upload</code></td>
+<td>Upload an agent binary (multipart)</td>
+<td>HTMX</td>
+</tr>
+<tr>
+<td><code>POST</code></td>
+<td><code>/api/settings/updates/{platform}/{arch}/{version}/rollout</code></td>
+<td>Set rollout percentage (form: <code>rollout_pct</code>)</td>
+<td>HTMX</td>
+</tr>
+<tr>
+<td><code>DELETE</code></td>
+<td><code>/api/settings/updates/{platform}/{arch}/{version}</code></td>
+<td>Remove an uploaded binary</td>
+<td>HTMX</td>
+</tr>
+</tbody>
+</table>
+<hr>
+<h2 id="custom-device-properties">Custom Device Properties</h2>
+<p>Administrators can define typed key-value properties on devices beyond the built-in identity fields and structured tags. Properties support four types: <code>string</code>, <code>int</code>, <code>bool</code>, and <code>datetime</code>.</p>
+<h3 id="property-schemas">Property Schemas</h3>
+<p>Before setting properties, define a schema to enforce type and validation rules.</p>
+<p><strong>Create a schema:</strong></p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/custom-properties/schemas<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;key&quot;: &quot;asset_owner&quot;,</span>
+<span class="s1">    &quot;type&quot;: &quot;string&quot;,</span>
+<span class="s1">    &quot;description&quot;: &quot;Department or individual responsible for this device&quot;,</span>
+<span class="s1">    &quot;validation_regex&quot;: &quot;^[a-zA-Z0-9_ -]{1,128}$&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Supported types: <code>string</code>, <code>int</code>, <code>bool</code>, <code>datetime</code>. Key names must be 1-64 characters matching <code>[a-zA-Z0-9_.-:]</code>. Values are limited to 1024 bytes.</p>
+<h3 id="setting-properties">Setting Properties</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>PUT<span class="w"> </span>http://localhost:8080/api/v1/devices/agent-001/properties/asset_owner<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;value&quot;: &quot;IT Operations&quot;}&#39;</span>
+</code></pre></div>
+<h3 id="using-properties-in-scope-expressions">Using Properties in Scope Expressions</h3>
+<p>Custom properties are available in scope expressions using the <code>props.&lt;key&gt;</code> syntax:</p>
+<div class="highlight"><pre><span></span><code>props.asset_owner == &quot;IT Operations&quot; AND ostype == &quot;windows&quot;
+</code></pre></div>
+<hr>
+<h2 id="device-discovery">Device Discovery</h2>
+<p>Discover unmanaged devices on your network using the <code>discovery</code> agent plugin and server-side discovery store.</p>
+<h3 id="running-a-subnet-scan">Running a Subnet Scan</h3>
+<p>Execute the <code>scan_subnet</code> action from the <code>discovery</code> plugin against an agent on the target subnet:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/executions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;definition_id&quot;: &quot;discovery.scan_subnet&quot;,</span>
+<span class="s1">    &quot;parameters&quot;: {&quot;subnet&quot;: &quot;192.168.1.0/24&quot;},</span>
+<span class="s1">    &quot;scope&quot;: &quot;agent_id == \&quot;agent-on-target-subnet\&quot;&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>The plugin performs an ARP scan and ping sweep, returning discovered hosts with IP address, MAC address, resolved hostname, and whether the host is already managed by Yuzu.</p>
+<h3 id="viewing-discovered-devices">Viewing Discovered Devices</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/api/v1/discovery<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span>
+</code></pre></div>
+<h3 id="marking-a-device-as-managed">Marking a Device as Managed</h3>
+<p>When a discovered device is enrolled, link it to the enrolled agent:</p>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/discovery/<span class="o">{</span>device_id<span class="o">}</span>/mark-managed<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;agent_id&quot;: &quot;a3f1c9e2-7b4d-...&quot;}&#39;</span>
+</code></pre></div>
+<hr>
+<h2 id="deployment-jobs">Deployment Jobs</h2>
+<p>Deploy the Yuzu agent to discovered or known endpoints without manual installation. Deployment jobs target hosts by IP address and support multiple deployment methods.</p>
+<h3 id="creating-a-deployment-job">Creating a Deployment Job</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/deployment-jobs<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;name&quot;: &quot;Deploy to office subnet&quot;,</span>
+<span class="s1">    &quot;targets&quot;: [&quot;192.168.1.10&quot;, &quot;192.168.1.11&quot;, &quot;192.168.1.12&quot;],</span>
+<span class="s1">    &quot;method&quot;: &quot;ssh&quot;,</span>
+<span class="s1">    &quot;os&quot;: &quot;linux&quot;</span>
+<span class="s1">  }&#39;</span>
+</code></pre></div>
+<p>Supported deployment methods: <code>ssh</code>, <code>group_policy</code>, <code>manual</code>.</p>
+<h3 id="job-lifecycle">Job Lifecycle</h3>
+<p>Jobs progress through the following states:</p>
+<table>
+<thead>
+<tr>
+<th>State</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>pending</code></td>
+<td>Job created, not yet started</td>
+</tr>
+<tr>
+<td><code>running</code></td>
+<td>Deployment in progress</td>
+</tr>
+<tr>
+<td><code>completed</code></td>
+<td>All targets successfully deployed</td>
+</tr>
+<tr>
+<td><code>failed</code></td>
+<td>One or more targets failed</td>
+</tr>
+<tr>
+<td><code>cancelled</code></td>
+<td>Job was cancelled by an administrator</td>
+</tr>
+</tbody>
+</table>
+<h3 id="monitoring-job-status">Monitoring Job Status</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>http://localhost:8080/api/v1/deployment-jobs/<span class="o">{</span>job_id<span class="o">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span>
+</code></pre></div>
+<h3 id="cancelling-a-job">Cancelling a Job</h3>
+<div class="highlight"><pre><span></span><code>curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8080/api/v1/deployment-jobs/<span class="o">{</span>job_id<span class="o">}</span>/cancel<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span>
+</code></pre></div>
+</main>
+</body>
+</html>
