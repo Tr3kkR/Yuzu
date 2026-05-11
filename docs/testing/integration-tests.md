@@ -84,7 +84,7 @@ meson test -C builddir --print-errorlogs
 │                  │ │                  │ │                  │
 │  Ports:          │ │  Ports:          │ │  Connects to:    │
 │  - :50050 agent  │ │  - :50051 agent  │ │  Gateway :50051  │
-│  - :50051 gw     │ │  - :50052 mgmt   │ │                  │
+│  - :50055 gw     │ │  - :50063 mgmt   │ │                  │
 │  - :8090 web     │ │                  │ │                  │
 └──────────────────┘ └──────────────────┘ └──────────────────┘
          ▲                   │
@@ -169,7 +169,7 @@ open _build/test/cover/index.html
 ## Troubleshooting
 
 ### Gateway fails to start
-- Check that ports 50051/50052 are not in use
+- Check that ports 50051/50063 are not in use
 - Verify Erlang/OTP version: `erl -version`
 - Check rebar3 dependencies: `rebar3 deps`
 

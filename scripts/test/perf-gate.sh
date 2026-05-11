@@ -180,7 +180,6 @@ fi
 QUIET_PORTS=(
     8080   # server dashboard / REST
     50051  # server agent gRPC + gateway agent-facing gRPC
-    50052  # server management gRPC
     50055  # server gateway upstream
     50063  # gateway management/command forwarding
     8081   # gateway health

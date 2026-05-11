@@ -41,12 +41,9 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--cert` | *(none)* | Path to PEM-encoded gRPC server certificate for the **agent listener** (port 50051 by default). Env: `YUZU_CERT`. |
 | `--key` | *(none)* | Path to PEM-encoded gRPC server private key for the agent listener. The file must not be world-readable (Unix: `chmod 600`). Env: `YUZU_KEY`. |
 | `--ca-cert` | *(none)* | Path to PEM-encoded CA certificate used to verify agent client certificates (full mTLS). Without this, the agent listener has no client-cert verification — `--insecure-skip-client-verify` plus `YUZU_ALLOW_INSECURE_TLS=1` is required to start in that posture. Env: `YUZU_CA_CERT`. |
-| `--insecure-skip-client-verify` | off | Allow gRPC TLS without `--ca-cert` (one-way TLS — server cert is presented but client certs are not verified). Applies to BOTH the agent listener and the management listener. **Requires `YUZU_ALLOW_INSECURE_TLS=1` in the environment as a second confirmation** — the server refuses to start without it. Renamed from `--allow-one-way-tls` in v0.12.0; the old name is still accepted with a deprecation warning. |
+| `--insecure-skip-client-verify` | off | Allow gRPC TLS without `--ca-cert` (one-way TLS — server cert is presented but client certs are not verified). Applies to both the agent listener (`:50051`) and the gateway-upstream listener (`:50055`). **Requires `YUZU_ALLOW_INSECURE_TLS=1` in the environment as a second confirmation** — the server refuses to start without it. Renamed from `--allow-one-way-tls` in v0.12.0; the old name is still accepted with a deprecation warning. |
 | `--allow-one-way-tls` | off | **[DEPRECATED]** Renamed to `--insecure-skip-client-verify`. Still accepted for backward compatibility with a startup deprecation warning; will be removed in a future release. |
-| `--management-cert` | *(none)* | Optional PEM cert for the **management listener** (port 50052 by default). If unset, the management listener reuses the agent listener's certificate. |
-| `--management-key` | *(none)* | Optional PEM key for the management listener. If `--management-cert`/`--management-key` are set without `--management-ca-cert`, the same `--insecure-skip-client-verify` + `YUZU_ALLOW_INSECURE_TLS=1` gate applies. |
-| `--management-ca-cert` | *(none)* | Optional CA cert for management client cert verification. Without this (and without `--insecure-skip-client-verify`), the management listener refuses to start. |
-| `--bidi-dispatcher-pool-size` | *(auto)* | Bounded thread pool size for the **agent listener's** bidi-streaming RPCs (`Subscribe`, `DownloadUpdate`). Default auto-computes to `clamp(64, hardware_concurrency × 8, 4096)`. Direct-connect deployments with steady-state agent counts above the default must raise this to at least the expected concurrent Subscribe count plus headroom; gateway-mode deployments can leave at default because the gateway terminates Subscribe per-fleet. Saturation rejects new bidi RPCs with `StatusCode::ResourceExhausted "transport: bidi dispatcher saturated"`. Does **not** apply to the management listener (port 50052). See [Bidi dispatcher pool sizing](#bidi-dispatcher-pool-sizing-direct-connect-deployments-only) for sizing guidance and OS thread-budget tuning. Env: `YUZU_BIDI_DISPATCHER_POOL_SIZE`. |
+| `--bidi-dispatcher-pool-size` | *(auto)* | Bounded thread pool size for the **agent listener's** bidi-streaming RPCs (`Subscribe`, `DownloadUpdate`). Default auto-computes to `clamp(64, hardware_concurrency × 8, 4096)`. Direct-connect deployments with steady-state agent counts above the default must raise this to at least the expected concurrent Subscribe count plus headroom; gateway-mode deployments can leave at default because the gateway terminates Subscribe per-fleet. Saturation rejects new bidi RPCs with `StatusCode::ResourceExhausted "transport: bidi dispatcher saturated"`. The gateway-upstream listener (`:50055`) is all-unary today, so this knob has no effect there. See [Bidi dispatcher pool sizing](#bidi-dispatcher-pool-sizing-direct-connect-deployments-only) for sizing guidance and OS thread-budget tuning. Env: `YUZU_BIDI_DISPATCHER_POOL_SIZE`. |
 | `--https-port` | `8443` | HTTPS listen port. |
 | `--https-cert` | *(none)* | Path to PEM-encoded TLS certificate file. Required unless `--no-https` is set. |
 | `--https-key` | *(none)* | Path to PEM-encoded TLS private key file. Required unless `--no-https` is set. The file must not be world-readable (Unix: `chmod 600`). |
@@ -265,7 +262,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 The Yuzu server has **two independent TLS surfaces**:
 
 1. **HTTPS** — the dashboard and REST API (port 8443 by default). Configured via `--https-cert` / `--https-key` (or runtime via the Settings page). Disabled with `--no-https`.
-2. **gRPC TLS** — the agent listener (port 50051) and the management listener (port 50052). Configured via `--cert` / `--key` / `--ca-cert` (and optionally `--management-cert` / `--management-key` / `--management-ca-cert` for a separate management cert). Disabled entirely with `--no-tls`.
+2. **gRPC TLS** — the agent listener (port 50051) and the gateway-upstream listener (port 50055, gateway-mode only). Configured via `--cert` / `--key` / `--ca-cert`. Both listeners share the same TLS material since #376 PR 1c-5. Disabled entirely with `--no-tls`.
 
 The two surfaces are configured separately and can be in different states (e.g., HTTPS enabled but gRPC TLS disabled for a local UAT against a remote dashboard).
 
@@ -304,7 +301,7 @@ This applies to **both** the agent listener and the management listener. The ser
 ./yuzu-server --no-tls
 ```
 
-This is the supported posture for **local UAT, customer demos, and development**. The administrative surface is ungated — anyone reachable on port 50052 can issue management RPCs. The server emits a multi-line ERROR-level startup banner and a 5-minute recurring reminder. Do not run `--no-tls` against any network you do not control end-to-end.
+This is the supported posture for **local UAT, customer demos, and development**. The agent listener (`:50051`) and gateway-upstream listener (`:50055`) accept plaintext from any peer with no encryption and no authentication. The server emits a multi-line ERROR-level startup banner and a 5-minute recurring reminder. Do not run `--no-tls` against any network you do not control end-to-end.
 
 ### Upgrade note (v0.12.0)
 
@@ -832,7 +829,6 @@ A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first s
 |---|---|---|
 | 8080 | Web dashboard + REST API | Always |
 | 50051 | gRPC (agent connections) | Always -- server in standalone, gateway in scaled |
-| 50052 | gRPC (management) | Always |
 | 50055 | gRPC (gateway upstream) | Gateway deployments only |
 | 50063 | gRPC (gateway command forwarding) | Gateway deployments only |
 | 8081 | Gateway health/readiness | Gateway deployments only |

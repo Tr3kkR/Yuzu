@@ -330,7 +330,7 @@ start_all() {
         exit 1
     fi
     ok "Server up (dashboard http://localhost:18080)"
-    info "Direct agent gRPC :50054 | Gateway upstream :50055 | Mgmt :50052"
+    info "Direct agent gRPC :50054 | Gateway upstream :50055"
 
     # ── 3. Gateway ────────────────────────────────────────────────────────
     echo ""

@@ -246,6 +246,20 @@ std::vector<AgentRegistry::GatewayPendingCmd> AgentRegistry::drain_gateway_pendi
     return result;
 }
 
+bool AgentRegistry::reenqueue_gateway_pending(GatewayPendingCmd cmd) {
+    // 3-strike cap preserves pre-PR-1c-5 inline-retry semantics
+    // (forward_gateway_pending used to spin 3 attempts inline with 1s/2s/4s
+    // sleeps; D.1 spreads those across drainer ticks instead).
+    constexpr int kGatewayForwardMaxAttempts = 3;
+    ++cmd.attempts;
+    if (cmd.attempts >= kGatewayForwardMaxAttempts) {
+        return false;
+    }
+    std::lock_guard glock(gw_pending_mu_);
+    gw_pending_.push_back(std::move(cmd));
+    return true;
+}
+
 bool AgentRegistry::has_any() const {
     std::lock_guard lock(mu_);
     return !agents_.empty();

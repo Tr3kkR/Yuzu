@@ -67,7 +67,7 @@ source "$YUZU_ROOT/scripts/ensure-erlang.sh" 2>/dev/null || true
 # we burn the first iteration's compile time.
 # shellcheck source=scripts/test/_portable.sh
 . "$YUZU_ROOT/scripts/test/_portable.sh"
-QUIET_PORTS=(8080 50051 50052 50055 50063 8081 9568)
+QUIET_PORTS=(8080 50051 50055 50063 8081 9568)
 BUSY=()
 BUSY_CSV=$(listening_ports_among "${QUIET_PORTS[@]}")
 if [[ -n "$BUSY_CSV" ]]; then

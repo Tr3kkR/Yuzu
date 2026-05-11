@@ -9,9 +9,25 @@ landed in PR 1a/1b. Once this lands the gRPC backend becomes plug-replaceable
 by the msquic backend (PR 3) without touching `agent.cpp`, `server.cpp`,
 `agent_service_impl.cpp`, `agent_registry.cpp`, or `gateway_service_impl.cpp`.
 
-The refactor is wire-equivalent — no behaviour change, no protocol change,
-no operator-visible flag change. CI must remain green at every sub-PR
-merge; the existing UAT (`scripts/start-UAT.sh`) is the integration ledger.
+The refactor is wire-equivalent **through PR 1c-6** — no behaviour change,
+no protocol change, no operator-visible flag change for the *retained*
+surfaces. The wire-equivalence framing was softened at PR 1c-5 (#376
+grill-me 2026-05-11): native-QUIC patterns (per-command stream IDs,
+persistent multiplexed channels, 0-RTT resumption, stream priority) are
+the *purpose* of moving off gRPC, not gRPC-equivalent semantics encoded
+on QUIC. Designing those patterns now — before msquic is exercised —
+produces primitives that don't survive contact with the real wire. The
+native-QUIC redesign therefore lands in a dedicated PR post-PR-3
+(msquic backend), at which point the abstraction shape can be A/B-tested
+against actual QUIC features.
+
+PR 1c-5 itself drops `:50052` and the four `--management*` CLI flags
+atomically (BREAKING change — no operator-facing :50052 to deprecate
+gradually since the `ManagementService` C++ impl has been an empty
+placeholder since v0.1).
+
+CI must remain green at every sub-PR merge; the existing UAT
+(`scripts/start-UAT.sh`) is the integration ledger.
 
 ## Scope inventory
 
@@ -248,14 +264,32 @@ filed as **#932-#938**:
 | #937 | doc SHOULD-FIX backlog (P2) |
 | #938 | code SHOULD/NICE backlog (P2) |
 
-### PR 1c-5 — Server-side: lift `gateway_service_impl` + `ManagementServiceImpl` + gw_mgmt_channel_
+### PR 1c-5 — Server-side: lift `gateway_service_impl` + drop `ManagementServiceImpl` + lift `gw_mgmt_channel_`
 
-* Same pattern as 1c-2 for the management + gateway-upstream services.
-* `agent_registry::gw_mgmt_stub_` becomes a `transport::Channel` for the
-  gateway's `ManagementService::SendCommand` server-stream.
-* Forwarding pumping (`forward_gateway_pending`) becomes a `BidiStream`
-  read-loop with writes_done() on the client side.
-* Risk: moderate. Gateway-mode only; UAT covers it.
+> **Merged 2026-05-11.** Three actions in one commit chain:
+>
+> 1. `GatewayUpstreamServiceImpl` lifted onto `transport::ServerListener`
+>    (4 unary RPCs via `register_unary_pb<>`).
+> 2. `ManagementServiceImpl` **deleted** — placeholder, never had method
+>    overrides, every RPC returned `UNIMPLEMENTED`. The four `--management*`
+>    CLI flags and the four `mgmt_tls_*` ServerConfig fields are dropped
+>    atomically. BREAKING change (CHANGELOG entry).
+> 3. `gw_mgmt_stub_` lifted onto `transport::Channel`; `forward_gateway_pending`
+>    rewritten as a `bidi_stream` with immediate `writes_done()` on the
+>    request side (server-streaming-as-bidi). Retry: **D.1** — detached
+>    `std::thread` per command preserved (maps onto a per-command QUIC
+>    stream post-PR-3); on `Unavailable`, `AgentRegistry::reenqueue_gateway_pending(gp)`
+>    increments `gp.attempts` and re-queues (3-strike cap); non-`Unavailable`
+>    failures drop with `yuzu_gateway_forward_dropped_total{reason=...}`.
+> 4. Shutdown unified to two sequential `transport::ServerListener::shutdown()`
+>    calls (agent then gateway-upstream); the 5s `mgmt_server_->Shutdown(deadline)`
+>    workaround is gone.
+>
+> Wire-equivalence framing softened — see the Goal section. Native-QUIC
+> redesign moved to a post-PR-3 PR.
+
+* Risk: moderate. Gateway-mode only; UAT covers it. CI matrix re-runs
+  the integration script with `--management` removed.
 
 ### PR 1c-6 — Cleanup + #896 readiness probe + #897 trailing-metadata scrub
 

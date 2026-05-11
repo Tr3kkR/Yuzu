@@ -19,7 +19,7 @@
 #
 # Ports:
 #   Server:   :50054 agent gRPC    :50055 gateway upstream
-#             :50052 mgmt gRPC     :8080  web dashboard
+#             :8080  web dashboard
 #   Gateway:  :50051 agent-facing  :50063 mgmt (command forwarding)
 #             :9568  metrics       :8081  health
 #
@@ -137,7 +137,7 @@ show_status() {
     # ports we care about and print one row per listener so the output is
     # the same shape on both OSes.
     local _any=0 _p _line
-    for _p in 50051 50052 50054 50055 50063 8080 8081 9568; do
+    for _p in 50051 50054 50055 50063 8080 8081 9568; do
         _line=$(lsof -iTCP:"$_p" -sTCP:LISTEN -P -n 2>/dev/null | tail -n +2)
         if [ -n "$_line" ]; then
             echo "$_line"
@@ -378,7 +378,7 @@ start_all() {
     fi
     ok "Server up (PID $server_pid)"
     info "Dashboard http://localhost:8080"
-    info "Direct agent gRPC :50054  |  Gateway upstream :50055  |  Mgmt :50052"
+    info "Direct agent gRPC :50054  |  Gateway upstream :50055"
 
     # ── 2. Gateway ──────────────────────────────────────────────────────
     echo ""

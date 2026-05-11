@@ -241,7 +241,7 @@ fi
 
 if ! skipped ports; then
     info "test ports"
-    PORTS=(8080 50051 50052 50054 50055 50063 8081 9568)
+    PORTS=(8080 50051 50054 50055 50063 8081 9568)
     busy=()
     for p in "${PORTS[@]}"; do
         if port_listening "$p"; then

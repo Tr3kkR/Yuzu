@@ -129,7 +129,7 @@ sleep 1
 
 # shellcheck source=scripts/test/_portable.sh
 . "$(dirname "$0")/_portable.sh"
-QUIET_PORTS=(8080 50051 50052 50055 50063 8081 9568)
+QUIET_PORTS=(8080 50051 50055 50063 8081 9568)
 STILL_BUSY=$(listening_ports_among "${QUIET_PORTS[@]}")
 if [[ -n "$STILL_BUSY" ]]; then
     echo "perf-cron-runner: ports still listening after stop ($STILL_BUSY) — aborting"

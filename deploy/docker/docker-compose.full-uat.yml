@@ -51,7 +51,6 @@ services:
       - "50"
     ports:
       - "8080:8080"     # Web dashboard + REST API
-      - "50052:50052"   # gRPC (management)
       - "50055:50055"   # gRPC (gateway upstream — internal)
     volumes:
       - ${UAT_CONFIG}:/etc/yuzu/yuzu-server.cfg:ro

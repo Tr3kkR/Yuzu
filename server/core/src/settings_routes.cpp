@@ -200,8 +200,6 @@ std::string SettingsRoutes::render_server_config_fragment() {
 
     html += "<tr><td>Agent gRPC Address</td><td><code>" +
             html_escape(cfg_->listen_address) + "</code></td></tr>";
-    html += "<tr><td>Management gRPC Address</td><td><code>" +
-            html_escape(cfg_->management_address) + "</code></td></tr>";
     html += "<tr><td>Web UI Address</td><td><code>" +
             html_escape(cfg_->web_address) + "</code></td></tr>";
     html += "<tr><td>Web UI Port</td><td><code>" +
@@ -383,29 +381,6 @@ std::string SettingsRoutes::render_tls_fragment() {
     html += "<div class=\"form-row\" style=\"margin-top:0.75rem\">"
             "  <label>Insecure Skip Client Verify</label>"
             "  <span style=\"font-size:0.8rem;color:" + owt_color + "\">" + owt_text + "</span>"
-            "</div>";
-
-    // Management TLS overrides
-    std::string mgmt_cert = cfg_->mgmt_tls_server_cert.empty() ? "Using agent TLS" : html_escape(cfg_->mgmt_tls_server_cert.string());
-    std::string mgmt_key = cfg_->mgmt_tls_server_key.empty() ? "Using agent TLS" : html_escape(cfg_->mgmt_tls_server_key.string());
-    std::string mgmt_ca = cfg_->mgmt_tls_ca_cert.empty() ? "Using agent TLS" : html_escape(cfg_->mgmt_tls_ca_cert.string());
-
-    html += "<div style=\"margin-top:0.75rem;padding-top:0.75rem;border-top:1px solid var(--border)\">"
-            "<div style=\"font-size:0.7rem;color:#8b949e;font-weight:600;"
-            "margin-bottom:0.5rem;text-transform:uppercase;letter-spacing:0.05em\">"
-            "Management Listener TLS Override</div>"
-            "<div class=\"form-row\">"
-            "  <label>Mgmt Certificate</label>"
-            "  <span class=\"file-name\">" + mgmt_cert + "</span>"
-            "</div>"
-            "<div class=\"form-row\">"
-            "  <label>Mgmt Private Key</label>"
-            "  <span class=\"file-name\">" + mgmt_key + "</span>"
-            "</div>"
-            "<div class=\"form-row\">"
-            "  <label>Mgmt CA Cert</label>"
-            "  <span class=\"file-name\">" + mgmt_ca + "</span>"
-            "</div>"
             "</div>";
 
     html += "<div class=\"feedback\" id=\"tls-feedback\"></div>";
@@ -1373,7 +1348,7 @@ std::string SettingsRoutes::render_gateway_fragment() {
             "<tr><td><code>YUZU_GW_AGENT_PORT</code></td>"
             "    <td>Agent-facing listener port</td><td><code>50051</code></td></tr>"
             "<tr><td><code>YUZU_GW_MGMT_PORT</code></td>"
-            "    <td>Management listener port</td><td><code>50052</code></td></tr>"
+            "    <td>Management listener port (command forwarding)</td><td><code>50063</code></td></tr>"
             "<tr><td><code>YUZU_GW_TLS_ENABLED</code></td>"
             "    <td>TLS master switch</td><td><code>auto</code></td></tr>"
             "<tr><td><code>YUZU_GW_TLS_CERTFILE</code></td>"

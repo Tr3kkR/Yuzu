@@ -60,7 +60,6 @@ AGENT_PIDS=()
 # 50055 and 50063 on the host). Override pattern:
 #   SERVER_GW_PORT=50155 GW_MGMT_PORT=50163 bash scripts/integration-test.sh
 SERVER_AGENT_PORT="${SERVER_AGENT_PORT:-50050}"   # C++ server agent gRPC (no direct connects in gateway mode)
-SERVER_MGMT_PORT="${SERVER_MGMT_PORT:-50053}"
 SERVER_GW_PORT="${SERVER_GW_PORT:-50055}"         # GatewayUpstream service (gateway connects here)
 SERVER_WEB_PORT="${SERVER_WEB_PORT:-8090}"
 
@@ -156,7 +155,6 @@ if $REUSE_STACK; then
     # Any explicit PORT env vars the caller passed are respected; we only
     # set values that are at their script-level default.
     SERVER_AGENT_PORT="${SERVER_AGENT_PORT_OVERRIDE:-50054}"
-    SERVER_MGMT_PORT="${SERVER_MGMT_PORT_OVERRIDE:-50052}"
     SERVER_GW_PORT="${SERVER_GW_PORT_OVERRIDE:-50055}"
     SERVER_WEB_PORT="${SERVER_WEB_PORT_OVERRIDE:-8080}"
     GW_AGENT_PORT="${GW_AGENT_PORT_OVERRIDE:-50051}"
@@ -295,7 +293,7 @@ if $REUSE_STACK; then
     log "═══════════════════════════════════════════════════════════════"
     log "Phase 4 REUSE mode: $REUSE_REASON"
     log "  Reusing existing stack on canonical ports:"
-    log "    server web=$SERVER_WEB_PORT agent=$SERVER_AGENT_PORT mgmt=$SERVER_MGMT_PORT gw=$SERVER_GW_PORT"
+    log "    server web=$SERVER_WEB_PORT agent=$SERVER_AGENT_PORT gw=$SERVER_GW_PORT"
     log "    gateway agent=$GW_AGENT_PORT mgmt=$GW_MGMT_PORT metrics=$GW_METRICS_PORT"
     log "  Skipping own-stack bring-up (server/gateway/agent already running)."
     log "═══════════════════════════════════════════════════════════════"
@@ -382,7 +380,6 @@ if ! $REUSE_STACK; then
         "$BUILDDIR/server/core/yuzu-server" \
             --config "$SERVER_CFG" \
             --no-tls --no-https --listen "127.0.0.1:$SERVER_AGENT_PORT" \
-            --management "127.0.0.1:$SERVER_MGMT_PORT" \
             --web-port "$SERVER_WEB_PORT" \
             > "$WORK_DIR/setup.log" 2>&1 &
     SETUP_PID=$!
@@ -423,12 +420,11 @@ fi
 # PHASE 1: Start the C++ Server
 # ══════════════════════════════════════════════════════════════════════
 if ! $REUSE_STACK; then
-    log "Starting C++ server (ports: agent=$SERVER_AGENT_PORT, mgmt=$SERVER_MGMT_PORT, web=$SERVER_WEB_PORT)..."
+    log "Starting C++ server (ports: agent=$SERVER_AGENT_PORT, web=$SERVER_WEB_PORT)..."
 
     "$BUILDDIR/server/core/yuzu-server" \
         --config "$SERVER_CFG" \
         --listen "127.0.0.1:$SERVER_AGENT_PORT" \
-        --management "127.0.0.1:$SERVER_MGMT_PORT" \
         --web-port "$SERVER_WEB_PORT" \
         --no-https \
         --gateway-mode \

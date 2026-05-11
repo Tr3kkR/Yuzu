@@ -122,9 +122,23 @@ public:
     struct GatewayPendingCmd {
         std::string agent_id;
         pb::CommandRequest cmd;
+        // #376 PR 1c-5 D.1 retry: per-command attempt counter. The
+        // detached SendCommand thread in `forward_gateway_pending()`
+        // increments this via `reenqueue_gateway_pending()` on each
+        // `Unavailable` failure; commands hitting the 3-attempt cap are
+        // dropped. In-memory only — same persistence model as
+        // `gw_pending_` itself (lost on restart).
+        int attempts{0};
     };
 
     std::vector<GatewayPendingCmd> drain_gateway_pending();
+
+    /// Re-queue a previously-drained pending command after a transient
+    /// failure. Increments `attempts` and re-pushes onto `gw_pending_` if
+    /// the cap (3 total attempts) has not been hit. Returns true if the
+    /// command was re-queued; false if dropped due to the cap. The cap
+    /// matches today's pre-PR-1c-5 inline 3-strike-retry semantics.
+    bool reenqueue_gateway_pending(GatewayPendingCmd cmd);
 
     bool has_any() const;
 

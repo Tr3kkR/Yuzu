@@ -61,7 +61,6 @@ services:
     ports:
       - "8080:8080"     # Web dashboard + REST API
       - "50051:50051"   # Agent gRPC (direct-connect agents)
-      - "50052:50052"   # Management gRPC
     # File-descriptor headroom mirrors the systemd unit at
     # deploy/systemd/yuzu-server.service. The Docker default soft limit
     # is 1024 — comfortably exhausted on a busy fleet by SSE EventSource

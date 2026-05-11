@@ -7,7 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **#376 PR 1c-5 — `:50052` management gRPC port and `--management*` CLI
+  flags removed.** The `ManagementService` C++ implementation has been an
+  empty placeholder since v0.1; every RPC routed through `:50052` returned
+  `UNIMPLEMENTED`. Operators always reached the equivalent surface via the
+  REST API. The placeholder, its port mapping, and four CLI flags
+  (`--management`, `--management-cert`, `--management-key`,
+  `--management-ca-cert`) are removed atomically. Operators pre-PR-1c-5
+  who passed any of those flags must update invocations; compose files
+  pre-PR-1c-5 with a `50052:50052` mapping must drop the line. The
+  gateway's own `ManagementService.SendCommand` (which the server calls
+  outbound for command fanout) is unaffected. Environment variable
+  `YUZU_MANAGEMENT_ADDRESS` is also removed.
+
+### Tests
+
+- **#376 PR 1c-5.** New `tests/unit/server/test_gateway_service_impl.cpp`
+  drives all 4 lifted RPCs (ProxyRegister, BatchHeartbeat, ProxyInventory,
+  NotifyStreamStatus) through a real in-proc `transport::ServerListener`
+  + `transport::Channel` pair and verifies typed-proto round-trip via
+  `register_unary_pb<>`. New `tests/unit/server/test_gateway_pending_retry.cpp`
+  pins the D.1 retry contract on `AgentRegistry::reenqueue_gateway_pending`:
+  `attempts` increments, 3-strike cap drops, payload preserved across
+  requeues.
+
 ### Internal
+
+- **#376 PR 1c-5 — server-side mgmt + gateway lift onto
+  `yuzu::transport`.** `GatewayUpstreamServiceImpl` (`:50055`,
+  4 unary RPCs) lifted from `gw::GatewayUpstream::Service` onto
+  `transport::ServerListener` via the `register_unary_pb<>` helpers
+  established in PR 1c-2 — drops `grpc::ServerContext*` / `grpc::Status`
+  from every handler signature. Outbound `gw_mgmt_stub_`
+  (`ManagementService::Stub` to the gateway's `:50063`) lifted onto
+  `transport::Channel` via `bidi_stream` with immediate `writes_done()`
+  — the established server-streaming-as-bidi pattern from `transport.hpp`.
+  Same wire format; no operator-visible behaviour change for the
+  retained surfaces.
+
+  Retry semantics change: `forward_gateway_pending()` D.1 — the
+  detached `std::thread` per pending command is preserved (maps cleanly
+  onto a per-command QUIC stream in the post-PR-3 native-QUIC redesign).
+  On `StatusCode::Unavailable` the command is re-queued via the new
+  `AgentRegistry::reenqueue_gateway_pending(GatewayPendingCmd)` with an
+  attempt counter (`GatewayPendingCmd::attempts`); the 3-strike cap is
+  preserved from the pre-lift inline-retry semantics, just spread across
+  drainer ticks instead of an inline `1s/2s/4s` sleep sequence. Non-`Unavailable`
+  failures drop with a `yuzu_gateway_forward_dropped_total{reason=...}`
+  metric.
+
+  Shutdown sequence updated to two sequential `transport::ServerListener::shutdown()`
+  calls (agent then gateway-upstream); the 5s `grpc::Server::Shutdown(deadline)`
+  workaround for indefinitely-blocking Subscribe drains is no longer
+  needed. `/readyz` adds a `gw_upstream_listener` check that is trivially
+  OK when the listener wasn't configured (single-host UAT deployments
+  unaffected).
+
+- **#376 PR 1c-5 — wire-equivalence framing softened.** The
+  `docs/pr-1c-lift-plan.md` "wire-equivalent" framing applied through PR
+  1c-6. The post-PR-3 (msquic backend) redesign window is now the
+  designated vehicle for native-QUIC patterns — per-command stream IDs,
+  persistent multiplexed channels, 0-RTT resumption, stream priority —
+  rather than encoding gRPC-equivalent semantics into the transport
+  abstraction. Designing native shapes before msquic is exercised
+  produced primitives that didn't survive contact with the real wire;
+  the redesign is moved post-PR-3 to anchor it against real QUIC
+  behaviour.
+
+- **#934 / UP-206 hardening round 1.** Closet-clean Round-2 of the
 
 - **#934 / UP-206 hardening round 1.** Closet-clean Round-2 of the
   closet-clean Round-2: governance gates 2-6 produced 3 BLOCKING +

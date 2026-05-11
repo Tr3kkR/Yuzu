@@ -65,7 +65,7 @@ fi
 if [[ "$COMPONENT" == "server" || "$COMPONENT" == "both" ]]; then
     echo ""
     echo "--- Ports ---"
-    for port in 8080 50051 50052; do
+    for port in 8080 50051; do
         if command -v ss &>/dev/null; then
             if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
                 fail "Port $port is already in use"

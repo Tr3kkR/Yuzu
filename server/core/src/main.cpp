@@ -92,9 +92,6 @@ int main(int argc, char* argv[]) {
     app.add_option("--listen", cfg.listen_address, "Agent gRPC address (host:port)")
         ->default_val("0.0.0.0:50051")
         ->envname("YUZU_LISTEN_ADDRESS");
-    app.add_option("--management", cfg.management_address, "Management gRPC address (host:port)")
-        ->default_val("0.0.0.0:50052")
-        ->envname("YUZU_MANAGEMENT_ADDRESS");
     app.add_option("--web-address", cfg.web_address, "Web UI bind address")
         ->default_val("127.0.0.1")
         ->envname("YUZU_WEB_ADDRESS");
@@ -118,12 +115,6 @@ int main(int argc, char* argv[]) {
             cfg.allow_one_way_tls = true;
             deprecated_allow_one_way_tls_flag = true;
         });
-    app.add_option("--management-cert", cfg.mgmt_tls_server_cert,
-                   "PEM management server certificate override");
-    app.add_option("--management-key", cfg.mgmt_tls_server_key,
-                   "PEM management server private key override");
-    app.add_option("--management-ca-cert", cfg.mgmt_tls_ca_cert,
-                   "PEM CA cert for management client cert verification");
     app.add_option("--gateway-upstream", cfg.gateway_upstream_address,
                    "Gateway upstream gRPC address (host:port); empty = disabled")
         ->envname("YUZU_GATEWAY_UPSTREAM");
@@ -439,11 +430,10 @@ int main(int argc, char* argv[]) {
         spdlog::error("***********************************************************************");
         spdlog::error("*** CLIENT CERTIFICATE VERIFICATION DISABLED (one-way TLS)          ***");
         spdlog::error("*** Any network peer can connect to the agent listener AND the      ***");
-        spdlog::error("*** management listener without an mTLS client certificate. This is ***");
-        spdlog::error("*** acceptable ONLY for short-term development or migration         ***");
-        spdlog::error("*** scenarios. Re-enable mTLS by supplying --ca-cert (and           ***");
-        spdlog::error("*** --management-ca-cert if a management override is configured)    ***");
-        spdlog::error("*** and removing --insecure-skip-client-verify.                     ***");
+        spdlog::error("*** gateway-upstream listener without an mTLS client certificate.   ***");
+        spdlog::error("*** This is acceptable ONLY for short-term development or migration ***");
+        spdlog::error("*** scenarios. Re-enable mTLS by supplying --ca-cert and removing   ***");
+        spdlog::error("*** --insecure-skip-client-verify.                                  ***");
         spdlog::error("***********************************************************************");
     }
 

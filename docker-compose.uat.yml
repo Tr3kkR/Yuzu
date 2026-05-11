@@ -186,7 +186,6 @@ services:
     ports:
       - "8092:8080"     # Web dashboard + REST API
       - "50051:50051"   # Agent gRPC (direct-connect agents)
-      - "50052:50052"   # Management gRPC
       - "50055:50055"   # Gateway upstream
     environment:
       - YUZU_LOG_LEVEL=info

@@ -1,9 +1,13 @@
 #include "gateway_service_impl.hpp"
 
+#include <yuzu/transport/proto_adapter.hpp>
+
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 
 namespace yuzu::server::detail {
+
+namespace tp = ::yuzu::transport;
 
 // -- Constructor --------------------------------------------------------------
 
@@ -14,11 +18,39 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(
     : registry_(registry), bus_(bus), auth_mgr_(auth_mgr), auto_approve_(auto_approve),
       metrics_(metrics), health_store_(health_store) {}
 
+// -- register_with ------------------------------------------------------------
+
+void GatewayUpstreamServiceImpl::register_with(tp::ServerListener& listener) {
+    tp::register_unary_pb<pb::RegisterRequest, pb::RegisterResponse>(
+        listener, "yuzu.gateway.v1.GatewayUpstream/ProxyRegister",
+        [this](const tp::CallContext& ctx, const pb::RegisterRequest& req,
+               pb::RegisterResponse& resp) -> tp::Status { return ProxyRegister(ctx, req, resp); });
+    tp::register_unary_pb<gw::BatchHeartbeatRequest, gw::BatchHeartbeatResponse>(
+        listener, "yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat",
+        [this](const tp::CallContext& ctx, const gw::BatchHeartbeatRequest& req,
+               gw::BatchHeartbeatResponse& resp) -> tp::Status {
+            return BatchHeartbeat(ctx, req, resp);
+        });
+    tp::register_unary_pb<pb::InventoryReport, pb::InventoryAck>(
+        listener, "yuzu.gateway.v1.GatewayUpstream/ProxyInventory",
+        [this](const tp::CallContext& ctx, const pb::InventoryReport& req,
+               pb::InventoryAck& resp) -> tp::Status { return ProxyInventory(ctx, req, resp); });
+    tp::register_unary_pb<gw::StreamStatusNotification, gw::StreamStatusAck>(
+        listener, "yuzu.gateway.v1.GatewayUpstream/NotifyStreamStatus",
+        [this](const tp::CallContext& ctx, const gw::StreamStatusNotification& req,
+               gw::StreamStatusAck& resp) -> tp::Status {
+            return NotifyStreamStatus(ctx, req, resp);
+        });
+}
+
 // -- ProxyRegister ------------------------------------------------------------
 
-grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*context*/,
-                                                       const pb::RegisterRequest* request,
-                                                       pb::RegisterResponse* response) {
+tp::Status GatewayUpstreamServiceImpl::ProxyRegister(const tp::CallContext& /*ctx*/,
+                                                     const pb::RegisterRequest& request_in,
+                                                     pb::RegisterResponse& response_in) {
+    const pb::RegisterRequest* request = &request_in;
+    pb::RegisterResponse* response = &response_in;
+
     const auto& info = request->info();
 
     // -- Tiered enrollment (same logic as AgentServiceImpl::Register) ----------
@@ -42,7 +74,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*co
             response->set_accepted(false);
             response->set_reject_reason("invalid, expired, or exhausted enrollment token");
             response->set_enrollment_status("denied");
-            return grpc::Status::OK;
+            return tp::Status{tp::StatusCode::Ok, ""};
         }
         spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token", info.agent_id());
         if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(),
@@ -51,7 +83,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*co
             response->set_accepted(false);
             response->set_reject_reason("enrollment denied by administrator");
             response->set_enrollment_status("denied");
-            return grpc::Status::OK;
+            return tp::Status{tp::StatusCode::Ok, ""};
         }
     } else {
         // Auto-approve policies (no peer IP available from gateway yet)
@@ -69,7 +101,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*co
                 response->set_accepted(false);
                 response->set_reject_reason("enrollment denied by administrator");
                 response->set_enrollment_status("denied");
-                return grpc::Status::OK;
+                return tp::Status{tp::StatusCode::Ok, ""};
             }
         } else {
             // Tier 1: pending queue
@@ -85,7 +117,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*co
                 response->set_enrollment_status("pending");
                 bus_.publish("pending-agent", info.agent_id());
                 spdlog::info("[gateway] Agent {} placed in pending queue", info.agent_id());
-                return grpc::Status::OK;
+                return tp::Status{tp::StatusCode::Ok, ""};
             }
 
             switch (*pending_status) {
@@ -93,12 +125,12 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*co
                 response->set_accepted(false);
                 response->set_reject_reason("still awaiting admin approval");
                 response->set_enrollment_status("pending");
-                return grpc::Status::OK;
+                return tp::Status{tp::StatusCode::Ok, ""};
             case auth::PendingStatus::denied:
                 response->set_accepted(false);
                 response->set_reject_reason("enrollment denied by administrator");
                 response->set_enrollment_status("denied");
-                return grpc::Status::OK;
+                return tp::Status{tp::StatusCode::Ok, ""};
             case auth::PendingStatus::approved:
                 spdlog::info("[gateway] Agent {} enrolled (admin-approved)", info.agent_id());
                 break;
@@ -131,16 +163,16 @@ gw_enrolled:
 
     spdlog::info("[gateway] ProxyRegister succeeded: agent={}, session={}", info.agent_id(),
                  session_id);
-    return grpc::Status::OK;
+    return tp::Status{tp::StatusCode::Ok, ""};
 }
 
 // -- BatchHeartbeat -----------------------------------------------------------
 
-grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* /*context*/,
-                                                        const gw::BatchHeartbeatRequest* request,
-                                                        gw::BatchHeartbeatResponse* response) {
+tp::Status GatewayUpstreamServiceImpl::BatchHeartbeat(const tp::CallContext& /*ctx*/,
+                                                      const gw::BatchHeartbeatRequest& request,
+                                                      gw::BatchHeartbeatResponse& response) {
     int acked = 0;
-    for (const auto& hb : request->heartbeats()) {
+    for (const auto& hb : request.heartbeats()) {
         // Validate that the session is known
         std::string agent_id;
         {
@@ -165,59 +197,59 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* /*c
         ++acked;
     }
 
-    response->set_acknowledged_count(acked);
+    response.set_acknowledged_count(acked);
     spdlog::debug("[gateway] BatchHeartbeat from node '{}': {}/{} acked",
-                  request->gateway_node(), acked, request->heartbeats_size());
-    return grpc::Status::OK;
+                  request.gateway_node(), acked, request.heartbeats_size());
+    return tp::Status{tp::StatusCode::Ok, ""};
 }
 
 // -- ProxyInventory -----------------------------------------------------------
 
-grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*context*/,
-                                                        const pb::InventoryReport* request,
-                                                        pb::InventoryAck* response) {
+tp::Status GatewayUpstreamServiceImpl::ProxyInventory(const tp::CallContext& /*ctx*/,
+                                                      const pb::InventoryReport& request,
+                                                      pb::InventoryAck& response) {
     std::string agent_id;
     {
         std::lock_guard lock(sessions_mu_);
-        auto it = gateway_sessions_.find(request->session_id());
+        auto it = gateway_sessions_.find(request.session_id());
         if (it != gateway_sessions_.end()) {
             agent_id = it->second;
         }
     }
     if (agent_id.empty()) {
-        spdlog::warn("[gateway] ProxyInventory: unknown session {}", request->session_id());
-        response->set_received(false);
-        return grpc::Status::OK;
+        spdlog::warn("[gateway] ProxyInventory: unknown session {}", request.session_id());
+        response.set_received(false);
+        return tp::Status{tp::StatusCode::Ok, ""};
     }
 
     // Persist inventory data via InventoryStore (Issue 7.17)
     if (inventory_store_ && inventory_store_->is_open()) {
         int64_t collected_epoch = 0;
-        if (request->has_collected_at()) {
-            collected_epoch = request->collected_at().millis_epoch() / 1000;
+        if (request.has_collected_at()) {
+            collected_epoch = request.collected_at().millis_epoch() / 1000;
         }
-        for (const auto& [plugin_name, data_bytes] : request->plugin_data()) {
+        for (const auto& [plugin_name, data_bytes] : request.plugin_data()) {
             std::string json_str(data_bytes.begin(), data_bytes.end());
             inventory_store_->upsert(agent_id, plugin_name, json_str, collected_epoch);
         }
         spdlog::info("[gateway] ProxyInventory persisted for agent={}, plugins={}",
-                      agent_id, request->plugin_data_size());
+                      agent_id, request.plugin_data_size());
     } else {
         spdlog::info("[gateway] ProxyInventory received for agent={}, plugins={} "
                       "(inventory store not available)",
-                      agent_id, request->plugin_data_size());
+                      agent_id, request.plugin_data_size());
     }
-    response->set_received(true);
-    return grpc::Status::OK;
+    response.set_received(true);
+    return tp::Status{tp::StatusCode::Ok, ""};
 }
 
 // -- NotifyStreamStatus -------------------------------------------------------
 
-grpc::Status GatewayUpstreamServiceImpl::NotifyStreamStatus(
-    grpc::ServerContext* /*context*/, const gw::StreamStatusNotification* request,
-    gw::StreamStatusAck* response) {
-    const auto& agent_id = request->agent_id();
-    const auto& session_id = request->session_id();
+tp::Status GatewayUpstreamServiceImpl::NotifyStreamStatus(
+    const tp::CallContext& /*ctx*/, const gw::StreamStatusNotification& request,
+    gw::StreamStatusAck& response) {
+    const auto& agent_id = request.agent_id();
+    const auto& session_id = request.session_id();
 
     // Verify session
     {
@@ -226,16 +258,16 @@ grpc::Status GatewayUpstreamServiceImpl::NotifyStreamStatus(
         if (it == gateway_sessions_.end() || it->second != agent_id) {
             spdlog::warn("[gateway] NotifyStreamStatus: unknown session {} for agent {}",
                          session_id, agent_id);
-            response->set_acknowledged(false);
-            return grpc::Status::OK;
+            response.set_acknowledged(false);
+            return tp::Status{tp::StatusCode::Ok, ""};
         }
     }
 
-    switch (request->event()) {
+    switch (request.event()) {
     case gw::StreamStatusNotification::CONNECTED:
-        registry_.set_gateway_node(agent_id, request->gateway_node());
+        registry_.set_gateway_node(agent_id, request.gateway_node());
         spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}'", agent_id,
-                     request->gateway_node());
+                     request.gateway_node());
         break;
 
     case gw::StreamStatusNotification::DISCONNECTED:
@@ -246,18 +278,18 @@ grpc::Status GatewayUpstreamServiceImpl::NotifyStreamStatus(
             gateway_sessions_.erase(session_id);
         }
         spdlog::info("[gateway] Agent {} stream DISCONNECTED at gateway node '{}'", agent_id,
-                     request->gateway_node());
+                     request.gateway_node());
         break;
 
     default:
         spdlog::warn("[gateway] NotifyStreamStatus: unknown event {} for agent {}",
-                     static_cast<int>(request->event()), agent_id);
-        response->set_acknowledged(false);
-        return grpc::Status::OK;
+                     static_cast<int>(request.event()), agent_id);
+        response.set_acknowledged(false);
+        return tp::Status{tp::StatusCode::Ok, ""};
     }
 
-    response->set_acknowledged(true);
-    return grpc::Status::OK;
+    response.set_acknowledged(true);
+    return tp::Status{tp::StatusCode::Ok, ""};
 }
 
 // -- session_count ------------------------------------------------------------

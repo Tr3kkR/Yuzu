@@ -66,13 +66,12 @@ yuzu-agent --cert-store MY --cert-subject "agent-001"
 | 8080 | TCP | Inbound | Web dashboard + REST API | Admin network |
 | 8443 | TCP | Inbound | HTTPS dashboard | Admin network |
 | 50051 | TCP | Inbound | Agent gRPC | Agent network |
-| 50052 | TCP | Inbound | Management gRPC | Admin network |
 | 50055 | TCP | Inbound | Gateway upstream | Gateway hosts only |
 | 9568 | TCP | Inbound | Gateway Prometheus | Monitoring network |
 
 **Recommendations:**
 - Bind the web dashboard to an internal interface: `--web-address 10.0.0.1`
-- Never expose gRPC ports (50051/50052) to the internet
+- Never expose gRPC port 50051 to the internet
 - Use a reverse proxy (nginx, Caddy) for TLS termination on the dashboard
 
 > **Coming in #376 — QUIC transport migration.** PR 5 of the QUIC

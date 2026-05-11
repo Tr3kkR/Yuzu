@@ -13,7 +13,6 @@ namespace yuzu::server {
 
 struct Config {
     std::string listen_address{"0.0.0.0:50051"};     // Agent-facing gRPC
-    std::string management_address{"0.0.0.0:50052"}; // Operator-facing gRPC
     std::string web_address{"127.0.0.1"};            // HTMX web UI bind address
     int web_port{8080};                              // HTMX web UI port
 
@@ -23,11 +22,11 @@ struct Config {
     std::filesystem::path tls_ca_cert;     // For mTLS agent verification
     bool allow_one_way_tls{false};         // Permit TLS without client cert verification
 
-    // Optional management listener TLS override.
-    // If left empty, management reuses the agent listener credentials.
-    std::filesystem::path mgmt_tls_server_cert;
-    std::filesystem::path mgmt_tls_server_key;
-    std::filesystem::path mgmt_tls_ca_cert;
+    // The gateway-upstream listener (#376 PR 1c-5) shares the agent
+    // listener's TLS material. The historical `mgmt_tls_*` per-port
+    // override path was dropped when the placeholder ManagementService
+    // listener at :50052 was removed — there is no operator-facing
+    // management port to need distinct trust.
 
     // Session management
     std::chrono::seconds session_timeout{
@@ -134,12 +133,11 @@ struct Config {
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only
 
     // Transport bidi dispatcher pool size (#904, governance UP-14).
-    // Applied to the agent-facing transport listener (port 50051) only;
-    // the management listener (port 50052) is still on the legacy
-    // grpc::ServerBuilder and is unaffected today. PR 1c-5 lifts the
-    // management plane onto transport::ServerListener, at which point
-    // this knob may need a sibling (e.g. mgmt_bidi_dispatcher_pool_size)
-    // if mgmt-plane bidi traffic appears.
+    // Applied to both transport listeners (agent on :50051 and
+    // gateway-upstream on :50055) since #376 PR 1c-5. Today only the
+    // agent listener uses bidi (Subscribe / DownloadUpdate); the
+    // gateway-upstream listener is all-unary so the knob has no effect
+    // there until/unless mgmt-plane bidi traffic appears.
     // 0 = backend default (auto-compute clamp(64, hardware_concurrency*8, 4096)).
     // Operators with direct-connect deployments above ~2K agents must
     // set this >= expected concurrent Subscribe count or front the
@@ -149,7 +147,8 @@ struct Config {
 };
 
 /**
- * Server manages inbound agent connections and exposes a management gRPC API.
+ * Server manages inbound agent connections and exposes a gateway-upstream
+ * gRPC API.
  */
 class Server {
 public:

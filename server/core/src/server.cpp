@@ -7,6 +7,7 @@
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/secure_zero.hpp>
+#include <yuzu/transport/proto_adapter.hpp>
 #include <yuzu/transport/transport.hpp>
 #include <yuzu/version.hpp>
 #include "cert_reloader.hpp"
@@ -35,7 +36,7 @@
 #include "inventory_store.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
-#include "management.grpc.pb.h"
+#include "management.pb.h"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "nvd_db.hpp"
@@ -452,12 +453,37 @@ public:
                 registry_, event_bus_, auth_mgr, auto_approve_, &metrics_, &health_store_);
         }
 
-        // Create gateway management client for command forwarding
+        // Create gateway management client for command forwarding (#376
+        // PR 1c-5). Lifted from `grpc::CreateChannel` + `ManagementService::NewStub`
+        // to `transport::Channel`. The actual outbound `SendCommand` call
+        // in `forward_gateway_pending()` opens a bidi stream and immediately
+        // half-closes the request side (server-streaming-as-bidi per the
+        // transport.hpp contract block).
         if (!cfg_.gateway_command_address.empty()) {
-            gw_mgmt_channel_ = grpc::CreateChannel(cfg_.gateway_command_address,
-                                                   grpc::InsecureChannelCredentials());
-            gw_mgmt_stub_ = ::yuzu::server::v1::ManagementService::NewStub(gw_mgmt_channel_);
-            spdlog::info("Gateway command forwarding enabled: {}", cfg_.gateway_command_address);
+            auto gw_cmd_endpoint = parse_listen_address(cfg_.gateway_command_address);
+            if (!gw_cmd_endpoint) {
+                spdlog::error("Failed to parse --gateway-command-addr: must be host:port "
+                              "with port 1..65535 (got '{}')",
+                              cfg_.gateway_command_address);
+            } else {
+                ::yuzu::transport::Credentials gw_cmd_creds{};
+                // Insecure today, matching the pre-lift `InsecureChannelCredentials`.
+                // mTLS for the server→gateway hop is a separate concern (no
+                // operator request yet; gateway runs alongside the server in
+                // the canonical topology).
+                gw_cmd_creds.verify_peer = false;
+                gw_cmd_creds.client_cert_mode = ::yuzu::transport::ClientCertMode::None;
+                gw_mgmt_channel_ = ::yuzu::transport::make_channel(
+                    ::yuzu::transport::Backend::Grpc, *gw_cmd_endpoint,
+                    std::move(gw_cmd_creds));
+                if (!gw_mgmt_channel_) {
+                    spdlog::error("Failed to construct gateway-command transport::Channel "
+                                  "(Grpc backend not linked)");
+                } else {
+                    spdlog::info("Gateway command forwarding enabled: {}",
+                                 cfg_.gateway_command_address);
+                }
+            }
         }
 
         // Load auto-approve policies
@@ -975,15 +1001,14 @@ public:
     void run() override {
         spdlog::info("run(): entering");
 
-        // Management + gateway-upstream services still ride on grpc::ServerBuilder
-        // (PR 1c-5 lifts those onto the transport abstraction). The agent
-        // listener has already been migrated to `transport::ServerListener` —
-        // see #376 PR 1c-2.
-        std::shared_ptr<grpc::ServerCredentials> mgmt_creds = grpc::InsecureServerCredentials();
+        // Pre-validate agent listener TLS material so the transport listener
+        // doesn't bring up half a service before failing. The lifted
+        // gw-upstream listener shares this material per #376 PR 1c-5
+        // (placeholder ManagementService and the --management-cert/key/ca
+        // separate-cert path were dropped at the same time — no operator-
+        // facing :50052 to need distinct trust). The transport listener's
+        // own `build_transport_credentials()` re-reads the same files.
         if (cfg_.tls_enabled) {
-            // Validate agent-listener TLS material up front so the transport
-            // listener doesn't bring up half a service before failing on the
-            // management side.
             auto agent_tls_validation =
                 build_tls_credentials(cfg_.tls_server_cert, cfg_.tls_server_key, cfg_.tls_ca_cert,
                                       cfg_.allow_one_way_tls, "agent listener");
@@ -991,23 +1016,6 @@ public:
                 spdlog::error("TLS is enabled but agent-listener credentials are invalid; "
                               "refusing to start");
                 return;
-            }
-
-            if (!cfg_.mgmt_tls_server_cert.empty() || !cfg_.mgmt_tls_server_key.empty() ||
-                !cfg_.mgmt_tls_ca_cert.empty()) {
-                // The management listener is governed by the SAME insecure-TLS gate
-                // as the agent listener (issue #79 / C-79-1).
-                auto mgmt_tls = build_tls_credentials(
-                    cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key, cfg_.mgmt_tls_ca_cert,
-                    cfg_.allow_one_way_tls, "management listener");
-                if (!mgmt_tls) {
-                    spdlog::error("Management TLS credentials are invalid; refusing to start");
-                    return;
-                }
-                mgmt_creds = std::move(mgmt_tls);
-            } else {
-                // No separate management cert/key — re-use the agent material.
-                mgmt_creds = std::move(agent_tls_validation);
             }
         }
 
@@ -1055,34 +1063,56 @@ public:
             return;
         }
 
-        // -- Management + gateway-upstream listener (still grpc::ServerBuilder) -
-        grpc::ServerBuilder mgmt_builder;
-        mgmt_builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
-        mgmt_builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
-        mgmt_builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
-        mgmt_builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
-        mgmt_builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS,
-                                        30000);
-        mgmt_builder.AddListeningPort(cfg_.management_address, mgmt_creds);
-        mgmt_builder.RegisterService(&mgmt_service_);
-
+        // -- Gateway-upstream listener via yuzu::transport (#376 PR 1c-5) -----
+        // Lifted from the legacy `grpc::ServerBuilder mgmt_builder` block
+        // when the placeholder ManagementService and its :50052 port were
+        // dropped in PR 1c-5. Shares TLS material with the agent listener
+        // per the design decision: there is no operator-facing :50052 to
+        // need a distinct cert, and the gateway is infrastructure, not an
+        // operator surface.
         if (gateway_service_) {
-            mgmt_builder.AddListeningPort(cfg_.gateway_upstream_address, mgmt_creds);
-            mgmt_builder.RegisterService(gateway_service_.get());
-            spdlog::info("Gateway upstream service enabled on {}", cfg_.gateway_upstream_address);
+            gw_upstream_listener_ =
+                ::yuzu::transport::make_server_listener(::yuzu::transport::Backend::Grpc);
+            if (!gw_upstream_listener_) {
+                spdlog::error(
+                    "Failed to construct gateway-upstream transport listener (Grpc backend "
+                    "not linked)");
+                agent_listener_->shutdown();
+                return;
+            }
+            gateway_service_->register_with(*gw_upstream_listener_);
+            auto gw_bind_opt = parse_listen_address(cfg_.gateway_upstream_address);
+            if (!gw_bind_opt) {
+                spdlog::error("Failed to parse --gateway-upstream: must be host:port with "
+                              "port 1..65535 (got '{}'); refusing to start",
+                              cfg_.gateway_upstream_address);
+                agent_listener_->shutdown();
+                return;
+            }
+            ::yuzu::transport::ListenerOptions gw_opts;
+            // Same operator knob applies; gateway-upstream is unary today
+            // so the pool isn't actively used, but keep parity in case the
+            // mgmt plane grows bidi traffic (per `bidi_dispatcher_pool_size`
+            // contract block in transport.hpp).
+            gw_opts.bidi_dispatcher_pool_size = cfg_.bidi_dispatcher_pool_size;
+            // Separate sink instance so metric labels can distinguish the
+            // two listeners if needed (today both backends increment the
+            // same counters; we keep them as separate sinks for symmetry
+            // and so the lifetime tracks each listener's `shutdown()`).
+            gw_opts.metric_sink = std::make_shared<detail::ServerTransportMetricSink>(metrics_);
+            auto gw_start =
+                gw_upstream_listener_->start(*gw_bind_opt, agent_creds_t, gw_opts);
+            if (!gw_start.has_value()) {
+                spdlog::error("Failed to start gateway-upstream listener on {}: {}",
+                              cfg_.gateway_upstream_address, gw_start.error().detail);
+                agent_listener_->shutdown();
+                return;
+            }
+            spdlog::info("Gateway upstream service enabled on {}",
+                         cfg_.gateway_upstream_address);
         }
 
-        mgmt_server_ = mgmt_builder.BuildAndStart();
-        if (!mgmt_server_) {
-            spdlog::error("Failed to start management gRPC server -- check that ports "
-                          "{} and {} are available",
-                          cfg_.management_address, cfg_.gateway_upstream_address);
-            agent_listener_->shutdown();
-            return;
-        }
-
-        spdlog::info("Yuzu Server listening on {} (agents) and {} (management)",
-                     cfg_.listen_address, cfg_.management_address);
+        spdlog::info("Yuzu Server listening on {} (agents)", cfg_.listen_address);
         if (gateway_service_) {
             spdlog::info("Gateway upstream listening on {}", cfg_.gateway_upstream_address);
         }
@@ -1239,13 +1269,12 @@ public:
                             no_tls_active ? "--no-tls" : "--insecure-skip-client-verify";
                         const char* detail =
                             no_tls_active
-                                ? "TLS is fully disabled; both agent and management gRPC "
+                                ? "TLS is fully disabled; agent and gateway-upstream "
                                   "listeners accept plaintext from any peer with no encryption "
                                   "and no peer authentication. Restart with TLS certificates "
                                   "to leave this posture."
-                                : "Agent / management listener still running without client "
-                                  "certificate verification. Re-enable mTLS by supplying "
-                                  "--ca-cert (and --management-ca-cert if applicable).";
+                                : "Listeners still running without client certificate "
+                                  "verification. Re-enable mTLS by supplying --ca-cert.";
                         spdlog::error("[INSECURE-TLS] ({}) {}", posture, detail);
                         if (audit_store_ && audit_store_->is_open()) {
                             audit_store_->log({.timestamp = std::time(nullptr),
@@ -1261,19 +1290,17 @@ public:
                 });
         }
 
-        // The transport listener owns its own internal threads; Wait()
-        // here on the management gRPC server is the main-thread blocker.
-        // shutdown() on either side wakes both.
-        mgmt_server_->Wait();
-        // On the graceful-stop path `stop()` invoked
-        // `agent_listener_->shutdown()` before the mgmt server's drain
-        // returned, so the transport listener's `shutting_down_` flag is
-        // already set and the cv has fired. This call is a non-blocking
-        // confirmation that the cq_worker / dispatcher threads have
-        // joined — NOT a second blocking wait. The systemd
-        // `TimeoutStopSec=30` cap (deploy/systemd/yuzu-server.service)
-        // bounds the cumulative time across both halves.
+        // Main-thread blocker: wait for the agent listener to drain.
+        // `stop()` calls `agent_listener_->shutdown()` (and
+        // `gw_upstream_listener_->shutdown()` after PR 1c-5) which sets
+        // the transport listener's `shutting_down_` flag and fires the
+        // condvar; this wait returns once cq_worker / dispatcher threads
+        // have joined. The systemd `TimeoutStopSec=30` cap
+        // (deploy/systemd/yuzu-server.service) bounds cumulative time.
         agent_listener_->wait_for_shutdown();
+        if (gw_upstream_listener_) {
+            gw_upstream_listener_->wait_for_shutdown();
+        }
     }
 
     void stop() noexcept override {
@@ -1355,26 +1382,33 @@ public:
             offload_target_store_->flush_all();
         }
 
-        // Shutdown gRPC with a deadline FIRST so in-flight Subscribe and
-        // ManagementService streams drain before we drop the stores they
-        // reference. Without a deadline, Shutdown() waits indefinitely for
-        // all RPCs to finish, and the Subscribe RPC is a long-lived
-        // bidirectional stream that never completes on its own. With a
-        // deadline, RPCs are forcibly cancelled at expiry.
+        // Shutdown the agent listener FIRST so in-flight Subscribe and
+        // OTA streams drain before we drop the stores they reference.
+        // The transport listener's `shutdown()` is graceful: in-flight
+        // handlers receive `StatusCode::Unavailable` on their trailing
+        // status and run to completion. Subscribe is a long-lived bidi;
+        // the cancel-on-shutdown path (transport.hpp ServerListener
+        // contract) tears it down.
         //
         // Governance round (UAT 2026-05-06 architect Gate 3 B-1):
         // AgentServiceImpl borrows execution_tracker_ via a raw pointer
         // (set_execution_tracker), and Subscribe/process_gateway_response
         // call notify_exec_tracker -> update_agent_status on every
         // CommandResponse frame. Resetting execution_tracker_ before the
-        // gRPC drain race-windowed a use-after-free during graceful
+        // listener drain race-windowed a use-after-free during graceful
         // shutdown. Drain producers first, null the borrowed pointer
         // explicitly, then release the tracker.
-        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
+        //
+        // Sequential listener shutdown — agent first, gateway-upstream
+        // second. Order is for log-readability; the two are functionally
+        // independent (#376 PR 1c-5). Both are transport graceful: in-flight
+        // handlers run to completion. The outbound transport::Channel for
+        // gateway command forwarding is destroyed via RAII at ServerImpl
+        // destruction.
         if (agent_listener_)
-            agent_listener_->shutdown(); // transport graceful: in-flight handlers run to completion
-        if (mgmt_server_)
-            mgmt_server_->Shutdown(deadline);
+            agent_listener_->shutdown();
+        if (gw_upstream_listener_)
+            gw_upstream_listener_->shutdown();
 
         // Now safe: gRPC streams have either completed or been cancelled,
         // so no thread is inside notify_exec_tracker holding the borrowed
@@ -1832,58 +1866,102 @@ private:
     }
 
     /// Forward any commands queued for gateway-connected agents.
+    ///
+    /// #376 PR 1c-5 D.1 retry pattern:
+    ///   * Per-command detached `std::thread` (preserves today's unbounded
+    ///     parallelism; maps cleanly onto a per-command QUIC stream in the
+    ///     future native-QUIC redesign).
+    ///   * One attempt per call. On `StatusCode::Unavailable`, the command
+    ///     is re-queued via `AgentRegistry::reenqueue_gateway_pending` with
+    ///     an incremented `attempts` counter; the next dispatch site to
+    ///     fire `forward_gateway_pending()` picks it up again. The cap
+    ///     (3 attempts total) is enforced inside `reenqueue_gateway_pending`.
+    ///   * On any non-`Unavailable` failure: drop with a metric.
+    ///   * No inline sleep / exponential backoff. The wall-clock retry
+    ///     interval is bounded by the cadence at which command-dispatch
+    ///     sites fire `forward_gateway_pending()` — operator-observable in
+    ///     logs and the `yuzu_gateway_forward_*` counters.
     void forward_gateway_pending() {
         auto gw_pending = registry_.drain_gateway_pending();
-        if (!gw_pending.empty() && gw_mgmt_stub_) {
-            for (auto& gp : gw_pending) {
-                auto* stub = gw_mgmt_stub_.get();
-                auto* svc = &agent_service_;
-                auto cmd_id = gp.cmd.command_id();
-                spdlog::debug("Forwarding command {} to gateway for agent {}", cmd_id, gp.agent_id);
-                std::thread([stub, svc, gp = std::move(gp), cmd_id]() {
-                    ::yuzu::server::v1::SendCommandRequest req;
-                    req.add_agent_ids(gp.agent_id);
-                    *req.mutable_command() = gp.cmd;
-                    req.set_timeout_seconds(300);
+        if (gw_pending.empty() || !gw_mgmt_channel_) return;
+        for (auto& gp : gw_pending) {
+            auto* ch = gw_mgmt_channel_.get();
+            auto* svc = &agent_service_;
+            auto* registry = &registry_;
+            auto* metrics_p = &metrics_;
+            auto cmd_id = gp.cmd.command_id();
+            spdlog::debug("Forwarding command {} to gateway for agent {} (attempt {})",
+                          cmd_id, gp.agent_id, gp.attempts + 1);
+            std::thread([ch, svc, registry, metrics_p, gp = std::move(gp), cmd_id]() mutable {
+                ::yuzu::server::v1::SendCommandRequest req;
+                req.add_agent_ids(gp.agent_id);
+                *req.mutable_command() = gp.cmd;
+                req.set_timeout_seconds(300);
 
-                    // Retry up to 3 times on transient connection failures
-                    for (int attempt = 0; attempt < 3; ++attempt) {
-                        if (attempt > 0) {
-                            spdlog::info("Retrying gateway SendCommand for {} (attempt {})", cmd_id,
-                                         attempt + 1);
-                            std::this_thread::sleep_for(std::chrono::seconds(1 << attempt));
-                        }
+                ::yuzu::transport::CallContext ctx;
+                ctx.deadline = std::chrono::seconds(300);
+                auto stream = ch->bidi_stream(
+                    "yuzu.server.v1.ManagementService/SendCommand", ctx);
+                if (!stream) {
+                    spdlog::warn("Gateway SendCommand for {} failed to open stream", cmd_id);
+                    metrics_p->counter("yuzu_gateway_forward_dropped_total",
+                                       {{"reason", "stream_open_failed"}})
+                        .increment();
+                    return;
+                }
 
-                        grpc::ClientContext ctx;
-                        ctx.set_deadline(std::chrono::system_clock::now() +
-                                         std::chrono::seconds(300));
-                        auto reader = stub->SendCommand(&ctx, req);
+                bool wrote = ::yuzu::transport::write_pb(*stream, req);
+                stream->writes_done();
+                if (!wrote) {
+                    // Treat write-side failures as transient; re-queue.
+                    bool requeued = registry->reenqueue_gateway_pending(std::move(gp));
+                    metrics_p
+                        ->counter("yuzu_gateway_forward_dropped_total",
+                                  {{"reason", requeued ? "requeued_write_failed"
+                                                       : "attempts_exhausted"}})
+                        .increment();
+                    spdlog::warn("Gateway SendCommand for {} write failed (requeued={})",
+                                 cmd_id, requeued);
+                    return;
+                }
 
-                        ::yuzu::server::v1::SendCommandResponse resp;
-                        int resp_count = 0;
-                        while (reader->Read(&resp)) {
-                            ++resp_count;
-                            svc->process_gateway_response(resp.agent_id(), resp.response());
-                        }
-                        auto status = reader->Finish();
-                        if (status.ok()) {
-                            spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
-                                          cmd_id, resp_count);
-                            return; // success — done
-                        }
-                        // Only retry on UNAVAILABLE (connection refused / not ready)
-                        if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
-                            spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
-                                         status.error_message(),
-                                         static_cast<int>(status.error_code()));
-                            return; // non-transient error — don't retry
-                        }
-                        spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
-                                     cmd_id, attempt + 1, status.error_message());
+                int resp_count = 0;
+                ::yuzu::server::v1::SendCommandResponse resp;
+                while (::yuzu::transport::read_pb(*stream, resp)) {
+                    ++resp_count;
+                    svc->process_gateway_response(resp.agent_id(), resp.response());
+                    resp.Clear();
+                }
+                auto final_status = stream->final_status();
+                if (final_status.code == ::yuzu::transport::StatusCode::Ok) {
+                    spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
+                                  cmd_id, resp_count);
+                    return;
+                }
+                if (final_status.code == ::yuzu::transport::StatusCode::Unavailable) {
+                    bool requeued = registry->reenqueue_gateway_pending(std::move(gp));
+                    metrics_p
+                        ->counter("yuzu_gateway_forward_dropped_total",
+                                  {{"reason",
+                                    requeued ? "requeued_unavailable" : "attempts_exhausted"}})
+                        .increment();
+                    if (requeued) {
+                        spdlog::warn(
+                            "Gateway SendCommand for {} unavailable: requeued for next drain",
+                            cmd_id);
+                    } else {
+                        spdlog::error("Gateway SendCommand for {} unavailable: attempts cap hit, "
+                                      "dropping",
+                                      cmd_id);
                     }
-                    spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
-                }).detach();
-            }
+                    return;
+                }
+                spdlog::warn("Gateway SendCommand for {} failed: {} (code={})", cmd_id,
+                             final_status.detail, static_cast<int>(final_status.code));
+                metrics_p->counter("yuzu_gateway_forward_dropped_total",
+                                   {{"reason", "non_transient"}})
+                    .increment();
+            }).detach();
         }
     }
 
@@ -2362,11 +2440,17 @@ private:
                 // hardening /readyz reported "ready" in that state. The
                 // transport contract designates `is_serving() &&
                 // bound_endpoint().port != 0` as the canonical readiness
-                // signal (transport.hpp:680-685). Mgmt grpc::Server stays on
-                // its own path for now; PR 1c-5 will lift it onto the same
-                // transport surface and a parallel check will land then.
+                // signal (transport.hpp:680-685). Both listeners (agent on
+                // :50051 + gateway-upstream on :50055 via #376 PR 1c-5)
+                // are checked. The gateway-upstream listener is only
+                // present when `--gateway-upstream` was configured; if
+                // unset, the check is trivially OK so single-host UAT
+                // deployments don't false-fail readiness.
                 {"agent_listener", agent_listener_ != nullptr && agent_listener_->is_serving() &&
                                        agent_listener_->bound_endpoint().port != 0},
+                {"gw_upstream_listener", gw_upstream_listener_ == nullptr ||
+                                             (gw_upstream_listener_->is_serving() &&
+                                              gw_upstream_listener_->bound_endpoint().port != 0)},
             };
 
             std::string failed_list;
@@ -5719,13 +5803,11 @@ private:
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
     detail::AgentServiceImpl agent_service_;
-    detail::ManagementServiceImpl mgmt_service_;
     std::unique_ptr<detail::GatewayUpstreamServiceImpl> gateway_service_;
-    std::shared_ptr<grpc::Channel> gw_mgmt_channel_;
-    std::unique_ptr<::yuzu::server::v1::ManagementService::Stub> gw_mgmt_stub_;
+    std::unique_ptr<::yuzu::transport::Channel> gw_mgmt_channel_;
     std::shared_ptr<spdlog::logger> file_logger_;
     std::unique_ptr<::yuzu::transport::ServerListener> agent_listener_;
-    std::unique_ptr<grpc::Server> mgmt_server_;
+    std::unique_ptr<::yuzu::transport::ServerListener> gw_upstream_listener_;
     std::unique_ptr<httplib::Server> web_server_;
     std::thread web_thread_;
 

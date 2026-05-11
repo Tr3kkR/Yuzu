@@ -220,9 +220,9 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     {agent_listen_addr, "0.0.0.0"},
     {agent_listen_port, 50051},
 
-    %% Operator-facing gRPC (dashboard/CLI)
+    %% Management gRPC (command forwarding from C++ server)
     {mgmt_listen_addr, "0.0.0.0"},
-    {mgmt_listen_port, 50052},
+    {mgmt_listen_port, 50063},
 
     %% Upstream C++ server (GatewayUpstream service)
     {upstream_addr, "127.0.0.1"},
