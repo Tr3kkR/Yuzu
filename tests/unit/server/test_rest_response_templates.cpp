@@ -99,8 +99,9 @@ struct RtHarness {
         };
         auto audit_fn = [this](const httplib::Request&, const std::string& a,
                                const std::string& r, const std::string& tt,
-                               const std::string& ti, const std::string& d) {
+                               const std::string& ti, const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
+            return true;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,

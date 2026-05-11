@@ -76,10 +76,16 @@ void AuditStore::create_tables() {
     }
 }
 
-void AuditStore::log(const AuditEvent& event) {
+bool AuditStore::log(const AuditEvent& event) {
     std::unique_lock lock(mtx_);
-    if (!db_)
-        return;
+    if (!db_) {
+        // Audit DB not open — surface as failure so callers can flag the
+        // gap. Operators running with audit deliberately disabled (no
+        // audit_store wired at all) never reach this code path because
+        // AuthRoutes::audit_log short-circuits on a null store.
+        emit_failed_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
 
     const char* sql = R"(
         INSERT INTO audit_events (timestamp, principal, principal_role, action,
@@ -87,8 +93,11 @@ void AuditStore::log(const AuditEvent& event) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        emit_failed_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::error("AuditStore: sqlite3_prepare_v2 failed: {}", sqlite3_errmsg(db_));
+        return false;
+    }
 
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
@@ -121,7 +130,7 @@ void AuditStore::log(const AuditEvent& event) {
         emit_failed_.fetch_add(1, std::memory_order_relaxed);
         spdlog::error("AuditStore: sqlite3_step rc={} ({}); event lost",
                       step_rc, sqlite3_errmsg(db_));
-        return;
+        return false;
     }
 
     // Bucket the write into a Prometheus-friendly counter so the audit subsystem
@@ -136,6 +145,7 @@ void AuditStore::log(const AuditEvent& event) {
         events_denied_.fetch_add(1, std::memory_order_relaxed);
     else
         events_other_.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 uint64_t AuditStore::events_written(const std::string& result) const noexcept {

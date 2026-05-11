@@ -449,16 +449,16 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
     return event;
 }
 
-void AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
+bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
                            const std::string& result, const std::string& target_type,
                            const std::string& target_id, const std::string& detail) {
     if (!audit_store_)
-        return;
+        return true; // audit-off deployment — not a failure relative to config
     auto event = make_audit_event(req, action, result);
     event.target_type = target_type;
     event.target_id = target_id;
     event.detail = detail;
-    audit_store_->log(event);
+    return audit_store_->log(event);
 }
 
 void AuthRoutes::emit_event(const std::string& event_type, const httplib::Request& req,

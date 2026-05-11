@@ -36,7 +36,17 @@ public:
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
-    using AuditFn = std::function<void(const httplib::Request&, const std::string& action,
+    /// Audit-event callback. Returns true iff the event was persisted
+    /// (or the deployment runs audit-off — both look the same to a
+    /// caller, see `AuthRoutes::audit_log` doc). Returns false on a
+    /// silent persistence failure (audit DB locked / disk full /
+    /// corruption). SOC 2 CC6.6 evidence-emitting handlers MUST capture
+    /// this return and surface partial-success on the response so
+    /// operators don't read a "200 OK" as compliance evidence the audit
+    /// row landed (HIGH-2 on PR #883). Pre-PR #883 this typedef was
+    /// `void(...)`; existing call sites that fire-and-forget continue to
+    /// work — the bool is just discarded.
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
     using ServiceGroupFn = std::function<void(const std::string& service_value)>;
@@ -57,6 +67,21 @@ public:
         std::size_t cookie_sessions_revoked{0};
         std::size_t api_tokens_revoked{0};
         bool db_persisted{true};
+    };
+
+    /// Carrier for the audit-emission outcome on a session-revocation
+    /// response. Populated by the handler from the AuditFn return value
+    /// (and an exception try/catch). Distinct from `SessionRevokeResult`
+    /// because the audit emission happens AFTER the revoke primitive
+    /// completes — operator's "stop NOW" still takes effect even when
+    /// the SOC 2 evidence row is lost (HIGH-2 on PR #883).
+    struct AuditEmission {
+        bool emitted{true};
+        // True iff AuditFn threw — distinguishes silent persist failure
+        // from an exception path. Both produce `emitted=false` and the
+        // `Sec-Audit-Failed: true` response header; the `threw` flag is
+        // only surfaced in the spdlog trail.
+        bool threw{false};
     };
 
     /// Revoke every credential bearing a username — cookie sessions

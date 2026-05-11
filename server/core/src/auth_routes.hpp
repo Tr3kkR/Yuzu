@@ -84,8 +84,15 @@ public:
     AuditEvent make_audit_event(const httplib::Request& req, const std::string& action,
                                 const std::string& result);
 
-    /// Write an audit event to the audit store.
-    void audit_log(const httplib::Request& req, const std::string& action,
+    /// Write an audit event to the audit store. Returns true iff the row
+    /// was persisted; returns true (no-op success) when no AuditStore is
+    /// configured (operator-chosen audit-off mode). Returns false on a
+    /// silent persist failure (audit DB locked / disk full / corruption).
+    /// SOC 2 CC6.6 evidence-emitting handlers MUST capture the return so
+    /// they can surface partial-success on the response (HIGH-2 on PR
+    /// #883). The bool is [[nodiscard]] on the AuditStore primitive but
+    /// not on this wrapper — most call sites legitimately fire-and-forget.
+    bool audit_log(const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type = {},
                    const std::string& target_id = {}, const std::string& detail = {});
 

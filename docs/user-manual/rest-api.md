@@ -682,16 +682,25 @@ curl -s -X DELETE \
 
 ```json
 {
-  "data": { "username": "alice", "revoked": 2, "db_persisted": true },
+  "data": {
+    "username": "alice",
+    "revoked": 2,
+    "db_persisted": true,
+    "audit_emitted": true
+  },
   "meta": { "api_version": "v1" }
 }
 ```
 
 `revoked` is the number of in-memory session cookies wiped. `db_persisted` reports whether the AuthDB DELETE for persisted session rows succeeded; when `false`, the audit row is recorded with `result="partial"` and `detail` carries `db_error=true`. A `false` value indicates the operator should retry or restart the server — server restart will otherwise resurrect any persisted rows that were not deleted.
 
+`audit_emitted` reports whether the SOC 2 CC6.6 audit row landed in the audit store. When `false` the response also sets the `Sec-Audit-Failed: true` header — SREs scraping for evidence-integrity gaps should alert on either signal. The revoke side-effect still completes when `audit_emitted=false` (operator's "stop NOW" intent is honoured); only the SOC 2 evidence chain is degraded for that request. This split was introduced in PR #883 (HIGH-2) to close a silent-failure window where a locked audit DB or disk-full condition produced a 200 OK that masqueraded as full evidence.
+
 **Audit:** successful cross-user invocations emit `session.revoke_all` with `target_type=User`, `target_id=<username>`, and `detail=count=<N>` (or `count=<N> db_error=true` on partial failure). When the caller's own username is supplied, the action is `session.revoke_all.self` instead.
 
-**Error (400) -- missing or invalid username:**
+The admin route emits two distinct 400 bodies — operators scripting the endpoint should distinguish them.
+
+**Error (400) -- missing `username` query parameter:**
 
 ```json
 {
@@ -700,7 +709,16 @@ curl -s -X DELETE \
 }
 ```
 
-The `username` parameter is validated with the same character set used at user creation (`is_valid_username`). NUL bytes, control characters, and newlines are rejected — passing them through to the SQL bind would silently truncate at the NUL while the audit log records the full string, producing a target/effect mismatch (sec-H1).
+**Error (400) -- malformed `username` value:**
+
+```json
+{
+  "error": { "code": 400, "message": "invalid username format" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The `username` parameter is validated with the same character set used at user creation (`is_valid_username`). NUL bytes, control characters, and newlines are rejected — passing them through to the SQL bind would silently truncate at the NUL while the audit log records the full string, producing a target/effect mismatch (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
 
 **Error (403) -- caller lacks `UserManagement:Write`:**
 
@@ -732,13 +750,14 @@ curl -s -X DELETE \
   "data": {
     "revoked": 3,
     "api_tokens_revoked": 2,
-    "db_persisted": true
+    "db_persisted": true,
+    "audit_emitted": true
   },
   "meta": { "api_version": "v1" }
 }
 ```
 
-The response sets `Set-Cookie: yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0` so the client side completes the revocation by deleting the cookie from the browser jar.
+The response sets `Set-Cookie: yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0` so the client side completes the revocation by deleting the cookie from the browser jar. `audit_emitted` and the `Sec-Audit-Failed: true` header have the same semantics as on the admin route above — `false` means the revoke completed but the audit row was lost (locked DB / disk full / pipeline exception), and the SOC 2 CC6.6 evidence chain is degraded for that request.
 
 **Error (403) -- non-interactive credential:**
 

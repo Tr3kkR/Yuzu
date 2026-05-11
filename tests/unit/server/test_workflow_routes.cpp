@@ -146,8 +146,9 @@ struct ExecHarness {
         };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) {
+                               const std::string& target_id, const std::string& detail) -> bool {
             audit_calls.push_back({action, result, target_type, target_id, detail});
+            return true;
         };
         auto emit_fn = [](const std::string&, const httplib::Request&) {
         };

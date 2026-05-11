@@ -1143,14 +1143,41 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             "application/json");
             return;
         }
+        // Audit emission helper — wraps audit_fn so we can capture both
+        // silent persistence failures (bool=false) and exceptions, and
+        // surface either via `Sec-Audit-Failed: true` + `audit_emitted`
+        // in the response body. HIGH-2 on PR #883: a 200 OK response
+        // that hides a lost audit row is fictional SOC 2 CC6.6/CC7.2
+        // evidence.
+        auto try_audit = [&audit_fn, &req](const std::string& action, const std::string& result,
+                                           const std::string& target_type,
+                                           const std::string& target_id,
+                                           const std::string& detail) -> RestApiV1::AuditEmission {
+            try {
+                bool ok = audit_fn(req, action, result, target_type, target_id, detail);
+                return RestApiV1::AuditEmission{ok, /*threw=*/false};
+            } catch (const std::exception& e) {
+                spdlog::error("audit_fn threw on session-revoke action={} target={}: {}",
+                              action, target_id, e.what());
+                return RestApiV1::AuditEmission{false, /*threw=*/true};
+            } catch (...) {
+                spdlog::error("audit_fn threw unknown on session-revoke action={} target={}",
+                              action, target_id);
+                return RestApiV1::AuditEmission{false, /*threw=*/true};
+            }
+        };
+
         if (!session->mcp_tier.empty() || !session->token_scope_service.empty()) {
             // sec-M2: a leaked readonly MCP token, or a service-scoped
             // automation token, must not be able to wipe its principal's
             // interactive cookies. Use the dashboard or a session cookie
             // for that.
-            audit_fn(req, "session.revoke_all.self", "denied", "User", session->username,
-                     "non-interactive credential rejected (mcp_tier='"
-                     + session->mcp_tier + "' scope='" + session->token_scope_service + "')");
+            const auto audit = try_audit(
+                "session.revoke_all.self", "denied", "User", session->username,
+                "non-interactive credential rejected (mcp_tier='"
+                + session->mcp_tier + "' scope='" + session->token_scope_service + "')");
+            if (!audit.emitted)
+                res.set_header("Sec-Audit-Failed", "true");
             res.status = 403;
             res.set_content(
                 error_json("self-revoke requires an interactive session, not an API token", 403),
@@ -1168,7 +1195,8 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             "count=" + std::to_string(result.cookie_sessions_revoked)
             + " api_tokens_revoked=" + std::to_string(result.api_tokens_revoked)
             + (result.db_persisted ? "" : " db_error=true");
-        audit_fn(req, "session.revoke_all.self", audit_result, "User", session->username, detail);
+        const auto audit = try_audit("session.revoke_all.self", audit_result, "User",
+                                     session->username, detail);
         // CC6.7 disposition: clear the caller's cookie on the response so
         // the client side completes the revocation. Mirrors POST /logout
         // attribute set; the `Secure` flag (set on issuance based on
@@ -1177,12 +1205,15 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // browser deletion, not match the original issuance flags.
         res.set_header("Set-Cookie",
                        "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+        if (!audit.emitted)
+            res.set_header("Sec-Audit-Failed", "true");
         res.set_content(ok_json(JObj()
                                     .add("revoked",
                                          static_cast<int64_t>(result.cookie_sessions_revoked))
                                     .add("api_tokens_revoked",
                                          static_cast<int64_t>(result.api_tokens_revoked))
                                     .add("db_persisted", result.db_persisted)
+                                    .add("audit_emitted", audit.emitted)
                                     .str()),
                         "application/json");
     });
@@ -1240,12 +1271,33 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         const std::string detail =
             "count=" + std::to_string(result.cookie_sessions_revoked)
             + (result.db_persisted ? "" : " db_error=true");
-        audit_fn(req, action, audit_result, "User", username, detail);
+        // HIGH-2 on PR #883 — wrap in try/catch and capture the audit_fn
+        // bool return so a silent persist failure (audit DB locked /
+        // disk full) or an exception path doesn't masquerade as 200 OK
+        // SOC 2 evidence. The `Sec-Audit-Failed` response header gives
+        // SRE/SIEM scrapers an out-of-band signal; the `audit_emitted`
+        // body field gives the API client the same signal.
+        bool audit_emitted = true;
+        try {
+            audit_emitted =
+                audit_fn(req, action, audit_result, "User", username, detail);
+        } catch (const std::exception& e) {
+            spdlog::error("audit_fn threw on session-revoke action={} target={}: {}",
+                          action, username, e.what());
+            audit_emitted = false;
+        } catch (...) {
+            spdlog::error("audit_fn threw unknown on session-revoke action={} target={}",
+                          action, username);
+            audit_emitted = false;
+        }
+        if (!audit_emitted)
+            res.set_header("Sec-Audit-Failed", "true");
         res.set_content(ok_json(JObj()
                                     .add("username", username)
                                     .add("revoked",
                                          static_cast<int64_t>(result.cookie_sessions_revoked))
                                     .add("db_persisted", result.db_persisted)
+                                    .add("audit_emitted", audit_emitted)
                                     .str()),
                         "application/json");
     });

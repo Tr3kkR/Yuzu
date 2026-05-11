@@ -85,8 +85,9 @@ struct VizHarness {
         };
         auto audit_fn = [this](const httplib::Request&, const std::string& a,
                                const std::string& r, const std::string& tt,
-                               const std::string& ti, const std::string& d) {
+                               const std::string& ti, const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
+            return true;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -215,7 +216,7 @@ TEST_CASE("REST visualization: null stores → 503",
                       const std::string&, const std::string&) -> bool { return true; };
     auto audit_fn = [](const httplib::Request&, const std::string&,
                        const std::string&, const std::string&,
-                       const std::string&, const std::string&) {};
+                       const std::string&, const std::string&) -> bool { return true; };
     RestApiV1 api;
     api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                         nullptr, nullptr, nullptr, nullptr,

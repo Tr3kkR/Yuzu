@@ -99,6 +99,22 @@ private:
     mutable std::atomic<uint64_t> cache_hits_{0};
     mutable std::atomic<uint64_t> cache_misses_{0};
 
+    // Defense-in-depth against a cache TOCTOU on revocation. Incremented
+    // before every UPDATE in `revoke_token`, `revoke_for_principal`, and
+    // `delete_token`. `validate_token` snapshots the value before its DB
+    // SELECT and re-reads before the cache write — if it moved, a revoke
+    // raced with us and we MUST NOT populate the cache with a stale
+    // (revoked=false) view that would survive for `kTokenCacheTtl` (60 s)
+    // and silently lie about "Sign out everywhere" success.
+    //
+    // The current `validate_token` also holds `db_mtx_` exclusively
+    // across the SELECT and the cache write, which on its own prevents
+    // the interleave. The generation counter is belt-and-suspenders
+    // against a future refactor that narrows the `db_mtx_` scope: the
+    // explicit acquire/release pairs make the invariant locally
+    // verifiable without lock-ordering analysis (HIGH-1 on PR #883).
+    std::atomic<uint64_t> revoke_generation_{0};
+
     void create_tables();
     std::string generate_raw_token() const;
     std::string sha256_hex(const std::string& input) const;

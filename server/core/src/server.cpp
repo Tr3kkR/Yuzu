@@ -1603,10 +1603,10 @@ private:
         return auth_routes_->make_audit_event(req, action, result);
     }
 
-    void audit_log(const httplib::Request& req, const std::string& action,
+    bool audit_log(const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type = {},
                    const std::string& target_id = {}, const std::string& detail = {}) {
-        auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
+        return auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
     }
 
     // Apply stored runtime config overrides on startup
@@ -4854,8 +4854,8 @@ private:
         };
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) {
-            audit_log(req, action, result, target_type, target_id, detail);
+                               const std::string& target_id, const std::string& detail) -> bool {
+            return audit_log(req, action, result, target_type, target_id, detail);
         };
 
         // ComplianceRoutes — /compliance, /fragments/compliance/*, /api/policies/*,
@@ -5110,8 +5110,8 @@ private:
             },
             [this](const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type,
-                   const std::string& target_id, const std::string& detail) {
-                audit_log(req, action, result, target_type, target_id, detail);
+                   const std::string& target_id, const std::string& detail) -> bool {
+                return audit_log(req, action, result, target_type, target_id, detail);
             },
             rbac_store_.get(), mgmt_group_store_.get(), api_token_store_.get(),
             quarantine_store_.get(), response_store_.get(), instruction_store_.get(),

@@ -36,6 +36,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -68,6 +69,16 @@ struct RestSessionsHarness {
     std::string session_token_scope;       // non-empty = service-scoped token
     bool perm_should_grant{true};
     bool wire_revoke_callback{true};       // false = test the 503 path
+
+    // HIGH-2 on PR #883 — fault-injection knobs for the audit emission
+    // path. `audit_should_emit=false` simulates a silent persist failure
+    // (audit DB locked / disk full / corruption); `audit_should_throw`
+    // simulates an exception thrown by the audit pipeline. Both produce
+    // the same observable response surface: `Sec-Audit-Failed: true`
+    // header + `audit_emitted=false` body field, with the success-side
+    // revoke still happening (operator's "stop NOW" semantics).
+    bool audit_should_emit{true};
+    bool audit_should_throw{false};
 
     std::vector<AuditRecord> audit_log;
     std::vector<RevokeCall> revoke_calls;
@@ -104,8 +115,11 @@ struct RestSessionsHarness {
 
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) {
+                               const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_type, target_id, detail});
+            if (audit_should_throw)
+                throw std::runtime_error("simulated audit_fn exception");
+            return audit_should_emit;
         };
 
         RestApiV1::SessionRevokeFn session_revoke_fn;
@@ -172,6 +186,10 @@ TEST_CASE("REST DELETE /api/v1/sessions: admin can force-logout another user",
     CHECK(body["revoked"].get<int64_t>() == 2);
     CHECK(body["username"].get<std::string>() == "alice");
     CHECK(body["db_persisted"].get<bool>() == true);
+    // HIGH-2: audit_emitted defaults to true on the happy path and the
+    // Sec-Audit-Failed header is absent.
+    CHECK(body["audit_emitted"].get<bool>() == true);
+    CHECK(!res->has_header("Sec-Audit-Failed"));
 
     REQUIRE(h.revoke_calls.size() == 1);
     CHECK(h.revoke_calls[0].username == "alice");
@@ -321,7 +339,8 @@ TEST_CASE("REST DELETE /api/v1/sessions: 503 when callback unwired",
         auto perm_fn = [](const httplib::Request&, httplib::Response&,
                           const std::string&, const std::string&) { return true; };
         auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                           const std::string&, const std::string&, const std::string&) {};
+                           const std::string&, const std::string&,
+                           const std::string&) -> bool { return true; };
         api2.register_routes(
             sink2, auth_fn, perm_fn, audit_fn, nullptr, nullptr, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, {}, {}, nullptr, nullptr,
@@ -475,4 +494,117 @@ TEST_CASE("REST DELETE /api/v1/sessions/me: idempotent (count=0)",
     CHECK(res->status == 200);
     CHECK(h.json_body(res)["revoked"].get<int64_t>() == 0);
     CHECK(h.json_body(res)["api_tokens_revoked"].get<int64_t>() == 0);
+}
+
+// ── HIGH-2: audit-emission failure paths ─────────────────────────────────
+//
+// SOC 2 CC6.6/CC7.2 evidence integrity: a 200 OK response that hides a
+// lost audit row produces fictional evidence. The handler must surface
+// the failure via the `Sec-Audit-Failed: true` response header and the
+// `audit_emitted: false` body field. The revoke side-effect still
+// happens (operator's "stop NOW" semantics) — only the evidence path
+// is marked partial.
+
+TEST_CASE("REST DELETE /api/v1/sessions: silent audit failure surfaces audit_emitted=false",
+          "[rest][session][revoke][high-2][audit-fail]") {
+    RestSessionsHarness h;
+    h.session_user = "root";
+    h.session_role = auth::Role::admin;
+    h.revoke_returns = {/*cookie=*/3, /*api_tokens=*/0, /*db_persisted=*/true};
+    h.audit_should_emit = false; // simulate audit DB locked / disk full
+
+    auto res = h.sink.Delete("/api/v1/sessions?username=alice");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // Revoke still happened — operator's "stop NOW" intent took effect.
+    REQUIRE(h.revoke_calls.size() == 1);
+    CHECK(h.revoke_calls[0].username == "alice");
+
+    // SOC 2 CC6.6 evidence-integrity contract.
+    auto body = h.json_body(res);
+    CHECK(body["audit_emitted"].get<bool>() == false);
+    CHECK(body["revoked"].get<int64_t>() == 3);
+    CHECK(body["db_persisted"].get<bool>() == true);
+    REQUIRE(res->has_header("Sec-Audit-Failed"));
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    // Audit was attempted (the lambda was invoked and recorded the call)
+    // even though it returned false — the failure is in persistence, not
+    // attempt. Tests pin this to prevent a regression where we skip
+    // calling audit_fn entirely on an upstream-degraded code path.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "session.revoke_all");
+}
+
+TEST_CASE("REST DELETE /api/v1/sessions: audit_fn exception surfaces audit_emitted=false",
+          "[rest][session][revoke][high-2][audit-fail]") {
+    RestSessionsHarness h;
+    h.session_user = "root";
+    h.session_role = auth::Role::admin;
+    h.revoke_returns = {2, 0, true};
+    h.audit_should_throw = true; // simulate audit pipeline exception
+
+    auto res = h.sink.Delete("/api/v1/sessions?username=alice");
+    REQUIRE(res);
+    // Critical: an exception in the audit emission path MUST NOT escape
+    // to the client as 500 — the revoke succeeded, the response must
+    // still convey that fact (with the audit-failure header).
+    CHECK(res->status == 200);
+    auto body = h.json_body(res);
+    CHECK(body["audit_emitted"].get<bool>() == false);
+    CHECK(body["revoked"].get<int64_t>() == 2);
+    REQUIRE(res->has_header("Sec-Audit-Failed"));
+}
+
+TEST_CASE("REST DELETE /api/v1/sessions/me: silent audit failure surfaces audit_emitted=false",
+          "[rest][session][revoke][me][high-2][audit-fail]") {
+    RestSessionsHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+    h.revoke_returns = {1, 2, true};
+    h.audit_should_emit = false;
+
+    auto res = h.sink.Delete("/api/v1/sessions/me");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = h.json_body(res);
+    CHECK(body["audit_emitted"].get<bool>() == false);
+    CHECK(body["revoked"].get<int64_t>() == 1);
+    CHECK(body["api_tokens_revoked"].get<int64_t>() == 2);
+    REQUIRE(res->has_header("Sec-Audit-Failed"));
+    // CC6.7 cookie-clear still fires on the failure path — the operator
+    // is still signing out, evidence integrity is a separate concern.
+    REQUIRE(res->has_header("Set-Cookie"));
+    CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") != std::string::npos);
+}
+
+TEST_CASE("REST DELETE /api/v1/sessions/me: audit_fn exception surfaces audit_emitted=false",
+          "[rest][session][revoke][me][high-2][audit-fail]") {
+    RestSessionsHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+    h.revoke_returns = {1, 0, true};
+    h.audit_should_throw = true;
+
+    auto res = h.sink.Delete("/api/v1/sessions/me");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = h.json_body(res);
+    CHECK(body["audit_emitted"].get<bool>() == false);
+    REQUIRE(res->has_header("Sec-Audit-Failed"));
+}
+
+TEST_CASE("REST DELETE /api/v1/sessions: missing username 400 is NOT marked audit-failed",
+          "[rest][session][revoke][validation][high-2]") {
+    // Validation errors are caught before audit emission — there's no
+    // audit row to lose, so `Sec-Audit-Failed` must be absent.
+    RestSessionsHarness h;
+    h.session_user = "root";
+    h.session_role = auth::Role::admin;
+    h.audit_should_emit = false; // would fail IF we reached audit_fn
+
+    auto res = h.sink.Delete("/api/v1/sessions");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(!res->has_header("Sec-Audit-Failed"));
+    CHECK(h.audit_log.empty());
 }

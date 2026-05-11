@@ -51,7 +51,15 @@ public:
 
     bool is_open() const;
 
-    void log(const AuditEvent& event);
+    /// Persist an audit event. Returns true iff the row was written. The
+    /// bool return is part of the SOC 2 CC6.6/CC7.2 evidence-integrity
+    /// chain: handlers that emit an audit row as their compliance evidence
+    /// MUST be able to detect a silent persist failure (audit DB locked,
+    /// disk full, !db_) and surface it to the caller. Pre-PR #883 this
+    /// returned void and the failure was only visible via the global
+    /// `emit_failed_count()` gauge — which doesn't tell the specific
+    /// request whether its row landed.
+    [[nodiscard]] bool log(const AuditEvent& event);
     std::vector<AuditEvent> query(const AuditQuery& q = {}) const;
     std::size_t total_count() const;
 
