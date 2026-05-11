@@ -313,6 +313,485 @@ mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em;
 }
 .frontmatter { border-left-color: var(--hex-indigo); }
 
+/* ── Diagrams — shared primitives for ASCII-art redraws ─────────────────── */
+figure.diagram {
+  margin: 1.5em 0;
+  padding: 1em;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+}
+figure.diagram figcaption {
+  margin-top: 0.75em;
+  padding-top: 0.5em;
+  border-top: 1px solid var(--border);
+  font-size: 0.85em;
+  font-style: italic;
+  color: var(--fg-muted);
+}
+figure.diagram .row {
+  display: flex;
+  gap: 0.75em;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin: 0.6em 0;
+}
+figure.diagram .row-agents,
+figure.diagram .row-three { gap: 1em; }
+figure.diagram .row-three > * { flex: 1 1 220px; }
+figure.diagram .col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5em;
+}
+figure.diagram .arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--rule);
+  font-weight: 700;
+  font-size: 1.2em;
+}
+figure.diagram .arrow.right::after { content: "→"; }
+figure.diagram .arrow.left::after  { content: "←"; }
+figure.diagram .arrow.down::after  { content: "↓"; }
+figure.diagram .arrow.up::after    { content: "↑"; }
+figure.diagram .arrow.centered {
+  display: flex;
+  width: 100%;
+  justify-content: center;
+}
+figure.diagram .arrow .edge-label {
+  margin-left: 0.4em;
+  font-size: 0.8em;
+  font-style: italic;
+  font-weight: 400;
+  color: var(--fg-muted);
+}
+figure.diagram .caption-wire {
+  text-align: center;
+  font-size: 0.85em;
+  color: var(--fg-muted);
+  margin: 0.25em 0;
+}
+figure.diagram .box {
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: 0.55em 0.75em;
+  font-size: 0.9em;
+  line-height: 1.35;
+  min-width: 7em;
+}
+figure.diagram .box.small {
+  padding: 0.35em 0.6em;
+  font-size: 0.85em;
+  min-width: 5em;
+}
+figure.diagram .box .box-title {
+  display: block;
+  font-weight: 700;
+  color: var(--h2-fg);
+  margin-bottom: 0.2em;
+  font-size: 0.95em;
+}
+figure.diagram .box.boundary,
+figure.diagram .boundary {
+  border: 2px dashed var(--rule);
+  background: var(--bg-soft);
+  padding: 0.9em 1em;
+}
+figure.diagram .boundary > .boundary-title {
+  display: block;
+  font-weight: 700;
+  color: var(--rule);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.8em;
+  margin: 0 0 0.6em;
+}
+figure.diagram .boundary-server { border-color: var(--hex-french-blue); }
+figure.diagram .boundary-server > .boundary-title { color: var(--hex-french-blue); }
+figure.diagram .boundary-inner {
+  border-style: solid;
+  border-color: var(--hex-indigo);
+}
+figure.diagram .boundary-inner > .boundary-title { color: var(--hex-indigo); }
+figure.diagram .grid {
+  display: grid;
+  gap: 0.55em;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+figure.diagram .grid-frontends { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+figure.diagram .grid-core      { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+figure.diagram .grid-server    { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+figure.diagram .chip {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 0.4em 0.6em;
+  font-size: 0.85em;
+}
+figure.diagram .chip code { background: transparent; border: 0; padding: 0; }
+figure.diagram .actor {
+  border: 1.5px solid var(--hex-indigo);
+  border-radius: 50px;
+  padding: 0.5em 1em;
+  background: var(--bg);
+  text-align: center;
+  font-size: 0.9em;
+}
+figure.diagram .actor.wide { padding: 0.6em 1.5em; }
+figure.diagram ul.bare {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+figure.diagram ul.bare.small { font-size: 0.8em; }
+figure.diagram ul.bare li { margin: 0.15em 0; }
+figure.diagram .ellipsis {
+  font-size: 1.3em;
+  color: var(--fg-muted);
+  align-self: center;
+  padding: 0 0.3em;
+}
+figure.diagram .gw-list { display: flex; flex-direction: column; gap: 0.3em; }
+figure.diagram .box.agent { border-left: 4px solid var(--hex-french-blue); }
+figure.diagram .box.gw-node { border-left: 4px solid var(--hex-gold); }
+figure.diagram .box.state {
+  border: 2px solid var(--hex-indigo);
+  border-radius: 14px;
+  padding: 0.6em 1em;
+  background: var(--bg);
+  display: block;
+  text-align: center;
+}
+figure.diagram .state-terminal { border-color: var(--error); }
+figure.diagram ol.state-flow {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25em;
+}
+figure.diagram ol.state-flow > li { width: 100%; max-width: 28em; }
+figure.diagram .state-arrow { padding: 0.2em 0; font-size: 0.95em; }
+
+/* Trees */
+figure.diagram ul.tree,
+figure.diagram ul.tree ul {
+  list-style: none;
+  padding-left: 1.4em;
+  margin: 0;
+  position: relative;
+  font-size: 0.9em;
+  line-height: 1.55;
+}
+figure.diagram ul.tree li {
+  position: relative;
+  padding: 0.05em 0 0.05em 0.9em;
+}
+figure.diagram ul.tree li::before {
+  content: "";
+  position: absolute;
+  left: -0.05em;
+  top: 0;
+  width: 0.9em;
+  height: 0.9em;
+  border-left: 1.5px solid var(--border);
+  border-bottom: 1.5px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+figure.diagram ul.tree li:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: -0.05em;
+  top: 0.9em;
+  bottom: 0;
+  border-left: 1.5px solid var(--border);
+}
+figure.diagram ul.tree .node {
+  color: var(--h2-fg);
+  font-weight: 600;
+}
+figure.diagram ul.tree .desc {
+  color: var(--fg-muted);
+  font-size: 0.9em;
+  margin-left: 0.4em;
+}
+figure.diagram ul.tree li.section { margin-top: 0.4em; }
+figure.diagram h4.tree-root {
+  font-size: 0.95em;
+  color: var(--h2-fg);
+  margin: 0.8em 0 0.3em;
+  border: 0;
+  padding: 0;
+}
+figure.diagram .tree-grid {
+  display: grid;
+  gap: 1em;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+figure.diagram .tree-prose { margin: 0.1em 0 0.5em; }
+figure.diagram p.tree-prose { font-size: 0.9em; color: var(--fg-muted); }
+figure.diagram .badge {
+  display: inline-block;
+  padding: 0.05em 0.5em;
+  border-radius: 999px;
+  font-size: 0.75em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-left: 0.4em;
+  vertical-align: middle;
+}
+figure.diagram .badge.ok    { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }
+figure.diagram .badge.warn  { background: var(--hex-yellow); color: var(--hex-black); }
+figure.diagram .badge.err   { background: var(--error-bg);   color: var(--error);   border: 1px solid var(--error-border); }
+figure.diagram .badge.done  { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }
+figure.diagram .badge.muted { background: var(--bg-soft);    color: var(--fg-muted);border: 1px solid var(--border); }
+figure.diagram .tag {
+  display: inline-block;
+  padding: 0 0.45em;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75em;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  margin-right: 0.3em;
+  vertical-align: 0.05em;
+}
+figure.diagram .tag.new  { background: var(--success); color: white; }
+figure.diagram .tag.edit { background: var(--hex-french-blue); color: white; }
+
+/* Swimlane (two parallel timelines) */
+figure.diagram .swimlane.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1em 1.5em;
+}
+figure.diagram .swimlane .lane {
+  border-left: 3px solid var(--rule);
+  padding-left: 0.9em;
+}
+figure.diagram .swimlane .lane:nth-child(2) { border-left-color: var(--accent); }
+figure.diagram .swimlane .lane-title {
+  font-size: 0.8em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  color: var(--rule);
+  margin: 0 0 0.5em;
+}
+figure.diagram .swimlane .lane:nth-child(2) .lane-title { color: var(--accent); }
+figure.diagram .swimlane ol.lane-steps {
+  list-style: decimal;
+  padding-left: 1.4em;
+  margin: 0;
+  font-size: 0.9em;
+}
+figure.diagram .swimlane li.phase {
+  list-style: none;
+  margin: 0.4em 0;
+  padding: 0.4em 0.6em;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+figure.diagram .swimlane li.phase ul.bare { font-size: 0.9em; }
+figure.diagram .swimlane li.phase .ok { color: var(--success); font-weight: 700; }
+figure.diagram .swimlane .lane-cross {
+  font-size: 0.8em;
+  color: var(--fg-muted);
+  font-style: italic;
+  margin: 0.25em 0 0;
+}
+
+/* Layered (numbered layer cards) */
+figure.diagram ol.layered {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+}
+figure.diagram ol.layered .layer {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg);
+  padding: 0.6em 0.9em;
+}
+figure.diagram ol.layered .layer-title {
+  font-weight: 700;
+  color: var(--h2-fg);
+  font-size: 0.95em;
+  margin: 0 0 0.3em;
+}
+
+/* Flow (vertical step list with optional branching row) */
+figure.diagram ol.flow {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35em;
+  align-items: stretch;
+}
+figure.diagram ol.flow .box.step {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5em 0.75em;
+  font-size: 0.9em;
+}
+figure.diagram .row.branch { gap: 0.6em; }
+figure.diagram .row.branch > * { flex: 1 1 200px; }
+figure.diagram .branch-left.ok  { border-left: 3px solid var(--success); }
+figure.diagram .branch-right.warn,
+figure.diagram .branch-right    { border-left: 3px solid var(--hex-yellow); }
+
+/* TAR plugin row */
+figure.diagram .row-tar { align-items: stretch; }
+figure.diagram .timer-list li { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; padding: 0.2em 0; }
+figure.diagram .tar-outputs li { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; padding: 0.15em 0; }
+figure.diagram .tar-outputs li.separator { color: var(--fg-muted); }
+figure.diagram .indent { padding-left: 1.5em; color: var(--fg-muted); }
+figure.diagram .box.boundary.tar-plugin { padding: 0.7em 0.9em; }
+
+/* UI mockups */
+figure.diagram .mockup {
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  width: 100%;
+}
+figure.diagram .mockup.wide { flex: 1 1 600px; }
+figure.diagram .mockup-row {
+  padding: 0.6em 0.85em;
+  border-top: 1px solid var(--border);
+  font-size: 0.85em;
+}
+figure.diagram .mockup-row:first-child { border-top: 0; }
+figure.diagram .mockup-header { background: var(--bg-soft); }
+figure.diagram .mockup-frame-title {
+  display: block;
+  font-weight: 700;
+  color: var(--h2-fg);
+  font-size: 0.85em;
+  margin-bottom: 0.3em;
+}
+figure.diagram .mockup-sub { color: var(--fg-muted); font-size: 0.85em; margin: 0.2em 0; }
+figure.diagram .mockup-actions { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; }
+figure.diagram .mockup-actions.right { float: right; }
+figure.diagram .right { float: right; }
+figure.diagram .mockup-pre {
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-radius: 4px;
+  padding: 0.5em 0.75em;
+  font-size: 0.8em;
+  margin: 0.3em 0 0;
+  overflow-x: auto;
+}
+figure.diagram .mockup-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.3em 0;
+  font-size: 0.85em;
+}
+figure.diagram .mockup-table th,
+figure.diagram .mockup-table td {
+  border: 1px solid var(--border);
+  padding: 0.25em 0.5em;
+  text-align: left;
+}
+figure.diagram .mockup-table thead { background: var(--table-header); }
+figure.diagram .mock-nav {
+  flex: 0 0 220px;
+  font-size: 0.85em;
+}
+figure.diagram .mock-nav li.active {
+  font-weight: 700;
+  color: var(--h2-fg);
+  border-left: 3px solid var(--accent);
+  padding-left: 0.4em;
+}
+figure.diagram .row-mock { align-items: stretch; }
+figure.diagram .mockup-kpis { display: flex; gap: 0.6em; flex-wrap: wrap; }
+figure.diagram .kpi {
+  flex: 1 1 100px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4em 0.6em;
+  background: var(--bg);
+  text-align: center;
+}
+figure.diagram .kpi.warn { border-color: var(--hex-yellow); }
+figure.diagram .kpi.err  { border-color: var(--error);     }
+figure.diagram .kpi-value { font-size: 1.2em; font-weight: 700; color: var(--h2-fg); }
+figure.diagram .kpi-label { font-size: 0.75em; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+figure.diagram .kpi-bar {
+  background: var(--bg-soft);
+  height: 4px;
+  border-radius: 2px;
+  margin-top: 0.3em;
+  overflow: hidden;
+}
+figure.diagram .kpi-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--success);
+}
+figure.diagram .mockup-twocol {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6em 1em;
+}
+figure.diagram .rule-list, figure.diagram .event-list, figure.diagram .pr-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.85em;
+}
+figure.diagram .rule-list li, figure.diagram .event-list li, figure.diagram .pr-list li {
+  padding: 0.25em 0;
+  border-bottom: 1px solid var(--border);
+}
+figure.diagram .rule-list li:last-child,
+figure.diagram .event-list li:last-child,
+figure.diagram .pr-list li:last-child { border-bottom: 0; }
+figure.diagram .dot { font-size: 0.9em; }
+figure.diagram .dot.ok    { color: var(--success); }
+figure.diagram .dot.drift { color: var(--hex-yellow); }
+figure.diagram .dot.alert { color: var(--error); }
+figure.diagram .dot.off   { color: var(--fg-muted); }
+figure.diagram .legend { font-size: 0.8em; color: var(--fg-muted); margin: 0.5em 0 0; }
+figure.diagram .approval { padding: 0.4em 0.5em; background: var(--bg-soft); border-radius: 4px; }
+figure.diagram .boundary-rule {
+  text-align: center;
+  font-size: 0.8em;
+  color: var(--fg-muted);
+  letter-spacing: 0.1em;
+  margin: 0.5em 0;
+  text-transform: uppercase;
+}
+figure.diagram .boundary-top    { border-color: var(--hex-french-blue); }
+figure.diagram .boundary-bottom { border-color: var(--hex-indigo); }
+figure.diagram .row-edges { gap: 2em; align-items: flex-start; }
+figure.diagram .row-edges .edge { display: flex; flex-direction: column; align-items: center; gap: 0.3em; }
+figure.diagram .row-edges .edge-label { font-size: 0.8em; color: var(--fg-muted); text-align: center; }
+figure.diagram .row-fanout { gap: 0.6em; align-items: center; }
+figure.diagram .row-fanout .gw-list { flex: 0 0 auto; }
+
 /* Inline doc-reference linkifier — keeps the original <code> chip styling but
    makes the surrounding anchor obvious by colouring the text french-blue. */
 a.doc-ref { text-decoration: none; }
@@ -433,19 +912,30 @@ surface inventory are deliberate content, not accidental disclosures.
 <h2 id="2-two-categories-of-guard">2. Two categories of guard</h2>
 <p>Not all detections are the same. A firewall rule change happens instantaneously and can be caught by a kernel notification. But "software hasn't been updated in 30 days" is a time-based condition that requires periodic evaluation. The architecture supports both via two guard categories.</p>
 <p>The guard types below are Windows-specific. See Section 15 for Linux equivalents and Section 19 for macOS equivalents. The two-category model (event guards vs condition guards) is identical across all platforms.</p>
-<div class="highlight"><pre><span></span><code>Guards
-├── Event Guards (real-time, kernel-backed user-mode APIs)
-│   ├── Registry Guard       RegNotifyChangeKeyValue          ~0ms latency
-│   ├── ETW Guard            OpenTrace / ProcessTrace          ~1-5ms latency
-│   ├── WFP Guard            FwpmFilterSubscribeChanges0       ~0ms latency
-│   └── SCM Guard            NotifyServiceStatusChange         ~0ms latency
-│
-└── Condition Guards (periodic evaluation on a schedule)
-    ├── Process Guard         ToolHelp32 snapshot + ETW hybrid  configurable interval
-    ├── Software Guard        Registry Uninstall keys + WMI     configurable interval
-    ├── Compliance Guard      Event Log query + WMI query       configurable interval
-    └── WMI Guard             Arbitrary WMI query evaluation    configurable interval
-</code></pre></div>
+<figure class="diagram tree-figure" aria-label="Guardian guard catalogue split into Event Guards (real-time, kernel-backed user-mode APIs — Registry, ETW, WFP, SCM, ~0–5ms latency) and Condition Guards (periodic evaluation on a schedule — Process, Software, Compliance, WMI).">
+  <div class="tree-grid">
+    <div>
+      <h4 class="tree-root">Event Guards <small>(real-time, kernel-backed user-mode APIs)</small></h4>
+      <ul class="tree">
+        <li><span class="node">Registry Guard</span> <code>RegNotifyChangeKeyValue</code> <span class="badge ok">~0 ms latency</span></li>
+        <li><span class="node">ETW Guard</span> <code>OpenTrace / ProcessTrace</code> <span class="badge ok">~1–5 ms latency</span></li>
+        <li><span class="node">WFP Guard</span> <code>FwpmFilterSubscribeChanges0</code> <span class="badge ok">~0 ms latency</span></li>
+        <li><span class="node">SCM Guard</span> <code>NotifyServiceStatusChange</code> <span class="badge ok">~0 ms latency</span></li>
+      </ul>
+    </div>
+    <div>
+      <h4 class="tree-root">Condition Guards <small>(periodic evaluation on a schedule)</small></h4>
+      <ul class="tree">
+        <li><span class="node">Process Guard</span> <code>ToolHelp32 snapshot + ETW hybrid</code> <span class="desc">configurable interval</span></li>
+        <li><span class="node">Software Guard</span> <code>Registry Uninstall keys + WMI</code> <span class="desc">configurable interval</span></li>
+        <li><span class="node">Compliance Guard</span> <code>Event Log query + WMI query</code> <span class="desc">configurable interval</span></li>
+        <li><span class="node">WMI Guard</span> <code>Arbitrary WMI query evaluation</code> <span class="desc">configurable interval</span></li>
+      </ul>
+    </div>
+  </div>
+  <figcaption>Guardian guard catalogue — Event Guards (real-time kernel-backed) and Condition Guards (periodic).</figcaption>
+</figure>
+
 <p><strong>Event guards</strong> block on kernel wait handles and fire within microseconds of a change. They are appropriate for configuration settings that can change at any moment and must be immediately reverted.</p>
 <p><strong>Condition guards</strong> run on a configurable schedule (default intervals vary by type: 30s for process checks, 3600s for software freshness). They evaluate a condition against a threshold and raise a drift event if the condition is not met. They are appropriate for time-based compliance checks where "within X hours/days" is the requirement.</p>
 <p><strong>Hybrid guards:</strong> The Process Guard is a hybrid. It uses the <code>Microsoft-Windows-Kernel-Process</code> ETW provider (event IDs 1/2 for process start/stop) for near-real-time detection, backed by a periodic <code>CreateToolhelp32Snapshot</code> poll for safety. If a required process terminates, the ETW event fires within milliseconds; the periodic poll catches cases where the process was never started or the ETW session missed an event.</p>
@@ -453,135 +943,186 @@ surface inventory are deliberate content, not accidental disclosures.
 <hr>
 <h2 id="3-architecture-overview">3. Architecture overview</h2>
 <h3 id="31-agent-side-component-hierarchy">3.1 Agent-side component hierarchy</h3>
-<div class="highlight"><pre><span></span><code>Yuzu Agent
-├── Plugin Host (existing — 44 plugins, C ABI)
-├── Trigger Engine (existing — interval, file, evtlog triggers)
-├── Comms / gRPC (existing — bidirectional stream)
-├── KV Storage (existing — SQLite, reused for policy cache)
-│
-└── Yuzu Guardian (NEW)
-    │
-    ├── Policy Cache
-    │   ├── SQLite table in existing KV store
-    │   ├── Versioned rules with HMAC signatures
-    │   └── Full offline operation — no network dependency
-    │
-    ├── Guard Manager
-    │   ├── Instantiates guards based on active policy rules
-    │   ├── Routes guard events to the State Evaluator
-    │   ├── Manages guard lifecycle (start/stop/restart)
-    │   │
-    │   ├── Event Guards (real-time)
-    │   │   ├── Registry Guard
-    │   │   ├── ETW Guard
-    │   │   ├── WFP Guard
-    │   │   └── SCM Guard
-    │   │
-    │   ├── Condition Guards (periodic)
-    │   │   ├── Process Guard (hybrid: ETW + periodic poll)
-    │   │   ├── Software Guard
-    │   │   ├── Compliance Guard
-    │   │   └── WMI Guard
-    │   │
-    │   └── Reconciliation Guard (periodic full-state check, safety net)
-    │
-    ├── State Evaluator
-    │   ├── Compares detected state against policy assertion
-    │   ├── Returns: compliant | drift | exempt
-    │   └── Assertion type registry (extensible)
-    │
-    ├── Remediation Engine
-    │   ├── Executes corrective action (in-process, no server round-trip)
-    │   ├── Delegates failure handling to Resilience Strategy
-    │   └── Re-entrancy protection (suppresses self-triggered events)
-    │
-    ├── Resilience Strategy (per-rule configurable)
-    │   ├── Fixed — N failures then cooldown + alert
-    │   ├── Backoff — exponential delay, never gives up
-    │   ├── Escalation — try method A, then B, then C, then terminal action
-    │   └── Race Detector — sliding window drift rate tracking
-    │
-    └── Audit Journal
-        ├── Local SQLite journal (sequential IDs, HMAC integrity)
-        ├── Async writes (fire-and-forget from guard threads)
-        └── Batch sync to server when online
-</code></pre></div>
+<figure class="diagram tree-figure" aria-label="Yuzu Agent with Guardian: existing Plugin Host, Trigger Engine, gRPC Comms, and KV Storage; new Yuzu Guardian subsystem composed of Policy Cache, Guard Manager (with Event Guards Registry/ETW/WFP/SCM, Condition Guards Process/Software/Compliance/WMI, and a Reconciliation Guard), State Evaluator, Remediation Engine, Resilience Strategy (Fixed/Backoff/Escalation/Race Detector), and an Audit Journal.">
+  <ul class="tree" role="tree">
+    <li role="treeitem"><span class="node">Yuzu Agent</span>
+      <ul role="group">
+        <li><span class="node">Plugin Host</span> <span class="desc">existing — 44 plugins, C ABI</span></li>
+        <li><span class="node">Trigger Engine</span> <span class="desc">existing — interval, file, evtlog triggers</span></li>
+        <li><span class="node">Comms / gRPC</span> <span class="desc">existing — bidirectional stream</span></li>
+        <li><span class="node">KV Storage</span> <span class="desc">existing — SQLite, reused for policy cache</span></li>
+        <li role="treeitem"><span class="node">Yuzu Guardian</span> <span class="tag new">NEW</span>
+          <ul role="group">
+            <li role="treeitem"><span class="node">Policy Cache</span>
+              <ul>
+                <li>SQLite table in existing KV store</li>
+                <li>Versioned rules with HMAC signatures</li>
+                <li>Full offline operation — no network dependency</li>
+              </ul>
+            </li>
+            <li role="treeitem"><span class="node">Guard Manager</span>
+              <ul>
+                <li>Instantiates guards based on active policy rules</li>
+                <li>Routes guard events to the State Evaluator</li>
+                <li>Manages guard lifecycle (start / stop / restart)</li>
+                <li role="treeitem"><span class="node">Event Guards</span> <span class="desc">real-time</span>
+                  <ul><li>Registry Guard</li><li>ETW Guard</li><li>WFP Guard</li><li>SCM Guard</li></ul>
+                </li>
+                <li role="treeitem"><span class="node">Condition Guards</span> <span class="desc">periodic</span>
+                  <ul><li>Process Guard <span class="desc">hybrid: ETW + periodic poll</span></li><li>Software Guard</li><li>Compliance Guard</li><li>WMI Guard</li></ul>
+                </li>
+                <li><span class="node">Reconciliation Guard</span> <span class="desc">periodic full-state check, safety net</span></li>
+              </ul>
+            </li>
+            <li role="treeitem"><span class="node">State Evaluator</span>
+              <ul>
+                <li>Compares detected state against policy assertion</li>
+                <li>Returns: <code>compliant</code> | <code>drift</code> | <code>exempt</code></li>
+                <li>Assertion type registry (extensible)</li>
+              </ul>
+            </li>
+            <li role="treeitem"><span class="node">Remediation Engine</span>
+              <ul>
+                <li>Executes corrective action (in-process, no server round-trip)</li>
+                <li>Delegates failure handling to Resilience Strategy</li>
+                <li>Re-entrancy protection (suppresses self-triggered events)</li>
+              </ul>
+            </li>
+            <li role="treeitem"><span class="node">Resilience Strategy</span> <span class="desc">per-rule configurable</span>
+              <ul>
+                <li><strong>Fixed</strong> — N failures then cooldown + alert</li>
+                <li><strong>Backoff</strong> — exponential delay, never gives up</li>
+                <li><strong>Escalation</strong> — try method A, then B, then C, then terminal action</li>
+                <li><strong>Race Detector</strong> — sliding window drift rate tracking</li>
+              </ul>
+            </li>
+            <li role="treeitem"><span class="node">Audit Journal</span>
+              <ul>
+                <li>Local SQLite journal (sequential IDs, HMAC integrity)</li>
+                <li>Async writes (fire-and-forget from guard threads)</li>
+                <li>Batch sync to server when online</li>
+              </ul>
+            </li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <figcaption>Agent-side Guardian architecture — existing agent capabilities plus the new Yuzu Guardian subsystem.</figcaption>
+</figure>
+
 <h3 id="32-data-flow">3.2 Data flow</h3>
-<div class="highlight"><pre><span></span><code>Server ──push──▶ Policy Cache (local SQLite)
-                      │
-              Guard Manager reads active rules,
-              starts appropriate guards
-                      │
-              ┌───────┴────────┐
-              │                │
-        Event Guard       Condition Guard
-        (kernel wait)     (scheduled timer)
-              │                │
-              └───────┬────────┘
-                      │
-              Guard fires ──▶ State Evaluator
-                                    │
-                              Compare actual vs desired
-                                    │
-                              ┌─ Compliant ──▶ no-op
-                              └─ Drift ──▶ Remediation Engine
-                                               │
-                                         Execute corrective action
-                                         Write audit event (async)
-                                         Re-arm guard
-</code></pre></div>
+<figure class="diagram flow-figure" aria-label="Guardian runtime flow: Server pushes a policy into the local SQLite Policy Cache. Guard Manager reads active rules and starts the appropriate guards (event-driven or scheduled). When a guard fires, the State Evaluator compares actual vs desired state — Compliant becomes a no-op, Drift hands off to the Remediation Engine which executes the corrective action, writes the audit event asynchronously, and re-arms the guard.">
+  <ol class="flow">
+    <li><div class="box step">Server <span class="edge-label">push</span> ▶ Policy Cache <small>(local SQLite)</small></div></li>
+    <li><div class="box step">Guard Manager reads active rules, starts appropriate guards</div></li>
+    <li>
+      <div class="row branch">
+        <div class="box step branch-left"><strong>Event Guard</strong><br><small>kernel wait</small></div>
+        <div class="box step branch-right"><strong>Condition Guard</strong><br><small>scheduled timer</small></div>
+      </div>
+    </li>
+    <li><div class="box step">Guard fires → <strong>State Evaluator</strong></div></li>
+    <li><div class="box step">Compare actual vs desired</div></li>
+    <li>
+      <div class="row branch">
+        <div class="box step branch-left ok"><strong>Compliant</strong> → no-op</div>
+        <div class="box step branch-right warn"><strong>Drift</strong> → Remediation Engine
+          <ul class="bare small">
+            <li>Execute corrective action</li>
+            <li>Write audit event (async)</li>
+            <li>Re-arm guard</li>
+          </ul>
+        </div>
+      </div>
+    </li>
+  </ol>
+  <figcaption>Guardian runtime — push policy, start guards, evaluate state, remediate drift in-process.</figcaption>
+</figure>
+
 <h3 id="33-server-side-additions">3.3 Server-side additions</h3>
-<div class="highlight"><pre><span></span><code>Yuzu Server (existing)
-│
-├── Guaranteed State Store (NEW — SQLite table)
-│   ├── Rule CRUD (yaml_source + denormalised columns)
-│   └── Fleet compliance state aggregation
-│
-├── REST API v1 additions (NEW endpoints)
-│   ├── /api/v1/guaranteed-state/rules          CRUD
-│   ├── /api/v1/guaranteed-state/push           Distribute to agents
-│   ├── /api/v1/guaranteed-state/status         Fleet compliance
-│   ├── /api/v1/guaranteed-state/events         Drift/remediation events
-│   └── /api/v1/guaranteed-state/alerts         Active alerts
-│
-├── Dashboard additions (NEW page)
-│   ├── /guaranteed-state                       Main page
-│   ├── /guaranteed-state/rules/:id             Rule detail
-│   ├── /guaranteed-state/alerts                Alert timeline
-│   └── HTMX fragments for all interactive elements
-│
-└── MCP tool additions
-    ├── get_guaranteed_state_status              Fleet compliance
-    ├── list_guaranteed_state_rules              Rule listing
-    └── get_guaranteed_state_alerts              Active alerts
-</code></pre></div>
+<figure class="diagram tree-figure" aria-label="Server-side Guardian additions: new SQLite Guaranteed State Store, new REST endpoints under /api/v1/guaranteed-state/* (rules, push, status, events, alerts), new dashboard pages under /guaranteed-state, and new MCP tools (get_guaranteed_state_status, list_guaranteed_state_rules, get_guaranteed_state_alerts).">
+  <ul class="tree" role="tree">
+    <li role="treeitem"><span class="node">Yuzu Server</span> <span class="desc">existing</span>
+      <ul role="group">
+        <li role="treeitem"><span class="node">Guaranteed State Store</span> <span class="tag new">NEW</span> <span class="desc">SQLite table</span>
+          <ul><li>Rule CRUD (yaml_source + denormalised columns)</li><li>Fleet compliance state aggregation</li></ul>
+        </li>
+        <li role="treeitem"><span class="node">REST API v1 additions</span> <span class="tag new">NEW endpoints</span>
+          <ul>
+            <li><code>/api/v1/guaranteed-state/rules</code> — CRUD</li>
+            <li><code>/api/v1/guaranteed-state/push</code> — Distribute to agents</li>
+            <li><code>/api/v1/guaranteed-state/status</code> — Fleet compliance</li>
+            <li><code>/api/v1/guaranteed-state/events</code> — Drift/remediation events</li>
+            <li><code>/api/v1/guaranteed-state/alerts</code> — Active alerts</li>
+          </ul>
+        </li>
+        <li role="treeitem"><span class="node">Dashboard additions</span> <span class="tag new">NEW page</span>
+          <ul>
+            <li><code>/guaranteed-state</code> — Main page</li>
+            <li><code>/guaranteed-state/rules/:id</code> — Rule detail</li>
+            <li><code>/guaranteed-state/alerts</code> — Alert timeline</li>
+            <li>HTMX fragments for all interactive elements</li>
+          </ul>
+        </li>
+        <li role="treeitem"><span class="node">MCP tool additions</span>
+          <ul>
+            <li><code>get_guaranteed_state_status</code> — Fleet compliance</li>
+            <li><code>list_guaranteed_state_rules</code> — Rule listing</li>
+            <li><code>get_guaranteed_state_alerts</code> — Active alerts</li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <figcaption>Server-side Guardian additions — Guaranteed State Store, REST endpoints, dashboard pages, and MCP tools.</figcaption>
+</figure>
+
 <hr>
 <h2 id="4-boot-time-enforcement-pre-login-activation">4. Boot-time enforcement (pre-login activation)</h2>
 <p>The Guardian engine must be enforcing policies <strong>before any user can log in</strong>. The agent achieves this by splitting its initialisation into two phases:</p>
-<div class="highlight"><pre><span></span><code>Windows Boot Sequence                    Yuzu Agent
-─────────────────────                    ──────────
-Kernel + HAL init
-Session Manager (smss.exe)
-Service Control Manager starts
-    │
-    ├── Yuzu Agent service starts ──────▶ Phase 1: start_local()
-    │   (SERVICE_AUTO_START)                  │
-    │                                        ├── Open SQLite KV store
-    │                                        ├── Load policy cache
-    │                                        ├── Start all guards
-    │                                        ├── Run initial reconciliation
-    │                                        └── ENFORCING ✓
-    │
-    ├── Network stack initialises
-    │
-Winlogon shows login screen ───────────▶ Phase 2: sync_with_server()
-    │                                        │
-    │                                        ├── Connect gRPC
-    │                                        ├── Fetch policy updates
-    │                                        └── Flush audit journal
-    │
-User logs in ──────────────────────────▶ Already enforcing for ~30s+
-</code></pre></div>
+<figure class="diagram swimlane-figure" aria-label="Windows boot sequence vs Yuzu Agent: Kernel + HAL → Session Manager (smss.exe) → Service Control Manager starts the Yuzu Agent service (SERVICE_AUTO_START), which begins Phase 1 start_local — opens SQLite KV store, loads policy cache, starts all guards, runs initial reconciliation, reaches ENFORCING state. Network stack initialises, Winlogon shows login, then Phase 2 sync_with_server connects gRPC, fetches policy updates, flushes audit journal. User logs in; agent has already been enforcing for ~30s+.">
+  <div class="swimlane two-col">
+    <div class="lane">
+      <h4 class="lane-title">Windows Boot Sequence</h4>
+      <ol class="lane-steps">
+        <li>Kernel + HAL init</li>
+        <li>Session Manager <code>(smss.exe)</code></li>
+        <li>Service Control Manager starts</li>
+        <li>Network stack initialises</li>
+        <li>Winlogon shows login screen</li>
+        <li>User logs in</li>
+      </ol>
+    </div>
+    <div class="lane">
+      <h4 class="lane-title">Yuzu Agent</h4>
+      <ol class="lane-steps">
+        <li class="phase">
+          <strong>Phase 1: <code>start_local()</code></strong>
+          <ul class="bare">
+            <li>Open SQLite KV store</li>
+            <li>Load policy cache</li>
+            <li>Start all guards</li>
+            <li>Run initial reconciliation</li>
+            <li class="ok"><strong>ENFORCING ✓</strong></li>
+          </ul>
+          <p class="lane-cross">← Yuzu Agent service starts <small>(<code>SERVICE_AUTO_START</code>)</small></p>
+        </li>
+        <li class="phase">
+          <strong>Phase 2: <code>sync_with_server()</code></strong>
+          <ul class="bare">
+            <li>Connect gRPC</li>
+            <li>Fetch policy updates</li>
+            <li>Flush audit journal</li>
+          </ul>
+        </li>
+        <li><strong>Already enforcing for ~30s+</strong></li>
+      </ol>
+    </div>
+  </div>
+  <figcaption>Windows boot sequence aligned with Yuzu Agent startup phases.</figcaption>
+</figure>
+
 <p><strong>Phase 1 — Local enforcement (no network required):</strong>
 Called immediately on service start. Opens SQLite, loads cached rules, starts all guards. Requires only filesystem and the OS subsystems being watched (registry, ETW, WFP, SCM) — all available as soon as the kernel finishes. Takes &lt;1 second.</p>
 <p><strong>Phase 2 — Network sync (background, non-blocking):</strong>
@@ -1742,86 +2283,111 @@ GET    /api/v1/guaranteed-state/alerts             Active alerts
 <h2 id="10-dashboard-design">10. Dashboard design</h2>
 <p>The dashboard uses the existing HTMX paradigm (server-rendered HTML fragments).</p>
 <h3 id="101-main-page-guaranteed-state">10.1 Main page: <code>/guaranteed-state</code></h3>
-<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────────┐
-│  Guaranteed State                                     [+ New Rule]│
-├──────────────────────────────────────────────────────────────────┤
-│  Platform: [All ▼]  [W] 148 agents  [L] 30 agents  [M] 20 agents│
-├──────────────────────────────────────────────────────────────────┤
-│  ┌──────┐  ┌─────────┐  ┌───────┐  ┌──────┐  ┌──────────────┐  │
-│  │  42  │  │   39    │  │   2   │  │   1  │  │ ████████░ 93%│  │
-│  │ Rules│  │Compliant│  │Drifted│  │Errors│  │  Fleet comp. │  │
-│  └──────┘  └─────────┘  └───────┘  └──────┘  └──────────────┘  │
-├────────────────────────────┬─────────────────────────────────────┤
-│  Rules                     │  Recent events                      │
-│  ┌───────────────────────┐ │  ┌────────────────────────────────┐ │
-│  │ ● block-smb-445   [W] │ │  │ 10:42  DRIFT REMEDIATED       │ │
-│  │   Compliant · 148/148 │ │  │ block-smb-445 on DESKTOP-A3F  │ │
-│  │   [event] HIGH        │ │  │ Port 445 opened → blocked 2ms │ │
-│  ├───────────────────────┤ │  ├────────────────────────────────┤ │
-│  │ ● edr-agent-running[W]│ │  │ 10:41  DRIFT DETECTED         │ │
-│  │   Compliant · 148/148 │ │  │ av-scan-7d on LAPTOP-B92      │ │
-│  │   [hybrid] CRITICAL   │ │  │ Last scan 9d ago → triggered   │ │
-│  ├───────────────────────┤ │  ├────────────────────────────────┤ │
-│  │ ◐ ssh-no-root-login[L]│ │  │ 10:38  COMPLIANT              │ │
-│  │   2 drifted · 28/30   │ │  │ edr-agent-running on SRV-DC01 │ │
-│  │   [event] HIGH        │ │  │ CSFalconService.exe running ✓  │ │
-│  ├───────────────────────┤ │  ├────────────────────────────────┤ │
-│  │ ● macos-alf-on    [M] │ │  │ 10:35  RESILIENCE ESCALATED   │ │
-│  │   Compliant · 20/20   │ │  │ block-smb-445 on DESKTOP-K7M  │ │
-│  │   [event] HIGH        │ │  │ firewall-api → registry-write  │ │
-│  └───────────────────────┘ │  └────────────────────────────────┘ │
-│                            │                                     │
-│  Legend:                   │  [Show all events →]                │
-│  ● Compliant  ◐ Drifted   │                                     │
-│  ◉ Alert      ○ Disabled  │                                     │
-├────────────────────────────┴─────────────────────────────────────┤
-│  Push policies     Scope: [________________________]  [Push Now] │
-├──────────────────────────────────────────────────────────────────┤
-│  Pending approvals (1)                                           │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ block-rdp-new-policy    Submitted by admin@corp 2m ago     │  │
-│  │ action: enforce · scope: tag:workstations                  │  │
-│  │ [View YAML]              [Approve]  [Reject]               │  │
-│  └────────────────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
-</code></pre></div>
+<figure class="diagram mockup-figure" aria-label="Guaranteed State dashboard mockup: filter row (Platform All, 148 Windows, 30 Linux, 20 macOS agents), KPI strip (42 Rules, 39 Compliant, 2 Drifted, 1 Errors, 93% Fleet compliance), two columns — Rules list with status dot per row (block-smb-445 compliant, edr-agent-running compliant, ssh-no-root-login 2 drifted, macos-alf-on compliant) and Recent events timeline (DRIFT REMEDIATED, DRIFT DETECTED, COMPLIANT, RESILIENCE ESCALATED) — then a Push policies row with scope input and Push Now button, plus a Pending approvals section with one approval request (block-rdp-new-policy submitted by admin@corp 2m ago).">
+  <section class="mockup wide">
+    <div class="mockup-row mockup-header">
+      <header class="box-title">Guaranteed State</header>
+      <div class="mockup-actions right">[+ New Rule]</div>
+    </div>
+    <div class="mockup-row">
+      Platform: <strong>[All ▼]</strong>
+      <span class="chip">W · 148 agents</span>
+      <span class="chip">L · 30 agents</span>
+      <span class="chip">M · 20 agents</span>
+    </div>
+    <div class="mockup-row mockup-kpis">
+      <div class="kpi"><div class="kpi-value">42</div><div class="kpi-label">Rules</div></div>
+      <div class="kpi"><div class="kpi-value">39</div><div class="kpi-label">Compliant</div></div>
+      <div class="kpi warn"><div class="kpi-value">2</div><div class="kpi-label">Drifted</div></div>
+      <div class="kpi err"><div class="kpi-value">1</div><div class="kpi-label">Errors</div></div>
+      <div class="kpi"><div class="kpi-value">93 %</div><div class="kpi-label">Fleet compliance</div><div class="kpi-bar"><span style="width:93%"></span></div></div>
+    </div>
+    <div class="mockup-row mockup-twocol">
+      <div class="mock-col">
+        <header class="mockup-frame-title">Rules</header>
+        <ul class="rule-list">
+          <li class="rule"><span class="dot ok">●</span> <strong>block-smb-445</strong> [W] <small>Compliant · 148/148 · [event] HIGH</small></li>
+          <li class="rule"><span class="dot ok">●</span> <strong>edr-agent-running</strong> [W] <small>Compliant · 148/148 · [hybrid] CRITICAL</small></li>
+          <li class="rule"><span class="dot drift">◐</span> <strong>ssh-no-root-login</strong> [L] <small>2 drifted · 28/30 · [event] HIGH</small></li>
+          <li class="rule"><span class="dot ok">●</span> <strong>macos-alf-on</strong> [M] <small>Compliant · 20/20 · [event] HIGH</small></li>
+        </ul>
+        <p class="legend"><span class="dot ok">●</span> Compliant <span class="dot drift">◐</span> Drifted <span class="dot alert">◉</span> Alert <span class="dot off">○</span> Disabled</p>
+      </div>
+      <div class="mock-col">
+        <header class="mockup-frame-title">Recent events</header>
+        <ul class="event-list">
+          <li><time>10:42</time> <span class="badge ok">DRIFT REMEDIATED</span> <strong>block-smb-445</strong> on <code>DESKTOP-A3F</code> · Port 445 opened → blocked 2 ms</li>
+          <li><time>10:41</time> <span class="badge warn">DRIFT DETECTED</span> <strong>av-scan-7d</strong> on <code>LAPTOP-B92</code> · Last scan 9d ago → triggered</li>
+          <li><time>10:38</time> <span class="badge ok">COMPLIANT</span> <strong>edr-agent-running</strong> on <code>SRV-DC01</code> · CSFalconService.exe running ✓</li>
+          <li><time>10:35</time> <span class="badge warn">RESILIENCE ESCALATED</span> <strong>block-smb-445</strong> on <code>DESKTOP-K7M</code> · firewall-api → registry-write</li>
+        </ul>
+        <p class="mockup-sub right">[Show all events →]</p>
+      </div>
+    </div>
+    <div class="mockup-row">
+      Push policies — Scope: <code>[________________________]</code> [Push Now]
+    </div>
+    <div class="mockup-row">
+      <header class="mockup-frame-title">Pending approvals (1)</header>
+      <div class="approval">
+        <strong>block-rdp-new-policy</strong> <small>Submitted by <code>admin@corp</code> 2m ago</small>
+        <p class="mockup-sub">action: enforce · scope: <code>tag:workstations</code></p>
+        <p>[View YAML] &nbsp;&nbsp; [Approve] [Reject]</p>
+      </div>
+    </div>
+  </section>
+  <figcaption>Guaranteed State main dashboard — KPIs, rules list, event stream, push controls, and pending approvals.</figcaption>
+</figure>
+
 <h3 id="102-rule-detail-page-guaranteed-staterulesid">10.2 Rule detail page: <code>/guaranteed-state/rules/:id</code></h3>
-<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────────┐
-│  ← Back    block-smb-port-445                    [Edit] [Delete] │
-├──────────────────────────────────────────────────────────────────┤
-│  Description: Ensure SMB port 445 is blocked for inbound traffic │
-│  Severity: HIGH    Mode: Enforce    OS: Windows                  │
-│  Scope: tag:production-workstations AND NOT tag:file-servers     │
-│  Tags: security, network, cis-benchmark-5.2.1                   │
-│  Guards: Registry (primary), ETW (primary), Reconciliation       │
-│  Assertion: firewall-port-blocked (TCP/445/inbound)              │
-│  Resilience: Escalation (firewall-api → registry → wfp-api)     │
-├──────────────────────────────────────────────────────────────────┤
-│  Agent compliance                           148 compliant / 148  │
-│  ┌────────────┬───────────┬────────────┬────────┬──────────────┐ │
-│  │ Agent      │ Status    │ Last check │ Drifts │ Remediations │ │
-│  ├────────────┼───────────┼────────────┼────────┼──────────────┤ │
-│  │ DESKTOP-A3F│ Compliant │ 10:42:31   │ 3      │ 3            │ │
-│  │ DESKTOP-K7M│ Compliant │ 10:35:14   │ 1      │ 1            │ │
-│  │ LAPTOP-B92 │ Compliant │ 10:40:05   │ 0      │ 0            │ │
-│  └────────────┴───────────┴────────────┴────────┴──────────────┘ │
-├──────────────────────────────────────────────────────────────────┤
-│  YAML source                                            [Copy]   │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ apiVersion: yuzu.io/v1alpha1                               │  │
-│  │ kind: GuaranteedStateRule                                  │  │
-│  │ ...                                                        │  │
-│  └────────────────────────────────────────────────────────────┘  │
-├──────────────────────────────────────────────────────────────────┤
-│  Event history (last 24h)                                        │
-│  ┌──────────┬─────────────┬──────────────────┬─────────────────┐ │
-│  │ Time     │ Agent       │ Event            │ Latency         │ │
-│  ├──────────┼─────────────┼──────────────────┼─────────────────┤ │
-│  │ 10:42:31 │ DESKTOP-A3F │ drift.remediated │ 2ms             │ │
-│  │ 10:35:14 │ DESKTOP-K7M │ resilience.escal.│ 340ms           │ │
-│  └──────────┴─────────────┴──────────────────┴─────────────────┘ │
-└──────────────────────────────────────────────────────────────────┘
-</code></pre></div>
+<figure class="diagram mockup-figure" aria-label="Rule detail mockup for block-smb-port-445: header with back link and Edit/Delete buttons; metadata section (description, HIGH severity, Enforce mode, OS Windows, scope tag:production-workstations AND NOT tag:file-servers, tags including cis-benchmark-5.2.1, Registry/ETW/Reconciliation guards, firewall-port-blocked assertion, Escalation resilience firewall-api → registry → wfp-api); agent compliance table (148 compliant / 148, three sample rows); YAML source block; event history (drift.remediated 2ms latency, resilience.escal. 340ms).">
+  <section class="mockup wide">
+    <div class="mockup-row mockup-header">
+      <span>← Back</span>
+      <header class="box-title">block-smb-port-445</header>
+      <div class="mockup-actions right">[Edit] [Delete]</div>
+    </div>
+    <div class="mockup-row">
+      <p><strong>Description:</strong> Ensure SMB port 445 is blocked for inbound traffic</p>
+      <p><strong>Severity:</strong> HIGH &nbsp;&nbsp; <strong>Mode:</strong> Enforce &nbsp;&nbsp; <strong>OS:</strong> Windows</p>
+      <p><strong>Scope:</strong> <code>tag:production-workstations AND NOT tag:file-servers</code></p>
+      <p><strong>Tags:</strong> security, network, cis-benchmark-5.2.1</p>
+      <p><strong>Guards:</strong> Registry (primary), ETW (primary), Reconciliation</p>
+      <p><strong>Assertion:</strong> <code>firewall-port-blocked</code> (TCP/445/inbound)</p>
+      <p><strong>Resilience:</strong> Escalation (<code>firewall-api → registry → wfp-api</code>)</p>
+    </div>
+    <div class="mockup-row">
+      <header class="mockup-frame-title">Agent compliance</header>
+      <p class="mockup-sub right">148 compliant / 148</p>
+      <table class="mockup-table">
+        <thead><tr><th>Agent</th><th>Status</th><th>Last check</th><th>Drifts</th><th>Remediations</th></tr></thead>
+        <tbody>
+          <tr><td>DESKTOP-A3F</td><td>Compliant</td><td>10:42:31</td><td>3</td><td>3</td></tr>
+          <tr><td>DESKTOP-K7M</td><td>Compliant</td><td>10:35:14</td><td>1</td><td>1</td></tr>
+          <tr><td>LAPTOP-B92</td><td>Compliant</td><td>10:40:05</td><td>0</td><td>0</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="mockup-row">
+      <header class="mockup-frame-title">YAML source <span class="right">[Copy]</span></header>
+      <pre class="mockup-pre">apiVersion: yuzu.io/v1alpha1
+kind: GuaranteedStateRule
+...</pre>
+    </div>
+    <div class="mockup-row">
+      <header class="mockup-frame-title">Event history (last 24 h)</header>
+      <table class="mockup-table">
+        <thead><tr><th>Time</th><th>Agent</th><th>Event</th><th>Latency</th></tr></thead>
+        <tbody>
+          <tr><td>10:42:31</td><td>DESKTOP-A3F</td><td>drift.remediated</td><td>2 ms</td></tr>
+          <tr><td>10:35:14</td><td>DESKTOP-K7M</td><td>resilience.escal.</td><td>340 ms</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <figcaption>Rule detail page — block-smb-port-445 metadata, agent compliance, YAML source, event history.</figcaption>
+</figure>
+
 <h3 id="103-htmx-fragment-endpoints">10.3 HTMX fragment endpoints</h3>
 <div class="highlight"><pre><span></span><code>GET  /gs/fragment/summary                 Summary stats bar
 GET  /gs/fragment/rules                   Rule list with badges
@@ -2103,19 +2669,27 @@ content/definitions/                   Example YAML files
 <h3 id="131-design-principle">13.1 Design principle</h3>
 <p>Yuzu Guardian must feel identical to use across Windows, Linux, and macOS. An operator writes a <code>GuaranteedStateRule</code> YAML once, sets <code>target.os</code> (or omits it for all platforms), and the system selects the correct guards and remediation methods for each platform automatically.</p>
 <p>The abstraction layers:</p>
-<div class="highlight"><pre><span></span><code>Operator experience (identical across platforms)
-    │
-    ├── YAML DSL — same schema, same assertion types, same remediation actions
-    ├── Dashboard — same compliance view, same events, same approval workflow
-    ├── REST API — same endpoints, same response format
-    └── MCP tools — same queries, same output
-    │
-Platform abstraction boundary
-    │
-    ├── Guard selection — GuardManager picks platform-appropriate guards
-    ├── Assertion evaluation — same logic, platform-specific state readers
-    └── Remediation execution — same action names, platform-specific system calls
-</code></pre></div>
+<figure class="diagram tree-figure" aria-label="Guardian platform abstraction: above the boundary the operator experience is identical across platforms (YAML DSL schema, dashboard, REST API, MCP tools); below, Guard selection chooses platform-appropriate guards, assertion evaluation runs the same logic via platform-specific state readers, and remediation execution uses the same action names with platform-specific system calls.">
+  <section class="box boundary boundary-top">
+    <header class="boundary-title">Operator experience <small>(identical across platforms)</small></header>
+    <ul class="bare">
+      <li><strong>YAML DSL</strong> — same schema, same assertion types, same remediation actions</li>
+      <li><strong>Dashboard</strong> — same compliance view, same events, same approval workflow</li>
+      <li><strong>REST API</strong> — same endpoints, same response format</li>
+      <li><strong>MCP tools</strong> — same queries, same output</li>
+    </ul>
+  </section>
+  <p class="boundary-rule" role="separator">— Platform abstraction boundary —</p>
+  <section class="box boundary boundary-bottom">
+    <ul class="bare">
+      <li><strong>Guard selection</strong> — GuardManager picks platform-appropriate guards</li>
+      <li><strong>Assertion evaluation</strong> — same logic, platform-specific state readers</li>
+      <li><strong>Remediation execution</strong> — same action names, platform-specific system calls</li>
+    </ul>
+  </section>
+  <figcaption>Guardian platform-abstraction boundary — operator surface stays identical; per-platform internals vary below the line.</figcaption>
+</figure>
+
 <h3 id="132-platform-specific-reality">13.2 Platform-specific reality</h3>
 <p>While the universal assertion types handle common cases, many real-world rules are inherently platform-specific. An operator who wants "SSH must use key-based auth only" writes:</p>
 <ul>
@@ -2787,21 +3361,44 @@ Windows has one firewall API (<code>INetFwPolicy2</code> COM). Linux has two com
 </table>
 <h3 id="172-boot-time-enforcement-on-linux">17.2 Boot-time enforcement on Linux</h3>
 <p>The two-phase init works identically on Linux:</p>
-<div class="highlight"><pre><span></span><code>systemd starts ──────────────────────▶ Phase 1: start_local()
-    │                                       │
-    ├── yuzu-agent.service starts           ├── Open SQLite
-    │   (After=local-fs.target)             ├── Load policy cache
-    │                                       ├── Start all guards
-    │                                       └── ENFORCING ✓
-    │
-    ├── network-online.target ──────▶ Phase 2: sync_with_server()
-    │                                       │
-    │                                       ├── Connect gRPC
-    │                                       └── Sync policies
-    │
-    ├── display-manager.service
-User logs in ──────────────────────▶ Already enforcing
-</code></pre></div>
+<figure class="diagram swimlane-figure" aria-label="systemd → Yuzu Agent boot sequence: yuzu-agent.service (After=local-fs.target) starts Phase 1 start_local — open SQLite, load policy cache, start all guards, ENFORCING. network-online.target reached → Phase 2 sync_with_server — connect gRPC, sync policies. display-manager.service starts, user logs in, agent already enforcing.">
+  <div class="swimlane two-col">
+    <div class="lane">
+      <h4 class="lane-title">systemd</h4>
+      <ol class="lane-steps">
+        <li>systemd starts</li>
+        <li><code>yuzu-agent.service</code> starts <small>(<code>After=local-fs.target</code>)</small></li>
+        <li><code>network-online.target</code></li>
+        <li><code>display-manager.service</code></li>
+        <li>User logs in</li>
+      </ol>
+    </div>
+    <div class="lane">
+      <h4 class="lane-title">Yuzu Agent</h4>
+      <ol class="lane-steps">
+        <li class="phase">
+          <strong>Phase 1: <code>start_local()</code></strong>
+          <ul class="bare">
+            <li>Open SQLite</li>
+            <li>Load policy cache</li>
+            <li>Start all guards</li>
+            <li class="ok"><strong>ENFORCING ✓</strong></li>
+          </ul>
+        </li>
+        <li class="phase">
+          <strong>Phase 2: <code>sync_with_server()</code></strong>
+          <ul class="bare">
+            <li>Connect gRPC</li>
+            <li>Sync policies</li>
+          </ul>
+        </li>
+        <li><strong>Already enforcing</strong></li>
+      </ol>
+    </div>
+  </div>
+  <figcaption>systemd boot ↔ Yuzu Agent startup (Linux).</figcaption>
+</figure>
+
 <p>The service unit uses <code>After=local-fs.target</code> (not <code>After=network-online.target</code>) so Phase 1 starts before the network is available. The gRPC connection in Phase 2 uses the existing agent reconnection logic with exponential backoff.</p>
 <hr>
 <h2 id="18-linux-implementation-files">18. Linux implementation files</h2>
@@ -2970,26 +3567,40 @@ agents/core/src/remediation_linux.hpp/.cpp   Linux remediation methods (system c
 - <strong>Legacy:</strong> Parse <code>/var/log/system.log</code> for older macOS versions</p>
 <h3 id="194-macos-firewall-detection-the-workaround">19.4 macOS firewall detection — the workaround</h3>
 <p>macOS <code>pf</code> has no change notification API. The design uses a three-layer detection strategy that achieves near-real-time for the common case:</p>
-<div class="highlight"><pre><span></span><code>Layer 1: Endpoint Security (real-time, ~0ms)
-    Watch for pfctl process execution
-    ├── ES_EVENT_TYPE_NOTIFY_EXEC where executable = /sbin/pfctl
-    ├── Inspect arguments: -f (load rules), -a (anchor), -t (table), -d (disable), -e (enable)
-    └── On match → trigger immediate rule evaluation via /dev/pf ioctl
+<figure class="diagram tree-figure" aria-label="macOS pfctl detection — three layers: Layer 1 Endpoint Security (real-time, ~0ms) watches ES_EVENT_TYPE_NOTIFY_EXEC for /sbin/pfctl with relevant flags; Layer 2 file monitoring watches /etc/pf.conf, /etc/pf.anchors/*, and /Library/Preferences/com.apple.alf.plist (~0-10ms); Layer 3 fast ioctl poll every 5s reads DIOCGETRULES and DIOCGETSTATUS via /dev/pf and compares against expected state.">
+  <ol class="layered">
+    <li class="layer">
+      <header class="layer-title">Layer 1 — Endpoint Security <span class="badge ok">real-time, ~0 ms</span></header>
+      <p>Watch for <code>pfctl</code> process execution</p>
+      <ul class="bare">
+        <li><code>ES_EVENT_TYPE_NOTIFY_EXEC</code> where executable = <code>/sbin/pfctl</code></li>
+        <li>Inspect arguments: <code>-f</code> (load rules), <code>-a</code> (anchor), <code>-t</code> (table), <code>-d</code> (disable), <code>-e</code> (enable)</li>
+        <li>On match → trigger immediate rule evaluation via <code>/dev/pf</code> ioctl</li>
+      </ul>
+    </li>
+    <li class="layer">
+      <header class="layer-title">Layer 2 — File monitoring <span class="badge ok">real-time, ~0–10 ms</span></header>
+      <p>Watch pf config files and ALF preferences</p>
+      <ul class="bare">
+        <li><code>/etc/pf.conf</code> — main pf ruleset</li>
+        <li><code>/etc/pf.anchors/*</code> — anchor rulesets</li>
+        <li><code>/Library/Preferences/com.apple.alf.plist</code> — Application Firewall config</li>
+        <li>On change → trigger evaluation (file change doesn't mean rules loaded, but indicates intent — evaluate current kernel state via ioctl)</li>
+      </ul>
+    </li>
+    <li class="layer">
+      <header class="layer-title">Layer 3 — Fast ioctl poll <span class="badge muted">periodic, 5 s default</span></header>
+      <p>Read current pf state via <code>/dev/pf</code> ioctls</p>
+      <ul class="bare">
+        <li><code>DIOCGETRULES</code> — read active ruleset</li>
+        <li><code>DIOCGETSTATUS</code> — check if pf is enabled/disabled</li>
+        <li>Compare against expected state from policy assertion</li>
+      </ul>
+    </li>
+  </ol>
+  <figcaption>macOS pfctl detection — three layered guards (Endpoint Security exec watch, file monitoring, ioctl poll).</figcaption>
+</figure>
 
-Layer 2: File monitoring (real-time, ~0-10ms)
-    Watch pf config files and ALF preferences
-    ├── /etc/pf.conf — main pf ruleset
-    ├── /etc/pf.anchors/* — anchor rulesets
-    ├── /Library/Preferences/com.apple.alf.plist — Application Firewall config
-    └── On change → trigger evaluation (file change doesn&#39;t mean rules loaded,
-                     but indicates intent — evaluate current kernel state via ioctl)
-
-Layer 3: Fast ioctl poll (periodic, 5s default)
-    Read current pf state via /dev/pf ioctls
-    ├── DIOCGETRULES — read active ruleset
-    ├── DIOCGETSTATUS — check if pf is enabled/disabled
-    └── Compare against expected state from policy assertion
-</code></pre></div>
 <p><strong>Why this works for most real-world scenarios:</strong></p>
 <table>
 <thead>
@@ -3282,18 +3893,38 @@ agents/core/src/remediation_macos.hpp/.cpp         macOS remediation (CoreFounda
 <span class="k">endif</span>
 </code></pre></div>
 <h3 id="222-boot-time-enforcement-on-macos">22.2 Boot-time enforcement on macOS</h3>
-<div class="highlight"><pre><span></span><code>launchd starts ──────────────────────▶ Phase 1: start_local()
-    │                                       │
-    ├── com.yuzu.agent.plist                ├── Open SQLite
-    │   (RunAtLoad=true)                    ├── Load policy cache
-    │                                       ├── Start all guards
-    │                                       └── ENFORCING ✓
-    │
-    ├── Network available ──────────▶ Phase 2: sync_with_server()
-    │
-Login window appears
-User logs in ──────────────────────▶ Already enforcing
-</code></pre></div>
+<figure class="diagram swimlane-figure" aria-label="launchd → Yuzu Agent boot sequence on macOS: com.yuzu.agent.plist (RunAtLoad=true) starts Phase 1 start_local — open SQLite, load policy cache, start guards, ENFORCING. Network available → Phase 2 sync_with_server. Login window appears, user logs in, agent already enforcing.">
+  <div class="swimlane two-col">
+    <div class="lane">
+      <h4 class="lane-title">launchd</h4>
+      <ol class="lane-steps">
+        <li>launchd starts</li>
+        <li><code>com.yuzu.agent.plist</code> <small>(<code>RunAtLoad=true</code>)</small></li>
+        <li>Network available</li>
+        <li>Login window appears</li>
+        <li>User logs in</li>
+      </ol>
+    </div>
+    <div class="lane">
+      <h4 class="lane-title">Yuzu Agent</h4>
+      <ol class="lane-steps">
+        <li class="phase">
+          <strong>Phase 1: <code>start_local()</code></strong>
+          <ul class="bare">
+            <li>Open SQLite</li>
+            <li>Load policy cache</li>
+            <li>Start all guards</li>
+            <li class="ok"><strong>ENFORCING ✓</strong></li>
+          </ul>
+        </li>
+        <li class="phase"><strong>Phase 2: <code>sync_with_server()</code></strong></li>
+        <li><strong>Already enforcing</strong></li>
+      </ol>
+    </div>
+  </div>
+  <figcaption>launchd ↔ Yuzu Agent startup (macOS).</figcaption>
+</figure>
+
 <p>The launchd plist uses <code>RunAtLoad=true</code> and is placed in <code>/Library/LaunchDaemons/</code> (system-wide, runs as root). No <code>WaitForNetwork</code> key — Phase 1 starts immediately.</p>
 <h3 id="223-updated-implementation-plan-macos-phases">22.3 Updated implementation plan (macOS phases)</h3>
 <table>

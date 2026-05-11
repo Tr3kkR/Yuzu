@@ -313,6 +313,485 @@ mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em;
 }
 .frontmatter { border-left-color: var(--hex-indigo); }
 
+/* ── Diagrams — shared primitives for ASCII-art redraws ─────────────────── */
+figure.diagram {
+  margin: 1.5em 0;
+  padding: 1em;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+}
+figure.diagram figcaption {
+  margin-top: 0.75em;
+  padding-top: 0.5em;
+  border-top: 1px solid var(--border);
+  font-size: 0.85em;
+  font-style: italic;
+  color: var(--fg-muted);
+}
+figure.diagram .row {
+  display: flex;
+  gap: 0.75em;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin: 0.6em 0;
+}
+figure.diagram .row-agents,
+figure.diagram .row-three { gap: 1em; }
+figure.diagram .row-three > * { flex: 1 1 220px; }
+figure.diagram .col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5em;
+}
+figure.diagram .arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--rule);
+  font-weight: 700;
+  font-size: 1.2em;
+}
+figure.diagram .arrow.right::after { content: "→"; }
+figure.diagram .arrow.left::after  { content: "←"; }
+figure.diagram .arrow.down::after  { content: "↓"; }
+figure.diagram .arrow.up::after    { content: "↑"; }
+figure.diagram .arrow.centered {
+  display: flex;
+  width: 100%;
+  justify-content: center;
+}
+figure.diagram .arrow .edge-label {
+  margin-left: 0.4em;
+  font-size: 0.8em;
+  font-style: italic;
+  font-weight: 400;
+  color: var(--fg-muted);
+}
+figure.diagram .caption-wire {
+  text-align: center;
+  font-size: 0.85em;
+  color: var(--fg-muted);
+  margin: 0.25em 0;
+}
+figure.diagram .box {
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: 0.55em 0.75em;
+  font-size: 0.9em;
+  line-height: 1.35;
+  min-width: 7em;
+}
+figure.diagram .box.small {
+  padding: 0.35em 0.6em;
+  font-size: 0.85em;
+  min-width: 5em;
+}
+figure.diagram .box .box-title {
+  display: block;
+  font-weight: 700;
+  color: var(--h2-fg);
+  margin-bottom: 0.2em;
+  font-size: 0.95em;
+}
+figure.diagram .box.boundary,
+figure.diagram .boundary {
+  border: 2px dashed var(--rule);
+  background: var(--bg-soft);
+  padding: 0.9em 1em;
+}
+figure.diagram .boundary > .boundary-title {
+  display: block;
+  font-weight: 700;
+  color: var(--rule);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.8em;
+  margin: 0 0 0.6em;
+}
+figure.diagram .boundary-server { border-color: var(--hex-french-blue); }
+figure.diagram .boundary-server > .boundary-title { color: var(--hex-french-blue); }
+figure.diagram .boundary-inner {
+  border-style: solid;
+  border-color: var(--hex-indigo);
+}
+figure.diagram .boundary-inner > .boundary-title { color: var(--hex-indigo); }
+figure.diagram .grid {
+  display: grid;
+  gap: 0.55em;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+figure.diagram .grid-frontends { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+figure.diagram .grid-core      { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+figure.diagram .grid-server    { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+figure.diagram .chip {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 0.4em 0.6em;
+  font-size: 0.85em;
+}
+figure.diagram .chip code { background: transparent; border: 0; padding: 0; }
+figure.diagram .actor {
+  border: 1.5px solid var(--hex-indigo);
+  border-radius: 50px;
+  padding: 0.5em 1em;
+  background: var(--bg);
+  text-align: center;
+  font-size: 0.9em;
+}
+figure.diagram .actor.wide { padding: 0.6em 1.5em; }
+figure.diagram ul.bare {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+figure.diagram ul.bare.small { font-size: 0.8em; }
+figure.diagram ul.bare li { margin: 0.15em 0; }
+figure.diagram .ellipsis {
+  font-size: 1.3em;
+  color: var(--fg-muted);
+  align-self: center;
+  padding: 0 0.3em;
+}
+figure.diagram .gw-list { display: flex; flex-direction: column; gap: 0.3em; }
+figure.diagram .box.agent { border-left: 4px solid var(--hex-french-blue); }
+figure.diagram .box.gw-node { border-left: 4px solid var(--hex-gold); }
+figure.diagram .box.state {
+  border: 2px solid var(--hex-indigo);
+  border-radius: 14px;
+  padding: 0.6em 1em;
+  background: var(--bg);
+  display: block;
+  text-align: center;
+}
+figure.diagram .state-terminal { border-color: var(--error); }
+figure.diagram ol.state-flow {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25em;
+}
+figure.diagram ol.state-flow > li { width: 100%; max-width: 28em; }
+figure.diagram .state-arrow { padding: 0.2em 0; font-size: 0.95em; }
+
+/* Trees */
+figure.diagram ul.tree,
+figure.diagram ul.tree ul {
+  list-style: none;
+  padding-left: 1.4em;
+  margin: 0;
+  position: relative;
+  font-size: 0.9em;
+  line-height: 1.55;
+}
+figure.diagram ul.tree li {
+  position: relative;
+  padding: 0.05em 0 0.05em 0.9em;
+}
+figure.diagram ul.tree li::before {
+  content: "";
+  position: absolute;
+  left: -0.05em;
+  top: 0;
+  width: 0.9em;
+  height: 0.9em;
+  border-left: 1.5px solid var(--border);
+  border-bottom: 1.5px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+figure.diagram ul.tree li:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: -0.05em;
+  top: 0.9em;
+  bottom: 0;
+  border-left: 1.5px solid var(--border);
+}
+figure.diagram ul.tree .node {
+  color: var(--h2-fg);
+  font-weight: 600;
+}
+figure.diagram ul.tree .desc {
+  color: var(--fg-muted);
+  font-size: 0.9em;
+  margin-left: 0.4em;
+}
+figure.diagram ul.tree li.section { margin-top: 0.4em; }
+figure.diagram h4.tree-root {
+  font-size: 0.95em;
+  color: var(--h2-fg);
+  margin: 0.8em 0 0.3em;
+  border: 0;
+  padding: 0;
+}
+figure.diagram .tree-grid {
+  display: grid;
+  gap: 1em;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+figure.diagram .tree-prose { margin: 0.1em 0 0.5em; }
+figure.diagram p.tree-prose { font-size: 0.9em; color: var(--fg-muted); }
+figure.diagram .badge {
+  display: inline-block;
+  padding: 0.05em 0.5em;
+  border-radius: 999px;
+  font-size: 0.75em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-left: 0.4em;
+  vertical-align: middle;
+}
+figure.diagram .badge.ok    { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }
+figure.diagram .badge.warn  { background: var(--hex-yellow); color: var(--hex-black); }
+figure.diagram .badge.err   { background: var(--error-bg);   color: var(--error);   border: 1px solid var(--error-border); }
+figure.diagram .badge.done  { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }
+figure.diagram .badge.muted { background: var(--bg-soft);    color: var(--fg-muted);border: 1px solid var(--border); }
+figure.diagram .tag {
+  display: inline-block;
+  padding: 0 0.45em;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75em;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  margin-right: 0.3em;
+  vertical-align: 0.05em;
+}
+figure.diagram .tag.new  { background: var(--success); color: white; }
+figure.diagram .tag.edit { background: var(--hex-french-blue); color: white; }
+
+/* Swimlane (two parallel timelines) */
+figure.diagram .swimlane.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1em 1.5em;
+}
+figure.diagram .swimlane .lane {
+  border-left: 3px solid var(--rule);
+  padding-left: 0.9em;
+}
+figure.diagram .swimlane .lane:nth-child(2) { border-left-color: var(--accent); }
+figure.diagram .swimlane .lane-title {
+  font-size: 0.8em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  color: var(--rule);
+  margin: 0 0 0.5em;
+}
+figure.diagram .swimlane .lane:nth-child(2) .lane-title { color: var(--accent); }
+figure.diagram .swimlane ol.lane-steps {
+  list-style: decimal;
+  padding-left: 1.4em;
+  margin: 0;
+  font-size: 0.9em;
+}
+figure.diagram .swimlane li.phase {
+  list-style: none;
+  margin: 0.4em 0;
+  padding: 0.4em 0.6em;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+figure.diagram .swimlane li.phase ul.bare { font-size: 0.9em; }
+figure.diagram .swimlane li.phase .ok { color: var(--success); font-weight: 700; }
+figure.diagram .swimlane .lane-cross {
+  font-size: 0.8em;
+  color: var(--fg-muted);
+  font-style: italic;
+  margin: 0.25em 0 0;
+}
+
+/* Layered (numbered layer cards) */
+figure.diagram ol.layered {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+}
+figure.diagram ol.layered .layer {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg);
+  padding: 0.6em 0.9em;
+}
+figure.diagram ol.layered .layer-title {
+  font-weight: 700;
+  color: var(--h2-fg);
+  font-size: 0.95em;
+  margin: 0 0 0.3em;
+}
+
+/* Flow (vertical step list with optional branching row) */
+figure.diagram ol.flow {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35em;
+  align-items: stretch;
+}
+figure.diagram ol.flow .box.step {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5em 0.75em;
+  font-size: 0.9em;
+}
+figure.diagram .row.branch { gap: 0.6em; }
+figure.diagram .row.branch > * { flex: 1 1 200px; }
+figure.diagram .branch-left.ok  { border-left: 3px solid var(--success); }
+figure.diagram .branch-right.warn,
+figure.diagram .branch-right    { border-left: 3px solid var(--hex-yellow); }
+
+/* TAR plugin row */
+figure.diagram .row-tar { align-items: stretch; }
+figure.diagram .timer-list li { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; padding: 0.2em 0; }
+figure.diagram .tar-outputs li { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; padding: 0.15em 0; }
+figure.diagram .tar-outputs li.separator { color: var(--fg-muted); }
+figure.diagram .indent { padding-left: 1.5em; color: var(--fg-muted); }
+figure.diagram .box.boundary.tar-plugin { padding: 0.7em 0.9em; }
+
+/* UI mockups */
+figure.diagram .mockup {
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  width: 100%;
+}
+figure.diagram .mockup.wide { flex: 1 1 600px; }
+figure.diagram .mockup-row {
+  padding: 0.6em 0.85em;
+  border-top: 1px solid var(--border);
+  font-size: 0.85em;
+}
+figure.diagram .mockup-row:first-child { border-top: 0; }
+figure.diagram .mockup-header { background: var(--bg-soft); }
+figure.diagram .mockup-frame-title {
+  display: block;
+  font-weight: 700;
+  color: var(--h2-fg);
+  font-size: 0.85em;
+  margin-bottom: 0.3em;
+}
+figure.diagram .mockup-sub { color: var(--fg-muted); font-size: 0.85em; margin: 0.2em 0; }
+figure.diagram .mockup-actions { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; }
+figure.diagram .mockup-actions.right { float: right; }
+figure.diagram .right { float: right; }
+figure.diagram .mockup-pre {
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-radius: 4px;
+  padding: 0.5em 0.75em;
+  font-size: 0.8em;
+  margin: 0.3em 0 0;
+  overflow-x: auto;
+}
+figure.diagram .mockup-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.3em 0;
+  font-size: 0.85em;
+}
+figure.diagram .mockup-table th,
+figure.diagram .mockup-table td {
+  border: 1px solid var(--border);
+  padding: 0.25em 0.5em;
+  text-align: left;
+}
+figure.diagram .mockup-table thead { background: var(--table-header); }
+figure.diagram .mock-nav {
+  flex: 0 0 220px;
+  font-size: 0.85em;
+}
+figure.diagram .mock-nav li.active {
+  font-weight: 700;
+  color: var(--h2-fg);
+  border-left: 3px solid var(--accent);
+  padding-left: 0.4em;
+}
+figure.diagram .row-mock { align-items: stretch; }
+figure.diagram .mockup-kpis { display: flex; gap: 0.6em; flex-wrap: wrap; }
+figure.diagram .kpi {
+  flex: 1 1 100px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4em 0.6em;
+  background: var(--bg);
+  text-align: center;
+}
+figure.diagram .kpi.warn { border-color: var(--hex-yellow); }
+figure.diagram .kpi.err  { border-color: var(--error);     }
+figure.diagram .kpi-value { font-size: 1.2em; font-weight: 700; color: var(--h2-fg); }
+figure.diagram .kpi-label { font-size: 0.75em; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+figure.diagram .kpi-bar {
+  background: var(--bg-soft);
+  height: 4px;
+  border-radius: 2px;
+  margin-top: 0.3em;
+  overflow: hidden;
+}
+figure.diagram .kpi-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--success);
+}
+figure.diagram .mockup-twocol {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6em 1em;
+}
+figure.diagram .rule-list, figure.diagram .event-list, figure.diagram .pr-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.85em;
+}
+figure.diagram .rule-list li, figure.diagram .event-list li, figure.diagram .pr-list li {
+  padding: 0.25em 0;
+  border-bottom: 1px solid var(--border);
+}
+figure.diagram .rule-list li:last-child,
+figure.diagram .event-list li:last-child,
+figure.diagram .pr-list li:last-child { border-bottom: 0; }
+figure.diagram .dot { font-size: 0.9em; }
+figure.diagram .dot.ok    { color: var(--success); }
+figure.diagram .dot.drift { color: var(--hex-yellow); }
+figure.diagram .dot.alert { color: var(--error); }
+figure.diagram .dot.off   { color: var(--fg-muted); }
+figure.diagram .legend { font-size: 0.8em; color: var(--fg-muted); margin: 0.5em 0 0; }
+figure.diagram .approval { padding: 0.4em 0.5em; background: var(--bg-soft); border-radius: 4px; }
+figure.diagram .boundary-rule {
+  text-align: center;
+  font-size: 0.8em;
+  color: var(--fg-muted);
+  letter-spacing: 0.1em;
+  margin: 0.5em 0;
+  text-transform: uppercase;
+}
+figure.diagram .boundary-top    { border-color: var(--hex-french-blue); }
+figure.diagram .boundary-bottom { border-color: var(--hex-indigo); }
+figure.diagram .row-edges { gap: 2em; align-items: flex-start; }
+figure.diagram .row-edges .edge { display: flex; flex-direction: column; align-items: center; gap: 0.3em; }
+figure.diagram .row-edges .edge-label { font-size: 0.8em; color: var(--fg-muted); text-align: center; }
+figure.diagram .row-fanout { gap: 0.6em; align-items: center; }
+figure.diagram .row-fanout .gw-list { flex: 0 0 auto; }
+
 /* Inline doc-reference linkifier — keeps the original <code> chip styling but
    makes the surrounding anchor obvious by colouring the text french-blue. */
 a.doc-ref { text-decoration: none; }
@@ -423,35 +902,30 @@ mutexes -- message passing provides serialization.</p>
 <hr>
 <h2 id="architecture">Architecture</h2>
 <p><strong>Status: PARTIALLY IMPLEMENTED</strong></p>
-<div class="highlight"><pre><span></span><code>Operators (browser, REST API, CLI)
-    |
-    v
-+-----------------------------------------------+
-|           yuzu-gateway (Erlang/OTP)            |
-|                                                |
-|   +----------+  +----------+  +----------+    |
-|   | gw_node1 |  | gw_node2 |  | gw_nodeN |    |
-|   +----------+  +----------+  +----------+    |
-|        |              |             |          |
-|    agent_proc     agent_proc   agent_proc      |
-|    agent_proc     agent_proc   agent_proc      |
-+--------+--------------+------------+----------+
-         |              |            |
-         v              v            v
-    +---------+    +---------+  +---------+
-    | Agent 1 |    | Agent 2 |  | Agent M |
-    +---------+    +---------+  +---------+
-         |              |            |
-         +--------------+------------+
-                        |
-                        | Register, Heartbeat, Inventory
-                        v
-               +------------------+
-               |  yuzu-server     |
-               |  (C++ control    |
-               |   plane)         |
-               +------------------+
-</code></pre></div>
+<figure class="diagram arch-figure" aria-label="Operators (browser, REST API, CLI) connect into the yuzu-gateway Erlang/OTP cluster (gw_node1, gw_node2, gw_nodeN) which each hold agent_proc processes that own bidi streams to Agent 1, Agent 2, Agent M; all gateway nodes share an upstream connection to the yuzu-server C++ control plane for Register, Heartbeat, and Inventory.">
+  <div class="actor wide"><strong>Operators</strong> <small>(browser, REST API, CLI)</small></div>
+  <div class="arrow down centered" aria-hidden="true"></div>
+  <section class="box boundary boundary-server">
+    <header class="boundary-title">yuzu-gateway <small>(Erlang/OTP)</small></header>
+    <div class="row">
+      <article class="box gw-node"><header class="box-title">gw_node1</header><ul class="bare small"><li>agent_proc</li><li>agent_proc</li></ul></article>
+      <article class="box gw-node"><header class="box-title">gw_node2</header><ul class="bare small"><li>agent_proc</li><li>agent_proc</li></ul></article>
+      <article class="box gw-node"><header class="box-title">gw_nodeN</header><ul class="bare small"><li>agent_proc</li><li>agent_proc</li></ul></article>
+    </div>
+  </section>
+  <div class="arrow down centered" aria-hidden="true"></div>
+  <div class="row row-agents">
+    <div class="box small">Agent 1</div>
+    <div class="box small">Agent 2</div>
+    <div class="box small">Agent M</div>
+  </div>
+  <div class="arrow down centered" aria-hidden="true"></div>
+  <p class="caption-wire">Register, Heartbeat, Inventory</p>
+  <div class="arrow down centered" aria-hidden="true"></div>
+  <div class="actor"><strong>yuzu-server</strong> <small>(C++ control plane)</small></div>
+  <figcaption>Operator-facing view of the gateway — operators connect into the gateway cluster, which proxies agent registration upstream to the C++ server.</figcaption>
+</figure>
+
 <p><strong>Plane separation:</strong></p>
 <table>
 <thead>

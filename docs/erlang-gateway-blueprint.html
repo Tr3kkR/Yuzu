@@ -313,6 +313,485 @@ mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em;
 }
 .frontmatter { border-left-color: var(--hex-indigo); }
 
+/* ── Diagrams — shared primitives for ASCII-art redraws ─────────────────── */
+figure.diagram {
+  margin: 1.5em 0;
+  padding: 1em;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+}
+figure.diagram figcaption {
+  margin-top: 0.75em;
+  padding-top: 0.5em;
+  border-top: 1px solid var(--border);
+  font-size: 0.85em;
+  font-style: italic;
+  color: var(--fg-muted);
+}
+figure.diagram .row {
+  display: flex;
+  gap: 0.75em;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin: 0.6em 0;
+}
+figure.diagram .row-agents,
+figure.diagram .row-three { gap: 1em; }
+figure.diagram .row-three > * { flex: 1 1 220px; }
+figure.diagram .col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5em;
+}
+figure.diagram .arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--rule);
+  font-weight: 700;
+  font-size: 1.2em;
+}
+figure.diagram .arrow.right::after { content: "→"; }
+figure.diagram .arrow.left::after  { content: "←"; }
+figure.diagram .arrow.down::after  { content: "↓"; }
+figure.diagram .arrow.up::after    { content: "↑"; }
+figure.diagram .arrow.centered {
+  display: flex;
+  width: 100%;
+  justify-content: center;
+}
+figure.diagram .arrow .edge-label {
+  margin-left: 0.4em;
+  font-size: 0.8em;
+  font-style: italic;
+  font-weight: 400;
+  color: var(--fg-muted);
+}
+figure.diagram .caption-wire {
+  text-align: center;
+  font-size: 0.85em;
+  color: var(--fg-muted);
+  margin: 0.25em 0;
+}
+figure.diagram .box {
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: 0.55em 0.75em;
+  font-size: 0.9em;
+  line-height: 1.35;
+  min-width: 7em;
+}
+figure.diagram .box.small {
+  padding: 0.35em 0.6em;
+  font-size: 0.85em;
+  min-width: 5em;
+}
+figure.diagram .box .box-title {
+  display: block;
+  font-weight: 700;
+  color: var(--h2-fg);
+  margin-bottom: 0.2em;
+  font-size: 0.95em;
+}
+figure.diagram .box.boundary,
+figure.diagram .boundary {
+  border: 2px dashed var(--rule);
+  background: var(--bg-soft);
+  padding: 0.9em 1em;
+}
+figure.diagram .boundary > .boundary-title {
+  display: block;
+  font-weight: 700;
+  color: var(--rule);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.8em;
+  margin: 0 0 0.6em;
+}
+figure.diagram .boundary-server { border-color: var(--hex-french-blue); }
+figure.diagram .boundary-server > .boundary-title { color: var(--hex-french-blue); }
+figure.diagram .boundary-inner {
+  border-style: solid;
+  border-color: var(--hex-indigo);
+}
+figure.diagram .boundary-inner > .boundary-title { color: var(--hex-indigo); }
+figure.diagram .grid {
+  display: grid;
+  gap: 0.55em;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+figure.diagram .grid-frontends { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+figure.diagram .grid-core      { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+figure.diagram .grid-server    { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+figure.diagram .chip {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 0.4em 0.6em;
+  font-size: 0.85em;
+}
+figure.diagram .chip code { background: transparent; border: 0; padding: 0; }
+figure.diagram .actor {
+  border: 1.5px solid var(--hex-indigo);
+  border-radius: 50px;
+  padding: 0.5em 1em;
+  background: var(--bg);
+  text-align: center;
+  font-size: 0.9em;
+}
+figure.diagram .actor.wide { padding: 0.6em 1.5em; }
+figure.diagram ul.bare {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+figure.diagram ul.bare.small { font-size: 0.8em; }
+figure.diagram ul.bare li { margin: 0.15em 0; }
+figure.diagram .ellipsis {
+  font-size: 1.3em;
+  color: var(--fg-muted);
+  align-self: center;
+  padding: 0 0.3em;
+}
+figure.diagram .gw-list { display: flex; flex-direction: column; gap: 0.3em; }
+figure.diagram .box.agent { border-left: 4px solid var(--hex-french-blue); }
+figure.diagram .box.gw-node { border-left: 4px solid var(--hex-gold); }
+figure.diagram .box.state {
+  border: 2px solid var(--hex-indigo);
+  border-radius: 14px;
+  padding: 0.6em 1em;
+  background: var(--bg);
+  display: block;
+  text-align: center;
+}
+figure.diagram .state-terminal { border-color: var(--error); }
+figure.diagram ol.state-flow {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25em;
+}
+figure.diagram ol.state-flow > li { width: 100%; max-width: 28em; }
+figure.diagram .state-arrow { padding: 0.2em 0; font-size: 0.95em; }
+
+/* Trees */
+figure.diagram ul.tree,
+figure.diagram ul.tree ul {
+  list-style: none;
+  padding-left: 1.4em;
+  margin: 0;
+  position: relative;
+  font-size: 0.9em;
+  line-height: 1.55;
+}
+figure.diagram ul.tree li {
+  position: relative;
+  padding: 0.05em 0 0.05em 0.9em;
+}
+figure.diagram ul.tree li::before {
+  content: "";
+  position: absolute;
+  left: -0.05em;
+  top: 0;
+  width: 0.9em;
+  height: 0.9em;
+  border-left: 1.5px solid var(--border);
+  border-bottom: 1.5px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+figure.diagram ul.tree li:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: -0.05em;
+  top: 0.9em;
+  bottom: 0;
+  border-left: 1.5px solid var(--border);
+}
+figure.diagram ul.tree .node {
+  color: var(--h2-fg);
+  font-weight: 600;
+}
+figure.diagram ul.tree .desc {
+  color: var(--fg-muted);
+  font-size: 0.9em;
+  margin-left: 0.4em;
+}
+figure.diagram ul.tree li.section { margin-top: 0.4em; }
+figure.diagram h4.tree-root {
+  font-size: 0.95em;
+  color: var(--h2-fg);
+  margin: 0.8em 0 0.3em;
+  border: 0;
+  padding: 0;
+}
+figure.diagram .tree-grid {
+  display: grid;
+  gap: 1em;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+figure.diagram .tree-prose { margin: 0.1em 0 0.5em; }
+figure.diagram p.tree-prose { font-size: 0.9em; color: var(--fg-muted); }
+figure.diagram .badge {
+  display: inline-block;
+  padding: 0.05em 0.5em;
+  border-radius: 999px;
+  font-size: 0.75em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-left: 0.4em;
+  vertical-align: middle;
+}
+figure.diagram .badge.ok    { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }
+figure.diagram .badge.warn  { background: var(--hex-yellow); color: var(--hex-black); }
+figure.diagram .badge.err   { background: var(--error-bg);   color: var(--error);   border: 1px solid var(--error-border); }
+figure.diagram .badge.done  { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }
+figure.diagram .badge.muted { background: var(--bg-soft);    color: var(--fg-muted);border: 1px solid var(--border); }
+figure.diagram .tag {
+  display: inline-block;
+  padding: 0 0.45em;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75em;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  margin-right: 0.3em;
+  vertical-align: 0.05em;
+}
+figure.diagram .tag.new  { background: var(--success); color: white; }
+figure.diagram .tag.edit { background: var(--hex-french-blue); color: white; }
+
+/* Swimlane (two parallel timelines) */
+figure.diagram .swimlane.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1em 1.5em;
+}
+figure.diagram .swimlane .lane {
+  border-left: 3px solid var(--rule);
+  padding-left: 0.9em;
+}
+figure.diagram .swimlane .lane:nth-child(2) { border-left-color: var(--accent); }
+figure.diagram .swimlane .lane-title {
+  font-size: 0.8em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  color: var(--rule);
+  margin: 0 0 0.5em;
+}
+figure.diagram .swimlane .lane:nth-child(2) .lane-title { color: var(--accent); }
+figure.diagram .swimlane ol.lane-steps {
+  list-style: decimal;
+  padding-left: 1.4em;
+  margin: 0;
+  font-size: 0.9em;
+}
+figure.diagram .swimlane li.phase {
+  list-style: none;
+  margin: 0.4em 0;
+  padding: 0.4em 0.6em;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+figure.diagram .swimlane li.phase ul.bare { font-size: 0.9em; }
+figure.diagram .swimlane li.phase .ok { color: var(--success); font-weight: 700; }
+figure.diagram .swimlane .lane-cross {
+  font-size: 0.8em;
+  color: var(--fg-muted);
+  font-style: italic;
+  margin: 0.25em 0 0;
+}
+
+/* Layered (numbered layer cards) */
+figure.diagram ol.layered {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+}
+figure.diagram ol.layered .layer {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg);
+  padding: 0.6em 0.9em;
+}
+figure.diagram ol.layered .layer-title {
+  font-weight: 700;
+  color: var(--h2-fg);
+  font-size: 0.95em;
+  margin: 0 0 0.3em;
+}
+
+/* Flow (vertical step list with optional branching row) */
+figure.diagram ol.flow {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35em;
+  align-items: stretch;
+}
+figure.diagram ol.flow .box.step {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5em 0.75em;
+  font-size: 0.9em;
+}
+figure.diagram .row.branch { gap: 0.6em; }
+figure.diagram .row.branch > * { flex: 1 1 200px; }
+figure.diagram .branch-left.ok  { border-left: 3px solid var(--success); }
+figure.diagram .branch-right.warn,
+figure.diagram .branch-right    { border-left: 3px solid var(--hex-yellow); }
+
+/* TAR plugin row */
+figure.diagram .row-tar { align-items: stretch; }
+figure.diagram .timer-list li { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; padding: 0.2em 0; }
+figure.diagram .tar-outputs li { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; padding: 0.15em 0; }
+figure.diagram .tar-outputs li.separator { color: var(--fg-muted); }
+figure.diagram .indent { padding-left: 1.5em; color: var(--fg-muted); }
+figure.diagram .box.boundary.tar-plugin { padding: 0.7em 0.9em; }
+
+/* UI mockups */
+figure.diagram .mockup {
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  width: 100%;
+}
+figure.diagram .mockup.wide { flex: 1 1 600px; }
+figure.diagram .mockup-row {
+  padding: 0.6em 0.85em;
+  border-top: 1px solid var(--border);
+  font-size: 0.85em;
+}
+figure.diagram .mockup-row:first-child { border-top: 0; }
+figure.diagram .mockup-header { background: var(--bg-soft); }
+figure.diagram .mockup-frame-title {
+  display: block;
+  font-weight: 700;
+  color: var(--h2-fg);
+  font-size: 0.85em;
+  margin-bottom: 0.3em;
+}
+figure.diagram .mockup-sub { color: var(--fg-muted); font-size: 0.85em; margin: 0.2em 0; }
+figure.diagram .mockup-actions { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; }
+figure.diagram .mockup-actions.right { float: right; }
+figure.diagram .right { float: right; }
+figure.diagram .mockup-pre {
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-radius: 4px;
+  padding: 0.5em 0.75em;
+  font-size: 0.8em;
+  margin: 0.3em 0 0;
+  overflow-x: auto;
+}
+figure.diagram .mockup-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.3em 0;
+  font-size: 0.85em;
+}
+figure.diagram .mockup-table th,
+figure.diagram .mockup-table td {
+  border: 1px solid var(--border);
+  padding: 0.25em 0.5em;
+  text-align: left;
+}
+figure.diagram .mockup-table thead { background: var(--table-header); }
+figure.diagram .mock-nav {
+  flex: 0 0 220px;
+  font-size: 0.85em;
+}
+figure.diagram .mock-nav li.active {
+  font-weight: 700;
+  color: var(--h2-fg);
+  border-left: 3px solid var(--accent);
+  padding-left: 0.4em;
+}
+figure.diagram .row-mock { align-items: stretch; }
+figure.diagram .mockup-kpis { display: flex; gap: 0.6em; flex-wrap: wrap; }
+figure.diagram .kpi {
+  flex: 1 1 100px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4em 0.6em;
+  background: var(--bg);
+  text-align: center;
+}
+figure.diagram .kpi.warn { border-color: var(--hex-yellow); }
+figure.diagram .kpi.err  { border-color: var(--error);     }
+figure.diagram .kpi-value { font-size: 1.2em; font-weight: 700; color: var(--h2-fg); }
+figure.diagram .kpi-label { font-size: 0.75em; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+figure.diagram .kpi-bar {
+  background: var(--bg-soft);
+  height: 4px;
+  border-radius: 2px;
+  margin-top: 0.3em;
+  overflow: hidden;
+}
+figure.diagram .kpi-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--success);
+}
+figure.diagram .mockup-twocol {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6em 1em;
+}
+figure.diagram .rule-list, figure.diagram .event-list, figure.diagram .pr-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.85em;
+}
+figure.diagram .rule-list li, figure.diagram .event-list li, figure.diagram .pr-list li {
+  padding: 0.25em 0;
+  border-bottom: 1px solid var(--border);
+}
+figure.diagram .rule-list li:last-child,
+figure.diagram .event-list li:last-child,
+figure.diagram .pr-list li:last-child { border-bottom: 0; }
+figure.diagram .dot { font-size: 0.9em; }
+figure.diagram .dot.ok    { color: var(--success); }
+figure.diagram .dot.drift { color: var(--hex-yellow); }
+figure.diagram .dot.alert { color: var(--error); }
+figure.diagram .dot.off   { color: var(--fg-muted); }
+figure.diagram .legend { font-size: 0.8em; color: var(--fg-muted); margin: 0.5em 0 0; }
+figure.diagram .approval { padding: 0.4em 0.5em; background: var(--bg-soft); border-radius: 4px; }
+figure.diagram .boundary-rule {
+  text-align: center;
+  font-size: 0.8em;
+  color: var(--fg-muted);
+  letter-spacing: 0.1em;
+  margin: 0.5em 0;
+  text-transform: uppercase;
+}
+figure.diagram .boundary-top    { border-color: var(--hex-french-blue); }
+figure.diagram .boundary-bottom { border-color: var(--hex-indigo); }
+figure.diagram .row-edges { gap: 2em; align-items: flex-start; }
+figure.diagram .row-edges .edge { display: flex; flex-direction: column; align-items: center; gap: 0.3em; }
+figure.diagram .row-edges .edge-label { font-size: 0.8em; color: var(--fg-muted); text-align: center; }
+figure.diagram .row-fanout { gap: 0.6em; align-items: center; }
+figure.diagram .row-fanout .gw-list { flex: 0 0 auto; }
+
 /* Inline doc-reference linkifier — keeps the original <code> chip styling but
    makes the surrounding anchor obvious by colouring the text french-blue. */
 a.doc-ref { text-decoration: none; }
@@ -409,39 +888,34 @@ while the C++ server retains the <em>control plane</em> (enrollment, auth, inven
 dashboard).</p>
 <hr>
 <h2 id="architecture-overview">Architecture Overview</h2>
-<div class="highlight"><pre><span></span><code>                  ┌─────────────────────────────────────────────────────────┐
-                  │                   Operator / Dashboard                  │
-                  │           (ManagementService.SendCommand)               │
-                  └────────────────────────┬────────────────────────────────┘
-                                           │ gRPC (or HTTP/2)
-                                           ▼
-                ┌──────────────────────────────────────────────────────────┐
-                │              yuzu-gateway  (Erlang/OTP cluster)          │
-                │                                                          │
-                │   ┌──────────┐  ┌──────────┐       ┌──────────┐        │
-                │   │ gw_node1 │  │ gw_node2 │  ...  │ gw_nodeN │        │
-                │   └──────────┘  └──────────┘       └──────────┘        │
-                │        │              │                   │              │
-                │    agent_proc     agent_proc         agent_proc          │
-                │    agent_proc     agent_proc         agent_proc          │
-                │    agent_proc     agent_proc         agent_proc          │
-                └──────┬───────────────┬───────────────────┬──────────────┘
-                       │               │                   │
-                       ▼               ▼                   ▼
-                  ┌─────────┐    ┌─────────┐         ┌─────────┐
-                  │ Agent 1 │    │ Agent 2 │   ...   │ Agent M │
-                  └─────────┘    └─────────┘         └─────────┘
-                       │               │                   │
-                       └───────────────┼───────────────────┘
-                                       │ Register, Heartbeat,
-                                       │ Inventory, Enrollment
-                                       ▼
-                              ┌──────────────────┐
-                              │  yuzu-server     │
-                              │  (C++ control    │
-                              │   plane)         │
-                              └──────────────────┘
-</code></pre></div>
+<figure class="diagram arch-figure" aria-label="Erlang gateway cluster topology: operator dashboard calls ManagementService.SendCommand over gRPC into the yuzu-gateway Erlang/OTP cluster (gw_node1..gw_nodeN), each holding many agent_proc processes that own bidi streams to individual agents; the same gateway nodes proxy agent register, heartbeat, inventory, and enrollment upstream to the yuzu-server C++ control plane.">
+  <div class="actor wide"><strong>Operator / Dashboard</strong><br><small>ManagementService.SendCommand</small></div>
+  <div class="arrow down centered" aria-hidden="true"></div>
+  <p class="caption-wire">gRPC <em>(or HTTP/2)</em></p>
+  <div class="arrow down centered" aria-hidden="true"></div>
+  <section class="box boundary boundary-server">
+    <header class="boundary-title">yuzu-gateway <small>(Erlang/OTP cluster)</small></header>
+    <div class="row">
+      <article class="box gw-node"><header class="box-title">gw_node1</header><ul class="bare small"><li>agent_proc</li><li>agent_proc</li><li>agent_proc</li></ul></article>
+      <article class="box gw-node"><header class="box-title">gw_node2</header><ul class="bare small"><li>agent_proc</li><li>agent_proc</li><li>agent_proc</li></ul></article>
+      <article class="box gw-node ellipsis"><span aria-hidden="true">…</span></article>
+      <article class="box gw-node"><header class="box-title">gw_nodeN</header><ul class="bare small"><li>agent_proc</li><li>agent_proc</li><li>agent_proc</li></ul></article>
+    </div>
+  </section>
+  <div class="arrow down centered" aria-hidden="true"></div>
+  <div class="row row-agents">
+    <div class="box small">Agent 1</div>
+    <div class="box small">Agent 2</div>
+    <div class="ellipsis" aria-hidden="true">…</div>
+    <div class="box small">Agent M</div>
+  </div>
+  <div class="arrow down centered" aria-hidden="true"></div>
+  <p class="caption-wire">Register, Heartbeat, Inventory, Enrollment</p>
+  <div class="arrow down centered" aria-hidden="true"></div>
+  <div class="actor"><strong>yuzu-server</strong><br><small>(C++ control plane)</small></div>
+  <figcaption>Erlang gateway cluster topology — operator→gateway→agent fleet, with the same gateway proxying agent registration up to the C++ server.</figcaption>
+</figure>
+
 <p><strong>Key split:</strong></p>
 <table>
 <thead>
@@ -466,44 +940,68 @@ dashboard).</p>
 </table>
 <hr>
 <h2 id="otp-application-structure">OTP Application Structure</h2>
-<div class="highlight"><pre><span></span><code>yuzu_gateway/
-├── rebar.config
-├── config/
-│   └── sys.config              % Node name, gRPC listen port, C++ upstream,
-│                               % Erlang distribution cookie, telemetry sinks
-├── apps/
-│   └── yuzu_gw/
-│       ├── src/
-│       │   ├── yuzu_gw_app.erl            % application behaviour
-│       │   ├── yuzu_gw_sup.erl            % top-level supervisor
-│       │   │
-│       │   ├── %% ── Agent Connection Layer ──
-│       │   ├── yuzu_gw_agent_sup.erl      % simple_one_for_one for agent procs
-│       │   ├── yuzu_gw_agent.erl          % gen_statem: one per agent bidi stream
-│       │   │
-│       │   ├── %% ── Routing / Registry ──
-│       │   ├── yuzu_gw_registry.erl       % pg (process groups) + ETS routing table
-│       │   ├── yuzu_gw_router.erl         % gen_server: command fanout coordinator
-│       │   │
-│       │   ├── %% ── Upstream (C++ server) ──
-│       │   ├── yuzu_gw_upstream.erl       % gen_server: gRPC client pool to yuzu-server
-│       │   │
-│       │   ├── %% ── Operator-facing gRPC ──
-│       │   ├── yuzu_gw_mgmt_service.erl   % grpc server: ManagementService.SendCommand
-│       │   ├── yuzu_gw_agent_service.erl  % grpc server: AgentService proxy (Register→upstream)
-│       │   │
-│       │   ├── %% ── Telemetry ──
-│       │   ├── yuzu_gw_telemetry.erl      % telemetry event definitions + handlers
-│       │   │
-│       │   └── %% ── Proto helpers ──
-│       │       └── yuzu_gw_proto.erl      % encode/decode wrappers (gpb or grpc_client)
-│       │
-│       └── priv/
-│           └── proto/                     % Symlink or copy of proto/ from repo root
-│               ├── yuzu/agent/v1/agent.proto
-│               ├── yuzu/common/v1/common.proto
-│               └── yuzu/server/v1/management.proto
-</code></pre></div>
+<figure class="diagram tree-figure" aria-label="Erlang gateway module layout: yuzu_gateway directory tree showing rebar.config, sys.config, supervisor, agent connection layer, routing/registry, upstream client, operator-facing gRPC services, telemetry, and proto helpers.">
+  <ul class="tree" role="tree">
+    <li><span class="node">yuzu_gateway/</span>
+      <ul>
+        <li><span class="node">rebar.config</span></li>
+        <li><span class="node">config/</span>
+          <ul><li><span class="node">sys.config</span> <span class="desc">node name, gRPC listen port, C++ upstream, distribution cookie, telemetry sinks</span></li></ul>
+        </li>
+        <li><span class="node">apps/</span>
+          <ul>
+            <li><span class="node">yuzu_gw/</span>
+              <ul>
+                <li><span class="node">src/</span>
+                  <ul>
+                    <li><code>yuzu_gw_app.erl</code> <span class="desc">application behaviour</span></li>
+                    <li><code>yuzu_gw_sup.erl</code> <span class="desc">top-level supervisor</span></li>
+                    <li class="section"><strong>Agent Connection Layer</strong>
+                      <ul>
+                        <li><code>yuzu_gw_agent_sup.erl</code> <span class="desc">simple_one_for_one for agent procs</span></li>
+                        <li><code>yuzu_gw_agent.erl</code> <span class="desc">gen_statem: one per agent bidi stream</span></li>
+                      </ul>
+                    </li>
+                    <li class="section"><strong>Routing / Registry</strong>
+                      <ul>
+                        <li><code>yuzu_gw_registry.erl</code> <span class="desc">pg (process groups) + ETS routing table</span></li>
+                        <li><code>yuzu_gw_router.erl</code> <span class="desc">gen_server: command fanout coordinator</span></li>
+                      </ul>
+                    </li>
+                    <li class="section"><strong>Upstream (C++ server)</strong>
+                      <ul><li><code>yuzu_gw_upstream.erl</code> <span class="desc">gen_server: gRPC client pool to yuzu-server</span></li></ul>
+                    </li>
+                    <li class="section"><strong>Operator-facing gRPC</strong>
+                      <ul>
+                        <li><code>yuzu_gw_mgmt_service.erl</code> <span class="desc">grpc server: ManagementService.SendCommand</span></li>
+                        <li><code>yuzu_gw_agent_service.erl</code> <span class="desc">grpc server: AgentService proxy (Register→upstream)</span></li>
+                      </ul>
+                    </li>
+                    <li class="section"><strong>Telemetry</strong>
+                      <ul><li><code>yuzu_gw_telemetry.erl</code> <span class="desc">telemetry event definitions + handlers</span></li></ul>
+                    </li>
+                    <li class="section"><strong>Proto helpers</strong>
+                      <ul><li><code>yuzu_gw_proto.erl</code> <span class="desc">encode/decode wrappers (gpb or grpc_client)</span></li></ul>
+                    </li>
+                  </ul>
+                </li>
+                <li><span class="node">priv/proto/</span> <span class="desc">symlink or copy of <code>proto/</code> from repo root</span>
+                  <ul>
+                    <li><code>yuzu/agent/v1/agent.proto</code></li>
+                    <li><code>yuzu/common/v1/common.proto</code></li>
+                    <li><code>yuzu/server/v1/management.proto</code></li>
+                  </ul>
+                </li>
+              </ul>
+            </li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <figcaption>Erlang gateway source layout — top-level supervisor, agent connection layer, routing, upstream pool, operator/agent gRPC services, telemetry, proto helpers.</figcaption>
+</figure>
+
 <h3 id="dependencies">Dependencies</h3>
 <div class="highlight"><pre><span></span><code><span class="c">%% rebar.config</span>
 <span class="p">{</span><span class="n">deps</span><span class="p">,</span><span class="w"> </span><span class="p">[</span>
@@ -520,21 +1018,23 @@ dashboard).</p>
 <p>This is the core scaling insight: Erlang can sustain <strong>millions of lightweight
 processes</strong>, each holding the state for one agent's bidi stream. No mutexes —
 message passing provides serialization.</p>
-<div class="highlight"><pre><span></span><code>States:
-  ┌──────────────┐
-  │  connecting   │  Agent called Register → upstream forwarded → got session_id
-  └──────┬───────┘
-         │ Subscribe stream established
-         ▼
-  ┌──────────────┐
-  │   streaming   │  Bidi stream active; agent_proc owns the stream writer
-  └──────┬───────┘
-         │ stream broken / heartbeat timeout
-         ▼
-  ┌──────────────┐
-  │ disconnected  │  Cleanup, deregister from routing table, terminate
-  └──────────────┘
-</code></pre></div>
+<figure class="diagram state-figure" aria-label="agent_proc gen_statem state machine: connecting (Register forwarded upstream and got session_id) → streaming (bidi stream active, agent_proc owns the stream writer) → disconnected (stream broken or heartbeat timeout; cleanup, deregister from routing table, terminate).">
+  <ol class="state-flow">
+    <li>
+      <div class="box state"><header class="box-title">connecting</header><p>Agent called <code>Register</code> → upstream forwarded → got <code>session_id</code></p></div>
+      <div class="arrow down state-arrow"><span class="edge-label">Subscribe stream established</span></div>
+    </li>
+    <li>
+      <div class="box state"><header class="box-title">streaming</header><p>Bidi stream active; <code>agent_proc</code> owns the stream writer</p></div>
+      <div class="arrow down state-arrow"><span class="edge-label">stream broken / heartbeat timeout</span></div>
+    </li>
+    <li>
+      <div class="box state state-terminal"><header class="box-title">disconnected</header><p>Cleanup, deregister from routing table, terminate</p></div>
+    </li>
+  </ol>
+  <figcaption>agent_proc gen_statem state transitions.</figcaption>
+</figure>
+
 <p><strong>Key properties:</strong></p>
 <ul>
 <li>The process <strong>owns</strong> the gRPC stream writer handle. All writes to this agent
@@ -632,14 +1132,22 @@ whose stream is already broken.</p>
 means the operator sees progressive results — identical to the current
 server-streaming <code>SendCommand</code> contract.</p>
 <h3 id="4-supervision-tree">4. Supervision Tree</h3>
-<div class="highlight"><pre><span></span><code>yuzu_gw_sup (one_for_one)
-  ├── yuzu_gw_registry          (gen_server — ETS owner, pg coordinator)
-  ├── yuzu_gw_upstream          (gen_server — gRPC client pool to C++ server)
-  ├── yuzu_gw_router            (gen_server — fanout coordinator)
-  ├── yuzu_gw_agent_sup         (simple_one_for_one — agent processes)
-  ├── yuzu_gw_mgmt_service      (grpcbox service — operator-facing)
-  └── yuzu_gw_agent_service     (grpcbox service — agent-facing proxy)
-</code></pre></div>
+<figure class="diagram tree-figure" aria-label="yuzu_gw_sup supervision tree (one_for_one): yuzu_gw_registry (ETS owner, pg coordinator), yuzu_gw_upstream (gRPC client pool to C++ server), yuzu_gw_router (fanout coordinator), yuzu_gw_agent_sup (simple_one_for_one for agent processes), yuzu_gw_mgmt_service (operator-facing grpcbox service), and yuzu_gw_agent_service (agent-facing grpcbox proxy).">
+  <ul class="tree" role="tree">
+    <li role="treeitem"><span class="node">yuzu_gw_sup</span> <span class="desc">one_for_one</span>
+      <ul role="group">
+        <li><code>yuzu_gw_registry</code> <span class="desc">gen_server — ETS owner, pg coordinator</span></li>
+        <li><code>yuzu_gw_upstream</code> <span class="desc">gen_server — gRPC client pool to C++ server</span></li>
+        <li><code>yuzu_gw_router</code> <span class="desc">gen_server — fanout coordinator</span></li>
+        <li><code>yuzu_gw_agent_sup</code> <span class="desc">simple_one_for_one — agent processes</span></li>
+        <li><code>yuzu_gw_mgmt_service</code> <span class="desc">grpcbox service — operator-facing</span></li>
+        <li><code>yuzu_gw_agent_service</code> <span class="desc">grpcbox service — agent-facing proxy</span></li>
+      </ul>
+    </li>
+  </ul>
+  <figcaption>yuzu_gw_sup supervision tree (one_for_one).</figcaption>
+</figure>
+
 <hr>
 <h2 id="routing-table">Routing Table</h2>
 <h3 id="design-ets-pg-process-groups">Design: ETS + pg (Process Groups)</h3>
@@ -1058,12 +1566,23 @@ events natively from process lifecycle monitoring.</p>
 machine. The BEAM scheduler pins one scheduler thread per core; all agent
 processes are multiplexed across them without thread-per-connection overhead.</p>
 <p><strong>Cluster topology for 5M agents:</strong></p>
-<div class="highlight"><pre><span></span><code>               ┌─── gw1 (1M agents) ───┐
-               ├─── gw2 (1M agents) ───┤
-LB/DNS ────────├─── gw3 (1M agents) ───├──── yuzu-server (C++)
-               ├─── gw4 (1M agents) ───┤
-               └─── gw5 (1M agents) ───┘
-</code></pre></div>
+<figure class="diagram arch-figure" aria-label="Load balancer fan-out: LB/DNS spreads agent connections across five gateway nodes (gw1..gw5), each holding ~1M agents, all of which converge upstream to a single yuzu-server (C++).">
+  <div class="row row-fanout">
+    <div class="actor"><strong>LB/DNS</strong></div>
+    <div class="arrow right" aria-hidden="true"></div>
+    <ul class="bare gw-list">
+      <li class="box small">gw1 <small>(1M agents)</small></li>
+      <li class="box small">gw2 <small>(1M agents)</small></li>
+      <li class="box small">gw3 <small>(1M agents)</small></li>
+      <li class="box small">gw4 <small>(1M agents)</small></li>
+      <li class="box small">gw5 <small>(1M agents)</small></li>
+    </ul>
+    <div class="arrow right" aria-hidden="true"></div>
+    <div class="actor"><strong>yuzu-server</strong><br><small>(C++)</small></div>
+  </div>
+  <figcaption>Gateway horizontal scaling — LB/DNS spreads agents across gateway nodes which all share a single upstream C++ server.</figcaption>
+</figure>
+
 <hr>
 <h2 id="migration-steps">Migration Steps</h2>
 <h3 id="phase-0-proto-preparation-no-runtime-changes">Phase 0: Proto Preparation (no runtime changes)</h3>
@@ -1260,31 +1779,36 @@ way (or proxy the raw TLS peer identity to the C++ server in <code>ProxyRegister
 </table>
 <hr>
 <h2 id="file-placement-in-yuzu-repo">File Placement in Yuzu Repo</h2>
-<div class="highlight"><pre><span></span><code>Yuzu/
-├── gateway/
-│   └── erlang/                    % New: Erlang OTP application
-│       ├── rebar.config
-│       ├── rebar.lock
-│       ├── config/
-│       │   ├── sys.config
-│       │   └── vm.args
-│       └── apps/
-│           └── yuzu_gw/
-│               └── src/
-│                   └── (modules listed above)
-├── proto/
-│   └── yuzu/
-│       ├── gateway/
-│       │   └── v1/
-│       │       └── gateway.proto  % New: internal gateway↔server proto
-│       ├── agent/v1/agent.proto   % Unchanged
-│       ├── common/v1/common.proto % Unchanged
-│       └── server/v1/management.proto % Unchanged
-└── server/
-    └── core/
-        └── src/
-            └── server.cpp         % Add GatewayUpstream service impl
-</code></pre></div>
+<figure class="diagram tree-figure" aria-label="Repo layout after gateway lands: Yuzu/gateway/erlang holds the new OTP application; proto/yuzu/gateway/v1/gateway.proto is the new internal gateway↔server proto; server/core/src/server.cpp gains the GatewayUpstream service impl.">
+  <ul class="tree" role="tree">
+    <li><span class="node">Yuzu/</span>
+      <ul>
+        <li><span class="node">gateway/</span>
+          <ul>
+            <li><span class="node">erlang/</span> <span class="tag new">NEW</span> <span class="desc">Erlang OTP application</span>
+              <ul>
+                <li><code>rebar.config</code></li>
+                <li><code>rebar.lock</code></li>
+                <li><span class="node">config/</span><ul><li><code>sys.config</code></li><li><code>vm.args</code></li></ul></li>
+                <li><span class="node">apps/yuzu_gw/src/</span> <span class="desc">(modules listed above)</span></li>
+              </ul>
+            </li>
+          </ul>
+        </li>
+        <li><span class="node">proto/yuzu/</span>
+          <ul>
+            <li><span class="node">gateway/v1/gateway.proto</span> <span class="tag new">NEW</span> <span class="desc">internal gateway↔server proto</span></li>
+            <li><span class="node">agent/v1/agent.proto</span> <span class="desc">unchanged</span></li>
+            <li><span class="node">common/v1/common.proto</span> <span class="desc">unchanged</span></li>
+            <li><span class="node">server/v1/management.proto</span> <span class="desc">unchanged</span></li>
+          </ul>
+        </li>
+        <li><span class="node">server/core/src/server.cpp</span> <span class="desc">add GatewayUpstream service impl</span></li>
+      </ul>
+    </li>
+  </ul>
+  <figcaption>Repo additions when gateway lands — new <code>gateway/erlang</code> OTP app, new <code>proto/yuzu/gateway/v1/gateway.proto</code>, and a server-side service impl.</figcaption>
+</figure>
 </main>
 </body>
 </html>

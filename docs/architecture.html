@@ -313,6 +313,485 @@ mark { background: var(--hex-yellow); color: var(--hex-black); padding: 0 0.2em;
 }
 .frontmatter { border-left-color: var(--hex-indigo); }
 
+/* ── Diagrams — shared primitives for ASCII-art redraws ─────────────────── */
+figure.diagram {
+  margin: 1.5em 0;
+  padding: 1em;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+}
+figure.diagram figcaption {
+  margin-top: 0.75em;
+  padding-top: 0.5em;
+  border-top: 1px solid var(--border);
+  font-size: 0.85em;
+  font-style: italic;
+  color: var(--fg-muted);
+}
+figure.diagram .row {
+  display: flex;
+  gap: 0.75em;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin: 0.6em 0;
+}
+figure.diagram .row-agents,
+figure.diagram .row-three { gap: 1em; }
+figure.diagram .row-three > * { flex: 1 1 220px; }
+figure.diagram .col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5em;
+}
+figure.diagram .arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--rule);
+  font-weight: 700;
+  font-size: 1.2em;
+}
+figure.diagram .arrow.right::after { content: "→"; }
+figure.diagram .arrow.left::after  { content: "←"; }
+figure.diagram .arrow.down::after  { content: "↓"; }
+figure.diagram .arrow.up::after    { content: "↑"; }
+figure.diagram .arrow.centered {
+  display: flex;
+  width: 100%;
+  justify-content: center;
+}
+figure.diagram .arrow .edge-label {
+  margin-left: 0.4em;
+  font-size: 0.8em;
+  font-style: italic;
+  font-weight: 400;
+  color: var(--fg-muted);
+}
+figure.diagram .caption-wire {
+  text-align: center;
+  font-size: 0.85em;
+  color: var(--fg-muted);
+  margin: 0.25em 0;
+}
+figure.diagram .box {
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  padding: 0.55em 0.75em;
+  font-size: 0.9em;
+  line-height: 1.35;
+  min-width: 7em;
+}
+figure.diagram .box.small {
+  padding: 0.35em 0.6em;
+  font-size: 0.85em;
+  min-width: 5em;
+}
+figure.diagram .box .box-title {
+  display: block;
+  font-weight: 700;
+  color: var(--h2-fg);
+  margin-bottom: 0.2em;
+  font-size: 0.95em;
+}
+figure.diagram .box.boundary,
+figure.diagram .boundary {
+  border: 2px dashed var(--rule);
+  background: var(--bg-soft);
+  padding: 0.9em 1em;
+}
+figure.diagram .boundary > .boundary-title {
+  display: block;
+  font-weight: 700;
+  color: var(--rule);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.8em;
+  margin: 0 0 0.6em;
+}
+figure.diagram .boundary-server { border-color: var(--hex-french-blue); }
+figure.diagram .boundary-server > .boundary-title { color: var(--hex-french-blue); }
+figure.diagram .boundary-inner {
+  border-style: solid;
+  border-color: var(--hex-indigo);
+}
+figure.diagram .boundary-inner > .boundary-title { color: var(--hex-indigo); }
+figure.diagram .grid {
+  display: grid;
+  gap: 0.55em;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+figure.diagram .grid-frontends { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+figure.diagram .grid-core      { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+figure.diagram .grid-server    { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+figure.diagram .chip {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 0.4em 0.6em;
+  font-size: 0.85em;
+}
+figure.diagram .chip code { background: transparent; border: 0; padding: 0; }
+figure.diagram .actor {
+  border: 1.5px solid var(--hex-indigo);
+  border-radius: 50px;
+  padding: 0.5em 1em;
+  background: var(--bg);
+  text-align: center;
+  font-size: 0.9em;
+}
+figure.diagram .actor.wide { padding: 0.6em 1.5em; }
+figure.diagram ul.bare {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+figure.diagram ul.bare.small { font-size: 0.8em; }
+figure.diagram ul.bare li { margin: 0.15em 0; }
+figure.diagram .ellipsis {
+  font-size: 1.3em;
+  color: var(--fg-muted);
+  align-self: center;
+  padding: 0 0.3em;
+}
+figure.diagram .gw-list { display: flex; flex-direction: column; gap: 0.3em; }
+figure.diagram .box.agent { border-left: 4px solid var(--hex-french-blue); }
+figure.diagram .box.gw-node { border-left: 4px solid var(--hex-gold); }
+figure.diagram .box.state {
+  border: 2px solid var(--hex-indigo);
+  border-radius: 14px;
+  padding: 0.6em 1em;
+  background: var(--bg);
+  display: block;
+  text-align: center;
+}
+figure.diagram .state-terminal { border-color: var(--error); }
+figure.diagram ol.state-flow {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25em;
+}
+figure.diagram ol.state-flow > li { width: 100%; max-width: 28em; }
+figure.diagram .state-arrow { padding: 0.2em 0; font-size: 0.95em; }
+
+/* Trees */
+figure.diagram ul.tree,
+figure.diagram ul.tree ul {
+  list-style: none;
+  padding-left: 1.4em;
+  margin: 0;
+  position: relative;
+  font-size: 0.9em;
+  line-height: 1.55;
+}
+figure.diagram ul.tree li {
+  position: relative;
+  padding: 0.05em 0 0.05em 0.9em;
+}
+figure.diagram ul.tree li::before {
+  content: "";
+  position: absolute;
+  left: -0.05em;
+  top: 0;
+  width: 0.9em;
+  height: 0.9em;
+  border-left: 1.5px solid var(--border);
+  border-bottom: 1.5px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+figure.diagram ul.tree li:not(:last-child)::after {
+  content: "";
+  position: absolute;
+  left: -0.05em;
+  top: 0.9em;
+  bottom: 0;
+  border-left: 1.5px solid var(--border);
+}
+figure.diagram ul.tree .node {
+  color: var(--h2-fg);
+  font-weight: 600;
+}
+figure.diagram ul.tree .desc {
+  color: var(--fg-muted);
+  font-size: 0.9em;
+  margin-left: 0.4em;
+}
+figure.diagram ul.tree li.section { margin-top: 0.4em; }
+figure.diagram h4.tree-root {
+  font-size: 0.95em;
+  color: var(--h2-fg);
+  margin: 0.8em 0 0.3em;
+  border: 0;
+  padding: 0;
+}
+figure.diagram .tree-grid {
+  display: grid;
+  gap: 1em;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+}
+figure.diagram .tree-prose { margin: 0.1em 0 0.5em; }
+figure.diagram p.tree-prose { font-size: 0.9em; color: var(--fg-muted); }
+figure.diagram .badge {
+  display: inline-block;
+  padding: 0.05em 0.5em;
+  border-radius: 999px;
+  font-size: 0.75em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-left: 0.4em;
+  vertical-align: middle;
+}
+figure.diagram .badge.ok    { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }
+figure.diagram .badge.warn  { background: var(--hex-yellow); color: var(--hex-black); }
+figure.diagram .badge.err   { background: var(--error-bg);   color: var(--error);   border: 1px solid var(--error-border); }
+figure.diagram .badge.done  { background: var(--success-bg); color: var(--success); border: 1px solid var(--success-border); }
+figure.diagram .badge.muted { background: var(--bg-soft);    color: var(--fg-muted);border: 1px solid var(--border); }
+figure.diagram .tag {
+  display: inline-block;
+  padding: 0 0.45em;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75em;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  margin-right: 0.3em;
+  vertical-align: 0.05em;
+}
+figure.diagram .tag.new  { background: var(--success); color: white; }
+figure.diagram .tag.edit { background: var(--hex-french-blue); color: white; }
+
+/* Swimlane (two parallel timelines) */
+figure.diagram .swimlane.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1em 1.5em;
+}
+figure.diagram .swimlane .lane {
+  border-left: 3px solid var(--rule);
+  padding-left: 0.9em;
+}
+figure.diagram .swimlane .lane:nth-child(2) { border-left-color: var(--accent); }
+figure.diagram .swimlane .lane-title {
+  font-size: 0.8em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  color: var(--rule);
+  margin: 0 0 0.5em;
+}
+figure.diagram .swimlane .lane:nth-child(2) .lane-title { color: var(--accent); }
+figure.diagram .swimlane ol.lane-steps {
+  list-style: decimal;
+  padding-left: 1.4em;
+  margin: 0;
+  font-size: 0.9em;
+}
+figure.diagram .swimlane li.phase {
+  list-style: none;
+  margin: 0.4em 0;
+  padding: 0.4em 0.6em;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+figure.diagram .swimlane li.phase ul.bare { font-size: 0.9em; }
+figure.diagram .swimlane li.phase .ok { color: var(--success); font-weight: 700; }
+figure.diagram .swimlane .lane-cross {
+  font-size: 0.8em;
+  color: var(--fg-muted);
+  font-style: italic;
+  margin: 0.25em 0 0;
+}
+
+/* Layered (numbered layer cards) */
+figure.diagram ol.layered {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6em;
+}
+figure.diagram ol.layered .layer {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg);
+  padding: 0.6em 0.9em;
+}
+figure.diagram ol.layered .layer-title {
+  font-weight: 700;
+  color: var(--h2-fg);
+  font-size: 0.95em;
+  margin: 0 0 0.3em;
+}
+
+/* Flow (vertical step list with optional branching row) */
+figure.diagram ol.flow {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35em;
+  align-items: stretch;
+}
+figure.diagram ol.flow .box.step {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5em 0.75em;
+  font-size: 0.9em;
+}
+figure.diagram .row.branch { gap: 0.6em; }
+figure.diagram .row.branch > * { flex: 1 1 200px; }
+figure.diagram .branch-left.ok  { border-left: 3px solid var(--success); }
+figure.diagram .branch-right.warn,
+figure.diagram .branch-right    { border-left: 3px solid var(--hex-yellow); }
+
+/* TAR plugin row */
+figure.diagram .row-tar { align-items: stretch; }
+figure.diagram .timer-list li { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; padding: 0.2em 0; }
+figure.diagram .tar-outputs li { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; padding: 0.15em 0; }
+figure.diagram .tar-outputs li.separator { color: var(--fg-muted); }
+figure.diagram .indent { padding-left: 1.5em; color: var(--fg-muted); }
+figure.diagram .box.boundary.tar-plugin { padding: 0.7em 0.9em; }
+
+/* UI mockups */
+figure.diagram .mockup {
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  width: 100%;
+}
+figure.diagram .mockup.wide { flex: 1 1 600px; }
+figure.diagram .mockup-row {
+  padding: 0.6em 0.85em;
+  border-top: 1px solid var(--border);
+  font-size: 0.85em;
+}
+figure.diagram .mockup-row:first-child { border-top: 0; }
+figure.diagram .mockup-header { background: var(--bg-soft); }
+figure.diagram .mockup-frame-title {
+  display: block;
+  font-weight: 700;
+  color: var(--h2-fg);
+  font-size: 0.85em;
+  margin-bottom: 0.3em;
+}
+figure.diagram .mockup-sub { color: var(--fg-muted); font-size: 0.85em; margin: 0.2em 0; }
+figure.diagram .mockup-actions { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; }
+figure.diagram .mockup-actions.right { float: right; }
+figure.diagram .right { float: right; }
+figure.diagram .mockup-pre {
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-radius: 4px;
+  padding: 0.5em 0.75em;
+  font-size: 0.8em;
+  margin: 0.3em 0 0;
+  overflow-x: auto;
+}
+figure.diagram .mockup-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.3em 0;
+  font-size: 0.85em;
+}
+figure.diagram .mockup-table th,
+figure.diagram .mockup-table td {
+  border: 1px solid var(--border);
+  padding: 0.25em 0.5em;
+  text-align: left;
+}
+figure.diagram .mockup-table thead { background: var(--table-header); }
+figure.diagram .mock-nav {
+  flex: 0 0 220px;
+  font-size: 0.85em;
+}
+figure.diagram .mock-nav li.active {
+  font-weight: 700;
+  color: var(--h2-fg);
+  border-left: 3px solid var(--accent);
+  padding-left: 0.4em;
+}
+figure.diagram .row-mock { align-items: stretch; }
+figure.diagram .mockup-kpis { display: flex; gap: 0.6em; flex-wrap: wrap; }
+figure.diagram .kpi {
+  flex: 1 1 100px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4em 0.6em;
+  background: var(--bg);
+  text-align: center;
+}
+figure.diagram .kpi.warn { border-color: var(--hex-yellow); }
+figure.diagram .kpi.err  { border-color: var(--error);     }
+figure.diagram .kpi-value { font-size: 1.2em; font-weight: 700; color: var(--h2-fg); }
+figure.diagram .kpi-label { font-size: 0.75em; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+figure.diagram .kpi-bar {
+  background: var(--bg-soft);
+  height: 4px;
+  border-radius: 2px;
+  margin-top: 0.3em;
+  overflow: hidden;
+}
+figure.diagram .kpi-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--success);
+}
+figure.diagram .mockup-twocol {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6em 1em;
+}
+figure.diagram .rule-list, figure.diagram .event-list, figure.diagram .pr-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.85em;
+}
+figure.diagram .rule-list li, figure.diagram .event-list li, figure.diagram .pr-list li {
+  padding: 0.25em 0;
+  border-bottom: 1px solid var(--border);
+}
+figure.diagram .rule-list li:last-child,
+figure.diagram .event-list li:last-child,
+figure.diagram .pr-list li:last-child { border-bottom: 0; }
+figure.diagram .dot { font-size: 0.9em; }
+figure.diagram .dot.ok    { color: var(--success); }
+figure.diagram .dot.drift { color: var(--hex-yellow); }
+figure.diagram .dot.alert { color: var(--error); }
+figure.diagram .dot.off   { color: var(--fg-muted); }
+figure.diagram .legend { font-size: 0.8em; color: var(--fg-muted); margin: 0.5em 0 0; }
+figure.diagram .approval { padding: 0.4em 0.5em; background: var(--bg-soft); border-radius: 4px; }
+figure.diagram .boundary-rule {
+  text-align: center;
+  font-size: 0.8em;
+  color: var(--fg-muted);
+  letter-spacing: 0.1em;
+  margin: 0.5em 0;
+  text-transform: uppercase;
+}
+figure.diagram .boundary-top    { border-color: var(--hex-french-blue); }
+figure.diagram .boundary-bottom { border-color: var(--hex-indigo); }
+figure.diagram .row-edges { gap: 2em; align-items: flex-start; }
+figure.diagram .row-edges .edge { display: flex; flex-direction: column; align-items: center; gap: 0.3em; }
+figure.diagram .row-edges .edge-label { font-size: 0.8em; color: var(--fg-muted); text-align: center; }
+figure.diagram .row-fanout { gap: 0.6em; align-items: center; }
+figure.diagram .row-fanout .gw-list { flex: 0 0 auto; }
+
 /* Inline doc-reference linkifier — keeps the original <code> chip styling but
    makes the surrounding anchor obvious by colouring the text french-blue. */
 a.doc-ref { text-decoration: none; }
@@ -393,45 +872,49 @@ ul.doc-index a:hover code { text-decoration: underline; }
 <h1 id="yuzu-architecture">Yuzu Architecture</h1>
 <p>This document describes how Yuzu's components interact, the data flows between them, and the design rationale behind each subsystem.</p>
 <h2 id="component-overview">Component Overview</h2>
-<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────────┐
-│                              Yuzu Server                                │
-│                                                                         │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐   │
-│  │  gRPC       │  │  HTTP/REST   │  │  Auth        │  │  Metrics    │   │
-│  │  Services   │  │  API + HTMX  │  │  Manager     │  │  /metrics   │   │
-│  │             │  │  Dashboard   │  │  (RBAC)      │  │             │   │
-│  └──────┬──────┘  └──────┬───────┘  └───────┬──────┘  └─────────────┘   │
-│         │         ┌──────────────┐          │                           │
-│         │         │  MCP Server  │  (JSON-RPC 2.0, AI tool use)         │
-│         │         │  /mcp/v1/    │          │                           │
-│         │         └──────────────┘          │                           │
-│         │                │                  │                           │
-│  ┌──────▼────────────────▼──────────────────▼─────────────────────────┐ │
-│  │                     Server Core                                    │ │
-│  │  ┌──────────────┐  ┌────────────┐  ┌────────────┐  ┌───────────┐   │ │
-│  │  │ Agent        │  │ Instruction│  │ Response   │  │ Audit     │   │ │
-│  │  │ Registry     │  │ Engine     │  │ Store      │  │ Log       │   │ │
-│  │  └──────────────┘  └────────────┘  └────────────┘  └───────────┘   │ │
-│  │  ┌──────────────┐  ┌────────────┐  ┌────────────┐  ┌───────────┐   │ │
-│  │  │ Scope        │  │ Policy     │  │ Scheduler  │  │ Event     │   │ │
-│  │  │ Engine       │  │ Engine     │  │            │  │ Bus       │   │ │
-│  │  └──────────────┘  └────────────┘  └────────────┘  └───────────┘   │ │
-│  │  ┌──────────────┐  ┌────────────┐  ┌────────────┐                  │ │
-│  │  │ Management   │  │ NVD Sync   │  │ Content    │                  │ │
-│  │  │ Groups       │  │            │  │ Repository │                  │ │
-│  │  └──────────────┘  └────────────┘  └────────────┘                  │ │
-│  └────────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────────┘
-         │                                              │
-    gRPC/mTLS                                     HTTP/REST
-    (agents)                                    (browsers, API)
-         │                                              │
-    ┌────▼────┐                                    ┌────▼────┐
-    │  Agent  │                                    │  Users  │
-    │  Fleet  │                                    │  &amp; API  │
-    └─────────┘                                    │ Clients │
-                                                   └─────────┘
-</code></pre></div>
+<figure class="diagram arch-figure" aria-label="Yuzu Server internals: gRPC services, HTTP/REST + HTMX dashboard, MCP server, Auth Manager, and Metrics fronted Server Core which hosts Agent Registry, Instruction Engine, Response Store, Audit Log, Scope Engine, Policy Engine, Scheduler, Event Bus, Management Groups, NVD Sync, and Content Repository. Agents connect over gRPC/mTLS; users and API clients over HTTP/REST.">
+  <section class="box boundary boundary-server">
+    <header class="boundary-title">Yuzu Server</header>
+    <div class="grid grid-frontends">
+      <div class="chip">gRPC Services</div>
+      <div class="chip">HTTP/REST API + HTMX Dashboard</div>
+      <div class="chip">MCP Server <small>(JSON-RPC 2.0, AI tool use, <code>/mcp/v1/</code>)</small></div>
+      <div class="chip">Auth Manager <small>(RBAC)</small></div>
+      <div class="chip">Metrics <code>/metrics</code></div>
+    </div>
+    <div class="arrow down centered" aria-hidden="true"></div>
+    <section class="box boundary boundary-inner">
+      <header class="boundary-title">Server Core</header>
+      <div class="grid grid-core">
+        <div class="chip">Agent Registry</div>
+        <div class="chip">Instruction Engine</div>
+        <div class="chip">Response Store</div>
+        <div class="chip">Audit Log</div>
+        <div class="chip">Scope Engine</div>
+        <div class="chip">Policy Engine</div>
+        <div class="chip">Scheduler</div>
+        <div class="chip">Event Bus</div>
+        <div class="chip">Management Groups</div>
+        <div class="chip">NVD Sync</div>
+        <div class="chip">Content Repository</div>
+      </div>
+    </section>
+  </section>
+  <div class="row row-edges">
+    <div class="edge">
+      <div class="arrow down" aria-hidden="true"></div>
+      <p class="edge-label">gRPC / mTLS<br><small>(agents)</small></p>
+      <div class="box small">Agent Fleet</div>
+    </div>
+    <div class="edge">
+      <div class="arrow down" aria-hidden="true"></div>
+      <p class="edge-label">HTTP / REST<br><small>(browsers, API)</small></p>
+      <div class="box small">Users &amp; API Clients</div>
+    </div>
+  </div>
+  <figcaption>Yuzu Server internals — front-end surfaces (gRPC, REST/HTMX, MCP, Auth, Metrics) fronting the Server Core stores; agents and operators connect over distinct edges.</figcaption>
+</figure>
+
 <h2 id="data-flows">Data Flows</h2>
 <h3 id="1-agent-registration-and-enrollment">1. Agent Registration and Enrollment</h3>
 <div class="highlight"><pre><span></span><code>Agent                           Server
@@ -619,20 +1102,35 @@ ul.doc-index a:hover code { text-decoration: underline; }
 </table>
 <p><strong>Why SQLite everywhere?</strong> Zero configuration, single-file deployment, fast reads, supports concurrent readers with WAL mode. For the agent (which must be lightweight), SQLite adds ~600KB to the binary and requires no external database. For the server, SQLite scales to millions of rows per shard. If the server outgrows SQLite, the storage layer can be swapped to PostgreSQL with minimal code change — the query patterns are simple (insert, filter, paginate).</p>
 <h2 id="plugin-architecture">Plugin Architecture</h2>
-<div class="highlight"><pre><span></span><code>Agent Process
-  │
-  ├── Plugin Loader
-  │   ├── dlopen(&quot;hardware.so&quot;) → yuzu_plugin_descriptor()
-  │   ├── dlopen(&quot;network.so&quot;)  → yuzu_plugin_descriptor()
-  │   └── dlopen(&quot;custom.so&quot;)   → yuzu_plugin_descriptor()
-  │
-  ├── Plugin Registry (name → descriptor)
-  │
-  └── Command Dispatch
-      └── execute(plugin_name, action, params)
-          └── descriptor.execute(ctx, action, params, param_count)
-              └── ctx-&gt;write_output(&quot;result data&quot;)
-</code></pre></div>
+<figure class="diagram tree-figure" aria-label="Agent process internals: Plugin Loader uses dlopen on hardware.so, network.so, custom.so to obtain yuzu_plugin_descriptor; the Plugin Registry maps plugin name to descriptor; the Command Dispatch calls descriptor.execute via the context's write_output sink.">
+  <ul class="tree" role="tree">
+    <li role="treeitem"><span class="node">Agent Process</span>
+      <ul role="group">
+        <li role="treeitem"><span class="node">Plugin Loader</span>
+          <ul role="group">
+            <li><code>dlopen("hardware.so")</code> → <code>yuzu_plugin_descriptor()</code></li>
+            <li><code>dlopen("network.so")</code> → <code>yuzu_plugin_descriptor()</code></li>
+            <li><code>dlopen("custom.so")</code> → <code>yuzu_plugin_descriptor()</code></li>
+          </ul>
+        </li>
+        <li role="treeitem"><span class="node">Plugin Registry</span> <span class="desc">name → descriptor</span></li>
+        <li role="treeitem"><span class="node">Command Dispatch</span>
+          <ul role="group">
+            <li><code>execute(plugin_name, action, params)</code>
+              <ul>
+                <li><code>descriptor.execute(ctx, action, params, param_count)</code>
+                  <ul><li><code>ctx-&gt;write_output("result data")</code></li></ul>
+                </li>
+              </ul>
+            </li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <figcaption>Agent process internals — plugin loading, registry, and command dispatch through the stable C ABI.</figcaption>
+</figure>
+
 <p><strong>Why a C ABI?</strong> The plugin boundary must survive compiler version changes, standard library changes, and even language changes. A C ABI is the only binary-stable interface on all platforms. The C++ wrapper (<code>plugin.hpp</code>) provides ergonomic CRTP-based development while generating the C trampolines automatically via <code>YUZU_PLUGIN_EXPORT</code>.</p>
 <p><strong>Why in-process plugins?</strong> Out-of-process plugins (like VS Code extensions) add IPC overhead and deployment complexity. Endpoint management plugins are typically small, focused, and trusted (shipped by the vendor). In-process loading via <code>dlopen</code>/<code>LoadLibrary</code> gives sub-microsecond dispatch and zero serialization overhead.</p>
 <h2 id="security-model">Security Model</h2>
