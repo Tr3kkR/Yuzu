@@ -23,7 +23,7 @@
 set -euo pipefail
 
 YUZU_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILDDIR="$YUZU_ROOT/builddir"
+BUILDDIR="${YUZU_BUILDDIR:-$YUZU_ROOT/builddir}"
 GATEWAY_DIR="$YUZU_ROOT/gateway"
 UAT_DIR="$YUZU_ROOT/.uat"
 
@@ -115,7 +115,7 @@ show_status() {
     cd "$YUZU_ROOT"
     echo ""
     echo "Endpoints:"
-    echo "  Dashboard:   http://localhost:8080"
+    echo "  Dashboard:   http://localhost:18080"
     echo "  Grafana:     http://localhost:3000 (admin/admin)"
     echo "  Prometheus:  http://localhost:9090"
     echo "  ClickHouse:  http://localhost:8123 (HTTP) / localhost:9000 (native)"
@@ -312,6 +312,7 @@ start_all() {
         --gateway-mode \
         --gateway-command-addr localhost:50063 \
         --web-address 0.0.0.0 \
+        --web-port 18080 \
         --log-level info \
         --metrics-no-auth \
         --config "$UAT_DIR/yuzu-server.cfg" \
@@ -324,11 +325,11 @@ start_all() {
         > "$UAT_DIR/server.log" 2>&1 &
     disown
 
-    if ! wait_for_port 8080 "yuzu-server" 30; then
+    if ! wait_for_port 18080 "yuzu-server" 30; then
         fail "Server failed to start — check $UAT_DIR/server.log"
         exit 1
     fi
-    ok "Server up (dashboard http://localhost:8080)"
+    ok "Server up (dashboard http://localhost:18080)"
     info "Direct agent gRPC :50054 | Gateway upstream :50055 | Mgmt :50052"
 
     # ── 3. Gateway ────────────────────────────────────────────────────────
@@ -356,12 +357,12 @@ start_all() {
 
     # ── Login & enrollment token ──────────────────────────────────────────
     info "Creating enrollment token..."
-    curl -s -c "$UAT_DIR/cookies.txt" http://localhost:8080/login \
+    curl -s -c "$UAT_DIR/cookies.txt" http://localhost:18080/login \
         -d "username=${ADMIN_USER}&password=${ADMIN_PASS}" -o /dev/null
 
     local token_html
     token_html=$(curl -s -b "$UAT_DIR/cookies.txt" \
-        -X POST http://localhost:8080/api/settings/enrollment-tokens \
+        -X POST http://localhost:18080/api/settings/enrollment-tokens \
         -d "label=uat-auto&max_uses=1000&ttl=86400")
     local enroll_token
     enroll_token=$(echo "$token_html" | python -c "import sys,re; m=re.search(r'[a-f0-9]{64}', sys.stdin.read()); print(m.group() if m else '')" 2>/dev/null || true)
@@ -415,7 +416,7 @@ start_all() {
     # Test 1: Dashboard
     tests_total=$((tests_total + 1))
     local dash_code
-    dash_code=$(curl -s -o /dev/null -w "%{http_code}" -b "$UAT_DIR/cookies.txt" http://localhost:8080/ 2>/dev/null)
+    dash_code=$(curl -s -o /dev/null -w "%{http_code}" -b "$UAT_DIR/cookies.txt" http://localhost:18080/ 2>/dev/null)
     if [ "$dash_code" = "200" ]; then
         ok "Dashboard reachable (HTTP $dash_code)"
         tests_passed=$((tests_passed + 1))
@@ -437,7 +438,7 @@ start_all() {
     # Test 3: Server metrics — agent registered
     tests_total=$((tests_total + 1))
     local reg_count
-    reg_count=$(curl -s http://localhost:8080/metrics 2>/dev/null | python -c "import sys,re; m=re.search(r'yuzu_agents_registered_total (\d+)', sys.stdin.read()); print(m.group(1) if m else '0')" 2>/dev/null || echo "0")
+    reg_count=$(curl -s http://localhost:18080/metrics 2>/dev/null | python -c "import sys,re; m=re.search(r'yuzu_agents_registered_total (\d+)', sys.stdin.read()); print(m.group(1) if m else '0')" 2>/dev/null || echo "0")
     if [ "$reg_count" -ge 1 ]; then
         ok "Server sees $reg_count registered agent(s)"
         tests_passed=$((tests_passed + 1))
@@ -505,7 +506,7 @@ except: print(0)
     tests_total=$((tests_total + 1))
     local help_html
     help_html=$(curl -s -m 10 -b "$UAT_DIR/cookies.txt" \
-        http://localhost:8080/api/help/html 2>/dev/null)
+        http://localhost:18080/api/help/html 2>/dev/null)
     local plugin_count
     plugin_count=$(echo "$help_html" | grep -o 'result-row' | wc -l)
     if [ "$plugin_count" -gt 0 ]; then
@@ -520,7 +521,7 @@ except: print(0)
     info "Sending 'os_info os_name' (full round-trip via gateway)..."
     local cmd_resp
     cmd_resp=$(curl -s -m 10 -b "$UAT_DIR/cookies.txt" \
-        -X POST http://localhost:8080/api/command \
+        -X POST http://localhost:18080/api/command \
         -H "Content-Type: application/json" \
         -d '{"plugin":"os_info","action":"os_name"}' 2>/dev/null)
     local cmd_id
@@ -535,7 +536,7 @@ except: print(0)
             sleep 1
             poll_count=$((poll_count + 1))
             os_result=$(curl -s -b "$UAT_DIR/cookies.txt" \
-                "http://localhost:8080/api/responses/$cmd_id" 2>/dev/null | \
+                "http://localhost:18080/api/responses/$cmd_id" 2>/dev/null | \
                 python -c "
 import sys,json
 d=json.load(sys.stdin)
@@ -592,7 +593,7 @@ for r in d.get('responses',[]):
     echo "           UAT Stack Ready                    "
     echo "=============================================="
     echo ""
-    echo "  Dashboard:   http://localhost:8080"
+    echo "  Dashboard:   http://localhost:18080"
     printf "  Login:       %s / %s\n" "$ADMIN_USER" "$ADMIN_PASS"
     echo "  Grafana:     http://localhost:3000 (admin/admin)"
     echo "  Prometheus:  http://localhost:9090"
@@ -604,7 +605,7 @@ for r in d.get('responses',[]):
     echo "  Agent -> GW(:50051) -> Server(:50055)   [data]"
     echo "  Server -> GW(:50063) -> Agent           [commands]"
     echo "  Server -> ClickHouse(:8123)             [analytics]"
-    echo "  Prometheus -> Server(:8080) + GW(:9568) [metrics]"
+    echo "  Prometheus -> Server(:18080) + GW(:9568) [metrics]"
     echo "  Grafana -> Prometheus + ClickHouse      [dashboards]"
     echo ""
     echo "  Logs: $UAT_DIR/{server,gateway,agent}.log"

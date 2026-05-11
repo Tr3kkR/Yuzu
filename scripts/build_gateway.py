@@ -22,13 +22,15 @@ if sys.platform == "win32":
     env["TEMP"] = real_temp
     env["TMP"] = real_temp
 
-    # Bypass the Chocolatey shim for rebar3 — it can lose env vars.
-    # Use escript.exe directly via the C:\Erlang junction (space-free path).
-    erlang_junction = r"C:\Erlang"
-    escript = os.path.join(erlang_junction, "bin", "escript.exe")
-    rebar3_escript = r"C:\ProgramData\chocolatey\lib\rebar3\tools\rebar3"
-    if os.path.isfile(escript) and os.path.isfile(rebar3_escript):
-        cmd = [escript, rebar3_escript, "compile"]
+    # Prefer the chocolatey rebar3 shim — it works under Python
+    # subprocess invocation. Direct escript.exe + rebar3-escript invocation
+    # crashes with STATUS_ACCESS_VIOLATION (0xC0000005) when launched via
+    # Python subprocess.run on this Windows host (reproducible from any
+    # cwd, with a clean env, no stdin attached). The shim escapes whatever
+    # console-handle / startup-info quirk causes the crash.
+    rebar3_shim = r"C:\ProgramData\chocolatey\bin\rebar3.exe"
+    if os.path.isfile(rebar3_shim):
+        cmd = [rebar3_shim, "compile"]
     else:
         cmd = ["rebar3", "compile"]
 else:
