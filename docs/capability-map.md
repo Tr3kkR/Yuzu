@@ -68,7 +68,7 @@ Overall      [======================---------]   169/225 done (75%)
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 0 | 0 | 4 |
 | 31. System Guardian | 10 | 1 | 2 | 7 |
-| **TOTAL** | **228** | **169** | **4** | **55** |
+| **TOTAL** | **228** | **169** | **5** | **54** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. Foundation and Advanced tiers reach 100% on the "implemented and functional" bar — they do not yet reach "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
 

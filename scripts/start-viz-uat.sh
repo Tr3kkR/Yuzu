@@ -16,6 +16,12 @@
 # Environment overrides:
 #   VIZ_UAT_DIR           default: /tmp/yuzu-viz-uat
 #   VIZ_UAT_AGENTS        default: 1     (compose --scale agent=N)
+#   VIZ_UAT_AGENT_MODE    default: container
+#                           container : in-container agent (default; thin host)
+#                           vm        : skip in-container agent, print enrollment-
+#                                       token + host gateway addr for native
+#                                       yuzu-agent on OrbStack VM / bare metal
+#                           none      : skip agent startup entirely
 #   VIZ_UAT_SKIP_BUILD    default: ""    (set to 1 to skip docker build)
 #   VIZ_UAT_PLATFORM      default: linux/$(uname -m mapped)
 
@@ -57,23 +63,33 @@ cmd_stop() {
   info "Stopping viz-UAT stack..."
   # YUZU_ENROLLMENT_TOKEN must be set to satisfy compose's `:?` interpolation
   # check, but the value doesn't matter for `down` -- no agent is started.
+  # --profile in-container-agent ensures profile-gated services are torn
+  # down explicitly rather than relying on --remove-orphans heuristic
+  # (gov R8 build-ci SHOULD).
   ( cd "$REPO_ROOT" && YUZU_ENROLLMENT_TOKEN=stub \
-      docker compose -f "$COMPOSE_FILE" down -v --remove-orphans ) || true
+      docker compose -f "$COMPOSE_FILE" --profile in-container-agent \
+        down -v --remove-orphans ) || true
   rm -rf "$VIZ_UAT_DIR"
   ok "Stopped + cleaned $VIZ_UAT_DIR"
 }
 
 cmd_status() {
   ( cd "$REPO_ROOT" && YUZU_ENROLLMENT_TOKEN=stub \
-      docker compose -f "$COMPOSE_FILE" ps )
+      docker compose -f "$COMPOSE_FILE" --profile in-container-agent ps )
   echo ""
   info "Last 20 lines from each service:"
   for svc in server gateway agent; do
     echo "── $svc ──"
     ( cd "$REPO_ROOT" && YUZU_ENROLLMENT_TOKEN=stub \
-        docker compose -f "$COMPOSE_FILE" logs --tail=20 "$svc" 2>/dev/null ) || true
+        docker compose -f "$COMPOSE_FILE" --profile in-container-agent \
+          logs --tail=20 "$svc" 2>/dev/null ) || true
     echo ""
   done
+}
+
+cmd_restart() {
+  cmd_stop
+  cmd_start
 }
 
 cmd_fleet_snapshot() {
@@ -355,13 +371,22 @@ cmd_start() {
       ;;
     vm)
       ok "Skipping in-container agent; VM-agent mode selected."
-      info "Bridge gateway IP for VM agent (typical OrbStack default):"
+      info "Run yuzu-agent on the OrbStack VM (or bare-metal host):"
       info "  enroll-token: $(cat "$VIZ_UAT_DIR/enrollment-token")"
-      info "  gateway addr: 192.168.139.1:50051   (host-exposed; confirm with: ip route show default | awk '/default/ {print \$3}' on the VM)"
-      info "  example:      yuzu-agent --server 192.168.139.1:50051 --no-tls \\"
+      # OrbStack proxies VM->macOS-host TCP through .2 on the VM bridge.
+      # Default-route gateway .1 answers ICMP but no TCP forwards (a
+      # common footgun — operators reading 'ip route show default' on
+      # the VM get .1 and find connect-refused). The .2 address is the
+      # canonical port-forward target. (gov R8 build-ci SHOULD;
+      # memory/reference_orbstack_vm_addressing.md)
+      info "  gateway addr: 192.168.139.2:50051   (OrbStack VM->host port-forward IP — NOT .1)"
+      printf '%s\n' "192.168.139.2:50051" > "$VIZ_UAT_DIR/gateway-host-addr"
+      chmod 600 "$VIZ_UAT_DIR/gateway-host-addr" 2>/dev/null || true
+      info "  example:      yuzu-agent --server 192.168.139.2:50051 --no-tls \\"
       info "                  --plugin-dir <path-to-plugins> \\"
       info "                  --data-dir /var/lib/yuzu-agent \\"
       info "                  --enrollment-token <token>"
+      info "(host addr also written to \$VIZ_UAT_DIR/gateway-host-addr)"
       ;;
     none)
       ok "Skipping agent startup; VIZ_UAT_AGENT_MODE=none"
@@ -399,13 +424,15 @@ case "${1:-start}" in
   start)            cmd_start ;;
   stop|down)        cmd_stop ;;
   status|ps)        cmd_status ;;
+  restart)          cmd_restart ;;
   fleet-snapshot)   cmd_fleet_snapshot ;;
   *)
     cat <<USAGE
-Usage: $(basename "$0") [start|stop|status|fleet-snapshot]
+Usage: $(basename "$0") [start|stop|restart|status|fleet-snapshot]
 
   start            (default) build + start + verify registration
   stop             docker compose down -v + clean \$VIZ_UAT_DIR
+  restart          stop + start
   status           docker compose ps + last log lines
   fleet-snapshot   dispatch crossplatform.tar.fleet_snapshot to all agents
 

@@ -394,11 +394,19 @@ TopologySnapshot FleetTopologyStore::build_snapshot(std::vector<RawAgentSnapshot
         // the renderer cannot draw a line into the void. O(n^2) per machine
         // -- acceptable for typical per-host connection counts; a
         // (addr,port)->pid hash index is a refactor candidate once n
-        // routinely exceeds a few hundred.
+        // routinely exceeds a few hundred (gov R8 SHOULD).
+        //
+        // Identity guard `&other != &e` prevents a degenerate edge whose
+        // src 4-tuple equals its dst 4-tuple (kernel does not normally
+        // emit this for ESTABLISHED loopback, but a synthetic /
+        // fuzzed agent payload could) from self-pairing with dst_pid =
+        // src_pid (gov R8 cpp-expert SHOULD).
         for (auto& e : m.connections) {
             if (e.scope != EdgeScope::Local)
                 continue;
             for (const auto& other : m.connections) {
+                if (&other == &e)
+                    continue;
                 if (other.scope != EdgeScope::Local)
                     continue;
                 if (other.src_addr == e.dst_addr && other.src_port == e.dst_port &&
@@ -408,9 +416,25 @@ TopologySnapshot FleetTopologyStore::build_snapshot(std::vector<RawAgentSnapshot
                 }
             }
         }
+        const auto before_drop = m.connections.size();
         std::erase_if(m.connections, [](const ConnectionEdge& e) {
             return e.scope == EdgeScope::Local && e.dst_pid == 0;
         });
+        const auto dropped = before_drop - m.connections.size();
+        if (dropped > 0) {
+            // Forensic counter (gov R8 SRE/architect/security/compliance:
+            // flagged by 6 separate agents as a monitoring blind spot).
+            // Debug level rather than info -- half-open loopback (kernel
+            // race during teardown, agent's connection cap cutting a
+            // partner, TIME_WAIT-vs-ESTABLISHED snapshot) is an expected
+            // source of unmatched halves, so warn would spam under normal
+            // churn. Aggregate visibility comes from
+            // `yuzu_viz_local_edges_dropped_total` (see counter increment
+            // path below).
+            spdlog::debug("FleetTopologyStore: dropped {} unmatched Local edges for agent {}",
+                          dropped, m.agent_id);
+            local_edges_dropped_.fetch_add(dropped, std::memory_order_relaxed);
+        }
 
         out.machines.push_back(std::move(m));
     }

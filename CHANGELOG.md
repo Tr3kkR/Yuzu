@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/viz/fleet` intra-cube localhost edges (PR 8 of the 11-PR
+  `/viz/fleet` 3D fleet network-topology ladder).** Faint white
+  `LineSegments` (opacity `0.3`) now connect process dots inside each
+  machine cube when two processes are reciprocal ends of a loopback
+  TCP socket (127.0.0.1 ↔ 127.0.0.1 or ::1 ↔ ::1). The visible flow:
+  Prometheus scraping node_exporter inside the same host renders as
+  one line between the two dots and refreshes on each topology poll.
+  Server-side `build_snapshot()` pairs reciprocal halves by exact
+  4-tuple swap and writes the peer's `src_pid` into a new
+  `ConnectionEdge.dst_pid` field; unmatched halves are dropped before
+  serialisation. JSON `schema_minor` bumps `1 → 2` to advertise the
+  additive `dst_pid` field (mirrors the `dst_agent_id`-when-non-empty
+  pattern). Renderer builds a per-cube `pidToPos` Map and adds one
+  `THREE.LineSegments(BufferGeometry, LineBasicMaterial({color:0xffffff,
+  transparent:true, opacity:0.3}))` per paired Local edge into the
+  per-cube `processGroup` — disposal is free via `clearFleet`'s
+  existing `traverse(disposeNode)` walk. `Number.isFinite` guards on
+  both pid endpoints before `Map.get` so a malformed agent payload
+  cannot crash the render loop.
+
+### Changed
+
+- **`/api/v1/viz/fleet/topology` envelope `schema_minor` bumped `1 → 2`.**
+  Additive evolution per the existing contract — renderers MUST ignore
+  unknown keys, so consumers ignoring `schema_minor` see no break.
+  Strict-validating consumers pinned to `schema_minor: 1` exactly
+  should relax their validator to `minimum: 1` rather than exact-match.
+  Wire change: new optional `dst_pid` (uint32) on `EdgeScope::Local`
+  connection edges; non-Local edges and edges with no resolved peer
+  omit the field.
+- **`/api/v1/viz/fleet/topology` no longer emits unmatched `local`-scope
+  connection edges.** Loopback edges where the reciprocal half is not
+  visible in the same agent snapshot (race during teardown, agent's
+  4096-connection cap cuts the partner, kernel-namespace asymmetry) are
+  now dropped server-side before serialisation. **Integrations counting
+  `connections` array length per machine as a proxy for "active IPC
+  pairs" should re-baseline after upgrade** — the count will trend lower
+  by the unmatched-half count, which is typically small but non-zero.
+
+### Build / Dev infrastructure
+
+- **viz-UAT compose: per-service `NO_PROXY=*` to bypass OrbStack's
+  gRPC-incompatible HTTP proxy.** OrbStack injects
+  `HTTP_PROXY=http://proxyproxy.orb.internal:8305` into containers; gRPC's
+  HTTP/2 client honours it and 502s on cross-container traffic
+  (`gateway↔server` upstream and `agent→gateway` registration). The
+  fix is scoped to `deploy/docker/docker-compose.viz-uat.yml` only;
+  production compose files are untouched.
+- **viz-UAT: gateway port `50051` exposed to host.** Lets a `yuzu-agent`
+  running *outside* the compose stack (OrbStack VM, bare metal, host
+  process) register through the dev gateway. The in-container agent
+  still reaches the gateway via the internal `gateway` service hostname
+  and doesn't need this binding.
+- **`scripts/start-viz-uat.sh` adds `VIZ_UAT_AGENT_MODE` switch.** Modes:
+  `container` (default, prior behaviour, in-container agent under the
+  new `in-container-agent` compose profile); `vm` (skip the in-container
+  agent, print the enrollment token + host-exposed gateway address for
+  running a native `yuzu-agent` on an external host — enables PR 8+
+  visual demos against real loopback workloads); `none` (skip agent
+  startup entirely, useful for empty-fleet renderer iteration).
+
+### Added
+
 - **`/viz/fleet` interior process nodes coloured by category (PR 7 of the
   11-PR `/viz/fleet` 3D fleet network-topology ladder).** Each fleet machine
   cube now contains one `SphereGeometry` dot per process reported by

@@ -337,6 +337,13 @@ public:
                           "gauge");
         metrics_.describe("yuzu_viz_refill_waiters_total",
                           "Fetch waiters that piggybacked on an in-flight refill", "gauge");
+        metrics_.describe("yuzu_viz_local_edges_dropped_total",
+                          "EdgeScope::Local connection edges dropped from the snapshot "
+                          "before serialisation because no reciprocal half was visible in "
+                          "the same agent payload (PR 8). Non-zero under normal churn; a "
+                          "spike vs steady-state indicates systematic loss (kernel race, "
+                          "agent connection-cap truncation, half-open sockets).",
+                          "gauge");
 
         // Wire health store into agent service
         agent_service_.set_health_store(&health_store_);
@@ -1183,6 +1190,8 @@ public:
                         .set(static_cast<double>(fleet_topology_store_->refill_wait_timeouts()));
                     metrics_.gauge("yuzu_viz_refill_waiters_total")
                         .set(static_cast<double>(fleet_topology_store_->refill_waiters()));
+                    metrics_.gauge("yuzu_viz_local_edges_dropped_total")
+                        .set(static_cast<double>(fleet_topology_store_->local_edges_dropped()));
                 }
                 // Publish audit event write rate so the audit subsystem is observable.
                 if (audit_store_) {

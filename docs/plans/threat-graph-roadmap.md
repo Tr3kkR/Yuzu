@@ -1,8 +1,16 @@
 # Threat Graph Roadmap
 
-**Status:** Proposal, 2026-05-11. Extends the existing 11-PR visualization ladder
-(`docs/plans/feat-viz-engine-plan-2026-05-09.md`) with the *Threat Graph* product
-vision discussed end-of-day 2026-05-10.
+**Status:** Internal planning draft, 2026-05-11. Extends the existing 11-PR
+visualization ladder (`docs/plans/feat-viz-engine-plan-2026-05-09.md`) with
+the *Threat Graph* product vision discussed end-of-day 2026-05-10.
+
+**Distribution:** Internal planning only — `docs/plans/` is the staging area
+for product direction not yet ready for external publication. The
+"Anti-Mythos" framing below names a specific LLM-driven offensive system
+("Mythos") as the antagonist; before this doc moves into customer-facing
+roadmap materials, the framing should be generalised to "LLM-driven
+offensive enumeration tooling" without naming a specific competitor's
+product, per standard vendor-roadmap hygiene.
 
 ## Anti-Mythos framing
 

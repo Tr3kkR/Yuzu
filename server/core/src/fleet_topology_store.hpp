@@ -136,6 +136,17 @@ public:
     uint64_t refill_wait_timeouts() const noexcept {
         return refill_wait_timeouts_.load(std::memory_order_relaxed);
     }
+    /// PR 8 forensic counter (gov R8): EdgeScope::Local edges whose reciprocal
+    /// half was missing from the agent snapshot and were therefore dropped
+    /// before serialisation. Expected to be non-zero under normal churn (kernel
+    /// race during teardown, TIME_WAIT halves, agent's 4096-connection cap
+    /// cutting a partner). A spike vs steady-state baseline signals systematic
+    /// loss -- e.g. an agent reporting half-open sockets, or a kernel-version
+    /// change altering /proc/net/tcp atomicity. Surfaces in metrics as
+    /// `yuzu_viz_local_edges_dropped_total`.
+    uint64_t local_edges_dropped() const noexcept {
+        return local_edges_dropped_.load(std::memory_order_relaxed);
+    }
 
     /// Build a TopologySnapshot from raw inputs without any caching. Public
     /// so PR 3 can reuse the same logic in any future on-demand path that
@@ -173,6 +184,9 @@ private:
     std::atomic<uint64_t> refill_waiters_{0};
     std::atomic<uint64_t> refill_oversize_drops_{0};
     std::atomic<uint64_t> refill_wait_timeouts_{0};
+    /// `mutable` because `build_snapshot()` is const (pure transformation
+    /// over `raw`) but updates this observability counter on each drop pass.
+    mutable std::atomic<uint64_t> local_edges_dropped_{0};
 
     bool fresh_locked(const Slot& s) const;
 };

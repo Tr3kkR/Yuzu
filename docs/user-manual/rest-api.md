@@ -2694,7 +2694,7 @@ Returns the full topology as JSON.
 ```json
 {
   "schema": "fleet_topology.v1",
-  "schema_minor": 1,
+  "schema_minor": 2,
   "generated_at": 1715299200,
   "include_vuln": false,
   "machines": [
@@ -2706,12 +2706,16 @@ Returns the full topology as JSON.
       "ts": 1715299200,
       "stale": false,
       "processes": [
-        {"pid": 1234, "ppid": 1, "name": "postgres", "user": "postgres", "category": "database"}
+        {"pid": 1234, "ppid": 1, "name": "postgres", "user": "postgres", "category": "database"},
+        {"pid": 5678, "ppid": 1, "name": "psql",     "user": "alice",    "category": "database"}
       ],
       "connections": [
         {"proto": "tcp", "src_pid": 1234, "src_addr": "10.0.0.1", "src_port": 5432,
          "dst_addr": "10.0.0.2", "dst_port": 54321, "scope": "internal_fleet",
-         "dst_agent_id": "...", "state": "ESTABLISHED"}
+         "dst_agent_id": "...", "state": "ESTABLISHED"},
+        {"proto": "tcp", "src_pid": 1234, "src_addr": "127.0.0.1", "src_port": 5432,
+         "dst_addr": "127.0.0.1", "dst_port": 53210, "scope": "local",
+         "dst_pid": 5678, "state": "ESTABLISHED"}
       ]
     }
   ]
@@ -2719,6 +2723,13 @@ Returns the full topology as JSON.
 ```
 
 `schema_minor` is bumped (not `schema`) on additive evolution; renderers MUST ignore unknown keys.
+
+**`schema_minor` history:**
+
+| Version | Change |
+|---|---|
+| 1 | Initial shape (PR 2–7) |
+| 2 | PR 8 — `dst_pid` (uint32) added to `ConnectionEdge`. Present only on `scope: local` edges with a resolved peer process on the same machine; omitted (not zero) on non-local edges. Unmatched `local` edges (no reciprocal half visible in the same snapshot) are dropped server-side before serialisation, so a `local` edge in the response always carries a non-zero `dst_pid`. Strict-validating consumers pinned to minor version 1 should relax their validator to `minimum: 1` rather than exact-match. |
 
 **Audit emissions**
 
