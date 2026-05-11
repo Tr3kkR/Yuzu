@@ -4,12 +4,27 @@
 Used by Meson custom_target because Ninja quotes compound shell commands
 (e.g. 'cd /d path && rebar3 compile') as a single argument, which breaks
 cmd.exe on Windows.  This script works on all platforms.
+
+PATH handling: meson's custom_target inherits the env from whatever shell
+invoked `meson compile` / `ninja`. Operators are expected to source
+`scripts/ensure-erlang.sh` first so `escript`, `erl`, and `rebar3` are on
+PATH. When that step is skipped (fresh shell, governance pipeline, CI),
+`rebar3`'s `#!/usr/bin/env escript` shebang dies with
+`/usr/bin/env: 'escript': No such file or directory`. We defensively
+call `_erlang_env.ensure_erlang_on_path()` at startup to import the
+helper's PATH if escript isn't already visible — same probe (kerl →
+asdf → Homebrew → MSYS2 Windows installer), single source of truth.
 """
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
+
+# Self-heal PATH when escript isn't already visible. No-op if it is.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _erlang_env import ensure_erlang_on_path  # noqa: E402
+
+ensure_erlang_on_path()
 
 gateway_dir = sys.argv[1]
 env = None

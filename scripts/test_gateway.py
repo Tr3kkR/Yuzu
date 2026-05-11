@@ -42,17 +42,15 @@ import sys
 import time
 from pathlib import Path
 
-# Ensure locally-installed OTP 28 and rebar3 are on PATH (Meson inherits
-# system PATH which may still point at the distro's older OTP 25 packages).
-_extra_paths = [
-    os.path.expanduser("~/.cache/rebar3/bin"),  # rebar3 local install
-    "/usr/local/bin",                            # OTP 28 from source
-]
-_path = os.environ.get("PATH", "")
-for p in reversed(_extra_paths):
-    if os.path.isdir(p) and p not in _path:
-        _path = p + ":" + _path
-os.environ["PATH"] = _path
+# Self-heal PATH when escript isn't already visible. No-op if it is.
+# Shared with build_gateway.py — single source of truth for the probe
+# logic. Replaces the previous naive prepend of ~/.cache/rebar3/bin +
+# /usr/local/bin which missed kerl, asdf, Homebrew, and the MSYS2
+# Windows installer; the bash helper handles all four.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _erlang_env import ensure_erlang_on_path  # noqa: E402
+
+ensure_erlang_on_path()
 
 gateway_dir = sys.argv[1]
 suite = sys.argv[2]  # "eunit" or "ct"
