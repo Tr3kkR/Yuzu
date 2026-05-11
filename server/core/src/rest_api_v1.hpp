@@ -70,6 +70,21 @@ public:
         bool db_persisted{true};
     };
 
+    /// Carrier for the audit-emission outcome on a session-revocation
+    /// response. Populated by the handler from the AuditFn return value
+    /// (and an exception try/catch). Distinct from `SessionRevokeResult`
+    /// because the audit emission happens AFTER the revoke primitive
+    /// completes — operator's "stop NOW" still takes effect even when
+    /// the SOC 2 evidence row is lost (HIGH-2 on PR #883).
+    struct AuditEmission {
+        bool emitted{true};
+        // True iff AuditFn threw — distinguishes silent persist failure
+        // from an exception path. Both produce `emitted=false` and the
+        // `Sec-Audit-Failed: true` response header; the `threw` flag is
+        // only surfaced in the spdlog trail.
+        bool threw{false};
+    };
+
     /// Revoke every credential bearing a username — cookie sessions
     /// (`AuthManager::invalidate_user_sessions`) and, when
     /// `revoke_api_tokens=true`, the user's API tokens (closes UP-13:

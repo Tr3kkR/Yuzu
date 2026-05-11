@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **HIGH-2 (PR #883 governance review): session-revocation REST surface
+  now reports audit-emission outcome on the response so a silent audit
+  persistence failure (locked audit DB, disk full, pipeline exception)
+  cannot masquerade as 200 OK SOC 2 CC6.6 evidence.** The `AuditFn`
+  callback (`std::function<…>` in `rest_api_v1.hpp`) and the underlying
+  `AuditStore::log` primitive now return `bool` rather than `void`; the
+  bool propagates through `AuthRoutes::audit_log` and `Server::audit_log`.
+  Existing call sites that fire-and-forget continue to compile — the
+  bool is just discarded. The two session-revocation handlers
+  (`DELETE /api/v1/sessions` and `DELETE /api/v1/sessions/me`) now wrap
+  `audit_fn` in try/catch and surface failure via:
+  - `Sec-Audit-Failed: true` response header (out-of-band signal for
+    SREs scraping responses or evidence integrity dashboards).
+  - `audit_emitted: false` field in the success-body JSON envelope.
+  The revoke side-effect still completes when audit emission fails —
+  operator's "stop NOW" intent takes precedence over evidence
+  integrity, and the partial-success signal lets the operator decide
+  whether to retry. Closes the silent-failure gap flagged in the PR
+  #883 governance review.
+- **HIGH-1 (PR #883 governance review): `ApiTokenStore::validate_token`
+  cache write now skipped when a revoke races our DB SELECT.** Added a
+  `revoke_generation_` atomic counter bumped by `revoke_token`,
+  `revoke_for_principal`, and `delete_token` before each UPDATE/DELETE.
+  `validate_token` snapshots the generation before its SELECT and
+  re-reads before the cache write — if it moved, we lost the race and
+  do not populate the cache with the now-stale (revoked=false) view
+  that would otherwise survive for up to 60 s (the
+  `kTokenCacheTtl`). Belt-and-suspenders: the existing `db_mtx_`
+  exclusive lock already spans SELECT through cache write and prevents
+  the interleave, but the explicit generation re-check survives any
+  future refactor that narrows the lock scope.
+
 ### Added
 
 - **Per-host IPC-graph drill-down (`/viz/host/<agent_id>`).** Double-clicking
