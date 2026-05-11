@@ -792,6 +792,17 @@ figure.diagram .row-edges .edge-label { font-size: 0.8em; color: var(--fg-muted)
 figure.diagram .row-fanout { gap: 0.6em; align-items: center; }
 figure.diagram .row-fanout .gw-list { flex: 0 0 auto; }
 
+/* SVG-backed diagram — render the file at full width with sensible bounds. */
+figure.diagram.svg-figure { padding: 0.6em; }
+figure.diagram .svg-diagram {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 70vh;
+  background: var(--bg);
+  border-radius: 6px;
+}
+
 /* Inline doc-reference linkifier — keeps the original <code> chip styling but
    makes the surrounding anchor obvious by colouring the text french-blue. */
 a.doc-ref { text-decoration: none; }

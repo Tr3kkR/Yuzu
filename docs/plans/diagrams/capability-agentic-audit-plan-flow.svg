@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 940 460"
+     role="img"
+     aria-labelledby="title desc"
+     preserveAspectRatio="xMidYMid meet">
+  <title id="title">Capability-agentic audit plan — cross-document flow</title>
+  <desc id="desc">
+    The new audit report cites the new agentic-first principle doc, and prescribes
+    edits to five existing artefacts: README.md, capability-map.md, CLAUDE.md,
+    roadmap.md, and mcp_server.cpp. The principle doc is itself referenced from
+    CLAUDE.md and roadmap.md.
+  </desc>
+
+  <defs>
+    <!-- Solid arrowhead for primary edges (cites, prescribes) -->
+    <marker id="arrow-solid" viewBox="0 0 12 12" refX="11" refY="6"
+            markerWidth="11" markerHeight="11" orient="auto-start-reverse">
+      <path d="M0,0 L12,6 L0,12 z" fill="#0072BB"/>
+    </marker>
+    <!-- Indigo arrowhead for cross-reference edges (referenced from) -->
+    <marker id="arrow-ref" viewBox="0 0 12 12" refX="11" refY="6"
+            markerWidth="11" markerHeight="11" orient="auto-start-reverse">
+      <path d="M0,0 L12,6 L0,12 z" fill="#4B0082"/>
+    </marker>
+    <style><![CDATA[
+      .node-rect {
+        stroke-width: 2;
+        rx: 8; ry: 8;
+      }
+      .node-rect.audit     { fill: #FAF1D6; stroke: #D4AF37; }
+      .node-rect.principle { fill: #E5EEF7; stroke: #0072BB; }
+      .node-rect.target    { fill: #FAFAFA; stroke: #C0C0C0; }
+      .node-title {
+        font: 600 13px ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+        fill: #0A0A0A;
+      }
+      .node-path {
+        font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        fill: #4B0082;
+      }
+      .edge {
+        fill: none;
+        stroke: #0072BB;
+        stroke-width: 1.6;
+      }
+      .edge.referenced {
+        stroke: #4B0082;
+        stroke-dasharray: 5 4;
+      }
+      .edge-label {
+        font: 600 10px ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+        fill: #014E83;
+        text-anchor: middle;
+      }
+      .edge-label.referenced { fill: #4B0082; }
+      .edge-label-bg {
+        fill: #FAFAFA;
+        opacity: 0.95;
+      }
+      .legend-title {
+        font: 700 10px ui-sans-serif, sans-serif;
+        fill: #4B0082;
+        letter-spacing: 0.08em;
+      }
+      .legend-text {
+        font: 11px ui-sans-serif, sans-serif;
+        fill: #0A0A0A;
+      }
+      @media (prefers-color-scheme: dark) {
+        .node-rect.audit     { fill: #2A2410; stroke: #D4AF37; }
+        .node-rect.principle { fill: #14143C; stroke: #2E8FCF; }
+        .node-rect.target    { fill: #0A0A0A; stroke: #4B0082; }
+        .node-title { fill: #E5E4E2; }
+        .node-path  { fill: #B39DDB; }
+        .edge { stroke: #2E8FCF; }
+        .edge.referenced { stroke: #B39DDB; }
+        .edge-label { fill: #2E8FCF; }
+        .edge-label.referenced { fill: #B39DDB; }
+        .edge-label-bg { fill: #0A0A0A; }
+        .legend-title { fill: #B39DDB; }
+        .legend-text  { fill: #E5E4E2; }
+      }
+    ]]></style>
+  </defs>
+
+  <!-- ── Nodes ─────────────────────────────────────────────────────── -->
+
+  <!-- A: Audit Report (gold = new origin doc) -->
+  <g transform="translate(20,200)">
+    <rect class="node-rect audit" width="240" height="60"/>
+    <text class="node-title"  x="120" y="25" text-anchor="middle">Audit Report</text>
+    <text class="node-path"   x="120" y="45" text-anchor="middle">docs/capability-agentic-audit-2026-05.md</text>
+  </g>
+
+  <!-- P: Principle Doc (french blue = architectural principle) -->
+  <g transform="translate(360,200)">
+    <rect class="node-rect principle" width="220" height="60"/>
+    <text class="node-title" x="110" y="25" text-anchor="middle">Agentic-First Principle Doc</text>
+    <text class="node-path"  x="110" y="45" text-anchor="middle">docs/agentic-first-principle.md</text>
+  </g>
+
+  <!-- Target column (silver = existing artefacts being edited) -->
+  <g transform="translate(680,20)">
+    <rect class="node-rect target" width="240" height="56"/>
+    <text class="node-title" x="120" y="22" text-anchor="middle">README count fix</text>
+    <text class="node-path"  x="120" y="42" text-anchor="middle">README.md</text>
+  </g>
+  <g transform="translate(680,96)">
+    <rect class="node-rect target" width="240" height="56"/>
+    <text class="node-title" x="120" y="22" text-anchor="middle">capability-map tiering + §2.2 fix</text>
+    <text class="node-path"  x="120" y="42" text-anchor="middle">docs/capability-map.md</text>
+  </g>
+  <g transform="translate(680,172)">
+    <rect class="node-rect target" width="240" height="56"/>
+    <text class="node-title" x="120" y="22" text-anchor="middle">CLAUDE routing + glossary</text>
+    <text class="node-path"  x="120" y="42" text-anchor="middle">CLAUDE.md</text>
+  </g>
+  <g transform="translate(680,248)">
+    <rect class="node-rect target" width="240" height="56"/>
+    <text class="node-title" x="120" y="22" text-anchor="middle">proposed Phase 15–17</text>
+    <text class="node-path"  x="120" y="42" text-anchor="middle">docs/roadmap.md</text>
+  </g>
+  <g transform="translate(680,324)">
+    <rect class="node-rect target" width="240" height="56"/>
+    <text class="node-title" x="120" y="22" text-anchor="middle">false "Implemented:" comment</text>
+    <text class="node-path"  x="120" y="42" text-anchor="middle">server/core/src/mcp_server.cpp</text>
+  </g>
+
+  <!-- ── Edges from A ──────────────────────────────────────────────── -->
+  <!-- A right edge: x=260, y=230. P left edge: x=360, y=230 -->
+  <path class="edge" d="M 260 230 L 360 230" marker-end="url(#arrow-solid)"/>
+  <rect class="edge-label-bg" x="294" y="217" width="32" height="14" rx="3"/>
+  <text class="edge-label" x="310" y="228">cites</text>
+
+  <!-- A → R (README, top target at y=20..76, midpoint 48). Curve. -->
+  <!-- A right-mid: 260,230. Target left: 680, ymid. -->
+  <path class="edge" d="M 260 220 C 420 60 520 60 680 48"
+        marker-end="url(#arrow-solid)"/>
+  <rect class="edge-label-bg" x="430" y="92" width="74" height="14" rx="3"/>
+  <text class="edge-label" x="467" y="103">prescribes</text>
+
+  <!-- A → CM (capability-map, y=124) -->
+  <path class="edge" d="M 260 224 C 460 165 520 130 680 124"
+        marker-end="url(#arrow-solid)"/>
+
+  <!-- A → CL (CLAUDE, y=200) — straight-ish -->
+  <path class="edge" d="M 260 232 C 470 220 530 205 680 200"
+        marker-end="url(#arrow-solid)"/>
+
+  <!-- A → RM (roadmap, y=276) -->
+  <path class="edge" d="M 260 240 C 460 290 520 285 680 276"
+        marker-end="url(#arrow-solid)"/>
+
+  <!-- A → MC (mcp_server.cpp, y=352) -->
+  <path class="edge" d="M 260 248 C 420 410 520 410 680 352"
+        marker-end="url(#arrow-solid)"/>
+  <rect class="edge-label-bg" x="430" y="372" width="74" height="14" rx="3"/>
+  <text class="edge-label" x="467" y="383">prescribes</text>
+
+  <!-- ── Edges from P (dashed, indigo) ─────────────────────────────── -->
+  <!-- P right edge: x=580, y=230 -->
+  <!-- P → CL (y=200) -->
+  <path class="edge referenced" d="M 580 224 C 620 210 640 205 680 200"
+        marker-end="url(#arrow-ref)"/>
+  <rect class="edge-label-bg" x="592" y="184" width="98" height="14" rx="3"/>
+  <text class="edge-label referenced" x="641" y="195">referenced from</text>
+
+  <!-- P → RM (y=276) -->
+  <path class="edge referenced" d="M 580 236 C 620 256 640 270 680 276"
+        marker-end="url(#arrow-ref)"/>
+  <rect class="edge-label-bg" x="592" y="264" width="98" height="14" rx="3"/>
+  <text class="edge-label referenced" x="641" y="275">referenced from</text>
+
+  <!-- ── Legend ────────────────────────────────────────────────────── -->
+  <g transform="translate(20,400)">
+    <text class="legend-title" x="0" y="0">LEGEND</text>
+    <rect class="node-rect audit"     x="0"   y="10" width="20" height="14"/>
+    <text class="legend-text"         x="28"  y="22">new</text>
+    <rect class="node-rect principle" x="80"  y="10" width="20" height="14"/>
+    <text class="legend-text"         x="108" y="22">new principle</text>
+    <rect class="node-rect target"    x="220" y="10" width="20" height="14"/>
+    <text class="legend-text"         x="248" y="22">existing — edited</text>
+    <line x1="400" y1="17" x2="440" y2="17" class="edge" marker-end="url(#arrow-solid)"/>
+    <text class="legend-text" x="448" y="22">cites / prescribes</text>
+    <line x1="580" y1="17" x2="620" y2="17" class="edge referenced" marker-end="url(#arrow-ref)"/>
+    <text class="legend-text" x="628" y="22">referenced from</text>
+  </g>
+</svg>

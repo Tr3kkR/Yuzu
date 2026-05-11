@@ -792,6 +792,17 @@ figure.diagram .row-edges .edge-label { font-size: 0.8em; color: var(--fg-muted)
 figure.diagram .row-fanout { gap: 0.6em; align-items: center; }
 figure.diagram .row-fanout .gw-list { flex: 0 0 auto; }
 
+/* SVG-backed diagram — render the file at full width with sensible bounds. */
+figure.diagram.svg-figure { padding: 0.6em; }
+figure.diagram .svg-diagram {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 70vh;
+  background: var(--bg);
+  border-radius: 6px;
+}
+
 /* Inline doc-reference linkifier — keeps the original <code> chip styling but
    makes the surrounding anchor obvious by colouring the text french-blue. */
 a.doc-ref { text-decoration: none; }
@@ -955,18 +966,13 @@ ul.doc-index a:hover code { text-decoration: underline; }
 </figure>
 
 <p>No code changes that affect runtime behaviour. The MCP comment fix is doc-only (a <code>//</code> comment that misrepresents implementation status).</p>
-<div class="highlight"><pre><span></span><code>flowchart LR
-    A[Audit Report&lt;br/&gt;docs/capability-agentic-audit-2026-05.md]
-    P[Agentic-First Principle Doc&lt;br/&gt;docs/agentic-first-principle.md]
-    A --&gt;|cites| P
-    A --&gt;|prescribes| R[README.md count fix]
-    A --&gt;|prescribes| CM[capability-map.md tiering + §2.2 fix]
-    A --&gt;|prescribes| CL[CLAUDE.md routing + glossary]
-    A --&gt;|prescribes| RM[roadmap.md proposed Ph 15-17]
-    A --&gt;|prescribes| MC[mcp_server.cpp comment fix]
-    P --&gt;|referenced from| CL
-    P --&gt;|referenced from| RM
-</code></pre></div>
+<figure class="diagram svg-figure" aria-label="The new audit report (docs/capability-agentic-audit-2026-05.md) cites the new agentic-first principle doc (docs/agentic-first-principle.md). The audit report prescribes edits to five existing files — README.md (stale capability count), docs/capability-map.md (header + §2.2 tiering fix), CLAUDE.md (routed concerns + glossary), docs/roadmap.md (proposed Phase 15-17 tail), and server/core/src/mcp_server.cpp:227 (false 'Implemented:' comment). The principle doc is itself referenced from CLAUDE.md and docs/roadmap.md.">
+  <img src="diagrams/capability-agentic-audit-plan-flow.svg"
+       alt="Cross-document flow: audit report cites the principle doc and prescribes edits to README.md, capability-map.md, CLAUDE.md, roadmap.md, and mcp_server.cpp; the principle doc is referenced back from CLAUDE.md and roadmap.md."
+       class="svg-diagram">
+  <figcaption>Audit-plan cross-document flow — new origin docs (left, gold &amp; french-blue) drive edits to five existing artefacts (right, silver). Dashed indigo edges show the principle doc's back-references.</figcaption>
+</figure>
+
 <h2 id="file-by-file-specification">File-by-file specification</h2>
 <h3 id="1-docscapability-agentic-audit-2026-05md-new">1. <a href="../capability-agentic-audit-2026-05.html" class="doc-ref"><code>docs/capability-agentic-audit-2026-05.md</code></a> (NEW)</h3>
 <p>Single audit deliverable. Sections:</p>
