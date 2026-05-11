@@ -386,6 +386,32 @@ TopologySnapshot FleetTopologyStore::build_snapshot(std::vector<RawAgentSnapshot
             m.connections.push_back(std::move(e));
         }
 
+        // PR 8 -- pair each Local-scope edge with its reciprocal half so the
+        // renderer can draw interior lines. A loopback TCP session shows up
+        // as two ESTABLISHED rows in the kernel socket table; the matching
+        // peer has swapped (addr, port) on each side. Set dst_pid to the
+        // peer's src_pid when matched. Unmatched halves are dropped because
+        // the renderer cannot draw a line into the void. O(n^2) per machine
+        // -- acceptable for typical per-host connection counts; a
+        // (addr,port)->pid hash index is a refactor candidate once n
+        // routinely exceeds a few hundred.
+        for (auto& e : m.connections) {
+            if (e.scope != EdgeScope::Local)
+                continue;
+            for (const auto& other : m.connections) {
+                if (other.scope != EdgeScope::Local)
+                    continue;
+                if (other.src_addr == e.dst_addr && other.src_port == e.dst_port &&
+                    other.dst_addr == e.src_addr && other.dst_port == e.src_port) {
+                    e.dst_pid = other.src_pid;
+                    break;
+                }
+            }
+        }
+        std::erase_if(m.connections, [](const ConnectionEdge& e) {
+            return e.scope == EdgeScope::Local && e.dst_pid == 0;
+        });
+
         out.machines.push_back(std::move(m));
     }
 

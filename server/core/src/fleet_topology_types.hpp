@@ -76,6 +76,13 @@ struct ConnectionEdge {
     /// agent_id of the destination machine when remote_addr resolves to a
     /// fleet host; empty for Local and External scopes.
     std::string dst_agent_id;
+    /// Resolved destination pid on the SAME machine for `EdgeScope::Local`
+    /// connections only. Populated by pairing each loopback connection with
+    /// its reciprocal half (same 4-tuple, swapped). Zero (the default) when
+    /// the destination is unresolved -- PR 8 drops those before they reach
+    /// the renderer, so a `dst_pid == 0` on a Local edge that survives into
+    /// a TopologySnapshot is a build-snapshot bug.
+    uint32_t dst_pid{0};
     EdgeScope scope{EdgeScope::External};
     std::string state; ///< ESTABLISHED, CLOSE_WAIT, etc.
 };
@@ -173,6 +180,8 @@ inline void to_json(nlohmann::json& j, const ConnectionEdge& e) {
          {"state", e.state}};
     if (!e.dst_agent_id.empty())
         j["dst_agent_id"] = e.dst_agent_id;
+    if (e.dst_pid != 0)
+        j["dst_pid"] = e.dst_pid;
 }
 
 inline void to_json(nlohmann::json& j, const MachineNode& m) {
@@ -191,10 +200,11 @@ inline void to_json(nlohmann::json& j, const MachineNode& m) {
 }
 
 inline void to_json(nlohmann::json& j, const TopologySnapshot& s) {
-    // schema_minor allows additive evolution (e.g. PR 7 adding cpu_pct).
-    // Renderers MUST ignore unknown keys.
+    // schema_minor allows additive evolution. Renderers MUST ignore unknown
+    // keys. Bumped 1 -> 2 in PR 8 to advertise ConnectionEdge.dst_pid on
+    // EdgeScope::Local edges.
     j = {{"schema", "fleet_topology.v1"},
-         {"schema_minor", 1},
+         {"schema_minor", 2},
          {"generated_at", s.generated_at},
          {"include_vuln", s.include_vuln},
          {"machines", s.machines}};

@@ -20,6 +20,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -150,14 +151,100 @@ TEST_CASE("topology: cross-machine connection resolves dst_agent_id", "[viz][top
 
 TEST_CASE("topology: loopback connections classified as Local", "[viz][topology]") {
     auto a = make_agent("agent-A", "hostA", {"10.0.0.7"});
-    a.connections.push_back(conn("tcp", "127.0.0.1", 8080, "127.0.0.1", 41234));
-    a.connections.push_back(conn("tcp6", "::1", 8080, "::1", 41235));
+    // IPv4 reciprocal pair on 8080.
+    a.connections.push_back(conn("tcp", "127.0.0.1", 41234, "127.0.0.1", 8080, "ESTABLISHED", 1));
+    a.connections.push_back(conn("tcp", "127.0.0.1", 8080, "127.0.0.1", 41234, "ESTABLISHED", 2));
+    // IPv6 reciprocal pair on 8081.
+    a.connections.push_back(conn("tcp6", "::1", 41235, "::1", 8081, "ESTABLISHED", 3));
+    a.connections.push_back(conn("tcp6", "::1", 8081, "::1", 41235, "ESTABLISHED", 4));
 
     FleetTopologyStore store(fixed_fetcher({a}));
     auto snap = store.get(false);
-    REQUIRE(snap->machines.at(0).connections.size() == 2);
-    CHECK(snap->machines[0].connections[0].scope == EdgeScope::Local);
-    CHECK(snap->machines[0].connections[1].scope == EdgeScope::Local);
+    // PR 8 keeps paired Local edges (each half resolved to its peer). Unpaired
+    // Local edges would be dropped here; these four form two reciprocal pairs.
+    REQUIRE(snap->machines.at(0).connections.size() == 4);
+    for (const auto& e : snap->machines[0].connections) {
+        CHECK(e.scope == EdgeScope::Local);
+    }
+}
+
+// PR 8: a TCP loopback session on Linux appears in the kernel's socket table
+// as TWO ESTABLISHED records -- the initiator's outbound half (local=ephemeral,
+// remote=service-port) and the listener's accepted half (local=service-port,
+// remote=ephemeral). The renderer needs the destination pid on each half to
+// draw the interior line between the two process dots. build_snapshot()
+// pairs the halves by reciprocal 4-tuple match and writes the peer's src_pid
+// into ConnectionEdge.dst_pid; unmatched halves are dropped (PR 8 spec).
+TEST_CASE("topology: reciprocal Local loopback pair resolves dst_pid both ways",
+          "[viz][topology][pr8]") {
+    auto a = make_agent("agent-A", "hostA", {"10.0.0.7"});
+    // Process 100 initiated a connection to 127.0.0.1:8080 from ephemeral port 50000.
+    a.connections.push_back(conn("tcp", "127.0.0.1", 50000, "127.0.0.1", 8080, "ESTABLISHED", 100));
+    // Process 200 is on the listening side, accepted the connection from 50000.
+    a.connections.push_back(conn("tcp", "127.0.0.1", 8080, "127.0.0.1", 50000, "ESTABLISHED", 200));
+
+    FleetTopologyStore store(fixed_fetcher({a}));
+    auto snap = store.get(false);
+    REQUIRE(snap->machines.size() == 1);
+    REQUIRE(snap->machines[0].connections.size() == 2);
+
+    const auto& edges = snap->machines[0].connections;
+    auto from_100 =
+        std::find_if(edges.begin(), edges.end(), [](const auto& e) { return e.src_pid == 100; });
+    auto from_200 =
+        std::find_if(edges.begin(), edges.end(), [](const auto& e) { return e.src_pid == 200; });
+    REQUIRE(from_100 != edges.end());
+    REQUIRE(from_200 != edges.end());
+
+    CHECK(from_100->scope == EdgeScope::Local);
+    CHECK(from_200->scope == EdgeScope::Local);
+    CHECK(from_100->dst_pid == 200);
+    CHECK(from_200->dst_pid == 100);
+}
+
+// PR 8 spec: "Drop edges with unresolved destination." If an agent captures
+// only one half of a loopback session (e.g. the listener is gone, or the
+// snapshot raced), the renderer has nothing to connect the line to. Server
+// drops these before serialisation so the wire payload stays consistent.
+TEST_CASE("topology: unmatched Local edge is dropped (no reciprocal half)",
+          "[viz][topology][pr8]") {
+    auto a = make_agent("agent-A", "hostA", {"10.0.0.7"});
+    a.connections.push_back(conn("tcp", "127.0.0.1", 50000, "127.0.0.1", 8080, "ESTABLISHED", 100));
+
+    FleetTopologyStore store(fixed_fetcher({a}));
+    auto snap = store.get(false);
+    REQUIRE(snap->machines.size() == 1);
+    CHECK(snap->machines[0].connections.empty());
+}
+
+// Non-Local edges (InternalFleet, External) must be untouched by the PR 8
+// pairing+drop pass -- their destination is on a different machine (or
+// outside the fleet), so dst_pid stays the default 0 and the drop predicate
+// must not catch them.
+TEST_CASE("topology: PR 8 pairing pass leaves non-Local edges untouched", "[viz][topology][pr8]") {
+    auto a = make_agent("agent-A", "hostA", {"10.0.0.7"});
+    auto b = make_agent("agent-B", "hostB", {"10.0.0.42"});
+
+    // Cross-fleet edge (InternalFleet scope expected).
+    a.connections.push_back(conn("tcp", "10.0.0.7", 50000, "10.0.0.42", 5432, "ESTABLISHED", 100));
+    // External edge.
+    a.connections.push_back(conn("tcp", "10.0.0.7", 50001, "8.8.8.8", 443, "ESTABLISHED", 100));
+
+    FleetTopologyStore store(fixed_fetcher({a, b}));
+    auto snap = store.get(false);
+    REQUIRE(snap->machines.size() == 2);
+
+    auto& a_edges = snap->machines[0].connections;
+    REQUIRE(a_edges.size() == 2);
+
+    auto fleet_it = std::find_if(a_edges.begin(), a_edges.end(),
+                                 [](const auto& e) { return e.scope == EdgeScope::InternalFleet; });
+    auto ext_it = std::find_if(a_edges.begin(), a_edges.end(),
+                               [](const auto& e) { return e.scope == EdgeScope::External; });
+    REQUIRE(fleet_it != a_edges.end());
+    REQUIRE(ext_it != a_edges.end());
+    CHECK(fleet_it->dst_pid == 0);
+    CHECK(ext_it->dst_pid == 0);
 }
 
 TEST_CASE("topology: connection to non-fleet IP marked External", "[viz][topology]") {
@@ -254,6 +341,104 @@ TEST_CASE("topology: TopologySnapshot serializes to fleet_topology.v1 JSON",
     CHECK(j["machines"][0]["local_ips"][0] == "10.0.0.7");
     CHECK(j["machines"][0]["processes"][0]["category"] == "web");
     CHECK(j["machines"][0]["connections"][0]["scope"] == "external");
+}
+
+// PR 8 JSON shape: dst_pid is emitted only when non-zero (matches the
+// dst_agent_id pattern -- optional field omitted when default). schema_minor
+// bumps 1 -> 2 to advertise the additive field; renderers ignoring unknown
+// minor versions continue to work.
+TEST_CASE("topology: dst_pid serializes only when non-zero; schema_minor bumped",
+          "[viz][topology][json][pr8]") {
+    auto a = make_agent("agent-A", "hostA", {"10.0.0.7"});
+    a.connections.push_back(conn("tcp", "127.0.0.1", 50000, "127.0.0.1", 8080, "ESTABLISHED", 100));
+    a.connections.push_back(conn("tcp", "127.0.0.1", 8080, "127.0.0.1", 50000, "ESTABLISHED", 200));
+    a.connections.push_back(conn("tcp", "10.0.0.7", 50001, "8.8.8.8", 443, "ESTABLISHED", 300));
+
+    FleetTopologyStore store(fixed_fetcher({a}));
+    auto snap = store.get(false);
+    json j = *snap;
+
+    CHECK(j["schema_minor"] == 2);
+
+    const auto& edges = j["machines"][0]["connections"];
+    REQUIRE(edges.size() == 3);
+
+    bool saw_paired = false, saw_external = false;
+    for (const auto& edge : edges) {
+        if (edge["scope"] == "local") {
+            CHECK(edge.contains("dst_pid"));
+            CHECK(edge["dst_pid"].is_number_unsigned());
+            CHECK((edge["dst_pid"] == 100 || edge["dst_pid"] == 200));
+            saw_paired = true;
+        }
+        if (edge["scope"] == "external") {
+            CHECK_FALSE(edge.contains("dst_pid"));
+            saw_external = true;
+        }
+    }
+    CHECK(saw_paired);
+    CHECK(saw_external);
+}
+
+// IPv6 loopback (::1) pairs must resolve equivalently to IPv4 -- the
+// matching key is the exact (addr, port) tuple, so the only requirement is
+// is_loopback_addr() recognises ::1 (it does).
+TEST_CASE("topology: IPv6 ::1 reciprocal pair resolves dst_pid", "[viz][topology][pr8]") {
+    auto a = make_agent("agent-A", "hostA", {"10.0.0.7"});
+    a.connections.push_back(conn("tcp6", "::1", 50000, "::1", 8080, "ESTABLISHED", 100));
+    a.connections.push_back(conn("tcp6", "::1", 8080, "::1", 50000, "ESTABLISHED", 200));
+
+    FleetTopologyStore store(fixed_fetcher({a}));
+    auto snap = store.get(false);
+    const auto& edges = snap->machines.at(0).connections;
+    REQUIRE(edges.size() == 2);
+    auto from_100 =
+        std::find_if(edges.begin(), edges.end(), [](const auto& e) { return e.src_pid == 100; });
+    auto from_200 =
+        std::find_if(edges.begin(), edges.end(), [](const auto& e) { return e.src_pid == 200; });
+    REQUIRE(from_100 != edges.end());
+    REQUIRE(from_200 != edges.end());
+    CHECK(from_100->dst_pid == 200);
+    CHECK(from_200->dst_pid == 100);
+}
+
+// Two independent Local pairs on the same machine must not cross-match: the
+// matcher keys on the full 4-tuple, so a "greedy first-match" bug would
+// surface here. Pair 1: pid 100 <-> pid 200 on port 8080. Pair 2: pid 300
+// <-> pid 400 on port 9090. Each edge's dst_pid must point at its own
+// reciprocal, not the other pair's process.
+TEST_CASE("topology: two Local pairs on same machine match correctly (no cross-pair leak)",
+          "[viz][topology][pr8]") {
+    auto a = make_agent("agent-A", "hostA", {"10.0.0.7"});
+    // Pair 1: client 100 -> server 200 on 8080
+    a.connections.push_back(conn("tcp", "127.0.0.1", 50000, "127.0.0.1", 8080, "ESTABLISHED", 100));
+    a.connections.push_back(conn("tcp", "127.0.0.1", 8080, "127.0.0.1", 50000, "ESTABLISHED", 200));
+    // Pair 2: client 300 -> server 400 on 9090
+    a.connections.push_back(conn("tcp", "127.0.0.1", 51000, "127.0.0.1", 9090, "ESTABLISHED", 300));
+    a.connections.push_back(conn("tcp", "127.0.0.1", 9090, "127.0.0.1", 51000, "ESTABLISHED", 400));
+
+    FleetTopologyStore store(fixed_fetcher({a}));
+    auto snap = store.get(false);
+    const auto& edges = snap->machines.at(0).connections;
+    REQUIRE(edges.size() == 4);
+
+    auto find_by_pid = [&](uint32_t pid) {
+        return std::find_if(edges.begin(), edges.end(),
+                            [pid](const auto& e) { return e.src_pid == pid; });
+    };
+    auto e100 = find_by_pid(100);
+    auto e200 = find_by_pid(200);
+    auto e300 = find_by_pid(300);
+    auto e400 = find_by_pid(400);
+    REQUIRE(e100 != edges.end());
+    REQUIRE(e200 != edges.end());
+    REQUIRE(e300 != edges.end());
+    REQUIRE(e400 != edges.end());
+
+    CHECK(e100->dst_pid == 200);
+    CHECK(e200->dst_pid == 100);
+    CHECK(e300->dst_pid == 400);
+    CHECK(e400->dst_pid == 300);
 }
 
 // =============================================================================

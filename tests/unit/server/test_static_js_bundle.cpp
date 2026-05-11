@@ -323,6 +323,20 @@ TEST_CASE("static_js_bundle: kYuzuVizJs disables OrbitControls panning", "[stati
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("controls.enablePan = false"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuVizJs draws PR 8 intra-cube edges as LineSegments",
+          "[static-js][viz][pr8]") {
+    // PR 8 contract: for every Local-scope connection with both src_pid and
+    // dst_pid populated, the renderer constructs a THREE.LineSegments inside
+    // the cube's processGroup so the disposeNode walk releases it on
+    // clearFleet. Pin (a) the scope discriminator, (b) the LineSegments +
+    // LineBasicMaterial construction, and (c) the dst_pid handling so a
+    // refactor that drops the pair drops the test along with it.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("scope !== 'local'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("THREE.LineSegments"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("LineBasicMaterial"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("c.dst_pid"));
+}
+
 TEST_CASE("static_js_bundle: kYuzuVizJs has no embedded NULs", "[static-js][viz]") {
     CHECK(yuzu::server::kYuzuVizJs.find('\0') == std::string::npos);
 }

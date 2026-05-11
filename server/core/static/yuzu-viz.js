@@ -665,6 +665,11 @@ function mount() {
         processGroup.name = 'yuzu-processes';
         cube.add(processGroup);
         const procPlacements = placeProcessesInCube(procs, CUBE_SIZE);
+        // PR 8: pid → in-cube position index. Built alongside dots so the
+        // edge pass below can resolve src_pid/dst_pid to the two endpoints
+        // without re-walking the placements array. Stays empty if a
+        // process row is missing pid or carries a non-finite one.
+        const pidToPos = new Map();
         for (let j = 0; j < procPlacements.length; j++) {
           const pp = procPlacements[j];
           const dot = buildProcessNode(pp.process);
@@ -676,6 +681,33 @@ function mount() {
           dot.position.set(pp.x, pp.y, pp.z);
           processGroup.add(dot);
           processMeshes.push(dot);
+          if (pp.process && Number.isFinite(pp.process.pid)) {
+            pidToPos.set(pp.process.pid, new THREE.Vector3(pp.x, pp.y, pp.z));
+          }
+        }
+
+        // PR 8: faint interior LineSegments between paired loopback peers.
+        // The server has already (a) classified the connection as Local,
+        // (b) resolved the reciprocal half's pid into dst_pid, and (c)
+        // dropped Local edges that couldn't be paired — so by this point
+        // a connection with scope==='local' AND both src_pid + dst_pid set
+        // is guaranteed to map to two dots already placed in this cube.
+        // Lines join the processGroup so clearFleet's traverse(disposeNode)
+        // walk releases the BufferGeometry + LineBasicMaterial together
+        // with the per-dot resources.
+        const conns = Array.isArray(p.machine.connections) ? p.machine.connections : [];
+        for (let k = 0; k < conns.length; k++) {
+          const c = conns[k];
+          if (!c || c.scope !== 'local') continue;
+          if (!Number.isFinite(c.src_pid) || !Number.isFinite(c.dst_pid)) continue;
+          const aPos = pidToPos.get(c.src_pid);
+          const bPos = pidToPos.get(c.dst_pid);
+          if (!aPos || !bPos) continue;
+          const geom = new THREE.BufferGeometry().setFromPoints([aPos, bPos]);
+          const mat = new THREE.LineBasicMaterial(
+            {color: 0xffffff, transparent: true, opacity: 0.3});
+          const line = new THREE.LineSegments(geom, mat);
+          processGroup.add(line);
         }
       }
     }
