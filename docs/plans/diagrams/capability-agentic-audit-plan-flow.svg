@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg"
-     viewBox="0 0 940 520"
+     viewBox="0 -40 940 560"
      role="img"
      aria-labelledby="title desc"
      preserveAspectRatio="xMidYMid meet">
@@ -123,10 +123,17 @@
     <text class="head-path"  x="710" y="68" text-anchor="middle">docs/agentic-first-principle.md</text>
   </g>
 
-  <!-- "cites" edge — single horizontal line in the gutter, top area -->
-  <path class="cite-edge" d="M 440 53 L 500 53" marker-end="url(#arrow-blue)"/>
-  <rect class="edge-label-bg" x="448" y="38" width="44" height="14" rx="3"/>
-  <text class="edge-label" x="470" y="49">cites</text>
+  <!--
+    "cites" edge — routed as a U-arc that rises above BOTH head boxes,
+    crosses the page above them, and drops onto the principle box's top
+    edge from above. This way the line is never at the same y-range as
+    either box's interior, so it can't be misread as cutting through them.
+  -->
+  <path class="cite-edge"
+        d="M 230 18 L 230 -20 L 710 -20 L 710 18"
+        marker-end="url(#arrow-blue)"/>
+  <rect class="edge-label-bg" x="448" y="-29" width="44" height="14" rx="3"/>
+  <text class="edge-label" x="470" y="-18">cites</text>
 
   <!-- ── Section labels ────────────────────────────────────────────── -->
   <text class="section-label"           x="60"  y="104">▼ Prescribes edits to:</text>
