@@ -80,9 +80,6 @@
 #include "agent_service_impl.hpp"
 #include "gateway_service_impl.hpp"
 
-#include <grpc/grpc_security_constants.h>
-#include <grpcpp/grpcpp.h>
-#include <grpcpp/health_check_service_interface.h>
 #include <httplib.h>
 
 // httplib compat: v0.18+ moved file upload helpers to req.form (MultipartFormData).
@@ -474,8 +471,7 @@ public:
                 gw_cmd_creds.verify_peer = false;
                 gw_cmd_creds.client_cert_mode = ::yuzu::transport::ClientCertMode::None;
                 gw_mgmt_channel_ = ::yuzu::transport::make_channel(
-                    ::yuzu::transport::Backend::Grpc, *gw_cmd_endpoint,
-                    std::move(gw_cmd_creds));
+                    ::yuzu::transport::Backend::Grpc, *gw_cmd_endpoint, std::move(gw_cmd_creds));
                 if (!gw_mgmt_channel_) {
                     spdlog::error("Failed to construct gateway-command transport::Channel "
                                   "(Grpc backend not linked)");
@@ -1002,19 +998,40 @@ public:
         spdlog::info("run(): entering");
 
         // Pre-validate agent listener TLS material so the transport listener
-        // doesn't bring up half a service before failing. The lifted
-        // gw-upstream listener shares this material per #376 PR 1c-5
-        // (placeholder ManagementService and the --management-cert/key/ca
-        // separate-cert path were dropped at the same time — no operator-
-        // facing :50052 to need distinct trust). The transport listener's
-        // own `build_transport_credentials()` re-reads the same files.
+        // doesn't bring up half a service before failing. PR 1c-6 cleanup:
+        // the previous `build_tls_credentials` helper constructed a throw-away
+        // `grpc::SslServerCredentials` object only to verify files were
+        // readable + key-file permissions were 0600 — both of which
+        // `build_transport_credentials` already does at the moment of use
+        // (and the `agent_creds_t.server_cert_pem.empty()` check below catches
+        // the same failure modes 20 lines later). Pre-flight now reads the
+        // same files directly so the grpc:: includes can leave server.cpp.
         if (cfg_.tls_enabled) {
-            auto agent_tls_validation =
-                build_tls_credentials(cfg_.tls_server_cert, cfg_.tls_server_key, cfg_.tls_ca_cert,
-                                      cfg_.allow_one_way_tls, "agent listener");
-            if (!agent_tls_validation) {
-                spdlog::error("TLS is enabled but agent-listener credentials are invalid; "
+            if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
+                spdlog::error("TLS is enabled but agent-listener cert/key paths are empty; "
                               "refusing to start");
+                return;
+            }
+            if (!detail::validate_key_file_permissions(cfg_.tls_server_key, "agent listener")) {
+                spdlog::error("TLS is enabled but agent-listener key permissions are invalid; "
+                              "refusing to start");
+                return;
+            }
+            if (detail::read_file_contents(cfg_.tls_server_cert).empty() ||
+                detail::read_file_contents(cfg_.tls_server_key).empty()) {
+                spdlog::error("TLS is enabled but agent-listener cert/key files are unreadable; "
+                              "refusing to start");
+                return;
+            }
+            if (!cfg_.tls_ca_cert.empty() && detail::read_file_contents(cfg_.tls_ca_cert).empty()) {
+                spdlog::error("TLS is enabled but agent-listener CA cert {} is unreadable; "
+                              "refusing to start",
+                              cfg_.tls_ca_cert.string());
+                return;
+            }
+            if (cfg_.tls_ca_cert.empty() && !cfg_.allow_one_way_tls) {
+                spdlog::error("agent listener TLS requires --ca-cert (or enable "
+                              "--insecure-skip-client-verify with YUZU_ALLOW_INSECURE_TLS=1)");
                 return;
             }
         }
@@ -1100,16 +1117,14 @@ public:
             // same counters; we keep them as separate sinks for symmetry
             // and so the lifetime tracks each listener's `shutdown()`).
             gw_opts.metric_sink = std::make_shared<detail::ServerTransportMetricSink>(metrics_);
-            auto gw_start =
-                gw_upstream_listener_->start(*gw_bind_opt, agent_creds_t, gw_opts);
+            auto gw_start = gw_upstream_listener_->start(*gw_bind_opt, agent_creds_t, gw_opts);
             if (!gw_start.has_value()) {
                 spdlog::error("Failed to start gateway-upstream listener on {}: {}",
                               cfg_.gateway_upstream_address, gw_start.error().detail);
                 agent_listener_->shutdown();
                 return;
             }
-            spdlog::info("Gateway upstream service enabled on {}",
-                         cfg_.gateway_upstream_address);
+            spdlog::info("Gateway upstream service enabled on {}", cfg_.gateway_upstream_address);
         }
 
         spdlog::info("Yuzu Server listening on {} (agents)", cfg_.listen_address);
@@ -1428,67 +1443,17 @@ public:
 
 private:
     // -- TLS ------------------------------------------------------------------
-
-    [[nodiscard]] std::shared_ptr<grpc::ServerCredentials>
-    build_tls_credentials(const std::filesystem::path& cert_path,
-                          const std::filesystem::path& key_path,
-                          const std::filesystem::path& ca_path, bool allow_one_way_tls,
-                          std::string_view listener_name) const {
-        if (cert_path.empty() || key_path.empty()) {
-            spdlog::error("{} TLS requires certificate and key", listener_name);
-            return nullptr;
-        }
-
-        if (!detail::validate_key_file_permissions(key_path, listener_name)) {
-            return nullptr;
-        }
-
-        auto cert = detail::read_file_contents(cert_path);
-        auto key = detail::read_file_contents(key_path);
-        if (cert.empty() || key.empty()) {
-            spdlog::error("Failed to read {} TLS cert/key files", listener_name);
-            return nullptr;
-        }
-
-        grpc::SslServerCredentialsOptions ssl_opts;
-        grpc::SslServerCredentialsOptions::PemKeyCertPair key_cert;
-        key_cert.private_key = std::move(key);
-        key_cert.cert_chain = std::move(cert);
-        ssl_opts.pem_key_cert_pairs.push_back(std::move(key_cert));
-
-        if (!ca_path.empty()) {
-            auto ca = detail::read_file_contents(ca_path);
-            if (ca.empty()) {
-                spdlog::error("Failed to read {} CA cert from {}", listener_name, ca_path.string());
-                return nullptr;
-            }
-
-            ssl_opts.pem_root_certs = std::move(ca);
-            ssl_opts.client_certificate_request =
-                GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
-        } else {
-            if (!allow_one_way_tls) {
-                spdlog::error("{} TLS requires --ca-cert (or enable "
-                              "--insecure-skip-client-verify with YUZU_ALLOW_INSECURE_TLS=1)",
-                              listener_name);
-                return nullptr;
-            }
-            spdlog::warn("{} TLS running without client certificate verification "
-                         "(--insecure-skip-client-verify)",
-                         listener_name);
-        }
-
-        auto creds = grpc::SslServerCredentials(ssl_opts);
-        for (auto& kc : ssl_opts.pem_key_cert_pairs) {
-            yuzu::secure_zero(kc.private_key);
-        }
-        return creds;
-    }
+    //
+    // PR 1c-6 cleanup: `build_tls_credentials` (a `grpc::SslServerCredentials`
+    // builder used purely as a pre-flight existence-check) was deleted along
+    // with its sole caller in run(). The pre-flight is now inline using
+    // `detail::validate_key_file_permissions` + `detail::read_file_contents`;
+    // the actual transport credentials are constructed by
+    // `build_transport_credentials` below.
 
     // Construct the transport-abstraction Credentials for the agent
-    // listener. Mirrors `build_tls_credentials` for the gRPC listener;
-    // the bytes flow into the transport layer which secure_zeros the
-    // server_key_pem after the listener consumes it (see run()).
+    // listener. The bytes flow into the transport layer which secure_zeros
+    // the server_key_pem after the listener consumes it (see run()).
     [[nodiscard]] ::yuzu::transport::Credentials build_transport_credentials() const {
         ::yuzu::transport::Credentials c{};
         if (!cfg_.tls_enabled) {
@@ -1883,15 +1848,16 @@ private:
     ///     logs and the `yuzu_gateway_forward_*` counters.
     void forward_gateway_pending() {
         auto gw_pending = registry_.drain_gateway_pending();
-        if (gw_pending.empty() || !gw_mgmt_channel_) return;
+        if (gw_pending.empty() || !gw_mgmt_channel_)
+            return;
         for (auto& gp : gw_pending) {
             auto* ch = gw_mgmt_channel_.get();
             auto* svc = &agent_service_;
             auto* registry = &registry_;
             auto* metrics_p = &metrics_;
             auto cmd_id = gp.cmd.command_id();
-            spdlog::debug("Forwarding command {} to gateway for agent {} (attempt {})",
-                          cmd_id, gp.agent_id, gp.attempts + 1);
+            spdlog::debug("Forwarding command {} to gateway for agent {} (attempt {})", cmd_id,
+                          gp.agent_id, gp.attempts + 1);
             std::thread([ch, svc, registry, metrics_p, gp = std::move(gp), cmd_id]() mutable {
                 ::yuzu::server::v1::SendCommandRequest req;
                 req.add_agent_ids(gp.agent_id);
@@ -1900,12 +1866,12 @@ private:
 
                 ::yuzu::transport::CallContext ctx;
                 ctx.deadline = std::chrono::seconds(300);
-                auto stream = ch->bidi_stream(
-                    "yuzu.server.v1.ManagementService/SendCommand", ctx);
+                auto stream = ch->bidi_stream("yuzu.server.v1.ManagementService/SendCommand", ctx);
                 if (!stream) {
                     spdlog::warn("Gateway SendCommand for {} failed to open stream", cmd_id);
-                    metrics_p->counter("yuzu_gateway_forward_dropped_total",
-                                       {{"reason", "stream_open_failed"}})
+                    metrics_p
+                        ->counter("yuzu_gateway_forward_dropped_total",
+                                  {{"reason", "stream_open_failed"}})
                         .increment();
                     return;
                 }
@@ -1916,12 +1882,12 @@ private:
                     // Treat write-side failures as transient; re-queue.
                     bool requeued = registry->reenqueue_gateway_pending(std::move(gp));
                     metrics_p
-                        ->counter("yuzu_gateway_forward_dropped_total",
-                                  {{"reason", requeued ? "requeued_write_failed"
-                                                       : "attempts_exhausted"}})
+                        ->counter(
+                            "yuzu_gateway_forward_dropped_total",
+                            {{"reason", requeued ? "requeued_write_failed" : "attempts_exhausted"}})
                         .increment();
-                    spdlog::warn("Gateway SendCommand for {} write failed (requeued={})",
-                                 cmd_id, requeued);
+                    spdlog::warn("Gateway SendCommand for {} write failed (requeued={})", cmd_id,
+                                 requeued);
                     return;
                 }
 
@@ -1934,16 +1900,16 @@ private:
                 }
                 auto final_status = stream->final_status();
                 if (final_status.code == ::yuzu::transport::StatusCode::Ok) {
-                    spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
-                                  cmd_id, resp_count);
+                    spdlog::debug("Gateway SendCommand for {} completed: {} response(s)", cmd_id,
+                                  resp_count);
                     return;
                 }
                 if (final_status.code == ::yuzu::transport::StatusCode::Unavailable) {
                     bool requeued = registry->reenqueue_gateway_pending(std::move(gp));
                     metrics_p
-                        ->counter("yuzu_gateway_forward_dropped_total",
-                                  {{"reason",
-                                    requeued ? "requeued_unavailable" : "attempts_exhausted"}})
+                        ->counter(
+                            "yuzu_gateway_forward_dropped_total",
+                            {{"reason", requeued ? "requeued_unavailable" : "attempts_exhausted"}})
                         .increment();
                     if (requeued) {
                         spdlog::warn(
@@ -1958,8 +1924,8 @@ private:
                 }
                 spdlog::warn("Gateway SendCommand for {} failed: {} (code={})", cmd_id,
                              final_status.detail, static_cast<int>(final_status.code));
-                metrics_p->counter("yuzu_gateway_forward_dropped_total",
-                                   {{"reason", "non_transient"}})
+                metrics_p
+                    ->counter("yuzu_gateway_forward_dropped_total", {{"reason", "non_transient"}})
                     .increment();
             }).detach();
         }

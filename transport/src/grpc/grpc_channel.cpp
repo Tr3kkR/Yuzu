@@ -432,11 +432,18 @@ CallResult GrpcChannel::unary(std::string_view method, const CallContext& ctx,
         }
     }
 
-    // Copy trailing metadata for the caller (per the abstraction
-    // contract — initial vs trailing distinction lives in transport.hpp).
+    // Copy trailing metadata for the caller, applying SYMMETRIC inbound
+    // scrub on both key AND value per the transport.hpp contract block
+    // (#897). Mirrors the Status::detail scrub above; closes the
+    // injection vector for downstream surfaces (Prometheus labels,
+    // audit log, SSE drawer) that consume trailing metadata. gRPC's
+    // outbound CHECK already blocks bad bytes for the gRPC backend
+    // alone, but the abstraction promise must hold for msquic in PR 3
+    // and for arbitrary HTTP/2 proxies in between.
     for (const auto& [k, v] : gctx.GetServerTrailingMetadata()) {
-        r.trailing_metadata.emplace(std::string(k.data(), k.size()),
-                                    std::string(v.data(), v.size()));
+        r.trailing_metadata.emplace(
+            sanitise_status_detail(std::string_view(k.data(), k.size())),
+            sanitise_status_detail(std::string_view(v.data(), v.size())));
     }
 
     if (g_status.ok()) {
@@ -699,10 +706,16 @@ public:
             // contract block); sec-1 / UP-41 / cons-G4-2.
             final_yt_status_.detail =
                 sanitise_status_detail(final_grpc_status_.error_message());
+            // SYMMETRIC inbound scrub of trailing metadata key + value
+            // (#897). Same wire-boundary contract as the unary path;
+            // closes the bidi side of the Prometheus / audit / SSE
+            // injection vector for non-Yuzu peers and msquic PR 3.
             for (const auto& [k, v] : gctx_.GetServerTrailingMetadata()) {
                 trailing_metadata_.emplace(
-                    std::string(k.data(), k.size()),
-                    std::string(v.data(), v.size()));
+                    sanitise_status_detail(
+                        std::string_view(k.data(), k.size())),
+                    sanitise_status_detail(
+                        std::string_view(v.data(), v.size())));
             }
             // BidiStream contract: if read() OR write() observed a
             // deadline expiry, final_status() reports DeadlineExceeded

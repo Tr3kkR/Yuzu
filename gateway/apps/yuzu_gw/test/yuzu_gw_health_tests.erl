@@ -34,7 +34,17 @@ setup() ->
 
     %% Start mock processes for readiness checks.
     %% Only register names that aren't already taken by other test suites.
-    MockNames = [yuzu_gw_registry, yuzu_gw_agent_sup, yuzu_gw_router],
+    %% grpcbox supervisor atoms join the list — sys.config configures two
+    %% servers (agent-facing 50051, mgmt-facing 50063) and the #896 readyz
+    %% probe expects their supervisors registered. In eunit grpcbox itself
+    %% is not started, so we register stand-in pids to satisfy the probe.
+    MockNames = [
+        yuzu_gw_registry,
+        yuzu_gw_agent_sup,
+        yuzu_gw_router,
+        grpcbox_services_sup:services_sup_name(#{port => 50051, ip => {0,0,0,0}}),
+        grpcbox_services_sup:services_sup_name(#{port => 50063, ip => {127,0,0,1}})
+    ],
     MockPids = lists:filtermap(fun(Name) ->
         case whereis(Name) of
             undefined ->

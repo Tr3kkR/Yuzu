@@ -176,6 +176,20 @@ enum class StatusCode : int {
 // helper at `transport/include/yuzu/transport/detail/sanitise.hpp`
 // (`yuzu::transport::sanitise_status_detail`) is the only sanctioned
 // implementation; both backends must route through it.
+//
+// TRAILING METADATA — same contract (#897). CallResult::trailing_metadata
+// and BidiStream::trailing_metadata() carry peer-supplied key/value
+// pairs that flow into the same downstream surfaces as Status::detail
+// (Prometheus labels, audit-log rows, SSE drawer renders). The same
+// printable-ASCII + 1024-byte cap rule applies to BOTH the key AND
+// the value of every received entry; implementations MUST route both
+// through `sanitise_status_detail` at the inbound copy site. The gRPC
+// backend's own HTTP/2 layer rejects non-printable bytes on outbound
+// (RFC 7230) so the threat surface for gRPC peers is the truncation
+// branch only; the obligation exists for msquic (PR 3), for malicious
+// HTTP/2 proxies that rewrite trailers post-validation, and for any
+// non-Yuzu peer the backend talks to. Outbound trailing-metadata
+// emitters MUST also pre-scrub before handing to the backend.
 struct Status {
     StatusCode code = StatusCode::Ok;
     std::string detail;
@@ -317,7 +331,12 @@ struct Credentials {
 //
 // Initial vs trailing metadata: the `metadata` field carries INITIAL
 // metadata only (the pre-RPC headers). Trailing metadata is delivered
-// via CallResult::trailing_metadata after the call completes.
+// via CallResult::trailing_metadata after the call completes. Trailing
+// metadata key/value bytes are SYMMETRICALLY scrubbed per the
+// Status::detail contract block above (#897) — implementations MUST
+// route both through `sanitise_status_detail` at the inbound copy
+// site so non-printable / oversize peer-supplied bytes never reach
+// Prometheus labels, audit-log rows, or SSE drawer renders.
 //
 // Server-side fields (peer_uri, peer_san_identities) are populated by
 // the transport when constructing a CallContext for a dispatched call;

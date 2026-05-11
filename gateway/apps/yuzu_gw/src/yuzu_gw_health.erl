@@ -128,7 +128,7 @@ readiness_check() ->
         check_process(<<"agent_sup">>, yuzu_gw_agent_sup),
         check_process(<<"router">>, yuzu_gw_router),
         check_circuit_breaker()
-    ],
+    ] ++ grpcbox_listener_checks(),
     AllOk = lists:all(fun({_, V}) -> V end, Checks),
     ChecksJson = build_checks_json(Checks),
     Status = case AllOk of true -> <<"ready">>; false -> <<"not_ready">> end,
@@ -143,6 +143,24 @@ check_process(Name, RegisteredName) ->
         undefined -> {Name, false};
         Pid       -> {Name, erlang:is_process_alive(Pid)}
     end.
+
+%% @doc #896 — readiness must reflect transport listener state. grpcbox
+%% supervises each configured server under an atom derived from its
+%% `listen_opts` (see `grpcbox_services_sup:services_sup_name/1`); we
+%% iterate the configured `{grpcbox, servers}` env, build the same atom,
+%% and check it the same way as the named core processes above. Pre-#896
+%% a dead grpcbox listener would leave readyz returning 200 even though
+%% no agent could connect.
+grpcbox_listener_checks() ->
+    Servers = application:get_env(grpcbox, servers, []),
+    [grpcbox_listener_check(S) || S <- Servers].
+
+grpcbox_listener_check(ServerOpts) ->
+    ListenOpts = maps:get(listen_opts, ServerOpts, #{}),
+    Port = maps:get(port, ListenOpts, 0),
+    Name = <<"grpcbox_listener_", (integer_to_binary(Port))/binary>>,
+    SupAtom = grpcbox_services_sup:services_sup_name(ListenOpts),
+    check_process(Name, SupAtom).
 
 check_circuit_breaker() ->
     try

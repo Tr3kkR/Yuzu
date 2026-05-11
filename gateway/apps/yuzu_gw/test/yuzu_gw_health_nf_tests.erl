@@ -26,6 +26,10 @@ health_nf_test_() ->
         fun readyz_503_dead_process/0},
        {"readyz 503 when circuit breaker is open",
         fun readyz_503_circuit_open/0},
+       {"readyz 503 when grpcbox agent-facing listener is dead (#896)",
+        fun readyz_503_grpcbox_agent_listener_dead/0},
+       {"readyz 503 when grpcbox mgmt-facing listener is dead (#896)",
+        fun readyz_503_grpcbox_mgmt_listener_dead/0},
        {"concurrent health checks complete without error",
         fun concurrent_health_checks/0},
        {"healthz response time is bounded",
@@ -33,6 +37,12 @@ health_nf_test_() ->
        {"readyz response time is bounded",
         fun readyz_response_time/0}
       ]}}.
+
+%% Canonical grpcbox listener configs that match sys.config. Tests register
+%% mock pids under `grpcbox_services_sup:services_sup_name/1` of each so
+%% the health module's `whereis` probe sees them as the running supervisor.
+agent_listen_opts() -> #{port => 50051, ip => {0,0,0,0}}.
+mgmt_listen_opts()  -> #{port => 50063, ip => {127,0,0,1}}.
 
 setup() ->
     Port = 18081,
@@ -54,7 +64,21 @@ setup() ->
     drain_exits(),
 
     %% Start mock processes for readiness checks (spawn, NOT spawn_link).
-    MockNames = [yuzu_gw_registry, yuzu_gw_agent_sup, yuzu_gw_router],
+    %% grpcbox-derived atoms join the list so the new #896 listener checks
+    %% have a registered supervisor to probe. The atom names are computed
+    %% from listen_opts via `grpcbox_services_sup:services_sup_name/1` —
+    %% identical to what grpcbox itself registers at runtime.
+    application:set_env(grpcbox, servers, [
+        #{listen_opts => agent_listen_opts()},
+        #{listen_opts => mgmt_listen_opts()}
+    ]),
+    MockNames = [
+        yuzu_gw_registry,
+        yuzu_gw_agent_sup,
+        yuzu_gw_router,
+        grpcbox_services_sup:services_sup_name(agent_listen_opts()),
+        grpcbox_services_sup:services_sup_name(mgmt_listen_opts())
+    ],
     MockPids = lists:filtermap(fun(Name) ->
         case whereis(Name) of
             undefined ->
@@ -193,6 +217,54 @@ readyz_503_dead_process() ->
     %% Re-register a mock so cleanup and subsequent tests don't fail.
     NewPid = spawn(fun() -> mock_loop() end),
     register(yuzu_gw_registry, NewPid),
+    process_flag(trap_exit, false).
+
+readyz_503_grpcbox_agent_listener_dead() ->
+    %% #896 third bullet (agent-facing listener readiness). If grpcbox's
+    %% agent-facing supervisor dies, readyz must return 503 — pre-#896 the
+    %% probe would have reported "ready" while no agent could connect.
+    process_flag(trap_exit, true),
+    AgentSup = grpcbox_services_sup:services_sup_name(agent_listen_opts()),
+    case whereis(AgentSup) of
+        undefined -> ok;
+        Pid ->
+            catch unlink(Pid),
+            catch unregister(AgentSup),
+            catch exit(Pid, kill),
+            timer:sleep(50)
+    end,
+    drain_exits(),
+    {Status, Body} = http_get(18081, "/readyz"),
+    ?assertEqual(503, Status),
+    ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
+    ?assert(binary:match(Body, <<"\"grpcbox_listener_50051\":false">>) =/= nomatch),
+    %% Restore for subsequent tests.
+    NewPid = spawn(fun() -> mock_loop() end),
+    register(AgentSup, NewPid),
+    process_flag(trap_exit, false).
+
+readyz_503_grpcbox_mgmt_listener_dead() ->
+    %% #896 third bullet, mgmt-facing leg. The mgmt-facing listener is the
+    %% operator/server-side path; its death blocks command fanout regardless
+    %% of agent reachability.
+    process_flag(trap_exit, true),
+    MgmtSup = grpcbox_services_sup:services_sup_name(mgmt_listen_opts()),
+    case whereis(MgmtSup) of
+        undefined -> ok;
+        Pid ->
+            catch unlink(Pid),
+            catch unregister(MgmtSup),
+            catch exit(Pid, kill),
+            timer:sleep(50)
+    end,
+    drain_exits(),
+    {Status, Body} = http_get(18081, "/readyz"),
+    ?assertEqual(503, Status),
+    ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
+    ?assert(binary:match(Body, <<"\"grpcbox_listener_50063\":false">>) =/= nomatch),
+    %% Restore for subsequent tests.
+    NewPid = spawn(fun() -> mock_loop() end),
+    register(MgmtSup, NewPid),
     process_flag(trap_exit, false).
 
 readyz_503_circuit_open() ->

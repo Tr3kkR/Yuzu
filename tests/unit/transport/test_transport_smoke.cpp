@@ -7,13 +7,20 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <future>
+#include <map>
 #include <memory>
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#include <grpcpp/grpcpp.h>
+#include <grpcpp/generic/async_generic_service.h>
+#include <grpcpp/security/server_credentials.h>
 
 #include "transport.pb.h" // generated from proto/yuzu/transport/framing/v1/transport.proto
 #include "yuzu/transport/proto_adapter.hpp"
@@ -372,6 +379,122 @@ private:
 // This eliminates the TIME_WAIT / CI-rerun flakiness of fixed ports
 // (governance qe-F1).
 
+// Raw gRPC AsyncGenericService server used by the #897 trailing-metadata
+// scrub tests. The yuzu listener does not expose a server-side
+// `AddTrailingMetadata` setter to handlers (trailing metadata is
+// read-only on the client side via CallResult / BidiStream), so this
+// helper drives gRPC's primitives directly to inject attacker-controlled
+// trailers and prove the inbound scrub at the wire boundary in
+// `grpc_channel.cpp` strips them before they reach CallResult.
+class RawTrailingMetaServer {
+public:
+    enum class Mode { Unary, Bidi };
+
+    explicit RawTrailingMetaServer(std::map<std::string, std::string> trailers,
+                                   Mode mode = Mode::Unary)
+        : trailers_(std::move(trailers)), mode_(mode) {
+        ::grpc::ServerBuilder builder;
+        int selected_port = 0;
+        builder.AddListeningPort("127.0.0.1:0", ::grpc::InsecureServerCredentials(),
+                                 &selected_port);
+        builder.RegisterAsyncGenericService(&svc_);
+        cq_ = builder.AddCompletionQueue();
+        server_ = builder.BuildAndStart();
+        bound_port_ = selected_port;
+        worker_ = std::thread([this] { worker_loop(); });
+    }
+
+    ~RawTrailingMetaServer() { stop(); }
+
+    RawTrailingMetaServer(const RawTrailingMetaServer&) = delete;
+    RawTrailingMetaServer& operator=(const RawTrailingMetaServer&) = delete;
+
+    int bound_port() const noexcept { return bound_port_; }
+
+    void stop() {
+        if (stopped_.exchange(true))
+            return;
+        if (server_) {
+            server_->Shutdown(std::chrono::system_clock::now());
+        }
+        if (cq_) {
+            cq_->Shutdown();
+        }
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+private:
+    struct CallState {
+        enum class Phase { AwaitingCall, AwaitingRead, AwaitingFinish };
+        Phase phase = Phase::AwaitingCall;
+        ::grpc::GenericServerContext gctx;
+        ::grpc::GenericServerAsyncReaderWriter rw{&gctx};
+        ::grpc::ByteBuffer request_buf;
+    };
+
+    void post_request_call() {
+        auto* call = new CallState();
+        svc_.RequestCall(&call->gctx, &call->rw, cq_.get(), cq_.get(), static_cast<void*>(call));
+    }
+
+    void worker_loop() {
+        post_request_call();
+        void* tag = nullptr;
+        bool ok = false;
+        while (cq_->Next(&tag, &ok)) {
+            auto* c = static_cast<CallState*>(tag);
+            if (!ok) {
+                // Shutdown drain or aborted op; drop the call state.
+                delete c;
+                continue;
+            }
+            switch (c->phase) {
+            case CallState::Phase::AwaitingCall:
+                post_request_call();
+                c->phase = CallState::Phase::AwaitingRead;
+                c->rw.Read(&c->request_buf, static_cast<void*>(c));
+                break;
+            case CallState::Phase::AwaitingRead:
+                for (const auto& [k, v] : trailers_) {
+                    c->gctx.AddTrailingMetadata(k, v);
+                }
+                c->phase = CallState::Phase::AwaitingFinish;
+                if (mode_ == Mode::Unary) {
+                    // Emit a single-byte response so the client's
+                    // byte_buffer_to_string path has at least one
+                    // slice to dump (an empty buffer surfaces as
+                    // DataLoss on some grpc++ builds).
+                    ::grpc::Slice payload("x", 1);
+                    ::grpc::ByteBuffer resp_buf(&payload, 1);
+                    c->rw.WriteAndFinish(resp_buf, ::grpc::WriteOptions(), ::grpc::Status::OK,
+                                         static_cast<void*>(c));
+                } else {
+                    // Bidi mode: skip the response write, go
+                    // straight to Finish with OK + the queued
+                    // trailing metadata. The client observes
+                    // peer-half-close on its next read().
+                    c->rw.Finish(::grpc::Status::OK, static_cast<void*>(c));
+                }
+                break;
+            case CallState::Phase::AwaitingFinish:
+                delete c;
+                break;
+            }
+        }
+    }
+
+    std::map<std::string, std::string> trailers_;
+    Mode mode_;
+    ::grpc::AsyncGenericService svc_;
+    std::unique_ptr<::grpc::Server> server_;
+    std::unique_ptr<::grpc::ServerCompletionQueue> cq_;
+    std::thread worker_;
+    int bound_port_ = 0;
+    std::atomic<bool> stopped_{false};
+};
+
 } // namespace
 
 TEST_CASE("Client/server unary round-trip with registered handler", "[transport][round-trip]") {
@@ -629,6 +752,130 @@ TEST_CASE("Client receives sanitised Status::detail on attacker-controlled bytes
 
     ch->close();
     listener->shutdown();
+}
+
+TEST_CASE("Client trailing-metadata is sanitised at the wire boundary",
+          "[transport][round-trip][trailing-metadata]") {
+    // #897: CallResult::trailing_metadata is wire data and must be
+    // scrubbed at the inbound copy site in grpc_channel.cpp parallel to
+    // Status::detail. A non-Yuzu peer (federation, buggy stack, malicious
+    // proxy, future msquic backend) can otherwise feed control bytes,
+    // high bytes, or oversize values into Prometheus labels, audit-log
+    // rows, or SSE drawer renders.
+    //
+    // gRPC's OUTBOUND `AddTrailingMetadata` CHECK rejects every byte
+    // outside printable ASCII before it can reach the wire, so the
+    // CR/LF/NUL/high-byte attack surface is structurally unreachable
+    // via gRPC's official emitter API today. The inbound scrub
+    // contractually remains because:
+    //   * msquic backend (PR 3) does not share gRPC's CHECK,
+    //   * a malicious HTTP/2 proxy can rewrite trailers post-CHECK,
+    //   * future gRPC releases may relax the CHECK.
+    //
+    // The unique fingerprint that proves the scrub was applied at the
+    // wire boundary is the helper's TRUNCATION behaviour: oversize
+    // values get capped at 1024 bytes with a `...[truncated]` marker.
+    // A 1500-byte all-printable-ASCII value is large enough to trigger
+    // truncation but well under gRPC's default 8 KiB metadata limit,
+    // so it round-trips successfully and then the inbound scrub
+    // shortens it. If the scrub is NOT applied, the client sees the
+    // full 1500-byte payload — the test fails on length.
+    constexpr std::size_t kOversize = 1500;
+    const std::string oversize_value(kOversize, 'A');
+
+    std::map<std::string, std::string> trailers{
+        {"x-detail", oversize_value},
+    };
+    RawTrailingMetaServer raw(trailers);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint target{"127.0.0.1", static_cast<uint16_t>(raw.bound_port())};
+    auto ch = make_channel(Backend::Grpc, target, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    StringMessage req, resp;
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(2);
+    auto r = ch->unary("yuzu.test.v1.Echo/InjectTrailing", ctx, req, resp);
+
+    REQUIRE(r.status.code == StatusCode::Ok);
+    REQUIRE_FALSE(r.trailing_metadata.empty());
+
+    const auto it = r.trailing_metadata.find("x-detail");
+    REQUIRE(it != r.trailing_metadata.end());
+
+    // sanitise_status_detail caps output at exactly 1024 bytes,
+    // including the suffix marker. If the inbound copy at
+    // grpc_channel.cpp:437-440 does NOT call the helper, the client
+    // observes the full 1500-byte original — this assertion fails.
+    REQUIRE(it->second.size() == 1024u);
+    constexpr std::string_view kSuffix{"...[truncated]"};
+    REQUIRE(it->second.size() >= kSuffix.size());
+    REQUIRE(it->second.compare(it->second.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0);
+
+    ch->close();
+    raw.stop();
+}
+
+TEST_CASE("Bidi trailing-metadata is sanitised at the wire boundary",
+          "[transport][round-trip][bidi][trailing-metadata]") {
+    // #897 mirror for the bidi path. BidiStream::trailing_metadata()
+    // is populated at the same inbound-copy pattern in
+    // `grpc_channel.cpp:702-705` and must apply the same
+    // sanitise_status_detail call. Uses the truncation fingerprint to
+    // prove the helper ran — gRPC's outbound CHECK prevents the wire
+    // from carrying CR/LF/NUL/high bytes, so the cap+suffix is the
+    // unique signal that the scrub was wired.
+    constexpr std::size_t kOversize = 1500;
+    const std::string oversize_value(kOversize, 'B');
+    std::map<std::string, std::string> trailers{
+        {"x-bidi-detail", oversize_value},
+    };
+    RawTrailingMetaServer raw(trailers, RawTrailingMetaServer::Mode::Bidi);
+
+    Credentials creds{};
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    Endpoint target{"127.0.0.1", static_cast<uint16_t>(raw.bound_port())};
+    auto ch = make_channel(Backend::Grpc, target, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(2)));
+
+    CallContext ctx;
+    ctx.deadline = std::chrono::seconds(5);
+    auto stream = ch->bidi_stream("yuzu.test.v1.Echo/BidiInjectTrailing", ctx);
+    REQUIRE(stream != nullptr);
+
+    // Send one frame so the server's Read completes; server then
+    // sets trailing metadata + Finish.
+    StringMessage out("hi");
+    REQUIRE(stream->write(out));
+    stream->writes_done();
+
+    // Drain the (empty) server-side write stream.
+    StringMessage in;
+    while (stream->read(in)) {
+        // No frames expected; this loop body is defensive.
+    }
+
+    Status final = stream->final_status();
+    REQUIRE(final.code == StatusCode::Ok);
+
+    const auto& trail = stream->trailing_metadata();
+    REQUIRE_FALSE(trail.empty());
+    const auto it = trail.find("x-bidi-detail");
+    REQUIRE(it != trail.end());
+
+    // Truncation fingerprint — same contract as the unary test.
+    REQUIRE(it->second.size() == 1024u);
+    constexpr std::string_view kSuffix{"...[truncated]"};
+    REQUIRE(it->second.compare(it->second.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0);
+
+    ch->close();
+    raw.stop();
 }
 
 // =====================================================================
