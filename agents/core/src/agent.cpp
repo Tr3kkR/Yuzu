@@ -1,4 +1,12 @@
 #ifdef _WIN32
+// NOMINMAX before <io.h> — MSVC's <io.h> transitively pulls in <windows.h>'s
+// `min` / `max` macros which collide with `std::min` / `std::max` in the
+// reconnect-backoff + heartbeat-sleep paths below. Matches the pattern
+// already used by `updater.cpp`, `process_enum.cpp`, `temp_file.cpp`, and
+// the event_logs / agent_logging plugins.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <io.h>
 #pragma section(".CRT$XCB", read)
 [[maybe_unused]] static void __cdecl diag_dll_static_init() {
