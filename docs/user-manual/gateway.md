@@ -390,6 +390,83 @@ via a controlled GOAWAY + reconnect cycle.
 
 ---
 
+## Health and Readiness
+
+The gateway exposes two HTTP endpoints on port 8081 (configurable via
+`health_port` in `sys.config` or the `YUZU_GW_HEALTH_PORT` env var):
+
+| Endpoint | Purpose | Success | Failure |
+|----------|---------|---------|---------|
+| `/healthz` | Liveness — the gateway HTTP listener can respond | `{"status":"ok","node":"..."}` (200) | — |
+| `/readyz`  | Readiness — core processes AND grpcbox listeners are alive | `{"status":"ready","checks":{...}}` (200) | `{"status":"not_ready","checks":{...}}` (503) |
+
+`/readyz` is the right endpoint to wire as a Kubernetes readiness probe.
+A 503 response means at least one required check failed; the `checks`
+object identifies which.
+
+### `/readyz` checks
+
+Checked per probe call:
+
+| Key | What it verifies |
+|---|---|
+| `registry` | `yuzu_gw_registry` gen_server alive |
+| `upstream` | `yuzu_gw_upstream` gen_server alive |
+| `agent_sup` | `yuzu_gw_agent_sup` supervisor alive |
+| `router` | `yuzu_gw_router` gen_server alive |
+| `circuit_breaker` | Upstream circuit is `closed` or `half_open` (not `open`) |
+| `agent_listener` | Agent-facing grpcbox listener supervisor alive (port 50051 by default) — added in #376 PR 1c-6 / #896 |
+| `mgmt_listener`  | Operator-facing grpcbox listener supervisor alive (port 50063 by default) — added in #376 PR 1c-6 / #896 |
+
+Listener-port keys are derived from `application:get_env(grpcbox, servers, ...)`.
+Ports that match `yuzu_gw.agent_listen_port` get the `agent_listener` label,
+ports that match `mgmt_listen_port` get `mgmt_listener`, and any other port
+falls back to `grpcbox_listener_<port>` so a non-canonical configuration
+still surfaces in the JSON.
+
+### Example responses
+
+Healthy:
+
+```json
+{
+  "status": "ready",
+  "checks": {
+    "registry": true,
+    "upstream": true,
+    "agent_sup": true,
+    "router": true,
+    "circuit_breaker": true,
+    "agent_listener": true,
+    "mgmt_listener": true
+  }
+}
+```
+
+Agent-facing grpcbox listener dead (HTTP 503):
+
+```json
+{
+  "status": "not_ready",
+  "checks": {
+    "registry": true,
+    "upstream": true,
+    "agent_sup": true,
+    "router": true,
+    "circuit_breaker": true,
+    "agent_listener": false,
+    "mgmt_listener": true
+  }
+}
+```
+
+A pod returning 503 on `/readyz` should not receive agent connections
+— the agent-facing gRPC listener may be down even though the Erlang
+VM and core supervisor tree are healthy. Pre-#896 this state silently
+returned 200 because only the named gen_servers were checked.
+
+---
+
 ## Prometheus Metrics
 
 **Status: PARTIALLY IMPLEMENTED**

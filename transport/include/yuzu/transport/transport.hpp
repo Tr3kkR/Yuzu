@@ -189,7 +189,11 @@ enum class StatusCode : int {
 // branch only; the obligation exists for msquic (PR 3), for malicious
 // HTTP/2 proxies that rewrite trailers post-validation, and for any
 // non-Yuzu peer the backend talks to. Outbound trailing-metadata
-// emitters MUST also pre-scrub before handing to the backend.
+// emitters MUST also pre-scrub before handing to the backend. (No
+// outbound emitter exists in the abstraction as of PR 1c-6 — the
+// listener does not expose `AddTrailingMetadata` to handlers; this
+// MUST is forward-looking guidance for future callers and the
+// msquic backend.)
 struct Status {
     StatusCode code = StatusCode::Ok;
     std::string detail;

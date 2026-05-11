@@ -293,13 +293,49 @@ filed as **#932-#938**:
 
 ### PR 1c-6 — Cleanup + #896 readiness probe + #897 trailing-metadata scrub
 
-* #896: wire `is_serving() && bound_endpoint().port != 0` into /readyz.
-  Today's /readyz signal predates the abstraction; align it.
-* #897: extend the inbound-scrub helper to trailing metadata (matching
-  `Status::detail` policy) once the gRPC server-side delivers it through
-  the abstraction in PR 1c-2.
-* Delete dead helpers: any remaining `grpc::*` includes in lifted files.
-* Risk: low.
+> **Merged 2026-05-11.** Three actions in one commit + one governance round 1 hardening:
+>
+> 1. **#896 third bullet — gateway `/readyz` reflects transport listener
+>    state.** `yuzu_gw_health.erl` adds `grpcbox_listener_checks/0` that
+>    iterates `application:get_env(grpcbox, servers, ...)` and probes
+>    each configured listener's supervisor via
+>    `grpcbox_services_sup:services_sup_name/1`. JSON gains role-named
+>    `agent_listener` / `mgmt_listener` keys (matching server-side
+>    naming). Two new eunit tests
+>    (`readyz_503_grpcbox_agent_listener_dead`,
+>    `readyz_503_grpcbox_mgmt_listener_dead`) pin the contract. The
+>    other #896 bullets (server-side `agent_listener_` +
+>    `gw_upstream_listener_` checks via
+>    `is_serving() && bound_endpoint().port != 0`,
+>    `on_connection_opened`/`on_connection_closed` symmetric pairing)
+>    were addressed in earlier PR 1c rounds. UP-56 wildcard
+>    `bound_endpoint().host` resolution deferred — no production
+>    broadcast call site today.
+> 2. **#897 trailing-metadata symmetric scrub.** Both inbound copy sites
+>    in `transport/src/grpc/grpc_channel.cpp` (unary path + bidi
+>    `final_status()`) route key+value through `sanitise_status_detail`
+>    — printable ASCII only, 1024-byte cap with `...[truncated]`
+>    marker. The Status::detail contract block in `transport.hpp`
+>    extended to cover trailing metadata explicitly.
+>    `RawTrailingMetaServer` test helper (raw `grpc::AsyncGenericService`)
+>    drives both paths with oversize key+value, asserting the
+>    truncation fingerprint.
+> 3. **Dead-helper cleanup.** `server.cpp::build_tls_credentials`
+>    deleted — was a `grpc::SslServerCredentials` builder used only as
+>    a pre-flight existence check. Inline pre-flight uses
+>    `std::filesystem::file_size > 0` (never reads PEM bytes into
+>    process memory; closes governance round 1 UP-319 — a
+>    `read_file_contents().empty()` first-pass had momentarily
+>    materialised the private key on the stack without
+>    `secure_zero`). Three `<grpc*>` includes removed from server.cpp.
+>
+> Governance round 1 produced 3 BLOCKING + ~15 SHOULD findings:
+> CHANGELOG entries, UP-319 secure_zero gap, UP-313 eunit env leak, and
+> a doc/test parity bundle (helper extraction, try/after teardown,
+> JSON key role-naming, `readyz_ok` parity assertions). All folded
+> into the hardening commit before merge.
+
+* Risk: low after governance round 1 hardening.
 
 ## Acceptance criteria per sub-PR
 

@@ -151,16 +151,32 @@ check_process(Name, RegisteredName) ->
 %% and check it the same way as the named core processes above. Pre-#896
 %% a dead grpcbox listener would leave readyz returning 200 even though
 %% no agent could connect.
+%%
+%% Label naming: role-named (`agent_listener` / `mgmt_listener`) to match
+%% the server-side `/readyz` convention (server.cpp:2449-2453 uses the
+%% same names for the C++ transport listeners). The yuzu_gw application
+%% env exposes the canonical port for each role; matching on that lets
+%% an operator who renamed the ports in sys.config still see meaningful
+%% labels. Unmatched ports fall back to `grpcbox_listener_<port>`.
 grpcbox_listener_checks() ->
     Servers = application:get_env(grpcbox, servers, []),
-    [grpcbox_listener_check(S) || S <- Servers].
+    AgentPort = application:get_env(yuzu_gw, agent_listen_port, 50051),
+    MgmtPort  = application:get_env(yuzu_gw, mgmt_listen_port,  50063),
+    [grpcbox_listener_check(S, AgentPort, MgmtPort) || S <- Servers].
 
-grpcbox_listener_check(ServerOpts) ->
+grpcbox_listener_check(ServerOpts, AgentPort, MgmtPort) ->
     ListenOpts = maps:get(listen_opts, ServerOpts, #{}),
     Port = maps:get(port, ListenOpts, 0),
-    Name = <<"grpcbox_listener_", (integer_to_binary(Port))/binary>>,
+    Name = listener_label(Port, AgentPort, MgmtPort),
     SupAtom = grpcbox_services_sup:services_sup_name(ListenOpts),
     check_process(Name, SupAtom).
+
+listener_label(Port, AgentPort, _MgmtPort) when Port =:= AgentPort ->
+    <<"agent_listener">>;
+listener_label(Port, _AgentPort, MgmtPort) when Port =:= MgmtPort ->
+    <<"mgmt_listener">>;
+listener_label(Port, _AgentPort, _MgmtPort) ->
+    <<"grpcbox_listener_", (integer_to_binary(Port))/binary>>.
 
 check_circuit_breaker() ->
     try

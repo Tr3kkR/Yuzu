@@ -68,6 +68,14 @@ setup() ->
     %% have a registered supervisor to probe. The atom names are computed
     %% from listen_opts via `grpcbox_services_sup:services_sup_name/1` —
     %% identical to what grpcbox itself registers at runtime.
+    %%
+    %% Snapshot the prior `grpcbox.servers` env value so cleanup can
+    %% restore it. UP-313 (governance round 1): `application:set_env`
+    %% persists across eunit modules in the same BEAM VM (CLAUDE.md
+    %% #336/#337) — a subsequent suite that depends on the env being
+    %% absent silently picks up our two-listener config and either
+    %% spuriously passes or fails. Restore on cleanup.
+    PriorGrpcboxServers = application:get_env(grpcbox, servers),
     application:set_env(grpcbox, servers, [
         #{listen_opts => agent_listen_opts()},
         #{listen_opts => mgmt_listen_opts()}
@@ -105,9 +113,9 @@ setup() ->
     %% Start the health endpoint.
     {ok, HealthPid} = yuzu_gw_health:start_link(),
     timer:sleep(100),
-    {Port, HealthPid, UpPid, MockPids}.
+    {Port, HealthPid, UpPid, MockPids, PriorGrpcboxServers}.
 
-cleanup({_Port, HealthPid, UpPid, MockPids}) ->
+cleanup({_Port, HealthPid, UpPid, MockPids, PriorGrpcboxServers}) ->
     process_flag(trap_exit, true),
     %% Synchronous shutdown — wait for actual death via monitors.
     sync_stop(HealthPid),
@@ -133,13 +141,23 @@ cleanup({_Port, HealthPid, UpPid, MockPids}) ->
     drain_exits(),
     catch meck:unload(grpcbox_client),
     catch meck:unload(telemetry),
+    %% UP-313 restore: put grpcbox.servers back the way we found it so
+    %% sibling eunit suites in the same BEAM VM see a fresh state.
+    case PriorGrpcboxServers of
+        undefined -> application:unset_env(grpcbox, servers);
+        {ok, V}   -> application:set_env(grpcbox, servers, V)
+    end,
     process_flag(trap_exit, false),
     ok.
 
 mock_loop() ->
+    %% No `_ -> mock_loop()` catchall — that's the #336 / gateway-erlang
+    %% SHOULD-2 pattern that silently swallows gen_server:call/2 messages
+    %% sent to a leaked-and-reused registered name. Without the catchall,
+    %% any unexpected call accumulates in the mailbox and times out, which
+    %% is loud rather than silent.
     receive
-        stop -> ok;
-        _ -> mock_loop()
+        stop -> ok
     after 60000 -> ok
     end.
 
@@ -223,6 +241,9 @@ readyz_503_grpcbox_agent_listener_dead() ->
     %% #896 third bullet (agent-facing listener readiness). If grpcbox's
     %% agent-facing supervisor dies, readyz must return 503 — pre-#896 the
     %% probe would have reported "ready" while no agent could connect.
+    %% Wrap the assertions in try/after so the supervisor mock is always
+    %% re-registered, even if the readyz probe assertions fail mid-test
+    %% (qe SHOULD-7).
     process_flag(trap_exit, true),
     AgentSup = grpcbox_services_sup:services_sup_name(agent_listen_opts()),
     case whereis(AgentSup) of
@@ -234,19 +255,24 @@ readyz_503_grpcbox_agent_listener_dead() ->
             timer:sleep(50)
     end,
     drain_exits(),
-    {Status, Body} = http_get(18081, "/readyz"),
-    ?assertEqual(503, Status),
-    ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
-    ?assert(binary:match(Body, <<"\"grpcbox_listener_50051\":false">>) =/= nomatch),
-    %% Restore for subsequent tests.
-    NewPid = spawn(fun() -> mock_loop() end),
-    register(AgentSup, NewPid),
-    process_flag(trap_exit, false).
+    try
+        {Status, Body} = http_get(18081, "/readyz"),
+        ?assertEqual(503, Status),
+        ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
+        ?assert(binary:match(Body, <<"\"agent_listener\":false">>) =/= nomatch)
+    after
+        case whereis(AgentSup) of
+            undefined ->
+                NewPid = spawn(fun() -> mock_loop() end),
+                register(AgentSup, NewPid);
+            _Alive -> ok
+        end,
+        process_flag(trap_exit, false)
+    end.
 
 readyz_503_grpcbox_mgmt_listener_dead() ->
-    %% #896 third bullet, mgmt-facing leg. The mgmt-facing listener is the
-    %% operator/server-side path; its death blocks command fanout regardless
-    %% of agent reachability.
+    %% #896 third bullet, mgmt-facing leg. Same try/after restoration
+    %% guarantee as the agent-facing test above.
     process_flag(trap_exit, true),
     MgmtSup = grpcbox_services_sup:services_sup_name(mgmt_listen_opts()),
     case whereis(MgmtSup) of
@@ -258,14 +284,20 @@ readyz_503_grpcbox_mgmt_listener_dead() ->
             timer:sleep(50)
     end,
     drain_exits(),
-    {Status, Body} = http_get(18081, "/readyz"),
-    ?assertEqual(503, Status),
-    ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
-    ?assert(binary:match(Body, <<"\"grpcbox_listener_50063\":false">>) =/= nomatch),
-    %% Restore for subsequent tests.
-    NewPid = spawn(fun() -> mock_loop() end),
-    register(MgmtSup, NewPid),
-    process_flag(trap_exit, false).
+    try
+        {Status, Body} = http_get(18081, "/readyz"),
+        ?assertEqual(503, Status),
+        ?assert(binary:match(Body, <<"not_ready">>) =/= nomatch),
+        ?assert(binary:match(Body, <<"\"mgmt_listener\":false">>) =/= nomatch)
+    after
+        case whereis(MgmtSup) of
+            undefined ->
+                NewPid = spawn(fun() -> mock_loop() end),
+                register(MgmtSup, NewPid);
+            _Alive -> ok
+        end,
+        process_flag(trap_exit, false)
+    end.
 
 readyz_503_circuit_open() ->
     %% Trip the circuit breaker to open state.

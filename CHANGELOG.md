@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **#896 (third bullet) — gateway `/readyz` reflects grpcbox listener
+  state.** Pre-PR 1c-6 the gateway's `/readyz` endpoint (port 8081)
+  returned 200 even when the agent-facing (`:50051`) or operator-facing
+  (`:50063`) grpcbox listener had crashed or never started. Kubernetes
+  readiness probes therefore marked the gateway pod ready while no
+  agent could connect. `/readyz` now iterates `application:get_env(grpcbox,
+  servers, ...)` and probes each configured listener's
+  `grpcbox_services_sup` supervisor; a dead listener flips readyz to
+  503. JSON gains role-named `"agent_listener"` / `"mgmt_listener"`
+  keys (matching server-side naming), or `"grpcbox_listener_<port>"`
+  for any unrecognised port. The other #896 bullets (server-side
+  `agent_listener_` + `gw_upstream_listener_` readiness;
+  `on_connection_opened`/`on_connection_closed` symmetric pairing) were
+  addressed in PR 1c-2 hardening.
+
+- **#897 — `CallResult::trailing_metadata` and
+  `BidiStream::trailing_metadata()` keys + values are scrubbed at the
+  inbound wire boundary.** Both inbound copy sites in
+  `transport/src/grpc/grpc_channel.cpp` (unary path + bidi
+  `final_status()`) now route each key and each value through
+  `sanitise_status_detail` — printable ASCII only, capped at 1024
+  bytes with a `...[truncated]` marker. The gRPC backend's own
+  `AddTrailingMetadata` CHECK already blocks the worst byte ranges
+  for gRPC peers, but the abstraction contract must hold for the
+  msquic backend (PR 3), malicious HTTP/2 proxies that rewrite trailers
+  post-CHECK, and any non-Yuzu peer. The Status::detail contract block
+  in `transport/include/yuzu/transport/transport.hpp` is extended to
+  document the trailing-metadata obligation symmetrically.
+
+### Operator-visible
+
+- **#376 PR 1c-6 — gateway `/readyz` JSON shape.** The JSON `checks`
+  object gains two new role-named keys: `"agent_listener"` (port 50051)
+  and `"mgmt_listener"` (port 50063). Both report `true` when the
+  corresponding grpcbox supervisor is alive and `false` when it has
+  crashed. Operators with K8s probes that read only the HTTP status
+  code are unaffected; operators with body-parsing dashboards or
+  Prometheus blackbox rules will see additive keys (no removals). See
+  `docs/user-manual/gateway.md` for the documented response shape.
+
+- **#376 PR 1c-6 — server TLS pre-flight error messages refined.** The
+  single startup error "TLS is enabled but agent-listener credentials
+  are invalid; refusing to start" is replaced by five distinct
+  messages: paths empty, key permissions invalid, cert/key files
+  unreadable or empty, CA cert unreadable or empty, or CA missing with
+  one-way TLS disabled. Operator alerting rules that grep for the old
+  wording need updating. See `docs/user-manual/upgrading.md`.
+
+### Internal
+
+- **#376 PR 1c-6 — closes the PR 1c lift ladder.** Three pieces:
+  (1) gateway `/readyz` checks grpcbox listeners (#896 third bullet, via
+  `grpcbox_services_sup:services_sup_name/1` supervisor-atom probe).
+  (2) Trailing-metadata symmetric scrub (#897, both inbound copy sites
+  in `grpc_channel.cpp`). (3) `server.cpp::build_tls_credentials`
+  deleted — was a `grpc::SslServerCredentials` builder used only as a
+  pre-flight existence check. Replacement uses
+  `std::filesystem::file_size > 0` to verify cert/key/CA files are
+  non-empty WITHOUT reading PEM bytes into process memory (closes the
+  governance-round-1 UP-319 regression vs the deleted helper's RAII
+  zeroisation). Three grpc:: includes removed from server.cpp.
+  Governance round 1: 3 BLOCKING + ~15 SHOULD findings folded into a
+  hardening commit before merge.
+
 ### Breaking changes
 
 - **#376 PR 1c-5 — `:50052` management gRPC port and `--management*` CLI

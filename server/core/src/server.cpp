@@ -1004,28 +1004,45 @@ public:
         // readable + key-file permissions were 0600 — both of which
         // `build_transport_credentials` already does at the moment of use
         // (and the `agent_creds_t.server_cert_pem.empty()` check below catches
-        // the same failure modes 20 lines later). Pre-flight now reads the
-        // same files directly so the grpc:: includes can leave server.cpp.
+        // the same failure modes 20 lines later).
+        //
+        // CRITICAL: pre-flight MUST NOT read PEM bytes into process memory.
+        // Governance round 1 UP-319: an earlier draft of this block used
+        // `read_file_contents(...).empty()` which materialised the private-key
+        // PEM into a stack `std::string` whose destructor does not zero memory.
+        // The lifetime window (microseconds) is small but a process crash mid-
+        // pre-flight would leave key bytes in a core dump. Use `file_size > 0`
+        // instead, which only `stat()`s the file and never reads its contents
+        // (closes the SOC 2 CC6.6 key-material-lifecycle regression vs the
+        // deleted helper, which relied on the implicit `grpc::SslServerCredentials`
+        // destructor zeroisation).
+        auto file_present_and_nonempty = [](const std::filesystem::path& p) noexcept {
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(p, ec) || ec)
+                return false;
+            const auto sz = std::filesystem::file_size(p, ec);
+            return !ec && sz > 0;
+        };
         if (cfg_.tls_enabled) {
             if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
-                spdlog::error("TLS is enabled but agent-listener cert/key paths are empty; "
+                spdlog::error("TLS is enabled but agent listener cert/key paths are empty; "
                               "refusing to start");
                 return;
             }
             if (!detail::validate_key_file_permissions(cfg_.tls_server_key, "agent listener")) {
-                spdlog::error("TLS is enabled but agent-listener key permissions are invalid; "
+                spdlog::error("TLS is enabled but agent listener key permissions are invalid; "
                               "refusing to start");
                 return;
             }
-            if (detail::read_file_contents(cfg_.tls_server_cert).empty() ||
-                detail::read_file_contents(cfg_.tls_server_key).empty()) {
-                spdlog::error("TLS is enabled but agent-listener cert/key files are unreadable; "
-                              "refusing to start");
+            if (!file_present_and_nonempty(cfg_.tls_server_cert) ||
+                !file_present_and_nonempty(cfg_.tls_server_key)) {
+                spdlog::error("TLS is enabled but agent listener cert/key files are unreadable "
+                              "or empty; refusing to start");
                 return;
             }
-            if (!cfg_.tls_ca_cert.empty() && detail::read_file_contents(cfg_.tls_ca_cert).empty()) {
-                spdlog::error("TLS is enabled but agent-listener CA cert {} is unreadable; "
-                              "refusing to start",
+            if (!cfg_.tls_ca_cert.empty() && !file_present_and_nonempty(cfg_.tls_ca_cert)) {
+                spdlog::error("TLS is enabled but agent listener CA cert {} is unreadable or "
+                              "empty; refusing to start",
                               cfg_.tls_ca_cert.string());
                 return;
             }

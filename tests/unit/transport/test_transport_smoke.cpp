@@ -783,8 +783,18 @@ TEST_CASE("Client trailing-metadata is sanitised at the wire boundary",
     constexpr std::size_t kOversize = 1500;
     const std::string oversize_value(kOversize, 'A');
 
+    // qe SHOULD-2 / sec LOW carry-forward: also pin the KEY-side scrub
+    // by using an oversize printable-ASCII key. gRPC's wire layer
+    // accepts long lowercase-letter keys; the inbound copy in
+    // grpc_channel.cpp wraps the key through sanitise_status_detail too,
+    // so the received key must be capped at 1024 bytes with the
+    // truncation marker.
+    constexpr std::size_t kOversizeKey = 1100;
+    const std::string oversize_key = "x-" + std::string(kOversizeKey - 2, 'k');
+
     std::map<std::string, std::string> trailers{
         {"x-detail", oversize_value},
+        {oversize_key, "short-value"},
     };
     RawTrailingMetaServer raw(trailers);
 
@@ -815,6 +825,20 @@ TEST_CASE("Client trailing-metadata is sanitised at the wire boundary",
     constexpr std::string_view kSuffix{"...[truncated]"};
     REQUIRE(it->second.size() >= kSuffix.size());
     REQUIRE(it->second.compare(it->second.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0);
+
+    // Key-side scrub: the oversize-key entry round-tripped; the key in
+    // the received map is the truncated form. Find the unique entry by
+    // its associated value ("short-value") to avoid hard-coding the
+    // truncated key prefix.
+    bool oversize_key_seen = false;
+    for (const auto& [k, v] : r.trailing_metadata) {
+        if (v == "short-value") {
+            REQUIRE(k.size() == 1024u);
+            REQUIRE(k.compare(k.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0);
+            oversize_key_seen = true;
+        }
+    }
+    REQUIRE(oversize_key_seen);
 
     ch->close();
     raw.stop();
