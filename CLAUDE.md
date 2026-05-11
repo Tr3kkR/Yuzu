@@ -2,19 +2,19 @@
 
 ## What is Yuzu?
 
-Yuzu is an enterprise endpoint management platform — a single control plane for querying, commanding, patching, and enforcing compliance on Windows, Linux, and macOS fleets in real time. Think of it as an open-source alternative to commercial endpoint management platforms, built from scratch in C++23.
+Yuzu is an agentic enterprise endpoint management platform — a single control plane where agentic colleagues can query, command, scan, patch, and enforce policy compliance on Windows, Linux, and macOS fleets in real time. Think of it as an open-source alternative to commercial endpoint management platforms, built from scratch in C++23.
 
 The project's goal is to match the full capability set of mature enterprise platforms (see `docs/capability-map.md`) while using modern architecture: gRPC/Protobuf transport, Prometheus-native metrics, SQLite for embedded storage, and a plugin ABI that is stable across compiler versions.
 
 ## Target Architecture
 
 ```
-Operators (browser, REST API, automation scripts)
+Operators (agentic AI, humans with a browser, REST API, automation scripts)
     │
     ▼
 Yuzu Server
     ├── REST API (v1) — versioned, JSON, token or session auth
-    ├── HTMX Dashboard — server-rendered, dark theme
+    ├── HTMX Dashboard — server-rendered, dark theme (light theme is not supported and I will not be discussing it further)
     ├── Instruction Engine — definitions, scheduling, approval workflows
     ├── Policy Engine (Guaranteed State) — desired-state rules + triggers + auto-remediation
     ├── Response Store (SQLite) — persistent, filterable, aggregatable
@@ -114,32 +114,7 @@ bash scripts/start-UAT.sh status   # show running processes
 
 ### viz-UAT (container-based, feat/viz-engine ladder)
 
-A separate container-based UAT stack lives at `scripts/start-viz-uat.sh` for the visualization feature ladder. It is **not** a replacement for `start-UAT.sh` — both bind host port 8080 and cannot run simultaneously.
-
-```bash
-bash scripts/start-viz-uat.sh                    # build + start + verify (~25-40 min cold, ~2 min cached)
-bash scripts/start-viz-uat.sh fleet-snapshot     # dispatch tar.fleet_snapshot + parse response
-bash scripts/start-viz-uat.sh status             # docker compose ps + last logs per service
-bash scripts/start-viz-uat.sh stop               # docker compose down -v + clean state dir
-```
-
-Differences from `start-UAT.sh`:
-
-| Property | `start-UAT.sh` | `start-viz-uat.sh` |
-|---|---|---|
-| Runtime | Native host processes | Three Docker containers (server + gateway + agent) |
-| Build | Reuses `build-{linux,macos,windows}/` | Builds inside `debian:trixie-slim` images (vcpkg + meson) |
-| Arch support | Host arch only | Apple Silicon arm64 (auto-detected) + linux/amd64 |
-| State dir | `/tmp/yuzu-uat/` | `/tmp/yuzu-viz-uat/` + Docker named volumes |
-| Analytics stack | Full (Prometheus, Grafana, ClickHouse) | None (viz feature does not exercise analytics yet) |
-| Scaling agents | One agent | `VIZ_UAT_AGENTS=N bash scripts/start-viz-uat.sh start` or `docker compose -f docker-compose.viz-uat.yml up -d --scale agent=N` |
-| Credentials | `admin / adminpassword1` (PBKDF2) | `admin / adminpassword1` (same posture) |
-
-**Docker arm64 build.** The Dockerfiles accept `--build-arg TRIPLET=arm64-linux` to select the `arm64-linux` vcpkg triplet. Unlike the meson cross-file (which cross-compiles from x64), this builds natively inside an `arm64` container — BuildKit pulls the arm64 base image automatically when `--platform linux/arm64` is passed. `start-viz-uat.sh` sets this automatically based on `uname -m`. Default ARG `TRIPLET=x64-linux` preserves the historical x64 path for `release.yml` (which still publishes amd64 only).
-
-**Compose file usage.** `deploy/docker/docker-compose.viz-uat.yml` requires `VIZ_UAT_CONFIG` to be set to an absolute path of a generated `yuzu-server.cfg`; the launcher exports it. Do not invoke `docker compose -f docker-compose.viz-uat.yml up` directly — go through the launcher.
-
-**Why two UAT scripts coexist.** `start-UAT.sh` is the canonical full UAT for change-management and pre-commit testing (`/test` skill). `start-viz-uat.sh` is dev-only infrastructure for the visualization feature ladder, with the renderer (PR 5+) eventually rendering against the live three-container stack. Once the renderer ships, the viz-UAT will gain a headless-browser smoke test step.
+`scripts/start-viz-uat.sh` stands up a three-container Docker stack (server + gateway + agent) for the visualization feature ladder. **Cannot run alongside `start-UAT.sh`** — both bind host port 8080. Auto-detects arm64 vs amd64 and sets `--build-arg TRIPLET` accordingly; default `x64-linux` preserves the `release.yml` path. The launcher exports `VIZ_UAT_CONFIG` (absolute path to a generated `yuzu-server.cfg`); do not invoke `docker compose -f docker-compose.viz-uat.yml up` directly. State dir `/tmp/yuzu-viz-uat/`; scale agents with `VIZ_UAT_AGENTS=N`. See `bash scripts/start-viz-uat.sh --help` for full usage.
 
 ### Port assignments
 
@@ -171,29 +146,9 @@ The dispatch flow in `agent_registry.cpp` `send_to()`:
 
 The gateway uses port range 5006x (vs server's 5005x); `gateway/config/sys.config` and `grpcbox` `listen_opts` are configured independently and must match. UAT credentials: fresh `yuzu-server.cfg` with PBKDF2-SHA256 hashed `admin` / `adminpassword1` per run; state lives under `/tmp/yuzu-uat/` and is wiped on each start.
 
-### Known bug: stale DB breaks session auth on restart
-
-If the server is restarted against an existing data directory (stale SQLite databases from a prior run), session authentication breaks: `authenticate()` succeeds (HTTP 200, Set-Cookie returned) but `validate_session()` fails on subsequent requests (HTTP 401). The UAT script works around this by doing `rm -rf /tmp/yuzu-uat` before each run. This bug should be investigated — the in-memory `sessions_` map and the database state may be interacting incorrectly on restart.
-
 ## Pre-commit testing with /test
 
-The `/test` skill (`.claude/skills/test/SKILL.md`) is the single-command pre-commit/pre-push gate. It compiles HEAD, stands up the previous released image (GitHub's current "Latest release" tag from `ghcr.io/tr3kkr/yuzu-*`, resolved at runtime via `gh api repos/Tr3kkR/Yuzu/releases/latest`; pin an older baseline with `--old-version X.Y.Z`), upgrades it to HEAD, verifies data preservation and migrations, then runs the standard test surface (unit + EUnit + dialyzer + CT + integration + e2e + synthetic UAT + puppeteer). Every gate result and sub-step timing is persisted to a SQLite test-runs DB at `~/.local/share/yuzu/test-runs.db` so operators can compare runs over time, spot flaky gates, and trend upgrade durations.
-
-Three modes:
-
-- `/test --quick` — sanity check (~10 min): build + unit + EUnit + dialyzer + synthetic UAT
-- `/test` (default, ~30-45 min): build + upgrade test + standard gates + fresh stack + coverage report
-- `/test --full` (~60-120 min): adds OTA Linux + OTA Windows (PR3), sanitizers dispatched to `yuzu-wsl2-linux`, coverage enforce + perf measurement (no enforcement, see below)
-
-Query historical runs via `bash scripts/test/test-db-query.sh --latest|--last N|--diff A B|--trend timing=phase2.image-swap|--flaky --days 14|--export RUN_ID|--prune 100`. Power users can `python3 scripts/test/test_db.py query ...` directly.
-
-The DB lives outside the repo (XDG data dir) so it persists across `git clean` and survives repo re-clones. Override with `YUZU_TEST_DB=path`.
-
-**Coverage baseline.** `--full` enforces `tests/coverage-baseline.json` (real numbers as of 2026-04-25 captured against `40acd33`: branch 26.8% / line 51.8% on the 5950X dev box, 0.5 pp slack). The PR2 `__seed: true` sentinel is gone; current numbers are real and the gate enforces. Refuses `--capture-baselines` when the underlying test suite exited non-zero, so a broken environment cannot anchor a bad baseline. Regenerate with `bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines` after a clean test run, and commit the JSON alongside the change that earned it.
-
-**Perf is measure-and-report (no baseline) as of 2026-05-03.** `tests/perf-baselines.json` is removed; the gate runs `yuzu_gw_perf_SUITE`, records `perf_*` metrics into the test-runs DB, and exits PASS without comparison. The N=300 calibration on Shulgi (raw at `tests/perf-baseline-provenance-N300.{jsonl,json}`, findings in `docs/perf-baseline-calibration-2026-05-03.md`) showed 3 of the 4 throughput/latency metrics are ceiling-bounded with long left tails — so neither σ nor %-tolerance bands fit them. Operator inspects shape against the calibration capture and trend via `bash scripts/test/test-db-query.sh --trend` until the gate is rebuilt around percentile primitives.
-
-**Sanitizers.** `--full` Phase 6 dispatches `.github/workflows/sanitizer-tests.yml` on the `yuzu-wsl2-linux` self-hosted runner via `scripts/test/dispatch-runner-job.sh`. Local runs would pin the dev box for ~15 min per sanitizer rebuild; the runner absorbs that cost in the background. Runner offline → WARN, not FAIL, with operator retry instructions in the gate notes.
+The `/test` skill (`.claude/skills/test/SKILL.md`) is the single-command pre-commit/pre-push gate — compiles HEAD, upgrades from the previous release image, runs the standard test surface, persists every gate result and sub-step timing to a SQLite test-runs DB at `~/.local/share/yuzu/test-runs.db` (XDG dir, survives `git clean`; override with `YUZU_TEST_DB=path`). Three modes: `--quick` (~10 min sanity), default (~30–45 min), `--full` (~60–120 min — adds OTA, dispatched sanitizers, coverage enforcement, perf measure-and-report). Query history via `bash scripts/test/test-db-query.sh --latest|--last N|--diff A B|--trend ...|--flaky`. Coverage baseline (`tests/coverage-baseline.json`) and perf calibration (`docs/perf-baseline-calibration-2026-05-03.md`) details live in the skill — perf is measure-only as of 2026-05-03 (no σ band, ceiling-bounded distributions).
 
 ## Instruction Engine
 
@@ -353,23 +308,7 @@ docs/             Architecture docs, conventions, roadmap, capability map
 
 ## CI architecture
 
-Three-tier split (April 2026 overhaul). Full reference + cache-key contract +
-runner topology + persistence rules + canary + corruption-recovery:
-`docs/ci-architecture.md`. The `build-ci` agent owns the matrix;
-`cross-platform` owns Windows/macOS specifics.
-
-- **Tier 1 — PR fast-path** (`ci.yml` on PRs): one Linux (gcc-13 debug,
-  `yuzu-wsl2-linux`) + one Windows (MSVC debug, `yuzu-local-windows`) + one
-  macOS (appleclang debug, `macos-15`) + `proto-compat`. <10 min wall.
-- **Tier 2 — push to dev/main**: full 4-way Linux matrix, 2-way Windows,
-  2-way macOS. No sanitizers, no coverage (#410).
-- **Tier 3 — nightly cron** (`nightly.yml`, 0 6 * * * UTC): ASan+UBSan, TSan,
-  coverage, on Linux self-hosted. Failure auto-opens a `nightly-broken` issue.
-  **Discipline norm: no merge to main while `nightly-broken` is open.**
-
-`workflow_dispatch` and cron schedules only fire once the workflow file is
-on the **default branch** (`main`) — new workflows added on `dev` are dormant
-until merged.
+Three-tier split (April 2026): Tier 1 PR fast-path (`ci.yml`, one Linux + one Windows + one macOS + `proto-compat`, <10 min), Tier 2 push to dev/main (full matrix, no sanitizers/coverage per #410), Tier 3 nightly cron (`nightly.yml`, sanitizers + coverage on Linux self-hosted — failure auto-opens `nightly-broken`; **no merge to main while that issue is open**). Full reference (cache contract, runner topology, persistence, canary, corruption recovery): `docs/ci-architecture.md`. `workflow_dispatch` and cron only fire once the workflow file is on `main` — new workflows added on `dev` are dormant until merged. `build-ci` owns the matrix; `cross-platform` owns Windows/macOS specifics.
 
 ## Release workflow gates
 
@@ -406,7 +345,7 @@ The release job will otherwise fail after all build matrix jobs have run, wastin
 | Enterprise-platform parity matrix — competitor capability comparison and gap analysis (complements `docs/capability-map.md`) | `docs/enterprise-parity-plan.md` | `architect` on capability-map / roadmap changes; `enterprise-readiness` agent during Gate 6 |
 | CI cache patterns — split `actions/cache/restore` + paired `actions/cache/save` for GHA-hosted; local `runner.tool_cache` for self-hosted; **never `save-always: true`** (zizmor guard enforces) | `.claude/skills/ci-cache/SKILL.md` | `build-ci` on any change touching `actions/cache@`, vcpkg cache scope, ccache scope, or self-hosted-runner cache wiring |
 | Agent privilege model — dedicated `_yuzu` / `yuzu` / `NT SERVICE\YuzuAgent` account, narrow `sudo NOPASSWD` entries (Linux/macOS) and LSA privileges (Windows), per-plugin privilege matrix, **production virtual-service-account vs dev local-user paths**, install scripts at `scripts/install-agent-user.{sh,ps1}` | `docs/agent-privilege-model.md` | `security-guardian` on any plugin shell-out / sudoers / setcap change; `cross-platform` on any change that gates a plugin behind a privileged command; `plugin-developer` when adding a new privileged plugin (the doc has the procedure) |
-| Fleet visualization (3D) — REST surface (`/api/v1/viz/fleet/topology` + `/fragments/...`), page route `/viz/fleet` (auth-gated, `Cache-Control: no-cache, no-store, must-revalidate` to close stale-page-vs-fresh-asset skew), kill switch (`--viz-disable` / `YUZU_VIZ_DISABLE`), `machines_max` DoS cap (M-1, default 5000 / ceiling 100000), tier-before-permission ordering (kill switch precedes RBAC), audit actions `viz.fleet_topology` + `viz.fleet_topology.invalidate` (target_type `FleetTopology`, results `success` / `denied` / `failure`), fragment `</script>` escape via `escape_json_for_script`, fetcher executions-tracker opt-out rationale, store-internal metrics (`yuzu_viz_refill_*`) gauge-as-snapshot pattern, `yuzu_viz_topology_fetch_duration_seconds` histogram (PR 6 / OBS-2 — wired via `set_fetch_duration_observer`, fires once per refill including on fetcher exception); **page-shell invariants:** importmap-before-module-script ordering (HTML spec, gov R4 UP-1), `webglcontextlost`/`webglcontextrestored` handlers (UP-3), WASD listener guards `INPUT/TEXTAREA/SELECT/contentEditable` targets (sec-M1), `HTMLScriptElement.supports('importmap')` detector before importmap (UP-16), no future `/viz/<param>` regex registered before `/viz/fleet` (arch-S1); **renderer invariants (PR 6):** FNV-1a 32-bit hash for stable per-agent layout, `MeshPhysicalMaterial({transparent:true, opacity:0.18})` (0.08 stale), Sprite hostname labels via `CanvasTexture`, `Raycaster` on `mousemove` for tooltip, `escapeHtml` on agent-controlled fields written via `innerHTML` (sec-M1), `Number.isFinite(camera.position.*)` reset-to-default guard in render loop (UP-7), explicit 401/403/503 status handling in `fetchAndRender` (UP-17), `fleet_topology.v1` schema check before render; **process-layer invariants (PR 7):** per-machine `processGroup` attached as a child of each cube (architect NICE-1 pick over a single sibling group — gives PR 8 per-cube edges + PR 11 per-cube LOD trivially, and reuses clearFleet's `traverse(disposeNode)` walk for free dispose), six-colour `CATEGORY_PALETTE` matching `category_to_string()` enum (`system=#6e7681`, `browser=#58a6ff`, `database=#d29922`, `web=#56d364`, `runtime=#bc8cff`, `other=#8b949e`), deterministic `hash32(pid|ppid)`-mod-bucket interior layout (with `hash32('j|pid')` jitter) inside `cubeSize * 0.78` interior fraction, low-poly `SphereGeometry(0.22, 6, 4)` + `MeshBasicMaterial` per dot (per-instance for clean dispose; PR 11 polish moves to `InstancedMesh`), flat `processMeshes[]` raycast index alongside `cubeMeshes[]`, **process raycast precedes cube raycast** in `onMouseMove` (process dots live inside translucent cubes — without the ordering the cube outer face always wins by distance and operators can't hover dots), process tooltip surfaces `pid / name / user / category` with `escapeHtml` on every interpolated string field and `Number(...) | 0` pid coercion (sec-M1 mirror) | `docs/user-manual/rest-api.md` §Fleet Visualization + `docs/user-manual/audit-log.md` viz rows + `docs/user-manual/metrics.md` §Fleet visualization metrics; renderer invariants documented at the head of `static/yuzu-viz.js` (codegen via `embed_js.py` — moved off hand-written TU at PR 6 when bundle exceeded MSVC 16,380-byte raw-string limit); page-shell invariants in `viz_page_ui.cpp` header + REST invariants in `viz_routes.cpp` header | `security-guardian` + `docs-writer` on any change to `viz_routes.{hpp,cpp}` / `fleet_topology_store.{hpp,cpp}` / `viz_page_ui.cpp` / `static/yuzu-viz.js` / `--viz-disable` / `Config::viz_disable` |
+| Fleet visualization (3D) — REST surface, page-shell, renderer, and process-layer invariants for the 11-PR `feat/viz-engine` ladder | `docs/fleet-viz-invariants.md` | `security-guardian` + `docs-writer` on any change to `viz_routes.{hpp,cpp}` / `fleet_topology_store.{hpp,cpp}` / `viz_page_ui.cpp` / `static/yuzu-viz.js` / `--viz-disable` / `Config::viz_disable` |
 
 ## Guardian engine — stores
 
@@ -425,7 +364,23 @@ gateway-safe wire payloads): same doc §24; PR ladder:
 
 ## Test conventions — shared helpers
 
-For any test that creates a temp file or SQLite database, use `yuzu::test::unique_temp_path(prefix)` or `yuzu::test::TempDbFile` from `tests/unit/test_helpers.hpp`. The helper uses a process-local `mt19937_64`-seeded salt plus an atomic monotonic counter — **never** use `std::hash<std::thread::id>` or `std::chrono::steady_clock` as a uniqueness salt. That pattern produces silent collisions under Defender-induced I/O serialisation on the `yuzu-local-windows` runner (flake #473). The shared header was introduced in Guardian PR 2 hardening round 2 (H-8); see #482 for the residual adoption work across 5 test files.
+Use `yuzu::test::unique_temp_path(prefix)` / `yuzu::test::TempDbFile` from `tests/unit/test_helpers.hpp` for any test temp file or SQLite DB. **Never** salt uniqueness with `std::hash<std::thread::id>` or `std::chrono::steady_clock` — silent collisions under Defender-induced I/O serialisation on `yuzu-local-windows` (flake #473). Rationale and residual adoption: header comment + #482.
+
+## Agent skills
+
+Per-repo configuration for the Matt Pocock engineering skills (`to-issues`, `triage`, `to-prd`, `qa`, `improve-codebase-architecture`, `diagnose`, `tdd`, `zoom-out`, `grill-with-docs`). Re-run `/setup-matt-pocock-skills` to change.
+
+### Issue tracker
+
+GitHub issues at `github.com/Tr3kkR/Yuzu` via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical defaults (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`); only `wontfix` exists in the repo's label set today. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout — `CONTEXT.md` at the repo root, ADRs under `docs/adrs/` (note the `s`). See `docs/agents/domain.md`.
 
 ## CLAUDE.md updates
 

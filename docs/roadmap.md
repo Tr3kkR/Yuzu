@@ -1674,6 +1674,69 @@ TPM, Secure Boot, UEFI verification. Reports posture state into compliance repor
 
 ---
 
+## Phase 19: Threat Graph & Defender Posture (Proposed)
+
+*Extends the `feat/viz-engine` 11-PR ladder with the Threat Graph product vision: a single canvas where SOC analysts, defenders, and system architects see the full per-host IPC graph + cross-host network graph + per-process security posture, so they can decide where to insert hardened controls (WAF, IPS, API gateways, VxLAN separation, firewalls) and which surfaces (network parsers etc.) to harden against which vulnerability classes. Anti-Mythos framing — Yuzu is the defender's mirror of LLM-driven offensive enumeration. Source: `docs/plans/threat-graph-roadmap.md`.*
+
+### Issue 19.1: Fleet IPC Enumeration — Unix Sockets, Named Pipes, Shared Memory
+**Capability:** 28.8 | **Scope:** Agent (plugins) + server (wire) | **Status:** Proposed
+
+Four new agent plugins so the topology snapshot covers all same-host IPC channels, not just TCP loopback:
+
+- `unix_sockets` — Linux + macOS path-bound + abstract-namespace AF_UNIX enumeration, mapped to owning processes via `lsof -U` / `/proc/net/unix` cross-reference. Windows AF_UNIX (Win10 1803+) is a follow-up.
+- `named_pipes` — Windows `\\.\pipe\*` via `NtQueryDirectoryObject` + ALPC port inventory; Linux FIFO inventory (`find / -type p`) as a smaller follow-up.
+- `shared_memory` — SysV `ipcs -m` + POSIX `/dev/shm` listing + `/dev/mqueue` (Linux + macOS); Windows shared sections (`NtQuerySection`) follow.
+- `signed_binaries` — Authenticode (Windows `WinVerifyTrust`), codesign (macOS `SecCodeCheckValidity`), IMA/EVM (Linux `getxattr security.ima`). Required for the posture-glyph "signed/unsigned" check.
+
+Wire model extension: new `EdgeKind` enum on `ConnectionEdge` (`TcpLoopback`, `UnixSocket`, `NamedPipe`, `SharedMemory`, `DBus`, `ALPC`, `EbpfMap`), `socket_path` for filesystem-backed channels, `world_accessible` boolean flagging endpoints any process can join (Unix socket `0666`, abstract socket, world-rw `/dev/shm`).
+
+### Issue 19.2: Process Binary Hashing + VirusTotal Server-Side Integration
+**Capability:** 28.8 | **Scope:** Agent (`processes` extension) + server (new) | **Status:** Proposed
+
+Extend the existing `processes` plugin to emit SHA-256 of each process's binary path. Server-side **`virustotal_cache.db`** store + a rate-limited (free tier: 4 req/min) VirusTotal API client; results cached with 7-day TTL keyed by hash. Threat-mode posture envelope carries `binary.hash_sha256` + `binary.virustotal_score`. API key lives in Settings → External Integrations, server-side, never on agent.
+
+### Issue 19.3: Per-Process Posture Envelope
+**Capability:** 28.8 | **Scope:** Server | **Status:** Proposed
+
+`ProcessNode.posture` envelope synthesises vulnerability scan (existing) + AV status (existing `antivirus`) + signed-binary verification (19.1) + firewall exposure (existing `firewall`) + disk encryption (existing `bitlocker`) + VirusTotal score (19.2) into one composite indicator. Server-side aggregation; agent plugins each contribute their slice. Composite glyph rendered as Sprite-child of each process Sphere (hidden when hardened, `!`/`⚠`/`?` otherwise).
+
+### Issue 19.4: Threat-Mode Toggle on `/viz/fleet`
+**Capability:** 28.8 | **Scope:** Server (renderer) | **Status:** Proposed
+
+`?mode=threat` URL param + `T`-key shortcut + UI control, persisted in `localStorage.yuzuVizMode`. Shared camera / scene-graph / dispatch contracts with the existing Fleet mode. Threat mode adds: posture-glyph rendering, IPC-edge rendering (19.1), `world_accessible` red glow, recommendation ghost overlays (19.5). Mode-state in URL hash takes precedence over `localStorage` (shareable links).
+
+### Issue 19.5: Recommendation Store + Agentic Recommender Integration
+**Capability:** 28.9 | **Scope:** Server | **Status:** Proposed
+
+New **`recommendations.db`** store. Schema: `id`, `customer_id`, `generated_at`, `generated_by`, `kind` (insert_waf / vxlan_separate / firewall_rule / harden_parser / kill_world_socket / other), `target_node_ids` (JSON), `target_edge_keys` (JSON), `rationale`, `status` (open / accepted / dismissed / applied), `operator_note`, `yaml_source`. REST CRUD at `/api/v1/recommendations/...` + matching MCP tools. An external agentic AI worker posts recommendations using a service-scoped API token; recommendations are ghost-overlaid in Threat mode. Accept / dismiss / apply via the existing approval workflow (`workflows.db`). "Apply" calls existing plugin actions via REST `/api/v1/dispatch`.
+
+### Issue 19.6: Action Surface — Click-Through to Existing Plugins
+**Capability:** 28.8 | **Scope:** Server (renderer + REST) | **Status:** Proposed
+
+Side-panel on node / edge click in Threat mode. Buttons call existing plugin actions through REST `/api/v1/dispatch`; no new `viz.actions` API surface. Initial action menu: check binary hash against VirusTotal, re-scan vulnerabilities, view firewall rules, add firewall rule, run sockwho, run ad-hoc bash, check AV / disk encryption status, kill process, quarantine binary. Each button respects the operator's RBAC (the button greys out if `Plugin:Execute` is missing).
+
+### Issue 19.7: Cross-Platform Parity Sweep — AV, Disk Encryption, Firewall
+**Capability:** 9.x extension | **Scope:** Agent (existing plugins) | **Status:** Proposed
+
+Audit `antivirus`, `bitlocker`, `firewall` plugins for macOS + Linux coverage. Plugin skeletons already have all three platform branches; verify each branch actually reports posture (gaps suspected on macOS XProtect / third-party AV, Linux ClamAV/SentinelOne/Crowdstrike, macOS FileVault, Linux LUKS, macOS `pfctl`, Linux `nftables`). Optionally rename `bitlocker` plugin to `disk_encryption` (decision deferred — breaking API token scope strings is the cost; recommendation in roadmap doc is to keep the name and add `disk_encryption` as an action alias).
+
+### Issue 19.8: Container-Runtime Awareness — `Containerised` Edge Scope
+**Capability:** 28.8 | **Scope:** Server (topology classification) + agent (optional new plugin) | **Status:** Proposed
+
+Detect Docker / Kubernetes / Podman in the host environment (could extend `os_info` or new `container_runtime` plugin). Server-side fleet topology classifier adds a `Containerised` `EdgeScope` for inter-container traffic on private RFC1918 / Docker default ranges. New `MountedSocket` edge kind for bind-mounted host sockets (the `/var/run/docker.sock` container-escape pattern) — special render to flag boundary crossings.
+
+### Issue 19.9: D-Bus + eBPF + Windows ALPC IPC (Defence-in-Depth)
+**Capability:** 28.8 | **Scope:** Agent (new plugins) | **Status:** Proposed
+
+Lower-priority IPC channels that round out the Threat Graph:
+- `dbus` plugin — `busctl list` system + session bus enumeration on Linux.
+- `ebpf_inventory` plugin — `bpftool map list` + `prog list` (root-only).
+- `alpc_ports` plugin — Windows ALPC port enumeration via `NtAlpcQueryInformation`.
+
+Land after the foundational IPC plugins (19.1) ship and the rendering model proves stable.
+
+---
+
 ## Open Decisions
 
 | # | Issue | Topic | Status |

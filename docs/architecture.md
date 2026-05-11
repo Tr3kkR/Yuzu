@@ -300,6 +300,8 @@ Operator                     Server                                  Agent
 | Server config | Config files (`.cfg`) | Users, tokens, enrollment, settings |
 | NVD/CVE data | SQLite | Vulnerability database |
 | Policy state | SQLite | Rule evaluation history, compliance |
+| Threat-graph recommendations *(proposed, §28.9)* | SQLite (`recommendations.db`) | Agentic-AI-produced hardening suggestions awaiting operator accept/dismiss/apply |
+| VirusTotal hash cache *(proposed, §28.8)* | SQLite (`virustotal_cache.db`) | Rate-limited hash→verdict cache; 7-day TTL; keyed on SHA-256 |
 
 **Why SQLite everywhere?** Zero configuration, single-file deployment, fast reads, supports concurrent readers with WAL mode. For the agent (which must be lightweight), SQLite adds ~600KB to the binary and requires no external database. For the server, SQLite scales to millions of rows per shard. If the server outgrows SQLite, the storage layer can be swapped to PostgreSQL with minimal code change — the query patterns are simple (insert, filter, paginate).
 
