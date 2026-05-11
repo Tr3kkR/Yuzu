@@ -3,8 +3,9 @@
 **Status:** Next rung on the `feat/viz-engine` ladder. Nothing started yet —
 this is a pickup brief, not in-flight work.
 
-**Branch:** `feat/viz-engine` at `cb80a28` (PR 8 shipped + visually verified
-end-to-end, pushed to `origin/feat/viz-engine`).
+**Branch:** `feat/viz-engine` at `0e984fa` (PR 8 shipped + visually verified
+end-to-end + **R8 governance round closed**, all pushed to
+`origin/feat/viz-engine`, 24 commits ahead of `origin/dev`).
 
 **Date of brief:** 2026-05-11.
 
@@ -47,14 +48,23 @@ sets `dst_agent_id` for InternalFleet. PR 9 is therefore primarily a
 
 ## Pickup sequence
 
-1. **Run R8 governance on `cb80a28` BEFORE starting PR 9.** PR 8 shipped
-   without a hardening round; the standing convention is `/governance
-   <range>` after each feature PR. Likely findings: arch-S1 (lockstep
-   registration array including the new `edgeMeshes`-equivalent — PR 8 added
-   line meshes to `processGroup` without a top-level index, which PR 9 will
-   want for raycast hover); arch-S3 (`__internal` snapshot test); per-host
-   pairing O(n²) refactor candidate noting the (addr,port)→pid hash
-   alternative.
+1. **R8 governance round CLOSED** (commit `0e984fa`). 6 BLOCKINGs +
+   6 high-impact SHOULDs addressed; 5 follow-ups filed:
+   - **#989** hash-index pairing refactor (perf; blocking-for->100-machines)
+   - **#990** LineSegments → InstancedMesh (perf; needed before PR 9 cross-
+     cube edges compound the draw-call problem)
+   - **#991** IPv4-mapped IPv6 canonicalisation in pairing key
+   - **#992** Container-netns 4-tuple disambiguation (security-adjacent;
+     prevents cross-namespace mispair on multi-container hosts)
+   - **#993** Test coverage gaps (self-loop, scope-not-mutated, multi-
+     machine isolation, JSON src_pid pin)
+
+   **arch-S1 (lockstep registration array)** still deferred — fold
+   `cubeMeshes` + `processMeshes` + new `edgeMeshes` into one registry
+   so `clearFleet`'s reset is enforced by construction. R8 architect
+   recommended doing this in **PR 9 round 1 hardening**, because PR 9
+   is where `edgeMeshes` first becomes operationally needed (for
+   cross-cube raycast hover).
 
 2. **Plan PR 9 with the user.** Open questions:
    - Edge geometry: straight 4-segment polyline (process → face → face →
