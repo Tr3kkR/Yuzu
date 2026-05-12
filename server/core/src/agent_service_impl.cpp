@@ -4,6 +4,7 @@
 
 #include "analytics_event_store.hpp"
 #include "execution_tracker.hpp"
+#include "fleet_topology_store.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
@@ -202,6 +203,13 @@ enrolled:
     if (mgmt_group_store_ && mgmt_group_store_->is_open())
         mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());
 
+    // UAT 2026-05-12: invalidate any cached topology snapshot so the
+    // next /api/v1/viz/fleet/topology refill dispatches to the new
+    // agent and the renderer doesn't show this cube as stale (`ts=0,
+    // procs=[]`) for up to the 60 s TTL window.
+    if (fleet_topology_store_)
+        fleet_topology_store_->invalidate();
+
     if (analytics_store_) {
         AnalyticsEvent ae;
         ae.event_type = "agent.registered";
@@ -321,6 +329,34 @@ grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* /*context*/,
                       std::chrono::system_clock::now().time_since_epoch())
                       .count();
     response->mutable_server_time()->set_millis_epoch(now_ms);
+
+    // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
+    //
+    // If the heartbeat carries a fleet_snapshot.v1 JSON payload, hand
+    // it to the shared parser (FleetTopologyStore::parse_fleet_snapshot_json)
+    // and feed the resulting RawAgentSnapshot into the store. The
+    // shared parser enforces row + byte caps (sec-H1 / UP-8 hardening),
+    // sanitises exception text (sec-M3 / UP-14), and keeps the field
+    // set in lock-step across the three ingestion sites (arch-B3).
+    // Parse failures are non-fatal — a malformed payload from a buggy
+    // agent must not knock the heartbeat path offline.
+    if (fleet_topology_store_ && !request->fleet_snapshot_json().empty()) {
+        std::string os_from_session;
+        if (auto sess = registry_.get_session(agent_id))
+            os_from_session = sess->os;
+        std::string parse_err;
+        auto parsed = yuzu::server::FleetTopologyStore::parse_fleet_snapshot_json(
+            request->fleet_snapshot_json(), agent_id, os_from_session, &parse_err);
+        if (parsed.has_value()) {
+            fleet_topology_store_->push_snapshot(std::move(*parsed));
+            metrics_.counter("yuzu_viz_topology_pushed_total", {{"via", "direct"}}).increment();
+        } else {
+            spdlog::warn("Heartbeat fleet_snapshot from agent={} rejected ({})", agent_id,
+                         parse_err);
+            metrics_.counter("yuzu_viz_topology_push_parse_errors_total", {{"via", "direct"}})
+                .increment();
+        }
+    }
 
     spdlog::debug("Heartbeat from agent={} (session={})", agent_id, session_id);
     return grpc::Status::OK;
@@ -601,6 +637,11 @@ grpc::Status AgentServiceImpl::Subscribe(
     // handler doesn't clobber a newer connection from the same agent_id.
     registry_.clear_stream_if_session(agent_id, session_id);
     registry_.remove_agent_if_session(agent_id, session_id);
+    // PR 10 hardening — evict pushed-snapshot slot too (sec-M4 / UP-5).
+    // Without this, deregistered agents render as ghost cubes
+    // indefinitely from the cached last-known-good snapshot.
+    if (fleet_topology_store_)
+        fleet_topology_store_->evict_pushed(agent_id);
     spdlog::info("Agent subscribe stream closed for {} (session={})", agent_id, session_id);
 
     if (analytics_store_) {

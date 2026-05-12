@@ -34,14 +34,18 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server {
 
 class NvdDatabase; ///< Forward-declare; vuln overlay only uses match_inventory.
+class AuditStore;  ///< Forward-declare; push audit (CC6.1/CC7.3 evidence).
 
 class FleetTopologyStore {
 public:
@@ -102,6 +106,72 @@ public:
     /// and by the operator-facing `?fresh=1` query parameter.
     void invalidate();
 
+    /// PR 10 hardening — Hard caps on per-snapshot row counts. Apply at
+    /// the JSON parser, BEFORE std::vector::reserve(), so a malicious
+    /// `[{}, {}, ...]` cannot trigger a ~200 MB allocation per heartbeat
+    /// (sec-H1 / UP-8). The cap matches `kFleetSnapshotMaxRows` in the
+    /// agent-side `tar_fleet_snapshot.hpp`; agents already truncate at
+    /// 4096 per list, so a legitimate snapshot will never trip this.
+    /// A snapshot exceeding the cap is rejected wholesale rather than
+    /// truncated server-side — the truncation signal belongs to the
+    /// producing agent.
+    static constexpr std::size_t kPushedSnapshotMaxRows = 4096;
+    /// Maximum accepted byte length of a single `fleet_snapshot_json`
+    /// HeartbeatRequest payload. The proto comment says "5–20 KB
+    /// typically"; the 4096-row cap at this constant's intended max-row
+    /// size implies an effective ceiling around 1.3 MB. Reject before
+    /// `nlohmann::json::parse` so a JSON-bomb payload (UP-8) cannot
+    /// consume parser CPU.
+    static constexpr std::size_t kPushedSnapshotMaxBytes = 2ull * 1024 * 1024;
+
+    /// PR 10 hardening — Push-staleness threshold. A pushed snapshot
+    /// whose `ts` (epoch seconds the agent emitted it) is older than
+    /// wall-clock now minus this constant is rendered as `stale=true`.
+    /// Bounded above by 3× the agent's pump interval (30 s) plus
+    /// gateway-batch latency, so a legitimately fresh push never trips
+    /// it but a stuck pump (UP-3) becomes visible to operators within
+    /// ~90 s.
+    static constexpr std::chrono::seconds kPushedStaleAfter{90};
+
+    /// Parse a fleet_snapshot.v1 JSON document into a RawAgentSnapshot,
+    /// enforcing the row + byte caps above and the trust boundary that
+    /// `agent_id` and `os` come from the session, never the JSON.
+    /// Returns an empty optional on parse failure (caller emits the
+    /// metric + audit event). `ex_message` receives the first 256 chars
+    /// of the parser's exception text, control-chars stripped, suitable
+    /// for inclusion in audit events — log lines should never echo it
+    /// directly (sec-M3 / UP-14).
+    ///
+    /// Shared by every ingestion site (Heartbeat, BatchHeartbeat, and
+    /// the legacy dispatch fetcher) so the field set, default values,
+    /// exception scope, and row caps stay in lock-step (arch-B3 /
+    /// cons-S1). Free function, not a member, because it has no
+    /// dependency on store state.
+    static std::optional<RawAgentSnapshot> parse_fleet_snapshot_json(std::string_view json,
+                                                                     std::string agent_id,
+                                                                     std::string os,
+                                                                     std::string* ex_message);
+
+    /// PR 10 / UAT 2026-05-12 — Push-based ingestion.
+    ///
+    /// Agents publish their latest fleet_snapshot.v1 over the heartbeat
+    /// channel (HeartbeatRequest.fleet_snapshot_json). Server-side
+    /// AgentServiceImpl::Heartbeat parses the JSON into a RawAgentSnapshot
+    /// and calls this method. The store keeps the latest snapshot per
+    /// agent in `pushed_` and invalidates the cache so the next get()
+    /// reads from the pushed map instead of dispatching tar.fleet_snapshot.
+    /// Thread-safe: takes `pushed_mu_` plus `slots_mu_` for the
+    /// invalidation half. Safe to call from any heartbeat-dispatcher
+    /// thread.
+    void push_snapshot(RawAgentSnapshot raw);
+
+    /// PR 10 hardening — evict a deregistered agent's pushed slot
+    /// (sec-M4 / UP-5). Called from AgentServiceImpl when an agent's
+    /// session ends, so a vanished agent stops rendering as a ghost
+    /// cube and frees its local_ips for re-use by a re-enrolling host.
+    /// Idempotent; no-op when the agent has no pushed slot.
+    void evict_pushed(const std::string& agent_id);
+
     /// Set the optional fetcher-duration observer (see
     /// FetchDurationObserver above). Pass an empty function to clear.
     ///
@@ -116,6 +186,19 @@ public:
     /// across the boundary, which is rarely useful operationally. (gov
     /// R6 architect SHOULD-1.)
     void set_fetch_duration_observer(FetchDurationObserver observer);
+
+    /// PR 10 hardening — wire the audit store for push-traceability
+    /// (F-1 / CC6.1 / CC7.3). When set, `push_snapshot` emits:
+    ///   • One `topology.push.first` AuditEvent the first time a given
+    ///     agent_id pushes per-process-lifetime (proves contribution
+    ///     without per-heartbeat audit volume — at 100k agents × 30 s
+    ///     cadence, per-push audit would blow the audit DB).
+    ///   • One `topology.push.rejected` AuditEvent on every rejection
+    ///     (parse failure or IP-spoof guard) — rejections are rare so
+    ///     the noise floor is acceptable.
+    /// nullptr disables audit emission. Setter is single-init at
+    /// bring-up, not thread-safe vs. concurrent pushes.
+    void set_audit_store(AuditStore* store) { audit_store_ = store; }
 
     // ── Observability counters ─────────────────────────────────────────────
     uint64_t cache_hits() const noexcept { return cache_hits_.load(std::memory_order_relaxed); }
@@ -178,6 +261,34 @@ private:
     /// Only two slots ever -- false (no vuln) and true (with vuln). A map
     /// keyed by bool is overkill but mirrors the symmetry plainly.
     std::unordered_map<bool, std::unique_ptr<Slot>> slots_;
+
+    /// PR 10: per-agent latest pushed snapshot. Written by push_snapshot()
+    /// from the heartbeat dispatcher; read by get() when building the
+    /// aggregate. Distinct mutex from slots_mu_ so a high-volume heartbeat
+    /// stream from a large fleet does not block /viz/fleet/topology
+    /// readers.
+    ///
+    /// PR 10 hardening — entries are `shared_ptr<const RawAgentSnapshot>`
+    /// so the get() refill builds its working vector by copying
+    /// pointers, not the underlying 5–20 KB struct each. At 100k-agent
+    /// scale the copy cost drops from ~1 GB → ~1 MB and pushed_mu_ is
+    /// released after a quick O(N) pointer walk instead of an O(N×K)
+    /// deep copy (UP-15 / perf-S3).
+    mutable std::mutex pushed_mu_;
+    std::unordered_map<std::string, std::shared_ptr<const RawAgentSnapshot>> pushed_;
+    /// Reverse index from local_ip → agent_id, maintained alongside the
+    /// pushed_ map. Used by push_snapshot to reject local_ips that
+    /// another agent has already claimed (UP-1 spoofing defence).
+    /// Same lock as pushed_.
+    std::unordered_map<std::string, std::string> ip_owner_;
+    std::atomic<uint64_t> pushed_count_{0};          // total pushes accepted
+    std::atomic<uint64_t> pushed_rejected_count_{0}; // ip-spoof rejections
+    /// Agent IDs already audited via `topology.push.first` — emit once
+    /// per process lifetime per agent to bound audit volume. Guarded
+    /// by pushed_mu_ (already taken when push_snapshot mutates the
+    /// map; the audit event itself is emitted outside the lock).
+    std::unordered_set<std::string> audited_first_push_;
+    AuditStore* audit_store_{nullptr};
 
     std::atomic<uint64_t> cache_hits_{0};
     std::atomic<uint64_t> cache_misses_{0};

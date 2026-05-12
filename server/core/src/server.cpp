@@ -337,6 +337,19 @@ public:
                           "gauge");
         metrics_.describe("yuzu_viz_refill_waiters_total",
                           "Fetch waiters that piggybacked on an in-flight refill", "gauge");
+        // PR 10 hardening — push-ingestion metrics. `via` label
+        // distinguishes the direct HeartbeatRequest path from the
+        // gateway BatchHeartbeat path; sum across the label set to
+        // get fleet-wide push volume.
+        metrics_.describe("yuzu_viz_topology_pushed_total",
+                          "Agent-pushed fleet_snapshot.v1 payloads accepted into the "
+                          "FleetTopologyStore via heartbeat. Labelled by via=direct|gateway.",
+                          "counter");
+        metrics_.describe("yuzu_viz_topology_push_parse_errors_total",
+                          "Agent-pushed fleet_snapshot.v1 payloads rejected by the shared "
+                          "parser (oversized, row-cap exceeded, malformed JSON). Labelled "
+                          "by via=direct|gateway.",
+                          "counter");
         metrics_.describe("yuzu_viz_local_edges_dropped_total",
                           "EdgeScope::Local connection edges dropped from the snapshot "
                           "before serialisation because no reciprocal half was visible in "
@@ -592,69 +605,43 @@ public:
                 for (const auto& r : matched) {
                     if (!have.insert(r.agent_id).second)
                         continue;
-                    RawAgentSnapshot rs;
-                    rs.agent_id = r.agent_id;
-                    if (auto sess = registry_.get_session(r.agent_id))
-                        rs.os = sess->os;
                     // CommandResponse::Status enum: 1 == SUCCESS. Anything
                     // else (FAILURE / TIMEOUT / REJECTED / RUNNING-only-row)
                     // is treated as a stale snapshot for renderer purposes.
                     if (r.status != 1) {
+                        RawAgentSnapshot rs;
+                        rs.agent_id = r.agent_id;
                         rs.stale = true;
-                        if (auto sess = registry_.get_session(r.agent_id))
+                        if (auto sess = registry_.get_session(r.agent_id)) {
+                            rs.os = sess->os;
                             rs.hostname = sess->hostname;
+                        }
                         out.push_back(std::move(rs));
                         continue;
                     }
-                    try {
-                        auto j = nlohmann::json::parse(r.output);
-                        rs.hostname = j.value("hostname", "");
-                        rs.ts = j.value("ts", static_cast<int64_t>(0));
-                        if (j.contains("local_ips") && j["local_ips"].is_array()) {
-                            for (const auto& ip : j["local_ips"]) {
-                                if (ip.is_string())
-                                    rs.local_ips.push_back(ip.get<std::string>());
-                            }
-                        }
-                        rs.truncated_processes = j.value("truncated_processes", false);
-                        rs.truncated_connections = j.value("truncated_connections", false);
-                        if (j.contains("processes") && j["processes"].is_array()) {
-                            rs.processes.reserve(j["processes"].size());
-                            for (const auto& p : j["processes"]) {
-                                RawAgentSnapshot::RawProcess rp;
-                                rp.pid = p.value("pid", 0u);
-                                rp.ppid = p.value("ppid", 0u);
-                                rp.name = p.value("name", "");
-                                rp.cmdline = p.value("cmdline", "");
-                                rp.user = p.value("user", "");
-                                rs.processes.push_back(std::move(rp));
-                            }
-                        }
-                        if (j.contains("connections") && j["connections"].is_array()) {
-                            rs.connections.reserve(j["connections"].size());
-                            for (const auto& c : j["connections"]) {
-                                RawAgentSnapshot::RawConnection rc;
-                                rc.proto = c.value("proto", "");
-                                rc.local_addr = c.value("local_addr", "");
-                                rc.local_port = c.value("local_port", 0);
-                                rc.remote_addr = c.value("remote_addr", "");
-                                rc.remote_host = c.value("remote_host", "");
-                                rc.remote_port = c.value("remote_port", 0);
-                                rc.state = c.value("state", "");
-                                rc.pid = c.value("pid", 0u);
-                                rc.process_name = c.value("process_name", "");
-                                rs.connections.push_back(std::move(rc));
-                            }
-                        }
-                    } catch (const std::exception& ex) {
-                        spdlog::warn("FleetTopologyStore fetcher: failed to parse "
-                                     "fleet_snapshot.v1 from {}: {}",
-                                     r.agent_id, ex.what());
-                        rs.stale = true;
-                        if (auto sess = registry_.get_session(r.agent_id))
-                            rs.hostname = sess->hostname;
+                    // PR 10 hardening — share the parser with the push
+                    // ingestion sites so caps + sanitisation + field
+                    // set stay in lock-step (arch-B3 / cons-S1).
+                    std::string os_from_session, hostname_fallback, parse_err;
+                    if (auto sess = registry_.get_session(r.agent_id)) {
+                        os_from_session = sess->os;
+                        hostname_fallback = sess->hostname;
                     }
-                    out.push_back(std::move(rs));
+                    auto parsed = FleetTopologyStore::parse_fleet_snapshot_json(
+                        r.output, r.agent_id, os_from_session, &parse_err);
+                    if (parsed.has_value()) {
+                        out.push_back(std::move(*parsed));
+                    } else {
+                        spdlog::warn("FleetTopologyStore fetcher: rejected "
+                                     "fleet_snapshot.v1 from {} ({})",
+                                     r.agent_id, parse_err);
+                        RawAgentSnapshot rs;
+                        rs.agent_id = r.agent_id;
+                        rs.os = std::move(os_from_session);
+                        rs.hostname = std::move(hostname_fallback);
+                        rs.stale = true;
+                        out.push_back(std::move(rs));
+                    }
                 }
 
                 // Agents that were dispatched but never responded -> stale
@@ -704,6 +691,18 @@ public:
             // when the histogram count fails to increment.
             spdlog::debug("FleetTopologyStore: fetch-duration observer wired "
                           "(yuzu_viz_topology_fetch_duration_seconds)");
+
+            // UAT 2026-05-12: wire the store into AgentServiceImpl so a
+            // fresh Register() drops both cache slots — eliminates the
+            // up-to-60 s "stale ghost cube" window operators saw after
+            // server restarts.
+            agent_service_.set_fleet_topology_store(fleet_topology_store_.get());
+            // PR 10: also wire into the gateway upstream service so
+            // BatchHeartbeat ingests pushed snapshots from
+            // gateway-routed agents (the path 100% of viz-UAT traffic
+            // takes today).
+            if (gateway_service_)
+                gateway_service_->set_fleet_topology_store(fleet_topology_store_.get());
         }
 
         // Initialize audit store
@@ -713,6 +712,13 @@ public:
             if (audit_store_->is_open()) {
                 audit_store_->start_cleanup();
             }
+            // PR 10 hardening — wire AuditStore into FleetTopologyStore
+            // so push success (first-per-agent) and rejections emit
+            // AuditEvents (F-1 / CC6.1 / CC7.3 evidence chain). Must
+            // run after fleet_topology_store_ AND audit_store_ are
+            // both initialised; that ordering is fixed here.
+            if (fleet_topology_store_ && audit_store_ && audit_store_->is_open())
+                fleet_topology_store_->set_audit_store(audit_store_.get());
         }
 
         // Initialize tag store

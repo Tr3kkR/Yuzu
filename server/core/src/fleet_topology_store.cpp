@@ -9,6 +9,7 @@
 
 #include "fleet_topology_store.hpp"
 
+#include "audit_store.hpp"
 #include "nvd_db.hpp"
 
 #include <nlohmann/json.hpp>
@@ -178,7 +179,40 @@ std::shared_ptr<const TopologySnapshot> FleetTopologyStore::get(bool include_vul
     std::shared_ptr<const TopologySnapshot> result;
     const auto fetch_started = std::chrono::steady_clock::now();
     try {
-        auto raw = fetcher_(fetch_deadline_);
+        // PR 10 / UAT 2026-05-12 — Push-first refill. If any agent has
+        // pushed a snapshot via heartbeat (HeartbeatRequest.fleet_snapshot_json
+        // → push_snapshot()), build the aggregate from the pushed map
+        // and skip the legacy dispatch entirely. Cache-miss latency
+        // drops from ~5 s (waiting on dispatched responses) to ~ms (a
+        // map walk + JSON build), and slow responders no longer get
+        // marked stale just because the gateway batched them past the
+        // fetch deadline.
+        //
+        // PR 10 hardening — copy shared_ptr handles only (UP-15). At
+        // 100k agents this is an O(N) pointer walk under pushed_mu_
+        // (~1 MB working set) instead of an O(N×K) deep copy (~1 GB).
+        // pushed_mu_ is released promptly so concurrent pushes don't
+        // queue behind the refill.
+        //
+        // Legacy dispatch fetcher_() runs only when pushed_ is empty
+        // (first boot, no agent has heartbeated yet).
+        std::vector<std::shared_ptr<const RawAgentSnapshot>> pushed_handles;
+        {
+            std::lock_guard plk(pushed_mu_);
+            if (!pushed_.empty()) {
+                pushed_handles.reserve(pushed_.size());
+                for (const auto& [_, snap_ptr] : pushed_)
+                    pushed_handles.push_back(snap_ptr);
+            }
+        }
+        std::vector<RawAgentSnapshot> raw;
+        if (!pushed_handles.empty()) {
+            raw.reserve(pushed_handles.size());
+            for (const auto& sp : pushed_handles)
+                raw.push_back(*sp); // copy is unavoidable for build_snapshot
+        } else {
+            raw = fetcher_(fetch_deadline_);
+        }
         result =
             std::make_shared<const TopologySnapshot>(build_snapshot(std::move(raw), include_vuln));
     } catch (const std::exception& ex) {
@@ -249,6 +283,285 @@ void FleetTopologyStore::invalidate() {
     std::lock_guard lk(slots_mu_);
     for (auto& [_, slot] : slots_) {
         slot->snap.reset();
+    }
+}
+
+// PR 10 hardening — sanitise an agent-controlled string before it
+// crosses into a log line or AuditEvent.detail. Strips control bytes
+// (`< 0x20 || == 0x7f`) AND any byte with the high bit set
+// (multi-byte UTF-8 continuation bytes 0x80–0xff). The result is
+// strict 7-bit ASCII with control chars replaced by spaces, capped
+// at `max_len`. Used by sec-M3 / UP-14 (parse-exception log) and by
+// audit-detail composition (Gate 7 HIGH: agent-controlled `ip` /
+// `agent_id` going into `topology.push.rejected` detail).
+static std::string sanitise_for_audit(std::string_view in, std::size_t max_len = 128) {
+    std::string out;
+    out.reserve(std::min(in.size(), max_len));
+    for (auto c : in) {
+        if (out.size() >= max_len)
+            break;
+        unsigned char u = static_cast<unsigned char>(c);
+        if (u < 0x20 || u == 0x7f || u >= 0x80) {
+            out.push_back(' ');
+        } else {
+            out.push_back(static_cast<char>(u));
+        }
+    }
+    return out;
+}
+
+// PR 10 hardening — single shared JSON parser for fleet_snapshot.v1.
+//
+// Called from every ingestion site (server.cpp dispatch fetcher,
+// AgentServiceImpl::Heartbeat, GatewayUpstreamServiceImpl::BatchHeartbeat)
+// so the field set, default values, exception scope, row caps, and
+// trust boundary stay in lock-step (arch-B3 / cons-S1). Free function
+// because it has no dependency on store state.
+//
+// Caps enforced:
+//   • Payload byte size — kPushedSnapshotMaxBytes; reject before parse
+//     so a JSON-bomb cannot consume parser CPU (UP-8).
+//   • `processes[]` length — kPushedSnapshotMaxRows; reject the whole
+//     snapshot if exceeded (the producing agent caps at this too, so
+//     legit snapshots never trip it).
+//   • `connections[]` length — same cap as processes.
+//
+// Trust boundary: `agent_id` and `os` are passed in from the caller
+// (session-authenticated) and never sourced from JSON. The JSON's
+// `hostname`, `local_ips`, etc. are agent-controlled and may be
+// fabricated; callers that need cross-agent validation (UP-1
+// local_ips spoofing) MUST apply it after this parser returns.
+std::optional<RawAgentSnapshot>
+FleetTopologyStore::parse_fleet_snapshot_json(std::string_view json, std::string agent_id,
+                                              std::string os, std::string* ex_message) {
+    if (json.empty()) {
+        if (ex_message)
+            *ex_message = "empty payload";
+        return std::nullopt;
+    }
+    if (json.size() > kPushedSnapshotMaxBytes) {
+        if (ex_message)
+            *ex_message = "payload exceeds " + std::to_string(kPushedSnapshotMaxBytes) + " bytes";
+        return std::nullopt;
+    }
+    try {
+        auto j = nlohmann::json::parse(json);
+        RawAgentSnapshot rs;
+        rs.agent_id = std::move(agent_id);
+        rs.os = std::move(os);
+        rs.hostname = j.value("hostname", std::string{});
+        rs.ts = j.value("ts", 0LL);
+        if (j.contains("local_ips") && j["local_ips"].is_array()) {
+            // Bound local_ips length too — modest, but prevents a runaway
+            // agent declaring 100k IPs to bloat the cube_world_pos map.
+            constexpr std::size_t kMaxLocalIps = 64;
+            for (const auto& ip : j["local_ips"]) {
+                if (rs.local_ips.size() >= kMaxLocalIps)
+                    break;
+                if (ip.is_string())
+                    rs.local_ips.push_back(ip.get<std::string>());
+            }
+        }
+        rs.truncated_processes = j.value("truncated_processes", false);
+        rs.truncated_connections = j.value("truncated_connections", false);
+        if (j.contains("processes") && j["processes"].is_array()) {
+            const auto& procs = j["processes"];
+            if (procs.size() > kPushedSnapshotMaxRows) {
+                if (ex_message)
+                    *ex_message = "processes[] exceeds row cap (" + std::to_string(procs.size()) +
+                                  " > " + std::to_string(kPushedSnapshotMaxRows) + ")";
+                return std::nullopt;
+            }
+            rs.processes.reserve(procs.size());
+            for (const auto& p : procs) {
+                RawAgentSnapshot::RawProcess rp;
+                rp.pid = p.value("pid", 0u);
+                rp.ppid = p.value("ppid", 0u);
+                rp.name = p.value("name", "");
+                rp.cmdline = p.value("cmdline", "");
+                rp.user = p.value("user", "");
+                rs.processes.push_back(std::move(rp));
+            }
+        }
+        if (j.contains("connections") && j["connections"].is_array()) {
+            const auto& conns = j["connections"];
+            if (conns.size() > kPushedSnapshotMaxRows) {
+                if (ex_message)
+                    *ex_message = "connections[] exceeds row cap (" + std::to_string(conns.size()) +
+                                  " > " + std::to_string(kPushedSnapshotMaxRows) + ")";
+                return std::nullopt;
+            }
+            rs.connections.reserve(conns.size());
+            for (const auto& c : conns) {
+                // Gate 7 MEDIUM — port-range sanity check. Out-of-range
+                // ports cannot represent a real socket; allowing them
+                // through pollutes EndpointKey hashes and renderer
+                // socket maps. We skip the row rather than reject the
+                // whole snapshot (one malformed row from a buggy agent
+                // shouldn't blank out the cube).
+                int lp = c.value("local_port", 0);
+                int rp = c.value("remote_port", 0);
+                if (lp < 0 || lp > 65535 || rp < 0 || rp > 65535)
+                    continue;
+                RawAgentSnapshot::RawConnection rc;
+                rc.proto = c.value("proto", "");
+                rc.local_addr = c.value("local_addr", "");
+                rc.local_port = lp;
+                rc.remote_addr = c.value("remote_addr", "");
+                rc.remote_host = c.value("remote_host", "");
+                rc.remote_port = rp;
+                rc.state = c.value("state", "");
+                rc.pid = c.value("pid", 0u);
+                rc.process_name = c.value("process_name", "");
+                rs.connections.push_back(std::move(rc));
+            }
+        }
+        return rs;
+    } catch (const std::exception& ex) {
+        // Strip control characters AND high-bit bytes via the shared
+        // sanitiser (Gate 7 HIGH — multi-byte UTF-8 continuation bytes
+        // would otherwise survive and could carry C1 control codes).
+        if (ex_message)
+            *ex_message = sanitise_for_audit(ex.what(), 256);
+        return std::nullopt;
+    }
+}
+
+// PR 10 / UAT 2026-05-12 — push-based ingestion entry point.
+//
+// Heartbeat dispatcher calls this whenever an agent attaches a
+// fleet_snapshot.v1 payload. We replace any previous entry for the
+// agent (latest snapshot wins).
+//
+// PR 10 hardening — does NOT invalidate the slot cache (perf-B1 /
+// UP-6). At 100k-agent / 30s heartbeat cadence the previous
+// behaviour fired invalidate() ~3,333×/s, thrashing the cache to a
+// near-zero hit rate and serialising every reader behind every
+// pusher. The slot cache now ages out via its normal TTL (60 s by
+// default), which still bounds rendered staleness — pushed_ is the
+// source of truth at refill time anyway.
+//
+// PR 10 hardening — UP-1 IP-spoofing defence. We index local_ips →
+// agent_id and reject a push whose local_ips overlap an OTHER agent's
+// claim. First-claim-wins; an agent re-claiming its own previously
+// reported IPs is fine. Rejection is loud (counter + spdlog::warn)
+// but non-fatal — the agent simply doesn't render until it stops
+// claiming a peer's IP.
+void FleetTopologyStore::push_snapshot(RawAgentSnapshot raw) {
+    if (raw.agent_id.empty())
+        return;
+    // Capture agent_id up front — `raw` is moved into the map below
+    // and we may need the id for audit emission AFTER the lock is
+    // dropped (AuditStore::log takes its own locks; we don't want to
+    // nest).
+    const std::string agent_id = raw.agent_id;
+    bool first_push_for_this_agent = false;
+    std::string spoof_detail;
+    {
+        std::lock_guard plk(pushed_mu_);
+
+        // UP-1 defence — scan claimed IPs against the index. A claim
+        // that's already owned by THIS agent_id is fine (re-push of
+        // same agent's snapshot); a conflict with any OTHER agent_id
+        // is a spoofing attempt and we reject the whole push.
+        for (const auto& ip : raw.local_ips) {
+            auto it = ip_owner_.find(ip);
+            if (it != ip_owner_.end() && it->second != agent_id) {
+                pushed_rejected_count_.fetch_add(1, std::memory_order_relaxed);
+                spdlog::warn("FleetTopologyStore: rejecting push from agent={} — claimed "
+                             "local_ip={} is already owned by agent={} (UP-1 IP-spoof guard)",
+                             agent_id, ip, it->second);
+                // Gate 7 HIGH — sanitise every component that may have
+                // been agent-controlled before it crosses into
+                // AuditEvent.detail. `ip` is agent-controlled
+                // (attacker-pushed JSON). `agent_id` is session-trusted
+                // but enrollment-name-influenced so we sanitise it too,
+                // following the defensive default. `it->second` is the
+                // existing owner's session-trusted agent_id.
+                spoof_detail = "claimant=" + sanitise_for_audit(agent_id) +
+                               " ip=" + sanitise_for_audit(ip) +
+                               " owner=" + sanitise_for_audit(it->second);
+                break;
+            }
+        }
+        if (!spoof_detail.empty()) {
+            // Fall through to audit emission outside the lock (below).
+        } else {
+            first_push_for_this_agent = audited_first_push_.insert(agent_id).second;
+
+            // Remove previous ip_owner_ entries for this agent (its IPs may
+            // have changed since the last push — e.g. DHCP rebind) and
+            // install the new set.
+            for (auto it = ip_owner_.begin(); it != ip_owner_.end();) {
+                if (it->second == raw.agent_id)
+                    it = ip_owner_.erase(it);
+                else
+                    ++it;
+            }
+            for (const auto& ip : raw.local_ips)
+                ip_owner_[ip] = raw.agent_id;
+
+            // Store the snapshot as a shared_ptr<const> — readers in
+            // get() copy the handle only, not the underlying 5–20 KB
+            // struct (UP-15 / perf-S3). Move raw last; agent_id was
+            // captured above.
+            pushed_[agent_id] = std::make_shared<const RawAgentSnapshot>(std::move(raw));
+        }
+    }
+
+    // Audit emission outside pushed_mu_ — AuditStore::log takes its
+    // own locks; nesting would couple per-push latency to the audit
+    // DB. Two emission paths:
+    //   • first-push-per-agent-per-lifetime → topology.push.first
+    //     (F-1 evidence chain for CC6.1/CC7.3 without per-heartbeat
+    //     audit volume).
+    //   • every rejection → topology.push.rejected (rare, so noise is
+    //     acceptable; threshold-based audit is a follow-up).
+    auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count();
+    if (!spoof_detail.empty()) {
+        if (audit_store_) {
+            AuditEvent ev;
+            ev.timestamp = now_s;
+            ev.principal = "agent:" + agent_id;
+            ev.action = "topology.push.rejected";
+            ev.target_type = "FleetTopology";
+            ev.target_id = agent_id;
+            ev.detail = spoof_detail;
+            ev.result = "denied";
+            audit_store_->log(ev);
+        }
+        return;
+    }
+    pushed_count_.fetch_add(1, std::memory_order_relaxed);
+    if (first_push_for_this_agent && audit_store_) {
+        AuditEvent ev;
+        ev.timestamp = now_s;
+        ev.principal = "agent:" + agent_id;
+        ev.action = "topology.push.first";
+        ev.target_type = "FleetTopology";
+        ev.target_id = agent_id;
+        ev.result = "success";
+        audit_store_->log(ev);
+    }
+}
+
+// PR 10 hardening — evict a deregistered agent's pushed slot.
+//
+// Called from AgentRegistry's remove path so a vanished agent stops
+// rendering as a ghost cube (sec-M4 / UP-5) and frees its IP claims
+// for re-use by a re-enrolling host.
+void FleetTopologyStore::evict_pushed(const std::string& agent_id) {
+    if (agent_id.empty())
+        return;
+    std::lock_guard plk(pushed_mu_);
+    pushed_.erase(agent_id);
+    for (auto it = ip_owner_.begin(); it != ip_owner_.end();) {
+        if (it->second == agent_id)
+            it = ip_owner_.erase(it);
+        else
+            ++it;
     }
 }
 
@@ -334,6 +647,22 @@ TopologySnapshot FleetTopologyStore::build_snapshot(std::vector<RawAgentSnapshot
         m.truncated_processes = r.truncated_processes;
         m.truncated_connections = r.truncated_connections;
 
+        // PR 10 hardening — push-staleness gate (UP-3 stuck pump).
+        // An agent whose pump wedged inside tar.fleet_snapshot will
+        // keep heartbeating but its last-attached snapshot's `ts` will
+        // never advance. Mark the cube stale once the gap between the
+        // snapshot's `ts` and wall-clock now exceeds
+        // `kPushedStaleAfter`. We don't overwrite a producer-set
+        // `stale=true` (the dispatch-timeout path); we only ADD the
+        // age-stale flag.
+        if (!m.stale && m.ts > 0) {
+            const int64_t now_s = out.generated_at; // already wall-clock epoch
+            const int64_t age = now_s - m.ts;
+            if (age > std::chrono::duration_cast<std::chrono::seconds>(kPushedStaleAfter).count()) {
+                m.stale = true;
+            }
+        }
+
         auto [vuln_by_name, count_by_name] = match_for(r);
 
         m.processes.reserve(r.processes.size());
@@ -366,9 +695,38 @@ TopologySnapshot FleetTopologyStore::build_snapshot(std::vector<RawAgentSnapshot
             e.dst_port = c.remote_port;
             e.state = c.state;
 
-            // Skip listening sockets with no remote endpoint -- they
-            // would render as edges into the void.
+            // Listening sockets get lifted into the per-machine
+            // `listeners` array (PR 9 / UAT 2026-05-12) so the renderer
+            // can draw a socket primitive on the cube top face —
+            // operators want "the ports this box is exposing" to be a
+            // first-class visual.
+            //
+            // PR 10 hardening — dual-emit during the deprecation window.
+            // arch-B1 flagged that removing LISTEN rows from
+            // `connections[]` is a breaking change for any consumer
+            // filtering by state. We continue emitting them in
+            // `connections[]` for one release alongside `listeners[]`
+            // so existing MCP-driven workers and custom dashboards
+            // don't break silently on minor=3. The `connections[]`
+            // LISTEN rows will be removed in a future PR after one
+            // full release on schema_minor=3 with a CHANGELOG
+            // "Breaking" warning and an `X-Yuzu-Deprecation: ...`
+            // response header pointing consumers at `listeners[]`.
             if (c.remote_addr.empty() || c.remote_port == 0) {
+                if (c.state == "LISTEN" && c.local_port > 0) {
+                    ListenerSocket ls;
+                    ls.proto = c.proto;
+                    ls.port = c.local_port;
+                    ls.pid = c.pid;
+                    ls.process_name = c.process_name;
+                    m.listeners.push_back(std::move(ls));
+                    // Dual-emit: also keep the LISTEN row in connections[]
+                    // with empty/zero remote endpoint, matching the
+                    // pre-PR-9 shape. Set scope=External so the renderer's
+                    // edge pass (which only draws ESTABLISHED) ignores it.
+                    e.scope = EdgeScope::External;
+                    m.connections.push_back(std::move(e));
+                }
                 continue;
             }
 
@@ -386,34 +744,54 @@ TopologySnapshot FleetTopologyStore::build_snapshot(std::vector<RawAgentSnapshot
             m.connections.push_back(std::move(e));
         }
 
-        // PR 8 -- pair each Local-scope edge with its reciprocal half so the
-        // renderer can draw interior lines. A loopback TCP session shows up
-        // as two ESTABLISHED rows in the kernel socket table; the matching
-        // peer has swapped (addr, port) on each side. Set dst_pid to the
-        // peer's src_pid when matched. Unmatched halves are dropped because
-        // the renderer cannot draw a line into the void. O(n^2) per machine
-        // -- acceptable for typical per-host connection counts; a
-        // (addr,port)->pid hash index is a refactor candidate once n
-        // routinely exceeds a few hundred (gov R8 SHOULD).
+        // PR 8 / PR 10 hardening — pair each Local-scope edge with its
+        // reciprocal half via an (addr,port)→(pid, index) index built
+        // in one O(N) pass (perf-B2). The previous O(N²) double-loop
+        // tripped on hosts with thousands of loopback connections
+        // (postgres, redis, JVMs); 4096² = 16M comparisons per refill
+        // was pathological once push ingestion put build_snapshot on
+        // every read path.
         //
-        // Identity guard `&other != &e` prevents a degenerate edge whose
+        // Identity guard via stored index — a degenerate edge whose
         // src 4-tuple equals its dst 4-tuple (kernel does not normally
-        // emit this for ESTABLISHED loopback, but a synthetic /
-        // fuzzed agent payload could) from self-pairing with dst_pid =
-        // src_pid (gov R8 cpp-expert SHOULD).
-        for (auto& e : m.connections) {
-            if (e.scope != EdgeScope::Local)
-                continue;
-            for (const auto& other : m.connections) {
-                if (&other == &e)
-                    continue;
-                if (other.scope != EdgeScope::Local)
-                    continue;
-                if (other.src_addr == e.dst_addr && other.src_port == e.dst_port &&
-                    other.dst_addr == e.src_addr && other.dst_port == e.src_port) {
-                    e.dst_pid = other.src_pid;
-                    break;
+        // emit this for ESTABLISHED loopback, but a synthetic / fuzzed
+        // agent payload could) would otherwise self-pair with
+        // dst_pid = src_pid. We compare positions in the connections
+        // vector rather than pointers to avoid the pointer-stability
+        // issue if we ever index this BEFORE the std::move into
+        // m.connections (gov R8 cpp-expert SHOULD).
+        {
+            struct EndpointKey {
+                std::string addr;
+                int port;
+                bool operator==(const EndpointKey& o) const noexcept {
+                    return port == o.port && addr == o.addr;
                 }
+            };
+            struct EndpointKeyHash {
+                std::size_t operator()(const EndpointKey& k) const noexcept {
+                    return std::hash<std::string>{}(k.addr) ^ (std::hash<int>{}(k.port) << 1);
+                }
+            };
+            std::unordered_map<EndpointKey, std::pair<uint32_t, std::size_t>, EndpointKeyHash>
+                by_src;
+            by_src.reserve(m.connections.size());
+            for (std::size_t i = 0; i < m.connections.size(); ++i) {
+                const auto& e = m.connections[i];
+                if (e.scope != EdgeScope::Local)
+                    continue;
+                by_src.emplace(EndpointKey{e.src_addr, e.src_port}, std::make_pair(e.src_pid, i));
+            }
+            for (std::size_t i = 0; i < m.connections.size(); ++i) {
+                auto& e = m.connections[i];
+                if (e.scope != EdgeScope::Local)
+                    continue;
+                auto it = by_src.find(EndpointKey{e.dst_addr, e.dst_port});
+                if (it == by_src.end())
+                    continue;
+                if (it->second.second == i) // self-pair guard
+                    continue;
+                e.dst_pid = it->second.first;
             }
         }
         const auto before_drop = m.connections.size();

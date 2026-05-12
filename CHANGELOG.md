@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/viz/fleet` cross-machine edges + socket-layer primitive (PR 9 of
+  the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** Each
+  machine cube now displays a ring of cream-coloured socket spheres on
+  its top face, one per listening port (e.g. `:80`, `:3000`, `:5432`),
+  with a `:port` label sprite floating just above each sphere. Hover
+  surfaces port + proto + owning pid + process name. ESTABLISHED
+  outbound connections render as cool-blue `THREE.Line` edges from the
+  source cube anchored at the destination's matching socket sphere on
+  the peer cube — operators see "frontend → app:3000" as a line that
+  literally lands on `:3000`. External destinations (off-fleet
+  endpoints like the agent control channel) get a short grey stub line
+  ending in a small ring marker; hover reveals the off-cluster
+  `ip:port`. Hover order is sockets → processes → edges → cubes.
+- **Push-based fleet topology ingestion (PR 10).** Agents now push
+  their `tar.fleet_snapshot.v1` JSON every ~30 s via a new
+  `HeartbeatRequest.fleet_snapshot_json` proto field (field 4,
+  additive). Server-side `FleetTopologyStore::push_snapshot` ingests
+  into a per-agent `pushed_` map keyed by session-authenticated
+  agent_id; `/api/v1/viz/fleet/topology` reads from this map.
+  Cache-miss latency drops from ~800 ms (full agent dispatch fan-out)
+  to ~2 ms (in-process map walk). Pull-based dispatch is retained as a
+  cold-start fallback. New metrics
+  `yuzu_viz_topology_pushed_total{via=direct|gateway}` and
+  `yuzu_viz_topology_push_parse_errors_total{via=direct|gateway}`
+  count accepted and rejected pushes; new audit events
+  `topology.push.first` (first push per agent per process lifetime —
+  CC6.1/CC7.3 evidence) and `topology.push.rejected` (parse failure
+  or IP-spoof guard).
+- **`MachineNode.listeners[]` field (schema_minor `2 → 3`).** Each
+  entry is a `ListenerSocket` (`proto`, `port`, optional `pid`,
+  optional `process_name`). Server-side `build_snapshot()` lifts
+  LISTEN-state rows from the agent's `connections[]` into this typed
+  array. LISTEN rows continue to appear in `connections[]` during the
+  deprecation window (see **Deprecated** below).
 - **`/viz/fleet` intra-cube localhost edges (PR 8 of the 11-PR
   `/viz/fleet` 3D fleet network-topology ladder).** Faint white
   `LineSegments` (opacity `0.3`) now connect process dots inside each
@@ -31,6 +65,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`/api/v1/viz/fleet/topology` envelope `schema_minor` bumped `2 → 3`.**
+  PR 9 additive evolution — adds per-`MachineNode` `listeners[]` array.
+- **Hostname labels in the 3D viz render below cubes** (was above; UAT
+  request 2026-05-12) so the cube top face is unoccluded for the new
+  socket-sphere ring.
+- **`/api/v1/viz/fleet/topology` cache-miss latency reduced ~800 ms →
+  ~2 ms** under PR 10's push ingestion; steady-state stale-flicker
+  eliminated.
+- **`HeartbeatRequest` gained proto field 4 (`bytes fleet_snapshot_json`,
+  additive).** Recommended upgrade order: server → gateway → agents.
 - **`/api/v1/viz/fleet/topology` envelope `schema_minor` bumped `1 → 2`.**
   Additive evolution per the existing contract — renderers MUST ignore
   unknown keys, so consumers ignoring `schema_minor` see no break.
@@ -47,6 +91,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `connections` array length per machine as a proxy for "active IPC
   pairs" should re-baseline after upgrade** — the count will trend lower
   by the unmatched-half count, which is typically small but non-zero.
+
+### Deprecated
+
+- **`connections[]` entries with `state: "LISTEN"`** are now duplicated
+  in the new `listeners[]` array (PR 9). For one release
+  `connections[]` continues to emit LISTEN rows alongside the new
+  array so consumers filtering `connections` by `state: LISTEN` are
+  not broken silently. A future release will remove LISTEN entries
+  from `connections[]` with a **Breaking** CHANGELOG entry; migrate
+  strict consumers to read `listeners[]` now.
 
 ### Build / Dev infrastructure
 

@@ -87,6 +87,22 @@ struct ConnectionEdge {
     std::string state; ///< ESTABLISHED, CLOSE_WAIT, etc.
 };
 
+/// One LISTEN socket on a fleet machine. PR 9 / UAT 2026-05-12 split
+/// these out of the `connections` array so the renderer can draw a
+/// per-port socket primitive on the cube top face — operators expect
+/// "the ports a machine is listening on" to be a first-class visual,
+/// not a derived facet of an active flow array that drops LISTEN-only
+/// rows. `pid` and `process_name` carry whatever the agent attached to
+/// the listening socket; `pid==0` means the agent couldn't resolve the
+/// owner (common on Linux when the process is owned by another user
+/// and /proc/<pid>/fd is unreadable).
+struct ListenerSocket {
+    std::string proto; ///< "tcp" / "tcp6" / "udp" / "udp6"
+    int port{0};
+    uint32_t pid{0};
+    std::string process_name;
+};
+
 /// One fleet machine -- a cube in the 3D scene.
 struct MachineNode {
     std::string agent_id;
@@ -95,6 +111,7 @@ struct MachineNode {
     std::vector<std::string> local_ips;
     std::vector<ProcessNode> processes;
     std::vector<ConnectionEdge> connections;
+    std::vector<ListenerSocket> listeners;
     /// True when the agent failed to respond within the dispatch deadline
     /// or when the snapshot is older than the cache TTL. Renderer uses
     /// this to dim the cube and show "stale" overlay.
@@ -184,15 +201,18 @@ inline void to_json(nlohmann::json& j, const ConnectionEdge& e) {
         j["dst_pid"] = e.dst_pid;
 }
 
+inline void to_json(nlohmann::json& j, const ListenerSocket& l) {
+    j = {{"proto", l.proto}, {"port", l.port}};
+    if (l.pid != 0)
+        j["pid"] = l.pid;
+    if (!l.process_name.empty())
+        j["process_name"] = l.process_name;
+}
+
 inline void to_json(nlohmann::json& j, const MachineNode& m) {
-    j = {{"agent_id", m.agent_id},
-         {"hostname", m.hostname},
-         {"os", m.os},
-         {"local_ips", m.local_ips},
-         {"processes", m.processes},
-         {"connections", m.connections},
-         {"stale", m.stale},
-         {"ts", m.ts}};
+    j = {{"agent_id", m.agent_id},   {"hostname", m.hostname},   {"os", m.os},
+         {"local_ips", m.local_ips}, {"processes", m.processes}, {"connections", m.connections},
+         {"listeners", m.listeners}, {"stale", m.stale},         {"ts", m.ts}};
     if (m.truncated_processes)
         j["truncated_processes"] = true;
     if (m.truncated_connections)
@@ -204,7 +224,9 @@ inline void to_json(nlohmann::json& j, const TopologySnapshot& s) {
     // keys. Bumped 1 -> 2 in PR 8 to advertise ConnectionEdge.dst_pid on
     // EdgeScope::Local edges.
     j = {{"schema", "fleet_topology.v1"},
-         {"schema_minor", 2},
+         // schema_minor bump 2 → 3: adds per-MachineNode `listeners` array
+         // (PR 9 / UAT 2026-05-12). Additive — older renderers ignore.
+         {"schema_minor", 3},
          {"generated_at", s.generated_at},
          {"include_vuln", s.include_vuln},
          {"machines", s.machines}};

@@ -224,9 +224,52 @@ struct CommandContextImpl {
     size_t output_buffer_bytes{0};
     std::mutex buf_mu;
 
+    // PR 10 / UAT 2026-05-12 — Push-based snapshot ingestion.
+    //
+    // When `capture` is non-null, plugin output is accumulated into
+    // this string (newline-joined between calls) instead of being
+    // streamed back to the server. The snapshot-pump thread uses this
+    // path to invoke `tar.fleet_snapshot` locally and harvest the JSON
+    // payload without touching the gRPC channel. `stream` and
+    // `write_mu` are nullptr/unused in that mode; `flush_output_locked`
+    // short-circuits.
+    std::string* capture{nullptr};
+
+    // PR 10 hardening — capture-mode upper bound (UP-9). The pump
+    // ships the captured string in the next HeartbeatRequest; gRPC's
+    // default 4 MiB inbound cap is the hard server-side ceiling, but
+    // we want a tighter agent-side cap so an oversized snapshot is
+    // *truncated with a marker* rather than retained-and-failing. The
+    // 2 MiB value matches `FleetTopologyStore::kPushedSnapshotMaxBytes`
+    // on the server (in-tree convention: same constant in two places
+    // until typed proto lands and renders both moot).
+    static constexpr std::size_t kCaptureMaxBytes = 2ull * 1024 * 1024;
+    bool capture_truncated{false};
+
     void append_output(const char* text) {
         std::lock_guard lock(buf_mu);
         size_t len = std::strlen(text);
+        if (capture) {
+            // Capture mode: append directly to the operator-owned buffer
+            // with a newline separator between successive writes, matching
+            // the wire format the plugin would have emitted if streamed.
+            if (capture_truncated)
+                return;
+            std::size_t prospective = capture->size() + (capture->empty() ? 0 : 1) + len;
+            if (prospective > kCaptureMaxBytes) {
+                // Truncate with a sentinel suffix so the server-side
+                // parser cleanly rejects the payload as malformed JSON
+                // rather than ingesting a half-finished structure. The
+                // pump emits a WARN; next pump cycle overwrites.
+                capture->append("\n/* TRUNCATED — exceeded kCaptureMaxBytes */");
+                capture_truncated = true;
+                return;
+            }
+            if (!capture->empty())
+                capture->push_back('\n');
+            capture->append(text, len);
+            return;
+        }
         output_buffer.emplace_back(text, len);
         output_buffer_bytes += len;
         if (output_buffer_bytes >= kOutputFlushThreshold) {
@@ -241,6 +284,11 @@ struct CommandContextImpl {
 
 private:
     void flush_output_locked() {
+        // Capture mode keeps everything in `capture` already; nothing to
+        // flush over the wire. Skipping this guard would call into
+        // `stream->Write` on a null stream and crash the pump thread.
+        if (capture)
+            return;
         if (output_buffer.empty())
             return;
 
@@ -695,6 +743,77 @@ public:
             }
         }
 
+        // PR 10 / UAT 2026-05-12 — snapshot pump is spawned ONCE, not
+        // per-reconnect. The pump runs through reconnects, keeping the
+        // shared `latest_snapshot_` buffer warm; the heartbeat thread
+        // (which IS re-spawned per connection) reads from it and ships
+        // it on the next heartbeat. This means a brief disconnect does
+        // not cost us the next push — the pump kept producing while
+        // the link was down, the first reconnected heartbeat carries
+        // the latest snapshot.
+        //
+        // Pump is gated on the TAR plugin being loaded; minimal /
+        // embedded agent variants without TAR simply leave the slot
+        // empty and the server falls back to dispatch-on-get.
+        {
+            const YuzuPluginDescriptor* tar_descriptor = nullptr;
+            for (const auto& handle : plugins_) {
+                if (std::string_view{handle.descriptor()->name} == "tar") {
+                    tar_descriptor = handle.descriptor();
+                    break;
+                }
+            }
+            if (tar_descriptor) {
+                snapshot_pump_thread_ = std::thread([this, tar_descriptor]() {
+                    spdlog::info("Snapshot pump started (interval=30s, action=tar.fleet_snapshot)");
+                    constexpr auto kFirstDelay = std::chrono::seconds{5};
+                    constexpr auto kInterval = std::chrono::seconds{30};
+                    auto sleep_for = [this](std::chrono::seconds total) {
+                        auto remaining = total;
+                        while (remaining.count() > 0 &&
+                               !stop_requested_.load(std::memory_order_acquire)) {
+                            auto step = std::min(remaining, std::chrono::seconds{2});
+                            std::this_thread::sleep_for(step);
+                            remaining -= step;
+                        }
+                    };
+                    sleep_for(kFirstDelay);
+                    while (!stop_requested_.load(std::memory_order_acquire)) {
+                        std::string captured;
+                        CommandContextImpl ctx_impl{};
+                        ctx_impl.command_id = "__local_snapshot_pump__";
+                        ctx_impl.start_time = std::chrono::steady_clock::now();
+                        ctx_impl.capture = &captured;
+                        auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
+                        int rc = tar_descriptor->execute(raw_ctx, "fleet_snapshot", nullptr, 0);
+                        ctx_impl.flush_output(); // no-op in capture mode
+                        if (ctx_impl.capture_truncated) {
+                            // Truncated payload would be rejected by
+                            // the server parser; drop on the floor and
+                            // hope the next pump cycle produces a
+                            // healthy snapshot. Don't advance the seq —
+                            // last-known-good stays attached on the
+                            // next heartbeat.
+                            spdlog::warn("Snapshot pump: capture truncated at "
+                                         "{}B; dropping this cycle's snapshot",
+                                         captured.size());
+                        } else if (rc == 0 && !captured.empty()) {
+                            std::lock_guard lock(snapshot_mu_);
+                            latest_snapshot_ = std::move(captured);
+                            latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
+                        } else if (rc != 0) {
+                            spdlog::warn("Snapshot pump: tar.fleet_snapshot rc={}, captured={}B",
+                                         rc, captured.size());
+                        }
+                        sleep_for(kInterval);
+                    }
+                    spdlog::info("Snapshot pump stopped");
+                });
+            } else {
+                spdlog::info("Snapshot pump skipped: TAR plugin not loaded");
+            }
+        }
+
         // 3. Register with server — with reconnect loop
         int reconnect_count = 0;
         constexpr int kMaxReconnectDelaySecs = 300; // 5 minutes max backoff
@@ -959,6 +1078,12 @@ public:
                             return stop_requested_.load(std::memory_order_acquire) ||
                                    heartbeat_stop_.load(std::memory_order_acquire);
                         };
+                        // PR 10: per-thread last-shipped snapshot generation.
+                        // Stays inside the heartbeat lambda so reconnects
+                        // see seq=0 first and re-ship whatever the pump
+                        // last produced — important so a flapping link
+                        // doesn't leave the server reading a stale slot.
+                        uint64_t last_attached_seq = 0;
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
                             auto remaining = cfg_.heartbeat_interval;
@@ -992,6 +1117,26 @@ public:
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
                             tags["yuzu.healthy"] = "1";
+
+                            // PR 10: attach pushed fleet snapshot if the
+                            // pump produced something newer than what
+                            // we last shipped. `last_attached_seq` is a
+                            // per-heartbeat-thread local; the pump's
+                            // monotonic counter is the source of truth.
+                            // Empty attach when no new snapshot is
+                            // available — keeps quiescent heartbeats at
+                            // their pre-PR-10 size.
+                            {
+                                const auto cur_seq =
+                                    latest_snapshot_seq_.load(std::memory_order_acquire);
+                                if (cur_seq > last_attached_seq) {
+                                    std::lock_guard lock(snapshot_mu_);
+                                    if (!latest_snapshot_.empty()) {
+                                        req.set_fleet_snapshot_json(latest_snapshot_);
+                                        last_attached_seq = cur_seq;
+                                    }
+                                }
+                            }
 
                             pb::HeartbeatResponse resp;
                             auto status = hb_stub->Heartbeat(&ctx, req, &resp);
@@ -1264,6 +1409,12 @@ public:
                 if (heartbeat_thread_.joinable()) {
                     heartbeat_thread_.join();
                 }
+                // PR 10: the snapshot pump is intentionally NOT joined
+                // here. It is a Run()-lifetime thread that survives
+                // reconnects, so the heartbeat thread of the next
+                // connection cycle finds a warm latest_snapshot_ and
+                // ships it immediately. The pump joins only at final
+                // shutdown, below — see the Run()-exit cleanup.
 
                 // Only shutdown plugins on final exit — keep them loaded for reconnect
                 if (stop_requested_.load(std::memory_order_acquire)) {
@@ -1294,6 +1445,15 @@ public:
             }
             break; // stop_requested
         }          // end while (reconnect loop)
+
+        // PR 10: snapshot pump joined here, post reconnect loop. The
+        // pump observes `stop_requested_` (set in stop() above) and
+        // exits at the next 2 s slice boundary; joining at final
+        // shutdown means the thread is collected before Run() returns
+        // and the AgentImpl dtor sees a default-constructed thread.
+        if (snapshot_pump_thread_.joinable()) {
+            snapshot_pump_thread_.join();
+        }
     }
 
     void stop() noexcept override {
@@ -1340,6 +1500,22 @@ private:
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;
     std::thread heartbeat_thread_;
+
+    // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
+    //
+    // `snapshot_pump_thread_` runs `tar.fleet_snapshot` locally on a
+    // 30 s interval, captures the JSON, and stashes it under
+    // `snapshot_mu_`. The heartbeat thread reads `latest_snapshot_`
+    // each iteration; if `latest_snapshot_seq_` advanced since the
+    // heartbeat's `last_attached_snapshot_seq_`, the snapshot rides
+    // out on the next HeartbeatRequest.fleet_snapshot_json field.
+    // Together they replace the previous dispatch-on-get path for
+    // /api/v1/viz/fleet/topology, so the renderer reads from
+    // per-agent slots that the agents themselves keep current.
+    std::thread snapshot_pump_thread_;
+    std::mutex snapshot_mu_;
+    std::string latest_snapshot_;                  // last JSON produced by pump
+    std::atomic<uint64_t> latest_snapshot_seq_{0}; // monotonically increases on each new snapshot
 
     // M8: Command replay protection — double-buffer dedup of command IDs.
     // Two sets: "current" and "previous". When current fills, previous is

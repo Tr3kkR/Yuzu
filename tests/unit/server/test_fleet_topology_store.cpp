@@ -358,7 +358,7 @@ TEST_CASE("topology: dst_pid serializes only when non-zero; schema_minor bumped"
     auto snap = store.get(false);
     json j = *snap;
 
-    CHECK(j["schema_minor"] == 2);
+    CHECK(j["schema_minor"] == 3); // PR 9: listeners[] added
 
     const auto& edges = j["machines"][0]["connections"];
     REQUIRE(edges.size() == 3);

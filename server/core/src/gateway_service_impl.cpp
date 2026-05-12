@@ -1,5 +1,8 @@
 #include "gateway_service_impl.hpp"
 
+#include <nlohmann/json.hpp>
+
+#include "fleet_topology_store.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 
@@ -7,10 +10,11 @@ namespace yuzu::server::detail {
 
 // -- Constructor --------------------------------------------------------------
 
-GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(
-    AgentRegistry& registry, EventBus& bus, auth::AuthManager& auth_mgr,
-    auth::AutoApproveEngine& auto_approve, yuzu::MetricsRegistry* metrics,
-    AgentHealthStore* health_store)
+GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, EventBus& bus,
+                                                       auth::AuthManager& auth_mgr,
+                                                       auth::AutoApproveEngine& auto_approve,
+                                                       yuzu::MetricsRegistry* metrics,
+                                                       AgentHealthStore* health_store)
     : registry_(registry), bus_(bus), auth_mgr_(auth_mgr), auto_approve_(auto_approve),
       metrics_(metrics), health_store_(health_store) {}
 
@@ -33,78 +37,77 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*co
     }
 
     {
-    const auto& enrollment_token = request->enrollment_token();
+        const auto& enrollment_token = request->enrollment_token();
 
-    if (!enrollment_token.empty()) {
-        if (!auth_mgr_.validate_enrollment_token(enrollment_token)) {
-            spdlog::warn("[gateway] Agent {} presented invalid enrollment token",
-                         info.agent_id());
-            response->set_accepted(false);
-            response->set_reject_reason("invalid, expired, or exhausted enrollment token");
-            response->set_enrollment_status("denied");
-            return grpc::Status::OK;
-        }
-        spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token", info.agent_id());
-        if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(),
-                                       info.platform().os(), info.platform().arch(),
-                                       info.agent_version())) {
-            response->set_accepted(false);
-            response->set_reject_reason("enrollment denied by administrator");
-            response->set_enrollment_status("denied");
-            return grpc::Status::OK;
-        }
-    } else {
-        // Auto-approve policies (no peer IP available from gateway yet)
-        auth::ApprovalContext approval_ctx;
-        approval_ctx.hostname = info.hostname();
-        approval_ctx.attestation_provider = request->attestation_provider();
-
-        auto matched_rule = auto_approve_.evaluate(approval_ctx);
-        if (!matched_rule.empty()) {
-            spdlog::info("[gateway] Agent {} auto-approved by policy: {}", info.agent_id(),
-                         matched_rule);
-            if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(),
-                                           info.platform().os(), info.platform().arch(),
-                                           info.agent_version())) {
+        if (!enrollment_token.empty()) {
+            if (!auth_mgr_.validate_enrollment_token(enrollment_token)) {
+                spdlog::warn("[gateway] Agent {} presented invalid enrollment token",
+                             info.agent_id());
+                response->set_accepted(false);
+                response->set_reject_reason("invalid, expired, or exhausted enrollment token");
+                response->set_enrollment_status("denied");
+                return grpc::Status::OK;
+            }
+            spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token", info.agent_id());
+            if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(), info.platform().os(),
+                                           info.platform().arch(), info.agent_version())) {
                 response->set_accepted(false);
                 response->set_reject_reason("enrollment denied by administrator");
                 response->set_enrollment_status("denied");
                 return grpc::Status::OK;
             }
         } else {
-            // Tier 1: pending queue
-            auto pending_status = auth_mgr_.get_pending_status(info.agent_id());
+            // Auto-approve policies (no peer IP available from gateway yet)
+            auth::ApprovalContext approval_ctx;
+            approval_ctx.hostname = info.hostname();
+            approval_ctx.attestation_provider = request->attestation_provider();
 
-            if (!pending_status) {
-                auth_mgr_.add_pending_agent(info.agent_id(), info.hostname(),
-                                            info.platform().os(), info.platform().arch(),
-                                            info.agent_version());
+            auto matched_rule = auto_approve_.evaluate(approval_ctx);
+            if (!matched_rule.empty()) {
+                spdlog::info("[gateway] Agent {} auto-approved by policy: {}", info.agent_id(),
+                             matched_rule);
+                if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(),
+                                               info.platform().os(), info.platform().arch(),
+                                               info.agent_version())) {
+                    response->set_accepted(false);
+                    response->set_reject_reason("enrollment denied by administrator");
+                    response->set_enrollment_status("denied");
+                    return grpc::Status::OK;
+                }
+            } else {
+                // Tier 1: pending queue
+                auto pending_status = auth_mgr_.get_pending_status(info.agent_id());
 
-                response->set_accepted(false);
-                response->set_reject_reason("awaiting admin approval");
-                response->set_enrollment_status("pending");
-                bus_.publish("pending-agent", info.agent_id());
-                spdlog::info("[gateway] Agent {} placed in pending queue", info.agent_id());
-                return grpc::Status::OK;
-            }
+                if (!pending_status) {
+                    auth_mgr_.add_pending_agent(info.agent_id(), info.hostname(),
+                                                info.platform().os(), info.platform().arch(),
+                                                info.agent_version());
 
-            switch (*pending_status) {
-            case auth::PendingStatus::pending:
-                response->set_accepted(false);
-                response->set_reject_reason("still awaiting admin approval");
-                response->set_enrollment_status("pending");
-                return grpc::Status::OK;
-            case auth::PendingStatus::denied:
-                response->set_accepted(false);
-                response->set_reject_reason("enrollment denied by administrator");
-                response->set_enrollment_status("denied");
-                return grpc::Status::OK;
-            case auth::PendingStatus::approved:
-                spdlog::info("[gateway] Agent {} enrolled (admin-approved)", info.agent_id());
-                break;
+                    response->set_accepted(false);
+                    response->set_reject_reason("awaiting admin approval");
+                    response->set_enrollment_status("pending");
+                    bus_.publish("pending-agent", info.agent_id());
+                    spdlog::info("[gateway] Agent {} placed in pending queue", info.agent_id());
+                    return grpc::Status::OK;
+                }
+
+                switch (*pending_status) {
+                case auth::PendingStatus::pending:
+                    response->set_accepted(false);
+                    response->set_reject_reason("still awaiting admin approval");
+                    response->set_enrollment_status("pending");
+                    return grpc::Status::OK;
+                case auth::PendingStatus::denied:
+                    response->set_accepted(false);
+                    response->set_reject_reason("enrollment denied by administrator");
+                    response->set_enrollment_status("denied");
+                    return grpc::Status::OK;
+                case auth::PendingStatus::approved:
+                    spdlog::info("[gateway] Agent {} enrolled (admin-approved)", info.agent_id());
+                    break;
+                }
             }
         }
-    }
     } // end enrollment checks
 
 gw_enrolled:
@@ -159,15 +162,45 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* /*c
             health_store_->upsert(agent_id, hb.status_tags());
         }
         if (metrics_) {
-            metrics_->counter("yuzu_heartbeats_received_total", {{"via", "gateway"}})
-                .increment();
+            metrics_->counter("yuzu_heartbeats_received_total", {{"via", "gateway"}}).increment();
+        }
+        // PR 10 / UAT 2026-05-12 — gateway-routed agents push their
+        // fleet_snapshot.v1 through the same HeartbeatRequest field
+        // as direct agents. Parse via the shared
+        // FleetTopologyStore::parse_fleet_snapshot_json so caps,
+        // exception sanitisation, and field set stay in lock-step
+        // with the direct-heartbeat ingest path (arch-B3 / cons-S1).
+        // Parse failures are non-fatal — a single buggy agent must not
+        // knock the batch handler offline.
+        if (fleet_topology_store_ && !hb.fleet_snapshot_json().empty()) {
+            std::string os_from_session;
+            if (auto sess = registry_.get_session(agent_id))
+                os_from_session = sess->os;
+            std::string parse_err;
+            auto parsed = yuzu::server::FleetTopologyStore::parse_fleet_snapshot_json(
+                hb.fleet_snapshot_json(), agent_id, os_from_session, &parse_err);
+            if (parsed.has_value()) {
+                fleet_topology_store_->push_snapshot(std::move(*parsed));
+                if (metrics_) {
+                    metrics_->counter("yuzu_viz_topology_pushed_total", {{"via", "gateway"}})
+                        .increment();
+                }
+            } else {
+                spdlog::warn("[gateway] BatchHeartbeat fleet_snapshot from agent={} rejected ({})",
+                             agent_id, parse_err);
+                if (metrics_) {
+                    metrics_
+                        ->counter("yuzu_viz_topology_push_parse_errors_total", {{"via", "gateway"}})
+                        .increment();
+                }
+            }
         }
         ++acked;
     }
 
     response->set_acknowledged_count(acked);
-    spdlog::debug("[gateway] BatchHeartbeat from node '{}': {}/{} acked",
-                  request->gateway_node(), acked, request->heartbeats_size());
+    spdlog::debug("[gateway] BatchHeartbeat from node '{}': {}/{} acked", request->gateway_node(),
+                  acked, request->heartbeats_size());
     return grpc::Status::OK;
 }
 
@@ -200,12 +233,12 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*c
             std::string json_str(data_bytes.begin(), data_bytes.end());
             inventory_store_->upsert(agent_id, plugin_name, json_str, collected_epoch);
         }
-        spdlog::info("[gateway] ProxyInventory persisted for agent={}, plugins={}",
-                      agent_id, request->plugin_data_size());
+        spdlog::info("[gateway] ProxyInventory persisted for agent={}, plugins={}", agent_id,
+                     request->plugin_data_size());
     } else {
         spdlog::info("[gateway] ProxyInventory received for agent={}, plugins={} "
-                      "(inventory store not available)",
-                      agent_id, request->plugin_data_size());
+                     "(inventory store not available)",
+                     agent_id, request->plugin_data_size());
     }
     response->set_received(true);
     return grpc::Status::OK;
@@ -213,9 +246,10 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* /*c
 
 // -- NotifyStreamStatus -------------------------------------------------------
 
-grpc::Status GatewayUpstreamServiceImpl::NotifyStreamStatus(
-    grpc::ServerContext* /*context*/, const gw::StreamStatusNotification* request,
-    gw::StreamStatusAck* response) {
+grpc::Status
+GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* /*context*/,
+                                               const gw::StreamStatusNotification* request,
+                                               gw::StreamStatusAck* response) {
     const auto& agent_id = request->agent_id();
     const auto& session_id = request->session_id();
 

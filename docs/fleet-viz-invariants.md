@@ -168,6 +168,105 @@ Standing rules:
   an integer before formatting (sec-M1 mirror of renderer rule).
 - **Soft cap.** 1000 process dots per cube; bundle size cap <80 KB.
 
+## Listener-socket invariants — PR 9
+
+- **`listeners[]` is the source of truth for LISTEN sockets.** Server-side
+  `build_snapshot()` lifts every LISTEN-state row from the agent's
+  `fleet_snapshot.v1` `connections[]` into a typed `ListenerSocket`
+  entry. Renderer reads `machine.listeners`, never filters `connections`
+  by state.
+- **Dual-emit during deprecation.** For one release the same LISTEN row
+  is *also* kept in `connections[]` (with `scope=external`) so
+  pre-PR-9 consumers filtering `connections` by `state == "LISTEN"`
+  don't break silently. Removal is gated on a `Breaking` CHANGELOG
+  entry in a future release.
+- **`pid == 0` is valid.** Agents that can't resolve the owning process
+  emit `pid` omitted (treated as 0). Renderer renders the sphere with
+  the "owner pid not reported" tooltip; no process-dot linkage.
+- **Schema bump.** `schema_minor` is `3` (was `2` in PR 8).
+- **Hostname label position.** Labels render BELOW each cube (not above)
+  so the top-face socket-sphere area stays unoccluded. Fixed UAT
+  decision (2026-05-12); do not revert without UAT sign-off.
+- **Socket primitives.** `SphereGeometry(SOCKET_DOT_RADIUS, 10, 8)` on a
+  ring of radius `CUBE_SIZE * 0.32` on the cube top face; port label
+  Sprite floats `0.55` units above each sphere. Listener sphere colour
+  is cream (`0xfff2cc`) — distinct from the cooler process-dot
+  palette so operators see them as "ports" not "processes".
+- **Cross-machine edges.** ESTABLISHED-state `connections` outbound
+  from one cube's `local_ips` resolve to the destination's
+  `listeners[]` socket position when `(dst_addr, dst_port)` matches.
+  Fallback: cube centre (peer's listener wasn't in the snapshot).
+  No match anywhere → external stub line + grey ring marker.
+- **Raycast order.** sockets → processes → edges → cubes. Sockets are
+  most-specific and operator-actionable; the cube face is least.
+
+## Push-ingestion invariants — PR 10
+
+- **`fleet_snapshot_json` is additive proto field 4 on
+  `HeartbeatRequest`.** Agents push the JSON every 30 s on their
+  snapshot-pump cadence; server ingests via
+  `FleetTopologyStore::push_snapshot()`. Old agents send empty and
+  the server's legacy dispatch path takes over.
+- **Shared parser is the single source of truth.**
+  `FleetTopologyStore::parse_fleet_snapshot_json` is called from
+  every ingestion site (direct `Heartbeat`, gateway `BatchHeartbeat`,
+  legacy dispatch fetcher). Caps + exception sanitisation + field
+  set stay in lock-step by construction. **Adding a new field means
+  exactly one code edit** (the parser); future drift would defeat
+  the invariant.
+- **Row caps.** `kPushedSnapshotMaxRows = 4096` for both
+  `processes[]` and `connections[]`. `kPushedSnapshotMaxBytes = 2
+  MiB` for the whole payload. Caps match the agent-side
+  `kFleetSnapshotMaxRows` so a legitimate snapshot never trips them.
+- **Trust boundary.** `agent_id` and `os` are session-authenticated
+  values passed *into* the parser, never read from JSON. JSON
+  `hostname`, `local_ips`, `processes[]`, etc. are agent-controlled
+  and may be fabricated; callers that need cross-agent validation
+  apply it after the parser returns.
+- **IP-spoof defence.** `pushed_` keeps a reverse `ip_owner_` index;
+  a push claiming a `local_ip` already owned by a DIFFERENT
+  `agent_id` is rejected wholesale, counted at
+  `pushed_rejected_count_`, and audited as `topology.push.rejected`.
+- **Push-staleness.** A pushed snapshot whose `ts` is older than
+  `kPushedStaleAfter` (90 s) is marked `stale=true` at
+  `build_snapshot` time even if the producer didn't set the flag.
+  This makes a stuck pump (UP-3) visible to operators within the
+  TTL window.
+- **`pushed_` holds `shared_ptr<const RawAgentSnapshot>`.** Readers
+  in `get()` copy pointer handles, not the underlying 5–20 KB
+  struct. O(N) pointer walk under `pushed_mu_` instead of O(N×K)
+  deep copy (UP-15).
+- **No invalidate-on-push.** Cache TTL alone bounds rendered
+  staleness; `push_snapshot` does NOT invalidate the slot cache
+  (perf-B1 / UP-6). At 100k-agent / 30s cadence the previous
+  behaviour fired ~3,333 invalidations/sec and serialised readers
+  behind the write lock.
+- **Eviction on disconnect.** `evict_pushed(agent_id)` runs when an
+  agent's Subscribe stream closes, dropping the slot + freeing IP
+  claims (sec-M4 / UP-5). Re-enrolling agents start clean.
+- **Audit emission.** First push per agent per process lifetime
+  emits `topology.push.first` (CC6.1/CC7.3 evidence chain).
+  Rejections emit `topology.push.rejected`. Successful subsequent
+  pushes are NOT audited individually — per-heartbeat audit at
+  3,333/sec would overwhelm `audit.db`. Counter
+  `yuzu_viz_topology_pushed_total{via=...}` is the canonical
+  per-push metric.
+- **Capture-mode CommandContextImpl on the agent.** Agent's
+  snapshot pump invokes `tar.fleet_snapshot` locally with a
+  `capture` pointer that diverts plugin output into a stack-local
+  string. Capture buffer caps at 2 MiB (UP-9); truncated payloads
+  are dropped on the floor (seq does NOT advance) so the next pump
+  cycle ships a fresh non-truncated snapshot. Pump thread is
+  Run()-lifetime — spawned once before the reconnect loop, joined
+  post-loop — so a brief disconnect doesn't drop the snapshot
+  buffer.
+- **gpb regen.** The Erlang gateway's `*_pb.erl` files must carry
+  field 4 of `HeartbeatRequest`; verify via `beam_lib:chunks(...,
+  [atoms])` after `rebar3 compile`. Without the field on the
+  gateway, gpb silently strips it on re-encode and the server
+  falls back to dispatch for gateway-routed agents — visible only
+  as `yuzu_viz_topology_pushed_total{via="gateway"} == 0`.
+
 ## Cross-references
 
 - REST API surface: `docs/user-manual/rest-api.md` § Fleet Visualization

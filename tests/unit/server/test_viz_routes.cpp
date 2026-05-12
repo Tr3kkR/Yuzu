@@ -139,7 +139,7 @@ TEST_CASE("REST viz: GET JSON returns fleet_topology.v1 envelope", "[viz][routes
     REQUIRE(j.contains("schema"));
     CHECK(j["schema"].get<std::string>() == "fleet_topology.v1");
     REQUIRE(j.contains("schema_minor"));
-    CHECK(j["schema_minor"].get<int>() == 2);
+    CHECK(j["schema_minor"].get<int>() == 3); // PR 9: listeners[] added
     REQUIRE(j.contains("machines"));
     REQUIRE(j["machines"].is_array());
     CHECK(j["machines"].size() == 2);
@@ -173,7 +173,7 @@ TEST_CASE("REST viz: GET fragment wraps the same JSON in <script> tag", "[viz][r
     REQUIRE(j.contains("schema"));
     CHECK(j["schema"].get<std::string>() == "fleet_topology.v1");
     REQUIRE(j.contains("schema_minor"));
-    CHECK(j["schema_minor"].get<int>() == 2);
+    CHECK(j["schema_minor"].get<int>() == 3); // PR 9: listeners[] added
 
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].detail.find("fragment=1") != std::string::npos);

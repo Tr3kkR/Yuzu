@@ -370,6 +370,123 @@ function buildHostnameLabel(hostname) {
   return sprite;
 }
 
+// ── PR 9 / UAT 2026-05-12: socket primitive + cross-machine edges ─────────
+// Listening sockets render as small bright spheres around the top face of
+// each cube; ESTABLISHED connections render as lines joining the source
+// socket to the destination's listening socket on the peer machine (or to
+// a stub marker if the destination is outside the fleet).
+
+const SOCKET_DOT_RADIUS = 0.34;
+const SOCKET_RING_RADIUS = CUBE_SIZE * 0.32;    // ring radius on top face
+const SOCKET_TOP_Y = CUBE_SIZE * 0.5 + 0.30;    // small lift above top face
+const SOCKET_LABEL_Y = SOCKET_TOP_Y + 0.55;     // port label sits just above sphere
+const EDGE_OPACITY_INTERNAL = 0.85;             // fleet ↔ fleet
+const EDGE_OPACITY_EXTERNAL = 0.40;             // fleet → off-cluster
+const EXTERNAL_STUB_LENGTH = CUBE_SIZE * 0.45;
+
+// Normalise an IPv4-mapped-in-IPv6 address (`::ffff:192.168.1.5`) into the
+// bare v4 form so `dst_addr` matches against `machine.local_ips` reliably.
+// Bare v6 / v4 / empty are returned unchanged.
+function normIp(addr) {
+  if (!addr) return '';
+  const s = String(addr);
+  const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(s);
+  return m ? m[1] : s;
+}
+
+// Walk a machine's `listeners` array (schema_minor 3, added by the
+// server in PR 9 / UAT 2026-05-12) and return its unique LISTEN
+// sockets. Dual-stack `tcp` + `tcp6` LISTENs on the same port collapse
+// into one visible socket (operators perceive them as one bound port).
+// `connections[]` is NOT consulted: the server strips LISTEN-only rows
+// from that array because they'd render as edges into the void; the
+// dedicated `listeners[]` field is the renderer's source of truth.
+function extractListenSockets(machine) {
+  if (!machine || !Array.isArray(machine.listeners)) return [];
+  const seen = new Map();
+  for (let i = 0; i < machine.listeners.length; i++) {
+    const l = machine.listeners[i];
+    if (!l) continue;
+    const port = Number(l.port);
+    if (!Number.isFinite(port) || port <= 0) continue;
+    const proto = String(l.proto || 'tcp').toLowerCase();
+    const protoNorm = (proto === 'tcp6' ? 'tcp' : proto === 'udp6' ? 'udp' : proto);
+    const key = protoNorm + ':' + port;
+    if (seen.has(key)) continue;
+    seen.set(key, {
+      port: port,
+      proto: protoNorm,
+      pid: Number(l.pid) | 0,
+      process_name: l.process_name || null
+    });
+  }
+  return Array.from(seen.values()).sort(function (a, b) {
+    return a.port - b.port;
+  });
+}
+
+// Lay N listening sockets out on a ring on the cube's top face.
+// Returns cube-local coordinates so the caller attaches them to a Group
+// that's a child of the cube (same parent-transform pattern as PR 7).
+function placeSocketsOnCube(sockets) {
+  const n = sockets.length;
+  const out = [];
+  if (n === 0) return out;
+  const ringR = n <= 1 ? 0 : SOCKET_RING_RADIUS;
+  for (let i = 0; i < n; i++) {
+    const theta = n <= 1 ? 0 : (2 * Math.PI * i) / n;
+    out.push({
+      socket: sockets[i],
+      x: ringR * Math.cos(theta),
+      y: SOCKET_TOP_Y,
+      z: ringR * Math.sin(theta)
+    });
+  }
+  return out;
+}
+
+function buildSocketSphere(socket, procName) {
+  const geom = new THREE.SphereGeometry(SOCKET_DOT_RADIUS, 10, 8);
+  // Warm cream against the dark canvas so listeners read as "open ports"
+  // visually distinct from the cooler-coloured process dots inside the
+  // cube. Single colour: protocol/port semantics live in the tooltip,
+  // not in the colour channel.
+  const mat = new THREE.MeshBasicMaterial({color: 0xfff2cc});
+  const mesh = new THREE.Mesh(geom, mat);
+  mesh.userData.yuzuSocket = {
+    port: socket.port,
+    proto: socket.proto,
+    pid: socket.pid,
+    proc_name: procName || null
+  };
+  return mesh;
+}
+
+function buildPortLabel(port) {
+  // Same canvas-Sprite recipe as buildHostnameLabel — keeps the renderer
+  // free of CSS2DRenderer / DOM-overlay machinery and the label always
+  // faces the camera.
+  const canvas = document.createElement('canvas');
+  canvas.width = 96;
+  canvas.height = 40;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.font = 'bold 22px sans-serif';
+  ctx.fillStyle = '#fff2cc';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(':' + port, canvas.width / 2, canvas.height / 2);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.minFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  const mat = new THREE.SpriteMaterial({map: tex, transparent: true, depthTest: false});
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(2.2, 0.9, 1);
+  return sprite;
+}
+
 function buildScene() {
   const scene = new THREE.Scene();
   // Background pulled from CSS bg token at render time so theme switches
@@ -579,6 +696,13 @@ function mount() {
   // construction.
   const processMeshes = [];
 
+  // PR 9 / UAT 2026-05-12: socket spheres + cross-machine edge meshes
+  // tracked as flat raycast indices alongside cubeMeshes/processMeshes.
+  // Hover order (closest semantic first): sockets → processes → edges →
+  // cubes — see the raycaster block below for the rationale spelled out.
+  const socketMeshes = [];
+  const edgeMeshes = [];
+
   // gov R6 happy-S1 / UP-20: cubes carry a wireframe LineSegments child
   // (added in buildCube). The straight `for child of fleetGroup.children`
   // walk only sees the cube — wireframe geometry + material would never
@@ -609,6 +733,8 @@ function mount() {
     // case is a benign empty raycast rather than ray-against-disposed.
     cubeMeshes.length = 0;
     processMeshes.length = 0;
+    socketMeshes.length = 0;
+    edgeMeshes.length = 0;
     while (fleetGroup.children.length > 0) {
       const child = fleetGroup.children[0];
       fleetGroup.remove(child);
@@ -624,6 +750,17 @@ function mount() {
   function addMachines(machines) {
     clearFleet();
     const placements = layoutMachines(machines);
+
+    // PR 9: world-space socket positions keyed by `${normalisedIp}:${port}`.
+    // Built during the per-machine pass below, consumed by the cross-machine
+    // edge pass that runs once every cube is placed. A separate map for
+    // cube centres keyed by IP supports the "cube anchor" fallback when a
+    // destination IP is in the fleet but the matching listener wasn't
+    // captured in the snapshot (rare, but happens when the dst agent's
+    // snapshot is stale).
+    const socketWorldPos = new Map();
+    const cubeWorldPosByIp = new Map();
+
     for (let i = 0; i < placements.length; i++) {
       const p = placements[i];
       const cube = buildCube(p.machine);
@@ -631,7 +768,11 @@ function mount() {
       fleetGroup.add(cube);
       cubeMeshes.push(cube);
       const label = buildHostnameLabel(p.machine.hostname);
-      label.position.set(p.x, p.y + CUBE_SIZE * 0.85, p.z);
+      // Hostname label sits just below the cube (UAT request, 2026-05-12) so
+      // the volume above the cube stays clear for the asset-tag chip stack
+      // that ships separately and so operators reading the grid top-down
+      // associate the text with the machine immediately under it.
+      label.position.set(p.x, p.y - CUBE_SIZE * 0.85, p.z);
       fleetGroup.add(label);
 
       // PR 7: per-machine process subgroup. Attached as a child of the
@@ -708,6 +849,166 @@ function mount() {
             {color: 0xffffff, transparent: true, opacity: 0.3});
           const line = new THREE.LineSegments(geom, mat);
           processGroup.add(line);
+        }
+      }
+
+      // PR 9 / UAT 2026-05-12: socket spheres + port labels on the cube
+      // top face. Built per-machine because each cube owns its sockets;
+      // world-space positions are stashed in `socketWorldPos` so the
+      // cross-machine edge pass (below) can resolve dst_ip:dst_port to
+      // the matching socket on the peer cube.
+      const procNameByPid = new Map();
+      for (let q = 0; q < allProcs.length; q++) {
+        const pr = allProcs[q];
+        if (pr && Number.isFinite(pr.pid))
+          procNameByPid.set(pr.pid, pr.name || null);
+      }
+      const sockets = extractListenSockets(p.machine);
+      if (sockets.length > 0) {
+        const socketGroup = new THREE.Group();
+        socketGroup.name = 'yuzu-sockets';
+        cube.add(socketGroup);
+        const socketPlacements = placeSocketsOnCube(sockets);
+        for (let s = 0; s < socketPlacements.length; s++) {
+          const sp = socketPlacements[s];
+          // Prefer the server-supplied process_name on the listener
+          // (matches the listening socket's owning pid even when the
+          // process didn't appear in the processes[] array — e.g.
+          // owner pid lives in a different cgroup the agent couldn't
+          // walk). Fall back to the pid → name join on processes[].
+          const procName = sp.socket.process_name ||
+                           procNameByPid.get(sp.socket.pid) || null;
+          const sphere = buildSocketSphere(sp.socket, procName);
+          sphere.position.set(sp.x, sp.y, sp.z);
+          socketGroup.add(sphere);
+          socketMeshes.push(sphere);
+          const portLabel = buildPortLabel(sp.socket.port);
+          portLabel.position.set(sp.x, SOCKET_LABEL_Y, sp.z);
+          socketGroup.add(portLabel);
+
+          // Record world-space position so cross-machine edges land on
+          // the sphere. Every local_ip the snapshot reports is a valid
+          // anchor for this listener (LISTEN sockets typically bind to
+          // 0.0.0.0 / ::; the agent expands that into the machine's
+          // local_ips when populating the snapshot).
+          const wp = new THREE.Vector3(p.x + sp.x, p.y + sp.y, p.z + sp.z);
+          const ips = Array.isArray(p.machine.local_ips) ? p.machine.local_ips : [];
+          for (let ipi = 0; ipi < ips.length; ipi++) {
+            const ip = normIp(ips[ipi]);
+            if (ip) socketWorldPos.set(ip + ':' + sp.socket.port, wp);
+          }
+        }
+      }
+
+      // Also record the cube centre keyed by every local_ip — used by
+      // the edge pass when the destination IP belongs to a fleet machine
+      // but the matching LISTEN socket wasn't in its snapshot (stale or
+      // not-yet-ingested peer). The edge lands on the cube centre
+      // instead of dropping silently.
+      const cubeCentre = new THREE.Vector3(p.x, p.y, p.z);
+      const lips = Array.isArray(p.machine.local_ips) ? p.machine.local_ips : [];
+      for (let ipi = 0; ipi < lips.length; ipi++) {
+        const ip = normIp(lips[ipi]);
+        if (ip) cubeWorldPosByIp.set(ip, cubeCentre);
+      }
+    }
+
+    // ── PR 9 cross-machine edges ────────────────────────────────────────
+    // After every cube + socket is placed, walk every machine's
+    // ESTABLISHED connections and draw an edge from the source cube
+    // (which is *this* machine for any outbound or accepted half) to the
+    // destination socket on the peer cube. Two operators of dedup:
+    //   • Skip the inbound half of each ESTABLISHED pair — keep only
+    //     rows where src_addr ∈ this machine's local_ips. Source side
+    //     "owns" the edge; dst side renders the listening socket.
+    //   • Per-direction canonical key (srcIp:srcPort → dstIp:dstPort) so
+    //     two snapshots reporting the same connection from both ends
+    //     don't draw twice.
+    // External destinations (dst not in any fleet machine's local_ips)
+    // render as a short stub from the source cube going outward with a
+    // small marker the operator can hover for the off-cluster address.
+    const drawnEdges = new Set();
+    for (let i = 0; i < placements.length; i++) {
+      const p = placements[i];
+      const conns = Array.isArray(p.machine.connections) ? p.machine.connections : [];
+      const srcIps = new Set();
+      const localIps = Array.isArray(p.machine.local_ips) ? p.machine.local_ips : [];
+      for (let j = 0; j < localIps.length; j++) {
+        const ip = normIp(localIps[j]);
+        if (ip) srcIps.add(ip);
+      }
+      for (let k = 0; k < conns.length; k++) {
+        const c = conns[k];
+        if (!c || c.state !== 'ESTABLISHED') continue;
+        const srcIp = normIp(c.src_addr);
+        // Only draw from the "outbound" side. The accepted-side row has
+        // src_addr = local listener IP and we'd double-draw.
+        if (!srcIps.has(srcIp)) continue;
+        const dstIp = normIp(c.dst_addr);
+        const dstPort = Number(c.dst_port);
+        if (!dstIp || !Number.isFinite(dstPort)) continue;
+
+        const edgeKey = srcIp + ':' + (Number(c.src_port) | 0) + '→' +
+                        dstIp + ':' + dstPort;
+        if (drawnEdges.has(edgeKey)) continue;
+        drawnEdges.add(edgeKey);
+
+        const srcCubePos = new THREE.Vector3(p.x, p.y, p.z);
+        const dstSocketPos = socketWorldPos.get(dstIp + ':' + dstPort) ||
+                             cubeWorldPosByIp.get(dstIp);
+
+        let endPos, isExternal;
+        if (dstSocketPos) {
+          endPos = dstSocketPos;
+          isExternal = false;
+        } else {
+          // External destination — stub line pointing roughly away from
+          // the fleet centre so adjacent cubes don't have their stubs
+          // overlap with their neighbours' faces. Length is small so
+          // the marker stays clearly tethered to the source cube.
+          const fromCentre = srcCubePos.clone().normalize();
+          if (fromCentre.lengthSq() < 1e-6) fromCentre.set(1, 0, 0);
+          endPos = srcCubePos.clone().addScaledVector(fromCentre, EXTERNAL_STUB_LENGTH);
+          isExternal = true;
+        }
+
+        const geom = new THREE.BufferGeometry().setFromPoints([srcCubePos, endPos]);
+        // Internal edges in a cool blue; external stubs in a dimmer grey
+        // so the fleet-internal traffic reads as "ours" at a glance.
+        const colour = isExternal ? 0x8090a0 : 0x4ea8de;
+        const mat = new THREE.LineBasicMaterial({
+          color: colour,
+          transparent: true,
+          opacity: isExternal ? EDGE_OPACITY_EXTERNAL : EDGE_OPACITY_INTERNAL
+        });
+        const line = new THREE.Line(geom, mat);
+        line.userData.yuzuEdge = {
+          src_hostname: p.machine.hostname,
+          src_ip: srcIp,
+          src_port: Number(c.src_port) | 0,
+          dst_ip: dstIp,
+          dst_port: dstPort,
+          proto: String(c.proto || 'tcp'),
+          external: isExternal
+        };
+        fleetGroup.add(line);
+        edgeMeshes.push(line);
+
+        if (isExternal) {
+          // Tiny ring marker at the end of the stub so external dests
+          // are visible (a bare line into empty space is easy to miss
+          // on a dense canvas). Same warm colour family as cubes for
+          // unknown OS so it reads as "out of fleet" not "another tier".
+          const ringGeom = new THREE.RingGeometry(0.22, 0.36, 16);
+          const ringMat = new THREE.MeshBasicMaterial({
+            color: 0x8090a0, transparent: true, opacity: 0.7, side: THREE.DoubleSide
+          });
+          const ring = new THREE.Mesh(ringGeom, ringMat);
+          ring.position.copy(endPos);
+          ring.lookAt(camera.position);
+          ring.userData.yuzuEdge = line.userData.yuzuEdge;
+          fleetGroup.add(ring);
+          edgeMeshes.push(ring);
         }
       }
     }
@@ -798,6 +1099,47 @@ function mount() {
     tip.style.top = (evt.clientY - rect.top + 12) + 'px';
     tip.style.display = 'block';
   }
+  // PR 9 / UAT 2026-05-12: socket tooltip — port / proto / owning process.
+  // Same XSS / clamp posture as the process tooltip; pid coerced through
+  // `Number(...) | 0`.
+  function showSocketTooltip(socket, evt) {
+    const tip = ensureTooltip();
+    const port = Number(socket && socket.port) | 0;
+    const proto = escapeHtml(clampForTooltip((socket && socket.proto) || 'tcp'));
+    const pid = Number(socket && socket.pid) | 0;
+    const procName = socket && socket.proc_name;
+    tip.innerHTML =
+      '<div style="font-weight:600;margin-bottom:0.2rem">' +
+      'listening: ' + proto + '/:' + port + '</div>' +
+      (pid > 0
+        ? '<div>pid ' + pid +
+          (procName ? ': ' + escapeHtml(clampForTooltip(procName)) : '') + '</div>'
+        : '<div style="color:#888">owner pid not reported</div>');
+    const rect = canvas.getBoundingClientRect();
+    tip.style.left = (evt.clientX - rect.left + 12) + 'px';
+    tip.style.top = (evt.clientY - rect.top + 12) + 'px';
+    tip.style.display = 'block';
+  }
+  // PR 9: edge tooltip — src → dst with port + proto. External edges
+  // flag the off-fleet destination so operators can spot egress to
+  // anything not represented by a cube.
+  function showEdgeTooltip(edge, evt) {
+    const tip = ensureTooltip();
+    const src = escapeHtml(clampForTooltip(edge.src_hostname || edge.src_ip || '?')) +
+                ':' + (Number(edge.src_port) | 0);
+    const dst = escapeHtml(clampForTooltip(edge.dst_ip || '?')) +
+                ':' + (Number(edge.dst_port) | 0);
+    const proto = escapeHtml(clampForTooltip(edge.proto || 'tcp'));
+    const ext = edge.external
+      ? '<div style="color:#f0c674">external destination</div>' : '';
+    tip.innerHTML =
+      '<div style="font-weight:600;margin-bottom:0.2rem">' + proto + ' connection</div>' +
+      '<div>' + src + ' → ' + dst + '</div>' + ext;
+    const rect = canvas.getBoundingClientRect();
+    tip.style.left = (evt.clientX - rect.left + 12) + 'px';
+    tip.style.top = (evt.clientY - rect.top + 12) + 'px';
+    tip.style.display = 'block';
+  }
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, function (c) {
       return c === '&' ? '&amp;' :
@@ -825,7 +1167,8 @@ function mount() {
     const evt = _pendingMouseEvt;
     _pendingMouseEvt = null;
     if (!evt) return;
-    if (cubeMeshes.length === 0 && processMeshes.length === 0) {
+    if (cubeMeshes.length === 0 && processMeshes.length === 0 &&
+        socketMeshes.length === 0) {
       hideTooltip();
       return;
     }
@@ -834,23 +1177,41 @@ function mount() {
     _ndc.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1;
     _ndc.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1;
     _ray.setFromCamera(_ndc, camera);
-    // PR 7: process raycast wins over cube raycast. Process dots live
-    // INSIDE the translucent cube; if we let intersectObjects pick the
-    // closest hit across both sets, the cube's outer face always wins
-    // by distance and the operator can never hover a process dot
-    // through the translucent shell. Raycast processMeshes first; only
-    // fall through to cubeMeshes when no process is intersected.
-    //
-    // gov R7 arch-N1: when PR 8/9 land edge meshes, the ordering will
-    // become: processMeshes → edgeMeshes → cubeMeshes. Edges are 1D
-    // primitives drawn on top of cube faces; an operator hovering an
-    // edge through the translucent cube wants edge details, not cube
-    // details, but a hovered process dot still wins. Pin the order
-    // here so PR 8 doesn't have to re-derive it.
+
+    // PR 9 hover order — most specific first: sockets sit on top of the
+    // cube and are operator-relevant for vuln-surface inspection, so a
+    // hover over a port sphere must surface port details before
+    // anything underneath. After sockets: processes (PR 7 reasoning —
+    // process dots live inside the translucent shell and the cube face
+    // would always win on distance otherwise). After processes: edges
+    // (1D primitives drawn on top of cube faces; an operator hovering
+    // a connection line through the cube wants edge details, not the
+    // cube). Last: the cube itself.
+    // gov R7 perf-F1 / R9 perf: edges use Line primitives, which
+    // intersect against the ray with a threshold. Setting _ray.params.
+    // Line.threshold tightens the hit zone so the operator has to be
+    // visibly close to a line rather than the default ±1 unit which
+    // would let edges hijack hovers from cubes behind them.
+    _ray.params.Line = _ray.params.Line || {};
+    _ray.params.Line.threshold = 0.25;
+    if (socketMeshes.length > 0) {
+      const socketHits = _ray.intersectObjects(socketMeshes, false);
+      if (socketHits.length > 0 && socketHits[0].object.userData.yuzuSocket) {
+        showSocketTooltip(socketHits[0].object.userData.yuzuSocket, evt);
+        return;
+      }
+    }
     if (processMeshes.length > 0) {
       const procHits = _ray.intersectObjects(processMeshes, false);
       if (procHits.length > 0 && procHits[0].object.userData.yuzuProcess) {
         showProcessTooltip(procHits[0].object.userData.yuzuProcess, evt);
+        return;
+      }
+    }
+    if (edgeMeshes.length > 0) {
+      const edgeHits = _ray.intersectObjects(edgeMeshes, false);
+      if (edgeHits.length > 0 && edgeHits[0].object.userData.yuzuEdge) {
+        showEdgeTooltip(edgeHits[0].object.userData.yuzuEdge, evt);
         return;
       }
     }

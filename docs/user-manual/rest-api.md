@@ -2694,7 +2694,7 @@ Returns the full topology as JSON.
 ```json
 {
   "schema": "fleet_topology.v1",
-  "schema_minor": 2,
+  "schema_minor": 3,
   "generated_at": 1715299200,
   "include_vuln": false,
   "machines": [
@@ -2708,6 +2708,9 @@ Returns the full topology as JSON.
       "processes": [
         {"pid": 1234, "ppid": 1, "name": "postgres", "user": "postgres", "category": "database"},
         {"pid": 5678, "ppid": 1, "name": "psql",     "user": "alice",    "category": "database"}
+      ],
+      "listeners": [
+        {"proto": "tcp", "port": 5432, "pid": 1234, "process_name": "postgres"}
       ],
       "connections": [
         {"proto": "tcp", "src_pid": 1234, "src_addr": "10.0.0.1", "src_port": 5432,
@@ -2730,6 +2733,7 @@ Returns the full topology as JSON.
 |---|---|
 | 1 | Initial shape (PR 2–7) |
 | 2 | PR 8 — `dst_pid` (uint32) added to `ConnectionEdge`. Present only on `scope: local` edges with a resolved peer process on the same machine; omitted (not zero) on non-local edges. Unmatched `local` edges (no reciprocal half visible in the same snapshot) are dropped server-side before serialisation, so a `local` edge in the response always carries a non-zero `dst_pid`. Strict-validating consumers pinned to minor version 1 should relax their validator to `minimum: 1` rather than exact-match. |
+| 3 | PR 9 — `listeners[]` array added to each `MachineNode`. Each entry is a `ListenerSocket` (`proto`, `port`, optional `pid`, optional `process_name`). LISTEN-state rows continue to appear in `connections[]` during the deprecation window so consumers filtering `connections` by `state: LISTEN` are not broken; a future release will remove them from `connections[]` with a `Breaking` CHANGELOG entry. Strict consumers should migrate to `listeners[]` now. Ingestion path also flipped: agents push `tar.fleet_snapshot` JSON via `HeartbeatRequest.fleet_snapshot_json` every 30 s (PR 10), so cache-miss latency drops from ~800 ms (full agent dispatch) to ~2 ms (in-process map walk). The dispatch path remains as a cold-start fallback. |
 
 **Audit emissions**
 
@@ -2745,6 +2749,8 @@ Every request produces a `viz.fleet_topology` row (target_type `FleetTopology`, 
 - `yuzu_viz_refill_oversize_drops_total` (gauge) — store-level 256 MiB cap exceeded; refill not cached.
 - `yuzu_viz_refill_wait_timeouts_total` (gauge) — single-flight waiters that timed out on the refill.
 - `yuzu_viz_refill_waiters_total` (gauge) — single-flight piggyback depth.
+- `yuzu_viz_topology_pushed_total{via=direct|gateway}` (counter, PR 10) — agent-pushed `fleet_snapshot.v1` payloads accepted via heartbeat. `via=direct` counts direct-to-server agents; `via=gateway` counts gateway-routed agents. A zero value across both labels after agents have been running for >30 s indicates agents have not upgraded to push-enabled binaries; the server falls back to the dispatch path automatically.
+- `yuzu_viz_topology_push_parse_errors_total{via=direct|gateway}` (counter, PR 10) — agent-pushed payloads rejected by the shared parser (oversized > 2 MiB, `processes[]`/`connections[]` exceeding the 4096-row cap, or malformed JSON). A non-zero value indicates agent/server version skew, a corrupt heartbeat, or a compromised agent attempting to inject malformed data. Each rejection also emits a `topology.push.rejected` audit event.
 
 **Example**
 
