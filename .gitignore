@@ -17,6 +17,7 @@ out/
 # shared ebin tree (Windows `.bea#`→`.beam` rename race in `proper`).
 gateway/_build/
 gateway/_build_eunit/
+gateway/_build_eunit_test/
 gateway/_build_ct/
 gateway/_build_ct_realup/
 gateway/.deps_cache/
