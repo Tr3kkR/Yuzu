@@ -271,15 +271,38 @@ TEST_CASE("topology: 0.0.0.0 / :: in local_ips skipped from ip_to_agent map", "[
     CHECK(edges[0].dst_agent_id.empty());
 }
 
-TEST_CASE("topology: connections without remote endpoint are dropped", "[viz][topology]") {
+TEST_CASE("topology: LISTEN row lifted into listeners[] AND dual-emitted in connections[]",
+          "[viz][topology]") {
+    // PR 9 / PR 10 hardening — LISTEN rows are the source of truth for
+    // `listeners[]` AND for one release continue to appear in
+    // `connections[]` (with `scope=external`) so pre-PR-9 consumers
+    // filtering `connections` by `state == "LISTEN"` are not silently
+    // broken. Removal of the dual-emit half ships with a `Breaking`
+    // CHANGELOG entry in a future release.
     auto a = make_agent("agent-A", "hostA", {"10.0.0.7"});
     a.connections.push_back(conn("tcp", "10.0.0.7", 22, "", 0, "LISTEN"));
     a.connections.push_back(conn("tcp", "10.0.0.7", 50000, "10.0.0.42", 443));
 
     FleetTopologyStore store(fixed_fetcher({a}));
     auto snap = store.get(false);
-    CHECK(snap->machines[0].connections.size() == 1);
-    CHECK(snap->machines[0].connections[0].dst_port == 443);
+    // listeners[] carries the LISTEN row exactly once.
+    REQUIRE(snap->machines[0].listeners.size() == 1);
+    CHECK(snap->machines[0].listeners[0].port == 22);
+    // connections[] carries both rows during the deprecation window.
+    REQUIRE(snap->machines[0].connections.size() == 2);
+    // The active flow is present and has the real remote endpoint.
+    bool saw_443 = false;
+    bool saw_listen = false;
+    for (const auto& e : snap->machines[0].connections) {
+        if (e.dst_port == 443)
+            saw_443 = true;
+        if (e.state == "LISTEN") {
+            saw_listen = true;
+            CHECK(e.scope == EdgeScope::External);
+        }
+    }
+    CHECK(saw_443);
+    CHECK(saw_listen);
 }
 
 TEST_CASE("topology: process category attached to ProcessNode", "[viz][topology]") {
