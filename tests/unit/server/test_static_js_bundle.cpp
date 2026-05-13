@@ -376,6 +376,155 @@ TEST_CASE("static_js_bundle: kYuzuVizJs lays machines out on a ceil(sqrt(N)) gri
     CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("Math.ceil(Math.sqrt"));
 }
 
+TEST_CASE("static_js_bundle: kYuzuVizJs stacks machines into three architecture tiers",
+          "[static-js][viz]") {
+    // PR 12: the canvas reads like a three-tier architecture diagram --
+    // frontend on top, application middle, database on the bottom. Pin
+    // the classifier name + the TIER_Y dict + the per-tier Y derivations
+    // so a refactor that collapses the layout back to a single grid (or
+    // that re-orders the tiers — top tier MUST be frontend, bottom MUST
+    // be database) fails the test instead of silently producing a flat
+    // grid with surprised operators.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("classifyTier"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("TIER_Y"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("database: CUBE_SIZE / 2,"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("app:      CUBE_SIZE / 2 + TIER_GAP,"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("frontend: CUBE_SIZE / 2 + 2 * TIER_GAP"));
+    // Classification priority is db > frontend > app; pin the return
+    // ordering so a refactor that flips priorities (and lands every
+    // co-located db-and-web box in the frontend tier) regresses loudly.
+    // Use rfind for the fall-through `return 'app'` so the test matches
+    // the trailing default-tier return, not the null-guard early return
+    // at the top of classifyTier.
+    auto pos_db = yuzu::server::kYuzuVizJs.find("if (dbScore > 0) return 'database'");
+    auto pos_web = yuzu::server::kYuzuVizJs.find("if (webScore > 0) return 'frontend'");
+    auto pos_default = yuzu::server::kYuzuVizJs.rfind("return 'app'");
+    REQUIRE(pos_db != std::string::npos);
+    REQUIRE(pos_web != std::string::npos);
+    REQUIRE(pos_default != std::string::npos);
+    CHECK(pos_db < pos_web);
+    CHECK(pos_web < pos_default);
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs drops the origin AxesHelper", "[static-js][viz]") {
+    // PR 12 regression guard. The original PR 5 scaffold shipped an
+    // AxesHelper(5) so the empty-scene scaffold had an orientation cue;
+    // once the three-tier stacked layout landed, the RGB gizmo clipped
+    // through the bottom tier and read as a fourth, unexplained signal.
+    // It has been deleted; pin the absence so a future "add an axes
+    // gizmo" PR has to consciously revisit this decision.
+    //
+    // Gate 7 QA F6 — if a future PR legitimately needs an orientation
+    // gizmo back (e.g., toggled by a URL param for a debug overlay),
+    // confirm the new geometry does NOT clip through TIER_Y.database
+    // and update this guard to allow the controlled re-introduction
+    // (perhaps narrowing to "no unconditional AxesHelper in buildScene").
+    CHECK_THAT(yuzu::server::kYuzuVizJs, !ContainsSubstring("AxesHelper"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs renders talking sockets and anchors cross-tier wires",
+          "[static-js][viz]") {
+    // PR 12: every cube grows a mirror ring of "talking socket" dots on
+    // the BOTTOM face — one per unique outbound (proto, dst_ip, dst_port)
+    // tuple aggregated from ESTABLISHED connections. The cross-machine
+    // edge pass anchors the source end of every wire at the matching dot
+    // (looked up via talkingWorldPos) so both ends of a wire are concrete
+    // socket primitives, not a cube-centre approximation.
+    //
+    // Pin: the helper function names, the bottom-face Y constant
+    // (negative — mirror of the listener ring above the cube), the
+    // userData payload shape, raycast/lifecycle parity with socketMeshes,
+    // and the source-end anchor lookup in the edge pass.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("extractTalkingDests"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("placeTalkingSocketsOnCube"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("buildTalkingSocketSphere"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("TALKING_SOCKET_BOTTOM_Y = -CUBE_SIZE * 0.5"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("yuzuTalkingSocket"));
+    // Flat raycast index lives alongside socketMeshes and follows the same
+    // lifecycle (declare / reset in clearFleet / push during add).
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("const talkingSocketMeshes = []"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("talkingSocketMeshes.length = 0"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("talkingSocketMeshes.push(sphere)"));
+    // Gate 7 QA F1 BLOCKING — pin that extractTalkingDests filters
+    // loopback DESTINATIONS too (mirror of the listener-side filter).
+    // A refactor that drops the dst-side `continue` would silently
+    // re-introduce intra-host loopback wires as cross-machine talking
+    // dots; the F1 pin is specific to that `continue` site.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("if (isLoopbackBind(dstIp)) continue"));
+    // Gate 7 UP-6 BLOCKING — talkingSocketMeshes must follow the
+    // same reset-before-traverse R7 UP-1 invariant as cubeMeshes /
+    // processMeshes / socketMeshes. Verify the reset precedes the
+    // traverse(disposeNode) walk in clearFleet so a mid-render hover
+    // raycast never resolves against a half-disposed mesh.
+    auto pos_talk_reset = yuzu::server::kYuzuVizJs.find("talkingSocketMeshes.length = 0");
+    auto pos_traverse_for_talk = yuzu::server::kYuzuVizJs.find("child.traverse(disposeNode)");
+    REQUIRE(pos_talk_reset != std::string::npos);
+    REQUIRE(pos_traverse_for_talk != std::string::npos);
+    CHECK(pos_talk_reset < pos_traverse_for_talk);
+    // Hover dispatch goes after the listener pass and surfaces the
+    // outbound-side tooltip.
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("intersectObjects(talkingSocketMeshes, false)"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("showTalkingSocketTooltip"));
+    // Source-end anchor lookup — the edge pass reads the cube's
+    // talking-socket world position via `agentId + '|' + dst_ip + ':' + dst_port`.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("talkingWorldPos"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("talkingWorldPos.get(talkingKey)"));
+    // Listener hits should fire BEFORE talking-socket hits so a hover on
+    // a peer's incoming port doesn't get hijacked by an unrelated
+    // outgoing dot underneath it (no realistic overlap today, but pin
+    // the ordering so refactors don't quietly swap them).
+    auto pos_listener = yuzu::server::kYuzuVizJs.find("intersectObjects(socketMeshes, false)");
+    auto pos_talking =
+        yuzu::server::kYuzuVizJs.find("intersectObjects(talkingSocketMeshes, false)");
+    REQUIRE(pos_listener != std::string::npos);
+    REQUIRE(pos_talking != std::string::npos);
+    CHECK(pos_listener < pos_talking);
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs renders cross-machine wires as curved tubes",
+          "[static-js][viz]") {
+    // PR 12: cross-machine edges switched from THREE.Line (1px on every
+    // shipping browser) to TubeGeometry along a QuadraticBezierCurve3 so
+    // wires get real 3D thickness AND a gentle arc that keeps parallel
+    // wires from collapsing onto the same path. The intra-cube loopback
+    // edges (PR 8) stay as THREE.LineSegments — their pin is in a
+    // different test case and stays satisfied. Pin: the helper name, the
+    // curve + tube constructors, and the per-edge bow-key keyed on
+    // (srcAgentId, dstIp:dstPort).
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("buildWireTube"));
+    // Internal cross-tier wires use a CubicBezier with vertical
+    // end-tangents (exit cube floor going down, re-enter cube ceiling
+    // coming down) so the wire reads as "leaves the talking socket
+    // straight, runs straight in the middle, lands on the listener
+    // straight". External stubs keep the quadratic upward bow.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("THREE.CubicBezierCurve3"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("THREE.QuadraticBezierCurve3"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("THREE.TubeGeometry"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("EDGE_TUBE_RADIUS_INTERNAL"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("bowKey:"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs filters loopback-bound listeners off the surface",
+          "[static-js][viz]") {
+    // PR 12: only listeners that another instance could reach belong on
+    // the cube surface. extractListenSockets honours the schema_minor 4
+    // `local_addr` field and drops 127.0.0.0/8 and ::1 binds via
+    // isLoopbackBind. Pin the helper name, the loopback string literals,
+    // and the call site so a refactor that removes the filter (and lets
+    // every loopback-only postgres / redis sidecar render on the cube
+    // top face) regresses loudly. Pinning v4-mapped-in-v6 separately
+    // prevents a half-fix that drops it.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("isLoopbackBind"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs,
+               ContainsSubstring("if (isLoopbackBind(l.local_addr)) continue"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("'::1'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("'127.'"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("^::ffff:127\\."));
+}
+
 TEST_CASE("static_js_bundle: kYuzuVizJs builds translucent cubes with MeshPhysicalMaterial",
           "[static-js][viz]") {
     // gov R6 PR-6: the cube material contract -- transparent + opacity
@@ -724,12 +873,15 @@ TEST_CASE("static_js_bundle: kYuzuVizJs has a sane size budget",
     // gov R7 OBS-1 / perf-F4: every other vendored bundle has a pinned
     // size or floor. kYuzuVizJs only had `>= 1000`. Add a sane upper
     // bound so PR 8/9/10/11 additions trip a guard rather than silently
-    // bloating the served asset to multi-MB. The bundle is currently
-    // ~45KB after R7; cap at 80KB to give PR 8/9 ~35KB of headroom
-    // without making the cap perpetually irrelevant. If a future PR
-    // legitimately needs more, raise this constant deliberately.
+    // bloating the served asset to multi-MB. The cap was 80KB after R7;
+    // PR 12 (three-tier layout + loopback filter + talking sockets +
+    // curved-tube cross-tier wires) pushed the bundle to ~82KB. Cap
+    // raised to 96KB to give the remaining feature PRs ~13KB of
+    // headroom without making the cap perpetually irrelevant. If a
+    // future PR legitimately needs more, raise this constant
+    // deliberately.
     REQUIRE(yuzu::server::kYuzuVizJs.size() >= 1000);
-    CHECK(yuzu::server::kYuzuVizJs.size() < 80 * 1024);
+    CHECK(yuzu::server::kYuzuVizJs.size() < 96 * 1024);
 }
 
 // ── Fleet viz page HTML scaffold ────────────────────────────────────────────

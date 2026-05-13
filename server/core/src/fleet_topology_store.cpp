@@ -27,6 +27,24 @@ namespace yuzu::server {
 
 namespace {
 
+// Per-field size cap for agent-reported address strings (Gate 7 UP-1 fix).
+// IPv6 canonical max is 39 chars; brackets + zone-id push that to ~60.
+// 64 is a generous upper bound that still bounds the worst-case wire
+// payload regardless of how many LISTEN rows the agent ships. An agent
+// sending a longer value is either buggy or hostile — silently truncate
+// and log so an operator chasing a malformed listener has a breadcrumb.
+constexpr std::size_t kAddressMaxLen = 64;
+
+// Truncate-or-pass for the parser. Empty strings are returned unchanged;
+// over-long strings are clipped at kAddressMaxLen. Caller emits a single
+// spdlog warn line on truncation so chasing a malformed listener has a
+// breadcrumb without flooding logs (one line per agent per snapshot).
+inline std::string clamp_address(std::string s) {
+    if (s.size() > kAddressMaxLen)
+        s.resize(kAddressMaxLen);
+    return s;
+}
+
 bool is_unspecified_addr(std::string_view addr) {
     return addr == "0.0.0.0" || addr == "::" || addr == "[::]" || addr == "0:0:0:0:0:0:0:0";
 }
@@ -38,6 +56,18 @@ bool is_loopback_addr(std::string_view addr) {
         return true;
     if (addr.size() >= 4 && addr.substr(0, 4) == "127.")
         return true;
+    // IPv4-mapped-in-IPv6 loopback (`::ffff:127.x.x.x` and bracket-wrapped
+    // `[::ffff:127.x.x.x]`) — seen on dual-stack Linux when a binder uses
+    // AF_INET6 without IPV6_V6ONLY. Gate 7 S-2 alignment with the
+    // renderer-side isLoopbackBind (yuzu-viz.js).
+    {
+        auto s = addr;
+        if (!s.empty() && s.front() == '[' && s.back() == ']')
+            s = s.substr(1, s.size() - 2);
+        if (s.size() >= 11 && (s[0] == ':') && (s[1] == ':') &&
+            (s.substr(2, 5) == "ffff:" || s.substr(2, 5) == "FFFF:") && s.substr(7, 4) == "127.")
+            return true;
+    }
     return false;
 }
 
@@ -406,9 +436,34 @@ FleetTopologyStore::parse_fleet_snapshot_json(std::string_view json, std::string
                     continue;
                 RawAgentSnapshot::RawConnection rc;
                 rc.proto = c.value("proto", "");
-                rc.local_addr = c.value("local_addr", "");
+                // Gate 7 UP-1: per-field size cap on agent-reported
+                // addresses. A buggy or hostile agent sending a 1.9 MiB
+                // `local_addr` value would otherwise sail through the
+                // 2 MiB whole-payload cap and balloon downstream wire JSON.
+                // Truncate at kAddressMaxLen — an IPv6+zone canonical form
+                // is < 64 bytes.
+                {
+                    std::string la = c.value("local_addr", "");
+                    if (la.size() > kAddressMaxLen) {
+                        spdlog::warn(
+                            "fleet_topology: agent={} clamped local_addr ({} bytes -> {}); "
+                            "possible malformed or hostile snapshot",
+                            agent_id, la.size(), kAddressMaxLen);
+                        la.resize(kAddressMaxLen);
+                    }
+                    rc.local_addr = std::move(la);
+                }
                 rc.local_port = lp;
-                rc.remote_addr = c.value("remote_addr", "");
+                {
+                    std::string ra = c.value("remote_addr", "");
+                    if (ra.size() > kAddressMaxLen) {
+                        spdlog::warn(
+                            "fleet_topology: agent={} clamped remote_addr ({} bytes -> {})",
+                            agent_id, ra.size(), kAddressMaxLen);
+                        ra.resize(kAddressMaxLen);
+                    }
+                    rc.remote_addr = std::move(ra);
+                }
                 rc.remote_host = c.value("remote_host", "");
                 rc.remote_port = rp;
                 rc.state = c.value("state", "");
@@ -751,6 +806,12 @@ TopologySnapshot FleetTopologyStore::build_snapshot(std::vector<RawAgentSnapshot
                     ls.port = c.local_port;
                     ls.pid = c.pid;
                     ls.process_name = c.process_name;
+                    // Preserve the bind address so the renderer can drop
+                    // loopback-only listeners from the cube-surface layer
+                    // (schema_minor 4) — they're not reachable from other
+                    // instances, so they don't belong on the inter-host
+                    // surface visual.
+                    ls.local_addr = c.local_addr;
                     m.listeners.push_back(std::move(ls));
                     // Dual-emit: also keep the LISTEN row in connections[]
                     // with empty/zero remote endpoint, matching the

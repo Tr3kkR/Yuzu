@@ -183,7 +183,15 @@ Standing rules:
 - **`pid == 0` is valid.** Agents that can't resolve the owning process
   emit `pid` omitted (treated as 0). Renderer renders the sphere with
   the "owner pid not reported" tooltip; no process-dot linkage.
-- **Schema bump.** `schema_minor` is `3` (was `2` in PR 8).
+- **Schema bump.** `schema_minor` is `4` (was `3` in PR 9). The new
+  optional `local_addr` field on each `ListenerSocket` carries the
+  kernel-reported bind address. Server treats it as agent-controlled
+  string (bounded at parse time to 64 bytes / `kAddressMaxLen`); the
+  loopback-bind filter lives in the renderer (`isLoopbackBind`) and
+  drops `127.0.0.0/8`, `::1`, `[::1]`, and `::ffff:127.x` (including
+  bracketed) from the cube surface. `0.0.0.0` / `::` / specific NIC
+  IPs survive. Renderer treats `local_addr` absent/empty as
+  non-loopback (safe default — show rather than hide).
 - **Hostname label position.** Labels render BELOW each cube (not above)
   so the top-face socket-sphere area stays unoccluded. Fixed UAT
   decision (2026-05-12); do not revert without UAT sign-off.
@@ -199,6 +207,92 @@ Standing rules:
   No match anywhere → external stub line + grey ring marker.
 - **Raycast order.** sockets → processes → edges → cubes. Sockets are
   most-specific and operator-actionable; the cube face is least.
+
+## Three-tier stacked layout — PR 12
+
+- **TIER_Y dict is the source of truth for cube Y placement.**
+  `database` lives at `CUBE_SIZE/2`, `app` at `CUBE_SIZE/2 + TIER_GAP`,
+  `frontend` at `CUBE_SIZE/2 + 2*TIER_GAP`. `TIER_GAP = 22` (well over
+  `CUBE_SIZE = 8` so planes read as separate). Top-tier is ALWAYS
+  frontend; bottom-tier is ALWAYS database — flipping the order
+  breaks the architectural-diagram convention every operator brings.
+- **Classification priority is db > frontend > app.** A host running
+  both nginx and postgres lands on the database plane; the heavier
+  architectural role wins. `classifyTier` reads listener ports first
+  (`DB_PORTS` / `WEB_PORTS` constant sets), then process category
+  (`'database'` / `'web'` strings from `process_category.hpp`'s
+  `category_to_string`). Hosts with no DB/web signal default to
+  `app`.
+- **Tier placement is a VISUAL cue only.** It's computed from
+  agent-controlled fields (listener ports + process category) and
+  carries NO authorization weight. Never use the tier output as a
+  security or trust signal.
+- **AxesHelper removed from `buildScene`.** Originally shipped in
+  PR 5 as an empty-scene orientation gizmo; clipped through the
+  bottom tier and read as a fourth signal once the stacked layout
+  landed. The three planes themselves are now the spatial cue. Pinned
+  via `!ContainsSubstring("AxesHelper")` in `test_static_js_bundle.cpp`.
+- **Camera default reframed.** `camera.position = (45, 60, 45)`,
+  `lookAt(0, TIER_Y.app, 0)`, `OrbitControls.target = (0, TIER_Y.app, 0)`.
+  NaN-recovery path uses the same values.
+- **Per-tier grid.** Each populated tier renders its own
+  `ceil(sqrt(N_tier))` grid centred on origin; within a tier,
+  machines sort by `hash32(agent_id)` so the same fleet renders
+  identically across reloads.
+
+## Talking-socket primitive — PR 12
+
+- **Mirror of the listener ring, on the bottom face.** One sphere
+  per unique outbound `(proto, dst_ip, dst_port)` aggregated from
+  `connections[]` ESTABLISHED rows whose `src_addr` is in the
+  cube's `local_ips`. Loopback destinations are dropped (intra-host
+  loopback edges live INSIDE the cube as PR 8 `LineSegments`, not
+  on the surface).
+- **Distinct colour.** `TALKING_SOCKET_COLOR = 0x7ec4f8` (cool blue)
+  — visually distinct from the listener-cream `0xfff2cc`. Operators
+  read incoming on the roof and outgoing through the floor.
+- **Position.** Ring radius `CUBE_SIZE * 0.32` (same as listeners),
+  Y position `-CUBE_SIZE * 0.5 - 0.30` (bottom face, slightly below).
+- **`talkingWorldPos` map** is keyed `${agent_id}|${dst_ip}:${dst_port}`
+  and consumed by the cross-machine edge pass as the source-end
+  anchor. Wire travels from talking dot → listener sphere on the
+  destination cube.
+- **Raycast order.** sockets → talking-sockets → processes → edges
+  → cubes. The talking-socket pass fires immediately after the
+  listener pass so a hover on either dot type surfaces the right
+  tooltip.
+- **Tooltip framing.** `talking: proto → dst_ip:dst_port`. XSS
+  posture identical to the listener tooltip (`escapeHtml` +
+  `clampForTooltip`).
+
+## Tube-wire geometry — PR 12
+
+- **Wires are `THREE.TubeGeometry` along a `THREE.CubicBezierCurve3`,
+  not `THREE.Line`.** `LineBasicMaterial.linewidth` is silently
+  clamped to 1px by every shipping browser; using `Line` would
+  regress wire visibility at typical zoom. Tube radius
+  `EDGE_TUBE_RADIUS_INTERNAL = 0.10` / `EXTERNAL = 0.07`,
+  20 path segments, 6 radial.
+- **Vertical end-tangents on internal wires.** The cubic Bezier
+  control points are `P1 = src + (0, -lift, 0) + fan` and
+  `P2 = end + (0, +lift, 0) + fan` so the wire exits the talking
+  socket straight down through the cube's bottom face, runs
+  mostly-straight through free space, and re-enters the listener
+  socket from straight above through the cube's top face.
+- **`lift = clamp(len * 0.25, 2, 8)`.** Scales with the wire length
+  so short same-tier wires don't overshoot.
+- **Fan key.** `hash32(bowKey) & 1` decides which side of the
+  midpoint the bow lands on. `bowKey = srcAgentId + '|' + dst_ip + ':' + dst_port`.
+  Parallel wires from two distinct sources to the same destination
+  fan opposite sides so they don't trace the same path.
+- **External stubs keep the quadratic upward bow** — no destination
+  cube to dock to, so the cubic-with-vertical-tangents geometry
+  doesn't apply. A grey ring marker at the stub end signals
+  "off-cluster".
+- **NaN guard.** `buildWireTube` returns an invisible no-op mesh
+  on non-finite `srcPos` / `endPos` so a poisoned upstream
+  position can't paint NaN tube vertices that corrupt the depth
+  buffer (Gate 7 UP-10).
 
 ## Push-ingestion invariants — PR 10
 

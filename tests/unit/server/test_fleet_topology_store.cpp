@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <map>
 #include <thread>
 #include <vector>
 
@@ -288,6 +289,9 @@ TEST_CASE("topology: LISTEN row lifted into listeners[] AND dual-emitted in conn
     // listeners[] carries the LISTEN row exactly once.
     REQUIRE(snap->machines[0].listeners.size() == 1);
     CHECK(snap->machines[0].listeners[0].port == 22);
+    // schema_minor 4: bind address propagates so the renderer can filter
+    // loopback-only listeners off the cube surface.
+    CHECK(snap->machines[0].listeners[0].local_addr == "10.0.0.7");
     // connections[] carries both rows during the deprecation window.
     REQUIRE(snap->machines[0].connections.size() == 2);
     // The active flow is present and has the real remote endpoint.
@@ -303,6 +307,122 @@ TEST_CASE("topology: LISTEN row lifted into listeners[] AND dual-emitted in conn
     }
     CHECK(saw_443);
     CHECK(saw_listen);
+}
+
+TEST_CASE("topology: ListenerSocket carries local_addr for renderer surface filter",
+          "[viz][topology]") {
+    // schema_minor 4 — `local_addr` ships on every LISTEN row in the
+    // topology JSON so the renderer can drop loopback-only listeners
+    // from the cube-surface socket layer. The agent already emits
+    // `local_addr` on every connection row; here we prove it makes it
+    // through build_snapshot unchanged for the bind flavours the
+    // filter cares about, including IPv6 forms (Gate 7 QA F2):
+    //   - routable NIC IP
+    //   - `0.0.0.0` any-interface (IPv4 unspecified)
+    //   - `127.0.0.1` loopback-only (IPv4)
+    //   - `::` any-interface (IPv6 unspecified)
+    //   - `::1` loopback-only (IPv6)
+    //   - `[::1]` bracketed IPv6 loopback (some agents wrap in brackets)
+    //   - empty string (older agents pre-PR-12) — JSON key must be ABSENT
+    //
+    // Server is the faithful pipe — even loopback addresses make it onto
+    // the wire; renderer is the filter. Empty `local_addr` is special:
+    // the `to_json` guard `if (!l.local_addr.empty())` omits the JSON key
+    // entirely so older snapshots produce the same wire shape as before
+    // the schema_minor 4 bump (graceful evolution).
+    auto a = make_agent("agent-A", "hostA", {"10.0.0.7"});
+    a.connections.push_back(conn("tcp", "10.0.0.7", 22, "", 0, "LISTEN"));    // routable
+    a.connections.push_back(conn("tcp", "0.0.0.0", 8080, "", 0, "LISTEN"));   // v4 any
+    a.connections.push_back(conn("tcp", "127.0.0.1", 5432, "", 0, "LISTEN")); // v4 loop
+    a.connections.push_back(conn("tcp6", "::", 9090, "", 0, "LISTEN"));       // v6 any
+    a.connections.push_back(conn("tcp6", "::1", 9091, "", 0, "LISTEN"));      // v6 loop
+    a.connections.push_back(conn("tcp6", "[::1]", 9092, "", 0, "LISTEN"));    // v6 bracketed
+    a.connections.push_back(conn("tcp", "", 9999, "", 0, "LISTEN"));          // empty (old agent)
+
+    FleetTopologyStore store(fixed_fetcher({a}));
+    auto snap = store.get(false);
+    REQUIRE(snap->machines.size() == 1);
+    const auto& ls = snap->machines[0].listeners;
+    REQUIRE(ls.size() == 7);
+    std::map<int, std::string> bind_by_port;
+    for (const auto& l : ls)
+        bind_by_port[l.port] = l.local_addr;
+    CHECK(bind_by_port[22] == "10.0.0.7");
+    CHECK(bind_by_port[8080] == "0.0.0.0");
+    CHECK(bind_by_port[5432] == "127.0.0.1");
+    CHECK(bind_by_port[9090] == "::");
+    CHECK(bind_by_port[9091] == "::1");
+    CHECK(bind_by_port[9092] == "[::1]");
+    CHECK(bind_by_port[9999] == "");
+
+    // And it's visible in the wire JSON — the renderer reads
+    // `listeners[i].local_addr` directly. The empty-`local_addr` row
+    // must OMIT the JSON key entirely (graceful pre-PR-12 evolution).
+    // Gate 7 QA F5: switched from per-row REQUIRE-in-loop to explicit
+    // by-port lookup so the omitted-key case doesn't abort with a
+    // misleading message.
+    nlohmann::json j = *snap;
+    const auto& wire_listeners = j["machines"][0]["listeners"];
+    REQUIRE(wire_listeners.is_array());
+    REQUIRE(wire_listeners.size() == 7);
+    std::map<int, nlohmann::json> wire_by_port;
+    for (const auto& wl : wire_listeners)
+        wire_by_port[wl["port"].get<int>()] = wl;
+    CHECK(wire_by_port[22].contains("local_addr"));
+    CHECK(wire_by_port[22]["local_addr"] == "10.0.0.7");
+    CHECK(wire_by_port[8080]["local_addr"] == "0.0.0.0");
+    CHECK(wire_by_port[5432]["local_addr"] == "127.0.0.1");
+    CHECK(wire_by_port[9090]["local_addr"] == "::");
+    CHECK(wire_by_port[9091]["local_addr"] == "::1");
+    CHECK(wire_by_port[9092]["local_addr"] == "[::1]");
+    // Empty-string row omits the key entirely — pre-PR-12 wire shape.
+    CHECK_FALSE(wire_by_port[9999].contains("local_addr"));
+}
+
+TEST_CASE("topology: parse_fleet_snapshot_json clamps oversize local_addr",
+          "[viz][topology][hardening]") {
+    // Gate 7 UP-1 BLOCKING fix. A malformed or hostile agent could ship
+    // a multi-MB `local_addr` per LISTEN row; the 2 MiB envelope cap
+    // alone would let it through. The parser clamps per-field at
+    // kAddressMaxLen (64 bytes) so the wire payload stays bounded
+    // regardless of agent behaviour. The truncation logs a spdlog warn
+    // (visible in operator logs as a breadcrumb).
+    std::string oversize(2048, 'A');
+    std::string body =
+        std::string("{\"schema\":\"fleet_snapshot.v1\",\"ts\":1,") +
+        "\"hostname\":\"h\",\"local_ips\":[\"10.0.0.5\"]," + "\"processes\":[]," +
+        "\"connections\":[{\"proto\":\"tcp\",\"local_addr\":\"" + oversize +
+        "\",\"local_port\":22,\"remote_addr\":\"\",\"remote_port\":0,\"state\":\"LISTEN\"}]," +
+        "\"truncated_processes\":false,\"truncated_connections\":false}";
+    std::string ex;
+    auto parsed = FleetTopologyStore::parse_fleet_snapshot_json(body, "agent-A", "linux", &ex);
+    REQUIRE(parsed.has_value());
+    REQUIRE(parsed->connections.size() == 1);
+    CHECK(parsed->connections[0].local_addr.size() == 64);
+    CHECK(parsed->connections[0].local_addr == std::string(64, 'A'));
+}
+
+TEST_CASE("topology: is_loopback_addr recognises v4-mapped-in-v6 form",
+          "[viz][topology][hardening]") {
+    // Gate 7 S-2 alignment with renderer's isLoopbackBind. The server's
+    // intra-cube loopback edge filter (build_snapshot ~line 786) uses
+    // is_loopback_addr; without this branch a host using AF_INET6 +
+    // ::ffff:127.0.0.1 wouldn't have its intra-host edges suppressed.
+    // Test the namespace-private helper indirectly via a LISTEN row.
+    auto a = make_agent("agent-V6", "v6host", {"10.0.0.42"});
+    a.connections.push_back(conn("tcp6", "::ffff:127.0.0.1", 6379, "", 0, "LISTEN"));
+    a.connections.push_back(conn("tcp6", "[::ffff:127.0.0.1]", 6380, "", 0, "LISTEN"));
+
+    FleetTopologyStore store(fixed_fetcher({a}));
+    auto snap = store.get(false);
+    REQUIRE(snap->machines.size() == 1);
+    REQUIRE(snap->machines[0].listeners.size() == 2);
+    // Server is the faithful pipe — both addresses propagate.
+    // The renderer's isLoopbackBind drops them at render time;
+    // is_loopback_addr's v4-mapped-loopback branch is for the
+    // build_snapshot's intra-cube edge filter.
+    CHECK(snap->machines[0].listeners[0].local_addr == "::ffff:127.0.0.1");
+    CHECK(snap->machines[0].listeners[1].local_addr == "[::ffff:127.0.0.1]");
 }
 
 TEST_CASE("topology: process category attached to ProcessNode", "[viz][topology]") {
@@ -381,7 +501,7 @@ TEST_CASE("topology: dst_pid serializes only when non-zero; schema_minor bumped"
     auto snap = store.get(false);
     json j = *snap;
 
-    CHECK(j["schema_minor"] == 3); // PR 9: listeners[] added
+    CHECK(j["schema_minor"] == 4); // PR 12: ListenerSocket.local_addr added
 
     const auto& edges = j["machines"][0]["connections"];
     REQUIRE(edges.size() == 3);

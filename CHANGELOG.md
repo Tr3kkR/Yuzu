@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`/viz/fleet` three-tier layout + talking-socket layer + curved tube
+  wires (PR 12 of the 11-PR `/viz/fleet` 3D fleet network-topology
+  ladder).** Machines now organise into three architectural Y planes:
+  frontends on top, applications in the middle, databases on the
+  bottom. Classification is a heuristic over listener ports (a
+  curated `DB_PORTS` / `WEB_PORTS` set) and the agent's process
+  category, priority `db > web > app`; tier placement is a visual
+  cue only and carries no authorisation weight. **`ListenerSocket`
+  grows an optional `local_addr` field** (`schema_minor` bumps
+  `3 → 4`) carrying the kernel-reported bind address; the renderer
+  reads it to drop loopback-only listeners (`127.0.0.0/8`, `::1`,
+  including bracketed and v4-mapped-in-v6 `[::ffff:127.x]` forms)
+  from the cube-surface socket ring — they're not reachable from
+  other instances. **Talking-socket primitive:** each cube grows a
+  ring of cool-blue dots on its BOTTOM face, one per unique
+  outbound `(proto, dst_ip, dst_port)`; hover surfaces
+  `talking: tcp → ip:port`. **Cross-machine wires render as
+  `THREE.TubeGeometry` along a `THREE.CubicBezierCurve3` with
+  vertical end-tangents** so the wire exits the source cube floor
+  going straight down, runs nearly-straight through free space,
+  and re-enters the destination cube ceiling going straight up
+  into the listener sphere — `LineBasicMaterial.linewidth` is
+  silently clamped to 1px on every shipping browser, so the
+  switch to tubes is what makes the wires visible at typical
+  zoom. Parallel wires fan opposite sides via a deterministic
+  hash on `(srcAgentId, dst_ip:dst_port)` so two cubes both
+  talking to the same destination don't trace the same arc.
+  Per-field size cap of 64 bytes applies to `local_addr` and
+  `remote_addr` at the parser to bound the wire payload
+  regardless of agent behaviour. Test-pinned JS bundle ceiling
+  raised 80 KB → 96 KB to fit the new primitives.
+
+### Changed
+
+- **`/viz/fleet` cube layout** moved from a single flat grid to a
+  three-tier stacked layout (PR 12). Operators with bookmarked URLs
+  will land on the new camera framing `(45, 60, 45)` looking at the
+  middle tier (was `(35, 30, 35)` looking at origin).
+- **`/api/v1/viz/fleet/topology` `schema_minor`** bumped `3 → 4`
+  (additive — strict consumers pinned to `== 3` should relax to
+  `>= 3`).
+
+### Removed
+
+- **Origin RGB `AxesHelper`** from the `/viz/fleet` empty-scene
+  scaffold (PR 12). The three-tier Y planes replace it as the
+  spatial orientation cue; the gizmo was clipping through the
+  bottom tier.
+
 - **`/viz/fleet` cross-machine edges + socket-layer primitive (PR 9 of
   the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** Each
   machine cube now displays a ring of cream-coloured socket spheres on

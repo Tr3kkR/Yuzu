@@ -101,6 +101,24 @@ struct ListenerSocket {
     int port{0};
     uint32_t pid{0};
     std::string process_name;
+    /// Bind address as the kernel reports it (`0.0.0.0`, `::`, `127.0.0.1`,
+    /// a NIC IP, etc.). The renderer uses this to drop loopback-only
+    /// listeners (`127.0.0.0/8`, `::1`) from the cube-surface socket
+    /// layer — those sockets are by definition not reachable from any
+    /// other instance, so they don't belong on the inter-host surface.
+    /// Empty when the agent didn't populate `local_addr` (older snapshots).
+    /// Renderer treats absent/empty as non-loopback (safe-default — show
+    /// rather than hide).
+    ///
+    /// **Field-name asymmetry note** (Gate 7 B-2): named `local_addr` to
+    /// mirror the wire field `connections[i].local_addr` from the agent;
+    /// semantically corresponds to `ConnectionEdge::src_addr` (the
+    /// outbound side of a TCP flow). Both describe a host's local IP, but
+    /// the LISTEN-row context names it `local_addr` and the
+    /// ESTABLISHED-row context names it `src_addr`. Bounded at parse
+    /// time to `kAddressMaxLen` (64 bytes) via the per-field cap in
+    /// `parse_fleet_snapshot_json`.
+    std::string local_addr;
 };
 
 /// One fleet machine -- a cube in the 3D scene.
@@ -207,6 +225,8 @@ inline void to_json(nlohmann::json& j, const ListenerSocket& l) {
         j["pid"] = l.pid;
     if (!l.process_name.empty())
         j["process_name"] = l.process_name;
+    if (!l.local_addr.empty())
+        j["local_addr"] = l.local_addr;
 }
 
 inline void to_json(nlohmann::json& j, const MachineNode& m) {
@@ -224,9 +244,13 @@ inline void to_json(nlohmann::json& j, const TopologySnapshot& s) {
     // keys. Bumped 1 -> 2 in PR 8 to advertise ConnectionEdge.dst_pid on
     // EdgeScope::Local edges.
     j = {{"schema", "fleet_topology.v1"},
-         // schema_minor bump 2 → 3: adds per-MachineNode `listeners` array
-         // (PR 9 / UAT 2026-05-12). Additive — older renderers ignore.
-         {"schema_minor", 3},
+         // schema_minor bump 3 → 4: ListenerSocket grows an optional
+         // `local_addr` (bind address) field. Additive — older renderers
+         // ignore. The renderer filters out loopback bind addresses so
+         // only externally-reachable listeners appear on the cube surface.
+         // Prior bumps: 2 → 3 added per-MachineNode `listeners` array
+         // (PR 9 / UAT 2026-05-12); 1 → 2 added `dst_pid` on Local edges.
+         {"schema_minor", 4},
          {"generated_at", s.generated_at},
          {"include_vuln", s.include_vuln},
          {"machines", s.machines}};

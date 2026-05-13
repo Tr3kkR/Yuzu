@@ -2,9 +2,11 @@
 // ladder).
 //
 // Scene built by PR 5: scene + perspective camera + ambient + directional
-// light + ground grid + axes helper, with OrbitControls drag-rotate /
-// wheel-zoom and a custom WASD pan listener (OrbitControls' `enablePan`
-// is off so WASD owns translation).
+// light + ground grid, with OrbitControls drag-rotate / wheel-zoom and a
+// custom WASD pan listener (OrbitControls' `enablePan` is off so WASD
+// owns translation). The startup axes helper was removed once the
+// three-tier stacked layout (frontend / app / database planes) made the
+// origin gizmo more confusing than orienting.
 //
 // Cube layer added by PR 6: fetches `data-yuzu-viz-url`, lays N machines
 // out on a `ceil(sqrt(N))` grid with positions seeded by a deterministic
@@ -148,38 +150,125 @@ function hash32(str) {
   return h >>> 0;
 }
 
-// PR 6: lay N machines out on a `ceil(sqrt(N))` grid centred on the
-// origin. Sort by hash32(agent_id) so the order is stable across renders
-// even when the fetched array order changes (server JSON is unspecified
-// on row order). Returns [{machine, x, y, z}].
+// Three-tier stacked layout. Cubes group by architectural role —
+// frontend (top), application (middle), database (bottom) — so the canvas
+// reads like a classic three-tier diagram instead of a single flat grid.
+// Each tier renders its own `ceil(sqrt(N_tier))` grid at a fixed Y so
+// every plane stays sortable on its own; the tiers are separated by
+// TIER_GAP which is generously larger than CUBE_SIZE so the planes don't
+// visually merge. Within a tier, machines sort by hash32(agent_id) so
+// the same fleet renders identically across reloads (preserves the
+// pre-tier determinism contract). Returns [{machine, x, y, z}].
 const CUBE_SIZE = 8;
 const CUBE_SPACING = 18;
+const TIER_GAP = 22;
+// Tier order is fixed: 'frontend' renders highest, 'database' lowest.
+// The dict is the source of truth for the layout AND camera framing; the
+// per-tier Y is derived from CUBE_SIZE so cubes rest on each plane the
+// way the lone tier did before (gov R5 UP-7 mirror — non-finite TIER_Y
+// would crash WebGL; the constants are arithmetic, no agent input).
+const TIER_Y = {
+  database: CUBE_SIZE / 2,
+  app:      CUBE_SIZE / 2 + TIER_GAP,
+  frontend: CUBE_SIZE / 2 + 2 * TIER_GAP
+};
+
+// Listener-port hints. The classifier prefers listener ports over process
+// category because a host bound to a DB/HTTP port is by definition serving
+// that protocol on this box; process names alone misclassify common cases
+// (e.g. an envoy reverse proxy with a `web` category is still serving as a
+// frontend regardless of whether it also hosts a database client library).
+const DB_PORTS = new Set([
+  3306,  // mysql / mariadb
+  5432,  // postgres
+  6379,  // redis
+  27017, // mongo
+  1521,  // oracle
+  1433,  // mssql
+  9042,  // cassandra / scylla
+  9200,  // elasticsearch
+  5984,  // couchdb
+  8086,  // influxdb
+  11211  // memcached
+]);
+const WEB_PORTS = new Set([
+  80, 443, 8080, 8443, 3000, 4200, 5173, 8000, 8088
+]);
+
+// Classify a machine into 'frontend' | 'app' | 'database'. Priority is
+// db > frontend > app so a co-located db-and-web box lands on the db
+// plane (the database is the architecturally heavier role; the operator
+// reading the diagram cares more about where data lives than where the
+// reverse proxy lives).
+//
+// Tier placement is purely a VISUAL cue and is computed from
+// agent-controlled fields (listener ports + process category). It carries
+// NO authorization or trust weight. Do not use the tier output as a
+// security signal — a hostile agent could place itself on any plane.
+function classifyTier(machine) {
+  if (!machine) return 'app';
+  let dbScore = 0;
+  let webScore = 0;
+  const sockets = extractListenSockets(machine);
+  for (let i = 0; i < sockets.length; i++) {
+    const port = sockets[i] && sockets[i].port;
+    if (DB_PORTS.has(port)) dbScore++;
+    if (WEB_PORTS.has(port)) webScore++;
+  }
+  const procs = Array.isArray(machine.processes) ? machine.processes : [];
+  for (let i = 0; i < procs.length; i++) {
+    const c = procs[i] && procs[i].category;
+    if (c === 'database') dbScore++;
+    if (c === 'web') webScore++;
+  }
+  if (dbScore > 0) return 'database';
+  if (webScore > 0) return 'frontend';
+  return 'app';
+}
+
 function layoutMachines(machines) {
   if (!machines || machines.length === 0) return [];
-  const sorted = machines.slice().sort(function (a, b) {
-    const ha = hash32(a && a.agent_id);
-    const hb = hash32(b && b.agent_id);
-    if (ha !== hb) return ha - hb;
-    const ka = (a && a.agent_id) || '';
-    const kb = (b && b.agent_id) || '';
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
-  });
-  const N = sorted.length;
-  const cols = Math.max(1, Math.ceil(Math.sqrt(N)));
-  const rows = Math.ceil(N / cols);
+  // Bucket each machine into its tier.
+  const tiers = {frontend: [], app: [], database: []};
+  for (let i = 0; i < machines.length; i++) {
+    const m = machines[i];
+    if (!m) continue;
+    const t = classifyTier(m);
+    tiers[t].push(m);
+  }
+  // Per-tier sort + per-tier grid. Top-to-bottom order in the output is
+  // frontend → app → database; the consumer is order-agnostic but this
+  // keeps stack traces / dev-console inspection top-down readable.
+  const order = ['frontend', 'app', 'database'];
   const out = [];
-  for (let i = 0; i < N; i++) {
-    const col = i % cols;
-    const row = Math.floor(i / cols);
-    const x = (col - (cols - 1) / 2) * CUBE_SPACING;
-    const z = (row - (rows - 1) / 2) * CUBE_SPACING;
-    const y = CUBE_SIZE / 2;
-    // gov R5 UP-7: defensive — Math operations on a large/strange agent
-    // count could in principle yield non-finite intermediates. WebGL
-    // crashes on NaN positions, so skip silently rather than render a
-    // broken scene.
-    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
-    out.push({machine: sorted[i], x: x, y: y, z: z});
+  for (let ti = 0; ti < order.length; ti++) {
+    const name = order[ti];
+    const bucket = tiers[name];
+    if (bucket.length === 0) continue;
+    bucket.sort(function (a, b) {
+      const ha = hash32(a && a.agent_id);
+      const hb = hash32(b && b.agent_id);
+      if (ha !== hb) return ha - hb;
+      const ka = (a && a.agent_id) || '';
+      const kb = (b && b.agent_id) || '';
+      return ka < kb ? -1 : ka > kb ? 1 : 0;
+    });
+    const N = bucket.length;
+    const cols = Math.max(1, Math.ceil(Math.sqrt(N)));
+    const rows = Math.ceil(N / cols);
+    const y = TIER_Y[name];
+    for (let i = 0; i < N; i++) {
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const x = (col - (cols - 1) / 2) * CUBE_SPACING;
+      const z = (row - (rows - 1) / 2) * CUBE_SPACING;
+      // gov R5 UP-7: defensive — Math operations on a large/strange agent
+      // count could in principle yield non-finite intermediates. WebGL
+      // crashes on NaN positions, so skip silently rather than render a
+      // broken scene.
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+      out.push({machine: bucket[i], x: x, y: y, z: z});
+    }
   }
   return out;
 }
@@ -383,6 +472,15 @@ const SOCKET_LABEL_Y = SOCKET_TOP_Y + 0.55;     // port label sits just above sp
 const EDGE_OPACITY_INTERNAL = 0.85;             // fleet ↔ fleet
 const EDGE_OPACITY_EXTERNAL = 0.40;             // fleet → off-cluster
 const EXTERNAL_STUB_LENGTH = CUBE_SIZE * 0.45;
+// Wire geometry — TubeGeometry along a QuadraticBezier curve.
+// MeshBasicMaterial linewidth is silently clamped to 1px on every
+// browser we ship to, so we fake a thick line with a thin tube. The
+// curve has a small perpendicular bow at its midpoint so wires don't
+// all overlap on a straight vertical column between tier planes.
+const EDGE_TUBE_RADIUS_INTERNAL = 0.10;
+const EDGE_TUBE_RADIUS_EXTERNAL = 0.07;
+const EDGE_TUBE_SEGMENTS = 20;
+const EDGE_TUBE_RADIAL = 6;
 
 // Normalise an IPv4-mapped-in-IPv6 address (`::ffff:192.168.1.5`) into the
 // bare v4 form so `dst_addr` matches against `machine.local_ips` reliably.
@@ -394,13 +492,37 @@ function normIp(addr) {
   return m ? m[1] : s;
 }
 
-// Walk a machine's `listeners` array (schema_minor 3, added by the
-// server in PR 9 / UAT 2026-05-12) and return its unique LISTEN
-// sockets. Dual-stack `tcp` + `tcp6` LISTENs on the same port collapse
-// into one visible socket (operators perceive them as one bound port).
-// `connections[]` is NOT consulted: the server strips LISTEN-only rows
-// from that array because they'd render as edges into the void; the
-// dedicated `listeners[]` field is the renderer's source of truth.
+// Return true for any bind address that cannot accept connections from
+// another instance: 127.0.0.0/8, ::1, and the v4-mapped-in-v6 form. The
+// agent emits LISTEN rows for every kernel-visible listener (this matches
+// what the `sockwho` plugin would surface for the host); the renderer's
+// job is to keep only the ones that participate in inter-host topology.
+function isLoopbackBind(addr) {
+  if (!addr) return false;
+  let s = String(addr);
+  // Strip a single bracket wrapping pair `[...]` so `[::1]` and
+  // `[::ffff:127.0.0.1]` collapse to the same path as their bare forms
+  // (Gate 7 sec LOW + UP-2 partial fix).
+  if (s.length >= 2 && s.charAt(0) === '[' && s.charAt(s.length - 1) === ']')
+    s = s.substring(1, s.length - 1);
+  if (s === '::1') return true;
+  if (s.indexOf('127.') === 0) return true;
+  // ::ffff:127.x.x.x — v4-mapped-in-v6 loopback. Rare but seen on dual-
+  // stack Linux when a binder uses AF_INET6 without IPV6_V6ONLY.
+  if (/^::ffff:127\./i.test(s)) return true;
+  return false;
+}
+
+// Walk a machine's `listeners` array (schema_minor 3 + the `local_addr`
+// field added in schema_minor 4) and return its unique LISTEN sockets
+// that COULD be reached from another instance — i.e. drop loopback-only
+// binds (`127.0.0.0/8`, `::1`). 0.0.0.0 and :: bind every interface
+// including loopback and stay in; specific NIC IPs stay in. Dual-stack
+// `tcp` + `tcp6` LISTENs on the same port collapse into one visible
+// socket (operators perceive them as one bound port). `connections[]`
+// is NOT consulted: the server strips LISTEN-only rows from that array
+// because they'd render as edges into the void; the dedicated
+// `listeners[]` field is the renderer's source of truth.
 function extractListenSockets(machine) {
   if (!machine || !Array.isArray(machine.listeners)) return [];
   const seen = new Map();
@@ -409,6 +531,11 @@ function extractListenSockets(machine) {
     if (!l) continue;
     const port = Number(l.port);
     if (!Number.isFinite(port) || port <= 0) continue;
+    // Surface filter — only listeners reachable from other instances
+    // belong on the cube surface. A listener bound to 127.0.0.1 cannot
+    // be contacted by any peer cube, so it has no place in the
+    // inter-host visual layer.
+    if (isLoopbackBind(l.local_addr)) continue;
     const proto = String(l.proto || 'tcp').toLowerCase();
     const protoNorm = (proto === 'tcp6' ? 'tcp' : proto === 'udp6' ? 'udp' : proto);
     const key = protoNorm + ':' + port;
@@ -487,6 +614,156 @@ function buildPortLabel(port) {
   return sprite;
 }
 
+// ── Talking sockets (cross-tier connection origins) ────────────────────────
+// Each established outbound connection has a *talking* socket on the source
+// host — the ephemeral source port that the peer's listener answers. We
+// aggregate by unique destination (dstIp:dstPort) so a busy frontend with
+// many parallel connections to the same app port surfaces ONE dot, not
+// hundreds. The dot sits on the cube's bottom face mirror of the listener
+// ring on top, so the metaphor reads top-down: "incoming on the roof,
+// outgoing through the floor". Inter-tier wires anchor at this dot so the
+// operator sees both ends of the connection as concrete sockets.
+const TALKING_SOCKET_DOT_RADIUS = 0.28;
+const TALKING_SOCKET_RING_RADIUS = CUBE_SIZE * 0.32;
+const TALKING_SOCKET_BOTTOM_Y = -CUBE_SIZE * 0.5 - 0.30;
+const TALKING_SOCKET_COLOR = 0x7ec4f8; // cool blue, distinct from listener cream
+
+// Walk a machine's ESTABLISHED outbound connections (rows whose src_addr
+// is one of THIS machine's local_ips) and return one entry per unique
+// (proto, dst_ip, dst_port) tuple — the canonical "we talk to N:p over
+// proto" set. Loopback destinations are dropped (those edges are drawn
+// inside the cube as Local-scope lines, not surface wires). External
+// (off-fleet) destinations stay because their wire anchors at this same
+// dot — the stub marker on the far end signals "out of fleet".
+function extractTalkingDests(machine) {
+  if (!machine || !Array.isArray(machine.connections)) return [];
+  const localIps = new Set();
+  const lips = Array.isArray(machine.local_ips) ? machine.local_ips : [];
+  for (let i = 0; i < lips.length; i++) {
+    const ip = normIp(lips[i]);
+    if (ip) localIps.add(ip);
+  }
+  const seen = new Map();
+  for (let i = 0; i < machine.connections.length; i++) {
+    const c = machine.connections[i];
+    if (!c || c.state !== 'ESTABLISHED') continue;
+    const srcIp = normIp(c.src_addr);
+    if (!localIps.has(srcIp)) continue;       // only the outbound side
+    const dstIp = normIp(c.dst_addr);
+    const dstPort = Number(c.dst_port);
+    if (!dstIp || !Number.isFinite(dstPort) || dstPort <= 0) continue;
+    if (isLoopbackBind(dstIp)) continue;      // intra-host loopback edges live inside the cube
+    const proto = String(c.proto || 'tcp').toLowerCase();
+    const protoNorm = (proto === 'tcp6' ? 'tcp' : proto === 'udp6' ? 'udp' : proto);
+    const key = protoNorm + ':' + dstIp + ':' + dstPort;
+    if (seen.has(key)) continue;
+    seen.set(key, {
+      dst_ip: dstIp,
+      dst_port: dstPort,
+      proto: protoNorm
+    });
+  }
+  return Array.from(seen.values()).sort(function (a, b) {
+    if (a.dst_ip !== b.dst_ip) return a.dst_ip < b.dst_ip ? -1 : 1;
+    return a.dst_port - b.dst_port;
+  });
+}
+
+// Mirror of placeSocketsOnCube but on the bottom face, with TALKING_SOCKET
+// radius. Returns cube-local coordinates.
+function placeTalkingSocketsOnCube(dests) {
+  const n = dests.length;
+  const out = [];
+  if (n === 0) return out;
+  const ringR = n <= 1 ? 0 : TALKING_SOCKET_RING_RADIUS;
+  for (let i = 0; i < n; i++) {
+    const theta = n <= 1 ? 0 : (2 * Math.PI * i) / n;
+    out.push({
+      dest: dests[i],
+      x: ringR * Math.cos(theta),
+      y: TALKING_SOCKET_BOTTOM_Y,
+      z: ringR * Math.sin(theta)
+    });
+  }
+  return out;
+}
+
+function buildTalkingSocketSphere(dest) {
+  const geom = new THREE.SphereGeometry(TALKING_SOCKET_DOT_RADIUS, 10, 8);
+  const mat = new THREE.MeshBasicMaterial({color: TALKING_SOCKET_COLOR});
+  const mesh = new THREE.Mesh(geom, mat);
+  mesh.userData.yuzuTalkingSocket = {
+    dst_ip: dest.dst_ip,
+    dst_port: dest.dst_port,
+    proto: dest.proto
+  };
+  return mesh;
+}
+
+// Build a curved tube between two points. Internal fleet wires use a
+// CubicBezierCurve3 with both end-tangents pointing vertically so the
+// wire exits the talking socket straight down through the cube's
+// bottom face, runs nearly-straight through the middle, and re-enters
+// the listening socket from straight above through the cube's top
+// face. A small horizontal bow keyed on `bowKey` fans parallel wires
+// apart so two frontends both talking to the same app don't trace the
+// same path. External stubs (off-fleet destinations) keep the simpler
+// quadratic upward bow — there's no listener cube to approach.
+function buildWireTube(srcPos, endPos, opts) {
+  const isExternal = opts && opts.external;
+  // gov R5 UP-7 mirror / Gate 7 UP-10: NaN in any control coordinate
+  // produces NaN tube vertices, which paint as black geometry that fills
+  // the canvas on some drivers and corrupts the depth buffer. Refuse to
+  // build for non-finite inputs and return a no-op invisible mesh
+  // (preserves the caller's .userData wiring without rendering).
+  if (!Number.isFinite(srcPos.x) || !Number.isFinite(srcPos.y) || !Number.isFinite(srcPos.z) ||
+      !Number.isFinite(endPos.x) || !Number.isFinite(endPos.y) || !Number.isFinite(endPos.z)) {
+    const noop = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshBasicMaterial({transparent: true, opacity: 0}));
+    return noop;
+  }
+  const dir = endPos.clone().sub(srcPos);
+  const len = dir.length();
+  let curve;
+  if (isExternal || len < 1e-3) {
+    const horiz = Math.hypot(dir.x, dir.z);
+    const mid = srcPos.clone().lerp(endPos, 0.5);
+    const bow = Math.min(5, horiz * 0.15 + 1.0);
+    const ctrl = mid.clone().add(new THREE.Vector3(0, bow, 0));
+    curve = new THREE.QuadraticBezierCurve3(srcPos, ctrl, endPos);
+  } else {
+    // Cubic Bezier with vertical end-tangents. P1 sits straight below
+    // the source (P0) and P2 straight above the destination (P3) so
+    // both tangents are (0, ±1, 0). The middle of the curve
+    // interpolates between them as a mostly-straight diagonal/vertical
+    // run, which is exactly what we want: a brief arc out of each
+    // cube, then a straight stretch in free space.
+    const lift = Math.max(2, Math.min(8, len * 0.25));
+    // Fan parallel wires sideways so a pair of frontends both talking
+    // to app-01 don't render the same path. Perpendicular to the line's
+    // horizontal projection.
+    let perp = new THREE.Vector3(-dir.z, 0, dir.x);
+    if (perp.lengthSq() < 1e-6) perp.set(1, 0, 0);
+    perp.normalize();
+    const sign = (hash32(String(opts && opts.bowKey || '')) & 1) ? 1 : -1;
+    const fan = perp.multiplyScalar(0.8 * sign);
+    const p1 = srcPos.clone().add(new THREE.Vector3(0, -lift, 0)).add(fan);
+    const p2 = endPos.clone().add(new THREE.Vector3(0,  lift, 0)).add(fan);
+    curve = new THREE.CubicBezierCurve3(srcPos, p1, p2, endPos);
+  }
+  const radius = isExternal ? EDGE_TUBE_RADIUS_EXTERNAL : EDGE_TUBE_RADIUS_INTERNAL;
+  const geom = new THREE.TubeGeometry(
+    curve, EDGE_TUBE_SEGMENTS, radius, EDGE_TUBE_RADIAL, false);
+  const colour = isExternal ? 0x8090a0 : 0x4ea8de;
+  const mat = new THREE.MeshBasicMaterial({
+    color: colour,
+    transparent: true,
+    opacity: isExternal ? EDGE_OPACITY_EXTERNAL : EDGE_OPACITY_INTERNAL
+  });
+  return new THREE.Mesh(geom, mat);
+}
+
 function buildScene() {
   const scene = new THREE.Scene();
   // Background pulled from CSS bg token at render time so theme switches
@@ -514,12 +791,9 @@ function buildScene() {
   grid.position.y = 0;
   scene.add(grid);
 
-  // Axes helper -- 5-unit length so it's visible at startup but doesn't
-  // dominate the view once cubes land. PR 11 may make this toggleable.
-  const axes = new THREE.AxesHelper(5);
-  axes.material.depthTest = false;
-  axes.renderOrder = 1;
-  scene.add(axes);
+  // No origin axes gizmo: the three-tier stacked layout (TIER_Y) gives
+  // operators a richer spatial cue than the RGB X/Y/Z lines did, and the
+  // lines themselves clipped through the bottom tier cubes at startup.
 
   return scene;
 }
@@ -582,12 +856,16 @@ function mount() {
 
   const camera = new THREE.PerspectiveCamera(
     FOV, canvas.clientWidth / Math.max(canvas.clientHeight, 1), NEAR, FAR);
-  camera.position.set(35, 30, 35);
-  camera.lookAt(0, 0, 0);
+  // Frame the three-tier stack. Target sits at the middle tier's Y so
+  // OrbitControls rotates around the visual centre of the stack instead
+  // of the floor grid (which was the old single-grid default).
+  camera.position.set(45, 60, 45);
+  camera.lookAt(0, TIER_Y.app, 0);
 
   // OrbitControls drives drag-to-rotate + wheel-zoom; pan is disabled so
   // the WASD listener owns translation in screen space.
   const controls = new OrbitControls(camera, canvas);
+  controls.target.set(0, TIER_Y.app, 0);
   controls.enablePan = false;
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
@@ -701,6 +979,7 @@ function mount() {
   // Hover order (closest semantic first): sockets → processes → edges →
   // cubes — see the raycaster block below for the rationale spelled out.
   const socketMeshes = [];
+  const talkingSocketMeshes = [];
   const edgeMeshes = [];
 
   // gov R6 happy-S1 / UP-20: cubes carry a wireframe LineSegments child
@@ -734,6 +1013,7 @@ function mount() {
     cubeMeshes.length = 0;
     processMeshes.length = 0;
     socketMeshes.length = 0;
+    talkingSocketMeshes.length = 0;
     edgeMeshes.length = 0;
     while (fleetGroup.children.length > 0) {
       const child = fleetGroup.children[0];
@@ -760,6 +1040,13 @@ function mount() {
     // snapshot is stale).
     const socketWorldPos = new Map();
     const cubeWorldPosByIp = new Map();
+    // World-space talking-socket positions keyed by
+    // `${agent_id}|${dst_ip}:${dst_port}`. One dot per cube per unique
+    // outbound destination. The edge pass uses this to anchor the source
+    // end of cross-tier wires at a concrete socket primitive instead of
+    // the cube centre — so the operator sees both ends of the connection
+    // as visible sockets.
+    const talkingWorldPos = new Map();
 
     for (let i = 0; i < placements.length; i++) {
       const p = placements[i];
@@ -900,6 +1187,32 @@ function mount() {
         }
       }
 
+      // Talking sockets — outbound side of each unique fleet-internal /
+      // external destination this cube speaks to. Mirror of the listener
+      // ring but on the BOTTOM face so the spatial metaphor reads
+      // unambiguously: incoming arrives on the roof, outgoing leaves
+      // through the floor. The cross-machine edge pass anchors the
+      // source end of every wire at the matching dot here.
+      const talkingDests = extractTalkingDests(p.machine);
+      if (talkingDests.length > 0) {
+        const talkingGroup = new THREE.Group();
+        talkingGroup.name = 'yuzu-talking-sockets';
+        cube.add(talkingGroup);
+        const talkingPlacements = placeTalkingSocketsOnCube(talkingDests);
+        const agentId = (p.machine && p.machine.agent_id) || '';
+        for (let t = 0; t < talkingPlacements.length; t++) {
+          const tp = talkingPlacements[t];
+          const sphere = buildTalkingSocketSphere(tp.dest);
+          sphere.position.set(tp.x, tp.y, tp.z);
+          talkingGroup.add(sphere);
+          talkingSocketMeshes.push(sphere);
+          // World position the edge pass reads to anchor the source end.
+          const wp = new THREE.Vector3(p.x + tp.x, p.y + tp.y, p.z + tp.z);
+          talkingWorldPos.set(
+            agentId + '|' + tp.dest.dst_ip + ':' + tp.dest.dst_port, wp);
+        }
+      }
+
       // Also record the cube centre keyed by every local_ip — used by
       // the edge pass when the destination IP belongs to a fleet machine
       // but the matching LISTEN socket wasn't in its snapshot (stale or
@@ -953,7 +1266,17 @@ function mount() {
         if (drawnEdges.has(edgeKey)) continue;
         drawnEdges.add(edgeKey);
 
-        const srcCubePos = new THREE.Vector3(p.x, p.y, p.z);
+        // Source-end anchor: prefer the talking-socket dot on the source
+        // cube's bottom face (placed in the per-machine pass above) so
+        // both ends of the wire are concrete socket primitives. Falls
+        // back to the cube centre when the talking dot is missing —
+        // shouldn't happen given the same connection rows feed both
+        // passes, but the fallback keeps the wire from disappearing if
+        // extractTalkingDests ever filters a row the edge pass keeps.
+        const srcAgentId = (p.machine && p.machine.agent_id) || '';
+        const talkingKey = srcAgentId + '|' + dstIp + ':' + dstPort;
+        const srcAnchorPos = talkingWorldPos.get(talkingKey) ||
+                             new THREE.Vector3(p.x, p.y, p.z);
         const dstSocketPos = socketWorldPos.get(dstIp + ':' + dstPort) ||
                              cubeWorldPosByIp.get(dstIp);
 
@@ -966,22 +1289,22 @@ function mount() {
           // the fleet centre so adjacent cubes don't have their stubs
           // overlap with their neighbours' faces. Length is small so
           // the marker stays clearly tethered to the source cube.
-          const fromCentre = srcCubePos.clone().normalize();
+          const fromCentre = srcAnchorPos.clone().normalize();
           if (fromCentre.lengthSq() < 1e-6) fromCentre.set(1, 0, 0);
-          endPos = srcCubePos.clone().addScaledVector(fromCentre, EXTERNAL_STUB_LENGTH);
+          endPos = srcAnchorPos.clone().addScaledVector(fromCentre, EXTERNAL_STUB_LENGTH);
           isExternal = true;
         }
 
-        const geom = new THREE.BufferGeometry().setFromPoints([srcCubePos, endPos]);
         // Internal edges in a cool blue; external stubs in a dimmer grey
         // so the fleet-internal traffic reads as "ours" at a glance.
-        const colour = isExternal ? 0x8090a0 : 0x4ea8de;
-        const mat = new THREE.LineBasicMaterial({
-          color: colour,
-          transparent: true,
-          opacity: isExternal ? EDGE_OPACITY_EXTERNAL : EDGE_OPACITY_INTERNAL
+        // TubeGeometry over a QuadraticBezierCurve3 — gives real 3D
+        // thickness (LineBasicMaterial.linewidth is silently clamped to
+        // 1px on every browser we ship to) AND a gentle arc that keeps
+        // parallel wires from collapsing onto the same path.
+        const line = buildWireTube(srcAnchorPos, endPos, {
+          external: isExternal,
+          bowKey: srcAgentId + '|' + dstIp + ':' + dstPort
         });
-        const line = new THREE.Line(geom, mat);
         line.userData.yuzuEdge = {
           src_hostname: p.machine.hostname,
           src_ip: srcIp,
@@ -1120,6 +1443,23 @@ function mount() {
     tip.style.top = (evt.clientY - rect.top + 12) + 'px';
     tip.style.display = 'block';
   }
+  // PR 12: talking-socket tooltip — outbound (dst_ip:dst_port + proto).
+  // Mirror of showSocketTooltip but framed from the sender's perspective:
+  // "this cube → that endpoint" so the operator can trace the outbound
+  // side of any cross-tier connection.
+  function showTalkingSocketTooltip(ts, evt) {
+    const tip = ensureTooltip();
+    const dstIp = escapeHtml(clampForTooltip((ts && ts.dst_ip) || '?'));
+    const dstPort = Number(ts && ts.dst_port) | 0;
+    const proto = escapeHtml(clampForTooltip((ts && ts.proto) || 'tcp'));
+    tip.innerHTML =
+      '<div style="font-weight:600;margin-bottom:0.2rem">' +
+      'talking: ' + proto + ' → ' + dstIp + ':' + dstPort + '</div>';
+    const rect = canvas.getBoundingClientRect();
+    tip.style.left = (evt.clientX - rect.left + 12) + 'px';
+    tip.style.top = (evt.clientY - rect.top + 12) + 'px';
+    tip.style.display = 'block';
+  }
   // PR 9: edge tooltip — src → dst with port + proto. External edges
   // flag the off-fleet destination so operators can spot egress to
   // anything not represented by a cube.
@@ -1168,7 +1508,7 @@ function mount() {
     _pendingMouseEvt = null;
     if (!evt) return;
     if (cubeMeshes.length === 0 && processMeshes.length === 0 &&
-        socketMeshes.length === 0) {
+        socketMeshes.length === 0 && talkingSocketMeshes.length === 0) {
       hideTooltip();
       return;
     }
@@ -1198,6 +1538,13 @@ function mount() {
       const socketHits = _ray.intersectObjects(socketMeshes, false);
       if (socketHits.length > 0 && socketHits[0].object.userData.yuzuSocket) {
         showSocketTooltip(socketHits[0].object.userData.yuzuSocket, evt);
+        return;
+      }
+    }
+    if (talkingSocketMeshes.length > 0) {
+      const talkingHits = _ray.intersectObjects(talkingSocketMeshes, false);
+      if (talkingHits.length > 0 && talkingHits[0].object.userData.yuzuTalkingSocket) {
+        showTalkingSocketTooltip(talkingHits[0].object.userData.yuzuTalkingSocket, evt);
         return;
       }
     }
@@ -1376,9 +1723,9 @@ function mount() {
       const ct = controls.target;
       if (!Number.isFinite(cp.x) || !Number.isFinite(cp.y) || !Number.isFinite(cp.z) ||
           !Number.isFinite(ct.x) || !Number.isFinite(ct.y) || !Number.isFinite(ct.z)) {
-        camera.position.set(35, 30, 35);
-        controls.target.set(0, 0, 0);
-        camera.lookAt(0, 0, 0);
+        camera.position.set(45, 60, 45);
+        controls.target.set(0, TIER_Y.app, 0);
+        camera.lookAt(0, TIER_Y.app, 0);
       }
       applyWasdPan();
       controls.update();
@@ -1408,6 +1755,9 @@ function mount() {
   dev.fleetGroup = fleetGroup;
   dev.cubeMeshes = cubeMeshes;
   dev.processMeshes = processMeshes;
+  dev.socketMeshes = socketMeshes;
+  dev.talkingSocketMeshes = talkingSocketMeshes;
+  dev.edgeMeshes = edgeMeshes;
   dev.addMachines = addMachines;
   dev.fetchAndRender = fetchAndRender;
 }

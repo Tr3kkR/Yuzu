@@ -17,8 +17,8 @@
 // Design: docs/agentic-first-principle.md A1 — the same fleet topology
 // data is reachable via REST (/api/v1/viz/fleet/topology), via the HTMX
 // fragment (/fragments/viz/fleet/topology), and rendered here. PR 6+ fills
-// in cube/process/edge layers; PR 5 ships the empty-scene scaffold (grid +
-// axes helper) so WASD/orbit/zoom controls can be validated independently.
+// in cube/process/edge layers; PR 5 shipped the empty-scene scaffold
+// (grid only) so WASD/orbit/zoom controls can be validated independently.
 
 // NOLINTBEGIN(cert-err58-cpp)
 extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>

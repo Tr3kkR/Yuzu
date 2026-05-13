@@ -2710,7 +2710,7 @@ Returns the full topology as JSON.
         {"pid": 5678, "ppid": 1, "name": "psql",     "user": "alice",    "category": "database"}
       ],
       "listeners": [
-        {"proto": "tcp", "port": 5432, "pid": 1234, "process_name": "postgres"}
+        {"proto": "tcp", "port": 5432, "pid": 1234, "process_name": "postgres", "local_addr": "0.0.0.0"}
       ],
       "connections": [
         {"proto": "tcp", "src_pid": 1234, "src_addr": "10.0.0.1", "src_port": 5432,
@@ -2734,6 +2734,7 @@ Returns the full topology as JSON.
 | 1 | Initial shape (PR 2–7) |
 | 2 | PR 8 — `dst_pid` (uint32) added to `ConnectionEdge`. Present only on `scope: local` edges with a resolved peer process on the same machine; omitted (not zero) on non-local edges. Unmatched `local` edges (no reciprocal half visible in the same snapshot) are dropped server-side before serialisation, so a `local` edge in the response always carries a non-zero `dst_pid`. Strict-validating consumers pinned to minor version 1 should relax their validator to `minimum: 1` rather than exact-match. |
 | 3 | PR 9 — `listeners[]` array added to each `MachineNode`. Each entry is a `ListenerSocket` (`proto`, `port`, optional `pid`, optional `process_name`). LISTEN-state rows continue to appear in `connections[]` during the deprecation window so consumers filtering `connections` by `state: LISTEN` are not broken; a future release will remove them from `connections[]` with a `Breaking` CHANGELOG entry. Strict consumers should migrate to `listeners[]` now. Ingestion path also flipped: agents push `tar.fleet_snapshot` JSON via `HeartbeatRequest.fleet_snapshot_json` every 30 s (PR 10), so cache-miss latency drops from ~800 ms (full agent dispatch) to ~2 ms (in-process map walk). The dispatch path remains as a cold-start fallback. |
+| 4 | PR 12 — `ListenerSocket` grows an optional `local_addr` field (the kernel-reported bind address: `0.0.0.0`, `::`, a NIC IP, `127.0.0.1`, etc., bounded server-side at 64 bytes per field). Omitted from the wire envelope when the agent did not populate it (older snapshots). The renderer reads this field and drops loopback-only listeners (`127.0.0.0/8`, `::1`, including bracketed and v4-mapped-in-v6 forms `[::ffff:127.x]`) from the cube-surface socket ring — those sockets are by definition not reachable from any other instance. `0.0.0.0` and `::` survive the filter; specific NIC IPs survive. Strict consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. |
 
 **Audit emissions**
 
