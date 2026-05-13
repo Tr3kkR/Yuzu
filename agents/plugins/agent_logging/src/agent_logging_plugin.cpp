@@ -243,11 +243,15 @@ private:
             lines = 500;
         }
 
-        // Find log file
+        // Find log file. "No log file on this host" is not an error — it's
+        // a legitimate empty result (e.g. agent logging to stderr-only).
+        // Report it as status|empty with rc=0 so callers can distinguish
+        // empty-set from genuine failures.
         std::string log_path = get_log_file_path();
         if (log_path.empty()) {
-            ctx.write_output("status|error|agent log file not found");
-            return 1;
+            ctx.write_output("status|empty|agent log file not configured on this host");
+            ctx.write_output("line_count|0");
+            return 0;
         }
 
         ctx.write_output(std::format("log_file|{}", log_path));

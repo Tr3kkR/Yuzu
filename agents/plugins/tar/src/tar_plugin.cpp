@@ -687,18 +687,30 @@ private:
             limit = 1000;
 
         // Pick the right live table (HP-5: handle empty filter and unknown types)
+        //
+        // For the "no filter" case we have to UNION ALL four tables that do
+        // not share a column count or schema. Project each branch to a
+        // uniform shape (source, ts, snapshot_id, action, summary) so the
+        // UNION is well-typed and the JSON envelope stays consistent for
+        // SIEM ingest. Callers that want per-table fields should pass a
+        // type filter.
         std::string sql;
         if (type_filter.empty()) {
-            // Export from all live tables
-            sql = std::format(
-                "SELECT * FROM ("
-                "SELECT 'process' AS source, * FROM process_live WHERE ts >= {} AND ts <= {} UNION "
-                "ALL "
-                "SELECT 'network', * FROM tcp_live WHERE ts >= {} AND ts <= {} UNION ALL "
-                "SELECT 'service', * FROM service_live WHERE ts >= {} AND ts <= {} UNION ALL "
-                "SELECT 'user', * FROM user_live WHERE ts >= {} AND ts <= {}"
-                ") ORDER BY ts ASC LIMIT {}",
-                from, to, from, to, from, to, from, to, limit);
+            sql = std::format("SELECT * FROM ("
+                              "SELECT 'process' AS source, ts, snapshot_id, action, "
+                              "       (name || '[' || pid || ']') AS summary "
+                              "  FROM process_live WHERE ts >= {} AND ts <= {} UNION ALL "
+                              "SELECT 'network', ts, snapshot_id, action, "
+                              "       (proto || ' ' || local_addr || ':' || local_port) AS summary "
+                              "  FROM tcp_live WHERE ts >= {} AND ts <= {} UNION ALL "
+                              "SELECT 'service', ts, snapshot_id, action, "
+                              "       (name || ' (' || status || ')') AS summary "
+                              "  FROM service_live WHERE ts >= {} AND ts <= {} UNION ALL "
+                              "SELECT 'user', ts, snapshot_id, action, "
+                              "       (user || '@' || COALESCE(domain,'')) AS summary "
+                              "  FROM user_live WHERE ts >= {} AND ts <= {}"
+                              ") ORDER BY ts ASC LIMIT {}",
+                              from, to, from, to, from, to, from, to, limit);
         } else {
             std::string table;
             if (type_filter == "process")
