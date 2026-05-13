@@ -27,6 +27,7 @@
 
 #include "fleet_topology_types.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -172,6 +173,22 @@ public:
     /// Idempotent; no-op when the agent has no pushed slot.
     void evict_pushed(const std::string& agent_id);
 
+    /// CAP-1 (#1002): set a soft cap on the `pushed_` map size. When the
+    /// map is at the cap and a NEW agent_id pushes (i.e. would grow the
+    /// map), the entry with the smallest `ts` is evicted first.
+    /// `cap` is clamped to `kPushedMapHardCap` (100000) to match the
+    /// /viz machines_max DoS ceiling. cap=0 disables the cap (legacy
+    /// behaviour). Setter is single-init at bring-up, not thread-safe vs
+    /// concurrent pushes.
+    static constexpr std::size_t kPushedMapHardCap = 100000;
+    void set_pushed_map_cap(std::size_t cap) { pushed_map_cap_ = std::min(cap, kPushedMapHardCap); }
+
+    /// Observability for CAP-1 — number of pushes that triggered an LRU
+    /// eviction because the map was at cap.
+    uint64_t pushed_evicted_for_cap() const noexcept {
+        return pushed_evicted_for_cap_.load(std::memory_order_relaxed);
+    }
+
     /// Set the optional fetcher-duration observer (see
     /// FetchDurationObserver above). Pass an empty function to clear.
     ///
@@ -281,8 +298,10 @@ private:
     /// another agent has already claimed (UP-1 spoofing defence).
     /// Same lock as pushed_.
     std::unordered_map<std::string, std::string> ip_owner_;
-    std::atomic<uint64_t> pushed_count_{0};          // total pushes accepted
-    std::atomic<uint64_t> pushed_rejected_count_{0}; // ip-spoof rejections
+    std::atomic<uint64_t> pushed_count_{0};           // total pushes accepted
+    std::atomic<uint64_t> pushed_rejected_count_{0};  // ip-spoof rejections
+    std::atomic<uint64_t> pushed_evicted_for_cap_{0}; // CAP-1 (#1002) LRU evictions
+    std::size_t pushed_map_cap_{0};                   // 0 = uncapped (legacy)
     /// Agent IDs already audited via `topology.push.first` — emit once
     /// per process lifetime per agent to bound audit volume. Guarded
     /// by pushed_mu_ (already taken when push_snapshot mutates the

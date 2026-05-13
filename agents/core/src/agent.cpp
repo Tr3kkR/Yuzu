@@ -31,6 +31,7 @@ __declspec(allocate(".CRT$XCB"))
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
+#include "local_dispatcher.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -320,6 +321,36 @@ template <typename F> struct ScopeExit {
 template <typename F> ScopeExit(F) -> ScopeExit<F>;
 
 } // anonymous namespace
+
+// #1001 / arch-S3 — shim used by LocalDispatcher to invoke a plugin
+// descriptor in-process with output captured into a caller-owned buffer.
+// Kept here (rather than in local_dispatcher.cpp) because CommandContextImpl
+// carries gRPC-typed streaming fields that would force local_dispatcher.cpp
+// to pull in grpcpp; this shim is the narrow boundary that contains that
+// coupling.
+int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* action,
+                          const YuzuParam* params, std::size_t param_count,
+                          std::string* capture_out, bool* truncated_out, std::size_t capture_cap) {
+    CommandContextImpl ctx_impl{};
+    ctx_impl.command_id = "__local_dispatch__";
+    ctx_impl.start_time = std::chrono::steady_clock::now();
+    ctx_impl.capture = capture_out;
+    // CommandContextImpl currently bakes the cap into its append_output
+    // (kCaptureMaxBytes constant). LocalDispatcher::kCaptureMaxBytes
+    // tracks the same value so the externally-visible policy lives in
+    // one place; the static_assert below catches divergence at compile
+    // time if either side drifts.
+    static_assert(CommandContextImpl::kCaptureMaxBytes ==
+                  yuzu::agent::LocalDispatcher::kCaptureMaxBytes);
+    (void)capture_cap;
+
+    auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
+    int rc = descriptor->execute(raw_ctx, action, params, param_count);
+    ctx_impl.flush_output(); // no-op in capture mode
+    if (truncated_out)
+        *truncated_out = ctx_impl.capture_truncated;
+    return rc;
+}
 
 // C ABI context function implementations
 
@@ -778,32 +809,24 @@ public:
                         }
                     };
                     sleep_for(kFirstDelay);
+                    LocalDispatcher dispatcher;
                     while (!stop_requested_.load(std::memory_order_acquire)) {
-                        std::string captured;
-                        CommandContextImpl ctx_impl{};
-                        ctx_impl.command_id = "__local_snapshot_pump__";
-                        ctx_impl.start_time = std::chrono::steady_clock::now();
-                        ctx_impl.capture = &captured;
-                        auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
-                        int rc = tar_descriptor->execute(raw_ctx, "fleet_snapshot", nullptr, 0);
-                        ctx_impl.flush_output(); // no-op in capture mode
-                        if (ctx_impl.capture_truncated) {
-                            // Truncated payload would be rejected by
-                            // the server parser; drop on the floor and
-                            // hope the next pump cycle produces a
-                            // healthy snapshot. Don't advance the seq —
-                            // last-known-good stays attached on the
-                            // next heartbeat.
-                            spdlog::warn("Snapshot pump: capture truncated at "
-                                         "{}B; dropping this cycle's snapshot",
-                                         captured.size());
-                        } else if (rc == 0 && !captured.empty()) {
+                        // #1001 / arch-S3 — local-dispatch concerns
+                        // (capture buffer, byte cap, truncation sentinel)
+                        // live in LocalDispatcher. The pump just decides
+                        // what to do with each cycle's result.
+                        auto result = dispatcher.run(tar_descriptor, "fleet_snapshot");
+                        if (result.truncated) {
+                            spdlog::warn("Snapshot pump: capture truncated at {}B; "
+                                         "dropping this cycle's snapshot",
+                                         result.captured.size());
+                        } else if (result.rc == 0 && !result.captured.empty()) {
                             std::lock_guard lock(snapshot_mu_);
-                            latest_snapshot_ = std::move(captured);
+                            latest_snapshot_ = std::move(result.captured);
                             latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
-                        } else if (rc != 0) {
+                        } else if (result.rc != 0) {
                             spdlog::warn("Snapshot pump: tar.fleet_snapshot rc={}, captured={}B",
-                                         rc, captured.size());
+                                         result.rc, result.captured.size());
                         }
                         sleep_for(kInterval);
                     }
@@ -1330,8 +1353,34 @@ public:
                             params.push_back(YuzuParam{k.c_str(), v.c_str()});
                         }
 
-                        int rc = target->execute(raw_ctx, cmd.action().c_str(), params.data(),
+                        // Defence-in-depth: wrap the plugin's execute() so a
+                        // thrown C++ exception cannot propagate up into the
+                        // command-dispatch thread and terminate() the whole
+                        // agent process. Plugins are expected to convert
+                        // failures into a non-zero `rc`; this is the safety
+                        // net for the cases they miss. Observed 2026-05-12:
+                        // agent_logging.get_log threw filesystem_error from
+                        // fs::exists on EACCES and brought the agent down
+                        // mid-test. The plugin bug is fixed separately;
+                        // this catch is so the next plugin's mistake
+                        // doesn't have the same blast radius.
+                        int rc;
+                        try {
+                            rc = target->execute(raw_ctx, cmd.action().c_str(), params.data(),
                                                  params.size());
+                        } catch (const std::exception& e) {
+                            spdlog::error("Plugin {} action {} threw std::exception: {}",
+                                          cmd.plugin(), cmd.action(), e.what());
+                            std::string msg = "plugin threw exception: ";
+                            msg += e.what();
+                            ctx_impl.append_output(msg.c_str());
+                            rc = 1;
+                        } catch (...) {
+                            spdlog::error("Plugin {} action {} threw non-std exception",
+                                          cmd.plugin(), cmd.action());
+                            ctx_impl.append_output("plugin threw non-std exception");
+                            rc = 1;
+                        }
 
                         // Flush any buffered output before sending timing/status
                         ctx_impl.flush_output();

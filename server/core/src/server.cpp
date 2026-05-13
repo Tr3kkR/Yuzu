@@ -52,6 +52,7 @@
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
 #include "fleet_topology_store.hpp"
+#include "heartbeat_ingestion.hpp"
 #include "fleet_topology_types.hpp"
 #include "mcp_server.hpp"
 #include "notification_routes.hpp"
@@ -719,6 +720,22 @@ public:
             // both initialised; that ordering is fixed here.
             if (fleet_topology_store_ && audit_store_ && audit_store_->is_open())
                 fleet_topology_store_->set_audit_store(audit_store_.get());
+
+            // CAP-1 (#1002) — bound the pushed_ map so a churning fleet or
+            // a session-management bug that leaves evict_pushed un-called
+            // can't grow the map unbounded. Cap at the same hard ceiling
+            // as the /viz machines_max DoS guard.
+            if (fleet_topology_store_)
+                fleet_topology_store_->set_pushed_map_cap(FleetTopologyStore::kPushedMapHardCap);
+
+            // #1000 / arch-S2 — construct the shared HeartbeatIngestion now
+            // that fleet_topology_store_ and health_store_ are wired, then
+            // inject into both ingestion paths so they cannot drift.
+            heartbeat_ingestion_ = std::make_unique<HeartbeatIngestion>(
+                registry_, &health_store_, fleet_topology_store_.get(), &metrics_);
+            agent_service_.set_heartbeat_ingestion(heartbeat_ingestion_.get());
+            if (gateway_service_)
+                gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
         }
 
         // Initialize tag store
@@ -5809,6 +5826,11 @@ private:
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     std::unique_ptr<FleetTopologyStore> fleet_topology_store_;
+    /// #1000 / arch-S2: shared heartbeat-ingestion pipeline. Constructed
+    /// after fleet_topology_store_ + health_store_ + metrics are wired;
+    /// injected into AgentServiceImpl and GatewayUpstreamServiceImpl so
+    /// both ingestion paths funnel through one entry point.
+    std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;
     std::unique_ptr<VizRoutes> viz_routes_;
     /// Atomic kill-switch consulted by VizRoutes on every request. Defaults
     /// to cfg_.viz_disable; runtime config could expose a flip path later.

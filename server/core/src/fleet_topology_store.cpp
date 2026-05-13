@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -500,6 +501,37 @@ void FleetTopologyStore::push_snapshot(RawAgentSnapshot raw) {
             }
             for (const auto& ip : raw.local_ips)
                 ip_owner_[ip] = raw.agent_id;
+
+            // CAP-1 (#1002): bound the map. When at cap and inserting a
+            // NEW agent_id, evict the entry with the smallest `ts` (oldest
+            // push). A re-push of an already-present agent_id replaces in
+            // place and doesn't trip the cap. Hot-path cost is O(N) over
+            // the map only on the cap edge; uncapped pushes are O(1).
+            if (pushed_map_cap_ > 0 && !pushed_.contains(agent_id) &&
+                pushed_.size() >= pushed_map_cap_) {
+                auto victim = pushed_.end();
+                int64_t victim_ts = std::numeric_limits<int64_t>::max();
+                for (auto it = pushed_.begin(); it != pushed_.end(); ++it) {
+                    const int64_t t = it->second ? it->second->ts : 0;
+                    if (t < victim_ts) {
+                        victim_ts = t;
+                        victim = it;
+                    }
+                }
+                if (victim != pushed_.end()) {
+                    // Also drop the evicted agent's ip_owner_ claims so a
+                    // re-enrollment with overlapping IPs isn't rejected.
+                    const std::string& vid = victim->first;
+                    for (auto it = ip_owner_.begin(); it != ip_owner_.end();) {
+                        if (it->second == vid)
+                            it = ip_owner_.erase(it);
+                        else
+                            ++it;
+                    }
+                    pushed_.erase(victim);
+                    pushed_evicted_for_cap_.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
 
             // Store the snapshot as a shared_ptr<const> — readers in
             // get() copy the handle only, not the underlying 5–20 KB

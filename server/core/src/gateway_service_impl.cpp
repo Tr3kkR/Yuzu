@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include "fleet_topology_store.hpp"
+#include "heartbeat_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 
@@ -157,43 +158,11 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* /*c
             spdlog::debug("[gateway] BatchHeartbeat: unknown session {}", hb.session_id());
             continue;
         }
-        // Store agent health from piggybacked status_tags
-        if (health_store_) {
-            health_store_->upsert(agent_id, hb.status_tags());
-        }
-        if (metrics_) {
-            metrics_->counter("yuzu_heartbeats_received_total", {{"via", "gateway"}}).increment();
-        }
-        // PR 10 / UAT 2026-05-12 — gateway-routed agents push their
-        // fleet_snapshot.v1 through the same HeartbeatRequest field
-        // as direct agents. Parse via the shared
-        // FleetTopologyStore::parse_fleet_snapshot_json so caps,
-        // exception sanitisation, and field set stay in lock-step
-        // with the direct-heartbeat ingest path (arch-B3 / cons-S1).
-        // Parse failures are non-fatal — a single buggy agent must not
-        // knock the batch handler offline.
-        if (fleet_topology_store_ && !hb.fleet_snapshot_json().empty()) {
-            std::string os_from_session;
-            if (auto sess = registry_.get_session(agent_id))
-                os_from_session = sess->os;
-            std::string parse_err;
-            auto parsed = yuzu::server::FleetTopologyStore::parse_fleet_snapshot_json(
-                hb.fleet_snapshot_json(), agent_id, os_from_session, &parse_err);
-            if (parsed.has_value()) {
-                fleet_topology_store_->push_snapshot(std::move(*parsed));
-                if (metrics_) {
-                    metrics_->counter("yuzu_viz_topology_pushed_total", {{"via", "gateway"}})
-                        .increment();
-                }
-            } else {
-                spdlog::warn("[gateway] BatchHeartbeat fleet_snapshot from agent={} rejected ({})",
-                             agent_id, parse_err);
-                if (metrics_) {
-                    metrics_
-                        ->counter("yuzu_viz_topology_push_parse_errors_total", {{"via", "gateway"}})
-                        .increment();
-                }
-            }
+        // #1000 / arch-S2: shared HeartbeatIngestion keeps the per-heartbeat
+        // work (health upsert, metrics, fleet_snapshot push) identical to
+        // the direct-heartbeat path so the two cannot drift.
+        if (heartbeat_ingestion_) {
+            heartbeat_ingestion_->ingest(hb, agent_id, "gateway");
         }
         ++acked;
     }

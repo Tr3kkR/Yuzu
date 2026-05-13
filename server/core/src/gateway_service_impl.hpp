@@ -25,6 +25,7 @@ namespace yuzu::server {
 class ManagementGroupStore;
 class InventoryStore;
 class FleetTopologyStore;
+class HeartbeatIngestion;
 } // namespace yuzu::server
 
 namespace yuzu::server::detail {
@@ -48,6 +49,9 @@ public:
     // fleets would still see /viz/fleet/topology fall back to the
     // dispatch path. nullptr disables for tests.
     void set_fleet_topology_store(FleetTopologyStore* store) { fleet_topology_store_ = store; }
+
+    /// #1000 / arch-S2: shared HeartbeatIngestion (see AgentServiceImpl).
+    void set_heartbeat_ingestion(HeartbeatIngestion* hi) { heartbeat_ingestion_ = hi; }
 
     grpc::Status ProxyRegister(grpc::ServerContext* context, const pb::RegisterRequest* request,
                                pb::RegisterResponse* response) override;
@@ -76,6 +80,7 @@ private:
     ManagementGroupStore* mgmt_group_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
+    HeartbeatIngestion* heartbeat_ingestion_{nullptr};
 
     // Map of gateway session_id -> agent_id for validation.
     mutable std::mutex sessions_mu_;

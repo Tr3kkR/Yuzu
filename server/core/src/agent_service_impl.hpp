@@ -37,6 +37,7 @@ class InventoryStore;
 class UpdateRegistry;
 class ExecutionTracker;
 class FleetTopologyStore;
+class HeartbeatIngestion;
 struct UpdatePackage;
 struct StoredResponse;
 struct AnalyticsEvent;
@@ -77,6 +78,12 @@ public:
     /// dispatcher; setter runs once during server bring-up before the
     /// dispatcher accepts traffic.
     void set_fleet_topology_store(FleetTopologyStore* store) { fleet_topology_store_ = store; }
+
+    /// #1000 / arch-S2: HeartbeatIngestion encapsulates the shared
+    /// per-heartbeat work (health upsert, metrics, fleet_snapshot push)
+    /// so both this service and GatewayUpstreamServiceImpl funnel
+    /// through one entry point. Set after bring-up alongside the stores.
+    void set_heartbeat_ingestion(HeartbeatIngestion* hi) { heartbeat_ingestion_ = hi; }
 
     /// UAT 2026-05-06 #8: when set, response-receipt paths (Subscribe +
     /// process_gateway_response) call `update_agent_status` so the
@@ -212,6 +219,7 @@ private:
     OffloadTargetStore* offload_target_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
+    HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     /// Atomic — see `set_execution_tracker` doc for why detached
     /// gateway-forward threads require the lock-free release/acquire
     /// pair instead of a plain raw pointer.

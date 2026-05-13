@@ -627,10 +627,17 @@ else
     # confirmed 2026-04-19 against a live v0.11.0 server; keep in sync
     # with server/core/src/metrics.cpp if it drifts.
     log "Phase 4 reuse: verifying registered agent count via /metrics..."
+    # The fleet-health recompute thread runs on a 15s interval, so a freshly
+    # registered agent can take up to one full interval to appear in /metrics.
+    # 20 attempts (~20s) covers one recompute + buffer. (#1008)
     AGENT_COUNT_FROM_METRICS=0
-    for i in $(seq 1 10); do
+    for i in $(seq 1 20); do
         METRICS=$(curl -sf --max-time 2 "http://127.0.0.1:$SERVER_WEB_PORT/metrics" 2>/dev/null || echo "")
-        HEALTHY=$(echo "$METRICS" | awk '/^yuzu_fleet_agents_healthy[[:space:]]/ { print $2; exit }')
+        # awk-no-exit pattern: `; exit` causes upstream SIGPIPE under
+        # `set -o pipefail` and breaks the loop on the first iteration
+        # without any of the expected metrics having been parsed.
+        # (#988-pattern carried over from feat/quic-transport.)
+        HEALTHY=$(echo "$METRICS" | awk '/^yuzu_fleet_agents_healthy[[:space:]]/ { val=$2 } END { print val }')
         if [[ -n "$HEALTHY" ]] && [[ "${HEALTHY%.*}" -ge 1 ]]; then
             AGENT_COUNT_FROM_METRICS=${HEALTHY%.*}
             break
@@ -641,7 +648,7 @@ else
         log "  Phase 4 agent confirmed: yuzu_fleet_agents_healthy = $AGENT_COUNT_FROM_METRICS"
         ALIVE_AGENTS=$AGENT_COUNT_FROM_METRICS
     else
-        echo "FAIL: Phase 4 reuse — yuzu_fleet_agents_healthy < 1 on /metrics after 10s" >&2
+        echo "FAIL: Phase 4 reuse — yuzu_fleet_agents_healthy < 1 on /metrics after 20s" >&2
         exit 1
     fi
 fi

@@ -5,6 +5,7 @@
 #include "analytics_event_store.hpp"
 #include "execution_tracker.hpp"
 #include "fleet_topology_store.hpp"
+#include "heartbeat_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
@@ -317,46 +318,21 @@ grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* /*context*/,
         return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown session");
     }
 
-    // Store health snapshot and update session activity timestamp
-    if (health_store_) {
-        health_store_->upsert(agent_id, request->status_tags());
-    }
+    // #1000 / arch-S2: per-heartbeat work (health upsert, metrics,
+    // fleet_snapshot push) lives in HeartbeatIngestion so the direct and
+    // gateway-batch paths cannot drift. `touch_activity` is direct-only
+    // — gateway-routed agents have their activity timestamp refreshed
+    // through ProxyRegister + the gateway's own bookkeeping.
     registry_.touch_activity(agent_id);
-    metrics_.counter("yuzu_heartbeats_received_total", {{"via", "direct"}}).increment();
+    if (heartbeat_ingestion_) {
+        heartbeat_ingestion_->ingest(*request, agent_id, "direct");
+    }
 
     response->set_acknowledged(true);
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::system_clock::now().time_since_epoch())
                       .count();
     response->mutable_server_time()->set_millis_epoch(now_ms);
-
-    // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
-    //
-    // If the heartbeat carries a fleet_snapshot.v1 JSON payload, hand
-    // it to the shared parser (FleetTopologyStore::parse_fleet_snapshot_json)
-    // and feed the resulting RawAgentSnapshot into the store. The
-    // shared parser enforces row + byte caps (sec-H1 / UP-8 hardening),
-    // sanitises exception text (sec-M3 / UP-14), and keeps the field
-    // set in lock-step across the three ingestion sites (arch-B3).
-    // Parse failures are non-fatal — a malformed payload from a buggy
-    // agent must not knock the heartbeat path offline.
-    if (fleet_topology_store_ && !request->fleet_snapshot_json().empty()) {
-        std::string os_from_session;
-        if (auto sess = registry_.get_session(agent_id))
-            os_from_session = sess->os;
-        std::string parse_err;
-        auto parsed = yuzu::server::FleetTopologyStore::parse_fleet_snapshot_json(
-            request->fleet_snapshot_json(), agent_id, os_from_session, &parse_err);
-        if (parsed.has_value()) {
-            fleet_topology_store_->push_snapshot(std::move(*parsed));
-            metrics_.counter("yuzu_viz_topology_pushed_total", {{"via", "direct"}}).increment();
-        } else {
-            spdlog::warn("Heartbeat fleet_snapshot from agent={} rejected ({})", agent_id,
-                         parse_err);
-            metrics_.counter("yuzu_viz_topology_push_parse_errors_total", {{"via", "direct"}})
-                .increment();
-        }
-    }
 
     spdlog::debug("Heartbeat from agent={} (session={})", agent_id, session_id);
     return grpc::Status::OK;
