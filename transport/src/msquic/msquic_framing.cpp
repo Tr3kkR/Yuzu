@@ -49,27 +49,36 @@ StatusCode FrameDecoder::feed(std::string_view bytes) {
 
     buffer_.append(bytes.data(), bytes.size());
 
-    std::size_t pos = 0;
-    while (buffer_.size() - pos >= 4) {
-        const std::uint32_t len = read_be32(buffer_, pos);
+    // Resume scanning at consumed_ — the bytes before it have already
+    // been emitted as frames and must not be re-scanned.
+    while (buffer_.size() - consumed_ >= 4) {
+        const std::uint32_t len = read_be32(buffer_, consumed_);
 
         // Frame-size enforcement BEFORE allocating a payload buffer sized
         // to the peer-controlled length (transport.hpp wire invariant 1).
         if (len > max_frame_) {
             error_ = StatusCode::ResourceExhausted;
             buffer_.clear();
+            consumed_ = 0;
             return error_;
         }
 
         // Payload not fully arrived yet — keep the bytes buffered.
-        if (buffer_.size() - pos < 4 + static_cast<std::size_t>(len)) break;
+        if (buffer_.size() - consumed_ < 4 + static_cast<std::size_t>(len)) {
+            break;
+        }
 
-        ready_.emplace_back(buffer_, pos + 4, len);
-        pos += 4 + len;
+        ready_.emplace_back(buffer_, consumed_ + 4, len);
+        consumed_ += 4 + len;
     }
 
-    // Compact consumed bytes once per feed rather than per frame.
-    if (pos > 0) buffer_.erase(0, pos);
+    // Compact lazily: drop the already-emitted prefix once it dominates
+    // the buffer, so the accumulator does not grow unbounded across many
+    // small feed() calls — but avoid an O(tail) shift on every feed.
+    if (consumed_ > 0 && consumed_ * 2 >= buffer_.size()) {
+        buffer_.erase(0, consumed_);
+        consumed_ = 0;
+    }
     return StatusCode::Ok;
 }
 

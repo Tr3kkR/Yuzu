@@ -70,11 +70,18 @@ public:
 
     // True if bytes have been buffered toward a frame that has not yet
     // fully arrived.
-    bool has_pending_partial() const noexcept { return !buffer_.empty(); }
+    bool has_pending_partial() const noexcept {
+        return buffer_.size() > consumed_;
+    }
 
 private:
     std::size_t             max_frame_;
-    std::string             buffer_;   // unconsumed wire bytes
+    // Wire bytes. [0, consumed_) have already been emitted as frames;
+    // feed() resumes scanning at consumed_ rather than 0 so completed-
+    // frame bytes are not re-scanned across calls, and compacts lazily
+    // rather than erasing on every feed (governance cpp-S1 / UP-12).
+    std::string             buffer_;
+    std::size_t             consumed_ = 0;
     std::deque<std::string> ready_;    // fully-assembled frames, FIFO
     StatusCode              error_ = StatusCode::Ok;
 };

@@ -8,16 +8,20 @@
 // grpc-only build the whole suite degrades to a single "backend not
 // linked" assertion.
 //
-// Increment 2 covers the unary path. Increments 3+ extend this file with
-// bidi, deadline, mTLS, metric-sink, and pool cases.
+// Increment 2 covers the unary path (happy path, unknown method,
+// handler-returned error, request parse failure, handler-thrown
+// exception). Increments 3+ extend this file with bidi, deadline, mTLS,
+// metric-sink, and pool cases.
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
+#include "test_transport_helpers.hpp" // yuzu::transport::test::StringMessage
 #include "yuzu/transport/transport.hpp"
 
 #ifdef YUZU_TRANSPORT_HAVE_MSQUIC
@@ -25,36 +29,28 @@
 #endif
 
 using namespace yuzu::transport;
+using yuzu::transport::test::StringMessage;
+
+#ifdef YUZU_TRANSPORT_HAVE_MSQUIC
 
 namespace {
 
-// Minimal SerializableMessage carrying an opaque byte string — the same
-// shape as test_transport_smoke.cpp's StringMessage, duplicated here so
-// this suite stays free of the gRPC-specific includes in that file.
-class StringMessage final : public SerializableMessage {
-public:
-    StringMessage() = default;
-    explicit StringMessage(std::string s) : data_(std::move(s)) {}
+// Increment-2 scope: server-auth-only TLS with the embedded self-signed
+// cert; the client does not verify the peer. Shared by every case here.
+Credentials make_test_creds() {
+    Credentials creds{};
+    creds.server_cert_pem = test::kTestServerCertPem;
+    creds.server_key_pem = test::kTestServerKeyPem;
+    creds.verify_peer = false;
+    creds.client_cert_mode = ClientCertMode::None;
+    return creds;
+}
 
-    bool serialize(std::string& out) const override {
-        out = data_;
-        return true;
-    }
-    bool parse(std::string_view in) override {
-        data_.assign(in.data(), in.size());
-        return true;
-    }
-
-    const std::string& data() const noexcept { return data_; }
-    void set_data(std::string s) { data_ = std::move(s); }
-
-private:
-    std::string data_;
-};
+std::unique_ptr<SerializableMessage> string_factory() {
+    return std::make_unique<StringMessage>();
+}
 
 } // namespace
-
-#ifdef YUZU_TRANSPORT_HAVE_MSQUIC
 
 TEST_CASE("msquic unary round-trip with registered handler", "[transport][msquic][round-trip]") {
     auto listener = make_server_listener(Backend::Msquic);
@@ -68,19 +64,9 @@ TEST_CASE("msquic unary round-trip with registered handler", "[transport][msquic
         sresp.set_data("ack:" + sreq.data());
         return Status{StatusCode::Ok, ""};
     };
-    auto factory = []() -> std::unique_ptr<SerializableMessage> {
-        return std::make_unique<StringMessage>();
-    };
-    listener->register_unary("yuzu.test.v1.Echo/Echo", factory, factory, handler);
+    listener->register_unary("yuzu.test.v1.Echo/Echo", string_factory, string_factory, handler);
 
-    // Increment-2 scope: server-auth-only TLS with the embedded
-    // self-signed cert; the client does not verify the peer.
-    Credentials creds{};
-    creds.server_cert_pem = test::kTestServerCertPem;
-    creds.server_key_pem = test::kTestServerKeyPem;
-    creds.verify_peer = false;
-    creds.client_cert_mode = ClientCertMode::None;
-
+    Credentials creds = make_test_creds();
     Endpoint bind{"127.0.0.1", 0}; // ephemeral port
     auto start_r = listener->start(bind, creds);
     REQUIRE(start_r.has_value());
@@ -108,22 +94,13 @@ TEST_CASE("msquic unary returns Unimplemented for an unknown method",
     auto listener = make_server_listener(Backend::Msquic);
     REQUIRE(listener != nullptr);
 
-    // A handler is registered, but the client calls a different method.
     auto handler = [](const CallContext&, const SerializableMessage&,
                       SerializableMessage&) -> Status {
         return Status{StatusCode::Ok, ""};
     };
-    auto factory = []() -> std::unique_ptr<SerializableMessage> {
-        return std::make_unique<StringMessage>();
-    };
-    listener->register_unary("yuzu.test.v1.Echo/Echo", factory, factory, handler);
+    listener->register_unary("yuzu.test.v1.Echo/Echo", string_factory, string_factory, handler);
 
-    Credentials creds{};
-    creds.server_cert_pem = test::kTestServerCertPem;
-    creds.server_key_pem = test::kTestServerKeyPem;
-    creds.verify_peer = false;
-    creds.client_cert_mode = ClientCertMode::None;
-
+    Credentials creds = make_test_creds();
     auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
     REQUIRE(start_r.has_value());
     Endpoint bound = listener->bound_endpoint();
@@ -135,10 +112,127 @@ TEST_CASE("msquic unary returns Unimplemented for an unknown method",
 
     StringMessage req("hello"), resp;
     CallContext ctx;
-    // The failure-path wire contract: a single TrailingStatus frame, no
-    // response frame.
+    // Failure-path wire contract: a single TrailingStatus frame, no
+    // response frame. The detail string is asserted so it stays in lock-
+    // step with the gRPC backend's verbatim string (governance cons-N2).
     auto r = ch->unary("yuzu.test.v1.Echo/DoesNotExist", ctx, req, resp);
     REQUIRE(r.status.code == StatusCode::Unimplemented);
+    REQUIRE(r.status.detail == "transport: method not registered");
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic unary propagates a handler-returned error status",
+          "[transport][msquic][round-trip]") {
+    // governance qe-S2a: a non-Ok handler return must reach the client's
+    // CallResult faithfully — code and detail — through send_trailing_status
+    // -> parse_trailer, with no response frame on the wire.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, const SerializableMessage&,
+                      SerializableMessage&) -> Status {
+        return Status{StatusCode::PermissionDenied, "operator denied"};
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Denied", string_factory, string_factory, handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+    REQUIRE(bound.port != 0);
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    StringMessage req("x"), resp;
+    CallContext ctx;
+    auto r = ch->unary("yuzu.test.v1.Echo/Denied", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::PermissionDenied);
+    REQUIRE(r.status.detail == "operator denied");
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic unary returns DataLoss when the request frame fails to parse",
+          "[transport][msquic][round-trip]") {
+    // governance qe-S2b: run_unary_handler maps a request->parse() failure
+    // to DataLoss before the handler ever runs.
+    struct ParseFailMessage final : SerializableMessage {
+        bool serialize(std::string& out) const override {
+            out.clear();
+            return true;
+        }
+        bool parse(std::string_view) override { return false; }
+    };
+
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    bool handler_ran = false;
+    auto handler = [&handler_ran](const CallContext&, const SerializableMessage&,
+                                  SerializableMessage&) -> Status {
+        handler_ran = true; // must NOT run — parse fails first
+        return Status{StatusCode::Ok, ""};
+    };
+    auto fail_factory = []() -> std::unique_ptr<SerializableMessage> {
+        return std::make_unique<ParseFailMessage>();
+    };
+    listener->register_unary("yuzu.test.v1.Echo/BadParse", fail_factory, string_factory, handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+    REQUIRE(bound.port != 0);
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    StringMessage req("anything"), resp;
+    CallContext ctx;
+    auto r = ch->unary("yuzu.test.v1.Echo/BadParse", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::DataLoss);
+    REQUIRE_FALSE(handler_ran);
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic unary scrubs a handler-thrown exception off the wire",
+          "[transport][msquic][round-trip]") {
+    // governance qe-S2c: a handler that throws must surface to the client
+    // as StatusCode::Internal with the static literal detail — the
+    // exception's what() text must never cross the process boundary.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, const SerializableMessage&,
+                      SerializableMessage&) -> Status {
+        throw std::runtime_error("SECRET_INTERNAL_DETAIL_/etc/shadow");
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Throws", string_factory, string_factory, handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+    REQUIRE(bound.port != 0);
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    StringMessage req("x"), resp;
+    CallContext ctx;
+    auto r = ch->unary("yuzu.test.v1.Echo/Throws", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Internal);
+    REQUIRE(r.status.detail == "transport: handler raised exception");
+    REQUIRE(r.status.detail.find("SECRET_INTERNAL_DETAIL") == std::string::npos);
 
     ch->close();
     listener->shutdown();

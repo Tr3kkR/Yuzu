@@ -51,7 +51,15 @@ if transport_opt == 'msquic' or transport_opt == 'both'
   # msquic's vcpkg port is ONLY_DYNAMIC_LIBRARY — yuzu_transport links it
   # as a shared lib; the runtime artefact set must ship libmsquic
   # alongside the binaries (see ADR-0001 / #376 PR 3 plan, risk 1).
-  msquic_dep = dependency('msquic', include_type: 'system')
+  #
+  # method: 'cmake' is pinned explicitly — the msquic port exports only a
+  # CMake config (find_package(msquic CONFIG)), and pinning avoids
+  # meson's pkg-config-then-cmake auto-probe ambiguity. This is the
+  # safer choice on Windows MSVC, where meson's cmake-dep translator has
+  # bitten the gRPC/protobuf/abseil deps before (the root meson.build
+  # option-D hand-wire block). The msquic build is still UNVALIDATED on
+  # Windows — tracked as governance build-S1.
+  msquic_dep = dependency('msquic', method: 'cmake', include_type: 'system')
   yuzu_transport_srcs += [
     'src/msquic/msquic_internal_helpers.cpp',
     'src/msquic/msquic_channel.cpp',

@@ -15,6 +15,8 @@
 #include <arpa/inet.h>
 #endif
 
+#include <spdlog/spdlog.h>
+
 namespace yuzu::transport::msquic_backend {
 
 // ── MsQuicApi singleton ──────────────────────────────────────────────────────
@@ -24,6 +26,10 @@ MsQuicApi::MsQuicApi() {
     if (QUIC_FAILED(st)) {
         init_error_ = "MsQuicOpen2 failed: " + quic_status_hex(st);
         api_ = nullptr;
+        // Log at init time, not just when a later caller queries ok():
+        // a poisoned singleton otherwise fails silently at startup and
+        // only surfaces from unrelated call sites (governance sre-1).
+        spdlog::critical("yuzu::transport[msquic]: {}", init_error_);
         return;
     }
 
@@ -37,6 +43,7 @@ MsQuicApi::MsQuicApi() {
         MsQuicClose(api_);
         api_          = nullptr;
         registration_ = nullptr;
+        spdlog::critical("yuzu::transport[msquic]: {}", init_error_);
         return;
     }
 }

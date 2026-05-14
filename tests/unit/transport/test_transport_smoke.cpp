@@ -23,6 +23,7 @@
 #include <grpcpp/security/server_credentials.h>
 
 #include "transport.pb.h" // generated from proto/yuzu/transport/framing/v1/transport.proto
+#include "test_transport_helpers.hpp"
 #include "yuzu/transport/proto_adapter.hpp"
 #include "yuzu/transport/transport.hpp"
 
@@ -367,28 +368,10 @@ TEST_CASE("Channel::unary cancel via stop_token returns Cancelled", "[transport]
 
 namespace {
 
-// Adapter: SerializableMessage that owns a std::string payload.
-// Used by both client (request/response) and server (handler) sides.
-class StringMessage final : public SerializableMessage {
-public:
-    StringMessage() = default;
-    explicit StringMessage(std::string s) : data_(std::move(s)) {}
-
-    bool serialize(std::string& out) const override {
-        out = data_;
-        return true;
-    }
-    bool parse(std::string_view in) override {
-        data_.assign(in.data(), in.size());
-        return true;
-    }
-
-    const std::string& data() const noexcept { return data_; }
-    void set_data(std::string s) { data_ = std::move(s); }
-
-private:
-    std::string data_;
-};
+// StringMessage (a SerializableMessage owning a std::string payload,
+// used by client and server sides) is shared with the msquic round-trip
+// suite — see test_transport_helpers.hpp (governance qe-S3 / cons-N1).
+using yuzu::transport::test::StringMessage;
 
 // Round-trip tests bind 127.0.0.1 with port 0 (ephemeral). After a
 // successful start(), listener->bound_endpoint() returns the

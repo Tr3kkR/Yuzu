@@ -47,6 +47,13 @@ struct ClientUnaryCall {
     bool                     done = false;
     Status                   transport_error;   // non-Ok if the stream broke
 
+    // True only when the peer half-closed cleanly (RECEIVE-with-FIN or
+    // PEER_SEND_SHUTDOWN). A stream that ended by abort / connection
+    // drop / mid-response crash leaves this false — and the frame
+    // sequence is then indeterminate, so unary() must not interpret it
+    // as a complete server message (governance UP-14 / CH-3).
+    bool                     peer_clean_fin = false;
+
     explicit ClientUnaryCall(std::size_t max_frame) : decoder(max_frame) {}
 };
 
@@ -57,7 +64,9 @@ constexpr const char* kBidiNotImplemented =
     "increment 3)";
 
 // Owned outbound buffer; the SendBuf* is the StreamSend client context,
-// freed on SEND_COMPLETE.
+// freed on SEND_COMPLETE. Raw new/delete: ownership is transferred
+// across the msquic C ABI — the client context is a void* msquic hands
+// back at SEND_COMPLETE, which no RAII type spans.
 struct SendBuf {
     QUIC_BUFFER quic{};
     std::string bytes;
@@ -85,11 +94,15 @@ bool send_framed(HQUIC stream, std::string framed, bool fin) {
     return true;
 }
 
-// Mark a call complete and wake unary().
-void finish_call(ClientUnaryCall* call, Status error) {
+// Mark a call complete and wake unary(). `clean_fin` records whether the
+// peer half-closed cleanly — only the RECEIVE-with-FIN and
+// PEER_SEND_SHUTDOWN paths pass true (governance UP-14 / CH-3).
+void finish_call(ClientUnaryCall* call, Status error,
+                 bool clean_fin = false) {
     {
         std::lock_guard<std::mutex> lock(call->mtx);
         if (call->done) return;
+        if (clean_fin) call->peer_clean_fin = true;
         if (!error.ok() && call->transport_error.ok()) {
             call->transport_error = std::move(error);
         }
@@ -111,6 +124,10 @@ QUIC_STATUS QUIC_API msquic_client_stream_callback(HQUIC stream, void* ctx,
             StatusCode sc = StatusCode::Ok;
             {
                 std::lock_guard<std::mutex> lock(call->mtx);
+                // Ignore a RECEIVE that arrives after the call already
+                // completed — unary() has moved-from call->frames
+                // (governance UP-17).
+                if (call->done) return QUIC_STATUS_SUCCESS;
                 for (uint32_t i = 0; i < ev->RECEIVE.BufferCount; ++i) {
                     const auto& b = ev->RECEIVE.Buffers[i];
                     sc = call->decoder.feed(std::string_view{
@@ -132,13 +149,15 @@ QUIC_STATUS QUIC_API msquic_client_stream_callback(HQUIC stream, void* ctx,
                             Status{StatusCode::DataLoss,
                                    "transport: inbound framing error"});
             } else if (fin) {
-                finish_call(call, Status{});
+                // RECEIVE-with-FIN is a clean peer half-close.
+                finish_call(call, Status{}, /*clean_fin=*/true);
             }
             return QUIC_STATUS_SUCCESS;
         }
 
         case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
-            finish_call(call, Status{});
+            // Clean peer half-close.
+            finish_call(call, Status{}, /*clean_fin=*/true);
             return QUIC_STATUS_SUCCESS;
 
         case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
@@ -474,25 +493,61 @@ CallResult MsquicChannel::unary(std::string_view method,
     }
 
     // Block until the stream completes (peer FIN, abort, or shutdown).
+    // Bounded wait: a CI/production safety net until increment 4 wires
+    // the real per-call deadline from CallContext::deadline — without
+    // the bound a wedged handler or a lost QUIC event hangs the caller
+    // indefinitely (governance UP-5 / qe-BLOCKING).
+    bool completed = false;
     {
         std::unique_lock<std::mutex> lock(call->mtx);
-        call->cv.wait(lock, [&call] { return call->done; });
+        completed = call->cv.wait_for(lock, std::chrono::seconds(10),
+                                      [&call] { return call->done; });
+        if (!completed) {
+            call->done            = true;  // a late finish_call no-ops
+            call->transport_error = Status{
+                StatusCode::DeadlineExceeded,
+                "transport: unary call did not complete within 10s"};
+        }
+    }
+    if (!completed) {
+        // Abort the stream so SHUTDOWN_COMPLETE fires and untracks it.
+        // This may race a real SHUTDOWN_COMPLETE callback already running
+        // untrack_call + StreamClose — that is benign: `call` stays alive
+        // via the live_calls_ shared_ptr, and StreamShutdown on a handle
+        // being closed is a msquic-tolerated no-op (governance Gate-7).
+        api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
     }
 
-    // Interpret the collected frames. Wire contract for unary:
-    //   success -> [response frame][TrailingStatus frame]
-    //   failure -> [TrailingStatus frame]
+    // Collect the call outcome.
     std::vector<std::string> frames;
     Status transport_error;
+    bool   peer_clean_fin = false;
     {
         std::lock_guard<std::mutex> lock(call->mtx);
         frames          = std::move(call->frames);
         transport_error = call->transport_error;
+        peer_clean_fin  = call->peer_clean_fin;
     }
     if (!transport_error.ok()) {
         return CallResult{transport_error, {}};
     }
+    // The frame-count interpretation below is only sound when the peer
+    // half-closed cleanly. A stream ended by abort / connection drop /
+    // mid-response crash has an indeterminate frame sequence — a lone
+    // frame could be a truncated response, NOT a trailer, and parsing a
+    // response as a TrailingStatus would fabricate an RPC status
+    // (governance UP-14 / CH-3).
+    if (!peer_clean_fin) {
+        return CallResult{
+            Status{StatusCode::Unavailable,
+                   "transport: stream ended without a clean peer half-close"},
+            {}};
+    }
 
+    // Interpret the collected frames. Wire contract for unary
+    // (peer_clean_fin == true):
+    //   success -> [response frame][TrailingStatus frame]
+    //   failure -> [TrailingStatus frame]
     auto parse_trailer = [](const std::string& body) -> Status {
         pb::TrailingStatus trailer;
         if (!trailer.ParseFromString(body)) {
@@ -567,7 +622,11 @@ void MsquicChannel::close() {
         api->ConfigurationClose(configuration);
     }
 
-    // Any calls still tracked had their streams closed by ConnectionClose.
+    // RELIES ON: ConnectionClose blocks until every stream callback for
+    // the connection has returned, so each stream's SHUTDOWN_COMPLETE
+    // (and its untrack_call) has already run by here — live_calls_ is
+    // normally empty. The clear() is a defensive catch, not the primary
+    // drain (governance hp-2).
     std::lock_guard<std::mutex> lock(mtx_);
     live_calls_.clear();
 }

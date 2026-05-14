@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 
 #include "msquic.h"
@@ -97,6 +98,15 @@ private:
     void track_stream(HQUIC stream, std::shared_ptr<ServerStreamCall> call);
     void untrack_stream(HQUIC stream);
 
+    // Accepted-connection registry. shutdown() must drain every live
+    // connection (ConnectionShutdown -> the conn callback's
+    // SHUTDOWN_COMPLETE -> ConnectionClose + untrack) BEFORE the listener
+    // and its live_streams_ map are destroyed — otherwise a late stream
+    // callback dereferences a freed ServerStreamCall (governance
+    // UP-13 / UP-18; surfaced as a crash by the per-stream mutex).
+    void track_connection(HQUIC conn);
+    void untrack_connection(HQUIC conn);
+
     // Effective per-stream frame cap (opts_.max_frame_size or the default).
     std::size_t stream_max_frame() const noexcept;
 
@@ -106,6 +116,7 @@ private:
 
     mutable std::mutex                       mtx_;
     std::condition_variable                  shutdown_cv_;
+    std::condition_variable                  conn_drain_cv_;  // live_connections_ empties
     std::map<std::string, UnaryRegistration> unary_handlers_;
     std::map<std::string, BidiStreamHandler> bidi_handlers_;
     ListenerOptions                          opts_;
@@ -122,6 +133,10 @@ private:
     // raw ServerStreamCall* is stashed as each stream's msquic context;
     // this map owns the shared_ptr so the call outlives the callbacks.
     std::map<HQUIC, std::shared_ptr<ServerStreamCall>> live_streams_;
+
+    // Live accepted-connection handles. shutdown() drains this set so no
+    // stream callback can fire on a freed ServerStreamCall after teardown.
+    std::set<HQUIC>                          live_connections_;
 
     std::atomic<bool>                        started_{false};
     std::atomic<bool>                        shutting_down_{false};

@@ -13,8 +13,10 @@
 #include "msquic_listener.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <expected>
 #include <functional>
@@ -54,6 +56,11 @@ struct ServerStreamCall {
 
     FrameDecoder decoder;
 
+    // `phase` is owned exclusively by the msquic stream callback, which
+    // msquic delivers serially per stream — there is no concurrent
+    // writer (governance cpp-S2 / UP-7: the worker thread no longer
+    // touches it; see run_unary_handler). Increment 3's bidi path makes
+    // per-stream state worker-shared and must revisit this.
     enum class Phase { AwaitingHello, AwaitingRequest, Dispatched, Done };
     Phase phase = Phase::AwaitingHello;
 
@@ -66,6 +73,15 @@ struct ServerStreamCall {
     std::function<std::unique_ptr<SerializableMessage>()>  response_factory;
     UnaryHandler                                          unary_handler;
 
+    // Serialises a worker thread's outbound StreamSend / StreamShutdown
+    // against the SHUTDOWN_COMPLETE callback's StreamClose (governance
+    // UP-1 / CH-1): a peer that aborts mid-handler can drive
+    // SHUTDOWN_COMPLETE while the worker still holds `this` and would
+    // otherwise call StreamSend on the freed HQUIC. Held only briefly
+    // around the msquic stream op.
+    std::mutex mtx;
+    bool       stream_closed = false;
+
     explicit ServerStreamCall(std::size_t max_frame) : decoder(max_frame) {}
 };
 
@@ -73,6 +89,9 @@ namespace {
 
 // Owned outbound buffer. The QUIC_BUFFER points into `bytes`; the
 // SendBuf* is the StreamSend client context, freed on SEND_COMPLETE.
+// Raw new/delete: ownership is transferred across the msquic C ABI —
+// the StreamSend client context is a void* msquic hands back at
+// SEND_COMPLETE, which no RAII type spans.
 struct SendBuf {
     QUIC_BUFFER quic{};
     std::string bytes;
@@ -129,8 +148,19 @@ QUIC_STATUS map_decoder_error_to_quic(StatusCode) noexcept {
 namespace {
 
 // Send one framed payload on the stream. `fin` half-closes the send
-// direction after this buffer. Returns false if StreamSend failed.
+// direction after this buffer. Returns false if the stream is already
+// closed or StreamSend failed. Takes call->mtx so a worker thread's
+// StreamSend cannot race the SHUTDOWN_COMPLETE callback's StreamClose
+// (governance UP-1 / CH-1).
+//
+// PRECONDITION: msquic does not synchronously re-enter the stream
+// callback from StreamSend/StreamShutdown/StreamClose (its documented
+// model — callbacks come from msquic worker threads, not inline). The
+// non-recursive call->mtx held here and in the SHUTDOWN_COMPLETE handler
+// relies on that.
 bool send_frame(ServerStreamCall* call, std::string payload, bool fin) {
+    std::lock_guard<std::mutex> lock(call->mtx);
+    if (call->stream_closed) return false;
     const auto* api = MsQuicApi::instance().api();
     auto* sb = new SendBuf(std::move(payload));
     const QUIC_SEND_FLAGS flags =
@@ -145,6 +175,15 @@ bool send_frame(ServerStreamCall* call, std::string payload, bool fin) {
     return true;
 }
 
+// Abort the stream. Takes call->mtx and no-ops if the stream is already
+// closed — same race guard as send_frame (governance UP-1 / CH-1).
+void abort_stream(ServerStreamCall* call) {
+    std::lock_guard<std::mutex> lock(call->mtx);
+    if (call->stream_closed) return;
+    MsQuicApi::instance().api()->StreamShutdown(
+        call->stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+}
+
 // Encode a TrailingStatus message and send it as the final frame.
 void send_trailing_status(ServerStreamCall* call, const Status& status) {
     pb::TrailingStatus trailer;
@@ -153,16 +192,14 @@ void send_trailing_status(ServerStreamCall* call, const Status& status) {
     std::string body;
     if (!trailer.SerializeToString(&body)) {
         // Should not happen for a trivial message; abort the stream.
-        MsQuicApi::instance().api()->StreamShutdown(
-            call->stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        abort_stream(call);
         return;
     }
     std::string framed;
     // TrailingStatus is transport-internal and small; the default cap
     // always accommodates it.
     if (!encode_frame(body, 0, framed)) {
-        MsQuicApi::instance().api()->StreamShutdown(
-            call->stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        abort_stream(call);
         return;
     }
     send_frame(call, std::move(framed), /*fin=*/true);
@@ -219,7 +256,10 @@ void run_unary_handler(std::shared_ptr<ServerStreamCall> keep,
         }
     }
     send_trailing_status(call, status);
-    call->phase = ServerStreamCall::Phase::Dispatched;
+    // NOTE: `phase` is deliberately NOT written here. The msquic stream
+    // callback already set it to Dispatched before submitting this task
+    // (governance hp-1 / cpp-S2 / UP-7: a write here would be a second
+    // writer racing the serial callback thread).
 }
 
 }  // namespace
@@ -320,7 +360,15 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
 
         case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
             MsquicServerListener* listener = call->listener;
-            MsQuicApi::instance().api()->StreamClose(stream);
+            // Set stream_closed and StreamClose under call->mtx so a
+            // worker thread mid-send_frame/abort_stream either completes
+            // its StreamSend before the handle is closed or observes
+            // stream_closed and no-ops (governance UP-1 / CH-1).
+            {
+                std::lock_guard<std::mutex> lock(call->mtx);
+                call->stream_closed = true;
+                MsQuicApi::instance().api()->StreamClose(stream);
+            }
             // Dropping the registry's shared_ptr; if a worker still holds
             // one the ServerStreamCall outlives this call until it
             // returns. After SHUTDOWN_COMPLETE msquic delivers no further
@@ -357,7 +405,12 @@ QUIC_STATUS QUIC_API msquic_conn_callback(HQUIC conn, void* ctx,
         }
 
         case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
+            // ConnectionClose frees the handle; untrack_connection then
+            // removes the (now-stale) handle value from the registry and
+            // wakes a draining shutdown(). After SHUTDOWN_COMPLETE msquic
+            // delivers no further events for this connection.
             api->ConnectionClose(conn);
+            listener->untrack_connection(conn);
             return QUIC_STATUS_SUCCESS;
 
         default:
@@ -372,11 +425,14 @@ QUIC_STATUS QUIC_API msquic_listener_callback(HQUIC /*listener_handle*/,
     const auto* api = MsQuicApi::instance().api();
     switch (ev->Type) {
         case QUIC_LISTENER_EVENT_NEW_CONNECTION: {
+            HQUIC conn = ev->NEW_CONNECTION.Connection;
             api->SetCallbackHandler(
-                ev->NEW_CONNECTION.Connection,
-                reinterpret_cast<void*>(msquic_conn_callback), listener);
-            return api->ConnectionSetConfiguration(
-                ev->NEW_CONNECTION.Connection, listener->configuration_);
+                conn, reinterpret_cast<void*>(msquic_conn_callback), listener);
+            // Track the connection before configuring it so shutdown()
+            // can drain it; the conn callback's SHUTDOWN_COMPLETE untracks.
+            listener->track_connection(conn);
+            return api->ConnectionSetConfiguration(conn,
+                                                   listener->configuration_);
         }
         default:
             return QUIC_STATUS_SUCCESS;
@@ -390,6 +446,14 @@ MsquicServerListener::MsquicServerListener() = default;
 MsquicServerListener::~MsquicServerListener() { shutdown(); }
 
 void MsquicServerListener::enforce_method_or_die(const std::string& method) {
+    // Registration after start() is a FailedPrecondition contract
+    // violation (transport.hpp) and would race dispatch_stream_call's
+    // handler-map reads — reject loudly, matching the gRPC backend
+    // (governance cons-B1).
+    if (started_.load(std::memory_order_acquire)) {
+        throw std::logic_error(
+            "transport: register_* called after start() (FailedPrecondition)");
+    }
     if (!method_name_well_formed(method)) {
         throw std::invalid_argument(
             "transport: malformed RPC method name: " + method);
@@ -403,6 +467,12 @@ void MsquicServerListener::register_unary(
     UnaryHandler handler) {
     enforce_method_or_die(method);
     std::lock_guard<std::mutex> lock(mtx_);
+    // Duplicate registration is a programming error — reject it loudly
+    // rather than silently overwriting via operator[] (governance cons-B2).
+    if (unary_handlers_.contains(method) || bidi_handlers_.contains(method)) {
+        throw std::invalid_argument(
+            "transport: method already registered: " + method);
+    }
     unary_handlers_[std::move(method)] = UnaryRegistration{
         std::move(request_factory), std::move(response_factory),
         std::move(handler)};
@@ -412,6 +482,10 @@ void MsquicServerListener::register_bidi_stream(std::string method,
                                                 BidiStreamHandler handler) {
     enforce_method_or_die(method);
     std::lock_guard<std::mutex> lock(mtx_);
+    if (unary_handlers_.contains(method) || bidi_handlers_.contains(method)) {
+        throw std::invalid_argument(
+            "transport: method already registered: " + method);
+    }
     bidi_handlers_[std::move(method)] = std::move(handler);
 }
 
@@ -420,6 +494,9 @@ std::size_t MsquicServerListener::stream_max_frame() const noexcept {
 }
 
 bool MsquicServerListener::listener_submit(std::function<void()> task) {
+    // worker_pool_ is read here from msquic stream-callback threads and
+    // moved-out by shutdown() — both under mtx_ (governance UP-6 / CH-2).
+    std::lock_guard<std::mutex> lock(mtx_);
     if (!worker_pool_) return false;
     return worker_pool_->submit(std::move(task));
 }
@@ -440,6 +517,20 @@ void MsquicServerListener::untrack_stream(HQUIC stream) {
             live_streams_.erase(it);
         }
     }
+}
+
+void MsquicServerListener::track_connection(HQUIC conn) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    live_connections_.insert(conn);
+}
+
+void MsquicServerListener::untrack_connection(HQUIC conn) {
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        live_connections_.erase(conn);
+    }
+    // Wake shutdown() if it is waiting for the connection set to drain.
+    conn_drain_cv_.notify_all();
 }
 
 void MsquicServerListener::dispatch_stream_call(ServerStreamCall* call,
@@ -463,10 +554,11 @@ void MsquicServerListener::dispatch_stream_call(ServerStreamCall* call,
         call->phase = ServerStreamCall::Phase::Done;
         return;
     }
-    // Unknown method.
+    // Unknown method — detail string matches the gRPC backend verbatim
+    // so operators grepping status records see one string (cons-S3).
     send_trailing_status(
         call, Status{StatusCode::Unimplemented,
-                     "transport: no handler registered for method"});
+                     "transport: method not registered"});
     call->phase = ServerStreamCall::Phase::Done;
 }
 
@@ -479,6 +571,14 @@ std::expected<void, Status> MsquicServerListener::start(
                                       "transport: " + api_handle.init_error()});
     }
     const auto* api = api_handle.api();
+
+    // max_frame_size must not exceed the absolute ceiling (transport.hpp);
+    // matches the gRPC backend's start() rejection (governance cons-S1).
+    if (opts.max_frame_size > kAbsoluteMaxFrameSize) {
+        return std::unexpected(Status{
+            StatusCode::InvalidArgument,
+            "transport: max_frame_size exceeds kAbsoluteMaxFrameSize"});
+    }
 
     {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -630,9 +730,50 @@ void MsquicServerListener::shutdown() {
         api->ListenerClose(listener_);
         listener_ = nullptr;
     }
-    // Join handler workers after the listener stopped accepting — no new
-    // callbacks will submit work past this point.
-    worker_pool_.reset();
+
+    // Drain every accepted connection before the listener (and its
+    // live_streams_ map) is destroyed: ConnectionShutdown initiates the
+    // close, each connection's SHUTDOWN_COMPLETE callback runs
+    // ConnectionClose + untrack_connection, and we wait for
+    // live_connections_ to empty. Without this a late stream callback
+    // dereferences a freed ServerStreamCall (governance UP-13 / UP-18 —
+    // surfaced as a crash by the B2 per-stream mutex).
+    if (api != nullptr) {
+        std::vector<HQUIC> conns;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            conns.assign(live_connections_.begin(), live_connections_.end());
+        }
+        for (HQUIC c : conns) {
+            api->ConnectionShutdown(c, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+        }
+        std::unique_lock<std::mutex> lock(mtx_);
+        if (!conn_drain_cv_.wait_for(lock, std::chrono::seconds(10), [this] {
+                return live_connections_.empty();
+            })) {
+            // ConnectionShutdown reliably produces SHUTDOWN_COMPLETE; a
+            // 10s no-drain means msquic itself is wedged. Proceeding
+            // would let the dtor destroy live_streams_ with a stream
+            // callback still in flight — the UP-13 use-after-free. A
+            // clean abort beats a UAF (governance Gate-7 re-review).
+            spdlog::critical(
+                "yuzu::transport[msquic]: {} connection(s) failed to drain "
+                "within 10s on shutdown — aborting to avoid use-after-free",
+                live_connections_.size());
+            std::abort();
+        }
+    }
+
+    // Join the worker pool after the connections have drained — no
+    // further callbacks will submit work. Move worker_pool_ out under
+    // mtx_ (listener_submit reads it from callback threads — UP-6) then
+    // join the local OUTSIDE the lock.
+    std::unique_ptr<WorkerPool> pool;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        pool = std::move(worker_pool_);
+    }
+    pool.reset();  // joins handler workers
     if (api != nullptr && configuration_ != nullptr) {
         api->ConfigurationClose(configuration_);
         configuration_ = nullptr;
