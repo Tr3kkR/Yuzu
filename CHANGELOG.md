@@ -90,6 +90,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never re-proxied the agent registrations it still held, leaving a
   freshly-restarted server with an empty registry. The gateway now
   drip-replays a `ProxyRegister` per held agent on upstream recovery.
+- **34 InstructionDefinitions now pass on macOS.** `procfetch` gained a
+  libproc/OpenSSL macOS branch, the instructions test runner gained
+  host-aware parameter synthesis and platform-aware skip (definitions
+  with a `platforms:` list now emit `skip` on a non-matching host
+  instead of a spurious `FAIL`).
+- **Mixed-fleet split-brain in `/viz/fleet` (governance Gate 7 UP-9).**
+  Once any agent pushed a snapshot, the topology was built solely from
+  the pushed map and the dispatch fallback was skipped — so any
+  registered agent that had *not* pushed (a pre-`tar.fleet_snapshot`
+  build mid rolling-upgrade, the TAR plugin disabled, a pump wedged on
+  its first cycle) silently vanished from the visualization. The store
+  now emits a `stale=true` placeholder cube for every
+  registered-but-unpushed agent.
+- **Gateway registration-replay storm (governance Gate 7 UP-5).** An
+  in-flight replay drip was restarted from scratch on every redundant
+  `replay_registrations` trigger, so under packet-loss flapping the
+  gateway re-proxied the whole fleet repeatedly and, at scale, never
+  drained. Redundant triggers while a drip is running are now dropped;
+  each outage event arms at most one full replay that runs to
+  completion.
+
+### Security
+
+- **Fleet-topology push-ingestion hardening (governance Gate 7).**
+  Round of fixes to `FleetTopologyStore` push ingestion:
+  - **Parser field caps (UP-1 / sec-M1).** `processes[].name`,
+    `.cmdline`, `.user`, `hostname`, and the connection meta strings
+    are now length-clamped at parse time (previously only the address
+    fields were), so a single oversize row can no longer balloon the
+    in-memory map or every `/viz/fleet/topology` response.
+  - **IP-claim reclaim window (UP-3).** The IP-spoof guard is still
+    first-claim-wins, but a claim whose owner has not pushed within
+    five minutes is now reclaimable — an agent that crashed without a
+    clean deregister no longer strands its `local_ips` forever, so a
+    re-imaged host re-enrolling on the same DHCP lease is not rejected
+    indefinitely.
+  - **CAP-1 LRU victim by server clock (UP-4).** Cap-eviction victim
+    selection now keys on the server-stamped receipt time, not the
+    agent-controlled `ts`, so a hostile agent can no longer choose
+    which legitimate agent gets evicted by lying about its emit time.
+    Cap evictions now also emit a `topology.push.evicted_for_cap`
+    audit event.
+  - **Push-staleness by server clock (UP-14).** The stuck-pump
+    staleness gate keys on server receipt time, so a clock-skewed
+    agent cannot render itself permanently fresh.
+  - **Batch-heartbeat isolation (UP-10).** A single malformed entry in
+    a gateway `BatchHeartbeat` (or an exception out of the direct
+    `Heartbeat` ingest) is now caught per-entry and can no longer
+    abort the whole batch.
+  - **Kill-switch hardening.** `--viz-disable` now also 503s the
+    `/viz/fleet` and `/viz/host/<id>` page shells (previously only the
+    REST/fragment endpoints), and emits a durable `server.viz_disabled`
+    audit event at startup so the disabled state is provable from the
+    audit store, not just process logs.
 
 ### Upgrade notes
 
@@ -104,6 +158,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A hot upgrade from a pre-change gateway build is not supported (no
   `code_change/3`); the documented gateway deploy path — container
   replacement — is unaffected.
+- **Rolling agent upgrades and `/viz/fleet`.** During a rolling agent
+  upgrade, agents on a build older than the `tar.fleet_snapshot` action
+  (the push-ingestion source) appear in `/viz/fleet` as dimmed `stale`
+  cubes until their agent is upgraded — they have no topology to push
+  yet. This is expected, not a regression; the cubes populate fully once
+  the agent is current.
 
 ### Removed
 

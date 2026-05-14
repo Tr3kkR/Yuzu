@@ -59,7 +59,7 @@ All Yuzu metrics follow a consistent naming scheme.
 | `yuzu_server_` | Server process | `yuzu_server_http_requests_total`, `yuzu_server_connected_agents` |
 | `yuzu_server_cert_` | Certificate reload | `yuzu_server_cert_reloads_total`, `yuzu_server_cert_reload_failures_total` |
 | `yuzu_agent_` | Agent process | `yuzu_agent_plugin_executions_total`, `yuzu_agent_heartbeat_latency_seconds` |
-| `yuzu_viz_` | Fleet visualization (`/api/v1/viz/fleet/topology`) | `yuzu_viz_topology_request_seconds`, `yuzu_viz_topology_fetch_duration_seconds`, `yuzu_viz_cache_hit_total`, `yuzu_viz_refill_oversize_drops_total` |
+| `yuzu_viz_` | Fleet visualization (`/api/v1/viz/fleet/topology` + heartbeat push ingestion) | `yuzu_viz_topology_request_seconds`, `yuzu_viz_topology_pushed_total`, `yuzu_viz_topology_push_rejected_total`, `yuzu_viz_pushed_cap_evictions_total`, `yuzu_viz_pushed_map_size` |
 
 ## Fleet visualization metrics
 
@@ -76,6 +76,12 @@ The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST 
 | `yuzu_viz_refill_oversize_drops_total` | gauge | Refills whose serialised size exceeded `max_snapshot_bytes` (256 MiB default). The result is returned to the caller but NOT cached, so the next request re-runs the full fetcher. Non-zero indicates a misbehaving agent or an undersized cap. |
 | `yuzu_viz_refill_wait_timeouts_total` | gauge | Single-flight waiters that timed out on `cv.wait_for` before the refill completed. Non-zero indicates the fetcher is exceeding its deadline. |
 | `yuzu_viz_refill_waiters_total` | gauge | Number of fetch waiters that piggybacked on an in-flight refill (single-flight wins). High values indicate stampede risk on `/viz/fleet`. |
+| `yuzu_viz_local_edges_dropped_total` | gauge | `EdgeScope::Local` connection edges dropped before serialisation because no reciprocal half was visible in the same agent payload. Non-zero is expected under normal churn (kernel race during socket teardown, the agent's 4096-connection cap cutting a partner); a sustained spike vs steady-state indicates systematic loss. |
+| `yuzu_viz_topology_pushed_total` | counter | Agent-pushed `fleet_snapshot.v1` payloads accepted into the `FleetTopologyStore`. Labelled `via=direct\|gateway` (direct `HeartbeatRequest` vs gateway `BatchHeartbeat`); sum across the label for fleet-wide push volume. |
+| `yuzu_viz_topology_push_parse_errors_total` | counter | Agent-pushed payloads rejected by the shared parser (oversized, row-cap exceeded, malformed JSON). Labelled `via=direct\|gateway`. |
+| `yuzu_viz_topology_push_rejected_total` | gauge | Pushes rejected by the IP-spoof guard because a claimed `local_ip` is owned by a live agent. A non-zero rate signals a spoofing campaign or a NAT/DHCP misconfiguration. |
+| `yuzu_viz_pushed_cap_evictions_total` | gauge | `pushed_` map entries evicted because the map was at `kPushedMapHardCap` (100000) when a new agent pushed. Non-zero means the fleet outgrew the cap or a cap-flood attack is evicting legitimate agents — cross-check with the `topology.push.evicted_for_cap` audit events. |
+| `yuzu_viz_pushed_map_size` | gauge | Current occupancy of the `pushed_` map. Primary memory-pressure signal — alert before it approaches the 100000 hard cap. |
 
 ### Recommended alerts
 
@@ -100,6 +106,22 @@ The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST 
   expr: increase(yuzu_viz_refill_oversize_drops_total[10m]) > 0
   annotations:
     summary: "FleetTopologyStore is dropping refills above 256 MiB cap; raise --max-snapshot-bytes or scope down the fleet"
+
+- alert: VizFleetPushRejections
+  expr: increase(yuzu_viz_topology_push_rejected_total[10m]) > 0
+  annotations:
+    summary: "Fleet-snapshot pushes rejected by the IP-spoof guard — spoofing campaign or NAT/DHCP misconfiguration"
+
+- alert: VizFleetCapEvictions
+  expr: increase(yuzu_viz_pushed_cap_evictions_total[10m]) > 0
+  annotations:
+    summary: "FleetTopologyStore is evicting agents at the 100000-entry hard cap — fleet outgrew the cap or a cap-flood attack is in progress"
+
+- alert: VizFleetPushedMapNearCap
+  expr: yuzu_viz_pushed_map_size > 80000
+  for: 10m
+  annotations:
+    summary: "FleetTopologyStore pushed_ map above 80% of the 100000 hard cap; evictions imminent"
 ```
 
 ## Labels

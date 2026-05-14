@@ -161,8 +161,29 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* /*c
         // #1000 / arch-S2: shared HeartbeatIngestion keeps the per-heartbeat
         // work (health upsert, metrics, fleet_snapshot push) identical to
         // the direct-heartbeat path so the two cannot drift.
+        //
+        // Gate 7 UP-10 — per-entry try/catch. A gateway BatchHeartbeat can
+        // carry thousands of agents' heartbeats in one RPC; if ingest()
+        // throws on a single entry (std::bad_alloc on a near-cap map walk,
+        // a malformed payload that slips past the parser's own guard, an
+        // exception out of health_store_/metrics_), an unhandled throw
+        // would abort the whole RPC handler and silently drop every
+        // remaining heartbeat in the batch — a single bad agent could
+        // blank a gateway's entire fleet. Isolate each entry.
         if (heartbeat_ingestion_) {
-            heartbeat_ingestion_->ingest(hb, agent_id, "gateway");
+            try {
+                heartbeat_ingestion_->ingest(hb, agent_id, "gateway");
+            } catch (const std::exception& ex) {
+                spdlog::warn("[gateway] BatchHeartbeat: ingest threw for agent {} — "
+                             "skipping entry, batch continues: {}",
+                             agent_id, ex.what());
+                continue;
+            } catch (...) {
+                spdlog::warn("[gateway] BatchHeartbeat: ingest threw unknown exception for "
+                             "agent {} — skipping entry, batch continues",
+                             agent_id);
+                continue;
+            }
         }
         ++acked;
     }

@@ -68,6 +68,24 @@ public:
     /// observation).
     using FetchDurationObserver = std::function<void(std::chrono::duration<double>)>;
 
+    /// One fleet-roster entry — a registered agent and the session-sourced
+    /// identity fields needed to render a stale placeholder cube for it.
+    struct RosterEntry {
+        std::string agent_id;
+        std::string hostname;
+        std::string os;
+    };
+
+    /// Roster seam (Gate 7 UP-9 / hp-S1): supplies the full set of currently
+    /// registered agents. When the push path is taken (pushed_ non-empty),
+    /// get() consults this to emit a `stale=true` placeholder for every
+    /// registered agent that has NOT pushed a snapshot — so legacy agents
+    /// (no fleet_snapshot_json, e.g. mid rolling-upgrade) render as dimmed
+    /// cubes instead of vanishing from the topology entirely. Null-by-default
+    /// (tests and the dispatch-fetcher-only path don't need it); the dispatch
+    /// fetcher already emits its own stale rows for non-responders.
+    using RosterProvider = std::function<std::vector<RosterEntry>()>;
+
     /// @param fetcher        Required. Called on cache miss / expiry.
     /// @param nvd            Optional. When include_vuln=true and nvd is
     ///                       non-null, processes get worst_severity + cve_count.
@@ -134,6 +152,18 @@ public:
     /// ~90 s.
     static constexpr std::chrono::seconds kPushedStaleAfter{90};
 
+    /// PR 10 hardening (Gate 7 UP-3) — IP-claim reclaim window. The UP-1
+    /// IP-spoof guard is first-claim-wins, but a claim must not be
+    /// *permanent*: an agent that crashes without a clean deregister
+    /// (no evict_pushed) would otherwise strand its local_ips forever,
+    /// so a re-imaged host re-enrolling on the same DHCP lease is rejected
+    /// indefinitely. A claim whose owning agent has not pushed within this
+    /// window is treated as abandoned and may be reclaimed by another
+    /// agent. Keyed on `server_received_at` (server wall-clock), never the
+    /// agent-controlled `ts`, so a stuck-clock agent cannot hold a claim
+    /// past its liveness.
+    static constexpr std::chrono::seconds kIpClaimReclaimAfter{300};
+
     /// Parse a fleet_snapshot.v1 JSON document into a RawAgentSnapshot,
     /// enforcing the row + byte caps above and the trust boundary that
     /// `agent_id` and `os` come from the session, never the JSON.
@@ -189,6 +219,24 @@ public:
         return pushed_evicted_for_cap_.load(std::memory_order_relaxed);
     }
 
+    /// Observability for the UP-1 IP-spoof guard — number of pushes rejected
+    /// because their claimed local_ips overlapped a live agent's claim.
+    /// A non-zero rate signals either a spoofing campaign or a NAT/DHCP
+    /// misconfiguration; either way the operator needs to see it (Gate 7
+    /// sre OBS-1 — this counter was previously dark).
+    uint64_t pushed_rejected_count() const noexcept {
+        return pushed_rejected_count_.load(std::memory_order_relaxed);
+    }
+
+    /// Current occupancy of the `pushed_` map. Primary memory-pressure
+    /// signal — an operator can alert before `kPushedMapHardCap` (and the
+    /// CAP-1 evictions it triggers) is reached (Gate 7 sre OBS-3).
+    /// Thread-safe: takes `pushed_mu_`.
+    std::size_t pushed_map_size() const {
+        std::lock_guard plk(pushed_mu_);
+        return pushed_.size();
+    }
+
     /// Set the optional fetcher-duration observer (see
     /// FetchDurationObserver above). Pass an empty function to clear.
     ///
@@ -203,6 +251,10 @@ public:
     /// across the boundary, which is rarely useful operationally. (gov
     /// R6 architect SHOULD-1.)
     void set_fetch_duration_observer(FetchDurationObserver observer);
+
+    /// Wire the roster provider (see RosterProvider above). Pass an empty
+    /// function to clear. Single-init at bring-up, not thread-safe vs get().
+    void set_roster_provider(RosterProvider provider) { roster_provider_ = std::move(provider); }
 
     /// PR 10 hardening — wire the audit store for push-traceability
     /// (F-1 / CC6.1 / CC7.3). When set, `push_snapshot` emits:
@@ -262,6 +314,7 @@ public:
 private:
     Fetcher fetcher_;
     FetchDurationObserver fetch_observer_;
+    RosterProvider roster_provider_;
     NvdDatabase* nvd_{nullptr};
     std::chrono::milliseconds ttl_;
     std::chrono::milliseconds fetch_deadline_;
@@ -298,6 +351,13 @@ private:
     /// another agent has already claimed (UP-1 spoofing defence).
     /// Same lock as pushed_.
     std::unordered_map<std::string, std::string> ip_owner_;
+    /// Forward index from agent_id → its claimed local_ips (Gate 7 UP-15 /
+    /// perf-B2). Lets push_snapshot / evict_pushed retract an agent's
+    /// ip_owner_ entries in O(agent's IPs) instead of an O(whole-map) scan
+    /// on every push — at 100k agents × 30 s cadence the old full-map walk
+    /// under pushed_mu_ was the lock-convoy hot spot. Same lock as pushed_;
+    /// kept strictly in sync with ip_owner_.
+    std::unordered_map<std::string, std::vector<std::string>> agent_ips_;
     std::atomic<uint64_t> pushed_count_{0};           // total pushes accepted
     std::atomic<uint64_t> pushed_rejected_count_{0};  // ip-spoof rejections
     std::atomic<uint64_t> pushed_evicted_for_cap_{0}; // CAP-1 (#1002) LRU evictions
@@ -319,6 +379,11 @@ private:
     mutable std::atomic<uint64_t> local_edges_dropped_{0};
 
     bool fresh_locked(const Slot& s) const;
+
+    /// Retract every ip_owner_ entry owned by `agent_id` and drop its
+    /// agent_ips_ row. O(agent's IPs), not O(whole map) (Gate 7 UP-15).
+    /// MUST be called with pushed_mu_ held.
+    void retract_ip_claims_locked(const std::string& agent_id);
 };
 
 } // namespace yuzu::server

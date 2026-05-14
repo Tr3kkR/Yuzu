@@ -361,6 +361,29 @@ public:
                           "spike vs steady-state indicates systematic loss (kernel race, "
                           "agent connection-cap truncation, half-open sockets).",
                           "gauge");
+        // Gate 7 sre OBS-1/OBS-2/OBS-3 — push-ingestion failure modes were
+        // previously dark (no Prometheus exposure). A non-zero rate on the
+        // first two is operator-actionable: a rejection spike means an
+        // IP-spoof campaign or a NAT/DHCP misconfiguration; a cap-eviction
+        // spike means the fleet outgrew kPushedMapHardCap (or a cap-flood
+        // attack). pushed_map_size is the memory-pressure gauge to alert on
+        // before evictions begin.
+        metrics_.describe("yuzu_viz_topology_push_rejected_total",
+                          "Agent fleet_snapshot pushes rejected by the UP-1 IP-spoof guard "
+                          "(claimed local_ip owned by a live agent). Non-zero signals a "
+                          "spoofing campaign or NAT/DHCP misconfiguration.",
+                          "gauge");
+        metrics_.describe("yuzu_viz_pushed_cap_evictions_total",
+                          "FleetTopologyStore pushed_ entries evicted because the map was at "
+                          "kPushedMapHardCap when a new agent pushed (CAP-1 LRU). Non-zero "
+                          "means the fleet outgrew the cap or a cap-flood attack is evicting "
+                          "legitimate agents.",
+                          "gauge");
+        metrics_.describe("yuzu_viz_pushed_map_size",
+                          "Current occupancy of the FleetTopologyStore pushed_ map. Primary "
+                          "memory-pressure signal — alert before it approaches "
+                          "kPushedMapHardCap (100000).",
+                          "gauge");
 
         // Wire health store into agent service
         agent_service_.set_health_store(&health_store_);
@@ -696,6 +719,30 @@ public:
             spdlog::debug("FleetTopologyStore: fetch-duration observer wired "
                           "(yuzu_viz_topology_fetch_duration_seconds)");
 
+            // Gate 7 UP-9 / hp-S1 — roster provider. The push path skips
+            // the dispatch fetcher, so a registered agent that has not
+            // pushed (legacy build mid rolling-upgrade, TAR plugin off,
+            // wedged first-cycle pump) would silently vanish from the
+            // topology. The store consults this to emit a stale placeholder
+            // cube for every registered-but-unpushed agent. Session-sourced
+            // identity only — no agent-controlled JSON.
+            fleet_topology_store_->set_roster_provider(
+                [this]() -> std::vector<FleetTopologyStore::RosterEntry> {
+                    std::vector<FleetTopologyStore::RosterEntry> roster;
+                    auto ids = registry_.all_ids();
+                    roster.reserve(ids.size());
+                    for (const auto& aid : ids) {
+                        FleetTopologyStore::RosterEntry e;
+                        e.agent_id = aid;
+                        if (auto sess = registry_.get_session(aid)) {
+                            e.hostname = sess->hostname;
+                            e.os = sess->os;
+                        }
+                        roster.push_back(std::move(e));
+                    }
+                    return roster;
+                });
+
             // UAT 2026-05-12: wire the store into AgentServiceImpl so a
             // fresh Register() drops both cache slots — eliminates the
             // up-to-60 s "stale ghost cube" window operators saw after
@@ -723,6 +770,31 @@ public:
             // both initialised; that ordering is fixed here.
             if (fleet_topology_store_ && audit_store_ && audit_store_->is_open())
                 fleet_topology_store_->set_audit_store(audit_store_.get());
+
+            // Gate 7 compliance F-1 — durable evidence that the viz
+            // kill-switch took effect. The per-request `kill_switch` audit
+            // row in VizRoutes only fires when a request actually hits a
+            // disabled endpoint; a cold deployment with --viz-disable and
+            // no viz traffic would leave zero audit rows despite the
+            // feature being off. Emit one startup AuditEvent so an auditor
+            // asking "was viz disabled during window X?" can answer it from
+            // the audit store, not just process logs. Emitted here (rather
+            // than at the viz_disabled_ seed above) because audit_store_ is
+            // only constructed now.
+            if (cfg_.viz_disable && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "server.viz_disabled";
+                ev.target_type = "FleetTopology";
+                ev.target_id = "viz";
+                ev.detail = "fleet visualization endpoints disabled at startup "
+                            "(--viz-disable / YUZU_VIZ_DISABLE)";
+                ev.result = "success";
+                audit_store_->log(ev);
+            }
 
             // CAP-1 (#1002) — bound the pushed_ map so a churning fleet or
             // a session-management bug that leaves evict_pushed un-called
@@ -1218,6 +1290,14 @@ public:
                         .set(static_cast<double>(fleet_topology_store_->refill_waiters()));
                     metrics_.gauge("yuzu_viz_local_edges_dropped_total")
                         .set(static_cast<double>(fleet_topology_store_->local_edges_dropped()));
+                    // Gate 7 sre OBS-1/OBS-2/OBS-3 — push-ingestion failure-mode
+                    // counters, previously unscraped.
+                    metrics_.gauge("yuzu_viz_topology_push_rejected_total")
+                        .set(static_cast<double>(fleet_topology_store_->pushed_rejected_count()));
+                    metrics_.gauge("yuzu_viz_pushed_cap_evictions_total")
+                        .set(static_cast<double>(fleet_topology_store_->pushed_evicted_for_cap()));
+                    metrics_.gauge("yuzu_viz_pushed_map_size")
+                        .set(static_cast<double>(fleet_topology_store_->pushed_map_size()));
                 }
                 // Publish audit event write rate so the audit subsystem is observable.
                 if (audit_store_) {
@@ -3790,6 +3870,19 @@ private:
                 res.set_redirect("/login");
                 return;
             }
+            // Gate 7 sec-L1 / cons-N1 — honour the kill switch on the page
+            // shell, not just the REST/fragment endpoints. Previously the
+            // shell rendered and only the JSON fetch 503'd, leaving the
+            // operator with a half-working page and a console error. 503
+            // here matches the VizRoutes posture and the invariant doc's
+            // "a disabled viz surface returns 503".
+            if (viz_disabled_.load(std::memory_order_acquire)) {
+                res.status = 503;
+                res.set_content("fleet visualization is disabled by an administrator "
+                                "(--viz-disable / YUZU_VIZ_DISABLE)",
+                                "text/plain; charset=utf-8");
+                return;
+            }
             res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
             res.set_content(kVizFleetPageHtml, "text/html; charset=utf-8");
         });
@@ -3809,6 +3902,16 @@ private:
                 auto session = require_auth(req, res);
                 if (!session) {
                     res.set_redirect("/login");
+                    return;
+                }
+                // Gate 7 sec-L1 / cons-N1 — kill switch on the host
+                // drill-down page shell too (cons-N1 confirmed the gap
+                // spans both viz page routes, not just /viz/fleet).
+                if (viz_disabled_.load(std::memory_order_acquire)) {
+                    res.status = 503;
+                    res.set_content("fleet visualization is disabled by an administrator "
+                                    "(--viz-disable / YUZU_VIZ_DISABLE)",
+                                    "text/plain; charset=utf-8");
                     return;
                 }
                 const std::string raw_id = req.matches.size() > 1 ? req.matches[1].str() : "";

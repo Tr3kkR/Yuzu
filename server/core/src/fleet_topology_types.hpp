@@ -198,6 +198,12 @@ struct RawAgentSnapshot {
     /// True when this agent timed out / errored during dispatch. Resulting
     /// MachineNode will have empty processes/connections and stale=true.
     bool stale{false};
+    /// Server wall-clock epoch seconds when push_snapshot() accepted this
+    /// snapshot. Distinct from `ts` (agent-controlled emit time) so neither
+    /// the CAP-1 LRU victim selection nor the push-staleness gate can be
+    /// skewed by an agent's clock (Gate 7 UP-4 / UP-14). 0 for snapshots
+    /// produced by the dispatch fetcher (build_snapshot falls back to `ts`).
+    int64_t server_received_at{0};
 };
 
 // ── JSON serialization (shape locked by tests) ────────────────────────────

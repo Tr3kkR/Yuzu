@@ -34,6 +34,7 @@
     [yuzu, gw, upstream, rpc_latency],
     [yuzu, gw, upstream, rpc_error],
     [yuzu, gw, upstream, circuit_state],
+    [yuzu, gw, upstream, registration_replay],
 
     %% Cluster
     [yuzu, gw, cluster, node_up],
@@ -119,6 +120,14 @@ handle_event([yuzu, gw, upstream, circuit_state], #{count := N}, Meta, _Config) 
     State = maps:get(state, Meta, <<"unknown">>),
     prometheus_counter:inc(yuzu_gw_upstream_circuit_transitions_total, [State], N);
 
+%% Gate 7 sre OBS-4 — registration-replay observability. `replayed` counts
+%% agents re-proxied upstream; `queue_depth` is the gauge an operator alerts
+%% on to spot a replay storm (UP-5) that never drains.
+handle_event([yuzu, gw, upstream, registration_replay],
+             #{replayed := N, queue_depth := Q}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_registration_replay_total, [], N),
+    prometheus_gauge:set(yuzu_gw_registration_replay_queue_depth, [node()], Q);
+
 handle_event([yuzu, gw, cluster, node_up], _Measurements, Meta, _Config) ->
     Node = maps:get(node, Meta, <<"unknown">>),
     prometheus_counter:inc(yuzu_gw_cluster_events_total, [<<"node_up">>, Node], 1);
@@ -191,6 +200,10 @@ declare_metrics() ->
         {name, yuzu_gw_cluster_rebalanced_agents_total},
         {labels, []},
         {help, "Total agents moved during rebalancing"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_registration_replay_total},
+        {labels, []},
+        {help, "Total agents re-proxied upstream by the registration-replay drip"}]),
 
     %% Histograms
     Buckets = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 10000],
@@ -242,6 +255,11 @@ declare_metrics() ->
         {name, yuzu_gw_beam_scheduler_util},
         {labels, [node]},
         {help, "BEAM scheduler utilization (weighted average)"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_registration_replay_queue_depth},
+        {labels, [node]},
+        {help, "Agents still queued for registration replay (0 = idle; "
+               "a persistently non-zero value indicates a replay storm)"}]),
 
     ok.
 

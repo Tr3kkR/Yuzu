@@ -882,3 +882,205 @@ TEST_CASE("cache: oversized snapshot is returned but not cached", "[viz][cache][
     CHECK(calls.load() == 2);
     CHECK(store.refill_oversize_drops() >= 2);
 }
+
+// =============================================================================
+// Gate 7 hardening — parser field clamps, IP-claim lifecycle, CAP-1 victim
+// selection, mixed-fleet roster sentinels, push-staleness clock source.
+// =============================================================================
+
+namespace {
+
+// Build a fleet_snapshot.v1 JSON body with caller-controlled field values.
+std::string snapshot_body(const std::string& hostname, const std::string& proc_name,
+                          const std::string& cmdline, const std::string& proc_user,
+                          const std::string& conn_state) {
+    json j;
+    j["schema"] = "fleet_snapshot.v1";
+    j["ts"] = 1;
+    j["hostname"] = hostname;
+    j["local_ips"] = json::array();
+    j["processes"] = json::array({json{
+        {"pid", 1}, {"ppid", 0}, {"name", proc_name}, {"cmdline", cmdline}, {"user", proc_user}}});
+    j["connections"] = json::array({json{{"proto", "tcp"},
+                                         {"local_addr", "10.0.0.1"},
+                                         {"local_port", 22},
+                                         {"remote_addr", "10.0.0.2"},
+                                         {"remote_port", 5000},
+                                         {"state", conn_state},
+                                         {"process_name", proc_name}}});
+    return j.dump();
+}
+
+// A RawAgentSnapshot ready to push, with explicit local_ips and an
+// optional server_received_at override (0 = let push_snapshot stamp it).
+RawAgentSnapshot pushable(std::string id, std::vector<std::string> ips,
+                          int64_t server_received_at = 0) {
+    RawAgentSnapshot r = make_agent(std::move(id), "host", std::move(ips));
+    r.server_received_at = server_received_at;
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("topology: parser clamps oversize process + hostname + conn-meta fields",
+          "[viz][topology][hardening][gate7]") {
+    // Gate 7 qe-B1 / sec-M1 — before this round only the address fields
+    // were clamped; process name/cmdline/user, hostname and the
+    // connection meta strings flowed in unbounded. A single oversize row
+    // sailed past the 2 MiB envelope cap and was held in pushed_ for the
+    // agent's lifetime.
+    const std::string big(8192, 'X');
+    std::string body = snapshot_body(big, big, big, big, big);
+    std::string ex;
+    auto parsed = FleetTopologyStore::parse_fleet_snapshot_json(body, "agent-A", "linux", &ex);
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->hostname.size() == 256);
+    REQUIRE(parsed->processes.size() == 1);
+    CHECK(parsed->processes[0].name.size() == 256);
+    CHECK(parsed->processes[0].cmdline.size() == 4096);
+    CHECK(parsed->processes[0].user.size() == 256);
+    REQUIRE(parsed->connections.size() == 1);
+    CHECK(parsed->connections[0].state.size() == 256);
+    CHECK(parsed->connections[0].process_name.size() == 256);
+}
+
+TEST_CASE("topology: parser rejects malformed / hostile input without throwing",
+          "[viz][topology][hardening][gate7]") {
+    // Gate 7 qe-S3 — the parser is called on every heartbeat; it must
+    // return nullopt (never throw, never crash) on adversarial input.
+    std::string ex;
+    CHECK_FALSE(FleetTopologyStore::parse_fleet_snapshot_json("", "a", "linux", &ex).has_value());
+    CHECK_FALSE(FleetTopologyStore::parse_fleet_snapshot_json("not json at all", "a", "linux", &ex)
+                    .has_value());
+    CHECK_FALSE(
+        FleetTopologyStore::parse_fleet_snapshot_json("{\"schema\":\"x\",", "a", "linux", &ex)
+            .has_value()); // truncated mid-object
+    // `processes` of the wrong type — the parser guards with is_array()
+    // so it must not throw; it simply yields a snapshot with no procs.
+    auto wrong_type = FleetTopologyStore::parse_fleet_snapshot_json(
+        "{\"schema\":\"fleet_snapshot.v1\",\"processes\":42}", "a", "linux", &ex);
+    REQUIRE(wrong_type.has_value());
+    CHECK(wrong_type->processes.empty());
+    // Embedded NUL byte in a string field — must not throw.
+    std::string nul_body = std::string("{\"schema\":\"fleet_snapshot.v1\",\"hostname\":\"a") +
+                           std::string(1, '\0') + "b\"}";
+    auto with_nul = FleetTopologyStore::parse_fleet_snapshot_json(nul_body, "a", "linux", &ex);
+    CHECK((with_nul.has_value() || !with_nul.has_value())); // only assertion: no throw
+}
+
+TEST_CASE("topology: live agent's IP claim blocks a spoofing push", "[viz][hardening][gate7]") {
+    // Gate 7 UP-1 — first-claim-wins while the owner is live.
+    FleetTopologyStore store(fixed_fetcher({}));
+    store.push_snapshot(pushable("agent-A", {"10.0.0.5"}));
+    CHECK(store.pushed_map_size() == 1);
+    // agent-B claims the same IP while agent-A is fresh -> rejected.
+    store.push_snapshot(pushable("agent-B", {"10.0.0.5"}));
+    CHECK(store.pushed_rejected_count() == 1);
+    CHECK(store.pushed_map_size() == 1); // B never landed
+}
+
+TEST_CASE("topology: abandoned IP claim is reclaimable after the reclaim window",
+          "[viz][hardening][gate7]") {
+    // Gate 7 UP-3 — an agent that crashed without a clean deregister must
+    // not strand its local_ips forever. A claim whose owner has not pushed
+    // within kIpClaimReclaimAfter is reclaimable, so a re-imaged host
+    // re-enrolling on the same DHCP lease is not rejected indefinitely.
+    FleetTopologyStore store(fixed_fetcher({}));
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    // agent-A's last push was well past the reclaim window.
+    store.push_snapshot(pushable("agent-A", {"10.0.0.5"}, now - 600));
+    // agent-B re-enrolls on the same IP -> reclaim, NOT reject.
+    store.push_snapshot(pushable("agent-B", {"10.0.0.5"}));
+    CHECK(store.pushed_rejected_count() == 0);
+    CHECK(store.pushed_map_size() == 2);
+}
+
+TEST_CASE("topology: CAP-1 evicts by server-receipt time, not agent-controlled ts",
+          "[viz][hardening][gate7]") {
+    // Gate 7 UP-4 — the LRU victim must be the genuinely
+    // least-recently-seen agent. Keying on the agent-controlled `ts` let
+    // an attacker pick the victim by lying about its emit time.
+    FleetTopologyStore store(fixed_fetcher({}));
+    store.set_pushed_map_cap(2);
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    // agent-OLD: oldest server-receipt time but a *high* (attacker-style)
+    // ts. agent-NEW: recent receipt, low ts.
+    RawAgentSnapshot old_agent = pushable("agent-OLD", {"10.0.0.1"}, now - 1000);
+    old_agent.ts = now + 100000; // attacker lies: "I am very fresh"
+    RawAgentSnapshot new_agent = pushable("agent-NEW", {"10.0.0.2"}, now - 1);
+    new_agent.ts = 1; // honest agent, low ts
+    store.push_snapshot(std::move(old_agent));
+    store.push_snapshot(std::move(new_agent));
+    // Map at cap (2). A third agent pushes -> evicts the smallest
+    // server_received_at, which is agent-OLD despite its inflated ts.
+    store.push_snapshot(pushable("agent-THIRD", {"10.0.0.3"}, now));
+    CHECK(store.pushed_evicted_for_cap() == 1);
+    auto snap = store.get(false);
+    std::vector<std::string> ids;
+    for (const auto& m : snap->machines)
+        ids.push_back(m.agent_id);
+    CHECK(std::find(ids.begin(), ids.end(), "agent-OLD") == ids.end());
+    CHECK(std::find(ids.begin(), ids.end(), "agent-NEW") != ids.end());
+    CHECK(std::find(ids.begin(), ids.end(), "agent-THIRD") != ids.end());
+}
+
+TEST_CASE("topology: evict_pushed frees the agent's IP claims", "[viz][hardening][gate7]") {
+    // Reverse-index correctness — after evict_pushed, another agent may
+    // claim the freed IP immediately (no reclaim-window wait).
+    FleetTopologyStore store(fixed_fetcher({}));
+    store.push_snapshot(pushable("agent-A", {"10.0.0.5"}));
+    store.evict_pushed("agent-A");
+    CHECK(store.pushed_map_size() == 0);
+    store.push_snapshot(pushable("agent-B", {"10.0.0.5"}));
+    CHECK(store.pushed_rejected_count() == 0);
+    CHECK(store.pushed_map_size() == 1);
+}
+
+TEST_CASE("topology: mixed fleet — registered-but-unpushed agent renders as a stale cube",
+          "[viz][hardening][gate7]") {
+    // Gate 7 UP-9 / hp-S1 — once any agent pushes, the push path skips
+    // the dispatch fetcher; without the roster seam a legacy agent
+    // (no fleet_snapshot_json) would vanish entirely. It must instead
+    // render as a stale placeholder.
+    FleetTopologyStore store(fixed_fetcher({}));
+    store.set_roster_provider([]() {
+        return std::vector<FleetTopologyStore::RosterEntry>{
+            {"agent-PUSHED", "host-pushed", "linux"}, {"agent-LEGACY", "host-legacy", "windows"}};
+    });
+    store.push_snapshot(pushable("agent-PUSHED", {"10.0.0.1"}));
+    auto snap = store.get(false);
+    REQUIRE(snap->machines.size() == 2);
+    bool legacy_seen = false, legacy_stale = false, pushed_fresh = false;
+    for (const auto& m : snap->machines) {
+        if (m.agent_id == "agent-LEGACY") {
+            legacy_seen = true;
+            legacy_stale = m.stale;
+        }
+        if (m.agent_id == "agent-PUSHED")
+            pushed_fresh = !m.stale;
+    }
+    CHECK(legacy_seen);
+    CHECK(legacy_stale);
+    CHECK(pushed_fresh);
+}
+
+TEST_CASE("topology: push-staleness gate keys on server-receipt time, not agent ts",
+          "[viz][hardening][gate7]") {
+    // Gate 7 UP-14 — a clock-skewed agent must not be able to render
+    // itself permanently fresh (defeating stuck-pump detection) by
+    // sending a future `ts`. build_snapshot keys on server_received_at.
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    FleetTopologyStore store(fixed_fetcher({}));
+    RawAgentSnapshot skewed = pushable("agent-SKEW", {"10.0.0.9"}, now - 600);
+    skewed.ts = now + 100000; // agent lies about being fresh
+    std::vector<RawAgentSnapshot> raw{skewed};
+    auto snap = store.build_snapshot(std::move(raw), false);
+    REQUIRE(snap.machines.size() == 1);
+    CHECK(snap.machines[0].stale); // stale by server clock despite the future ts
+}

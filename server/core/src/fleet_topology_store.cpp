@@ -35,13 +35,32 @@ namespace {
 // and log so an operator chasing a malformed listener has a breadcrumb.
 constexpr std::size_t kAddressMaxLen = 64;
 
-// Truncate-or-pass for the parser. Empty strings are returned unchanged;
-// over-long strings are clipped at kAddressMaxLen. Caller emits a single
-// spdlog warn line on truncation so chasing a malformed listener has a
-// breadcrumb without flooding logs (one line per agent per snapshot).
-inline std::string clamp_address(std::string s) {
-    if (s.size() > kAddressMaxLen)
-        s.resize(kAddressMaxLen);
+// Gate 7 qe-B1 / sec-M1 — per-field caps for the agent-controlled string
+// fields that until this round flowed in unbounded. Only the address
+// fields were clamped before, so a single oversize `cmdline` / `name` /
+// `hostname` row sailed through the 2 MiB whole-payload cap, was held in
+// `pushed_` for the agent's lifetime, and was re-serialised into every
+// /viz/fleet/topology response. RFC 1123 caps a hostname at 253; a
+// process image name is comfortably < 256; the connection meta strings
+// (proto/state/process_name/remote_host) are short; `cmdline` is the one
+// genuinely long field and gets a generous 4096.
+constexpr std::size_t kHostnameMaxLen = 256;
+constexpr std::size_t kProcNameMaxLen = 256;
+constexpr std::size_t kCmdlineMaxLen = 4096;
+constexpr std::size_t kProcUserMaxLen = 256;
+constexpr std::size_t kConnMetaMaxLen = 256;
+
+// Clamp an agent-controlled string field to `max_len`, emitting one WARN
+// on truncation so an operator chasing a malformed (or hostile) snapshot
+// has a breadcrumb. Empty / in-bounds strings pass through untouched.
+inline std::string clamp_field(std::string s, std::size_t max_len, std::string_view field,
+                               std::string_view agent_id) {
+    if (s.size() > max_len) {
+        spdlog::warn("fleet_topology: agent={} clamped {} ({} bytes -> {}); "
+                     "possible malformed or hostile snapshot",
+                     agent_id, field, s.size(), max_len);
+        s.resize(max_len);
+    }
     return s;
 }
 
@@ -239,8 +258,34 @@ std::shared_ptr<const TopologySnapshot> FleetTopologyStore::get(bool include_vul
         std::vector<RawAgentSnapshot> raw;
         if (!pushed_handles.empty()) {
             raw.reserve(pushed_handles.size());
-            for (const auto& sp : pushed_handles)
+            std::unordered_set<std::string> have;
+            have.reserve(pushed_handles.size());
+            for (const auto& sp : pushed_handles) {
+                have.insert(sp->agent_id);
                 raw.push_back(*sp); // copy is unavoidable for build_snapshot
+            }
+            // Gate 7 UP-9 / hp-S1 — mixed-fleet split-brain fix. The push
+            // path skips the dispatch fetcher entirely, so a registered
+            // agent that has NOT pushed (a legacy build mid rolling-upgrade,
+            // the TAR plugin disabled, or a pump wedged on its first cycle)
+            // would silently vanish from the topology the moment ANY agent
+            // pushes. Consult the roster and emit a stale placeholder for
+            // every registered-but-unpushed agent so it renders as a dimmed
+            // cube instead of disappearing. The fetcher path (pushed_ empty)
+            // already emits its own stale rows for non-responders, so this
+            // only applies to the push path.
+            if (roster_provider_) {
+                for (auto& entry : roster_provider_()) {
+                    if (entry.agent_id.empty() || have.count(entry.agent_id))
+                        continue;
+                    RawAgentSnapshot rs;
+                    rs.agent_id = std::move(entry.agent_id);
+                    rs.hostname = std::move(entry.hostname);
+                    rs.os = std::move(entry.os);
+                    rs.stale = true;
+                    raw.push_back(std::move(rs));
+                }
+            }
         } else {
             raw = fetcher_(fetch_deadline_);
         }
@@ -380,7 +425,8 @@ FleetTopologyStore::parse_fleet_snapshot_json(std::string_view json, std::string
         RawAgentSnapshot rs;
         rs.agent_id = std::move(agent_id);
         rs.os = std::move(os);
-        rs.hostname = j.value("hostname", std::string{});
+        rs.hostname = clamp_field(j.value("hostname", std::string{}), kHostnameMaxLen, "hostname",
+                                  rs.agent_id);
         rs.ts = j.value("ts", 0LL);
         if (j.contains("local_ips") && j["local_ips"].is_array()) {
             // Bound local_ips length too — modest, but prevents a runaway
@@ -408,9 +454,12 @@ FleetTopologyStore::parse_fleet_snapshot_json(std::string_view json, std::string
                 RawAgentSnapshot::RawProcess rp;
                 rp.pid = p.value("pid", 0u);
                 rp.ppid = p.value("ppid", 0u);
-                rp.name = p.value("name", "");
-                rp.cmdline = p.value("cmdline", "");
-                rp.user = p.value("user", "");
+                rp.name = clamp_field(p.value("name", std::string{}), kProcNameMaxLen,
+                                      "process.name", rs.agent_id);
+                rp.cmdline = clamp_field(p.value("cmdline", std::string{}), kCmdlineMaxLen,
+                                         "process.cmdline", rs.agent_id);
+                rp.user = clamp_field(p.value("user", std::string{}), kProcUserMaxLen,
+                                      "process.user", rs.agent_id);
                 rs.processes.push_back(std::move(rp));
             }
         }
@@ -435,7 +484,8 @@ FleetTopologyStore::parse_fleet_snapshot_json(std::string_view json, std::string
                 if (lp < 0 || lp > 65535 || rp < 0 || rp > 65535)
                     continue;
                 RawAgentSnapshot::RawConnection rc;
-                rc.proto = c.value("proto", "");
+                rc.proto = clamp_field(c.value("proto", std::string{}), kConnMetaMaxLen,
+                                       "conn.proto", rs.agent_id);
                 // Gate 7 UP-1: per-field size cap on agent-reported
                 // addresses. A buggy or hostile agent sending a 1.9 MiB
                 // `local_addr` value would otherwise sail through the
@@ -464,11 +514,14 @@ FleetTopologyStore::parse_fleet_snapshot_json(std::string_view json, std::string
                     }
                     rc.remote_addr = std::move(ra);
                 }
-                rc.remote_host = c.value("remote_host", "");
+                rc.remote_host = clamp_field(c.value("remote_host", std::string{}), kConnMetaMaxLen,
+                                             "conn.remote_host", rs.agent_id);
                 rc.remote_port = rp;
-                rc.state = c.value("state", "");
+                rc.state = clamp_field(c.value("state", std::string{}), kConnMetaMaxLen,
+                                       "conn.state", rs.agent_id);
                 rc.pid = c.value("pid", 0u);
-                rc.process_name = c.value("process_name", "");
+                rc.process_name = clamp_field(c.value("process_name", std::string{}),
+                                              kProcNameMaxLen, "conn.process_name", rs.agent_id);
                 rs.connections.push_back(std::move(rc));
             }
         }
@@ -503,6 +556,22 @@ FleetTopologyStore::parse_fleet_snapshot_json(std::string_view json, std::string
 // reported IPs is fine. Rejection is loud (counter + spdlog::warn)
 // but non-fatal — the agent simply doesn't render until it stops
 // claiming a peer's IP.
+void FleetTopologyStore::retract_ip_claims_locked(const std::string& agent_id) {
+    auto ai = agent_ips_.find(agent_id);
+    if (ai == agent_ips_.end())
+        return;
+    for (const auto& ip : ai->second) {
+        auto io = ip_owner_.find(ip);
+        // Guard: only retract entries STILL owned by this agent. A claim
+        // may have been reclaimed by another agent in the interim (UP-3
+        // reclaim path overwrites ip_owner_ without touching the old
+        // owner's agent_ips_ row).
+        if (io != ip_owner_.end() && io->second == agent_id)
+            ip_owner_.erase(io);
+    }
+    agent_ips_.erase(ai);
+}
+
 void FleetTopologyStore::push_snapshot(RawAgentSnapshot raw) {
     if (raw.agent_id.empty())
         return;
@@ -511,21 +580,49 @@ void FleetTopologyStore::push_snapshot(RawAgentSnapshot raw) {
     // dropped (AuditStore::log takes its own locks; we don't want to
     // nest).
     const std::string agent_id = raw.agent_id;
+    // Gate 7 UP-4 / UP-14 — stamp the server wall-clock receipt time.
+    // CAP-1 victim selection and the push-staleness gate both key on
+    // THIS, never the agent-controlled `raw.ts`, so a clock-skewed or
+    // hostile agent cannot dodge eviction / staleness by lying about
+    // its emit time.
+    const int64_t now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                              std::chrono::system_clock::now().time_since_epoch())
+                              .count();
+    // Stamp the receipt time. Production callers (heartbeat_ingestion via
+    // the shared parser) always pass server_received_at=0, so this always
+    // takes effect there; a pre-set value is preserved so unit tests can
+    // exercise the reclaim / LRU-victim paths without a 300 s wait.
+    if (raw.server_received_at == 0)
+        raw.server_received_at = now_s;
     bool first_push_for_this_agent = false;
     std::string spoof_detail;
+    std::string evicted_agent_id; // CAP-1 victim, for audit outside the lock
     {
         std::lock_guard plk(pushed_mu_);
 
         // UP-1 defence — scan claimed IPs against the index. A claim
-        // that's already owned by THIS agent_id is fine (re-push of
-        // same agent's snapshot); a conflict with any OTHER agent_id
-        // is a spoofing attempt and we reject the whole push.
+        // already owned by THIS agent_id is fine (re-push). A conflict
+        // with another agent_id is rejected ONLY while that agent is
+        // still live: a claim whose owner has not pushed within
+        // kIpClaimReclaimAfter is abandoned (agent crashed without a
+        // clean deregister) and may be reclaimed, so a re-imaged host
+        // re-enrolling on the same DHCP lease is not stranded forever
+        // (Gate 7 UP-3).
         for (const auto& ip : raw.local_ips) {
             auto it = ip_owner_.find(ip);
-            if (it != ip_owner_.end() && it->second != agent_id) {
+            if (it == ip_owner_.end() || it->second == agent_id)
+                continue;
+            bool owner_live = true;
+            auto po = pushed_.find(it->second);
+            if (po == pushed_.end() || !po->second) {
+                owner_live = false; // owner not in pushed_ — defensive
+            } else if (now_s - po->second->server_received_at > kIpClaimReclaimAfter.count()) {
+                owner_live = false; // owner hasn't pushed within the window
+            }
+            if (owner_live) {
                 pushed_rejected_count_.fetch_add(1, std::memory_order_relaxed);
                 spdlog::warn("FleetTopologyStore: rejecting push from agent={} — claimed "
-                             "local_ip={} is already owned by agent={} (UP-1 IP-spoof guard)",
+                             "local_ip={} is already owned by live agent={} (UP-1 IP-spoof guard)",
                              agent_id, ip, it->second);
                 // Gate 7 HIGH — sanitise every component that may have
                 // been agent-controlled before it crosses into
@@ -539,50 +636,55 @@ void FleetTopologyStore::push_snapshot(RawAgentSnapshot raw) {
                                " owner=" + sanitise_for_audit(it->second);
                 break;
             }
+            spdlog::info("FleetTopologyStore: agent={} reclaiming abandoned local_ip={} from "
+                         "inactive agent={} (UP-3 reclaim window {}s elapsed)",
+                         agent_id, ip, it->second, kIpClaimReclaimAfter.count());
+            // Fall through — the install step below overwrites
+            // ip_owner_[ip]; the stale owner's agent_ips_ row is left
+            // alone and cleaned up lazily by retract_ip_claims_locked's
+            // ownership guard.
         }
         if (!spoof_detail.empty()) {
             // Fall through to audit emission outside the lock (below).
         } else {
             first_push_for_this_agent = audited_first_push_.insert(agent_id).second;
 
-            // Remove previous ip_owner_ entries for this agent (its IPs may
-            // have changed since the last push — e.g. DHCP rebind) and
-            // install the new set.
-            for (auto it = ip_owner_.begin(); it != ip_owner_.end();) {
-                if (it->second == raw.agent_id)
-                    it = ip_owner_.erase(it);
-                else
-                    ++it;
+            // Retract this agent's previous IP claims (its IPs may have
+            // changed since the last push — DHCP rebind) and install the
+            // new set. O(agent's IPs) via the agent_ips_ reverse index
+            // (Gate 7 UP-15), not an O(whole-map) scan.
+            retract_ip_claims_locked(agent_id);
+            auto& ip_list = agent_ips_[agent_id];
+            ip_list.reserve(raw.local_ips.size());
+            for (const auto& ip : raw.local_ips) {
+                ip_owner_[ip] = agent_id;
+                ip_list.push_back(ip);
             }
-            for (const auto& ip : raw.local_ips)
-                ip_owner_[ip] = raw.agent_id;
 
             // CAP-1 (#1002): bound the map. When at cap and inserting a
-            // NEW agent_id, evict the entry with the smallest `ts` (oldest
-            // push). A re-push of an already-present agent_id replaces in
-            // place and doesn't trip the cap. Hot-path cost is O(N) over
-            // the map only on the cap edge; uncapped pushes are O(1).
+            // NEW agent_id, evict the entry with the smallest
+            // `server_received_at` (genuinely least-recently-seen — Gate 7
+            // UP-4: keying on the agent-controlled `ts` let an attacker
+            // pick the victim). A re-push of an already-present agent_id
+            // replaces in place and doesn't trip the cap. Hot-path cost is
+            // O(N) over the map only on the cap edge; uncapped pushes are
+            // O(1).
             if (pushed_map_cap_ > 0 && !pushed_.contains(agent_id) &&
                 pushed_.size() >= pushed_map_cap_) {
                 auto victim = pushed_.end();
-                int64_t victim_ts = std::numeric_limits<int64_t>::max();
+                int64_t victim_recv = std::numeric_limits<int64_t>::max();
                 for (auto it = pushed_.begin(); it != pushed_.end(); ++it) {
-                    const int64_t t = it->second ? it->second->ts : 0;
-                    if (t < victim_ts) {
-                        victim_ts = t;
+                    const int64_t t = it->second ? it->second->server_received_at : 0;
+                    if (t < victim_recv) {
+                        victim_recv = t;
                         victim = it;
                     }
                 }
                 if (victim != pushed_.end()) {
-                    // Also drop the evicted agent's ip_owner_ claims so a
+                    evicted_agent_id = victim->first;
+                    // Drop the evicted agent's ip_owner_ claims so a
                     // re-enrollment with overlapping IPs isn't rejected.
-                    const std::string& vid = victim->first;
-                    for (auto it = ip_owner_.begin(); it != ip_owner_.end();) {
-                        if (it->second == vid)
-                            it = ip_owner_.erase(it);
-                        else
-                            ++it;
-                    }
+                    retract_ip_claims_locked(victim->first);
                     pushed_.erase(victim);
                     pushed_evicted_for_cap_.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -598,15 +700,16 @@ void FleetTopologyStore::push_snapshot(RawAgentSnapshot raw) {
 
     // Audit emission outside pushed_mu_ — AuditStore::log takes its
     // own locks; nesting would couple per-push latency to the audit
-    // DB. Two emission paths:
+    // DB. Three emission paths:
     //   • first-push-per-agent-per-lifetime → topology.push.first
     //     (F-1 evidence chain for CC6.1/CC7.3 without per-heartbeat
     //     audit volume).
     //   • every rejection → topology.push.rejected (rare, so noise is
     //     acceptable; threshold-based audit is a follow-up).
-    auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
-                     std::chrono::system_clock::now().time_since_epoch())
-                     .count();
+    //   • every CAP-1 eviction → topology.push.evicted_for_cap (Gate 7
+    //     compliance F-2: a cap-flood attack silently evicting a
+    //     legitimate agent must leave an audit trail, not just a
+    //     metric spike).
     if (!spoof_detail.empty()) {
         if (audit_store_) {
             AuditEvent ev;
@@ -620,6 +723,19 @@ void FleetTopologyStore::push_snapshot(RawAgentSnapshot raw) {
             audit_store_->log(ev);
         }
         return;
+    }
+    if (!evicted_agent_id.empty() && audit_store_) {
+        AuditEvent ev;
+        ev.timestamp = now_s;
+        ev.principal = "agent:" + agent_id;
+        ev.action = "topology.push.evicted_for_cap";
+        ev.target_type = "FleetTopology";
+        ev.target_id = evicted_agent_id;
+        ev.detail = "evicted=" + sanitise_for_audit(evicted_agent_id) +
+                    " cap=" + std::to_string(pushed_map_cap_) +
+                    " by_push_from=" + sanitise_for_audit(agent_id);
+        ev.result = "warning";
+        audit_store_->log(ev);
     }
     pushed_count_.fetch_add(1, std::memory_order_relaxed);
     if (first_push_for_this_agent && audit_store_) {
@@ -644,12 +760,7 @@ void FleetTopologyStore::evict_pushed(const std::string& agent_id) {
         return;
     std::lock_guard plk(pushed_mu_);
     pushed_.erase(agent_id);
-    for (auto it = ip_owner_.begin(); it != ip_owner_.end();) {
-        if (it->second == agent_id)
-            it = ip_owner_.erase(it);
-        else
-            ++it;
-    }
+    retract_ip_claims_locked(agent_id);
 }
 
 void FleetTopologyStore::set_fetch_duration_observer(FetchDurationObserver observer) {
@@ -736,17 +847,22 @@ TopologySnapshot FleetTopologyStore::build_snapshot(std::vector<RawAgentSnapshot
 
         // PR 10 hardening — push-staleness gate (UP-3 stuck pump).
         // An agent whose pump wedged inside tar.fleet_snapshot will
-        // keep heartbeating but its last-attached snapshot's `ts` will
-        // never advance. Mark the cube stale once the gap between the
-        // snapshot's `ts` and wall-clock now exceeds
-        // `kPushedStaleAfter`. We don't overwrite a producer-set
-        // `stale=true` (the dispatch-timeout path); we only ADD the
-        // age-stale flag.
-        if (!m.stale && m.ts > 0) {
-            const int64_t now_s = out.generated_at; // already wall-clock epoch
-            const int64_t age = now_s - m.ts;
-            if (age > std::chrono::duration_cast<std::chrono::seconds>(kPushedStaleAfter).count()) {
-                m.stale = true;
+        // keep heartbeating but its last-attached snapshot will never
+        // advance. Mark the cube stale once the gap between when the
+        // server last accepted a push and wall-clock now exceeds
+        // `kPushedStaleAfter`. Gate 7 UP-14 — key on `server_received_at`
+        // (server wall-clock), not the agent-controlled `ts`: a skewed
+        // agent clock must not be able to render itself permanently
+        // fresh (defeating stuck-pump detection) or permanently stale.
+        // Dispatch-fetcher rows carry server_received_at=0 and fall back
+        // to `ts`. We don't overwrite a producer-set `stale=true` (the
+        // dispatch-timeout path); we only ADD the age-stale flag.
+        if (!m.stale) {
+            const int64_t freshness_ref = r.server_received_at > 0 ? r.server_received_at : m.ts;
+            if (freshness_ref > 0) {
+                const int64_t now_s = out.generated_at; // already wall-clock epoch
+                if (now_s - freshness_ref > kPushedStaleAfter.count())
+                    m.stale = true;
             }
         }
 

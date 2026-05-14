@@ -182,30 +182,34 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
             end
     end;
 
+handle_cast(replay_registrations, #state{replay_queue = [_ | _]} = State) ->
+    %% Gate 7 UP-5 — a drip is already in flight. The OLD behaviour
+    %% reseeded `replay_queue` with a fresh full-fleet snapshot on every
+    %% cast, so a server that flapped (fail→recover→fail→recover under
+    %% packet loss) restarted the replay from zero each time and, at
+    %% fleet scale, never drained. Drop the cast: the running drip
+    %% already holds a registry snapshot and will complete. If the
+    %% upstream genuinely went away again, check_circuit aborts the drip
+    %% and the next true half_open->closed recovery reseeds from scratch.
+    logger:debug("Registration replay: drip already in flight "
+                 "(~b queued) — ignoring redundant trigger",
+                 [length(State#state.replay_queue)]),
+    {noreply, State};
 handle_cast(replay_registrations, State) ->
-    %% Snapshot the agents the registry currently holds and (re)seed the
-    %% replay queue. Reading the registry here — not at recovery-detect
-    %% time — means an agent that disconnected during the outage is
-    %% already gone from ETS and will not be replayed. If a drip is
-    %% already running, this just refreshes the queue with the latest
-    %% snapshot; the running replay_next will pick it up.
+    %% Idle — snapshot the agents the registry currently holds and seed
+    %% the replay queue. Reading the registry here (not at recovery-detect
+    %% time) means an agent that disconnected during the outage is already
+    %% gone from ETS and will not be replayed.
     Agents = yuzu_gw_registry:all_register_reqs(),
     case Agents of
         [] ->
             logger:info("Registration replay: no agents to re-proxy"),
             {noreply, State#state{replay_queue = []}};
         _ ->
-            WasIdle = State#state.replay_queue =:= [],
             logger:info("Registration replay: re-proxying ~b agent(s) upstream",
                         [length(Agents)]),
-            State1 = State#state{replay_queue = Agents},
-            %% Only kick a fresh drip if one wasn't already in flight —
-            %% otherwise two replay_next loops would race the queue.
-            case WasIdle of
-                true  -> self() ! replay_next;
-                false -> ok
-            end,
-            {noreply, State1}
+            self() ! replay_next,
+            {noreply, State#state{replay_queue = Agents}}
     end;
 
 handle_cast(_Msg, State) ->
@@ -254,6 +258,13 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, RegisterReq} | Rest],
                         %% but record_result_no_replay so a successful
                         %% replay RPC can't kick off a nested replay.
                         State3 = record_result_no_replay(Result, State1),
+                        %% Gate 7 sre OBS-4 — registration-replay
+                        %% observability. `replayed` counts this re-proxy;
+                        %% `queue_depth` lets an operator alert on a drip
+                        %% that never drains (UP-5 storm).
+                        telemetry:execute([yuzu, gw, upstream, registration_replay],
+                                          #{replayed => 1, queue_depth => length(Rest)},
+                                          #{}),
                         schedule_replay_next(Rest, Spacing),
                         State3#state{replay_queue = Rest}
                 end
@@ -333,6 +344,14 @@ on_success(#state{cb_state = closed} = State) ->
     %% failures to trip the breaker. This is the common server-bounce
     %% case (few/idle agents, short outage) — replay so the freshly
     %% restarted server relearns every agent.
+    %%
+    %% Gate 7 UP-5 — this trigger fires readily (a single failed RPC
+    %% then a success is routine under packet loss), but that is now
+    %% safe: the replay_registrations handler below NO LONGER restarts
+    %% an in-flight drip from scratch. Each outage event arms at most
+    %% one full-fleet replay that runs to completion; redundant
+    %% triggers while it drains are dropped. The storm was the
+    %% restart-from-zero, not the trigger.
     logger:info("Upstream recovered (closed, ~b prior failures) — "
                 "scheduling registration replay", [State#state.cb_failures]),
     {State#state{cb_failures = 0}, replay};

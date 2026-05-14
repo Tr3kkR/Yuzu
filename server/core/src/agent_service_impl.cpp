@@ -325,7 +325,21 @@ grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* /*context*/,
     // through ProxyRegister + the gateway's own bookkeeping.
     registry_.touch_activity(agent_id);
     if (heartbeat_ingestion_) {
-        heartbeat_ingestion_->ingest(*request, agent_id, "direct");
+        // Gate 7 UP-10 — isolate ingest failures. An exception here would
+        // otherwise fail the whole Heartbeat RPC; the agent would retry,
+        // but a deterministically-bad payload would wedge the agent in a
+        // heartbeat-retry loop. Swallow + log so the heartbeat still acks
+        // (the snapshot push is best-effort; health/metrics already ran).
+        try {
+            heartbeat_ingestion_->ingest(*request, agent_id, "direct");
+        } catch (const std::exception& ex) {
+            spdlog::warn("Heartbeat: ingest threw for agent {} — heartbeat still acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("Heartbeat: ingest threw unknown exception for agent {} — "
+                         "heartbeat still acked",
+                         agent_id);
+        }
     }
 
     response->set_acknowledged(true);

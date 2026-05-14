@@ -8,6 +8,8 @@
 
 #include <yuzu/agent/trigger_engine.hpp>
 
+#include "test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
@@ -450,8 +452,12 @@ TEST_CASE("TriggerEngine: interval trigger registered, start/stop no crash",
 
 TEST_CASE("TriggerEngine: file change trigger fires on modification",
           "[trigger_engine][filechange]") {
-    // Create a temp file to watch
-    auto tmp_dir = fs::temp_directory_path() / "yuzu_trigger_test";
+    // Create a temp file to watch. Gate 7 qe-S1 — use a per-invocation
+    // unique path rather than a fixed shared directory: parallel Catch2
+    // workers (or Defender-induced I/O serialisation on Windows, flake
+    // #473) writing to one shared dir cross-pollute mtimes and produce
+    // intermittent false fires / false negatives.
+    auto tmp_dir = yuzu::test::unique_temp_path("yuzu_trigger_test");
     fs::create_directories(tmp_dir);
     auto watch_file = tmp_dir / "watched.txt";
     {
