@@ -45,6 +45,8 @@ bool ConcurrencyManager::try_acquire(const std::string& definition_id,
     if (!db_)
         return false;
 
+    std::lock_guard<std::mutex> lock(mutex_);
+
     // Agent-side enforcement or no limit — always allow
     if (concurrency_mode == "unlimited" || concurrency_mode == "per-device" ||
         concurrency_mode == "per-set") {
@@ -127,6 +129,8 @@ void ConcurrencyManager::release(const std::string& definition_id,
     if (!db_)
         return;
 
+    std::lock_guard<std::mutex> lock(mutex_);
+
     const char* sql = "DELETE FROM concurrency_locks WHERE definition_id = ? AND execution_id = ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -143,6 +147,8 @@ void ConcurrencyManager::release(const std::string& definition_id,
 int ConcurrencyManager::active_count(const std::string& definition_id) const {
     if (!db_)
         return 0;
+
+    std::lock_guard<std::mutex> lock(mutex_);
 
     const char* sql = "SELECT COUNT(*) FROM concurrency_locks WHERE definition_id = ?";
     sqlite3_stmt* stmt = nullptr;
