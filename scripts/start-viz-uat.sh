@@ -17,11 +17,22 @@
 #   VIZ_UAT_DIR           default: /tmp/yuzu-viz-uat
 #   VIZ_UAT_AGENTS        default: 1     (compose --scale agent=N)
 #   VIZ_UAT_AGENT_MODE    default: container
-#                           container : in-container agent (default; thin host)
-#                           vm        : skip in-container agent, print enrollment-
-#                                       token + host gateway addr for native
-#                                       yuzu-agent on OrbStack VM / bare metal
-#                           none      : skip agent startup entirely
+#                           container  : in-container agent (default; thin host)
+#                           vm         : skip in-container agent, print enrollment-
+#                                        token + host gateway addr for native
+#                                        yuzu-agent on OrbStack VM / bare metal
+#                           cedar-vale : skip in-container agent; refresh the
+#                                        enrollment token on the three Alpine
+#                                        OrbStack VMs that model the Cedar & Vale
+#                                        three-tier company (yuzu-frontend /
+#                                        yuzu-app / yuzu-db) and restart their
+#                                        agents so /viz/fleet renders all three
+#                                        tiers with real loopback IPC traffic
+#                           none       : skip agent startup entirely
+#   VIZ_UAT_CV_VMS        default: "yuzu-frontend yuzu-app yuzu-db"
+#                           Space-separated list of OrbStack VMs for cedar-vale
+#                           mode. Override for adding tier members or running
+#                           against alternate VM names.
 #   VIZ_UAT_SKIP_BUILD    default: ""    (set to 1 to skip docker build)
 #   VIZ_UAT_PLATFORM      default: linux/$(uname -m mapped)
 
@@ -34,6 +45,7 @@ COMPOSE_FILE="$REPO_ROOT/deploy/docker/docker-compose.viz-uat.yml"
 VIZ_UAT_DIR=${VIZ_UAT_DIR:-/tmp/yuzu-viz-uat}
 VIZ_UAT_AGENTS=${VIZ_UAT_AGENTS:-1}
 VIZ_UAT_SKIP_BUILD=${VIZ_UAT_SKIP_BUILD:-}
+VIZ_UAT_CV_VMS=${VIZ_UAT_CV_VMS:-"yuzu-frontend yuzu-app yuzu-db"}
 # Compose references ${VIZ_UAT_CONFIG:?...} so it must be set for every
 # subcommand, not just `start`. The path itself only has to exist for `up`
 # (bind mount); `down`/`ps`/`logs` just need the variable defined to pass
@@ -69,6 +81,19 @@ cmd_stop() {
   ( cd "$REPO_ROOT" && YUZU_ENROLLMENT_TOKEN=stub \
       docker compose -f "$COMPOSE_FILE" --profile in-container-agent \
         down -v --remove-orphans ) || true
+
+  # Stop the Cedar & Vale VM agents (if present) so they don't sit in a
+  # reconnect loop against the dead viz-UAT server. The VMs themselves
+  # stay running — they're operator-managed via `orb`, not by this
+  # script. orb command failures are swallowed: a missing VM is fine.
+  # -u root because rc-service needs to write the pidfile and signal the
+  # agent process (which runs as root).
+  if command -v orb >/dev/null 2>&1; then
+    for vm in $VIZ_UAT_CV_VMS; do
+      orb -u root -m "$vm" rc-service yuzu-agent stop >/dev/null 2>&1 || true
+    done
+  fi
+
   rm -rf "$VIZ_UAT_DIR"
   ok "Stopped + cleaned $VIZ_UAT_DIR"
 }
@@ -272,6 +297,133 @@ wait_for_url() {
   return 1
 }
 
+# ── Cedar & Vale: register agents on the three Alpine OrbStack VMs ─────────
+#
+# The Cedar & Vale rig models a fictional three-tier company:
+#   yuzu-frontend  (nginx, web tier)        — frontend plane in the viz
+#   yuzu-app       (nodejs app, mid-tier)   — app plane
+#   yuzu-db        (database tier)          — database plane
+#
+# Each VM is a long-lived Alpine 3.23 OrbStack VM that the operator
+# provisioned by hand (orb-style — see orb list). Each has yuzu-agent
+# installed at /opt/yuzu/ and an OpenRC init script `yuzu-agent` whose
+# wrapper at /opt/yuzu/run-agent.sh holds the registration CLI args.
+#
+# Because the wrapper hardcodes the enrollment token, restarting the
+# viz-UAT Docker stack (which generates a fresh token every time)
+# leaves the VM agents unable to register. This function repaints the
+# wrapper on each VM with the current token and bounces the agent.
+#
+# Idempotent: VMs already running are not restarted; missing VMs are
+# logged and skipped (the operator can `orb create` them and re-run).
+# Missing `orb` CLI is a hard fail — there's no Plan B for reaching
+# OrbStack VMs from the host.
+register_cedar_vale_agents() {
+  local enroll_token=$1
+
+  if ! command -v orb >/dev/null 2>&1; then
+    fail "VIZ_UAT_AGENT_MODE=cedar-vale needs the 'orb' CLI on PATH"
+    fail "  install OrbStack: https://orbstack.dev/"
+    exit 1
+  fi
+
+  info "Cedar & Vale rig: configuring agents on the three-tier VMs..."
+
+  # Snapshot of running OrbStack VMs (one per line: NAME ...). orb list's
+  # output format is "NAME STATE DISTRO ..."; awk on column 1+2 captures
+  # name+state without depending on column counts that may grow.
+  local orb_status
+  orb_status=$(orb list 2>/dev/null) || {
+    fail "orb list failed — is OrbStack running?"
+    exit 1
+  }
+
+  local registered_vms=0
+  local missing_vms=()
+  for vm in $VIZ_UAT_CV_VMS; do
+    local state
+    state=$(printf '%s\n' "$orb_status" | awk -v n="$vm" '$1==n {print $2; exit}')
+    if [ -z "$state" ]; then
+      missing_vms+=("$vm")
+      warn "  $vm — not present (skip; create with 'orb create alpine $vm')"
+      continue
+    fi
+    if [ "$state" != "running" ]; then
+      info "  $vm — state=$state, starting..."
+      orb start "$vm" >/dev/null 2>&1 || true
+    fi
+    # Sanity-check the agent layout. If /opt/yuzu is missing, this VM
+    # hasn't been provisioned for Cedar & Vale yet — bail with a clear
+    # error rather than silently leaving a tier off the viz.
+    if ! orb -m "$vm" test -x /opt/yuzu/yuzu-agent 2>/dev/null; then
+      fail "  $vm — /opt/yuzu/yuzu-agent missing or non-executable"
+      fail "    The Cedar & Vale rig expects /opt/yuzu/{yuzu-agent,run-agent.sh,plugins/} on each tier."
+      exit 1
+    fi
+
+    info "  $vm — refreshing enrollment token + restarting yuzu-agent"
+    # /opt/yuzu/run-agent.sh is root-owned (the agent itself runs as root
+    # to read /proc/<pid>/net/* and similar privileged paths). `orb -m`
+    # without -u maps to the host user (nathan), who can't write into
+    # /opt/yuzu/. `orb -u root -m <vm>` elevates without prompting; sudo
+    # would also work but requires NOPASSWD config we don't manage.
+    #
+    # OrbStack VM->macOS-host = 192.168.139.2 (NOT .1 — see
+    # memory/reference_orbstack_vm_addressing.md).
+    orb -u root -m "$vm" sh -c "
+      cat > /opt/yuzu/run-agent.sh.new <<'AGENT_EOF'
+#!/bin/sh
+exec /opt/yuzu/libs/ld-linux-aarch64.so.1 \\
+  --library-path /opt/yuzu/libs:/opt/yuzu/usr-local-lib \\
+  /opt/yuzu/yuzu-agent \\
+  --server 192.168.139.2:50051 \\
+  --no-tls \\
+  --plugin-dir /opt/yuzu/plugins \\
+  --data-dir /var/lib/yuzu-agent \\
+  --log-level info \\
+  --enrollment-token $enroll_token
+AGENT_EOF
+      chmod 0700 /opt/yuzu/run-agent.sh.new
+      mv /opt/yuzu/run-agent.sh.new /opt/yuzu/run-agent.sh
+      rc-service yuzu-agent restart >/dev/null 2>&1 || rc-service yuzu-agent start >/dev/null 2>&1
+    " || {
+      fail "  $vm — failed to refresh agent (see 'orb -u root -m $vm rc-service yuzu-agent status')"
+      exit 1
+    }
+    ok "  $vm — agent restarted"
+    registered_vms=$((registered_vms + 1))
+  done
+
+  if [ "$registered_vms" -eq 0 ]; then
+    fail "No Cedar & Vale VMs were configured. Missing: ${missing_vms[*]:-none}"
+    fail "  Provision with: orb create alpine <name>  (then install yuzu-agent under /opt/yuzu)"
+    exit 1
+  fi
+
+  info "Waiting for $registered_vms VM agent(s) to register..."
+  local waited=0 reg=0
+  while [ "$waited" -lt 90 ]; do
+    reg=$(curl -fsS "http://localhost:8080/metrics" 2>/dev/null \
+            | awk '/^yuzu_agents_registered_total /{print $2; exit}' || echo 0)
+    reg=${reg:-0}
+    if awk "BEGIN { exit !($reg >= $registered_vms) }"; then
+      break
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  if ! awk "BEGIN { exit !($reg >= $registered_vms) }"; then
+    fail "Only $reg of $registered_vms Cedar & Vale agents registered within 90s."
+    fail "  Inspect: orb -m yuzu-app rc-service yuzu-agent status"
+    fail "  Logs:    orb -m yuzu-app tail -50 /var/log/yuzu-agent.log"
+    exit 1
+  fi
+  ok "$reg Cedar & Vale agent(s) registered"
+  if [ "${#missing_vms[@]}" -gt 0 ]; then
+    warn "Note: ${#missing_vms[@]} expected tier VM(s) absent: ${missing_vms[*]}"
+  fi
+}
+
 # ── Bring-up ───────────────────────────────────────────────────────────────
 
 cmd_start() {
@@ -369,6 +521,9 @@ cmd_start() {
       fi
       ok "$reg agent(s) registered"
       ;;
+    cedar-vale)
+      register_cedar_vale_agents "$enroll_token"
+      ;;
     vm)
       ok "Skipping in-container agent; VM-agent mode selected."
       info "Run yuzu-agent on the OrbStack VM (or bare-metal host):"
@@ -392,7 +547,7 @@ cmd_start() {
       ok "Skipping agent startup; VIZ_UAT_AGENT_MODE=none"
       ;;
     *)
-      fail "Unknown VIZ_UAT_AGENT_MODE='$mode'. Allowed: container | vm | none"
+      fail "Unknown VIZ_UAT_AGENT_MODE='$mode'. Allowed: container | vm | cedar-vale | none"
       exit 1
       ;;
   esac
@@ -441,6 +596,13 @@ Env overrides:
   VIZ_UAT_AGENTS=1     (--scale agent=N)
   VIZ_UAT_SKIP_BUILD=1 (skip docker build)
   VIZ_UAT_PLATFORM=linux/arm64
+  VIZ_UAT_AGENT_MODE=container|vm|cedar-vale|none
+                       cedar-vale = register agents on the three Alpine
+                                    OrbStack VMs that model the Cedar &
+                                    Vale three-tier company so /viz/fleet
+                                    renders all three tiers
+  VIZ_UAT_CV_VMS="yuzu-frontend yuzu-app yuzu-db"
+                       VM names for cedar-vale mode
 USAGE
     exit 2
     ;;
