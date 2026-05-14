@@ -116,6 +116,27 @@ agent, waits for registration.
   restarted. Verified: an nginx→app connection now survives 15 s+ post-request
   (was 5 s) — outlives both the 30 s snapshot pump and the 60 s `collect_fast`.
 
+### Blue tubes (cross-VM edges) need live traffic — they are NOT automatic
+
+A blue tube only renders for an `internal_fleet`-scope connection — one cube's
+ESTABLISHED outbound socket whose `remote_addr` is another fleet VM's IP. After
+*any* agent or server restart there are **zero** inter-VM connections (verified:
+`internal_fleet=0` on all three right after the deploy) — the keepalive pools
+don't exist until a request flows through. The renderer is working; there's just
+nothing to draw.
+
+To light them up: send **~90 s of sustained traffic** to the frontend (longer
+than one `collect_fast` cycle) —
+`for i in $(seq 1 45); do curl -s -o /dev/null http://192.168.139.141/customers; sleep 2; done`.
+Each request warms nginx→app (held ~75 s by the keepalive + `keepAliveTimeout`
+bump) **and** app→db (node-pg pool, ~10 s idle) — traffic every 2 s keeps both
+continuously warm across a `collect_fast` cycle, so they land in `tcp_live` and
+the `last_seen_seconds_ago` merge then carries them for the full 1-hour window
+after the traffic stops. This is the "refresh for a minute → good for an hour"
+behaviour; it works now because all four enablers landed this session (nginx
+keepalive, the `keepAliveTimeout` bump, the `last_seen` merge, and the trigger
+fix that makes `collect_fast` actually run).
+
 ---
 
 ## Open / next
@@ -123,11 +144,15 @@ agent, waits for registration.
 1. **Push.** `git push origin feat/viz-engine` — not done; operator's call.
 2. **Visual UAT — still not done.** Per `feedback_visual_features_need_visual_proof`,
    the viz slices need a human to eyeball the rendered result. Hard-refresh is no
-   longer needed for *future* changes (the `no-cache` fix), but do confirm now:
-   `/viz/fleet` shows three correctly-tiered cubes; double-click a cube → host
+   longer needed for *future* changes (the `no-cache` fix), but the browser still
+   has the pre-fix cached `yuzu-viz.js` — do **one** `Cmd+Option+R` on `/viz/fleet`
+   first. Then confirm: three correctly-tiered cubes; double-click a cube → host
    page → IPC graph renders with `cose`, TAR tree below, splitter drags,
-   cross-pane highlight works. (The host page already had its renderer verified
-   served as `cose`; the visual itself is unconfirmed.)
+   cross-pane highlight works. **For the blue cross-VM tubes specifically, run the
+   ~90 s traffic loop first** (see "Blue tubes" under Demo environment) — they are
+   not automatic and will be absent on a freshly-restarted rig. (The host page
+   already had its renderer verified served as `cose`; the visual itself is
+   unconfirmed.)
 3. **Governance.** None of the 5 commits has been through `/governance`. Slices
    1–4 want docs-writer gate work; the trigger fix, TAR `last_seen`, and gateway
    replay each warrant a review pass.
