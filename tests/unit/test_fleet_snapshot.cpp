@@ -124,16 +124,116 @@ TEST_CASE("fleet_snapshot: source_paused markers emitted when sources disabled",
     auto j = json::parse(out);
     CHECK(j["process_source_paused"] == true);
     CHECK(j["tcp_source_paused"] == true);
-    CHECK(j["schema_minor"] == 1);
+    CHECK(j["schema_minor"] == 2);
 }
 
 TEST_CASE("fleet_snapshot: schema_minor present in envelope", "[tar][fleet]") {
     auto out = build_fleet_snapshot_json({}, {}, {}, "h", 1);
     auto j = json::parse(out);
-    CHECK(j["schema_minor"] == 1);
+    CHECK(j["schema_minor"] == 2);
     // markers omitted when sources are enabled (default)
     CHECK(!j.contains("process_source_paused"));
     CHECK(!j.contains("tcp_source_paused"));
+}
+
+TEST_CASE("merge_live_and_recent_connections: recent-only rows survive with computed age",
+          "[tar][fleet][merge]") {
+    // A connection observed in TAR's tcp_live 30 minutes ago that isn't
+    // currently in /proc/net/tcp must still appear in the merged output,
+    // with last_seen_seconds_ago = now_ts - recent.ts.
+    using yuzu::tar::merge_live_and_recent_connections;
+    using yuzu::tar::NetworkEvent;
+    yuzu::tar::NetworkEvent recent;
+    recent.ts = 4000;
+    recent.proto = "tcp";
+    recent.local_addr = "10.0.0.10";
+    recent.local_port = 50001;
+    recent.remote_addr = "10.0.0.20";
+    recent.remote_port = 5432;
+    recent.state = "ESTABLISHED";
+    recent.pid = 100;
+    recent.process_name = "node";
+
+    auto merged = merge_live_and_recent_connections(
+        /*live=*/{}, /*recent=*/{recent}, /*now_ts=*/5800);
+    REQUIRE(merged.size() == 1);
+    CHECK(merged[0].proto == "tcp");
+    CHECK(merged[0].local_port == 50001);
+    CHECK(merged[0].last_seen_seconds_ago == 1800);
+}
+
+TEST_CASE("merge_live_and_recent_connections: live row preempts a same-5-tuple recent row",
+          "[tar][fleet][merge]") {
+    // /proc shows the connection right now, and tcp_live remembers an
+    // earlier observation of the same 5-tuple+pid. The live row wins —
+    // it's the most authoritative current state.
+    using yuzu::tar::merge_live_and_recent_connections;
+    auto live = make_conn("tcp", "10.0.0.10", 50001, "10.0.0.20", 5432, "ESTABLISHED", 100, "node");
+    yuzu::tar::NetworkEvent recent;
+    recent.ts = 4000;
+    recent.proto = "tcp";
+    recent.local_addr = "10.0.0.10";
+    recent.local_port = 50001;
+    recent.remote_addr = "10.0.0.20";
+    recent.remote_port = 5432;
+    recent.state = "ESTABLISHED";
+    recent.pid = 100;
+    recent.process_name = "node";
+
+    auto merged = merge_live_and_recent_connections({live}, {recent}, /*now_ts=*/5800);
+    REQUIRE(merged.size() == 1);
+    CHECK(merged[0].last_seen_seconds_ago == 0); // live row, not historical
+}
+
+TEST_CASE("merge_live_and_recent_connections: distinct 5-tuples coexist", "[tar][fleet][merge]") {
+    using yuzu::tar::merge_live_and_recent_connections;
+    auto live = make_conn("tcp", "10.0.0.10", 50001, "10.0.0.20", 5432, "ESTABLISHED", 100, "node");
+    yuzu::tar::NetworkEvent recent;
+    recent.ts = 4000;
+    recent.proto = "tcp";
+    recent.local_addr = "10.0.0.10";
+    recent.local_port = 60001; // different local port → different 5-tuple
+    recent.remote_addr = "10.0.0.30";
+    recent.remote_port = 6379;
+    recent.state = "ESTABLISHED";
+    recent.pid = 100;
+    recent.process_name = "node";
+
+    auto merged = merge_live_and_recent_connections({live}, {recent}, /*now_ts=*/5800);
+    REQUIRE(merged.size() == 2);
+    // Live first (zero age), then recent.
+    CHECK(merged[0].last_seen_seconds_ago == 0);
+    CHECK(merged[1].last_seen_seconds_ago == 1800);
+    CHECK(merged[1].remote_port == 6379);
+}
+
+TEST_CASE("fleet_snapshot: last_seen_seconds_ago round-trips for historical connections",
+          "[tar][fleet][recent]") {
+    // PR 9-pre / Slice 2 follow-up: TAR widens fleet_snapshot from "currently
+    // ESTABLISHED" to "ESTABLISHED within the last hour" by joining /proc
+    // (live) with tcp_live (recent). Each connection carries its age so the
+    // server can later distinguish live tubes from recently-recent ones.
+    //
+    // Wire contract: `last_seen_seconds_ago` is OMITTED when zero (live)
+    // and EMITTED otherwise (additive, schema_minor 1->2).
+    auto live =
+        make_conn("tcp", "10.0.0.7", 5432, "10.0.0.42", 54321, "ESTABLISHED", 100, "postgres");
+    auto recent =
+        make_conn("tcp", "10.0.0.7", 6379, "10.0.0.99", 6379, "ESTABLISHED", 101, "redis-cli");
+    recent.last_seen_seconds_ago = 1800; // 30 minutes ago
+
+    std::vector<NetConnection> conns = {live, recent};
+    auto out = build_fleet_snapshot_json({}, conns, {}, "h", 1);
+    auto j = json::parse(out);
+
+    REQUIRE(j["connections"].size() == 2);
+    // Live row: field omitted.
+    CHECK(!j["connections"][0].contains("last_seen_seconds_ago"));
+    // Recent row: field present with the exact value.
+    REQUIRE(j["connections"][1].contains("last_seen_seconds_ago"));
+    CHECK(j["connections"][1]["last_seen_seconds_ago"] == 1800);
+    // Schema bumped to advertise the additive field.
+    CHECK(j["schema_minor"] == 2);
 }
 
 TEST_CASE("fleet_snapshot: cmdline redaction applied", "[tar][fleet][redaction]") {

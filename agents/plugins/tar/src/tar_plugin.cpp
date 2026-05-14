@@ -796,7 +796,32 @@ private:
         }
         std::vector<yuzu::tar::NetConnection> connections;
         if (tcp_on) {
-            connections = yuzu::tar::enumerate_connections();
+            auto live = yuzu::tar::enumerate_connections();
+            // Widen the snapshot from "currently ESTABLISHED" to "ESTABLISHED
+            // within the rolling window" by joining /proc with TAR's tcp_live
+            // warehouse. A connection that closed 30 minutes ago still
+            // appears with last_seen_seconds_ago>0 so the viz can render it
+            // as a tube. Window default 3600s; operator-tunable via the
+            // fleet_snapshot_window_seconds config (added by tar.configure).
+            int window_seconds = 3600;
+            if (auto cfg = db_->get_config("fleet_snapshot_window_seconds", ""); !cfg.empty()) {
+                try {
+                    window_seconds = std::max(0, std::stoi(cfg));
+                } catch (...) {
+                    // Bad config value — fall back to the default rather
+                    // than fail the whole snapshot.
+                }
+            }
+            std::vector<yuzu::tar::NetworkEvent> recent;
+            if (window_seconds > 0) {
+                auto q = db_->query_recent_tcp_connections(ts - window_seconds);
+                if (q.has_value()) {
+                    recent = std::move(*q);
+                } else {
+                    spdlog::warn("tar.fleet_snapshot: tcp_live query failed: {}", q.error());
+                }
+            }
+            connections = yuzu::tar::merge_live_and_recent_connections(live, recent, ts);
         }
 
         // Defence-in-depth: union operator patterns with the compiled-in

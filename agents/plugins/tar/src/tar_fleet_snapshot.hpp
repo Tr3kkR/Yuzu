@@ -36,6 +36,7 @@
  */
 
 #include "tar_collectors.hpp"
+#include "tar_db.hpp" // NetworkEvent (input shape from query_recent_tcp_connections)
 
 #include <yuzu/agent/process_enum.hpp>
 
@@ -75,5 +76,27 @@ std::string build_fleet_snapshot_json(
     const std::vector<std::string>& redaction_patterns = kDefaultRedactionPatterns,
     bool process_source_enabled = true, bool tcp_source_enabled = true,
     int max_rows = kFleetSnapshotMaxRows);
+
+/**
+ * Merge the live `/proc/net/tcp` snapshot with the TAR warehouse's recent
+ * observations so the viz can render any connection that existed within
+ * the recent window as a tube — not just those still ESTABLISHED at the
+ * exact sample moment.
+ *
+ * Live rows are emitted first with `last_seen_seconds_ago = 0`. Recent
+ * rows are appended only when their (proto, local_addr, local_port,
+ * remote_addr, remote_port, pid) 5-tuple does NOT match any live row;
+ * matched rows are dropped because /proc has the more authoritative
+ * current state. For each surviving recent row, `last_seen_seconds_ago`
+ * is computed as `max(0, now_ts - recent.ts)` so the renderer can fade
+ * older tubes.
+ *
+ * Pure function — no I/O. The plugin orchestration produces `live` from
+ * `enumerate_connections()` and `recent` from
+ * `TarDatabase::query_recent_tcp_connections(now - window)`.
+ */
+std::vector<NetConnection>
+merge_live_and_recent_connections(const std::vector<NetConnection>& live,
+                                  const std::vector<NetworkEvent>& recent, int64_t now_ts);
 
 } // namespace yuzu::tar
