@@ -1,5 +1,6 @@
 #include <yuzu/agent/trigger_engine.hpp>
 
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -17,11 +18,59 @@
 
 namespace yuzu::agent {
 
+// ── Trigger-config parsing (C-ABI registration parse point) ──────────────────
+
+std::optional<TriggerConfig> parse_trigger_config(std::string_view id, std::string_view type,
+                                                  std::string_view config_json) {
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(config_json);
+    } catch (const std::exception& e) {
+        spdlog::warn("parse_trigger_config('{}'): malformed config JSON: {}", id, e.what());
+        return std::nullopt;
+    }
+    if (!j.is_object()) {
+        spdlog::warn("parse_trigger_config('{}'): config JSON is not an object", id);
+        return std::nullopt;
+    }
+
+    TriggerConfig cfg;
+    cfg.id = std::string{id};
+    cfg.type = trigger_type_from_string(type);
+    cfg.plugin = j.value("plugin", std::string{});
+    cfg.action = j.value("action", std::string{});
+
+    // A trigger that names no plugin/action can never dispatch — that's a
+    // registration bug, not a trigger worth keeping around.
+    if (cfg.plugin.empty() || cfg.action.empty()) {
+        spdlog::warn("parse_trigger_config('{}'): missing plugin or action — rejected", id);
+        return std::nullopt;
+    }
+
+    cfg.interval_seconds = j.value("interval_seconds", 0);
+    cfg.watch_path = j.value("watch_path", std::string{});
+    cfg.service_name = j.value("service_name", std::string{});
+    cfg.expected_status = j.value("expected_status", std::string{});
+    cfg.registry_hive = j.value("registry_hive", std::string{});
+    cfg.registry_key = j.value("registry_key", std::string{});
+    cfg.debounce_seconds = j.value("debounce_seconds", 0);
+
+    if (auto it = j.find("parameters"); it != j.end() && it->is_object()) {
+        for (const auto& [key, val] : it->items()) {
+            cfg.parameters[key] = val.is_string() ? val.get<std::string>() : val.dump();
+        }
+    }
+
+    return cfg;
+}
+
 // ── Construction / destruction ───────────────────────────────────────────────
 
 TriggerEngine::TriggerEngine() = default;
 
-TriggerEngine::~TriggerEngine() { stop(); }
+TriggerEngine::~TriggerEngine() {
+    stop();
+}
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -45,8 +94,8 @@ void TriggerEngine::register_trigger(TriggerConfig config) {
     } else {
         // Enforce maximum trigger count to prevent resource exhaustion
         if (triggers_.size() >= max_triggers_) {
-            spdlog::warn("Trigger '{}' rejected: maximum trigger count ({}) reached",
-                         config.id, max_triggers_);
+            spdlog::warn("Trigger '{}' rejected: maximum trigger count ({}) reached", config.id,
+                         max_triggers_);
             return;
         }
         spdlog::info("Trigger '{}' registered (type={}, plugin={}, action={})", config.id,
@@ -120,7 +169,9 @@ size_t TriggerEngine::trigger_count() const {
     return triggers_.size();
 }
 
-bool TriggerEngine::is_running() const noexcept { return running_.load(std::memory_order_acquire); }
+bool TriggerEngine::is_running() const noexcept {
+    return running_.load(std::memory_order_acquire);
+}
 
 // ── Dispatch helper ──────────────────────────────────────────────────────────
 
@@ -371,20 +422,26 @@ void TriggerEngine::registry_watch_loop() {
 
     auto cleanup = [&]() {
         for (auto& [id, evt] : watch_events) {
-            if (evt) CloseHandle(evt);
+            if (evt)
+                CloseHandle(evt);
         }
         for (auto& [id, key] : watched_keys) {
-            if (key) RegCloseKey(key);
+            if (key)
+                RegCloseKey(key);
         }
         watched_keys.clear();
         watch_events.clear();
     };
 
     auto parse_hive = [](const std::string& hive) -> HKEY {
-        if (hive == "HKLM") return HKEY_LOCAL_MACHINE;
-        if (hive == "HKCU") return HKEY_CURRENT_USER;
-        if (hive == "HKCR") return HKEY_CLASSES_ROOT;
-        if (hive == "HKU")  return HKEY_USERS;
+        if (hive == "HKLM")
+            return HKEY_LOCAL_MACHINE;
+        if (hive == "HKCU")
+            return HKEY_CURRENT_USER;
+        if (hive == "HKCR")
+            return HKEY_CLASSES_ROOT;
+        if (hive == "HKU")
+            return HKEY_USERS;
         return nullptr;
     };
 
@@ -406,32 +463,32 @@ void TriggerEngine::registry_watch_loop() {
                 continue; // already watching
 
             if (trigger.registry_key.empty() || trigger.registry_hive.empty()) {
-                spdlog::warn("Trigger '{}': registry_hive and registry_key are required", trigger.id);
+                spdlog::warn("Trigger '{}': registry_hive and registry_key are required",
+                             trigger.id);
                 continue;
             }
 
             HKEY root = parse_hive(trigger.registry_hive);
             if (!root) {
-                spdlog::warn("Trigger '{}': invalid registry hive '{}'",
-                             trigger.id, trigger.registry_hive);
+                spdlog::warn("Trigger '{}': invalid registry hive '{}'", trigger.id,
+                             trigger.registry_hive);
                 continue;
             }
 
             // Convert key path to wide string
             std::wstring wkey;
             {
-                int len = MultiByteToWideChar(CP_UTF8, 0, trigger.registry_key.c_str(),
-                                               -1, nullptr, 0);
+                int len =
+                    MultiByteToWideChar(CP_UTF8, 0, trigger.registry_key.c_str(), -1, nullptr, 0);
                 wkey.resize(static_cast<size_t>(len));
-                MultiByteToWideChar(CP_UTF8, 0, trigger.registry_key.c_str(),
-                                     -1, wkey.data(), len);
+                MultiByteToWideChar(CP_UTF8, 0, trigger.registry_key.c_str(), -1, wkey.data(), len);
             }
 
             HKEY opened = nullptr;
-            if (RegOpenKeyExW(root, wkey.c_str(), 0,
-                              KEY_NOTIFY | KEY_READ, &opened) != ERROR_SUCCESS) {
-                spdlog::warn("Trigger '{}': failed to open registry key '{}'",
-                             trigger.id, trigger.registry_key);
+            if (RegOpenKeyExW(root, wkey.c_str(), 0, KEY_NOTIFY | KEY_READ, &opened) !=
+                ERROR_SUCCESS) {
+                spdlog::warn("Trigger '{}': failed to open registry key '{}'", trigger.id,
+                             trigger.registry_key);
                 continue;
             }
 
@@ -442,15 +499,15 @@ void TriggerEngine::registry_watch_loop() {
             }
 
             // Request notification for any change to the key or its values
-            LONG rc = RegNotifyChangeKeyValue(
-                opened, TRUE,
-                REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |
-                REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY,
-                evt, TRUE);
+            LONG rc =
+                RegNotifyChangeKeyValue(opened, TRUE,
+                                        REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |
+                                            REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY,
+                                        evt, TRUE);
 
             if (rc != ERROR_SUCCESS) {
-                spdlog::warn("Trigger '{}': RegNotifyChangeKeyValue failed (error {})",
-                             trigger.id, rc);
+                spdlog::warn("Trigger '{}': RegNotifyChangeKeyValue failed (error {})", trigger.id,
+                             rc);
                 CloseHandle(evt);
                 RegCloseKey(opened);
                 continue;
@@ -458,12 +515,12 @@ void TriggerEngine::registry_watch_loop() {
 
             watched_keys[trigger.id] = opened;
             watch_events[trigger.id] = evt;
-            spdlog::info("Trigger '{}': watching registry key '{}\\{}'",
-                         trigger.id, trigger.registry_hive, trigger.registry_key);
+            spdlog::info("Trigger '{}': watching registry key '{}\\{}'", trigger.id,
+                         trigger.registry_hive, trigger.registry_key);
         }
 
         // Check all watched events
-        for (auto it = watch_events.begin(); it != watch_events.end(); ) {
+        for (auto it = watch_events.begin(); it != watch_events.end();) {
             DWORD wait = WaitForSingleObject(it->second, 0);
             if (wait == WAIT_OBJECT_0) {
                 // Change detected — fire the trigger
@@ -481,11 +538,11 @@ void TriggerEngine::registry_watch_loop() {
                 ResetEvent(it->second);
                 auto key_it = watched_keys.find(it->first);
                 if (key_it != watched_keys.end()) {
-                    RegNotifyChangeKeyValue(
-                        key_it->second, TRUE,
-                        REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |
-                        REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY,
-                        it->second, TRUE);
+                    RegNotifyChangeKeyValue(key_it->second, TRUE,
+                                            REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_ATTRIBUTES |
+                                                REG_NOTIFY_CHANGE_LAST_SET |
+                                                REG_NOTIFY_CHANGE_SECURITY,
+                                            it->second, TRUE);
                 }
                 ++it;
             } else {
@@ -520,10 +577,11 @@ void TriggerEngine::registry_watch_loop() {
 bool TriggerEngine::is_valid_service_name(const std::string& name) {
     // Service names must be alphanumeric + dots, underscores, hyphens, @
     // This blocks ALL shell metacharacters (;, &, |, `, $, (, ), etc.)
-    if (name.empty() || name.size() > 256) return false;
+    if (name.empty() || name.size() > 256)
+        return false;
     for (char c : name) {
-        if (!std::isalnum(static_cast<unsigned char>(c)) &&
-            c != '.' && c != '_' && c != '-' && c != '@') {
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '_' && c != '-' &&
+            c != '@') {
             return false;
         }
     }
@@ -649,8 +707,8 @@ std::string TriggerEngine::query_service_status(const std::string& service_name)
     pclose(pipe);
 
     // Trim trailing whitespace/newlines
-    while (!output.empty() && (output.back() == '\n' || output.back() == '\r' ||
-                                output.back() == ' ')) {
+    while (!output.empty() &&
+           (output.back() == '\n' || output.back() == '\r' || output.back() == ' ')) {
         output.pop_back();
     }
 

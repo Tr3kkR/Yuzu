@@ -89,6 +89,61 @@ TEST_CASE("trigger_type_from_string unknown defaults to Interval", "[trigger_eng
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// parse_trigger_config — the C-ABI trigger-registration parse point
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("parse_trigger_config: TAR interval config round-trips", "[trigger_engine][parsing]") {
+    // This is exactly what the TAR plugin's init() passes across the C ABI.
+    auto cfg = parse_trigger_config(
+        "tar.fast", "interval",
+        R"({"interval_seconds":60,"plugin":"tar","action":"collect_fast","parameters":{}})");
+    REQUIRE(cfg.has_value());
+    CHECK(cfg->id == "tar.fast");
+    CHECK(cfg->type == TriggerType::Interval);
+    CHECK(cfg->plugin == "tar");
+    CHECK(cfg->action == "collect_fast");
+    CHECK(cfg->interval_seconds == 60);
+    CHECK(cfg->parameters.empty());
+}
+
+TEST_CASE("parse_trigger_config: malformed JSON returns nullopt", "[trigger_engine][parsing]") {
+    CHECK_FALSE(parse_trigger_config("x", "interval", "{not json").has_value());
+    CHECK_FALSE(parse_trigger_config("x", "interval", "").has_value());
+}
+
+TEST_CASE("parse_trigger_config: missing plugin or action returns nullopt",
+          "[trigger_engine][parsing]") {
+    // A trigger with no plugin/action can never dispatch — reject it rather
+    // than register a dead trigger.
+    CHECK_FALSE(
+        parse_trigger_config("x", "interval", R"({"interval_seconds":60,"action":"collect_fast"})")
+            .has_value());
+    CHECK_FALSE(parse_trigger_config("x", "interval", R"({"interval_seconds":60,"plugin":"tar"})")
+                    .has_value());
+}
+
+TEST_CASE("parse_trigger_config: parameters object is forwarded", "[trigger_engine][parsing]") {
+    auto cfg = parse_trigger_config(
+        "p", "interval",
+        R"({"interval_seconds":30,"plugin":"tar","action":"rollup","parameters":{"mode":"full","keep":"7"}})");
+    REQUIRE(cfg.has_value());
+    REQUIRE(cfg->parameters.size() == 2);
+    CHECK(cfg->parameters.at("mode") == "full");
+    CHECK(cfg->parameters.at("keep") == "7");
+}
+
+TEST_CASE("parse_trigger_config: filesystem trigger captures watch_path",
+          "[trigger_engine][parsing]") {
+    auto cfg = parse_trigger_config(
+        "watch-hosts", "filesystem",
+        R"({"plugin":"event_logs","action":"scan","watch_path":"/etc/hosts"})");
+    REQUIRE(cfg.has_value());
+    CHECK(cfg->type == TriggerType::FileChange);
+    CHECK(cfg->watch_path == "/etc/hosts");
+    CHECK(cfg->plugin == "event_logs");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Service name validation (mirror function)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -204,7 +259,8 @@ TEST_CASE("TriggerEngine: unregister non-existent is safe", "[trigger_engine][re
     CHECK(engine.trigger_count() == 0);
 }
 
-TEST_CASE("TriggerEngine: unregister specific trigger leaves others", "[trigger_engine][registration]") {
+TEST_CASE("TriggerEngine: unregister specific trigger leaves others",
+          "[trigger_engine][registration]") {
     TriggerEngine engine;
 
     TriggerConfig a;
@@ -321,7 +377,8 @@ TEST_CASE("TriggerEngine: multiple startup triggers all fire", "[trigger_engine]
     engine.stop();
 }
 
-TEST_CASE("TriggerEngine: non-startup triggers do not fire on start()", "[trigger_engine][startup]") {
+TEST_CASE("TriggerEngine: non-startup triggers do not fire on start()",
+          "[trigger_engine][startup]") {
     TriggerEngine engine;
     DispatchRecorder recorder;
     engine.set_dispatch(recorder.callback());
@@ -361,7 +418,8 @@ TEST_CASE("TriggerEngine: non-startup triggers do not fire on start()", "[trigge
 // Instead, we test that the interval loop runs without crashing and that the
 // engine shuts down cleanly.
 
-TEST_CASE("TriggerEngine: interval trigger registered, start/stop no crash", "[trigger_engine][interval]") {
+TEST_CASE("TriggerEngine: interval trigger registered, start/stop no crash",
+          "[trigger_engine][interval]") {
     TriggerEngine engine;
     DispatchRecorder recorder;
     engine.set_dispatch(recorder.callback());
@@ -390,7 +448,8 @@ TEST_CASE("TriggerEngine: interval trigger registered, start/stop no crash", "[t
 // File change triggers
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("TriggerEngine: file change trigger fires on modification", "[trigger_engine][filechange]") {
+TEST_CASE("TriggerEngine: file change trigger fires on modification",
+          "[trigger_engine][filechange]") {
     // Create a temp file to watch
     auto tmp_dir = fs::temp_directory_path() / "yuzu_trigger_test";
     fs::create_directories(tmp_dir);
@@ -457,7 +516,8 @@ TEST_CASE("TriggerEngine: file change trigger fires on modification", "[trigger_
     fs::remove_all(tmp_dir, ec);
 }
 
-TEST_CASE("TriggerEngine: file change trigger with empty watch_path is skipped", "[trigger_engine][filechange]") {
+TEST_CASE("TriggerEngine: file change trigger with empty watch_path is skipped",
+          "[trigger_engine][filechange]") {
     TriggerEngine engine;
     DispatchRecorder recorder;
     engine.set_dispatch(recorder.callback());
@@ -493,8 +553,8 @@ TEST_CASE("TriggerEngine: start and stop clean shutdown", "[trigger_engine][life
 
 TEST_CASE("TriggerEngine: start without any triggers", "[trigger_engine][lifecycle]") {
     TriggerEngine engine;
-    engine.set_dispatch([](const std::string&, const std::string&,
-                           const std::map<std::string, std::string>&) {});
+    engine.set_dispatch(
+        [](const std::string&, const std::string&, const std::map<std::string, std::string>&) {});
 
     CHECK(engine.trigger_count() == 0);
     engine.start();
@@ -603,7 +663,8 @@ TEST_CASE("TriggerEngine: unregister trigger while running", "[trigger_engine][l
 // Dispatch without callback
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("TriggerEngine: startup trigger fires without dispatch set (no crash)", "[trigger_engine][dispatch]") {
+TEST_CASE("TriggerEngine: startup trigger fires without dispatch set (no crash)",
+          "[trigger_engine][dispatch]") {
     TriggerEngine engine;
     // Do NOT call set_dispatch
 
@@ -624,7 +685,8 @@ TEST_CASE("TriggerEngine: startup trigger fires without dispatch set (no crash)"
 // Debounce
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("TriggerEngine: debounce suppresses rapid startup triggers", "[trigger_engine][debounce]") {
+TEST_CASE("TriggerEngine: debounce suppresses rapid startup triggers",
+          "[trigger_engine][debounce]") {
     // Register two startup triggers with the same debounce window
     // and same ID should only fire once
     TriggerEngine engine;
@@ -682,12 +744,13 @@ TEST_CASE("TriggerEngine: parameters are forwarded to dispatch", "[trigger_engin
 // Exception safety in dispatch callback
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("TriggerEngine: throwing dispatch callback does not crash engine", "[trigger_engine][dispatch]") {
+TEST_CASE("TriggerEngine: throwing dispatch callback does not crash engine",
+          "[trigger_engine][dispatch]") {
     TriggerEngine engine;
-    engine.set_dispatch([](const std::string&, const std::string&,
-                           const std::map<std::string, std::string>&) {
-        throw std::runtime_error("callback exploded");
-    });
+    engine.set_dispatch(
+        [](const std::string&, const std::string&, const std::map<std::string, std::string>&) {
+            throw std::runtime_error("callback exploded");
+        });
 
     TriggerConfig cfg;
     cfg.id = "will-throw";

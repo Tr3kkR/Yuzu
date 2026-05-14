@@ -464,16 +464,36 @@ YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char
     return result;
 }
 
-YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* /*ctx*/, const char* /*trigger_id*/,
-                                      const char* /*trigger_type*/, const char* /*config_json*/) {
-    // Trigger registration is handled by the trigger engine at the agent level.
-    // Plugins call this to express intent; the agent wires it during init.
-    // For now, return success — the agent's init sequence reads trigger configs
-    // from the plugin's init() call and routes them to the TriggerEngine.
+YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigger_id,
+                                      const char* trigger_type, const char* config_json) {
+    if (!ctx || !trigger_id || !trigger_type || !config_json)
+        return -1;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    if (!impl->trigger_engine) {
+        // The agent did not wire a TriggerEngine into this context. Without
+        // it the registration cannot take effect — fail loudly rather than
+        // returning success and silently dropping the trigger (the old
+        // stub's bug — it cost the whole interval-trigger feature).
+        spdlog::error("yuzu_register_trigger('{}'): no TriggerEngine in plugin context",
+                      trigger_id);
+        return -2;
+    }
+    auto cfg = yuzu::agent::parse_trigger_config(trigger_id, trigger_type, config_json);
+    if (!cfg) {
+        // parse_trigger_config already logged the specific reason.
+        return -3;
+    }
+    impl->trigger_engine->register_trigger(std::move(*cfg));
     return 0;
 }
 
-YUZU_EXPORT int yuzu_unregister_trigger(YuzuPluginContext* /*ctx*/, const char* /*trigger_id*/) {
+YUZU_EXPORT int yuzu_unregister_trigger(YuzuPluginContext* ctx, const char* trigger_id) {
+    if (!ctx || !trigger_id)
+        return -1;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    if (!impl->trigger_engine)
+        return -2;
+    impl->trigger_engine->unregister_trigger(trigger_id);
     return 0;
 }
 
@@ -534,6 +554,14 @@ public:
         plugin_ctx_.config["agent.debug_mode"] = cfg_.debug_mode ? "true" : "false";
         plugin_ctx_.config["agent.verbose_logging"] = cfg_.verbose_logging ? "true" : "false";
         plugin_ctx_.config["agent.reconnect_count"] = "0";
+
+        // Wire the trigger engine into the master plugin context BEFORE the
+        // per-plugin contexts are snapshotted from it (the load loop copies
+        // plugin_ctx_.trigger_engine into each pctx). Plugins call
+        // ctx.register_trigger() inside their own init(), which routes
+        // through yuzu_register_trigger -> pctx->trigger_engine; if this
+        // pointer is still null at init time, every registration is dropped.
+        plugin_ctx_.trigger_engine = &trigger_engine_;
 
         // 1b. Open KV store for plugin persistent storage
         {
@@ -674,6 +702,11 @@ public:
 
         // Scope guard: shutdown plugins and destroy thread pool on any exit path
         ScopeExit cleanup{[this]() {
+            // Stop the trigger engine FIRST — before plugins are torn down —
+            // so an in-flight interval/file/service trigger can't dispatch
+            // into a plugin that's mid-shutdown. stop() joins the worker
+            // threads, so once it returns no further dispatch can occur.
+            trigger_engine_.stop();
             for (auto& handle : plugins_) {
                 if (handle.descriptor()->shutdown) {
                     // Use per-plugin context if available, fall back to shared
@@ -688,6 +721,44 @@ public:
             thread_pool_.reset();
             spdlog::info("Yuzu agent stopped");
         }};
+
+        // Wire trigger dispatch + start the engine. Plugins registered their
+        // triggers during init() (above); the engine has been holding them
+        // inert until now. The dispatch callback resolves the plugin by name
+        // and runs the action in-process via LocalDispatcher — the same
+        // mechanism the snapshot pump uses. start() spins up the interval /
+        // file-watch / service-watch worker threads and fires any
+        // AgentStartup triggers immediately.
+        trigger_engine_.set_dispatch([this](const std::string& plugin, const std::string& action,
+                                            const std::map<std::string, std::string>& params) {
+            const YuzuPluginDescriptor* descriptor = nullptr;
+            for (const auto& handle : plugins_) {
+                if (std::string_view{handle.descriptor()->name} == plugin) {
+                    descriptor = handle.descriptor();
+                    break;
+                }
+            }
+            if (!descriptor) {
+                spdlog::warn("Trigger dispatch: plugin '{}' not loaded — skipping action '{}'",
+                             plugin, action);
+                return;
+            }
+            // Convert the param map into the C-ABI YuzuParam span. The map
+            // outlives this synchronous run() call (it's owned by the
+            // TriggerConfig snapshot in the engine's worker loop), so the
+            // c_str() views stay valid for the duration of the dispatch.
+            std::vector<YuzuParam> yparams;
+            yparams.reserve(params.size());
+            for (const auto& [k, v] : params)
+                yparams.push_back(YuzuParam{k.c_str(), v.c_str()});
+
+            LocalDispatcher dispatcher;
+            auto result = dispatcher.run(descriptor, action, yparams);
+            if (result.rc != 0) {
+                spdlog::warn("Trigger dispatch: {}.{} returned rc={}", plugin, action, result.rc);
+            }
+        });
+        trigger_engine_.start();
 
         // 2. Connect to server (tuned for low-latency bidirectional streaming)
         grpc::ChannelArguments ch_args;
@@ -1535,6 +1606,12 @@ private:
     std::unordered_map<std::string, std::unique_ptr<PluginContextImpl>> per_plugin_ctx_;
     std::unique_ptr<KvStore> kv_store_;
     std::unique_ptr<GuardianEngine> guardian_;
+    // Drives interval / file-change / service-status triggers that plugins
+    // register during init(). Owned here; a non-owning pointer is handed to
+    // every per-plugin context so yuzu_register_trigger can reach it.
+    // start() is called once plugins are loaded; stop() runs before plugin
+    // shutdown so a trigger never fires into a half-torn-down plugin.
+    TriggerEngine trigger_engine_;
     yuzu::MetricsRegistry metrics_;
     std::chrono::steady_clock::time_point start_time_;
     std::string session_id_;
