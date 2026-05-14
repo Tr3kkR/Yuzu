@@ -303,6 +303,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
 
 void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Response& res,
                                      bool as_fragment) {
+    const auto t_start = std::chrono::steady_clock::now();
     const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
 
     // ── 1. Kill switch (tier-before-permission) ──────────────────────────
@@ -331,7 +332,39 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
     if (!perm_fn_(req, res, "Response", "Read"))
         return;
 
-    auto snap = store_->get(/*include_vuln=*/false);
+    // ── 4. Fetch (mirrors handle_topology: try/catch + null guard) ───────
+    const auto pre_hits = store_->cache_hits();
+    const auto pre_misses = store_->cache_misses();
+
+    std::shared_ptr<const TopologySnapshot> snap;
+    try {
+        snap = store_->get(/*include_vuln=*/false);
+    } catch (const std::exception& ex) {
+        spdlog::error("VizRoutes: store->get threw (host_topology): {}", ex.what());
+        res.status = 500;
+        res.set_content(error_envelope(500, "topology fetch failed"), "application/json");
+        if (audit_fn_)
+            audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "fetch_threw");
+        return;
+    }
+    // get() is documented never to return null; defensive belt anyway --
+    // an unguarded deref here is a remotely reachable post-auth crash.
+    if (!snap) {
+        res.status = 500;
+        res.set_content(error_envelope(500, "topology fetch returned null"), "application/json");
+        if (audit_fn_)
+            audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "snap_null");
+        return;
+    }
+
+    if (metrics_) {
+        if (store_->cache_hits() > pre_hits)
+            metrics_->counter("yuzu_viz_cache_hit_total").increment();
+        if (store_->cache_misses() > pre_misses)
+            metrics_->counter("yuzu_viz_cache_miss_total").increment();
+    }
+
+    // ── 5. Slice the requested host out of the fleet snapshot ────────────
     for (const auto& m : snap->machines) {
         if (m.agent_id == agent_id) {
             HostTopologySnapshot wrapper{snap->generated_at, m.stale, m};
@@ -353,6 +386,11 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
             if (audit_fn_)
                 audit_fn_(req, "viz.host_topology", "success", "HostTopology", agent_id,
                           as_fragment ? "fragment=1" : "");
+            if (metrics_) {
+                const auto elapsed = std::chrono::steady_clock::now() - t_start;
+                metrics_->histogram("yuzu_viz_topology_request_seconds")
+                    .observe(std::chrono::duration<double>(elapsed).count());
+            }
             return;
         }
     }

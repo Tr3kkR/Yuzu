@@ -2768,6 +2768,70 @@ Identical data, wrapped in `<script type="application/json" id="viz-data">...</s
 
 **Content-Type:** `text/html; charset=utf-8` (the body is HTML wrapping JSON, not JSON proper).
 
+#### `GET /api/v1/viz/host/<agent_id>/topology`
+
+Returns a single host's topology — one `MachineNode` sliced out of the
+current fleet snapshot — for the per-host IPC-graph drill-down page. The
+`agent_id` is taken from the path.
+
+**Permission:** `Response:Read`.
+
+**Responses**
+
+| Status | When | Body |
+|---|---|---|
+| `200` | Success | `host_topology.v1` JSON envelope (see schema below) |
+| `404` | No machine with that `agent_id` in the current snapshot | `{"error":{"code":404,"message":"host not found"}, ...}` |
+| `403` | RBAC denied | Standard auth error envelope |
+| `500` | Topology fetch threw or returned null | `{"error":{"code":500,"message":"..."}, ...}` |
+| `503` | Kill switch on (`--viz-disable`) or store unavailable | `{"error":{"code":503,"message":"..."}, ...}` |
+
+**Schema (`host_topology.v1`)**
+
+```json
+{
+  "schema": "host_topology.v1",
+  "schema_minor": 1,
+  "generated_at": 1715299200,
+  "stale": false,
+  "machine": { "agent_id": "...", "hostname": "host-1", "...": "MachineNode — same shape as a fleet_topology.v1 machines[] entry" }
+}
+```
+
+The `stale` flag is promoted from `machine.stale` to the envelope so a
+renderer can decide whether to show a stale banner without reaching into
+`machine`. The embedded `machine` object is byte-for-byte the same
+`MachineNode` shape served by `/api/v1/viz/fleet/topology`.
+
+**Audit emissions:** every request produces a `viz.host_topology` row
+(target_type `HostTopology`, target_id = `agent_id`), with result
+`success` / `denied` / `failure` and a detail of `kill_switch`,
+`store_null`, `fetch_threw`, `snap_null`, `not_found`, or `fragment=1`.
+
+**Example**
+
+```bash
+curl -H 'Authorization: Bearer <token>' \
+     'http://localhost:8080/api/v1/viz/host/cedar-01/topology'
+```
+
+#### `GET /fragments/viz/host/<agent_id>/topology`
+
+Identical data, wrapped in `<script type="application/json" id="viz-data">...</script>`
+for HTMX rendering — same escaping and `Content-Type` posture as
+`/fragments/viz/fleet/topology`. Permission and status codes identical to
+the JSON route above.
+
+#### `GET /viz/host/<agent_id>`
+
+Browser-facing per-host drill-down page (the 2D Cytoscape IPC graph above
+the TAR process tree), opened by double-clicking a cube in `/viz/fleet`.
+Auth-gated only (`require_auth`); redirects to `/login` on no session.
+The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` — any
+other character returns `400` — before it is templated into the page
+shell. Per-request RBAC is enforced when the page's JS fetches
+`/api/v1/viz/host/<agent_id>/topology`.
+
 ---
 
 ### Fleet Statistics

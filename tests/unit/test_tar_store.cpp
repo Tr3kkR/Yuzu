@@ -6,36 +6,21 @@
  */
 
 #include "tar_db.hpp"
+#include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <chrono>
-#include <cstdlib>
 #include <filesystem>
 #include <string>
-#include <thread>
 #include <vector>
-
-#ifndef _WIN32
-#include <unistd.h>
-#endif
 
 namespace fs = std::filesystem;
 using namespace yuzu::tar;
 
-// Per-uid suffix so multi-user hosts (e.g. WSL2 with both an interactive
-// user and the github-runner CI account) don't collide on /tmp ownership.
-static std::string yuzu_test_uid_suffix() {
-#ifdef _WIN32
-    if (const char* u = std::getenv("USERNAME"))
-        return std::string("_") + u;
-    return "_unknown";
-#else
-    return "_" + std::to_string(static_cast<unsigned long>(::geteuid()));
-#endif
-}
-
 // Helper: create a TarDatabase in a unique temp file, clean up on destruction.
+// Uniqueness comes from yuzu::test::unique_temp_path -- never salt with
+// std::hash<thread::id> / steady_clock, which collide under Defender-induced
+// I/O serialisation on the Windows runner (CLAUDE.md test conventions, #473).
 struct TestTarDb {
     TarDatabase db;
     fs::path path;
@@ -50,10 +35,7 @@ struct TestTarDb {
 };
 
 static TestTarDb make_test_db() {
-    auto tmp =
-        fs::temp_directory_path() / ("yuzu_test_tar" + yuzu_test_uid_suffix()) /
-        ("tar_" + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) + "_" +
-         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".db");
+    auto tmp = yuzu::test::unique_temp_path("tar_");
     auto result = TarDatabase::open(tmp);
     REQUIRE(result.has_value());
     return TestTarDb{std::move(*result), tmp};

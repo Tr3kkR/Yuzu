@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-host IPC-graph drill-down (`/viz/host/<agent_id>`).** Double-clicking
+  a cube in `/viz/fleet` opens a new tab with a 2D bipartite IPC graph
+  (processes + sockets, Cytoscape `cose` layout) above the existing TAR
+  process tree, with cross-pane select-to-highlight and a resizable
+  splitter. New REST routes `GET /api/v1/viz/host/<agent_id>/topology`
+  and `GET /fragments/viz/host/<agent_id>/topology` return a
+  `host_topology.v1` envelope (one `MachineNode` sliced from the fleet
+  snapshot); both require `Response:Read` and honour the `--viz-disable`
+  kill switch. The `/viz/host/<id>` page route is auth-gated and
+  allow-lists the `agent_id` (`[A-Za-z0-9._-]`) before templating.
+  Vendored Cytoscape.js 3.33.3 (MIT).
+- **`tar.fleet_snapshot` connection window.** `fleet_snapshot` now merges
+  connections seen recently from the `tcp_live` warehouse, not only those
+  ESTABLISHED at the exact `/proc` sample instant, so short-lived flows
+  reach the viz. New operator-tunable `fleet_snapshot_window_seconds`
+  (default `3600`). `fleet_snapshot.v1` `schema_minor` bumps `1 → 2`
+  (additive `connections[].last_seen_seconds_ago`, emitted only when
+  non-zero).
 - **`/viz/fleet` three-tier layout + talking-socket layer + curved tube
   wires (PR 12 of the 11-PR `/viz/fleet` 3D fleet network-topology
   ladder).** Machines now organise into three architectural Y planes:
@@ -43,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`/viz/fleet` `WEB_PORTS` trimmed** — dev-server ports (3000 etc.) no
+  longer score as "web", so a node app classifies application-tier not
+  frontend.
+- **`/static/yuzu-viz.js` cache posture** flipped to
+  `no-cache, no-store, must-revalidate` (was `max-age=86400`) — the
+  renderer bundle changes every viz PR and a `max-age` silently served a
+  stale renderer after a server upgrade.
 - **`/viz/fleet` cube layout** moved from a single flat grid to a
   three-tier stacked layout (PR 12). Operators with bookmarked URLs
   will land on the new camera framing `(45, 60, 45)` looking at the
@@ -50,6 +75,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`/api/v1/viz/fleet/topology` `schema_minor`** bumped `3 → 4`
   (additive — strict consumers pinned to `== 3` should relax to
   `>= 3`).
+
+### Fixed
+
+- **Agent interval triggers now fire.** `yuzu_register_trigger` /
+  `yuzu_unregister_trigger` were no-op stubs — no `TriggerEngine` was
+  instantiated, so `collect_fast` / `collect_slow` / `rollup` never ran
+  for any plugin. The TAR warehouse `*_live` tables sat permanently empty
+  in the field. The agent now owns a `TriggerEngine`, wires it into the
+  plugin context before plugin init, and starts it after plugins load.
+  See the upgrade note below.
+- **Gateway replays agent registrations on upstream reconnect.** After an
+  upstream connection drop, the gateway reconnected the transport but
+  never re-proxied the agent registrations it still held, leaving a
+  freshly-restarted server with an empty registry. The gateway now
+  drip-replays a `ProxyRegister` per held agent on upstream recovery.
+
+### Upgrade notes
+
+- **Interval triggers were previously non-functional.** After upgrading
+  the agent daemon, registered interval triggers begin firing for the
+  first time. Operators should expect the TAR `*_live` warehouse tables
+  to start populating (on the first `collect_fast` cycle, default 60 s)
+  and may see a small increase in per-agent CPU/IO. Any plugin that
+  registered an interval trigger expecting the old no-op behaviour will
+  now have that trigger fire.
+- **Gateway registry ETS row and upstream state record changed shape.**
+  A hot upgrade from a pre-change gateway build is not supported (no
+  `code_change/3`); the documented gateway deploy path — container
+  replacement — is unaffected.
 
 ### Removed
 

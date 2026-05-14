@@ -478,13 +478,24 @@ YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigge
                       trigger_id);
         return -2;
     }
-    auto cfg = yuzu::agent::parse_trigger_config(trigger_id, trigger_type, config_json);
-    if (!cfg) {
-        // parse_trigger_config already logged the specific reason.
-        return -3;
+    // No exception may cross this C ABI boundary -- doing so is UB. Catch
+    // everything (parse_trigger_config is exception-safe, but
+    // register_trigger does map/vector insertion that can throw bad_alloc).
+    try {
+        auto cfg = yuzu::agent::parse_trigger_config(trigger_id, trigger_type, config_json);
+        if (!cfg) {
+            // parse_trigger_config already logged the specific reason.
+            return -3;
+        }
+        impl->trigger_engine->register_trigger(std::move(*cfg));
+        return 0;
+    } catch (const std::exception& e) {
+        spdlog::error("yuzu_register_trigger('{}'): threw: {}", trigger_id, e.what());
+        return -4;
+    } catch (...) {
+        spdlog::error("yuzu_register_trigger('{}'): threw non-std exception", trigger_id);
+        return -4;
     }
-    impl->trigger_engine->register_trigger(std::move(*cfg));
-    return 0;
 }
 
 YUZU_EXPORT int yuzu_unregister_trigger(YuzuPluginContext* ctx, const char* trigger_id) {
@@ -493,8 +504,17 @@ YUZU_EXPORT int yuzu_unregister_trigger(YuzuPluginContext* ctx, const char* trig
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->trigger_engine)
         return -2;
-    impl->trigger_engine->unregister_trigger(trigger_id);
-    return 0;
+    // No exception may cross this C ABI boundary.
+    try {
+        impl->trigger_engine->unregister_trigger(trigger_id);
+        return 0;
+    } catch (const std::exception& e) {
+        spdlog::error("yuzu_unregister_trigger('{}'): threw: {}", trigger_id, e.what());
+        return -4;
+    } catch (...) {
+        spdlog::error("yuzu_unregister_trigger('{}'): threw non-std exception", trigger_id);
+        return -4;
+    }
 }
 
 } // extern "C"

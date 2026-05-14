@@ -196,6 +196,44 @@ The fleet-visualization feature ladder lands across the `feat/viz-engine` branch
 
 **Browser-side errors are not server-logged.** WebGL context loss, module-fetch 503, and importmap-resolution failures surface only in the operator's browser console. A future polish PR will add a client-error beacon; today, support engineers diagnosing "viz is blank" reports should ask for a screenshot of the browser console.
 
+**Per-host drill-down (`/viz/host/<agent_id>`).** Double-clicking a cube
+opens a new tab with a 2D bipartite IPC graph (processes + sockets,
+Cytoscape `cose` layout) above the existing TAR process tree, with
+cross-pane select-to-highlight and a resizable splitter. The page route
+is auth-gated only; the data fetch (`GET /api/v1/viz/host/<agent_id>/topology`)
+enforces `Response:Read` and honours the `--viz-disable` kill switch.
+Audit rows are emitted as `viz.host_topology` (`target_type = HostTopology`).
+The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` before
+templating; any other character returns `400`.
+
+**Connection window — `fleet_snapshot_window_seconds` (TAR plugin config).**
+`tar.fleet_snapshot` reports not only the connections ESTABLISHED at the
+exact `/proc` sample instant but also connections TAR observed recently
+in its `tcp_live` warehouse, so short-lived flows still reach the viz.
+The look-back window is operator-tunable via the TAR plugin's KV config
+key `fleet_snapshot_window_seconds` (default `3600`). It is a TAR plugin
+config key, not a server CLI flag — set it through the TAR plugin's
+configuration surface. The 60 s sampler still cannot see sub-interval
+connections; that needs kernel eventing (tracked separately).
+
+### vNEXT — Agent interval triggers now functional
+
+`yuzu_register_trigger` / `yuzu_unregister_trigger` were previously no-op
+stubs — no `TriggerEngine` was instantiated on the agent, so interval
+triggers were silently discarded and never fired. As a result the TAR
+warehouse `*_live` tables (`tcp_live` and friends) sat permanently empty
+in the field, and any plugin that registered an interval trigger had it
+silently dropped.
+
+**Upgrade caveat.** After upgrading the **agent** daemon, registered
+interval triggers begin firing for the first time. On the first
+`collect_fast` cycle (default 60 s) the TAR `*_live` tables start
+populating, and operators may see a small increase in per-agent CPU/IO
+proportional to the number of registered triggers. Any plugin that
+registered an interval trigger expecting the old no-op behaviour will now
+have that trigger fire — this is the fix, not a regression. Server-only
+upgrades are unaffected; the change is entirely agent-side.
+
 ### vNEXT — Plugin code signing (#80)
 
 Plugin signature verification ships in two parts: an agent-side CMS verifier and a server-side Settings UI for managing the trust bundle. **Default behaviour is unchanged** — agents that do not pass `--plugin-trust-bundle` and operators that do not upload a bundle through the new Settings card see identical behaviour to prior releases (allowlist-only, sha256 hash check).

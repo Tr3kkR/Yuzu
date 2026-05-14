@@ -22,46 +22,51 @@ namespace yuzu::agent {
 
 std::optional<TriggerConfig> parse_trigger_config(std::string_view id, std::string_view type,
                                                   std::string_view config_json) {
-    nlohmann::json j;
+    // The whole extraction is wrapped, not just parse(): nlohmann's
+    // j.value()/get()/items() throw type_error on a key present with the
+    // wrong JSON type (e.g. "interval_seconds":"60"). This function is the
+    // C-ABI registration parse point — an exception escaping here would
+    // cross the C ABI boundary in yuzu_register_trigger and be UB (gov R3).
     try {
-        j = nlohmann::json::parse(config_json);
-    } catch (const std::exception& e) {
-        spdlog::warn("parse_trigger_config('{}'): malformed config JSON: {}", id, e.what());
-        return std::nullopt;
-    }
-    if (!j.is_object()) {
-        spdlog::warn("parse_trigger_config('{}'): config JSON is not an object", id);
-        return std::nullopt;
-    }
-
-    TriggerConfig cfg;
-    cfg.id = std::string{id};
-    cfg.type = trigger_type_from_string(type);
-    cfg.plugin = j.value("plugin", std::string{});
-    cfg.action = j.value("action", std::string{});
-
-    // A trigger that names no plugin/action can never dispatch — that's a
-    // registration bug, not a trigger worth keeping around.
-    if (cfg.plugin.empty() || cfg.action.empty()) {
-        spdlog::warn("parse_trigger_config('{}'): missing plugin or action — rejected", id);
-        return std::nullopt;
-    }
-
-    cfg.interval_seconds = j.value("interval_seconds", 0);
-    cfg.watch_path = j.value("watch_path", std::string{});
-    cfg.service_name = j.value("service_name", std::string{});
-    cfg.expected_status = j.value("expected_status", std::string{});
-    cfg.registry_hive = j.value("registry_hive", std::string{});
-    cfg.registry_key = j.value("registry_key", std::string{});
-    cfg.debounce_seconds = j.value("debounce_seconds", 0);
-
-    if (auto it = j.find("parameters"); it != j.end() && it->is_object()) {
-        for (const auto& [key, val] : it->items()) {
-            cfg.parameters[key] = val.is_string() ? val.get<std::string>() : val.dump();
+        nlohmann::json j = nlohmann::json::parse(config_json);
+        if (!j.is_object()) {
+            spdlog::warn("parse_trigger_config('{}'): config JSON is not an object", id);
+            return std::nullopt;
         }
-    }
 
-    return cfg;
+        TriggerConfig cfg;
+        cfg.id = std::string{id};
+        cfg.type = trigger_type_from_string(type);
+        cfg.plugin = j.value("plugin", std::string{});
+        cfg.action = j.value("action", std::string{});
+
+        // A trigger that names no plugin/action can never dispatch — that's a
+        // registration bug, not a trigger worth keeping around.
+        if (cfg.plugin.empty() || cfg.action.empty()) {
+            spdlog::warn("parse_trigger_config('{}'): missing plugin or action — rejected", id);
+            return std::nullopt;
+        }
+
+        cfg.interval_seconds = j.value("interval_seconds", 0);
+        cfg.watch_path = j.value("watch_path", std::string{});
+        cfg.service_name = j.value("service_name", std::string{});
+        cfg.expected_status = j.value("expected_status", std::string{});
+        cfg.registry_hive = j.value("registry_hive", std::string{});
+        cfg.registry_key = j.value("registry_key", std::string{});
+        cfg.debounce_seconds = j.value("debounce_seconds", 0);
+
+        if (auto it = j.find("parameters"); it != j.end() && it->is_object()) {
+            for (const auto& [key, val] : it->items()) {
+                cfg.parameters[key] = val.is_string() ? val.get<std::string>() : val.dump();
+            }
+        }
+
+        return cfg;
+    } catch (const std::exception& e) {
+        spdlog::warn("parse_trigger_config('{}'): malformed or ill-typed config JSON: {}", id,
+                     e.what());
+        return std::nullopt;
+    }
 }
 
 // ── Construction / destruction ───────────────────────────────────────────────
