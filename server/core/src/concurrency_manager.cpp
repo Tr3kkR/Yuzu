@@ -45,8 +45,6 @@ bool ConcurrencyManager::try_acquire(const std::string& definition_id,
     if (!db_)
         return false;
 
-    std::lock_guard<std::mutex> lock(mutex_);
-
     // Agent-side enforcement or no limit — always allow
     if (concurrency_mode == "unlimited" || concurrency_mode == "per-device" ||
         concurrency_mode == "per-set") {
@@ -64,15 +62,18 @@ bool ConcurrencyManager::try_acquire(const std::string& definition_id,
         }
     }
 
-    // Single-statement atomic conditional insert. The COUNT subquery and the
-    // INSERT execute as one SQL statement, so SQLite holds the write lock for
-    // the duration. This closes the SELECT-then-INSERT TOCTOU race that
-    // SQLITE_OPEN_FULLMUTEX cannot guard against (FULLMUTEX serializes
-    // individual API calls but not multi-statement sequences).
+    // Single-statement atomic conditional insert: the COUNT subquery and the
+    // INSERT execute as one statement under SQLite's per-statement write lock,
+    // closing the SELECT-then-INSERT TOCTOU race. The RETURNING clause makes
+    // "did a row get inserted?" the result of stepping this one statement, so
+    // we never call sqlite3_changes() — which reads db->nChange without the
+    // connection mutex and would data-race a concurrent step() on the shared
+    // FULLMUTEX connection.
     const char* sql = R"(
         INSERT OR IGNORE INTO concurrency_locks (definition_id, execution_id, acquired_at)
         SELECT ?, ?, ?
         WHERE (SELECT COUNT(*) FROM concurrency_locks WHERE definition_id = ?) < ?
+        RETURNING 1
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -88,8 +89,13 @@ bool ConcurrencyManager::try_acquire(const std::string& definition_id,
     sqlite3_bind_int(stmt, 5, limit);
 
     int rc = sqlite3_step(stmt);
-    int changes = sqlite3_changes(db_);
     sqlite3_finalize(stmt);
+
+    if (rc == SQLITE_ROW) {
+        // RETURNING produced a row: the conditional INSERT actually inserted,
+        // so this caller now holds the lock.
+        return true;
+    }
 
     if (rc != SQLITE_DONE) {
         spdlog::error("concurrency: insert failed for definition='{}' execution='{}': {}",
@@ -97,13 +103,10 @@ bool ConcurrencyManager::try_acquire(const std::string& definition_id,
         return false;
     }
 
-    if (changes > 0) {
-        return true;
-    }
-
-    // The conditional insert was a no-op. Either the limit is reached, or this
-    // (definition_id, execution_id) lock is already held (idempotent re-acquire
-    // by the same caller). Distinguish so re-acquire stays idempotent.
+    // SQLITE_DONE with no RETURNING row: the conditional insert was a no-op.
+    // Either the limit is reached, or this (definition_id, execution_id) lock
+    // is already held (idempotent re-acquire by the same caller). Distinguish
+    // so re-acquire stays idempotent.
     const char* exists_sql =
         "SELECT 1 FROM concurrency_locks WHERE definition_id = ? AND execution_id = ? LIMIT 1";
     sqlite3_stmt* check = nullptr;
@@ -129,8 +132,6 @@ void ConcurrencyManager::release(const std::string& definition_id,
     if (!db_)
         return;
 
-    std::lock_guard<std::mutex> lock(mutex_);
-
     const char* sql = "DELETE FROM concurrency_locks WHERE definition_id = ? AND execution_id = ?";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -147,8 +148,6 @@ void ConcurrencyManager::release(const std::string& definition_id,
 int ConcurrencyManager::active_count(const std::string& definition_id) const {
     if (!db_)
         return 0;
-
-    std::lock_guard<std::mutex> lock(mutex_);
 
     const char* sql = "SELECT COUNT(*) FROM concurrency_locks WHERE definition_id = ?";
     sqlite3_stmt* stmt = nullptr;

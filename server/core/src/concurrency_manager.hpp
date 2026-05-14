@@ -2,7 +2,6 @@
 
 #include <sqlite3.h>
 
-#include <mutex>
 #include <string>
 
 namespace yuzu::server {
@@ -35,13 +34,13 @@ public:
 
 private:
     sqlite3* db_;
-    // SQLITE_OPEN_FULLMUTEX serializes individual SQLite API calls but not
-    // multi-call sequences. try_acquire pairs sqlite3_step() with
-    // sqlite3_changes(), and sqlite3_changes() reads db->nChange without
-    // taking the connection mutex — so a concurrent step() on the same
-    // connection both data-races the read and can corrupt the observed
-    // change count. mutex_ makes each manager operation atomic end-to-end.
-    mutable std::mutex mutex_;
+    // No application-level mutex. try_acquire/release/active_count each
+    // prepare-and-finalize one statement per call, so SQLITE_OPEN_FULLMUTEX
+    // on the shared connection serializes them. try_acquire's conditional
+    // INSERT carries a RETURNING clause, so "was a row inserted?" is the
+    // result of stepping that single statement — it never calls
+    // sqlite3_changes(), which reads db->nChange without the connection
+    // mutex and would data-race a concurrent step() on the shared connection.
 };
 
 } // namespace yuzu::server
