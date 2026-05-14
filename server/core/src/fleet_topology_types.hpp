@@ -148,6 +148,16 @@ struct TopologySnapshot {
     std::vector<MachineNode> machines;
 };
 
+/// Single-host snapshot wrapper returned by `/api/v1/viz/host/<agent_id>/topology`.
+/// Carries the same `generated_at` provenance as the fleet snapshot plus the
+/// host-level `stale` flag promoted to the envelope so renderers can decide
+/// whether to show a stale banner without reaching into `machine.stale`.
+struct HostTopologySnapshot {
+    int64_t generated_at{0};
+    bool stale{false};
+    MachineNode machine;
+};
+
 /// Input shape -- one parsed fleet_snapshot.v1 payload from a single agent.
 /// SERVER-INTERNAL ONLY; never serialised to a renderer. The fetcher seam
 /// produces a vector of these; FleetTopologyStore turns them into the
@@ -237,6 +247,14 @@ inline void to_json(nlohmann::json& j, const MachineNode& m) {
         j["truncated_processes"] = true;
     if (m.truncated_connections)
         j["truncated_connections"] = true;
+}
+
+inline void to_json(nlohmann::json& j, const HostTopologySnapshot& s) {
+    j = {{"schema", "host_topology.v1"},
+         {"schema_minor", 1},
+         {"generated_at", s.generated_at},
+         {"stale", s.stale},
+         {"machine", s.machine}};
 }
 
 inline void to_json(nlohmann::json& j, const TopologySnapshot& s) {

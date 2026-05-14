@@ -15,10 +15,20 @@ governance.
 
 - **Endpoints.** `/api/v1/viz/fleet/topology` (JSON snapshot) +
   `/fragments/...` (HTMX fragments).
-- **Page route.** `/viz/fleet`, auth-gated. Responses set
-  `Cache-Control: no-cache, no-store, must-revalidate` to close the
-  stale-page-vs-fresh-asset skew window — page shell and module bundle must
-  reload together.
+- **Page route.** `/viz/fleet` (and `/viz/host/<agent_id>`), auth-gated.
+  Responses set `Cache-Control: no-cache, no-store, must-revalidate` to
+  close the stale-page-vs-fresh-asset skew window — page shell and module
+  bundle must reload together.
+- **Renderer bundles are `no-cache`, vendored libs are `max-age`.**
+  `/static/yuzu-viz.js` and `/static/yuzu-viz-host.js` are *our* renderer
+  code — they change every feat/viz-engine PR — so they're served
+  `no-cache, no-store, must-revalidate`, same as the page shell. A
+  `max-age` on them silently serves a stale renderer (wrong tier
+  classification, missing layout code, outdated features) for the whole
+  window after a server upgrade. The vendored libraries
+  (`/static/cytoscape.min.js`, `/static/three.module.min.js`,
+  `/static/three-orbit-controls.js`) keep `public, max-age=86400` — they
+  are content-stable and only change on a deliberate vendor refresh.
 - **Route ordering.** No future `/viz/<param>` regex may be registered
   *before* `/viz/fleet` in the route table — the more-specific literal must
   win the match (arch-S1).
@@ -223,6 +233,18 @@ Standing rules:
   (`'database'` / `'web'` strings from `process_category.hpp`'s
   `category_to_string`). Hosts with no DB/web signal default to
   `app`.
+- **`WEB_PORTS` intentionally excludes dev-server defaults.** The set
+  is `{80, 443, 8080, 8443, 8088}` — reverse proxies, load balancers,
+  API gateways. Common dev-server ports (`3000` express, `4200`
+  angular, `5173` vite, `8000` django) are **not** in WEB_PORTS, even
+  though they speak HTTP. A nodejs/django/vite server is application
+  work in a classic three-tier deployment (HSBC-style: gateway →
+  app servers → database); putting it on the frontend plane
+  misrepresents the topology a reviewer expects. The dev-server
+  ports cost a real misclassification on the Cedar & Vale UAT rig
+  (yuzu-app on `:3000` landed on the frontend plane) before they
+  were removed. Port-based heuristics are a starting point only;
+  function-aware classification is tracked as a follow-up.
 - **Tier placement is a VISUAL cue only.** It's computed from
   agent-controlled fields (listener ports + process category) and
   carries NO authorization weight. Never use the tier output as a

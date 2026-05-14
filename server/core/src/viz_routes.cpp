@@ -132,6 +132,21 @@ void VizRoutes::register_routes(HttpRouteSink& sink, AuthFn /*auth_fn*/, PermFn 
              [this](const httplib::Request& req, httplib::Response& res) {
                  handle_topology(req, res, /*as_fragment=*/true);
              });
+
+    // Per-host drill-down. Pattern is a regex so the agent_id is captured in
+    // req.matches[1]. fleet-viz-invariants.md § Route ordering: register
+    // /viz/fleet BEFORE /viz/host/<id> — both are literal-prefix routes (the
+    // regex parameter only matches after `/api/v1/viz/host/`), no overlap,
+    // but follow the convention.
+    sink.Get(R"(/api/v1/viz/host/([^/]+)/topology)",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 handle_host_topology(req, res, /*as_fragment=*/false);
+             });
+
+    sink.Get(R"(/fragments/viz/host/([^/]+)/topology)",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 handle_host_topology(req, res, /*as_fragment=*/true);
+             });
 }
 
 void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& res,
@@ -284,6 +299,67 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
         const double seconds = std::chrono::duration<double>(elapsed).count();
         metrics_->histogram("yuzu_viz_topology_request_seconds").observe(seconds);
     }
+}
+
+void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Response& res,
+                                     bool as_fragment) {
+    const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+
+    // ── 1. Kill switch (tier-before-permission) ──────────────────────────
+    if (kill_switch_ && kill_switch_->load(std::memory_order_acquire)) {
+        res.status = 503;
+        res.set_content(
+            error_envelope(503, "viz endpoint disabled by operator (yuzu_viz_disabled)"),
+            "application/json");
+        if (audit_fn_)
+            audit_fn_(req, "viz.host_topology", "denied", "HostTopology", agent_id, "kill_switch");
+        return;
+    }
+
+    // ── 2. Store availability ─────────────────────────────────────────────
+    if (!store_) {
+        res.status = 503;
+        res.set_content(error_envelope(503, "fleet topology store not available"),
+                        "application/json");
+        if (audit_fn_)
+            audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "store_null");
+        return;
+    }
+
+    // ── 3. RBAC ──────────────────────────────────────────────────────────
+    // perm_fn_ writes 401/403 body and status itself; bail on false.
+    if (!perm_fn_(req, res, "Response", "Read"))
+        return;
+
+    auto snap = store_->get(/*include_vuln=*/false);
+    for (const auto& m : snap->machines) {
+        if (m.agent_id == agent_id) {
+            HostTopologySnapshot wrapper{snap->generated_at, m.stale, m};
+            nlohmann::json j = wrapper;
+            auto body = j.dump();
+
+            if (as_fragment) {
+                escape_json_for_script(body);
+                std::string fragment;
+                fragment.reserve(body.size() + 64);
+                fragment.append("<script type=\"application/json\" id=\"viz-data\">");
+                fragment.append(body);
+                fragment.append("</script>");
+                res.set_content(std::move(fragment), "text/html; charset=utf-8");
+            } else {
+                res.set_content(std::move(body), "application/json");
+            }
+
+            if (audit_fn_)
+                audit_fn_(req, "viz.host_topology", "success", "HostTopology", agent_id,
+                          as_fragment ? "fragment=1" : "");
+            return;
+        }
+    }
+    res.status = 404;
+    res.set_content(error_envelope(404, "host not found"), "application/json");
+    if (audit_fn_)
+        audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "not_found");
 }
 
 } // namespace yuzu::server

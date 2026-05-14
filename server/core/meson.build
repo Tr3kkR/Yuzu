@@ -116,6 +116,39 @@ yuzu_viz_js_embed = custom_target(
   ],
 )
 
+# PR 9-pre: per-host renderer module + vendored Cytoscape.js 3.33.3 (MIT).
+# Cytoscape ships as ESM minified (cytoscape.esm.min.mjs from the npm
+# tarball) so the importmap entry in viz_host_page_ui.cpp can resolve
+# `import cytoscape from "cytoscape"`. The renderer uses cytoscape's
+# built-in `cose` force-directed layout — no layout extension is vendored
+# (the faster `fcose` is a UMD bundle with an external cose-base
+# dependency that doesn't resolve cleanly against an ESM importmap).
+yuzu_viz_host_js_embed = custom_target(
+  'yuzu_viz_host_js_bundle',
+  input: 'static/yuzu-viz-host.js',
+  output: 'yuzu_viz_host_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuVizHostJs',
+  ],
+)
+
+cytoscape_js_embed = custom_target(
+  'cytoscape_js_bundle',
+  input: 'static/cytoscape.min.js',
+  output: 'cytoscape_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'CytoscapeJs',
+  ],
+)
+
 # Build-time embed of the Yuzu Design System CSS bundle. The source
 # kYuzuCss exceeded MSVC's 16,380-byte raw-string-literal limit (C2026)
 # after the design-token expansion. Chunking into ~14 KB
@@ -186,7 +219,9 @@ content_embed = custom_target(
 
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
-  [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed, yuzu_css_embed, inter_embed, content_embed,
+  [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
+   yuzu_viz_host_js_embed, cytoscape_js_embed,
+   yuzu_css_embed, inter_embed, content_embed,
   files(
     'src/server.cpp',
     'src/agent_registry.cpp',
@@ -249,6 +284,7 @@ yuzu_server_core_lib = static_library(
     'src/discovery_routes.cpp',
     'src/viz_routes.cpp',
     'src/viz_page_ui.cpp',
+    'src/viz_host_page_ui.cpp',
     'src/compliance_ui.cpp',
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',

@@ -83,6 +83,11 @@ private:
     /// the response body is the raw JSON or a script-wrapped HTMX fragment.
     void handle_topology(const httplib::Request& req, httplib::Response& res, bool as_fragment);
 
+    /// Per-host drill-down handler — slices one MachineNode out of the fleet
+    /// snapshot. `as_fragment` controls JSON vs `<script>`-wrapped fragment.
+    void handle_host_topology(const httplib::Request& req, httplib::Response& res,
+                              bool as_fragment);
+
     // auth_fn is accepted in the public register_routes signature for parity
     // with sibling routes (see offload_routes.hpp:39) but discarded -- the
     // perm_fn lambda already wraps require_auth. No member here.

@@ -455,3 +455,160 @@ TEST_CASE("REST viz: include_vuln=1 returns include_vuln field set true", "[viz]
     REQUIRE(j.contains("include_vuln"));
     CHECK(j["include_vuln"].get<bool>() == true);
 }
+
+// =============================================================================
+// Per-host drill-down (PR 9-pre): /api/v1/viz/host/<agent_id>/topology
+// =============================================================================
+//
+// Tracer bullet: prove the route is registered with a path parameter, the
+// handler slices the matching MachineNode out of the fleet snapshot, and the
+// response carries the host_topology.v1 envelope. Subsequent tests exercise
+// 404 / 503 / RBAC / stale / fragment / page-shell paths one at a time.
+
+TEST_CASE("REST viz: GET /api/v1/viz/host/<id>/topology returns matching machine", "[viz][host]") {
+    std::vector<RawAgentSnapshot> seed{mk_agent("a1", "host-1"), mk_agent("a2", "host-2")};
+    VizHarness h(std::move(seed));
+
+    auto res = h.sink.Get("/api/v1/viz/host/a1/topology");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Content-Type").find("application/json") != std::string::npos);
+
+    auto j = json::parse(res->body);
+    REQUIRE(j.contains("schema"));
+    CHECK(j["schema"].get<std::string>() == "host_topology.v1");
+    REQUIRE(j.contains("machine"));
+    CHECK(j["machine"]["agent_id"].get<std::string>() == "a1");
+    CHECK(j["machine"]["hostname"].get<std::string>() == "host-1");
+}
+
+// Tier-before-permission invariant (fleet-viz-invariants.md §). The kill
+// switch is a cheap configuration-pinned guard that runs BEFORE the
+// identity-bound RBAC check, so a disabled tier returns 503 even when the
+// caller would also have failed RBAC.
+TEST_CASE("REST viz: host endpoint kill switch returns 503 before RBAC",
+          "[viz][host][killswitch][rbac]") {
+    VizHarness h({mk_agent("a1", "host-1")});
+    h.kill_switch.store(true);
+    h.perm_grant = false; // would also be 403, but tier wins
+
+    auto res = h.sink.Get("/api/v1/viz/host/a1/topology");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "viz.host_topology");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_type == "HostTopology");
+    CHECK(h.audit_log[0].target_id == "a1");
+    CHECK(h.audit_log[0].detail == "kill_switch");
+}
+
+TEST_CASE("REST viz: host endpoint returns 403 when RBAC denies (no audit)", "[viz][host][rbac]") {
+    VizHarness h({mk_agent("a1", "host-1")});
+    h.perm_grant = false;
+
+    auto res = h.sink.Get("/api/v1/viz/host/a1/topology");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // perm_fn short-circuits before the audit envelope — matches the fleet
+    // endpoint's contract.
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST viz: host endpoint emits success audit row with agent_id", "[viz][host][audit]") {
+    VizHarness h({mk_agent("a1", "host-1")});
+    auto res = h.sink.Get("/api/v1/viz/host/a1/topology");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "viz.host_topology");
+    CHECK(h.audit_log[0].result == "success");
+    CHECK(h.audit_log[0].target_type == "HostTopology");
+    CHECK(h.audit_log[0].target_id == "a1");
+}
+
+// sec-M2 mirror of the fleet route — agent-controlled hostname must not break
+// out of the <script type="application/json"> wrapper.
+TEST_CASE("REST viz: host fragment escapes </script> in agent string fields",
+          "[viz][host][fragment][security]") {
+    VizHarness h({mk_agent("evil-id", "</script><script>alert(1)</script>")});
+    auto res = h.sink.Get("/fragments/viz/host/evil-id/topology");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    const std::string& body = res->body;
+    auto open_pos = body.find("<script type=\"application/json\" id=\"viz-data\">");
+    REQUIRE(open_pos != std::string::npos);
+    auto close_pos = body.rfind("</script>");
+    REQUIRE(close_pos != std::string::npos);
+    // Exactly one closing tag — the one that closes the wrapper. Any
+    // unescaped </script> in the hostname would land an earlier closing
+    // position, breaking this equality.
+    auto next_close = body.find("</script>", open_pos);
+    CHECK(next_close == close_pos);
+}
+
+TEST_CASE("REST viz: host fragment wraps the same JSON in <script> tag", "[viz][host][fragment]") {
+    VizHarness h({mk_agent("a1", "host-1")});
+    auto res = h.sink.Get("/fragments/viz/host/a1/topology");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->get_header_value("Content-Type").find("text/html") != std::string::npos);
+
+    const std::string& body = res->body;
+    auto open_pos = body.find("<script type=\"application/json\" id=\"viz-data\">");
+    REQUIRE(open_pos != std::string::npos);
+    auto close_pos = body.rfind("</script>");
+    REQUIRE(close_pos != std::string::npos);
+
+    auto open_tag = std::string("<script type=\"application/json\" id=\"viz-data\">");
+    auto inner = body.substr(open_pos + open_tag.size(), close_pos - (open_pos + open_tag.size()));
+    auto j = json::parse(inner);
+    CHECK(j["schema"].get<std::string>() == "host_topology.v1");
+    CHECK(j["machine"]["agent_id"].get<std::string>() == "a1");
+}
+
+TEST_CASE("REST viz: host endpoint returns 503 when store is null", "[viz][host]") {
+    VizHarness h({}, /*with_store=*/false);
+    auto res = h.sink.Get("/api/v1/viz/host/a1/topology");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+
+    auto j = json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "failure");
+    CHECK(h.audit_log[0].detail == "store_null");
+}
+
+TEST_CASE("REST viz: host endpoint propagates machine.stale into envelope", "[viz][host]") {
+    RawAgentSnapshot stale_agent = mk_agent("a1", "host-1");
+    stale_agent.stale = true;
+    VizHarness h({stale_agent});
+
+    auto res = h.sink.Get("/api/v1/viz/host/a1/topology");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = json::parse(res->body);
+    REQUIRE(j.contains("stale"));
+    CHECK(j["stale"].get<bool>() == true);
+}
+
+TEST_CASE("REST viz: host endpoint returns 404 for unknown agent + audit row", "[viz][host]") {
+    VizHarness h({mk_agent("a1", "host-1")});
+    auto res = h.sink.Get("/api/v1/viz/host/bogus-id/topology");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+
+    auto j = json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 404);
+
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "viz.host_topology");
+    CHECK(h.audit_log[0].result == "failure");
+    CHECK(h.audit_log[0].target_id == "bogus-id");
+    CHECK(h.audit_log[0].detail == "not_found");
+}

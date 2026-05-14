@@ -62,6 +62,7 @@ extern const std::string kYuzuChartsJs;
 // Page HTML constants (separate TUs at namespace scope -- not in
 // yuzu::server like the JS bundles).
 extern const char* const kVizFleetPageHtml;
+extern const char* const kVizHostPageHtml;
 
 using Catch::Matchers::ContainsSubstring;
 
@@ -405,6 +406,39 @@ TEST_CASE("static_js_bundle: kYuzuVizJs stacks machines into three architecture 
     REQUIRE(pos_default != std::string::npos);
     CHECK(pos_db < pos_web);
     CHECK(pos_web < pos_default);
+}
+
+TEST_CASE("static_js_bundle: WEB_PORTS contains only classic frontend-tier ports",
+          "[static-js][viz][tier-classify]") {
+    // Port-based tier classification is a starting heuristic, not the final
+    // answer (see follow-up issue on function-aware classification). The
+    // contract today: WEB_PORTS is the set of listener ports that mean
+    // "this machine is an HTTP-serving frontend / reverse proxy / load
+    // balancer" — the **first tier** in a classic three-tier deployment
+    // (HSBC-style: API gateway / reverse proxy → app servers → database).
+    //
+    // Dev-server defaults (express on :3000, angular on :4200, vite on
+    // :5173, django dev on :8000) are NOT frontend tier — they're
+    // application servers in disguise. A nodejs API listening on :3000
+    // belongs on the app plane; the reverse proxy in front of it (on :80)
+    // is what owns the frontend plane.
+    //
+    // Lock the inclusion + exclusion lists so a future "let's just add a
+    // port" change can't silently re-misclassify app-tier dev servers.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("const WEB_PORTS = new Set(["));
+    // Included — classic web tier
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("80, 443, 8080, 8443"));
+    // Excluded — common dev-server ports that are architecturally app-tier
+    auto& js = yuzu::server::kYuzuVizJs;
+    auto web_start = js.find("const WEB_PORTS = new Set([");
+    REQUIRE(web_start != std::string::npos);
+    auto web_end = js.find("])", web_start);
+    REQUIRE(web_end != std::string::npos);
+    auto web_block = js.substr(web_start, web_end - web_start);
+    CHECK(web_block.find("3000") == std::string::npos);
+    CHECK(web_block.find("4200") == std::string::npos);
+    CHECK(web_block.find("5173") == std::string::npos);
+    CHECK(web_block.find("8000") == std::string::npos);
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs drops the origin AxesHelper", "[static-js][viz]") {
@@ -771,14 +805,22 @@ TEST_CASE("static_js_bundle: kYuzuVizJs hardens pickCategoryColor against protot
                ContainsSubstring("String(category).trim().toLowerCase()"));
 }
 
-TEST_CASE("static_js_bundle: kYuzuVizJs raycaster ordering occurs exactly once",
+TEST_CASE("static_js_bundle: kYuzuVizJs raycaster ordering occurs exactly twice",
           "[static-js][viz][pr7][hardening]") {
-    // gov R7 qe-S1: the position-ordering assertion (procHits before
-    // cubeHits) is correct but only checks FIRST occurrences. A future
-    // refactor adding a SECOND `intersectObjects(processMeshes ...)`
-    // call AFTER the cube call (e.g. a debug fallback) would still
-    // satisfy the position invariant. Pin the count to exactly one for
-    // each so any duplicate raycast call regresses the test.
+    // gov R7 qe-S1 (PR 7) pinned this to == 1: the position-ordering
+    // assertion (procHits before cubeHits) is correct but only checks
+    // FIRST occurrences, so a future refactor adding a SECOND
+    // `intersectObjects(processMeshes ...)` call AFTER the cube call
+    // (e.g. a debug fallback) would still satisfy the position
+    // invariant. Pinned to a hard count to catch accidental duplicate
+    // raycasts.
+    //
+    // Slice 3 (PR 9-pre) deliberately adds a SECOND raycast site —
+    // the dblclick handler must run its own hit-test to know whether
+    // the user double-clicked a cube vs a higher-priority hover
+    // target (socket / process). The invariant relaxes from "== 1"
+    // to "== 2": exactly the mousemove site + exactly the dblclick
+    // site, no more. Any third call still regresses the test.
     auto count_substr = [](const std::string& hay, const std::string& needle) {
         size_t n = 0;
         size_t pos = 0;
@@ -788,8 +830,8 @@ TEST_CASE("static_js_bundle: kYuzuVizJs raycaster ordering occurs exactly once",
         }
         return n;
     };
-    CHECK(count_substr(yuzu::server::kYuzuVizJs, "intersectObjects(processMeshes, false)") == 1);
-    CHECK(count_substr(yuzu::server::kYuzuVizJs, "intersectObjects(cubeMeshes, false)") == 1);
+    CHECK(count_substr(yuzu::server::kYuzuVizJs, "intersectObjects(processMeshes, false)") == 2);
+    CHECK(count_substr(yuzu::server::kYuzuVizJs, "intersectObjects(cubeMeshes, false)") == 2);
 }
 
 TEST_CASE("static_js_bundle: kYuzuVizJs processGroup is parented to cube (not fleetGroup)",
@@ -1056,4 +1098,217 @@ TEST_CASE("static_js_bundle: kYuzuChartsJs renders an empty-state message on no 
     // can't silently remove it.
     CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("No data to plot."));
     CHECK_THAT(yuzu::server::kYuzuChartsJs, ContainsSubstring("isEmptyData"));
+}
+
+// ── Per-host page shell (PR 9-pre, /viz/host/<agent_id>) ────────────────────
+
+TEST_CASE("static_js_bundle: kVizHostPageHtml renders IPC graph mount point", "[viz-host][page]") {
+    REQUIRE(kVizHostPageHtml != nullptr);
+    std::string html(kVizHostPageHtml);
+    CHECK_THAT(html, ContainsSubstring("id=\"ipc-graph\""));
+}
+
+TEST_CASE("static_js_bundle: kVizHostPageHtml renders TAR tree mount point", "[viz-host][page]") {
+    std::string html(kVizHostPageHtml);
+    CHECK_THAT(html, ContainsSubstring("id=\"tar-tree\""));
+}
+
+TEST_CASE("static_js_bundle: kVizHostPageHtml binds via data-agent-id attribute",
+          "[viz-host][page]") {
+    // The renderer reads agent_id from data-agent-id on the mount root.
+    // The attribute is templated by the page-route handler at request time;
+    // the static HTML uses a sentinel placeholder.
+    std::string html(kVizHostPageHtml);
+    CHECK_THAT(html, ContainsSubstring("data-agent-id"));
+}
+
+TEST_CASE("static_js_bundle: kVizHostPageHtml imports cytoscape via importmap",
+          "[viz-host][page]") {
+    std::string html(kVizHostPageHtml);
+    // Vendored, not CDN — page must not reach off-box for the graph lib.
+    CHECK_THAT(html, ContainsSubstring("\"cytoscape\""));
+    CHECK_THAT(html, ContainsSubstring("/static/cytoscape"));
+}
+
+// ── Per-host renderer bundle (yuzu-viz-host.js) ─────────────────────────────
+
+namespace yuzu::server {
+extern const std::string kYuzuVizHostJs;
+extern const std::string kCytoscapeJs;
+} // namespace yuzu::server
+
+TEST_CASE("static_js_bundle: kYuzuVizHostJs imports cytoscape", "[static-js][viz-host]") {
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("cytoscape"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizHostJs fetches per-host topology endpoint",
+          "[static-js][viz-host]") {
+    // Renderer must call fetch() with /api/v1/viz/host/<agent_id>/topology.
+    // The "fetch(" call site + URL fragment together is much harder to
+    // satisfy with a comment than either alone.
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("fetch("));
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("/api/v1/viz/host/"));
+    // Schema gate (UP-17 mirror — render must reject non-host_topology.v1
+    // responses, just like the fleet renderer rejects non-fleet_topology.v1).
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("host_topology.v1"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizHostJs builds bipartite process + socket nodes",
+          "[static-js][viz-host]") {
+    // Schema decision: nodes are typed by `kind` so the renderer can apply
+    // distinct styles per node type. Process nodes from machine.processes,
+    // socket nodes from machine.listeners + the local-loopback halves of
+    // machine.connections.
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("\"process\""));
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("\"socket\""));
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("\"owns\""));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizHostJs uses the built-in cose layout",
+          "[static-js][viz-host]") {
+    // cose ("Compound Spring Embedder") is force-directed and ships in
+    // cytoscape core — no extension, no cytoscape.use(), no dependency
+    // tree. fcose (a faster reimplementation) was dropped because it's a
+    // UMD bundle with an external cose-base dependency that doesn't
+    // resolve cleanly alongside an ESM importmap.
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("name: \"cose\""));
+    // Guard the actual regression — not the word "fcose" (which appears in
+    // an explanatory comment) but its *use*: a `name: "fcose"` layout or a
+    // cytoscape.use() extension-registration call. cose is built into
+    // cytoscape core; needing neither is the whole point of the switch.
+    CHECK(yuzu::server::kYuzuVizHostJs.find("name: \"fcose\"") == std::string::npos);
+    CHECK(yuzu::server::kYuzuVizHostJs.find("cytoscape.use(") == std::string::npos);
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizHostJs wires a refresh button", "[static-js][viz-host]") {
+    // Slice 2: manual refresh fetches the topology again. Locked here to
+    // prevent a future renderer rewrite from silently dropping the button.
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("refresh"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizHostJs surfaces stale banner on stale topology",
+          "[static-js][viz-host]") {
+    // UX invariant: a stale snapshot must visibly inform the operator —
+    // never render stale data silently as fresh.
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("stale"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizHostJs handles 401, 403, 503 explicitly",
+          "[static-js][viz-host]") {
+    // UP-17 mirror: do not collapse auth/disable failures into a generic
+    // error. Each must produce its own user-visible message.
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("401"));
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("403"));
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("503"));
+}
+
+// ── 3D viz dblclick → drill-down (Slice 3) ──────────────────────────────────
+
+TEST_CASE("static_js_bundle: kYuzuVizJs listens for dblclick on the canvas",
+          "[static-js][viz][dblclick]") {
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("dblclick"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs dblclick opens /viz/host/<id> in a new tab",
+          "[static-js][viz][dblclick]") {
+    // window.open is the bridge; noopener+noreferrer is mandatory for any
+    // operator-triggered cross-window navigation (gov sec — child window
+    // must not get window.opener back to a privileged context).
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("window.open"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("/viz/host/"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("noopener"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("noreferrer"));
+    // The path parameter must be URI-encoded — agent_id may contain
+    // characters that would otherwise re-route. encodeURIComponent is
+    // the smallest sufficient encoder.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("encodeURIComponent"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs dblclick respects raycast hit-order",
+          "[static-js][viz][dblclick]") {
+    // Slice 3 invariant: dblclick must not steal hits from sockets,
+    // processes, or talking-sockets — they have higher priority on the
+    // hover surface and reserving them for future per-port/per-process
+    // drill-down keeps the cube the single "open new tab" target. The
+    // implementation reuses the existing _ray Raycaster rather than
+    // constructing a new one (every Raycaster instantiation allocates
+    // a couple of Vec3s).
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("socketMeshes"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("processMeshes"));
+    // Bundle contains exactly one "new THREE.Raycaster()" instantiation
+    // — the existing _ray used by mousemove. dblclick must not add a
+    // second one.
+    const auto& js = yuzu::server::kYuzuVizJs;
+    auto count = std::size_t{0};
+    for (auto pos = js.find("new THREE.Raycaster"); pos != std::string::npos;
+         pos = js.find("new THREE.Raycaster", pos + 1)) {
+        ++count;
+    }
+    CHECK(count == 1u);
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs heartbeat flash has 100/200/350 ms timing",
+          "[static-js][viz][dblclick]") {
+    // Locked by spec: first (lower) peak at 100 ms, second (higher) peak
+    // at 200 ms, settles by 350 ms. All three constants must appear in
+    // the same renderer source.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("100"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("200"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("350"));
+    // Heartbeat metaphor named explicitly so a future refactor doesn't
+    // silently drop the visual feedback.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("heartbeat"));
+}
+
+TEST_CASE("static_js_bundle: kYuzuVizJs wires Cmd/Ctrl-click accelerator",
+          "[static-js][viz][dblclick]") {
+    // Browser parity: Cmd-click (macOS) / Ctrl-click (Linux/Windows) on a
+    // hyperlink opens it in a new tab. The cube should honour the same
+    // convention so power users don't have to double-click for the same
+    // result.
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("metaKey"));
+    CHECK_THAT(yuzu::server::kYuzuVizJs, ContainsSubstring("ctrlKey"));
+}
+
+// ── Slice 4: cross-pane sync + resizable splitter ───────────────────────────
+
+TEST_CASE("static_js_bundle: kYuzuVizHostJs dispatches process-select CustomEvent",
+          "[static-js][viz-host][sync]") {
+    // Slice 4 invariant: clicking a process node in the IPC graph dispatches
+    // a 'yuzu:select-process' CustomEvent carrying the pid; the page-shell
+    // listens for it and scrolls/highlights the matching <details data-pid>
+    // in the TAR tree below. One-way (IPC graph → TAR tree) for v1.
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("yuzu:select-process"));
+    CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("CustomEvent"));
+}
+
+TEST_CASE("static_js_bundle: kVizHostPageHtml listens for process-select CustomEvent",
+          "[viz-host][page][sync]") {
+    // The receiver side lives inline in the page-shell HTML so the TAR
+    // fragment's <details data-pid> can be reached after HTMX swap.
+    std::string html(kVizHostPageHtml);
+    CHECK_THAT(html, ContainsSubstring("yuzu:select-process"));
+    CHECK_THAT(html, ContainsSubstring("scrollIntoView"));
+}
+
+TEST_CASE("static_js_bundle: kVizHostPageHtml has a resizable splitter persisted in localStorage",
+          "[viz-host][page][splitter]") {
+    // The splitter between #ipc-graph and #tar-tree is draggable; the
+    // ratio persists across reloads via localStorage so an operator's
+    // preferred layout sticks. Default 60/40 (IPC top, TAR bottom) per
+    // the grilling decisions.
+    std::string html(kVizHostPageHtml);
+    CHECK_THAT(html, ContainsSubstring("yuzuVizHostSplitRatio"));
+    CHECK_THAT(html, ContainsSubstring("localStorage"));
+    CHECK_THAT(html, ContainsSubstring("splitter"));
+}
+
+TEST_CASE("static_js_bundle: kVizHostPageHtml does not reference any CDN",
+          "[viz-host][page][security]") {
+    // Sec invariant: no off-box dependency loading. cytoscape must be
+    // vendored and served from /static (mirrors three.module.min.js).
+    std::string html(kVizHostPageHtml);
+    CHECK(html.find("cdn.") == std::string::npos);
+    CHECK(html.find("unpkg.") == std::string::npos);
+    CHECK(html.find("jsdelivr.") == std::string::npos);
 }

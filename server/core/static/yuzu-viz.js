@@ -191,8 +191,16 @@ const DB_PORTS = new Set([
   8086,  // influxdb
   11211  // memcached
 ]);
+// "Frontend tier" in a classic three-tier deployment means an HTTP-
+// serving reverse proxy / load balancer / API gateway — the box an
+// external client first reaches. Dev-server defaults (express :3000,
+// angular :4200, vite :5173, django :8000) listen on HTTP but are
+// architecturally application servers, not frontend infrastructure;
+// putting them on the frontend plane misrepresents the topology a
+// reviewer expects. Tracked as a deeper classification rework (see
+// follow-up GitHub issue on function-aware tier classification).
 const WEB_PORTS = new Set([
-  80, 443, 8080, 8443, 3000, 4200, 5173, 8000, 8088
+  80, 443, 8080, 8443, 8088
 ]);
 
 // Classify a machine into 'frontend' | 'app' | 'database'. Priority is
@@ -1578,6 +1586,81 @@ function mount() {
   }
   canvas.addEventListener('mousemove', onMouseMove);
   canvas.addEventListener('mouseleave', hideTooltip);
+
+  // PR 9-pre / Slice 3 — double-click a cube to open the per-host
+  // drill-down page in a new tab. Reuses _ray (no second Raycaster)
+  // and respects the existing hover hit-order: only acts when the
+  // outermost cube wins the hit-test (after sockets / processes /
+  // edges have first refusal). dblclick on a socket or process is
+  // reserved for future drill-down (do nothing for now).
+  function onCubeDblClick(evt) {
+    if (cubeMeshes.length === 0) return;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    _ndc.x = ((evt.clientX - rect.left) / rect.width) * 2 - 1;
+    _ndc.y = -((evt.clientY - rect.top) / rect.height) * 2 + 1;
+    _ray.setFromCamera(_ndc, camera);
+    // Sockets / processes / edges have higher priority — if a hover-
+    // priority object wins the hit, do nothing (dblclick on a port or
+    // process dot is reserved).
+    if (socketMeshes.length > 0 &&
+        _ray.intersectObjects(socketMeshes, false).length > 0) return;
+    if (talkingSocketMeshes.length > 0 &&
+        _ray.intersectObjects(talkingSocketMeshes, false).length > 0) return;
+    if (processMeshes.length > 0 &&
+        _ray.intersectObjects(processMeshes, false).length > 0) return;
+    const hits = _ray.intersectObjects(cubeMeshes, false);
+    if (hits.length === 0 || !hits[0].object.userData.yuzuMachine) return;
+    const machine = hits[0].object.userData.yuzuMachine;
+    const cube = hits[0].object;
+    heartbeatFlash(cube);
+    const url = `/viz/host/${encodeURIComponent(machine.agent_id)}`;
+    window.open(url, '_blank', 'noopener,noreferrer');
+  }
+  canvas.addEventListener('dblclick', onCubeDblClick);
+  // Cmd/Ctrl + single-click is a power-user accelerator that mirrors
+  // browser middle-click / Cmd-click semantics: opens the drill-down
+  // in a new tab without the flash animation.
+  canvas.addEventListener('click', (evt) => {
+    if (!(evt.metaKey || evt.ctrlKey)) return;
+    onCubeDblClick(evt);
+  });
+
+  // Heartbeat flash: lerp the cube material's emissive intensity in
+  // a double-peak envelope. First (lower) peak at t=100 ms, second
+  // (higher) peak at t=200 ms, settles back to baseline by t=350 ms.
+  // Single rAF loop driven by elapsed-time interpolation — not
+  // nested setTimeout — so the animation rides on the renderer's
+  // own clock.
+  function heartbeatFlash(cube) {
+    const mat = cube.material;
+    if (!mat || !mat.emissive) return;
+    const baseR = mat.emissive.r;
+    const baseG = mat.emissive.g;
+    const baseB = mat.emissive.b;
+    const baseI = (typeof mat.emissiveIntensity === 'number') ? mat.emissiveIntensity : 1.0;
+    const start = performance.now();
+    function envelope(t) {
+      // Two Gaussian-ish bumps. Heights tuned so peak2 > peak1.
+      const bump = (mu, height, sigma) => height *
+        Math.exp(-((t - mu) * (t - mu)) / (2 * sigma * sigma));
+      return bump(100, 0.6, 30) + bump(200, 1.0, 35);
+    }
+    function step(now) {
+      const t = now - start;
+      if (t > 350 || !Number.isFinite(t)) {
+        mat.emissive.setRGB(baseR, baseG, baseB);
+        mat.emissiveIntensity = baseI;
+        return;
+      }
+      const k = envelope(t);
+      // Push the cube emissive toward white by k.
+      mat.emissive.setRGB(baseR + k, baseG + k, baseB + k);
+      mat.emissiveIntensity = baseI + k;
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  }
 
   // ── PR 6: data fetch ──────────────────────────────────────────────────
   // Asynchronous because the cache-cold path on the server can take up to

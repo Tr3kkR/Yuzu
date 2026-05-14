@@ -158,6 +158,7 @@ extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kTarPageHtml;
 extern const char* const kVizFleetPageHtml; // server/core/src/viz_page_ui.cpp (PR 5)
+extern const char* const kVizHostPageHtml;  // server/core/src/viz_host_page_ui.cpp (PR 9-pre)
 extern const char* const kInstructionEditorHtml;
 extern const char* const kInstructionEditorDeniedHtml;
 
@@ -174,6 +175,8 @@ extern const std::string
     kThreeOrbitControlsJs; // server/core/vendor/three-orbit-controls.js (MIT, three.js r168)
 extern const std::string
     kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
+extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
+extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
 extern const std::string_view
     kInterVariableWoff2; // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
 extern const std::vector<std::string>
@@ -2869,13 +2872,43 @@ private:
         // PR 5 of feat/viz-engine: yuzu-viz.js renderer module. Loaded as
         // type="module" so it can resolve the `import 'three'` bare
         // specifier through the importmap declared in viz_page_ui.cpp.
-        // Same Cache-Control as the other vendored bundles -- the body is
-        // content-addressed by server binary version.
+        //
+        // Cache-Control: no-cache, no-store, must-revalidate -- matches the
+        // /viz/fleet page shell. The renderer bundles change on every
+        // feat/viz-engine PR; a `max-age` here means operators serve a
+        // stale renderer (wrong tier classification, missing features,
+        // outdated layout code) for up to the max-age window after a
+        // server upgrade, with no signal that anything is wrong. The page
+        // shell already revalidates; the bundle it pulls must too, or the
+        // skew window just moves from the HTML to the JS. ~88 KB of
+        // revalidated body per page load is cheap next to a silently-stale
+        // renderer. Vendored libs below (cytoscape, three) keep max-age --
+        // they're content-stable and only change on a deliberate refresh.
         web_server_->Get(
             "/static/yuzu-viz.js", [](const httplib::Request&, httplib::Response& res) {
-                res.set_header("Cache-Control", "public, max-age=86400");
+                res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
                 res.set_content(yuzu::server::kYuzuVizJs, "application/javascript; charset=utf-8");
             });
+
+        // PR 9-pre: per-host renderer + vendored Cytoscape.js 3.33.3 (MIT).
+        // yuzu-viz-host.js is the ES module entry; cytoscape.min.js is the
+        // ESM minified Cytoscape bundle resolved via the importmap in
+        // viz_host_page_ui.cpp. The renderer uses cytoscape's built-in
+        // `cose` layout — no layout-extension asset is served.
+        //
+        // yuzu-viz-host.js gets the same no-cache treatment as yuzu-viz.js
+        // (it's our renderer code, changes every viz PR); cytoscape.min.js
+        // keeps max-age (vendored, content-stable).
+        web_server_->Get("/static/yuzu-viz-host.js", [](const httplib::Request&,
+                                                        httplib::Response& res) {
+            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+            res.set_content(yuzu::server::kYuzuVizHostJs, "application/javascript; charset=utf-8");
+        });
+        web_server_->Get("/static/cytoscape.min.js", [](const httplib::Request&,
+                                                        httplib::Response& res) {
+            res.set_header("Cache-Control", "public, max-age=86400");
+            res.set_content(yuzu::server::kCytoscapeJs, "application/javascript; charset=utf-8");
+        });
         // Inter variable webfont (SIL OFL) — the Yuzu design system's
         // default family. Single woff2 covers all weights via font-
         // variation-settings on the @font-face declaration in
@@ -3760,6 +3793,43 @@ private:
             res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
             res.set_content(kVizFleetPageHtml, "text/html; charset=utf-8");
         });
+
+        // PR 9-pre: per-host drill-down page. Opened by the 3D viz's
+        // dblclick handler in a new tab. Must be registered AFTER
+        // /viz/fleet (literal match wins; the regex below would otherwise
+        // swallow `fleet` as a parameter — gov R4 arch-S1 ordering).
+        // Agent_id is URL-decoded by httplib (req.matches[1]); we replace
+        // `{{AGENT_ID}}` in the static HTML with the sanitised id so the
+        // renderer can read it from data-agent-id without parsing the URL.
+        // Allow-list: a-z A-Z 0-9 dash underscore dot — anything else is
+        // 400 (the agent_id schema is hexadecimal-uuid-ish; nothing else
+        // should reach this route).
+        web_server_->Get(
+            R"(/viz/host/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) {
+                    res.set_redirect("/login");
+                    return;
+                }
+                const std::string raw_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+                for (char c : raw_id) {
+                    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                    (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+                    if (!ok) {
+                        res.status = 400;
+                        res.set_content("invalid agent_id", "text/plain");
+                        return;
+                    }
+                }
+                std::string html(kVizHostPageHtml);
+                const std::string token = "{{AGENT_ID}}";
+                for (auto pos = html.find(token); pos != std::string::npos;
+                     pos = html.find(token, pos + raw_id.size())) {
+                    html.replace(pos, token.size(), raw_id);
+                }
+                res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+                res.set_content(std::move(html), "text/html; charset=utf-8");
+            });
 
         // -- Instruction management page --------------------------------------
         web_server_->Get("/instructions",
