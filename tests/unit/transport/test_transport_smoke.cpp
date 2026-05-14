@@ -143,13 +143,30 @@ TEST_CASE("make_channel rejects BackoffPolicy invariant violation", "[transport]
     REQUIRE(r.status.detail.find("initial_delay") != std::string::npos);
 }
 
-TEST_CASE("make_channel(Msquic) returns nullptr in PR 1a (impl is PR 3)", "[transport][factory]") {
+TEST_CASE("make_channel(Msquic) returns a usable Channel when linked", "[transport][factory]") {
+#ifdef YUZU_TRANSPORT_HAVE_MSQUIC
+    // msquic backend compiled in (-Dtransport=msquic|both). make_channel
+    // returns a real Channel. #376 PR 3 increment 0 is the skeleton:
+    // construction + lifecycle are live; the RPC paths return
+    // StatusCode::Unimplemented until increment 2.
     Endpoint target{"127.0.0.1", 0};
     Credentials creds{};
     creds.verify_peer = false;
 
     auto ch = make_channel(Backend::Msquic, target, creds);
+    REQUIRE(ch != nullptr);
+
+    // wait_for_connected must not hang and must report not-connected;
+    // close() is documented idempotent.
+    REQUIRE_FALSE(ch->wait_for_connected(std::chrono::milliseconds(200)));
+    ch->close();
+    ch->close();
+#else
+    // msquic backend not compiled into this build (-Dtransport=grpc):
+    // make_channel signals "backend not linked" by returning nullptr.
+    auto ch = make_channel(Backend::Msquic, Endpoint{"127.0.0.1", 0}, Credentials{});
     REQUIRE(ch == nullptr);
+#endif
 }
 
 TEST_CASE("ServerListener registers handlers and reports is_serving", "[transport][lifecycle]") {

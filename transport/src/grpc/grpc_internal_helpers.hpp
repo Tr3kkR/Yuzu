@@ -9,42 +9,24 @@
 #include <grpcpp/support/byte_buffer.h>
 #include <grpcpp/support/slice.h>
 
-#include <regex>
 #include <string>
 #include <string_view>
 #include <vector>
 
-#include "yuzu/transport/detail/sanitise.hpp"  // sanitise_status_detail
+#include "yuzu/transport/detail/method_name.hpp"  // method_name_well_formed
+#include "yuzu/transport/detail/sanitise.hpp"     // sanitise_status_detail
 #include "yuzu/transport/transport.hpp"
 
 namespace yuzu::transport::grpc_backend {
 
-// Re-export the cross-backend Status::detail sanitiser into the gRPC
-// backend's namespace so existing call sites (`sanitise_status_detail(s)`)
-// continue to resolve. The implementation lives in
-// `transport/include/yuzu/transport/detail/sanitise.hpp` so the future
-// msquic backend uses byte-identical scrub semantics.
+// Re-export the cross-backend Status::detail sanitiser and method-name
+// validator into the gRPC backend's namespace so existing call sites
+// (`sanitise_status_detail(s)`, `method_name_well_formed(m)`) continue to
+// resolve. The implementations live under
+// `transport/include/yuzu/transport/detail/` so the msquic backend uses
+// byte-identical semantics.
 using ::yuzu::transport::sanitise_status_detail;
-
-// Method-name validator matching the proto contract — see
-// proto/yuzu/transport/framing/v1/transport.proto, HandshakeHello.method.
-// Anchored so partial matches are rejected. Uses const char* pointer-pair
-// regex_match for MSVC <regex> portability across the supported matrix.
-//
-// An optional leading `/` is tolerated because gRPC's HTTP/2 `:path`
-// header carries the slash for spec-conformant clients (the Erlang
-// gateway via grpcbox, codegen-built gRPC stubs, curl-based testers),
-// and that wire form surfaces through `gctx.method()` on the server
-// dispatcher. The yuzu Channel historically passes the no-slash form;
-// both spellings now validate equally and the listener dispatch strips
-// the optional `/` before handler lookup (see `grpc_listener.cpp`
-// `handle_request_arrived` / `dispatch_unary` / `dispatch_bidi`).
-inline bool method_name_well_formed(std::string_view method) noexcept {
-    if (method.empty() || method.size() > kMaxMethodSize) return false;
-    static const std::regex re{
-        R"(^/?[A-Za-z][A-Za-z0-9_.]*\/[A-Za-z][A-Za-z0-9_]*$)"};
-    return std::regex_match(method.data(), method.data() + method.size(), re);
-}
+using ::yuzu::transport::detail::method_name_well_formed;
 
 // Convert std::string bytes to grpc::ByteBuffer (single slice).
 inline ::grpc::ByteBuffer string_to_byte_buffer(const std::string& bytes) {

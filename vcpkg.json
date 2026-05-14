@@ -23,6 +23,10 @@
     "sqlite3",
     "openssl",
     {
+      "name": "msquic",
+      "features": ["0-rtt"]
+    },
+    {
       "name": "catch2",
       "platform": "x64 | arm64"
     }

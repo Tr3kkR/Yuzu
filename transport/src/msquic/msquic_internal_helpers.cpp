@@ -1,0 +1,150 @@
+// SPDX-License-Identifier: Apache-2.0
+// #376 PR 3, increment 2 — msquic backend internal helpers.
+
+#include "msquic_internal_helpers.hpp"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <string_view>
+
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#endif
+
+namespace yuzu::transport::msquic_backend {
+
+// ── MsQuicApi singleton ──────────────────────────────────────────────────────
+
+MsQuicApi::MsQuicApi() {
+    QUIC_STATUS st = MsQuicOpen2(&api_);
+    if (QUIC_FAILED(st)) {
+        init_error_ = "MsQuicOpen2 failed: " + quic_status_hex(st);
+        api_ = nullptr;
+        return;
+    }
+
+    // "yuzu" registration, low-latency execution profile (the agent and
+    // server are latency-sensitive control planes, not bulk-throughput).
+    const QUIC_REGISTRATION_CONFIG reg_config = {
+        "yuzu", QUIC_EXECUTION_PROFILE_LOW_LATENCY};
+    st = api_->RegistrationOpen(&reg_config, &registration_);
+    if (QUIC_FAILED(st)) {
+        init_error_ = "RegistrationOpen failed: " + quic_status_hex(st);
+        MsQuicClose(api_);
+        api_          = nullptr;
+        registration_ = nullptr;
+        return;
+    }
+}
+
+MsQuicApi::~MsQuicApi() {
+    if (registration_ != nullptr) {
+        api_->RegistrationClose(registration_);
+        registration_ = nullptr;
+    }
+    if (api_ != nullptr) {
+        MsQuicClose(api_);
+        api_ = nullptr;
+    }
+}
+
+MsQuicApi& MsQuicApi::instance() {
+    static MsQuicApi inst;
+    return inst;
+}
+
+// ── Status mapping ───────────────────────────────────────────────────────────
+
+StatusCode quic_status_to_status_code(QUIC_STATUS status) noexcept {
+    if (QUIC_SUCCEEDED(status)) return StatusCode::Ok;
+
+    // msquic guarantees a portable logical status set across platforms
+    // even though the underlying integer values differ (errno-like on
+    // POSIX, HRESULT on Windows) — compare against the QUIC_STATUS_*
+    // macros, never raw integers.
+    if (status == QUIC_STATUS_INVALID_PARAMETER) return StatusCode::InvalidArgument;
+    if (status == QUIC_STATUS_INVALID_ADDRESS)   return StatusCode::InvalidArgument;
+    if (status == QUIC_STATUS_INVALID_STATE)     return StatusCode::FailedPrecondition;
+    if (status == QUIC_STATUS_NOT_SUPPORTED)     return StatusCode::Unimplemented;
+    if (status == QUIC_STATUS_NOT_FOUND)         return StatusCode::NotFound;
+    if (status == QUIC_STATUS_BUFFER_TOO_SMALL)  return StatusCode::ResourceExhausted;
+    if (status == QUIC_STATUS_OUT_OF_MEMORY)     return StatusCode::ResourceExhausted;
+    if (status == QUIC_STATUS_STREAM_LIMIT_REACHED) return StatusCode::ResourceExhausted;
+    if (status == QUIC_STATUS_ABORTED)           return StatusCode::Cancelled;
+    if (status == QUIC_STATUS_USER_CANCELED)     return StatusCode::Cancelled;
+    if (status == QUIC_STATUS_CONNECTION_TIMEOUT) return StatusCode::DeadlineExceeded;
+    if (status == QUIC_STATUS_CONNECTION_IDLE)   return StatusCode::DeadlineExceeded;
+    if (status == QUIC_STATUS_CONNECTION_REFUSED) return StatusCode::Unavailable;
+    if (status == QUIC_STATUS_UNREACHABLE)       return StatusCode::Unavailable;
+    if (status == QUIC_STATUS_ADDRESS_IN_USE)    return StatusCode::Unavailable;
+    if (status == QUIC_STATUS_ADDRESS_NOT_AVAILABLE) return StatusCode::Unavailable;
+    if (status == QUIC_STATUS_ALPN_NEG_FAILURE)  return StatusCode::Unavailable;
+    if (status == QUIC_STATUS_VER_NEG_ERROR)     return StatusCode::Unavailable;
+    if (status == QUIC_STATUS_ALPN_IN_USE)       return StatusCode::FailedPrecondition;
+    if (status == QUIC_STATUS_HANDSHAKE_FAILURE) return StatusCode::Unauthenticated;
+    if (status == QUIC_STATUS_TLS_ERROR)         return StatusCode::Unauthenticated;
+    if (status == QUIC_STATUS_BAD_CERTIFICATE)   return StatusCode::Unauthenticated;
+    if (status == QUIC_STATUS_CERT_EXPIRED)      return StatusCode::Unauthenticated;
+    if (status == QUIC_STATUS_EXPIRED_CERTIFICATE) return StatusCode::Unauthenticated;
+    if (status == QUIC_STATUS_CERT_UNTRUSTED_ROOT) return StatusCode::Unauthenticated;
+    if (status == QUIC_STATUS_REVOKED_CERTIFICATE) return StatusCode::Unauthenticated;
+    if (status == QUIC_STATUS_UNKNOWN_CERTIFICATE) return StatusCode::Unauthenticated;
+    if (status == QUIC_STATUS_UNSUPPORTED_CERTIFICATE) return StatusCode::Unauthenticated;
+    if (status == QUIC_STATUS_REQUIRED_CERTIFICATE) return StatusCode::Unauthenticated;
+    if (status == QUIC_STATUS_CERT_NO_CERT)      return StatusCode::Unauthenticated;
+    if (status == QUIC_STATUS_PROTOCOL_ERROR)    return StatusCode::Internal;
+    if (status == QUIC_STATUS_INTERNAL_ERROR)    return StatusCode::Internal;
+    return StatusCode::Unknown;
+}
+
+std::string quic_status_hex(QUIC_STATUS status) {
+    // QUIC_STATUS is an unsigned integer on every supported platform.
+    char buf[2 + sizeof(unsigned long long) * 2 + 1];
+    std::snprintf(buf, sizeof(buf), "0x%llx",
+                  static_cast<unsigned long long>(status));
+    return std::string(buf);
+}
+
+// ── QUIC_ADDR construction ───────────────────────────────────────────────────
+
+bool make_quic_addr(std::string_view host, uint16_t port,
+                    QUIC_ADDR& out) noexcept {
+    std::memset(&out, 0, sizeof(out));
+
+    const bool wildcard_v4 = host.empty() || host == "0.0.0.0";
+    const bool wildcard_v6 = host == "::";
+
+    if (wildcard_v4) {
+        QuicAddrSetFamily(&out, QUIC_ADDRESS_FAMILY_INET);
+        QuicAddrSetPort(&out, port);
+        return true;  // zeroed sin_addr == INADDR_ANY
+    }
+    if (wildcard_v6) {
+        QuicAddrSetFamily(&out, QUIC_ADDRESS_FAMILY_INET6);
+        QuicAddrSetPort(&out, port);
+        return true;  // zeroed sin6_addr == in6addr_any
+    }
+
+    // IP literal. A ':' means IPv6 (no DNS names reach this path).
+    const std::string host_str(host);
+    if (host.find(':') != std::string_view::npos) {
+        if (inet_pton(AF_INET6, host_str.c_str(), &out.Ipv6.sin6_addr) != 1) {
+            return false;
+        }
+        QuicAddrSetFamily(&out, QUIC_ADDRESS_FAMILY_INET6);
+        QuicAddrSetPort(&out, port);
+        return true;
+    }
+    if (inet_pton(AF_INET, host_str.c_str(), &out.Ipv4.sin_addr) != 1) {
+        return false;
+    }
+    QuicAddrSetFamily(&out, QUIC_ADDRESS_FAMILY_INET);
+    QuicAddrSetPort(&out, port);
+    return true;
+}
+
+}  // namespace yuzu::transport::msquic_backend

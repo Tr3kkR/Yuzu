@@ -249,7 +249,14 @@ endif
 # ── Transport unit tests (#376 PR 1+) ─────────────────────────────────────────
 transport_test_exe = executable(
   'yuzu_transport_tests',
-  files('unit/transport/test_transport_smoke.cpp'),
+  files(
+    'unit/transport/test_transport_smoke.cpp',
+    'unit/transport/test_msquic_framing.cpp',
+    'unit/transport/test_msquic_roundtrip.cpp',
+  ),
+  # The framing codec header lives in the msquic backend's private source
+  # dir (it is backend-internal, not part of the public transport API).
+  include_directories: include_directories('../transport/src/msquic'),
   # yuzu_proto_dep provides the link to libyuzu_proto.a so generated
   # symbols (HandshakeHello, TrailingStatus) resolve. yuzu_transport_dep
   # alone exposes only proto headers.
