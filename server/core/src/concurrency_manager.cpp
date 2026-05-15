@@ -67,8 +67,15 @@ bool ConcurrencyManager::try_acquire(const std::string& definition_id,
     // closing the SELECT-then-INSERT TOCTOU race. The RETURNING clause makes
     // "did a row get inserted?" the result of stepping this one statement, so
     // we never call sqlite3_changes() — which reads db->nChange without the
-    // connection mutex and would data-race a concurrent step() on the shared
-    // FULLMUTEX connection.
+    // connection mutex and would data-race a concurrent step() on the same
+    // handle from another thread.
+    //
+    // `RETURNING 1` is a no-payload sentinel: sqlite3_step() returns
+    // SQLITE_ROW iff the INSERT actually inserted (RETURNING does not fire
+    // for OR-IGNORE skips or for WHERE-excluded rows), SQLITE_DONE otherwise.
+    // Do not change the literal `1` to a column projection unless try_acquire
+    // is rewritten to consume the value — the rc == SQLITE_ROW check below
+    // is the sole signal driving control flow.
     const char* sql = R"(
         INSERT OR IGNORE INTO concurrency_locks (definition_id, execution_id, acquired_at)
         SELECT ?, ?, ?

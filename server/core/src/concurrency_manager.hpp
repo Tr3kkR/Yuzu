@@ -34,13 +34,15 @@ public:
 
 private:
     sqlite3* db_;
-    // No application-level mutex. try_acquire/release/active_count each
-    // prepare-and-finalize one statement per call, so SQLITE_OPEN_FULLMUTEX
-    // on the shared connection serializes them. try_acquire's conditional
-    // INSERT carries a RETURNING clause, so "was a row inserted?" is the
-    // result of stepping that single statement — it never calls
-    // sqlite3_changes(), which reads db->nChange without the connection
-    // mutex and would data-race a concurrent step() on the shared connection.
+    // Caller-contract: db_ must be opened with SQLITE_OPEN_FULLMUTEX, so
+    // each individual SQLite API call on it is serialized. No
+    // application-level mutex is needed because try_acquire's conditional
+    // INSERT carries a RETURNING clause — "was a row inserted?" is the
+    // result of stepping that single statement, never a separate
+    // sqlite3_changes() call. (sqlite3_changes() reads db->nChange without
+    // the per-connection mutex and would data-race a concurrent step()
+    // from another thread holding the same handle. Issue #1033 tracks
+    // 24 other store sites that still carry that anti-pattern.)
 };
 
 } // namespace yuzu::server
