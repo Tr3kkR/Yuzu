@@ -790,6 +790,180 @@ TEST_CASE("msquic ALPN multi-protocol negotiation picks a common entry",
     listener->shutdown();
 }
 
+// ── Metric sink parity (#376 PR 3 increment 6) ───────────────────────────────
+
+#ifdef YUZU_TRANSPORT_HAVE_MSQUIC
+namespace {
+
+struct RecordingMetricSink final : public TransportMetricSink {
+    struct Event {
+        std::string kind;    // "conn_opened" / "stream_opened" / etc.
+        std::string backend; // always "msquic"
+        std::string method;  // method name when applicable, else ""
+        std::size_t bytes = 0;
+        Status final_status{};
+    };
+
+    mutable std::mutex mtx;
+    std::vector<Event> events;
+
+    void on_connection_opened(std::string_view backend) override {
+        std::lock_guard<std::mutex> lock(mtx);
+        events.push_back({"conn_opened", std::string(backend), "", 0, {}});
+    }
+    void on_connection_closed(std::string_view backend, Status final) override {
+        std::lock_guard<std::mutex> lock(mtx);
+        events.push_back({"conn_closed", std::string(backend), "", 0, final});
+    }
+    void on_stream_opened(std::string_view backend, std::string_view method) override {
+        std::lock_guard<std::mutex> lock(mtx);
+        events.push_back({"stream_opened", std::string(backend), std::string(method), 0, {}});
+    }
+    void on_stream_closed(std::string_view backend, std::string_view method,
+                          Status final) override {
+        std::lock_guard<std::mutex> lock(mtx);
+        events.push_back({"stream_closed", std::string(backend), std::string(method), 0, final});
+    }
+    void on_bytes_sent(std::string_view backend, std::size_t bytes) override {
+        std::lock_guard<std::mutex> lock(mtx);
+        events.push_back({"bytes_sent", std::string(backend), "", bytes, {}});
+    }
+    void on_bytes_received(std::string_view backend, std::size_t bytes) override {
+        std::lock_guard<std::mutex> lock(mtx);
+        events.push_back({"bytes_received", std::string(backend), "", bytes, {}});
+    }
+    void on_unexpected_dispatch_throw(std::string_view backend, std::string_view method,
+                                      std::string_view kind) override {
+        std::lock_guard<std::mutex> lock(mtx);
+        events.push_back({"dispatch_throw_" + std::string(kind),
+                          std::string(backend),
+                          std::string(method),
+                          0,
+                          {}});
+    }
+
+    bool has(const std::string& kind) const {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (const auto& e : events) {
+            if (e.kind == kind)
+                return true;
+        }
+        return false;
+    }
+    bool has_with_method(const std::string& kind, const std::string& method) const {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (const auto& e : events) {
+            if (e.kind == kind && e.method == method)
+                return true;
+        }
+        return false;
+    }
+    std::size_t total_bytes(const std::string& kind) const {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::size_t sum = 0;
+        for (const auto& e : events) {
+            if (e.kind == kind)
+                sum += e.bytes;
+        }
+        return sum;
+    }
+};
+
+} // namespace
+#endif
+
+TEST_CASE("msquic metric sink fires connection + stream + bytes events with msquic backend label",
+          "[transport][msquic][round-trip][metrics]") {
+    // qe-S6: A round-trip with a recording sink installed on both sides
+    // must produce on_connection_opened/closed, on_stream_opened/closed,
+    // and on_bytes_sent/received events all labelled "msquic". The
+    // method label on stream_opened/closed must match the registered
+    // method exactly.
+    auto server_sink = std::make_shared<RecordingMetricSink>();
+    auto client_sink = std::make_shared<RecordingMetricSink>();
+
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+    auto handler = [](const CallContext&, const SerializableMessage& req,
+                      SerializableMessage& resp) -> Status {
+        const auto& sreq = static_cast<const StringMessage&>(req);
+        auto& sresp = static_cast<StringMessage&>(resp);
+        sresp.set_data("ack:" + sreq.data());
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Echo", string_factory, string_factory, handler);
+
+    Credentials creds = make_test_creds();
+    ListenerOptions opts;
+    opts.metric_sink = server_sink;
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds, opts);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds, BackoffPolicy{}, client_sink);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    StringMessage req("hi"), resp;
+    CallContext ctx;
+    auto r = ch->unary("yuzu.test.v1.Echo/Echo", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Ok);
+    REQUIRE(resp.data() == "ack:hi");
+
+    ch->close();
+    listener->shutdown();
+
+    REQUIRE(client_sink->has("conn_opened"));
+    REQUIRE(server_sink->has("conn_opened"));
+    REQUIRE(client_sink->has_with_method("stream_opened", "yuzu.test.v1.Echo/Echo"));
+    REQUIRE(server_sink->has_with_method("stream_opened", "yuzu.test.v1.Echo/Echo"));
+    REQUIRE(client_sink->has_with_method("stream_closed", "yuzu.test.v1.Echo/Echo"));
+    REQUIRE(server_sink->has_with_method("stream_closed", "yuzu.test.v1.Echo/Echo"));
+    REQUIRE(client_sink->total_bytes("bytes_sent") > 0);
+    REQUIRE(client_sink->total_bytes("bytes_received") > 0);
+    REQUIRE(server_sink->total_bytes("bytes_sent") > 0);
+    REQUIRE(server_sink->total_bytes("bytes_received") > 0);
+}
+
+TEST_CASE("msquic metric sink fires on_unexpected_dispatch_throw on a thrown handler",
+          "[transport][msquic][round-trip][metrics]") {
+    // qe-S6b: a handler that throws std::exception must trigger
+    // on_unexpected_dispatch_throw("msquic", method, "std_exception")
+    // on the server-side sink — the kind label is bounded so it is
+    // safe as a Prometheus label.
+    auto server_sink = std::make_shared<RecordingMetricSink>();
+
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+    auto handler = [](const CallContext&, const SerializableMessage&,
+                      SerializableMessage&) -> Status {
+        throw std::runtime_error("metric throw test");
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Throws", string_factory, string_factory, handler);
+
+    Credentials creds = make_test_creds();
+    ListenerOptions opts;
+    opts.metric_sink = server_sink;
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds, opts);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    StringMessage req("x"), resp;
+    CallContext ctx;
+    auto r = ch->unary("yuzu.test.v1.Echo/Throws", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Internal);
+
+    ch->close();
+    listener->shutdown();
+
+    REQUIRE(
+        server_sink->has_with_method("dispatch_throw_std_exception", "yuzu.test.v1.Echo/Throws"));
+}
+
 TEST_CASE("msquic bidi stream destroyed without final_status terminates cleanly",
           "[transport][msquic][round-trip][bidi]") {
     // transport.hpp: "destroying the BidiStream cancels the stream if

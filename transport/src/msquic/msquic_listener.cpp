@@ -69,6 +69,13 @@ struct ServerStreamCall {
 
     CallContext ctx;  // populated from HandshakeHello before dispatch
 
+    // Resolved method name from the HandshakeHello (after stripping any
+    // leading '/'). Used for metric_sink labels and the
+    // on_unexpected_dispatch_throw `method` argument. Bounded-cardinality
+    // because dispatch_stream_call only sets it from the operator-
+    // controlled handler map; never from attacker-controlled bytes.
+    std::string method;
+
     // Resolved unary registration (copied out of the listener's handler
     // map once the HandshakeHello method is known).
     bool                                                  is_unary = false;
@@ -172,6 +179,7 @@ bool send_frame(ServerStreamCall* call, std::string payload, bool fin) {
     std::lock_guard<std::mutex> lock(call->mtx);
     if (call->stream_closed) return false;
     const auto* api = MsQuicApi::instance().api();
+    const std::size_t bytes = payload.size();
     auto* sb = new SendBuf(std::move(payload));
     const QUIC_SEND_FLAGS flags =
         fin ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE;
@@ -181,6 +189,9 @@ bool send_frame(ServerStreamCall* call, std::string payload, bool fin) {
                      quic_status_hex(st));
         delete sb;
         return false;
+    }
+    if (auto& sink = call->listener->metric_sink(); sink) {
+        sink->on_bytes_sent("msquic", bytes);
     }
     return true;
 }
@@ -237,12 +248,20 @@ void run_unary_handler(std::shared_ptr<ServerStreamCall> keep,
                 "yuzu::transport[msquic]: unary handler raised std::exception "
                 "— type={} what={}",
                 typeid(e).name(), e.what());
+            if (auto& sink = call->listener->metric_sink(); sink) {
+                sink->on_unexpected_dispatch_throw("msquic", call->method,
+                                                   "std_exception");
+            }
             status = Status{StatusCode::Internal,
                             "transport: handler raised exception"};
         } catch (...) {
             spdlog::error(
                 "yuzu::transport[msquic]: unary handler raised non-std "
                 "exception");
+            if (auto& sink = call->listener->metric_sink(); sink) {
+                sink->on_unexpected_dispatch_throw("msquic", call->method,
+                                                   "non_std_exception");
+            }
             status = Status{StatusCode::Internal,
                             "transport: handler raised non-std exception"};
         }
@@ -321,6 +340,15 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
         case QUIC_STREAM_EVENT_RECEIVE: {
             const bool fin =
                 (ev->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
+            std::size_t total_bytes = 0;
+            for (uint32_t i = 0; i < ev->RECEIVE.BufferCount; ++i) {
+                total_bytes += ev->RECEIVE.Buffers[i].Length;
+            }
+            if (total_bytes != 0) {
+                if (auto& sink = call->listener->metric_sink(); sink) {
+                    sink->on_bytes_received("msquic", total_bytes);
+                }
+            }
             for (uint32_t i = 0; i < ev->RECEIVE.BufferCount; ++i) {
                 const auto& b = ev->RECEIVE.Buffers[i];
                 StatusCode sc = call->decoder.feed(std::string_view{
@@ -484,6 +512,17 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                                 Status{StatusCode::Cancelled,
                                        "transport: stream closed"});
             }
+            if (auto& sink = listener->metric_sink();
+                sink && !call->method.empty()) {
+                Status final_status;
+                if (call->bidi_state) {
+                    std::lock_guard<std::mutex> lock(call->bidi_state->mtx);
+                    if (call->bidi_state->final_valid) {
+                        final_status = call->bidi_state->final_status;
+                    }
+                }
+                sink->on_stream_closed("msquic", call->method, final_status);
+            }
             // Dropping the registry's shared_ptr; if a worker still holds
             // one the ServerStreamCall outlives this call until it
             // returns. After SHUTDOWN_COMPLETE msquic delivers no further
@@ -503,6 +542,9 @@ QUIC_STATUS QUIC_API msquic_conn_callback(HQUIC conn, void* ctx,
     const auto* api = MsQuicApi::instance().api();
     switch (ev->Type) {
         case QUIC_CONNECTION_EVENT_CONNECTED:
+            if (auto& sink = listener->metric_sink(); sink) {
+                sink->on_connection_opened("msquic");
+            }
             return QUIC_STATUS_SUCCESS;
 
         case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
@@ -519,14 +561,21 @@ QUIC_STATUS QUIC_API msquic_conn_callback(HQUIC conn, void* ctx,
             return QUIC_STATUS_SUCCESS;
         }
 
-        case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE:
+        case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
             // ConnectionClose frees the handle; untrack_connection then
             // removes the (now-stale) handle value from the registry and
             // wakes a draining shutdown(). After SHUTDOWN_COMPLETE msquic
             // delivers no further events for this connection.
+            if (auto& sink = listener->metric_sink(); sink) {
+                // Connection-final status is best-effort: msquic does not
+                // surface a peer-supplied close reason here in a portable
+                // way, so we report Ok unless the local listener failed.
+                sink->on_connection_closed("msquic", Status{});
+            }
             api->ConnectionClose(conn);
             listener->untrack_connection(conn);
             return QUIC_STATUS_SUCCESS;
+        }
 
         default:
             return QUIC_STATUS_SUCCESS;
@@ -671,19 +720,27 @@ void MsquicServerListener::dispatch_stream_call(ServerStreamCall* call,
     }
 
     if (kind == Unary) {
+        call->method           = method;
         call->is_unary         = true;
         call->request_factory  = std::move(unary_reg.request_factory);
         call->response_factory = std::move(unary_reg.response_factory);
         call->unary_handler    = std::move(unary_reg.handler);
         call->phase            = ServerStreamCall::Phase::AwaitingRequest;
+        if (auto& sink = metric_sink(); sink) {
+            sink->on_stream_opened("msquic", call->method);
+        }
         return;
     }
     if (kind == Bidi) {
+        call->method              = method;
         call->bidi_handler        = std::move(bidi_handler);
         call->bidi_state          = std::make_shared<BidiStreamState>();
         call->bidi_state->stream  = call->stream;
         call->bidi_state->self    = call->bidi_state;
         call->phase               = ServerStreamCall::Phase::Bidi;
+        if (auto& sink = metric_sink(); sink) {
+            sink->on_stream_opened("msquic", call->method);
+        }
 
         auto keep = call->self.lock();
         if (!keep) {

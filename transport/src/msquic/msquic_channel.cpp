@@ -75,6 +75,7 @@ struct ClientBidiCall {
 
     FrameDecoder                  decoder;
     std::shared_ptr<BidiStreamState> state;
+    std::string                   method;  // for metric_sink labels
 
     explicit ClientBidiCall(std::size_t max_frame) : decoder(max_frame) {}
 };
@@ -96,9 +97,12 @@ struct SendBuf {
 
 // Send one already-framed payload. `fin` half-closes the send direction
 // after this buffer. On failure the SendBuf is freed here; on success it
-// is freed in the stream's SEND_COMPLETE handler.
-bool send_framed(HQUIC stream, std::string framed, bool fin) {
+// is freed in the stream's SEND_COMPLETE handler. Optional metric sink
+// fires on_bytes_sent("msquic", payload size) on a successful send.
+bool send_framed(HQUIC stream, std::string framed, bool fin,
+                 const std::shared_ptr<TransportMetricSink>& sink = nullptr) {
     const auto* api = MsQuicApi::instance().api();
+    const std::size_t bytes = framed.size();
     auto* sb = new SendBuf(std::move(framed));
     const QUIC_SEND_FLAGS flags =
         fin ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE;
@@ -109,6 +113,7 @@ bool send_framed(HQUIC stream, std::string framed, bool fin) {
         delete sb;
         return false;
     }
+    if (sink) sink->on_bytes_sent("msquic", bytes);
     return true;
 }
 
@@ -140,6 +145,15 @@ QUIC_STATUS QUIC_API msquic_client_stream_callback(HQUIC stream, void* ctx,
         case QUIC_STREAM_EVENT_RECEIVE: {
             bool fin = (ev->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
             StatusCode sc = StatusCode::Ok;
+            std::size_t total_bytes = 0;
+            for (uint32_t i = 0; i < ev->RECEIVE.BufferCount; ++i) {
+                total_bytes += ev->RECEIVE.Buffers[i].Length;
+            }
+            if (total_bytes != 0 && call->channel &&
+                call->channel->metric_sink_) {
+                call->channel->metric_sink_->on_bytes_received("msquic",
+                                                                total_bytes);
+            }
             {
                 std::lock_guard<std::mutex> lock(call->mtx);
                 // Ignore a RECEIVE that arrives after the call already
@@ -219,6 +233,15 @@ QUIC_STATUS QUIC_API msquic_client_bidi_stream_callback(
             const bool fin =
                 (ev->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
             StatusCode sc = StatusCode::Ok;
+            std::size_t total_bytes = 0;
+            for (uint32_t i = 0; i < ev->RECEIVE.BufferCount; ++i) {
+                total_bytes += ev->RECEIVE.Buffers[i].Length;
+            }
+            if (total_bytes != 0 && call->channel &&
+                call->channel->metric_sink_) {
+                call->channel->metric_sink_->on_bytes_received("msquic",
+                                                                total_bytes);
+            }
             for (uint32_t i = 0; i < ev->RECEIVE.BufferCount; ++i) {
                 const auto& b = ev->RECEIVE.Buffers[i];
                 sc = call->decoder.feed(std::string_view{
@@ -272,6 +295,17 @@ QUIC_STATUS QUIC_API msquic_client_bidi_stream_callback(
             feed_bidi_error(*call->state,
                             Status{StatusCode::Cancelled,
                                    "transport: stream closed"});
+            if (channel && channel->metric_sink_) {
+                Status final_status;
+                {
+                    std::lock_guard<std::mutex> lock(call->state->mtx);
+                    if (call->state->final_valid) {
+                        final_status = call->state->final_status;
+                    }
+                }
+                channel->metric_sink_->on_stream_closed("msquic", call->method,
+                                                         final_status);
+            }
             channel->untrack_bidi_call(stream);
             return QUIC_STATUS_SUCCESS;
         }
@@ -291,6 +325,9 @@ QUIC_STATUS QUIC_API msquic_client_conn_callback(HQUIC /*conn*/, void* ctx,
                 channel->conn_state_ = MsquicChannel::ConnState::Connected;
             }
             channel->conn_cv_.notify_all();
+            if (channel->metric_sink_) {
+                channel->metric_sink_->on_connection_opened("msquic");
+            }
             return QUIC_STATUS_SUCCESS;
         }
 
@@ -326,6 +363,7 @@ QUIC_STATUS QUIC_API msquic_client_conn_callback(HQUIC /*conn*/, void* ctx,
         }
 
         case QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE: {
+            Status final_status;
             {
                 std::lock_guard<std::mutex> lock(channel->mtx_);
                 if (channel->conn_state_ != MsquicChannel::ConnState::Connected) {
@@ -336,8 +374,12 @@ QUIC_STATUS QUIC_API msquic_client_conn_callback(HQUIC /*conn*/, void* ctx,
                             "transport: connection closed before ready"};
                     }
                 }
+                final_status = channel->conn_error_;
             }
             channel->conn_cv_.notify_all();
+            if (channel->metric_sink_) {
+                channel->metric_sink_->on_connection_closed("msquic", final_status);
+            }
             // The handle is freed by MsquicChannel::close(); msquic permits
             // holding the handle past SHUTDOWN_COMPLETE.
             return QUIC_STATUS_SUCCESS;
@@ -587,6 +629,9 @@ CallResult MsquicChannel::unary(std::string_view method,
                           {}};
     }
     call->stream = stream;
+    if (metric_sink_) {
+        metric_sink_->on_stream_opened("msquic", method);
+    }
     {
         std::lock_guard<std::mutex> lock(mtx_);
         live_calls_[stream] = call;
@@ -604,8 +649,10 @@ CallResult MsquicChannel::unary(std::string_view method,
 
     // HandshakeHello, then the request frame with FIN (client half-close —
     // a unary client sends exactly two frames then stops writing).
-    if (!send_framed(stream, std::move(hello_frame), /*fin=*/false) ||
-        !send_framed(stream, std::move(request_frame), /*fin=*/true)) {
+    if (!send_framed(stream, std::move(hello_frame), /*fin=*/false,
+                     metric_sink_) ||
+        !send_framed(stream, std::move(request_frame), /*fin=*/true,
+                     metric_sink_)) {
         finish_call(call.get(),
                     Status{StatusCode::Unavailable,
                            "transport: failed to send request frames"});
@@ -654,6 +701,9 @@ CallResult MsquicChannel::unary(std::string_view method,
         peer_clean_fin  = call->peer_clean_fin;
     }
     if (!transport_error.ok()) {
+        if (metric_sink_) {
+            metric_sink_->on_stream_closed("msquic", method, transport_error);
+        }
         return CallResult{transport_error, {}};
     }
     // The frame-count interpretation below is only sound when the peer
@@ -663,10 +713,12 @@ CallResult MsquicChannel::unary(std::string_view method,
     // response as a TrailingStatus would fabricate an RPC status
     // (governance UP-14 / CH-3).
     if (!peer_clean_fin) {
-        return CallResult{
-            Status{StatusCode::Unavailable,
-                   "transport: stream ended without a clean peer half-close"},
-            {}};
+        Status st{StatusCode::Unavailable,
+                  "transport: stream ended without a clean peer half-close"};
+        if (metric_sink_) {
+            metric_sink_->on_stream_closed("msquic", method, st);
+        }
+        return CallResult{st, {}};
     }
 
     // Interpret the collected frames. Wire contract for unary
@@ -683,29 +735,40 @@ CallResult MsquicChannel::unary(std::string_view method,
                       sanitise_status_detail(trailer.detail())};
     };
 
+    auto emit_close = [this, method](const Status& s) {
+        if (metric_sink_) {
+            metric_sink_->on_stream_closed("msquic", method, s);
+        }
+    };
+
     if (frames.empty()) {
-        return CallResult{Status{StatusCode::Unknown,
-                                 "transport: peer closed without trailing "
-                                 "status"},
-                          {}};
+        Status st{StatusCode::Unknown,
+                  "transport: peer closed without trailing status"};
+        emit_close(st);
+        return CallResult{st, {}};
     }
     if (frames.size() == 1) {
         // Failure path — only the trailer was sent.
-        return CallResult{parse_trailer(frames[0]), {}};
+        Status t = parse_trailer(frames[0]);
+        emit_close(t);
+        return CallResult{t, {}};
     }
     // Success path — frames[0] is the response, frames[1] the trailer.
     if (!response.parse(frames[0])) {
-        return CallResult{Status{StatusCode::DataLoss,
-                                 "transport: response frame failed to parse"},
-                          {}};
+        Status st{StatusCode::DataLoss,
+                  "transport: response frame failed to parse"};
+        emit_close(st);
+        return CallResult{st, {}};
     }
     if (frames.size() > 2) {
-        return CallResult{Status{StatusCode::DataLoss,
-                                 "transport: unexpected frame after "
-                                 "TrailingStatus"},
-                          {}};
+        Status st{StatusCode::DataLoss,
+                  "transport: unexpected frame after TrailingStatus"};
+        emit_close(st);
+        return CallResult{st, {}};
     }
-    return CallResult{parse_trailer(frames[1]), {}};
+    Status t = parse_trailer(frames[1]);
+    emit_close(t);
+    return CallResult{t, {}};
 }
 
 std::unique_ptr<BidiStream> MsquicChannel::bidi_stream(std::string_view method,
@@ -778,6 +841,7 @@ std::unique_ptr<BidiStream> MsquicChannel::bidi_stream(std::string_view method,
     call->channel = this;
     call->self    = call;
     call->state   = state;
+    call->method  = std::string(method);
 
     HQUIC stream = nullptr;
     QUIC_STATUS st =
@@ -795,6 +859,9 @@ std::unique_ptr<BidiStream> MsquicChannel::bidi_stream(std::string_view method,
         std::lock_guard<std::mutex> lock(mtx_);
         live_bidi_calls_[stream] = call;
     }
+    if (metric_sink_) {
+        metric_sink_->on_stream_opened("msquic", call->method);
+    }
 
     st = api->StreamStart(stream, QUIC_STREAM_START_FLAG_NONE);
     if (QUIC_FAILED(st)) {
@@ -806,7 +873,8 @@ std::unique_ptr<BidiStream> MsquicChannel::bidi_stream(std::string_view method,
     }
 
     // Send the HandshakeHello (no FIN — bidi continues writing).
-    if (!send_framed(stream, std::move(hello_frame), /*fin=*/false)) {
+    if (!send_framed(stream, std::move(hello_frame), /*fin=*/false,
+                     metric_sink_)) {
         api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
         feed_bidi_error(*state,
                         Status{StatusCode::Unavailable,

@@ -70,6 +70,16 @@ public:
     bool is_serving() const noexcept override;
     Endpoint bound_endpoint() const noexcept override;
 
+    // Metric sink accessor for the msquic callbacks AND for the in-TU
+    // helper functions (send_frame, run_unary_handler, etc., which are
+    // not friends but live in the anon namespace of msquic_listener.cpp
+    // and reach this through `call->listener`). Returns the
+    // ListenerOptions sink set at start(); empty if none was supplied.
+    // The shared_ptr makes dereference safe without taking mtx_.
+    const std::shared_ptr<TransportMetricSink>& metric_sink() const noexcept {
+        return opts_.metric_sink;
+    }
+
 private:
     struct UnaryRegistration {
         std::function<std::unique_ptr<SerializableMessage>()> request_factory;
