@@ -448,10 +448,14 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                         call->ctx.metadata.emplace(k, v);
                     }
                     // peer_uri (#376 PR 3 inc 8): query the connection's
-                    // remote address and format as "msquic://ip:port".
-                    // Best-effort — a query failure leaves peer_uri
-                    // empty, which mirrors the gRPC backend's behaviour
-                    // when the peer-identity probe fails.
+                    // remote address and format as "ipv4:host:port" or
+                    // "ipv6:[host]:port" — byte-for-byte parity with
+                    // gRPC's gctx.peer() per cons-BLOCKING-2 so
+                    // downstream consumers (notably AgentServiceImpl
+                    // peer_ip extraction) work identically across
+                    // backends. Best-effort — a query failure leaves
+                    // peer_uri empty, mirroring gRPC's behaviour when
+                    // the peer-identity probe fails.
                     if (call->connection != nullptr) {
                         QUIC_ADDR remote{};
                         uint32_t  size = sizeof(remote);
