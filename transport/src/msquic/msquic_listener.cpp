@@ -35,8 +35,10 @@
 
 #include <spdlog/spdlog.h>
 
+#include "msquic_bidi_stream.hpp"
 #include "msquic_framing.hpp"
 #include "msquic_internal_helpers.hpp"
+#include "msquic_stream_state.hpp"
 #include "transport.pb.h"  // HandshakeHello, TrailingStatus
 
 namespace yuzu::transport::msquic_backend {
@@ -58,10 +60,11 @@ struct ServerStreamCall {
 
     // `phase` is owned exclusively by the msquic stream callback, which
     // msquic delivers serially per stream — there is no concurrent
-    // writer (governance cpp-S2 / UP-7: the worker thread no longer
-    // touches it; see run_unary_handler). Increment 3's bidi path makes
-    // per-stream state worker-shared and must revisit this.
-    enum class Phase { AwaitingHello, AwaitingRequest, Dispatched, Done };
+    // writer (governance cpp-S2 / UP-7: the worker thread does not
+    // touch it). For Bidi the worker reads/writes only `bidi_state`
+    // (the shared BidiStreamState), not `phase`; the callback continues
+    // routing inbound frames into bidi_state until SHUTDOWN_COMPLETE.
+    enum class Phase { AwaitingHello, AwaitingRequest, Dispatched, Bidi, Done };
     Phase phase = Phase::AwaitingHello;
 
     CallContext ctx;  // populated from HandshakeHello before dispatch
@@ -72,6 +75,13 @@ struct ServerStreamCall {
     std::function<std::unique_ptr<SerializableMessage>()>  request_factory;
     std::function<std::unique_ptr<SerializableMessage>()>  response_factory;
     UnaryHandler                                          unary_handler;
+
+    // Resolved bidi registration. `bidi_state` is the shared blocking-
+    // bridge state passed to the handler via MsquicBidiStream; the
+    // RECEIVE callback feeds decoded frames into it. Set up by
+    // dispatch_stream_call's bidi branch.
+    BidiStreamHandler                bidi_handler;
+    std::shared_ptr<BidiStreamState> bidi_state;
 
     // Serialises a worker thread's outbound StreamSend / StreamShutdown
     // against the SHUTDOWN_COMPLETE callback's StreamClose (governance
@@ -262,6 +272,44 @@ void run_unary_handler(std::shared_ptr<ServerStreamCall> keep,
     // writer racing the serial callback thread).
 }
 
+// Run a resolved bidi handler. Executes on a worker-pool thread; `keep`
+// keeps the ServerStreamCall alive even if the stream is torn down
+// concurrently. The MsquicBidiStream is scoped to keep the trailer
+// emission BEFORE the dtor (which would otherwise ABORT a stream whose
+// wire FIN has not yet been sent).
+void run_bidi_handler(std::shared_ptr<ServerStreamCall> keep,
+                      std::shared_ptr<BidiStreamState>  bidi_state,
+                      BidiStreamHandler                 handler,
+                      CallContext                       ctx) {
+    Status status;
+    {
+        MsquicBidiStream bidi_stream(bidi_state, /*server_side=*/true);
+        try {
+            status = handler(ctx, bidi_stream);
+        } catch (const std::exception& e) {
+            spdlog::error(
+                "yuzu::transport[msquic]: bidi handler raised std::exception "
+                "— type={} what={}",
+                typeid(e).name(), e.what());
+            status = Status{StatusCode::Internal,
+                            "transport: handler raised exception"};
+        } catch (...) {
+            spdlog::error(
+                "yuzu::transport[msquic]: bidi handler raised non-std "
+                "exception");
+            status = Status{StatusCode::Internal,
+                            "transport: handler raised non-std exception"};
+        }
+        // Emit the trailer + FIN with the handler's RETURN status BEFORE
+        // bidi_stream destructs, so the dtor sees wire_fin_sent and
+        // skips its abort path.
+        send_server_trailer_and_fin(*bidi_state, status);
+    }
+    // bidi_stream destructed cleanly. `keep` is dropped on return —
+    // the ServerStreamCall stays alive while the listener's
+    // live_streams_ holds a ref (until SHUTDOWN_COMPLETE untracks).
+}
+
 }  // namespace
 
 // ── msquic callback trampolines ──────────────────────────────────────────────
@@ -271,6 +319,8 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
     auto* call = static_cast<ServerStreamCall*>(ctx);
     switch (ev->Type) {
         case QUIC_STREAM_EVENT_RECEIVE: {
+            const bool fin =
+                (ev->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
             for (uint32_t i = 0; i < ev->RECEIVE.BufferCount; ++i) {
                 const auto& b = ev->RECEIVE.Buffers[i];
                 StatusCode sc = call->decoder.feed(std::string_view{
@@ -282,11 +332,18 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                     MsQuicApi::instance().api()->StreamShutdown(
                         stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT,
                         map_decoder_error_to_quic(sc));
+                    if (call->bidi_state) {
+                        feed_bidi_error(*call->bidi_state,
+                                        Status{StatusCode::DataLoss,
+                                               "transport: inbound framing error"});
+                    }
                     call->phase = ServerStreamCall::Phase::Done;
                     return QUIC_STATUS_SUCCESS;
                 }
             }
-            // Drain whatever whole frames are now available.
+            // Drain whatever whole frames are now available. Bidi keeps
+            // draining (each frame routes into bidi_state); unary breaks
+            // out after the request frame is submitted to the worker.
             for (;;) {
                 if (call->phase == ServerStreamCall::Phase::Done ||
                     call->phase == ServerStreamCall::Phase::Dispatched) {
@@ -319,7 +376,7 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                     }
                     call->listener->dispatch_stream_call(call, method);
                     // dispatch_stream_call sets phase to AwaitingRequest
-                    // (unary) or Done (rejected / unimplemented).
+                    // (unary), Bidi, or Done (rejected / unimplemented).
                 } else if (call->phase ==
                            ServerStreamCall::Phase::AwaitingRequest) {
                     if (call->is_unary) {
@@ -343,7 +400,20 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                         }
                         call->phase = ServerStreamCall::Phase::Dispatched;
                     }
+                } else if (call->phase ==
+                           ServerStreamCall::Phase::Bidi) {
+                    if (call->bidi_state) {
+                        feed_bidi_frame(*call->bidi_state, std::move(*frame));
+                    }
                 }
+            }
+            // Honour the FIN flag if it rode in on this RECEIVE event —
+            // for bidi the handler's read() needs to know the peer is
+            // done (PEER_SEND_SHUTDOWN below covers the separate-event
+            // path).
+            if (fin && call->phase == ServerStreamCall::Phase::Bidi &&
+                call->bidi_state) {
+                feed_bidi_fin(*call->bidi_state);
             }
             return QUIC_STATUS_SUCCESS;
         }
@@ -354,8 +424,14 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
         }
 
         case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
-            // Peer half-closed its send direction — for unary this is the
-            // expected close after the request frame. Nothing to do here.
+            // Peer half-closed its send direction. For unary this is
+            // the expected close after the request frame. For bidi the
+            // handler's read() needs to wake — feed_bidi_fin parses any
+            // pending lookahead frame as the TrailingStatus.
+            if (call->phase == ServerStreamCall::Phase::Bidi &&
+                call->bidi_state) {
+                feed_bidi_fin(*call->bidi_state);
+            }
             return QUIC_STATUS_SUCCESS;
 
         case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
@@ -368,6 +444,19 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                 std::lock_guard<std::mutex> lock(call->mtx);
                 call->stream_closed = true;
                 MsQuicApi::instance().api()->StreamClose(stream);
+            }
+            // For bidi, also close the bidi-state side and synthesise a
+            // final status if the peer never delivered a clean trailer
+            // (otherwise final_status() blocks forever). Same UP-1 lock
+            // discipline — write under bidi_state->mtx.
+            if (call->bidi_state) {
+                {
+                    std::lock_guard<std::mutex> lock(call->bidi_state->mtx);
+                    call->bidi_state->stream_closed = true;
+                }
+                feed_bidi_error(*call->bidi_state,
+                                Status{StatusCode::Cancelled,
+                                       "transport: stream closed"});
             }
             // Dropping the registry's shared_ptr; if a worker still holds
             // one the ServerStreamCall outlives this call until it
@@ -535,25 +624,76 @@ void MsquicServerListener::untrack_connection(HQUIC conn) {
 
 void MsquicServerListener::dispatch_stream_call(ServerStreamCall* call,
                                                 const std::string& method) {
-    std::lock_guard<std::mutex> lock(mtx_);
-    auto uit = unary_handlers_.find(method);
-    if (uit != unary_handlers_.end()) {
+    // Snapshot the handler under mtx_, then release before doing any
+    // listener_submit (which also takes mtx_ — avoid the nested lock).
+    UnaryRegistration unary_reg;
+    BidiStreamHandler bidi_handler;
+    enum { Unary, Bidi, Unknown } kind = Unknown;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto uit = unary_handlers_.find(method);
+        if (uit != unary_handlers_.end()) {
+            kind      = Unary;
+            unary_reg = uit->second;
+        } else {
+            auto bit = bidi_handlers_.find(method);
+            if (bit != bidi_handlers_.end()) {
+                kind         = Bidi;
+                bidi_handler = bit->second;
+            }
+        }
+    }
+
+    if (kind == Unary) {
         call->is_unary         = true;
-        call->request_factory  = uit->second.request_factory;
-        call->response_factory = uit->second.response_factory;
-        call->unary_handler    = uit->second.handler;
+        call->request_factory  = std::move(unary_reg.request_factory);
+        call->response_factory = std::move(unary_reg.response_factory);
+        call->unary_handler    = std::move(unary_reg.handler);
         call->phase            = ServerStreamCall::Phase::AwaitingRequest;
         return;
     }
-    if (bidi_handlers_.find(method) != bidi_handlers_.end()) {
-        // Bidi dispatch lands in #376 PR 3 increment 3.
-        send_trailing_status(
-            call, Status{StatusCode::Unimplemented,
-                         "transport: msquic bidi dispatch not yet "
-                         "implemented (#376 PR 3 increment 3)"});
-        call->phase = ServerStreamCall::Phase::Done;
+    if (kind == Bidi) {
+        call->bidi_handler        = std::move(bidi_handler);
+        call->bidi_state          = std::make_shared<BidiStreamState>();
+        call->bidi_state->stream  = call->stream;
+        call->bidi_state->self    = call->bidi_state;
+        call->phase               = ServerStreamCall::Phase::Bidi;
+
+        auto keep = call->self.lock();
+        if (!keep) {
+            call->phase = ServerStreamCall::Phase::Done;
+            return;
+        }
+        // Snapshot what the worker needs and submit. The worker runs the
+        // BidiStreamHandler with a server-side MsquicBidiStream wrapping
+        // the bidi_state, then emits the trailer + FIN with the handler's
+        // RETURN status (run_bidi_handler).
+        auto bidi_state_for_worker = call->bidi_state;
+        auto handler_copy          = call->bidi_handler;
+        CallContext ctx_copy       = call->ctx;
+        bool submitted = listener_submit(
+            [keep, bidi_state_for_worker, handler_copy,
+             ctx_copy = std::move(ctx_copy)]() mutable {
+                run_bidi_handler(std::move(keep),
+                                 std::move(bidi_state_for_worker),
+                                 std::move(handler_copy),
+                                 std::move(ctx_copy));
+            });
+        if (!submitted) {
+            // Pool gone — listener shutting down. Emit Unavailable on
+            // the bidi state so any future read on the (yet to be
+            // constructed) MsquicBidiStream sees a final status.
+            feed_bidi_error(*call->bidi_state,
+                            Status{StatusCode::Unavailable,
+                                   "transport: listener shutting down"});
+            send_trailing_status(
+                call, Status{StatusCode::Unavailable,
+                             "transport: listener shutting down"});
+            call->phase = ServerStreamCall::Phase::Done;
+        }
         return;
     }
+
     // Unknown method — detail string matches the gRPC backend verbatim
     // so operators grepping status records see one string (cons-S3).
     send_trailing_status(
@@ -594,7 +734,7 @@ std::expected<void, Status> MsquicServerListener::start(
     alpn.Buffer = reinterpret_cast<uint8_t*>(alpn_str.data());
 
     QUIC_SETTINGS settings{};
-    settings.IdleTimeoutMs            = 30000;
+    settings.IdleTimeoutMs            = 5000;
     settings.IsSet.IdleTimeoutMs      = TRUE;
     settings.PeerBidiStreamCount =
         opts.max_concurrent_streams_per_connection

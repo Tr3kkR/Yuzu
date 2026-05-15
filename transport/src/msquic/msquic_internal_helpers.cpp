@@ -49,14 +49,25 @@ MsQuicApi::MsQuicApi() {
 }
 
 MsQuicApi::~MsQuicApi() {
-    if (registration_ != nullptr) {
-        api_->RegistrationClose(registration_);
-        registration_ = nullptr;
-    }
-    if (api_ != nullptr) {
-        MsQuicClose(api_);
-        api_ = nullptr;
-    }
+    // Deliberately leak the msquic registration + API table at process
+    // exit. RegistrationClose blocks the calling thread until every
+    // msquic worker has drained outstanding per-connection grace work
+    // — even after every Channel and ServerListener has cleanly closed,
+    // that drain has been observed to take many tens of seconds (the
+    // transport meson test suite hangs the full 180s timeout in this
+    // dtor while the test cases themselves complete in <2s).
+    //
+    // This is a process-lifetime singleton — its dtor runs in static-
+    // destruction time, immediately before the OS reclaims the process.
+    // Leaking the registration here is harmless: the OS releases the
+    // memory and sockets unconditionally on exit. Long-lived production
+    // processes (server, agent) never destroy this singleton in normal
+    // operation either.
+    //
+    // Tracked as a follow-up: msquic RegistrationClose process-exit
+    // drain (#376 PR 3 increment 3 follow-up).
+    registration_ = nullptr;
+    api_          = nullptr;
 }
 
 MsQuicApi& MsQuicApi::instance() {

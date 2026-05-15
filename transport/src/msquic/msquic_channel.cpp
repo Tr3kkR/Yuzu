@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// #376 PR 3, increment 2 — MsquicChannel: client connection establishment
-// and synchronous unary RPC over a QUIC stream.
+// #376 PR 3, increment 3 — MsquicChannel: client connection establishment,
+// synchronous unary RPC, and bidi streams (the bidi BidiStream impl
+// itself is the shared MsquicBidiStream from msquic_bidi_stream.hpp).
 //
-// Out of scope for increment 2: the bidi path (increment 3 — bidi_stream()
-// still returns the skeleton stub), per-call deadlines (increment 4),
-// mTLS / server-cert verification (increment 5 — increment 2 honours
-// verify_peer=false only), the metric sink (increment 6).
+// Out of scope for increment 3: per-call deadlines (increment 4), mTLS /
+// server-cert verification (increment 5 — honours verify_peer=false
+// only), the metric sink (increment 6).
 
 #include "msquic_channel.hpp"
 
@@ -23,8 +23,10 @@
 
 #include <spdlog/spdlog.h>
 
+#include "msquic_bidi_stream.hpp"
 #include "msquic_framing.hpp"
 #include "msquic_internal_helpers.hpp"
+#include "msquic_stream_state.hpp"
 #include "transport.pb.h"  // HandshakeHello, TrailingStatus
 #include "yuzu/secure_zero.hpp"
 
@@ -57,11 +59,27 @@ struct ClientUnaryCall {
     explicit ClientUnaryCall(std::size_t max_frame) : decoder(max_frame) {}
 };
 
-namespace {
+// ── Per-stream client-side bidi call state ───────────────────────────────────
+//
+// Owns the FrameDecoder and the channel-side handle bookkeeping; the
+// blocking-bridge state (frame queue, cv, peer_fin, etc.) lives in the
+// shared BidiStreamState which is also held by the MsquicBidiStream
+// returned to the caller. The msquic stream callback recovers this raw
+// pointer from the stream's context, decodes RECEIVE bytes here, and
+// routes frames into `state` via feed_bidi_frame / feed_bidi_fin.
 
-constexpr const char* kBidiNotImplemented =
-    "transport: msquic bidi streams not yet implemented (#376 PR 3 "
-    "increment 3)";
+struct ClientBidiCall {
+    MsquicChannel*                channel = nullptr;
+    HQUIC                         stream  = nullptr;
+    std::weak_ptr<ClientBidiCall> self;
+
+    FrameDecoder                  decoder;
+    std::shared_ptr<BidiStreamState> state;
+
+    explicit ClientBidiCall(std::size_t max_frame) : decoder(max_frame) {}
+};
+
+namespace {
 
 // Owned outbound buffer; the SendBuf* is the StreamSend client context,
 // freed on SEND_COMPLETE. Raw new/delete: ownership is transferred
@@ -185,6 +203,84 @@ QUIC_STATUS QUIC_API msquic_client_stream_callback(HQUIC stream, void* ctx,
     }
 }
 
+// ── Client-side BIDI stream callback ─────────────────────────────────────────
+//
+// Decodes RECEIVE bytes and routes them into the shared BidiStreamState
+// via the feed_bidi_* helpers. Mirrors msquic_client_stream_callback
+// (unary) but talks to a BidiStreamState instead of a ClientUnaryCall's
+// frames vector — and uses one-frame lookahead for trailing-status
+// detection inside the feeders.
+
+QUIC_STATUS QUIC_API msquic_client_bidi_stream_callback(
+    HQUIC stream, void* ctx, QUIC_STREAM_EVENT* ev) {
+    auto* call = static_cast<ClientBidiCall*>(ctx);
+    switch (ev->Type) {
+        case QUIC_STREAM_EVENT_RECEIVE: {
+            const bool fin =
+                (ev->RECEIVE.Flags & QUIC_RECEIVE_FLAG_FIN) != 0;
+            StatusCode sc = StatusCode::Ok;
+            for (uint32_t i = 0; i < ev->RECEIVE.BufferCount; ++i) {
+                const auto& b = ev->RECEIVE.Buffers[i];
+                sc = call->decoder.feed(std::string_view{
+                    reinterpret_cast<const char*>(b.Buffer), b.Length});
+                if (sc != StatusCode::Ok) break;
+            }
+            if (sc != StatusCode::Ok) {
+                MsQuicApi::instance().api()->StreamShutdown(
+                    stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+                feed_bidi_error(*call->state,
+                                Status{StatusCode::DataLoss,
+                                       "transport: inbound framing error"});
+                return QUIC_STATUS_SUCCESS;
+            }
+            for (;;) {
+                auto f = call->decoder.next_frame();
+                if (!f) break;
+                feed_bidi_frame(*call->state, std::move(*f));
+            }
+            if (fin) feed_bidi_fin(*call->state);
+            return QUIC_STATUS_SUCCESS;
+        }
+
+        case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
+            feed_bidi_fin(*call->state);
+            return QUIC_STATUS_SUCCESS;
+
+        case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
+            feed_bidi_error(*call->state,
+                            Status{StatusCode::Cancelled,
+                                   "transport: peer aborted the stream"});
+            return QUIC_STATUS_SUCCESS;
+
+        case QUIC_STREAM_EVENT_SEND_COMPLETE:
+            delete static_cast<SendBuf*>(ev->SEND_COMPLETE.ClientContext);
+            return QUIC_STATUS_SUCCESS;
+
+        case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
+            MsquicChannel* channel = call->channel;
+            // Mirror the server-side B2 fix: serialise the StreamClose
+            // with any in-flight write() via state->stream_closed under
+            // state->mtx (governance UP-1 / CH-1 — the bidi side).
+            {
+                std::lock_guard<std::mutex> lock(call->state->mtx);
+                call->state->stream_closed = true;
+                MsQuicApi::instance().api()->StreamClose(stream);
+            }
+            // Synthesise a final status if the peer never delivered a
+            // clean trailer (otherwise final_status() blocks forever).
+            // No-op if final_valid was already set by feed_bidi_fin.
+            feed_bidi_error(*call->state,
+                            Status{StatusCode::Cancelled,
+                                   "transport: stream closed"});
+            channel->untrack_bidi_call(stream);
+            return QUIC_STATUS_SUCCESS;
+        }
+
+        default:
+            return QUIC_STATUS_SUCCESS;
+    }
+}
+
 QUIC_STATUS QUIC_API msquic_client_conn_callback(HQUIC /*conn*/, void* ctx,
                                                  QUIC_CONNECTION_EVENT* ev) {
     auto* channel = static_cast<MsquicChannel*>(ctx);
@@ -252,24 +348,9 @@ QUIC_STATUS QUIC_API msquic_client_conn_callback(HQUIC /*conn*/, void* ctx,
     }
 }
 
-// ── MsquicBidiStream skeleton (real impl: increment 3) ───────────────────────
-
-bool MsquicBidiStream::write(const SerializableMessage&,
-                             std::chrono::milliseconds) {
-    return false;
-}
-bool MsquicBidiStream::read(SerializableMessage&, std::chrono::milliseconds) {
-    return false;
-}
-void MsquicBidiStream::writes_done() {}
-Status MsquicBidiStream::final_status() {
-    return Status{StatusCode::Unimplemented, kBidiNotImplemented};
-}
-const std::map<std::string, std::string>&
-MsquicBidiStream::trailing_metadata() const {
-    return trailing_metadata_;
-}
-void MsquicBidiStream::cancel() {}
+// MsquicBidiStream itself lives in msquic_bidi_stream.{hpp,cpp} — one
+// shared implementation serves both the client (here) and the server
+// (msquic_listener.cpp::run_bidi_handler).
 
 // ── MsquicChannel ────────────────────────────────────────────────────────────
 
@@ -313,7 +394,7 @@ Status MsquicChannel::connect_and_wait(std::chrono::milliseconds deadline) {
         alpn.Buffer = reinterpret_cast<uint8_t*>(alpn_str.data());
 
         QUIC_SETTINGS settings{};
-        settings.IdleTimeoutMs       = 30000;
+        settings.IdleTimeoutMs       = 5000;
         settings.IsSet.IdleTimeoutMs = TRUE;
 
         QUIC_STATUS st = api->ConfigurationOpen(handle.registration(), &alpn, 1,
@@ -397,6 +478,18 @@ void MsquicChannel::untrack_call(HQUIC stream) {
         if (it != live_calls_.end()) {
             released = std::move(it->second);
             live_calls_.erase(it);
+        }
+    }
+}
+
+void MsquicChannel::untrack_bidi_call(HQUIC stream) {
+    std::shared_ptr<ClientBidiCall> released;  // freed outside the lock
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = live_bidi_calls_.find(stream);
+        if (it != live_bidi_calls_.end()) {
+            released = std::move(it->second);
+            live_bidi_calls_.erase(it);
         }
     }
 }
@@ -583,10 +676,101 @@ CallResult MsquicChannel::unary(std::string_view method,
     return CallResult{parse_trailer(frames[1]), {}};
 }
 
-std::unique_ptr<BidiStream> MsquicChannel::bidi_stream(std::string_view,
-                                                       const CallContext&) {
-    // Real bidi streams land in #376 PR 3 increment 3.
-    return std::make_unique<MsquicBidiStream>();
+std::unique_ptr<BidiStream> MsquicChannel::bidi_stream(std::string_view method,
+                                                       const CallContext& ctx) {
+    auto state  = std::make_shared<BidiStreamState>();
+    state->self = state;
+
+    // Helper: pre-populate the state with a terminal status so the
+    // returned MsquicBidiStream's read/write/final_status all see the
+    // failure immediately. Used for connect / serialize / StreamOpen
+    // failures BEFORE the stream is live.
+    auto fail_with = [&state](Status s) -> std::unique_ptr<BidiStream> {
+        {
+            std::lock_guard<std::mutex> lock(state->mtx);
+            state->final_status  = std::move(s);
+            state->final_valid   = true;
+            state->stream_closed = true;
+            state->peer_fin      = true;
+        }
+        return std::make_unique<MsquicBidiStream>(std::move(state),
+                                                  /*server_side=*/false);
+    };
+
+    if (closed_.load(std::memory_order_acquire)) {
+        return fail_with(
+            Status{StatusCode::Unavailable, "transport: channel closed"});
+    }
+    Status conn = connect_and_wait(std::chrono::milliseconds::zero());
+    if (!conn.ok()) return fail_with(conn);
+
+    const auto* api = MsQuicApi::instance().api();
+
+    // Encode the HandshakeHello. For unary the FIN rides the request
+    // frame; for bidi the client keeps writing, so the hello is sent
+    // without FIN.
+    pb::HandshakeHello hello;
+    hello.set_method(std::string(method));
+    for (const auto& [k, v] : ctx.metadata) {
+        (*hello.mutable_metadata())[k] = v;
+    }
+    hello.set_deadline_unix_millis(0);  // increment 4 wires deadline
+    std::string hello_body;
+    if (!hello.SerializeToString(&hello_body)) {
+        return fail_with(Status{
+            StatusCode::Internal,
+            "transport: HandshakeHello serialisation failed"});
+    }
+    std::string hello_frame;
+    if (!encode_frame(hello_body, 0, hello_frame)) {
+        return fail_with(Status{
+            StatusCode::ResourceExhausted,
+            "transport: HandshakeHello frame exceeds the frame-size cap"});
+    }
+
+    auto call     = std::make_shared<ClientBidiCall>(kDefaultMaxFrameSize);
+    call->channel = this;
+    call->self    = call;
+    call->state   = state;
+
+    HQUIC stream = nullptr;
+    QUIC_STATUS st =
+        api->StreamOpen(connection_, QUIC_STREAM_OPEN_FLAG_NONE,
+                        msquic_client_bidi_stream_callback, call.get(),
+                        &stream);
+    if (QUIC_FAILED(st)) {
+        return fail_with(Status{StatusCode::Unavailable,
+                                "transport: StreamOpen failed " +
+                                    quic_status_hex(st)});
+    }
+    call->stream  = stream;
+    state->stream = stream;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        live_bidi_calls_[stream] = call;
+    }
+
+    st = api->StreamStart(stream, QUIC_STREAM_START_FLAG_NONE);
+    if (QUIC_FAILED(st)) {
+        untrack_bidi_call(stream);
+        api->StreamClose(stream);
+        return fail_with(Status{StatusCode::Unavailable,
+                                "transport: StreamStart failed " +
+                                    quic_status_hex(st)});
+    }
+
+    // Send the HandshakeHello (no FIN — bidi continues writing).
+    if (!send_framed(stream, std::move(hello_frame), /*fin=*/false)) {
+        api->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+        feed_bidi_error(*state,
+                        Status{StatusCode::Unavailable,
+                               "transport: failed to send HandshakeHello"});
+        // Stream will SHUTDOWN_COMPLETE -> untrack. The MsquicBidiStream
+        // wrapping `state` reflects the failure via final_status().
+    }
+
+    return std::make_unique<MsquicBidiStream>(std::move(state),
+                                              /*server_side=*/false);
 }
 
 bool MsquicChannel::wait_for_connected(std::chrono::milliseconds deadline) {
@@ -624,11 +808,12 @@ void MsquicChannel::close() {
 
     // RELIES ON: ConnectionClose blocks until every stream callback for
     // the connection has returned, so each stream's SHUTDOWN_COMPLETE
-    // (and its untrack_call) has already run by here — live_calls_ is
-    // normally empty. The clear() is a defensive catch, not the primary
-    // drain (governance hp-2).
+    // (and its untrack_call / untrack_bidi_call) has already run by
+    // here — live_calls_ and live_bidi_calls_ are normally empty. The
+    // clear()s are a defensive catch, not the primary drain (gov hp-2).
     std::lock_guard<std::mutex> lock(mtx_);
     live_calls_.clear();
+    live_bidi_calls_.clear();
 }
 
 }  // namespace yuzu::transport::msquic_backend

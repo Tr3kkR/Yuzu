@@ -15,11 +15,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include "test_transport_helpers.hpp" // yuzu::transport::test::StringMessage
 #include "yuzu/transport/transport.hpp"
@@ -236,6 +238,200 @@ TEST_CASE("msquic unary scrubs a handler-thrown exception off the wire",
 
     ch->close();
     listener->shutdown();
+}
+
+// ── Bidi round-trip cases (#376 PR 3 increment 3) ────────────────────────────
+
+TEST_CASE("msquic bidi echoes N frames in order", "[transport][msquic][round-trip][bidi]") {
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    // Server reads every inbound frame and echoes it with an "ack:" prefix
+    // until the peer half-closes; then returns Ok.
+    auto handler = [](const CallContext&, BidiStream& s) -> Status {
+        StringMessage in;
+        while (s.read(in)) {
+            StringMessage out("ack:" + in.data());
+            if (!s.write(out)) {
+                return Status{StatusCode::Unavailable, "transport: server write failed"};
+            }
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/Bidi", handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    CallContext ctx;
+    auto bidi = ch->bidi_stream("yuzu.test.v1.Echo/Bidi", ctx);
+    REQUIRE(bidi != nullptr);
+
+    constexpr int N = 5;
+    for (int i = 0; i < N; ++i) {
+        StringMessage out("frame-" + std::to_string(i));
+        REQUIRE(bidi->write(out));
+    }
+    bidi->writes_done();
+
+    int got = 0;
+    StringMessage in;
+    while (bidi->read(in)) {
+        REQUIRE(in.data() == "ack:frame-" + std::to_string(got));
+        ++got;
+    }
+    REQUIRE(got == N);
+    REQUIRE(bidi->final_status().code == StatusCode::Ok);
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic bidi propagates a handler-returned error status",
+          "[transport][msquic][round-trip][bidi]") {
+    // governance qe parity — bidi version of the unary handler-error case.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& s) -> Status {
+        StringMessage in;
+        s.read(in); // drain at least the first frame so the test's
+                    // write actually leaves the client buffer
+        return Status{StatusCode::PermissionDenied, "operator denied"};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiDenied", handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    CallContext ctx;
+    auto bidi = ch->bidi_stream("yuzu.test.v1.Echo/BidiDenied", ctx);
+    REQUIRE(bidi != nullptr);
+
+    StringMessage out("hello");
+    REQUIRE(bidi->write(out));
+    bidi->writes_done();
+
+    StringMessage in;
+    while (bidi->read(in)) { /* drain — server sends no data frames */
+    }
+
+    Status fs = bidi->final_status();
+    REQUIRE(fs.code == StatusCode::PermissionDenied);
+    REQUIRE(fs.detail == "operator denied");
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic bidi concurrent reader and writer threads coexist",
+          "[transport][msquic][round-trip][bidi]") {
+    // transport.hpp BidiStream contract: single-reader + single-writer
+    // are concurrent-safe. This test runs them on separate threads on
+    // the same MsquicBidiStream and asserts every echoed frame arrives.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& s) -> Status {
+        StringMessage in;
+        while (s.read(in)) {
+            StringMessage out("ack:" + in.data());
+            if (!s.write(out)) {
+                return Status{StatusCode::Unavailable, "transport: server write failed"};
+            }
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiConcurrent", handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    CallContext ctx;
+    auto bidi = ch->bidi_stream("yuzu.test.v1.Echo/BidiConcurrent", ctx);
+    REQUIRE(bidi != nullptr);
+
+    constexpr int N = 10;
+    std::atomic<int> received{0};
+    std::thread reader([&] {
+        StringMessage in;
+        while (bidi->read(in)) {
+            received.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    std::thread writer([&] {
+        for (int i = 0; i < N; ++i) {
+            StringMessage out("c-" + std::to_string(i));
+            (void)bidi->write(out);
+        }
+        bidi->writes_done();
+    });
+    writer.join();
+    reader.join();
+
+    REQUIRE(received.load(std::memory_order_relaxed) == N);
+    REQUIRE(bidi->final_status().code == StatusCode::Ok);
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic bidi stream destroyed without final_status terminates cleanly",
+          "[transport][msquic][round-trip][bidi]") {
+    // transport.hpp: "destroying the BidiStream cancels the stream if
+    // not finished." The dtor must not hang or crash — and the listener
+    // must be able to shutdown() (which drains live connections) without
+    // waiting forever for the abandoned stream.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& s) -> Status {
+        StringMessage in;
+        while (s.read(in)) { /* discard */
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiDestroy", handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    CallContext ctx;
+    {
+        auto bidi = ch->bidi_stream("yuzu.test.v1.Echo/BidiDestroy", ctx);
+        REQUIRE(bidi != nullptr);
+        StringMessage out("x");
+        (void)bidi->write(out);
+        // Drop the unique_ptr without calling writes_done() or
+        // final_status() — dtor must cancel cleanly.
+    }
+
+    ch->close();
+    listener->shutdown(); // must not hang
 }
 
 #else // !YUZU_TRANSPORT_HAVE_MSQUIC

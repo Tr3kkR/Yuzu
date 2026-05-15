@@ -83,9 +83,24 @@ enum StatusCode {
 // emitters that log trailing metadata MUST treat values as untrusted
 // and pass through `audit_safe_string()` to prevent stored XSS or log
 // injection.
+//
+// SYMMETRIC scrub obligation (#897 / #988 — see the `Status::detail` and
+// "TRAILING METADATA" blocks in `transport/include/yuzu/transport/transport.hpp`,
+// lines ~141-196). Both `detail` and every key/value in `metadata` are
+// scrubbed to printable ASCII with a 1024-byte cap on BOTH inbound
+// (consumer) and outbound (emitter) sides. Receivers do not trust the
+// peer's adherence — a malicious or buggy peer can otherwise feed
+// control bytes / oversize blobs into Prometheus label cardinality,
+// audit-log rows, and dashboard SSE renders. The canonical helper is
+// `yuzu::transport::sanitise_status_detail` in
+// `transport/include/yuzu/transport/detail/sanitise.hpp`; backends
+// (gRPC today, msquic per PR 3) MUST route through it for wire-byte
+// compatibility.
 message TrailingStatus {
   StatusCode code = 1;
+  // SYMMETRIC scrub: see TrailingStatus message-level comment above.
   string detail = 2;
+  // SYMMETRIC scrub applies to BOTH key and value of every entry.
   map<string, string> metadata = 3;
 }
 

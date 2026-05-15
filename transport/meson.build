@@ -62,6 +62,7 @@ if transport_opt == 'msquic' or transport_opt == 'both'
   msquic_dep = dependency('msquic', method: 'cmake', include_type: 'system')
   yuzu_transport_srcs += [
     'src/msquic/msquic_internal_helpers.cpp',
+    'src/msquic/msquic_bidi_stream.cpp',
     'src/msquic/msquic_channel.cpp',
     'src/msquic/msquic_listener.cpp',
     'src/msquic/msquic_transport.cpp',
