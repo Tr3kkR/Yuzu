@@ -256,18 +256,79 @@ jobs:
       - name: Build
         run: meson compile -C build-linux-tsan
 
+      - name: Build gai_sync_shim (TSan + glibc getaddrinfo_a workaround)
+        # cpp-httplib enables CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO by
+        # default (HTTPLIB_IS_USING_NON_BLOCKING_GETADDRINFO=ON in
+        # httplibConfig.cmake), routing Client::create_socket through
+        # getaddrinfo_a(). glibc implements that by spawning an async DNS
+        # helper thread via clone3 directly — bypassing TSan's
+        # pthread_create interceptor — so the helper's per-thread
+        # allocator state never initialises and its first malloc() segfaults
+        # inside __tsan::SizeClassAllocator64LocalCache::Allocate (this=0x8).
+        # That bare SIGSEGV (#438) is what the #1031 race fix was unmasking;
+        # the diagnostic step below captured the stack in run 25901174628.
+        #
+        # The shim interposes getaddrinfo_a/gai_suspend/gai_error/gai_cancel
+        # with synchronous getaddrinfo on the calling thread — no async
+        # helper, no crash. Scoped to the TSan job only via LD_PRELOAD on
+        # the Test and gdb steps; production keeps the non-blocking-DNS
+        # behaviour (DNS timeouts still interruptible there).
+        run: |
+          cat > /tmp/gai_sync_shim.c << 'SHIM_EOF'
+          #define _GNU_SOURCE
+          #include <netdb.h>
+          #include <stddef.h>
+          #include <signal.h>
+          #include <time.h>
+
+          int getaddrinfo_a(int mode, struct gaicb *list[], int nitems,
+                             struct sigevent *sig) {
+              (void)mode; (void)sig;
+              for (int i = 0; i < nitems; ++i) {
+                  if (!list[i]) continue;
+                  list[i]->ar_result = NULL;
+                  list[i]->__return = getaddrinfo(list[i]->ar_name,
+                                                    list[i]->ar_service,
+                                                    list[i]->ar_request,
+                                                    &list[i]->ar_result);
+              }
+              return 0;
+          }
+
+          int gai_suspend(const struct gaicb *const list[], int nitems,
+                           const struct timespec *timeout) {
+              (void)list; (void)nitems; (void)timeout;
+              return 0; /* already completed synchronously */
+          }
+
+          int gai_error(struct gaicb *req) {
+              return req ? req->__return : 0;
+          }
+
+          int gai_cancel(struct gaicb *req) {
+              (void)req;
+              return EAI_NOTCANCELED;
+          }
+          SHIM_EOF
+          gcc -shared -fPIC -O2 -Wall -Wextra \
+            -o /tmp/libgai_sync_shim.so /tmp/gai_sync_shim.c
+          file /tmp/libgai_sync_shim.so
+
       - name: Test
+        env:
+          LD_PRELOAD: /tmp/libgai_sync_shim.so
         run: meson test -C build-linux-tsan --print-errorlogs
 
       - name: Capture stack trace under gdb (#438 diagnostic)
-        # The TSan nightly fails with a bare SIGSEGV (no TSan report) in the
-        # server unit suite — instrumentation-sensitive, not the originally-
-        # documented #438 httplib mechanism (whose fix landed in 7bd823e and is
-        # already in main). Re-run the failing binary under gdb so the next
-        # nightly captures a real all-thread backtrace at the crash site.
-        # Best-effort: SIGSEGV reproduction is Catch2-shuffle-dependent, so we
-        # replay the seed the meson run used when extractable.
+        # With the gai_sync_shim active, the originally-documented #438
+        # getaddrinfo_a crash is suppressed and the TSan suite should pass.
+        # This step only runs on failure, so any stack captured here is a
+        # NEW failure mode worth investigating. Best-effort: SIGSEGV
+        # reproduction is Catch2-shuffle-dependent, so we replay the seed
+        # the meson run used when extractable.
         if: failure()
+        env:
+          LD_PRELOAD: /tmp/libgai_sync_shim.so
         run: |
           sudo apt-get install -y gdb >/dev/null 2>&1 || true
           if ! command -v gdb >/dev/null; then
