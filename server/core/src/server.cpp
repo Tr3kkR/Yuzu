@@ -51,11 +51,15 @@
 #include "compliance_routes.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
+#include "fleet_topology_store.hpp"
+#include "heartbeat_ingestion.hpp"
+#include "fleet_topology_types.hpp"
 #include "mcp_server.hpp"
 #include "notification_routes.hpp"
 #include "offload_routes.hpp"
 #include "rest_api_v1.hpp"
 #include "settings_routes.hpp"
+#include "viz_routes.hpp"
 #include "webhook_routes.hpp"
 #include "workflow_routes.hpp"
 #include "runtime_config_store.hpp"
@@ -153,6 +157,8 @@ extern const char* const kSettingsHtml;
 extern const char* const kHelpHtml;
 extern const char* const kInstructionPageHtml;
 extern const char* const kTarPageHtml;
+extern const char* const kVizFleetPageHtml; // server/core/src/viz_page_ui.cpp (PR 5)
+extern const char* const kVizHostPageHtml;  // server/core/src/viz_host_page_ui.cpp (PR 9-pre)
 extern const char* const kInstructionEditorHtml;
 extern const char* const kInstructionEditorDeniedHtml;
 
@@ -164,6 +170,13 @@ namespace yuzu::server {
 extern const std::string kYuzuCss; // server/core/static/yuzu.css (build-time embed)
 extern const std::string kYuzuChartsJs;
 extern const std::string kEChartsJs; // server/core/vendor/echarts.min.js (Apache-2.0)
+extern const std::string kThreeJs;   // server/core/vendor/three.module.min.js (MIT, three.js r168)
+extern const std::string
+    kThreeOrbitControlsJs; // server/core/vendor/three-orbit-controls.js (MIT, three.js r168)
+extern const std::string
+    kYuzuVizJs; // server/core/src/yuzu_viz_js_bundle.cpp (PR 5 fleet renderer module)
+extern const std::string kYuzuVizHostJs; // server/core/src/yuzu_viz_host_js_bundle.cpp (PR 9-pre)
+extern const std::string kCytoscapeJs;   // Cytoscape.js 3.33.3 ESM (MIT)
 extern const std::string_view
     kInterVariableWoff2; // server/core/vendor/inter/InterVariable.woff2 (SIL OFL)
 extern const std::vector<std::string>
@@ -301,6 +314,76 @@ public:
                           "Cumulative SSE channels reaped after retention "
                           "window + zero subscribers",
                           "counter");
+        // Fleet visualization observability (PR 3 + PR 6 of feat/viz-engine).
+        // gov R6 SRE OBS-1: every metric has a describe() so /metrics
+        // includes # HELP and # TYPE lines for Prometheus / Grafana scrapers.
+        metrics_.describe("yuzu_viz_topology_request_seconds",
+                          "End-to-end /api/v1/viz/fleet/topology request latency", "histogram");
+        metrics_.describe("yuzu_viz_topology_fetch_duration_seconds",
+                          "Inner agent-dispatch (tar.fleet_snapshot fan-out) duration "
+                          "on cache-miss refills only; observed even on fetcher exception",
+                          "histogram");
+        metrics_.describe("yuzu_viz_cache_hit_total",
+                          "Fleet topology requests served from the FleetTopologyStore cache",
+                          "counter");
+        metrics_.describe("yuzu_viz_cache_miss_total",
+                          "Fleet topology requests that triggered a cache refill", "counter");
+        metrics_.describe("yuzu_viz_oversize_response_total",
+                          "Fleet topology requests rejected with HTTP 413 (machines_max breached)",
+                          "counter");
+        metrics_.describe("yuzu_viz_agent_dispatch_timeout_total",
+                          "Per-agent timeouts during tar.fleet_snapshot fan-out", "counter");
+        metrics_.describe("yuzu_viz_refill_oversize_drops_total",
+                          "Refills exceeding max_snapshot_bytes (returned to caller, not cached)",
+                          "gauge");
+        metrics_.describe("yuzu_viz_refill_wait_timeouts_total",
+                          "Single-flight waiters that timed out before the refill completed",
+                          "gauge");
+        metrics_.describe("yuzu_viz_refill_waiters_total",
+                          "Fetch waiters that piggybacked on an in-flight refill", "gauge");
+        // PR 10 hardening — push-ingestion metrics. `via` label
+        // distinguishes the direct HeartbeatRequest path from the
+        // gateway BatchHeartbeat path; sum across the label set to
+        // get fleet-wide push volume.
+        metrics_.describe("yuzu_viz_topology_pushed_total",
+                          "Agent-pushed fleet_snapshot.v1 payloads accepted into the "
+                          "FleetTopologyStore via heartbeat. Labelled by via=direct|gateway.",
+                          "counter");
+        metrics_.describe("yuzu_viz_topology_push_parse_errors_total",
+                          "Agent-pushed fleet_snapshot.v1 payloads rejected by the shared "
+                          "parser (oversized, row-cap exceeded, malformed JSON). Labelled "
+                          "by via=direct|gateway.",
+                          "counter");
+        metrics_.describe("yuzu_viz_local_edges_dropped_total",
+                          "EdgeScope::Local connection edges dropped from the snapshot "
+                          "before serialisation because no reciprocal half was visible in "
+                          "the same agent payload (PR 8). Non-zero under normal churn; a "
+                          "spike vs steady-state indicates systematic loss (kernel race, "
+                          "agent connection-cap truncation, half-open sockets).",
+                          "gauge");
+        // Gate 7 sre OBS-1/OBS-2/OBS-3 — push-ingestion failure modes were
+        // previously dark (no Prometheus exposure). A non-zero rate on the
+        // first two is operator-actionable: a rejection spike means an
+        // IP-spoof campaign or a NAT/DHCP misconfiguration; a cap-eviction
+        // spike means the fleet outgrew kPushedMapHardCap (or a cap-flood
+        // attack). pushed_map_size is the memory-pressure gauge to alert on
+        // before evictions begin.
+        metrics_.describe("yuzu_viz_topology_push_rejected_total",
+                          "Agent fleet_snapshot pushes rejected by the UP-1 IP-spoof guard "
+                          "(claimed local_ip owned by a live agent). Non-zero signals a "
+                          "spoofing campaign or NAT/DHCP misconfiguration.",
+                          "gauge");
+        metrics_.describe("yuzu_viz_pushed_cap_evictions_total",
+                          "FleetTopologyStore pushed_ entries evicted because the map was at "
+                          "kPushedMapHardCap when a new agent pushed (CAP-1 LRU). Non-zero "
+                          "means the fleet outgrew the cap or a cap-flood attack is evicting "
+                          "legitimate agents.",
+                          "gauge");
+        metrics_.describe("yuzu_viz_pushed_map_size",
+                          "Current occupancy of the FleetTopologyStore pushed_ map. Primary "
+                          "memory-pressure signal — alert before it approaches "
+                          "kPushedMapHardCap (100000).",
+                          "gauge");
 
         // Wire health store into agent service
         agent_service_.set_health_store(&health_store_);
@@ -451,6 +534,228 @@ public:
             }
         }
 
+        // Seed kill-switch from cfg_; runtime flip path can land later.
+        viz_disabled_.store(cfg_.viz_disable, std::memory_order_release);
+        if (cfg_.viz_disable) {
+            // gov R3 F-1 (compliance): the per-request audit row only fires
+            // when a request hits the disabled endpoint. Operators deploying
+            // with --viz-disable from boot need a startup-time evidence line
+            // confirming the kill-switch took effect. Mirrors the MCP
+            // precedent at server.cpp:5161 below.
+            spdlog::warn("[VIZ] viz endpoint disabled by configuration "
+                         "(--viz-disable / YUZU_VIZ_DISABLE)");
+        }
+
+        // Initialize fleet topology store (PR 3 of feat/viz-engine).
+        //
+        // The fetcher dispatches `tar.fleet_snapshot` to every connected
+        // agent on cache miss, polls the response_store for matches keyed
+        // on the synthesised command_id, and returns whatever arrived
+        // before the deadline. Missing agents come back as stale=true rows
+        // so the renderer dims their cubes rather than disappearing them.
+        //
+        // Notes on integration choices:
+        //  * No execution_id is recorded for the fetcher dispatch. The
+        //    executions tracker is operator-facing; an automated cache
+        //    refill happening every 60s would otherwise spam its history
+        //    pane. record_send_time stays so the standard latency
+        //    histogram still observes these dispatches (sec-INFO-10:
+        //    intentionally opted-out of cmd_execution_ids_).
+        //  * forward_gateway_pending() drains commands queued for
+        //    gateway-proxied agents so a fleet that mixes direct and
+        //    gateway-connected hosts gets uniform dispatch.
+        //  * The poll loop sleeps in 100ms increments; a future PR can
+        //    swap in the response-arrival event bus when one exists.
+        if (response_store_) {
+            auto fetcher =
+                [this](std::chrono::milliseconds deadline) -> std::vector<RawAgentSnapshot> {
+                std::vector<RawAgentSnapshot> out;
+                if (!response_store_ || !response_store_->is_open())
+                    return out;
+
+                auto agent_ids = registry_.all_ids();
+                if (agent_ids.empty())
+                    return out;
+
+                // Sibling dispatchers use `<plugin>-<hex>` (server.cpp:2820,
+                // 4879, 5014). Stick to that shape so anyone grepping
+                // response_store for `tar-` finds viz fetcher dispatches too,
+                // and so the `<plugin>-` prefix doesn't lie about the actual
+                // wire plugin (gov R3 C-3).
+                const auto command_id =
+                    "tar-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+
+                detail::pb::CommandRequest cmd;
+                cmd.set_command_id(command_id);
+                cmd.set_plugin("tar");
+                cmd.set_action("fleet_snapshot");
+
+                agent_service_.record_send_time(command_id);
+
+                std::unordered_set<std::string> dispatched;
+                dispatched.reserve(agent_ids.size());
+                for (const auto& aid : agent_ids) {
+                    if (registry_.send_to(aid, cmd))
+                        dispatched.insert(aid);
+                }
+                forward_gateway_pending();
+
+                if (dispatched.empty())
+                    return out;
+
+                // Poll response_store for matching responses until we have
+                // one per dispatched agent OR the deadline elapses. Each
+                // response carries `instruction_id == command_id` (set by
+                // agent_service when the frame arrives -- naming overload
+                // we live with).
+                const auto t_deadline = std::chrono::steady_clock::now() + deadline;
+                std::vector<StoredResponse> matched;
+                std::unordered_set<std::string> seen;
+                while (std::chrono::steady_clock::now() < t_deadline &&
+                       seen.size() < dispatched.size()) {
+                    ResponseQuery q;
+                    q.limit = static_cast<int>(dispatched.size()) + 16;
+                    auto rows = response_store_->query(command_id, q);
+                    for (const auto& r : rows) {
+                        if (seen.insert(r.agent_id).second)
+                            matched.push_back(r);
+                    }
+                    if (seen.size() >= dispatched.size())
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+
+                // Deduplicate by agent_id (one response per agent expected;
+                // duplicates ignored).
+                std::unordered_set<std::string> have;
+                out.reserve(dispatched.size());
+                for (const auto& r : matched) {
+                    if (!have.insert(r.agent_id).second)
+                        continue;
+                    // CommandResponse::Status enum: 1 == SUCCESS. Anything
+                    // else (FAILURE / TIMEOUT / REJECTED / RUNNING-only-row)
+                    // is treated as a stale snapshot for renderer purposes.
+                    if (r.status != 1) {
+                        RawAgentSnapshot rs;
+                        rs.agent_id = r.agent_id;
+                        rs.stale = true;
+                        if (auto sess = registry_.get_session(r.agent_id)) {
+                            rs.os = sess->os;
+                            rs.hostname = sess->hostname;
+                        }
+                        out.push_back(std::move(rs));
+                        continue;
+                    }
+                    // PR 10 hardening — share the parser with the push
+                    // ingestion sites so caps + sanitisation + field
+                    // set stay in lock-step (arch-B3 / cons-S1).
+                    std::string os_from_session, hostname_fallback, parse_err;
+                    if (auto sess = registry_.get_session(r.agent_id)) {
+                        os_from_session = sess->os;
+                        hostname_fallback = sess->hostname;
+                    }
+                    auto parsed = FleetTopologyStore::parse_fleet_snapshot_json(
+                        r.output, r.agent_id, os_from_session, &parse_err);
+                    if (parsed.has_value()) {
+                        out.push_back(std::move(*parsed));
+                    } else {
+                        spdlog::warn("FleetTopologyStore fetcher: rejected "
+                                     "fleet_snapshot.v1 from {} ({})",
+                                     r.agent_id, parse_err);
+                        RawAgentSnapshot rs;
+                        rs.agent_id = r.agent_id;
+                        rs.os = std::move(os_from_session);
+                        rs.hostname = std::move(hostname_fallback);
+                        rs.stale = true;
+                        out.push_back(std::move(rs));
+                    }
+                }
+
+                // Agents that were dispatched but never responded -> stale
+                // entries so the aggregate snapshot still shows them.
+                int dispatch_timeouts = 0;
+                for (const auto& aid : dispatched) {
+                    if (have.contains(aid))
+                        continue;
+                    RawAgentSnapshot rs;
+                    rs.agent_id = aid;
+                    rs.stale = true;
+                    if (auto sess = registry_.get_session(aid)) {
+                        rs.hostname = sess->hostname;
+                        rs.os = sess->os;
+                    }
+                    out.push_back(std::move(rs));
+                    ++dispatch_timeouts;
+                }
+                if (dispatch_timeouts > 0) {
+                    metrics_.counter("yuzu_viz_agent_dispatch_timeout_total")
+                        .increment(static_cast<double>(dispatch_timeouts));
+                }
+
+                return out;
+            };
+
+            // 60s TTL, 5s fetch deadline, 256 MiB max snapshot bytes from
+            // PR 2 defaults. nvd_db_ may be null if NVD store failed to open;
+            // the store handles that gracefully (vuln overlay becomes inert).
+            fleet_topology_store_ = std::make_unique<FleetTopologyStore>(
+                std::move(fetcher), nvd_db_ ? nvd_db_.get() : nullptr);
+
+            // PR 6 / OBS-2: wire the agent-dispatch duration histogram.
+            // Distinguishes "agent dispatch is slow" from "the rest of
+            // the request is slow" -- viz_routes.cpp already times the
+            // whole HTTP path via yuzu_viz_topology_request_seconds.
+            // Captures only on cache miss / refill (warm requests skip
+            // the fetcher entirely).
+            fleet_topology_store_->set_fetch_duration_observer(
+                [this](std::chrono::duration<double> elapsed) {
+                    metrics_.histogram("yuzu_viz_topology_fetch_duration_seconds")
+                        .observe(elapsed.count());
+                });
+            // gov R6 SRE OBS-2: log so a future refactor that silently
+            // skips the wire-up (re-ordered init, conditional metrics-off
+            // mode, etc.) leaves a positive trace operators can grep for
+            // when the histogram count fails to increment.
+            spdlog::debug("FleetTopologyStore: fetch-duration observer wired "
+                          "(yuzu_viz_topology_fetch_duration_seconds)");
+
+            // Gate 7 UP-9 / hp-S1 — roster provider. The push path skips
+            // the dispatch fetcher, so a registered agent that has not
+            // pushed (legacy build mid rolling-upgrade, TAR plugin off,
+            // wedged first-cycle pump) would silently vanish from the
+            // topology. The store consults this to emit a stale placeholder
+            // cube for every registered-but-unpushed agent. Session-sourced
+            // identity only — no agent-controlled JSON.
+            fleet_topology_store_->set_roster_provider(
+                [this]() -> std::vector<FleetTopologyStore::RosterEntry> {
+                    std::vector<FleetTopologyStore::RosterEntry> roster;
+                    auto ids = registry_.all_ids();
+                    roster.reserve(ids.size());
+                    for (const auto& aid : ids) {
+                        FleetTopologyStore::RosterEntry e;
+                        e.agent_id = aid;
+                        if (auto sess = registry_.get_session(aid)) {
+                            e.hostname = sess->hostname;
+                            e.os = sess->os;
+                        }
+                        roster.push_back(std::move(e));
+                    }
+                    return roster;
+                });
+
+            // UAT 2026-05-12: wire the store into AgentServiceImpl so a
+            // fresh Register() drops both cache slots — eliminates the
+            // up-to-60 s "stale ghost cube" window operators saw after
+            // server restarts.
+            agent_service_.set_fleet_topology_store(fleet_topology_store_.get());
+            // PR 10: also wire into the gateway upstream service so
+            // BatchHeartbeat ingests pushed snapshots from
+            // gateway-routed agents (the path 100% of viz-UAT traffic
+            // takes today).
+            if (gateway_service_)
+                gateway_service_->set_fleet_topology_store(fleet_topology_store_.get());
+        }
+
         // Initialize audit store
         {
             auto audit_db = cfg_.db_dir() / "audit.db";
@@ -458,6 +763,54 @@ public:
             if (audit_store_->is_open()) {
                 audit_store_->start_cleanup();
             }
+            // PR 10 hardening — wire AuditStore into FleetTopologyStore
+            // so push success (first-per-agent) and rejections emit
+            // AuditEvents (F-1 / CC6.1 / CC7.3 evidence chain). Must
+            // run after fleet_topology_store_ AND audit_store_ are
+            // both initialised; that ordering is fixed here.
+            if (fleet_topology_store_ && audit_store_ && audit_store_->is_open())
+                fleet_topology_store_->set_audit_store(audit_store_.get());
+
+            // Gate 7 compliance F-1 — durable evidence that the viz
+            // kill-switch took effect. The per-request `kill_switch` audit
+            // row in VizRoutes only fires when a request actually hits a
+            // disabled endpoint; a cold deployment with --viz-disable and
+            // no viz traffic would leave zero audit rows despite the
+            // feature being off. Emit one startup AuditEvent so an auditor
+            // asking "was viz disabled during window X?" can answer it from
+            // the audit store, not just process logs. Emitted here (rather
+            // than at the viz_disabled_ seed above) because audit_store_ is
+            // only constructed now.
+            if (cfg_.viz_disable && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "server.viz_disabled";
+                ev.target_type = "FleetTopology";
+                ev.target_id = "viz";
+                ev.detail = "fleet visualization endpoints disabled at startup "
+                            "(--viz-disable / YUZU_VIZ_DISABLE)";
+                ev.result = "success";
+                audit_store_->log(ev);
+            }
+
+            // CAP-1 (#1002) — bound the pushed_ map so a churning fleet or
+            // a session-management bug that leaves evict_pushed un-called
+            // can't grow the map unbounded. Cap at the same hard ceiling
+            // as the /viz machines_max DoS guard.
+            if (fleet_topology_store_)
+                fleet_topology_store_->set_pushed_map_cap(FleetTopologyStore::kPushedMapHardCap);
+
+            // #1000 / arch-S2 — construct the shared HeartbeatIngestion now
+            // that fleet_topology_store_ and health_store_ are wired, then
+            // inject into both ingestion paths so they cannot drift.
+            heartbeat_ingestion_ = std::make_unique<HeartbeatIngestion>(
+                registry_, &health_store_, fleet_topology_store_.get(), &metrics_);
+            agent_service_.set_heartbeat_ingestion(heartbeat_ingestion_.get());
+            if (gateway_service_)
+                gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
         }
 
         // Initialize tag store
@@ -922,6 +1275,29 @@ public:
                         .set(static_cast<double>(api_token_store_->cache_misses()));
                     metrics_.gauge("yuzu_server_token_cache_size")
                         .set(static_cast<double>(api_token_store_->cache_size()));
+                }
+                // Publish FleetTopologyStore internals so the 256 MiB store-
+                // level oversize cap and single-flight refill timeouts are
+                // observable -- the route-level yuzu_viz_oversize_response_total
+                // only fires on the machines_max gate, not on the byte cap
+                // (gov R3 OBS-1).
+                if (fleet_topology_store_) {
+                    metrics_.gauge("yuzu_viz_refill_oversize_drops_total")
+                        .set(static_cast<double>(fleet_topology_store_->refill_oversize_drops()));
+                    metrics_.gauge("yuzu_viz_refill_wait_timeouts_total")
+                        .set(static_cast<double>(fleet_topology_store_->refill_wait_timeouts()));
+                    metrics_.gauge("yuzu_viz_refill_waiters_total")
+                        .set(static_cast<double>(fleet_topology_store_->refill_waiters()));
+                    metrics_.gauge("yuzu_viz_local_edges_dropped_total")
+                        .set(static_cast<double>(fleet_topology_store_->local_edges_dropped()));
+                    // Gate 7 sre OBS-1/OBS-2/OBS-3 — push-ingestion failure-mode
+                    // counters, previously unscraped.
+                    metrics_.gauge("yuzu_viz_topology_push_rejected_total")
+                        .set(static_cast<double>(fleet_topology_store_->pushed_rejected_count()));
+                    metrics_.gauge("yuzu_viz_pushed_cap_evictions_total")
+                        .set(static_cast<double>(fleet_topology_store_->pushed_evicted_for_cap()));
+                    metrics_.gauge("yuzu_viz_pushed_map_size")
+                        .set(static_cast<double>(fleet_topology_store_->pushed_map_size()));
                 }
                 // Publish audit event write rate so the audit subsystem is observable.
                 if (audit_store_) {
@@ -2022,6 +2398,12 @@ private:
                 // silent no-op on every response.
                 {"execution_tracker",
                  execution_tracker_ != nullptr && instr_db_pool_ && instr_db_pool_->is_open()},
+                // gov R3 HC-1: FleetTopologyStore became load-bearing for
+                // /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology.
+                // Pure in-memory store with no is_open(); pointer-not-null is
+                // the right probe. Without this, a store-construction failure
+                // would leave /readyz "ready" while every viz request 503s.
+                {"fleet_topology_store", fleet_topology_store_ != nullptr},
             };
 
             std::string failed_list;
@@ -2547,6 +2929,66 @@ private:
                 res.set_header("Cache-Control", "public, max-age=86400");
                 res.set_content(yuzu::server::kEChartsJs, "application/javascript; charset=utf-8");
             });
+
+        // PR 4 of feat/viz-engine: vendored Three.js r168 (MIT) + OrbitControls
+        // (MIT, ES module). Modern Three.js (r150+) ships only as ES modules,
+        // so PR 5's page scaffold loads these via `<script type="importmap">`
+        // mapping `"three"` to `/static/three.module.min.js` and
+        // `"three/addons/controls/OrbitControls.js"` to
+        // `/static/three-orbit-controls.js`. Cache-Control matches the
+        // ECharts pattern: public, max-age=86400, content-addressed by
+        // server binary version.
+        web_server_->Get(
+            "/static/three.module.min.js", [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "public, max-age=86400");
+                res.set_content(yuzu::server::kThreeJs, "application/javascript; charset=utf-8");
+            });
+        web_server_->Get("/static/three-orbit-controls.js",
+                         [](const httplib::Request&, httplib::Response& res) {
+                             res.set_header("Cache-Control", "public, max-age=86400");
+                             res.set_content(yuzu::server::kThreeOrbitControlsJs,
+                                             "application/javascript; charset=utf-8");
+                         });
+        // PR 5 of feat/viz-engine: yuzu-viz.js renderer module. Loaded as
+        // type="module" so it can resolve the `import 'three'` bare
+        // specifier through the importmap declared in viz_page_ui.cpp.
+        //
+        // Cache-Control: no-cache, no-store, must-revalidate -- matches the
+        // /viz/fleet page shell. The renderer bundles change on every
+        // feat/viz-engine PR; a `max-age` here means operators serve a
+        // stale renderer (wrong tier classification, missing features,
+        // outdated layout code) for up to the max-age window after a
+        // server upgrade, with no signal that anything is wrong. The page
+        // shell already revalidates; the bundle it pulls must too, or the
+        // skew window just moves from the HTML to the JS. ~88 KB of
+        // revalidated body per page load is cheap next to a silently-stale
+        // renderer. Vendored libs below (cytoscape, three) keep max-age --
+        // they're content-stable and only change on a deliberate refresh.
+        web_server_->Get(
+            "/static/yuzu-viz.js", [](const httplib::Request&, httplib::Response& res) {
+                res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+                res.set_content(yuzu::server::kYuzuVizJs, "application/javascript; charset=utf-8");
+            });
+
+        // PR 9-pre: per-host renderer + vendored Cytoscape.js 3.33.3 (MIT).
+        // yuzu-viz-host.js is the ES module entry; cytoscape.min.js is the
+        // ESM minified Cytoscape bundle resolved via the importmap in
+        // viz_host_page_ui.cpp. The renderer uses cytoscape's built-in
+        // `cose` layout — no layout-extension asset is served.
+        //
+        // yuzu-viz-host.js gets the same no-cache treatment as yuzu-viz.js
+        // (it's our renderer code, changes every viz PR); cytoscape.min.js
+        // keeps max-age (vendored, content-stable).
+        web_server_->Get("/static/yuzu-viz-host.js", [](const httplib::Request&,
+                                                        httplib::Response& res) {
+            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+            res.set_content(yuzu::server::kYuzuVizHostJs, "application/javascript; charset=utf-8");
+        });
+        web_server_->Get("/static/cytoscape.min.js", [](const httplib::Request&,
+                                                        httplib::Response& res) {
+            res.set_header("Cache-Control", "public, max-age=86400");
+            res.set_content(yuzu::server::kCytoscapeJs, "application/javascript; charset=utf-8");
+        });
         // Inter variable webfont (SIL OFL) — the Yuzu design system's
         // default family. Single woff2 covers all weights via font-
         // variation-settings on the @font-face declaration in
@@ -3399,6 +3841,98 @@ private:
             }
             res.set_content(kTarPageHtml, "text/html; charset=utf-8");
         });
+
+        // PR 5 of feat/viz-engine: Fleet visualization page. Auth-gated
+        // (same posture as /tar) but the per-request RBAC check happens
+        // inside VizRoutes when the page's JS hits /api/v1/viz/fleet/topology.
+        // The page itself is just the renderer scaffold + nav chrome -- no
+        // per-machine data is rendered server-side; the JSON fetch on the
+        // client is what enforces Response.Read.
+        //
+        // Cache-Control: no-cache, no-store, must-revalidate forces the
+        // browser to revalidate the page HTML on every navigation. This
+        // closes the gov R4 UP-10 / DEP-1 / CHAOS-C3 "stale page + new
+        // bundle" skew window: the page references a hard-coded importmap
+        // for `/static/three.module.min.js` etc. that are themselves
+        // cached for 24 hours. Without revalidation, a heuristically-
+        // cached stale page after a server upgrade pairs with new asset
+        // bytes (or vice versa), producing a silent blank canvas with a
+        // module-resolution console error.
+        //
+        // Future-PR ordering note (gov R4 arch-S1): if a future PR
+        // introduces a regex route like `R"(/viz/([^/]+))"` for per-
+        // machine drill-in, register it AFTER this literal route or the
+        // first-match-wins routing in cpp-httplib would swallow `fleet`
+        // as a path parameter.
+        web_server_->Get("/viz/fleet", [this](const httplib::Request& req, httplib::Response& res) {
+            auto session = require_auth(req, res);
+            if (!session) {
+                res.set_redirect("/login");
+                return;
+            }
+            // Gate 7 sec-L1 / cons-N1 — honour the kill switch on the page
+            // shell, not just the REST/fragment endpoints. Previously the
+            // shell rendered and only the JSON fetch 503'd, leaving the
+            // operator with a half-working page and a console error. 503
+            // here matches the VizRoutes posture and the invariant doc's
+            // "a disabled viz surface returns 503".
+            if (viz_disabled_.load(std::memory_order_acquire)) {
+                res.status = 503;
+                res.set_content("fleet visualization is disabled by an administrator "
+                                "(--viz-disable / YUZU_VIZ_DISABLE)",
+                                "text/plain; charset=utf-8");
+                return;
+            }
+            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+            res.set_content(kVizFleetPageHtml, "text/html; charset=utf-8");
+        });
+
+        // PR 9-pre: per-host drill-down page. Opened by the 3D viz's
+        // dblclick handler in a new tab. Must be registered AFTER
+        // /viz/fleet (literal match wins; the regex below would otherwise
+        // swallow `fleet` as a parameter — gov R4 arch-S1 ordering).
+        // Agent_id is URL-decoded by httplib (req.matches[1]); we replace
+        // `{{AGENT_ID}}` in the static HTML with the sanitised id so the
+        // renderer can read it from data-agent-id without parsing the URL.
+        // Allow-list: a-z A-Z 0-9 dash underscore dot — anything else is
+        // 400 (the agent_id schema is hexadecimal-uuid-ish; nothing else
+        // should reach this route).
+        web_server_->Get(
+            R"(/viz/host/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session) {
+                    res.set_redirect("/login");
+                    return;
+                }
+                // Gate 7 sec-L1 / cons-N1 — kill switch on the host
+                // drill-down page shell too (cons-N1 confirmed the gap
+                // spans both viz page routes, not just /viz/fleet).
+                if (viz_disabled_.load(std::memory_order_acquire)) {
+                    res.status = 503;
+                    res.set_content("fleet visualization is disabled by an administrator "
+                                    "(--viz-disable / YUZU_VIZ_DISABLE)",
+                                    "text/plain; charset=utf-8");
+                    return;
+                }
+                const std::string raw_id = req.matches.size() > 1 ? req.matches[1].str() : "";
+                for (char c : raw_id) {
+                    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                                    (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+                    if (!ok) {
+                        res.status = 400;
+                        res.set_content("invalid agent_id", "text/plain");
+                        return;
+                    }
+                }
+                std::string html(kVizHostPageHtml);
+                const std::string token = "{{AGENT_ID}}";
+                for (auto pos = html.find(token); pos != std::string::npos;
+                     pos = html.find(token, pos + raw_id.size())) {
+                    html.replace(pos, token.size(), raw_id);
+                }
+                res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
+                res.set_content(std::move(html), "text/html; charset=utf-8");
+            });
 
         // -- Instruction management page --------------------------------------
         web_server_->Get("/instructions",
@@ -4862,6 +5396,12 @@ private:
             },
             policy_store_.get(), [this]() -> std::string { return registry_.to_json(); });
 
+        // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
+        // (PR 3 of feat/viz-engine ladder)
+        viz_routes_ = std::make_unique<VizRoutes>();
+        viz_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn,
+                                     fleet_topology_store_.get(), &metrics_, &viz_disabled_);
+
         // DashboardRoutes — /fragments/results, /fragments/results/filter-bar,
         //                   /fragments/create-group-form, /api/dashboard/group-from-results
         dashboard_routes_ = std::make_unique<DashboardRoutes>();
@@ -5456,6 +5996,18 @@ private:
     std::unique_ptr<WebhookRoutes> webhook_routes_;
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
+
+    // Fleet visualization (PR 3 of feat/viz-engine ladder)
+    std::unique_ptr<FleetTopologyStore> fleet_topology_store_;
+    /// #1000 / arch-S2: shared heartbeat-ingestion pipeline. Constructed
+    /// after fleet_topology_store_ + health_store_ + metrics are wired;
+    /// injected into AgentServiceImpl and GatewayUpstreamServiceImpl so
+    /// both ingestion paths funnel through one entry point.
+    std::unique_ptr<HeartbeatIngestion> heartbeat_ingestion_;
+    std::unique_ptr<VizRoutes> viz_routes_;
+    /// Atomic kill-switch consulted by VizRoutes on every request. Defaults
+    /// to cfg_.viz_disable; runtime config could expose a flip path later.
+    std::atomic<bool> viz_disabled_{false};
 
     // Phase 7: Runtime config, custom properties, health monitoring, workflows, product packs
     std::unique_ptr<RuntimeConfigStore> runtime_config_store_;

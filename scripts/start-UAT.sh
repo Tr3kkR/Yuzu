@@ -358,6 +358,9 @@ start_all() {
     # but in this UAT topology agents connect through the gateway only.
     echo ""
     echo "[1/3] Starting yuzu-server..."
+    # Rate limits are bumped well above production defaults so the /test
+    # Phase 5 fan-out (instructions runner with parallelism=4, parallel
+    # security E2E logins, etc.) doesn't trip 429s/401s. (#1006, #1007)
     "$BUILDDIR/server/core/yuzu-server" \
         --no-tls \
         --no-https \
@@ -368,6 +371,8 @@ start_all() {
         --web-address 0.0.0.0 \
         --log-level info \
         --metrics-no-auth \
+        --rate-limit 2000 \
+        --login-rate-limit 200 \
         --config "$UAT_DIR/yuzu-server.cfg" \
         > "$UAT_DIR/server.log" 2>&1 &
     local server_pid=$!
@@ -471,13 +476,15 @@ start_all() {
     fi
     local agent_pid=$!
 
-    # Wait for registration
+    # Wait for registration. PR 10 push-pump agents have a first-delay before
+    # the initial heartbeat, so the worst case is ~10-20s. 30s gives headroom
+    # on a moderately busy dev box. (#1003)
     local waited=0
     while ! grep -q "Registered with server" "$UAT_DIR/agent.log" 2>/dev/null; do
         sleep 1
         waited=$((waited + 1))
-        if [ "$waited" -ge 15 ]; then
-            fail "Agent did not register within 15s. Check $UAT_DIR/agent.log"
+        if [ "$waited" -ge 30 ]; then
+            fail "Agent did not register within 30s. Check $UAT_DIR/agent.log"
             exit 1
         fi
     done
@@ -547,7 +554,13 @@ start_all() {
     tests_total=$((tests_total + 1))
     local reg_count
     # awk replaces grep -oP '\K' (lookbehind) which BSD grep lacks.
-    reg_count=$(curl -s http://localhost:8080/metrics | awk '/^yuzu_agents_registered_total /{print $2; exit}')
+    # `awk ... ; exit` triggers SIGPIPE on the upstream curl when awk
+    # closes stdin after the first match; combined with `set -o pipefail`
+    # the script aborts after this line and Phase 4 records FAIL despite
+    # the stack being healthy. Let awk read to EOF instead — the metrics
+    # body is small (a few KB) so there's no cost. (#988-pattern fix
+    # carried over from feat/quic-transport `7f28d21`.)
+    reg_count=$(curl -s http://localhost:8080/metrics | awk '/^yuzu_agents_registered_total /{val=$2} END{print val}')
     [ -z "$reg_count" ] && reg_count=0
     if [ "$reg_count" -ge 1 ]; then
         ok "Server sees $reg_count registered agent(s)"
@@ -559,7 +572,8 @@ start_all() {
     # Test 4: Gateway metrics show agent connection
     tests_total=$((tests_total + 1))
     local gw_agents
-    gw_agents=$(curl -s http://localhost:9568/metrics | awk '/^yuzu_gw_agents_connected_total\{/{print $2; exit}')
+    # awk-no-exit pattern; see comment above on reg_count. (#988-pattern)
+    gw_agents=$(curl -s http://localhost:9568/metrics | awk '/^yuzu_gw_agents_connected_total\{/{val=$2} END{print val}')
     [ -z "$gw_agents" ] && gw_agents=0
     if [ "$gw_agents" -ge 1 ]; then
         ok "Gateway shows $gw_agents connected agent(s)"

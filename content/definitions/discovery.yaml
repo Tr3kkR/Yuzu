@@ -27,7 +27,7 @@ metadata:
   tags: [discovery, network, scan, inventory]
 
 spec:
-  type: query
+  type: question
   platforms: [windows, linux, darwin]
 
   execution:

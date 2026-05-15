@@ -508,18 +508,36 @@ log "Category 7: Rate Limiting"
 GOT_429=false
 GOT_RETRY_AFTER=false
 
-# Send 50 rapid POST /login requests with bad credentials.
-# The server's default login rate limit is 10/sec per IP, so this should
-# trigger a 429 fairly quickly.
-for i in $(seq 1 50); do
-    RESP=$(curl -s -D- -o /dev/null -w "\n%{http_code}" \
-        -X POST "${SERVER_URL}/login" \
-        -d "username=ratelimit_test&password=bad_${i}" 2>/dev/null || echo "")
-    STATUS=$(echo "$RESP" | tail -1)
-    if [[ "$STATUS" == "429" ]]; then
+# Drive POST /login in parallel until a 429 fires. The production-default
+# login rate limit is 10/sec per IP; the /test pipeline's UAT bumps that
+# to 200/sec (#1006/#1007) so the parallel Phase 5 fan-out doesn't
+# self-DoS. Sequential curl requests are paced by per-request latency
+# (~30-50ms each, so ~20-30/sec max), never exceeding the high UAT
+# bucket. Fan-out via xargs -P to genuinely exceed the bucket: 500
+# requests at concurrency 64 floods the limiter from a cold bucket
+# within a second on any sane box. If the limiter is OFF entirely none
+# of the 500 returns 429 — that IS the bug the test catches.
+RATELIMIT_ATTEMPTS=500
+RATELIMIT_PARALLELISM=64
+RATELIMIT_TMP=$(mktemp -d)
+trap "rm -rf '$RATELIMIT_TMP'" EXIT
+# Each worker writes a full header dump to a per-request file. We then
+# look for any file whose first line is a 429 and inspect its headers
+# for Retry-After. Doing it this way (rather than a serial follow-up
+# after the storm) avoids the refill race — the bucket refills within
+# ~10ms after the storm ends, so a serial follow-up reliably gets a
+# fresh token and we miss the 429 headers.
+seq 1 $RATELIMIT_ATTEMPTS | xargs -P "$RATELIMIT_PARALLELISM" -I{} sh -c "
+    curl -s -D'$RATELIMIT_TMP/h_{}' -o /dev/null \
+        -X POST '${SERVER_URL}/login' \
+        -d 'username=ratelimit_test&password=bad_{}' 2>/dev/null || true
+"
+# Pick any 429 response file and read its headers.
+for h in "$RATELIMIT_TMP"/h_*; do
+    [[ -f "$h" ]] || continue
+    if head -1 "$h" | grep -q "429"; then
         GOT_429=true
-        # Check for Retry-After header in the captured headers
-        if echo "$RESP" | grep -qi "Retry-After"; then
+        if grep -qi "^Retry-After:" "$h"; then
             GOT_RETRY_AFTER=true
         fi
         break
@@ -528,9 +546,9 @@ done
 
 TESTS=$((TESTS + 1))
 if $GOT_429; then
-    pass "Rate limiting triggered (429 returned within 50 requests)"
+    pass "Rate limiting triggered (429 returned within $RATELIMIT_ATTEMPTS parallel requests)"
 else
-    fail "Rate limiting NOT triggered (no 429 in 50 rapid login attempts)"
+    fail "Rate limiting NOT triggered (no 429 in $RATELIMIT_ATTEMPTS parallel login attempts)"
 fi
 
 TESTS=$((TESTS + 1))

@@ -403,13 +403,13 @@ gate_run "C++ unit (Catch2)" "unit-cpp.log" \
     "meson test -C \"$BUILDDIR\" --suite agent --suite server --suite tar --suite proto --suite docs --print-errorlogs"
 
 gate_run "EUnit" "eunit.log" \
-    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; REBAR_BASE_DIR=\$PWD/_build_eunit rebar3 eunit --dir apps/yuzu_gw/test"
+    "bash scripts/test/eunit-gate.sh"
 
 gate_run "Dialyzer" "dialyzer.log" \
     "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; rebar3 dialyzer"
 
 gate_run "CT suites" "ct.log" \
-    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; REBAR_BASE_DIR=\$PWD/_build_ct rebar3 ct --dir apps/yuzu_gw/test --suite=yuzu_gw_e2e_SUITE,yuzu_gw_integration_SUITE,yuzu_gw_metrics_e2e_SUITE,yuzu_gw_prometheus_SUITE"
+    "cd gateway && source ../scripts/ensure-erlang.sh 2>/dev/null; REBAR_BASE_DIR=\$PWD/_build_ct rebar3 ct --dir apps/yuzu_gw/test/ct --suite=yuzu_gw_e2e_SUITE,yuzu_gw_integration_SUITE,yuzu_gw_metrics_e2e_SUITE,yuzu_gw_prometheus_SUITE"
 
 # Real-upstream CT suite — lives under apps/yuzu_gw/integration_test/
 # (separate dir from the regular test/ tree so CI's `rebar3 ct --dir

@@ -1,7 +1,7 @@
 # Enterprise Readiness Plan: SOC 2 Type II + First Large Enterprise Customer
 
-**Version:** 1.0  
-**Date:** 2026-04-04  
+**Version:** 1.0
+**Date:** 2026-04-04
 **Audience:** Engineering, Security, Product, Operations, GTM, Executive Leadership
 
 ---
@@ -150,8 +150,13 @@ Yuzu has strong product depth (agent/server/gateway architecture, RBAC, policy e
 | Guaranteed-state rules | `guaranteed-state.db` (`guaranteed_state_rules`) | Rule definitions (configuration) | Indefinite — lifecycle via explicit delete | REST DELETE / `delete_rule` | n/a |
 | Guaranteed-state events | `guaranteed-state.db` (`guaranteed_state_events`) | Drift/remediation telemetry (high-volume operational) | **30 days default** | `GuaranteedStateStore::run_cleanup` thread — `DELETE … WHERE ttl_expires_at > 0 AND ttl_expires_at < now` | `guardian_event_retention_days` |
 | Analytics events | ClickHouse / JSONL | Telemetry + usage | Customer-controlled (external sink) | Sink-side retention | `clickhouse_*`, `analytics_jsonl_path` |
+| Fleet visualization cache | `FleetTopologyStore` (in-memory) | Aggregated `tar.fleet_snapshot` topology — per-machine process records (pid, ppid, process name, OS user, category) and connection edges | **60 s TTL, LRU-of-2 cache slots** (one per `include_vuln` value) | Time-based eviction in-process; never persisted to disk | `--viz-disable` to disable entirely; `tar.configure process_enabled=false` per-agent to suppress process collection upstream |
+| Threat-graph recommendations *(proposed, capability §28.9)* | `recommendations.db` | Agentic-AI-produced hardening suggestions awaiting operator action; carries customer_id, generator id, target node/edge keys, rationale, status (open / accepted / dismissed / applied) | Indefinite while open; **90 days default** after dismissed/applied | `RecommendationStore::run_cleanup` thread (planned) — `DELETE … WHERE status IN ('dismissed','applied') AND closed_at < now - retention` | `recommendation_retention_days` |
+| VirusTotal hash cache *(proposed, capability §28.8)* | `virustotal_cache.db` | Rate-limited SHA-256 → verdict lookup cache; verdict, scanned_at, engine_hits JSON | **7 days default** | TTL at insert; opportunistic eviction on lookup | `virustotal_cache_ttl_days` |
 
 Retention numbers are inline defaults; every store exposes a `retention_days` constructor argument so a customer can tighten them without a code change. `retention_days = 0` disables the reaper (intended for forensic freezes; requires a compensating manual-export process to avoid unbounded growth).
+
+The fleet visualization cache (`FleetTopologyStore`) is the highest-resolution endpoint telemetry surfaced in the dashboard. It holds at most two snapshots in memory at any time (single-flight refill, no SQLite persistence) and each snapshot is invalidated 60 seconds after the agent dispatch completes; restarting the server purges all cached topology. Process-level fields (`name`, `user`, `category`) are agent-controlled strings rendered after HTML escape and length clamp; the `category` field is computed server-side from a typed enum (`process_category.hpp`) so agents cannot inject arbitrary palette keys. Privacy-sensitive customers can suppress process collection on specific agents via `tar.configure process_enabled=false` (the corresponding cubes in the visualization render with no interior dots) or disable the whole feature with `--viz-disable` / `YUZU_VIZ_DISABLE`.
 
 The Guardian events table is sized for **~10k events/s during a fleet-wide incident** (design doc §9.1), i.e. ~864M rows/day. The 30-day default is the retention/recovery trade-off: long enough to correlate an incident across the standard forensic window, short enough to keep steady-state disk under ~25GB per million endpoints at typical drift rates. Tenants with longer forensic SLAs should raise `guardian_event_retention_days` _and_ provision storage — the product does not auto-trim disk.
 
@@ -316,4 +321,3 @@ The Guardian events table is sized for **~10k events/s during a fleet-wide incid
 - Access review records and privileged access logs.
 - Change management and release approval records.
 - Vulnerability management reports and remediation logs.
-

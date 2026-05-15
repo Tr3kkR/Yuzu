@@ -1702,8 +1702,11 @@ This section enumerates the stable builtin primitives that content authors targe
 | `tar.sql` | `tar` | Y | Y | Y | Verified |
 | `tar.rollup` | `tar` | Y | Y | Y | Verified |
 | `tar.compatibility` | `tar` | Y | Y | Y | Verified |
+| `tar.fleet_snapshot` | `tar` | Y | Y | Y | Active |
 
 **`tar.compatibility`** -- Emit the live OS compatibility matrix for all four capture sources (process, tcp, service, user). Returns one `header|...` line followed by N `row|source|os|status|capture_method|notes` lines. Status values: `supported` | `constrained` | `planned` | `unsupported`. Read-only static metadata; safe to call at any frequency. Use to verify which sources are wired on the current agent OS before configuring `network_capture_method`.
+
+**`tar.fleet_snapshot`** -- Enumerate running processes, open network connections, and host-bound IPs and emit a single `fleet_snapshot.v1` JSON document. Each list is capped at 4096 entries; truncation is flagged via `truncated_processes` / `truncated_connections`. Cmdlines are redacted per the active redaction patterns (defaults always apply). When the operator has paused the `process` or `tcp` source, the corresponding list is empty and `process_source_paused` / `tcp_source_paused` markers appear in the document. Consumed by the server-side `FleetTopologyStore` for the `/viz/fleet` 3D renderer (PR ladder 1-11). Dispatched on demand by the server at the topology cache TTL (default 60 s); not typically invoked manually.
 
 ### 14.16 Test and Debug
 

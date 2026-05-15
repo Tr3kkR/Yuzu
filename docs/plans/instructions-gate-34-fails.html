@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Yuzu — Instructions gate: 34 failing instructions</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #161a21;
+    --panel-2: #1c222b;
+    --border: #2a313c;
+    --fg: #e6e8eb;
+    --muted: #9aa3af;
+    --accent: #7aa2f7;
+    --ok: #7ee787;
+    --warn: #e3b341;
+    --bad: #ff6b6b;
+    --skip: #a78bfa;
+    --code-bg: #0b0e13;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 15px; line-height: 1.5;
+  }
+  main { max-width: 1200px; margin: 0 auto; padding: 32px 24px 64px; }
+  h1 { font-size: 28px; margin: 0 0 4px; }
+  h2 { font-size: 21px; margin: 36px 0 12px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 17px; margin: 24px 0 8px; color: var(--accent); }
+  .sub { color: var(--muted); margin-bottom: 24px; }
+  code, pre { font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace; font-size: 13px; }
+  code { background: var(--code-bg); padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px 16px; overflow-x: auto; line-height: 1.45;
+  }
+  pre code { background: none; border: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; background: var(--panel); }
+  th, td {
+    border: 1px solid var(--border); padding: 8px 10px; vertical-align: top;
+    text-align: left; font-size: 13.5px;
+  }
+  th { background: var(--panel-2); font-weight: 600; color: var(--accent); }
+  tr:nth-child(even) td { background: rgba(255,255,255,0.015); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; width: 38px; color: var(--muted); }
+  .cause {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    font-weight: 600; font-size: 12px; letter-spacing: 0.3px;
+  }
+  .cause-A { background: #1d3a5c; color: #9ec4ff; }
+  .cause-B { background: #2c3a1d; color: #c0e493; }
+  .cause-C { background: #3a1d2c; color: #f0a3c0; }
+  .cause-D { background: #3a2d1d; color: #e3b341; }
+  .cause-E { background: #3a1d1d; color: #ff8a8a; }
+  .cause-F { background: #2d1d3a; color: #c4a7ff; }
+  .pill {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    font-size: 12px; font-weight: 600; letter-spacing: 0.3px;
+  }
+  .pill-win { background: #1c3458; color: #9ec4ff; }
+  .pill-lin { background: #1c4530; color: #9eddb5; }
+  .pill-mac { background: #4a3a1a; color: #f4d28a; }
+  .pill-all { background: #2a313c; color: #cfd5df; }
+  .resp { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: #f0a3c0; white-space: pre-wrap; word-break: break-word; }
+  .summary-grid {
+    display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; margin: 16px 0 24px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px;
+  }
+  .card .num-big { font-size: 28px; font-weight: 700; }
+  .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 4px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 8px 0 16px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+  ul.tight li { margin: 2px 0; }
+  .callout {
+    background: var(--panel); border-left: 3px solid var(--accent); padding: 10px 14px;
+    border-radius: 4px; margin: 12px 0; color: var(--fg);
+  }
+  .callout.warn { border-left-color: var(--warn); }
+  .callout.bad  { border-left-color: var(--bad); }
+  .callout.ok   { border-left-color: var(--ok); }
+  details { margin: 8px 0; }
+  summary { cursor: pointer; color: var(--accent); padding: 4px 0; }
+  .toc { columns: 2; column-gap: 32px; padding: 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .toc li { break-inside: avoid; list-style: none; padding: 2px 0; }
+  .meta { color: var(--muted); font-size: 13px; }
+  .meta strong { color: var(--fg); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Instructions gate &mdash; 34 failing instructions</h1>
+<p class="sub">Cross-platform Linux / macOS / Windows feature parity reference. Branch: <code>feat/viz-engine</code> &middot; Last run <code>1778652107-77698</code> (2026-05-13 07:01 UTC).</p>
+
+<div class="callout">
+  <strong>Goal:</strong> Yuzu must work equally well on Linux, macOS, and Windows. Get to feature parity where possible, then run <code>/test</code> on all three platforms (this Mac, OrbStack Linux VM, Shulgi Windows). Windows-only instructions stay <em>SKIP</em> off-Windows; everything else should be <em>PASS</em> on every host.
+</div>
+
+<h2 id="summary">Summary</h2>
+
+<div class="summary-grid">
+  <div class="card"><div class="num-big">144</div><div class="label">Pass</div></div>
+  <div class="card"><div class="num-big" style="color: var(--bad)">34</div><div class="label">Fail</div></div>
+  <div class="card"><div class="num-big" style="color: var(--warn)">7</div><div class="label">Pending</div></div>
+  <div class="card"><div class="num-big" style="color: var(--skip)">33</div><div class="label">Skip</div></div>
+  <div class="card"><div class="num-big">38s</div><div class="label">Wall</div></div>
+  <div class="card"><div class="num-big">218</div><div class="label">Total</div></div>
+</div>
+
+<h3>Root-cause buckets</h3>
+<table>
+  <thead><tr><th style="width:60px">Cause</th><th style="width:60px">Count</th><th style="width:180px">Owner</th><th>Fix shape</th><th style="width:90px">Cross-plat?</th></tr></thead>
+  <tbody>
+    <tr><td><span class="cause cause-A">A</span></td><td>15</td><td>Test runner</td><td>Synthesise plausible defaults for required parameters from the YAML schema</td><td><span class="pill pill-all">all</span></td></tr>
+    <tr><td><span class="cause cause-B">B</span></td><td>9</td><td>Test runner</td><td>Honour YAML <code>platforms:</code> &mdash; host-not-in-list maps to <em>SKIP</em>, not FAIL</td><td><span class="pill pill-all">all</span></td></tr>
+    <tr><td><span class="cause cause-C">C</span></td><td>5</td><td>Plugins</td><td>Stale or missing macOS / Linux branch &mdash; this is the parity work</td><td><span class="pill pill-mac">mac</span> <span class="pill pill-lin">lin</span></td></tr>
+    <tr><td><span class="cause cause-D">D</span></td><td>2</td><td>YAML or importer</td><td><code>type: query</code> rejected by importer &mdash; rename to <code>question</code> or add alias</td><td><span class="pill pill-all">all</span></td></tr>
+    <tr><td><span class="cause cause-E">E</span></td><td>1</td><td>tar plugin</td><td>Real bug &mdash; <code>UNION ALL</code> column-count mismatch in <code>tar.export</code> SQL</td><td><span class="pill pill-all">all</span></td></tr>
+    <tr><td><span class="cause cause-F">F</span></td><td>2</td><td>Plugins or runner</td><td>Empty-result conditions returning <code>error|...</code> instead of rc=0</td><td><span class="pill pill-all">all</span></td></tr>
+  </tbody>
+</table>
+
+<div class="callout ok">
+  <strong>Order:</strong> A &rarr; B &rarr; D drops 34 &rarr; 8 with three contained PRs. Then E, F, C as parity work.
+</div>
+
+<h2 id="parity-strategy">Cross-platform parity strategy</h2>
+
+<p>The handover doc treated bucket B (9 Windows-only definitions) as <em>"just skip them off-Windows"</em>. Widen the lens: which of these <em>should</em> have Linux/macOS equivalents?</p>
+
+<table>
+  <thead><tr><th>Definition</th><th>Win behaviour</th><th>Linux equivalent</th><th>macOS equivalent</th><th>Parity verdict</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>crossplatform.process.fetch</code></td>
+      <td>WMI / toolhelp</td>
+      <td><code>/proc/&lt;pid&gt;</code> walk (already works)</td>
+      <td><code>proc_listpids</code> + <code>proc_pidpath</code> + <code>sysctl</code></td>
+      <td><strong>Parity required</strong> &mdash; add macOS branch</td>
+    </tr>
+    <tr>
+      <td><code>device.wifi.list_networks</code></td>
+      <td>netsh wlan</td>
+      <td><code>iw dev … scan</code> / <code>nmcli</code></td>
+      <td><code>wdutil info</code> (privileged) or <code>system_profiler SPAirPortDataType</code></td>
+      <td><strong>Parity required</strong> &mdash; <code>airport</code> removed in macOS 14+</td>
+    </tr>
+    <tr>
+      <td><code>security.sccm.client_version</code> / <code>.site</code></td>
+      <td>Registry / WMI</td>
+      <td>n/a (SCCM is Windows-only)</td>
+      <td>n/a</td>
+      <td><strong>SKIP off-Windows</strong> &mdash; YAML <code>platforms: [windows]</code></td>
+    </tr>
+    <tr>
+      <td><code>windows.registry.*</code> (5)</td>
+      <td>Native registry API</td>
+      <td>n/a</td>
+      <td>n/a</td>
+      <td><strong>SKIP off-Windows</strong></td>
+    </tr>
+    <tr>
+      <td><code>windows.software.msi.*</code> (2)</td>
+      <td>MSI API</td>
+      <td>Could parallel with <code>dpkg/rpm</code> under a different id (<code>linux.software.deb.*</code>)</td>
+      <td>Could parallel with <code>pkgutil</code> under <code>mac.software.pkg.*</code></td>
+      <td><strong>SKIP off-Windows</strong>; file parity issues for Linux/mac equivalents under their own ids</td>
+    </tr>
+    <tr>
+      <td><code>windows.wmi.*</code> (2)</td>
+      <td>WMI/CIM</td>
+      <td>n/a (WMI is Windows-only)</td>
+      <td>n/a</td>
+      <td><strong>SKIP off-Windows</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <strong>Action:</strong> The YAML <code>platforms:</code> field on the 9 Windows-only defs needs auditing. If any of them currently declare <code>[windows, linux, macos]</code> (which is why the runner dispatches them on Mac), correct to <code>[windows]</code>. That alone moves them from FAIL to SKIP without touching the runner. Runner-side platform-aware skip (bucket B) is still the right belt-and-braces fix.
+</div>
+
+<h2 id="per-instruction">Per-instruction table</h2>
+<p class="meta">Click a row's response cell to copy. Sort/filter columns visually by scanning the cause badges.</p>
+
+<table>
+<thead><tr>
+  <th>#</th><th>Instruction</th><th>Type</th><th>Platforms (declared)</th><th>What it does</th><th>Response on macOS UAT</th><th>Cause</th>
+</tr></thead>
+<tbody>
+<tr><td class="num">1</td><td><code>agent.content_dist.stage</code></td><td>action</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Download a file to agent's staging dir, verify SHA256</td><td class="resp">error|missing required parameters: url, filename, sha256</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">2</td><td><code>agent.content_dist.upload_file</code></td><td>action</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Upload a local file from agent &rarr; server via multipart POST</td><td class="resp">error|missing required parameter: path</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">3</td><td><code>crossplatform.process.fetch</code></td><td>question</td><td><span class="pill pill-win">win</span> <span class="pill pill-lin">lin</span></td><td>Deep process enumeration with SHA-1 hash of each exe</td><td class="resp">error: process enumeration not supported on this platform</td><td><span class="cause cause-B">B</span> <span class="cause cause-C">C</span></td></tr>
+<tr><td class="num">4</td><td><code>crossplatform.tar.export</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Export TAR events as JSON for Splunk/ELK</td><td class="resp">error|query failed: SELECTs to the left and right of UNION ALL do not have the same number ...</td><td><span class="cause cause-E">E</span></td></tr>
+<tr><td class="num">5</td><td><code>crossplatform.tar.sql</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Execute arbitrary SELECT against TAR warehouse</td><td class="resp">error|missing required 'sql' parameter</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">6</td><td><code>device.agent_logging.get_log</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Tail last N lines of the agent log</td><td class="resp">status|error|agent log file not found</td><td><span class="cause cause-F">F</span> <span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">7</td><td><code>device.discovery.scan_subnet</code></td><td><strong>query</strong></td><td><span class="pill pill-all">win/lin/mac</span></td><td>ARP-table + ICMP-sweep subnet scan</td><td class="resp">DISPATCH_ERR: instruction definition not found
+(server log: bundled definition import failed: type must be 'question' or 'action')</td><td><span class="cause cause-D">D</span></td></tr>
+<tr><td class="num">8</td><td><code>device.event_logs.errors</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Recent Level-2 (Error) event log entries</td><td class="resp">error|Timestamp|...akd[951:...</td><td><span class="cause cause-F">F</span></td></tr>
+<tr><td class="num">9</td><td><code>device.filesystem.file_hash</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>SHA-256 of a given file</td><td class="resp">error|missing required parameter: path</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">10</td><td><code>device.filesystem.find_by_hash</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Recursive search for files with given SHA256</td><td class="resp">error|missing required parameters: directory, sha256</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">11</td><td><code>device.filesystem.get_acl</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>NTFS ACL / POSIX mode</td><td class="resp">error|missing required parameter: path</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">12</td><td><code>device.filesystem.get_signature</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Authenticode / codesign signature info</td><td class="resp">error|missing required parameter: path</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">13</td><td><code>device.filesystem.get_version_info</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>PE / Mach-O / ELF version metadata of a binary</td><td class="resp">error|missing required parameter: path</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">14</td><td><code>device.filesystem.list_dir</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Non-recursive directory listing</td><td class="resp">error|missing required parameter: path</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">15</td><td><code>device.filesystem.read</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Read file contents (capped)</td><td class="resp">error|missing required parameter: path</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">16</td><td><code>device.filesystem.search</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Recursive glob search</td><td class="resp">error|missing required parameters: path, pattern</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">17</td><td><code>device.filesystem.search_dir</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Recursive search rooted at a directory</td><td class="resp">error|missing required parameters: root, pattern</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">18</td><td><code>device.users.group_members</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>List members of a local OS group</td><td class="resp">group_member|error|Missing required parameter: group</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">19</td><td><code>device.wifi.list_networks</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>List nearby Wi-Fi networks (SSID, BSSID, signal)</td><td class="resp">wifi|error|airport command not available|0|0|none</td><td><span class="cause cause-C">C</span></td></tr>
+<tr><td class="num">20</td><td><code>security.certificates.details</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Details for cert by thumbprint</td><td class="resp">error|thumbprint parameter required</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">21</td><td><code>security.ioc.check</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Check IOC (hash/IP/domain) against device state</td><td class="resp">error|none|false|No IOC parameters provided</td><td><span class="cause cause-A">A</span></td></tr>
+<tr><td class="num">22</td><td><code>security.sccm.client_version</code></td><td>question</td><td><span class="pill pill-win">win</span> (declared all)</td><td>SCCM client version</td><td class="resp">installed|false error|platform not supported</td><td><span class="cause cause-B">B</span></td></tr>
+<tr><td class="num">23</td><td><code>security.sccm.site</code></td><td>question</td><td><span class="pill pill-win">win</span> (declared all)</td><td>SCCM assigned site code</td><td class="resp">error|platform not supported</td><td><span class="cause cause-B">B</span></td></tr>
+<tr><td class="num">24</td><td><code>server.deployment.list_jobs</code></td><td><strong>query</strong></td><td><span class="pill pill-all">win/lin/mac</span></td><td>List server-side agent-deployment jobs</td><td class="resp">DISPATCH_ERR: instruction definition not found</td><td><span class="cause cause-D">D</span></td></tr>
+<tr><td class="num">25</td><td><code>windows.registry.enumerate_keys</code></td><td>question</td><td><span class="pill pill-win">win</span></td><td>Enumerate subkeys of a registry path</td><td class="resp">error|registry not available on this platform</td><td><span class="cause cause-B">B</span></td></tr>
+<tr><td class="num">26</td><td><code>windows.registry.enumerate_values</code></td><td>question</td><td><span class="pill pill-win">win</span></td><td>Enumerate values under a registry key</td><td class="resp">error|registry not available on this platform</td><td><span class="cause cause-B">B</span></td></tr>
+<tr><td class="num">27</td><td><code>windows.registry.get_user_value</code></td><td>question</td><td><span class="pill pill-win">win</span></td><td>Read HKCU value from a per-user hive</td><td class="resp">error|registry not available on this platform</td><td><span class="cause cause-B">B</span></td></tr>
+<tr><td class="num">28</td><td><code>windows.registry.get_value</code></td><td>question</td><td><span class="pill pill-win">win</span></td><td>Read a single registry value</td><td class="resp">error|registry not available on this platform</td><td><span class="cause cause-B">B</span></td></tr>
+<tr><td class="num">29</td><td><code>windows.registry.key_exists</code></td><td>question</td><td><span class="pill pill-win">win</span></td><td>Check whether a registry key exists</td><td class="resp">error|registry not available on this platform</td><td><span class="cause cause-B">B</span></td></tr>
+<tr><td class="num">30</td><td><code>windows.software.msi.list</code></td><td>question</td><td><span class="pill pill-win">win</span></td><td>List installed MSI products</td><td class="resp">error|platform not supported</td><td><span class="cause cause-B">B</span></td></tr>
+<tr><td class="num">31</td><td><code>windows.software.msi.product_codes</code></td><td>question</td><td><span class="pill pill-win">win</span></td><td>Look up MSI product GUIDs</td><td class="resp">error|platform not supported</td><td><span class="cause cause-B">B</span></td></tr>
+<tr><td class="num">32</td><td><code>windows.wmi.get_instance</code></td><td>question</td><td><span class="pill pill-win">win</span></td><td>Fetch a single WMI/CIM instance</td><td class="resp">error|WMI not available on this platform</td><td><span class="cause cause-B">B</span></td></tr>
+<tr><td class="num">33</td><td><code>windows.wmi.query</code></td><td>question</td><td><span class="pill pill-win">win</span></td><td>Run a WQL query</td><td class="resp">error|WMI not available on this platform</td><td><span class="cause cause-B">B</span></td></tr>
+<tr><td class="num">34</td><td><code>workflow.version_compliance_check</code></td><td>question</td><td><span class="pill pill-all">win/lin/mac</span></td><td>Compare a file's version metadata against a policy floor</td><td class="resp">error|missing required parameter: path</td><td><span class="cause cause-A">A</span></td></tr>
+</tbody>
+</table>
+
+<h2 id="fixes">Concrete fix recipes</h2>
+
+<h3>A &mdash; parameter synthesis (15)</h3>
+<p>Edit <code>scripts/test/instructions_runner.py</code> <code>synthesise_params</code> (~line 200). Walk the YAML's <code>parameters:</code> block; emit per-name + per-type defaults. Honour the YAML's <code>default:</code> field if present.</p>
+
+<table>
+<thead><tr><th>Param name (case-insensitive)</th><th>Linux</th><th>macOS</th><th>Windows</th></tr></thead>
+<tbody>
+<tr><td><code>path</code></td><td><code>/bin/ls</code></td><td><code>/bin/ls</code></td><td><code>C:\Windows\System32\notepad.exe</code></td></tr>
+<tr><td><code>directory</code>, <code>root</code></td><td><code>/tmp</code></td><td><code>/tmp</code></td><td><code>C:\Temp</code></td></tr>
+<tr><td><code>pattern</code></td><td colspan="3"><code>*.txt</code></td></tr>
+<tr><td><code>filename</code></td><td colspan="3"><code>synth.bin</code></td></tr>
+<tr><td><code>url</code></td><td colspan="3"><code>https://example.invalid/synth</code></td></tr>
+<tr><td><code>sha256</code></td><td colspan="3"><code>0000…</code> (64 zeros)</td></tr>
+<tr><td><code>sql</code></td><td colspan="3"><code>SELECT 1</code></td></tr>
+<tr><td><code>group</code></td><td><code>sudo</code></td><td><code>wheel</code></td><td><code>Administrators</code></td></tr>
+<tr><td><code>thumbprint</code></td><td colspan="3"><code>0000…</code> (40 zeros)</td></tr>
+<tr><td><code>ioc_hash</code> / <code>_ip</code> / <code>_domain</code></td><td colspan="3"><code>d41d8cd98f00b204e9800998ecf8427e</code> / <code>127.0.0.1</code> / <code>example.invalid</code></td></tr>
+<tr><td><code>lines</code> + other ints</td><td colspan="3">YAML <code>default:</code> if present, else <code>10</code></td></tr>
+</tbody>
+</table>
+
+<h3>B &mdash; platform-aware SKIP (9)</h3>
+<p>Two halves; do both.</p>
+<ol>
+  <li><strong>YAML audit:</strong> the 9 Windows-only defs currently declare <code>platforms:</code> too broadly. Fix each YAML to declare <code>platforms: [windows]</code>.</li>
+  <li><strong>Runner classification:</strong> before dispatch in <code>instructions_runner.py</code> <code>exercise()</code>:</li>
+</ol>
+<pre><code>host = {"Darwin": "darwin", "Linux": "linux", "Windows": "windows"}[platform.system()]
+if defn.platforms and host not in defn.platforms:
+    return Outcome(outcome="skip",
+                   note=f"host={host} not in platforms={defn.platforms}")</code></pre>
+
+<h3>C &mdash; parity work (the headline)</h3>
+<ul class="tight">
+  <li><code>crossplatform.process.fetch</code> &mdash; add macOS branch (<code>proc_listpids</code>, <code>proc_pidpath</code>, <code>sysctl</code>). Linux branch already exists.</li>
+  <li><code>device.wifi.list_networks</code> &mdash; replace <code>airport</code> (removed in macOS 14+). Try <code>system_profiler SPAirPortDataType</code> first (no privilege); fall back to <code>wdutil info</code> with sudoers entry. Linux: <code>nmcli -t -f SSID,BSSID,SIGNAL device wifi list</code>.</li>
+  <li>If you discover <code>tar.export</code>, <code>agent_logging.get_log</code>, or <code>event_logs.errors</code> have stale macOS branches once buckets A/F clear, file an issue per plugin.</li>
+</ul>
+
+<h3>D &mdash; <code>type: query</code> (2)</h3>
+<p>Two-line fix. In <code>content/definitions/discovery.yaml</code> and <code>content/definitions/deployment.yaml</code>, change <code>type: query</code> &rarr; <code>type: question</code> for <code>device.discovery.scan_subnet</code> and <code>server.deployment.list_jobs</code>. Rebuild; verify with:</p>
+<pre><code>curl -s -b /tmp/cookies.txt 'http://localhost:8080/api/instructions?limit=500' \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); ids=[x['id'] for x in d['definitions']]; \
+      print('scan_subnet:', 'device.discovery.scan_subnet' in ids); \
+      print('list_jobs:',   'server.deployment.list_jobs' in ids)"</code></pre>
+<p class="meta">Orthogonally, consider patching <code>server/core/src/instruction_store.cpp</code> to accept <code>query</code> as an alias for <code>question</code> &mdash; fixes the class, not just these two instances.</p>
+
+<h3>E &mdash; <code>tar.export</code> UNION ALL (1)</h3>
+<p>Real plugin bug. In <code>agents/plugins/tar/src/tar_plugin.cpp</code> (or sibling), the export action composes a <code>UNION ALL</code> across TAR tables; one branch's column count diverges. Align columns; SQLite emits the error pre-exec so success is verified just by dispatch returning rc=0.</p>
+
+<h3>F &mdash; empty-result rc=1 (2)</h3>
+<ul class="tight">
+  <li><code>device.agent_logging.get_log</code>: when <code>get_log_file_path()</code> returns empty, return <code>status|empty</code> rc=0 instead of <code>status|error|agent log file not found</code>. "No rows" is not "error".</li>
+  <li><code>device.event_logs.errors</code>: legitimate error lines start with <code>error|</code>; runner currently treats that as failure. Fix runner-side &mdash; trust the agent's rc rather than parsing column-0 of the body.</li>
+</ul>
+
+<h2 id="three-platform">Three-platform validation plan</h2>
+
+<table>
+<thead><tr><th>Host</th><th>How to reach</th><th>Build dir</th><th>Run</th></tr></thead>
+<tbody>
+<tr>
+  <td>macOS (this box)</td>
+  <td>local</td>
+  <td><code>build-macos</code></td>
+  <td><code>bash scripts/start-UAT.sh && /test</code></td>
+</tr>
+<tr>
+  <td>Linux (OrbStack VM <code>yuzu</code>)</td>
+  <td><code>ssh yuzu@&lt;orbstack-ip&gt;</code> &mdash; the VM is already provisioned for the viz-engine work</td>
+  <td><code>build-linux</code></td>
+  <td><code>bash scripts/start-UAT.sh && bash scripts/test/instructions-tests.sh --output /tmp/out-lin.json</code></td>
+</tr>
+<tr>
+  <td>Windows (Shulgi remote)</td>
+  <td><code>ssh Shulgi</code> &mdash; lands in PWSH 7.6.1; for builds use MSYS2 bash per <code>docs/windows-build.md</code></td>
+  <td><code>build-windows</code></td>
+  <td>MSYS2 bash: <code>bash scripts/start-UAT.sh && bash scripts/test/instructions-tests.sh --output /tmp/out-win.json</code></td>
+</tr>
+</tbody>
+</table>
+
+<h3>Expected outcomes per host after A+B+D land</h3>
+<table>
+<thead><tr><th>Bucket</th><th>Linux</th><th>macOS</th><th>Windows</th></tr></thead>
+<tbody>
+<tr><td>A (15)</td><td>PASS</td><td>PASS</td><td>PASS</td></tr>
+<tr><td>B (9 win-only)</td><td>SKIP</td><td>SKIP</td><td>PASS</td></tr>
+<tr><td>C process.fetch</td><td>PASS</td><td>FAIL until macOS branch lands</td><td>PASS</td></tr>
+<tr><td>C wifi</td><td>PASS once nmcli wired</td><td>FAIL until <code>airport</code> replaced</td><td>PASS</td></tr>
+<tr><td>D (2)</td><td>PASS</td><td>PASS</td><td>PASS</td></tr>
+<tr><td>E tar.export</td><td>PASS once SQL fix lands</td><td>same</td><td>same</td></tr>
+<tr><td>F (2)</td><td>PASS once rc semantics fixed</td><td>same</td><td>same</td></tr>
+</tbody>
+</table>
+
+<h2 id="reproduction">Reproduction recipe</h2>
+
+<pre><code># 1. Bring up the stack
+bash scripts/start-UAT.sh
+
+# 2. Run the Instructions gate standalone
+bash scripts/test/instructions-tests.sh \
+    --dashboard http://localhost:8080 \
+    --user admin --password 'YuzuUatAdmin1!' \
+    --run-id manual --gate-name instructions \
+    --output /tmp/instructions-outcomes.json
+
+# 3. Inspect the fail list
+python3 -c "
+import json; d=json.load(open('/tmp/instructions-outcomes.json'))
+print('outcomes:', {o['outcome'] for o in d['outcomes']})
+for o in d['outcomes']:
+    if o['outcome'] in ('fail','error'):
+        print(' ', o['definition_id'], '|', o.get('note',''))
+"</code></pre>
+
+<details>
+  <summary>Probe a single failing instruction against the live agent</summary>
+<pre><code>curl -s -c /tmp/cookies.txt -X POST http://localhost:8080/login \
+    -d 'username=admin&password=YuzuUatAdmin1!' >/dev/null
+RESP=$(curl -s -b /tmp/cookies.txt -X POST \
+    'http://localhost:8080/api/instructions/&lt;DEF_ID&gt;/execute' \
+    -H 'Content-Type: application/json' -d '{}')
+echo "$RESP"
+CMD_ID=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('command_id',''))")
+sleep 2
+curl -s -b /tmp/cookies.txt "http://localhost:8080/api/responses/$CMD_ID" | python3 -m json.tool</code></pre>
+</details>
+
+<h2 id="dod">Definition of done</h2>
+<ul class="tight">
+  <li>A + B + D land &mdash; <code>/test</code> Phase 5 Instructions FAIL &le; 8 on every host.</li>
+  <li>macOS-parity work (C) closed for <code>crossplatform.process.fetch</code> and <code>device.wifi.list_networks</code>.</li>
+  <li>E, F fixes land &mdash; one PR each.</li>
+  <li><code>/test</code> default mode returns <strong>17 PASS / 0 FAIL / 0 WARN / 3 SKIP</strong> on macOS, Linux, and Windows.</li>
+  <li>Each remaining survivor has a GitHub issue with cause bucket + one-line repro.</li>
+</ul>
+
+<p class="meta" style="margin-top: 48px; border-top: 1px solid var(--border); padding-top: 12px;">
+  Generated 2026-05-13. Source: <code>docs/plans/instructions-gate-34-fails-handover-2026-05-13.md</code>.
+</p>
+
+</main>
+</body>
+</html>

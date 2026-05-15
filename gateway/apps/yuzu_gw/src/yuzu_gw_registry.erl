@@ -1,7 +1,11 @@
 %%%-------------------------------------------------------------------
 %%% @doc Agent routing registry — ETS + pg.
 %%%
-%%% ETS (`yuzu_gw_agents`): fast O(1) lookup by agent_id.
+%%% ETS (`yuzu_gw_agents`): fast O(1) lookup by agent_id. Each row also
+%%%   carries the verbatim `RegisterRequest` the agent first sent, so
+%%%   `yuzu_gw_upstream` can re-proxy it byte-for-byte when the upstream
+%%%   connection re-establishes (the server comes back with an empty
+%%%   registry and must relearn every agent the gateway already holds).
 %%% ETS (`yuzu_gw_pending`): pending Register→Subscribe state with TTL.
 %%% pg (`yuzu_gw` scope):   cluster-aware process groups for broadcast
 %%%   and plugin-targeted fanout.
@@ -16,10 +20,12 @@
 %% API
 -export([start_link/0,
          register_agent/5,
+         register_agent/6,
          deregister_agent/1,
          lookup/1,
          all_agents/0,
          all_agent_pids/0,
+         all_register_reqs/0,
          agents_for_plugin/1,
          agent_count/0,
          list_agents/2,
@@ -48,11 +54,31 @@
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
+%% @doc Register an agent with no stashed RegisterRequest.
+%%
+%% Back-compat entry point: production registration goes through
+%% register_agent/6 (yuzu_gw_agent:init/1 always has the verbatim
+%% request). This /5 form is for callers — chiefly routing-focused
+%% tests — that do not exercise the upstream-reconnect replay path; it
+%% records an empty request, so such an agent is simply skipped by the
+%% replay drip.
+-spec register_agent(binary(), pid(), binary() | undefined,
+                     [binary()], binary()) -> ok.
+register_agent(AgentId, Pid, SessionId, Plugins, Hostname) ->
+    register_agent(AgentId, Pid, SessionId, Plugins, Hostname, #{}).
+
 %% @doc Register an agent process in the routing table.
 %% Called by yuzu_gw_agent:init/1 from the agent process itself.
--spec register_agent(binary(), pid(), binary() | undefined, [binary()], binary()) -> ok.
-register_agent(AgentId, Pid, SessionId, Plugins, Hostname) ->
-    gen_server:call(?SERVER, {register, AgentId, Pid, SessionId, Plugins, Hostname}, 30000).
+%%
+%% RegisterReq is the verbatim `yuzu.agent.v1.RegisterRequest' map the
+%% agent originally sent; it is stashed so the upstream client can
+%% re-proxy it on reconnect (see all_register_reqs/0).
+-spec register_agent(binary(), pid(), binary() | undefined,
+                     [binary()], binary(), map()) -> ok.
+register_agent(AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq) ->
+    gen_server:call(?SERVER,
+                    {register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq},
+                    30000).
 
 %% @doc Remove an agent from the routing table.
 -spec deregister_agent(binary()) -> ok.
@@ -63,7 +89,7 @@ deregister_agent(AgentId) ->
 -spec lookup(binary()) -> {ok, pid()} | error.
 lookup(AgentId) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, Pid, _, _, _, _, _}] ->
+        [{_, Pid, _, _, _, _, _, _}] ->
             case is_process_alive(Pid) of
                 true  -> {ok, Pid};
                 false -> error
@@ -75,12 +101,32 @@ lookup(AgentId) ->
 %% @doc Return all agent IDs.
 -spec all_agents() -> [binary()].
 all_agents() ->
-    [AgentId || {AgentId, _, _, _, _, _, _} <- ets:tab2list(?TABLE)].
+    [AgentId || {AgentId, _, _, _, _, _, _, _} <- ets:tab2list(?TABLE)].
 
 %% @doc Return all agent pids (for broadcast via pg fallback).
 -spec all_agent_pids() -> [pid()].
 all_agent_pids() ->
     pg:get_members(?PG_SCOPE, all_agents).
+
+%% @doc Return {AgentId, RegisterRequest} for every currently-registered
+%% agent. Used by yuzu_gw_upstream to re-proxy registrations when the
+%% upstream connection re-establishes. Because this reads straight from
+%% ETS at call time, an agent that deregistered during the outage is
+%% already absent — it will not be replayed.
+%%
+%% Returns [] if the table does not exist (registry not started, or
+%% torn down) — same defensive contract as agent_count/0, so a caller
+%% on the reconnect path never crashes just because the registry is
+%% momentarily absent.
+-spec all_register_reqs() -> [{binary(), map()}].
+all_register_reqs() ->
+    case ets:info(?TABLE, size) of
+        undefined ->
+            [];
+        _ ->
+            [{AgentId, RegisterReq}
+             || {AgentId, _, _, _, _, _, _, RegisterReq} <- ets:tab2list(?TABLE)]
+    end.
 
 %% @doc Return pids of agents that have a specific plugin loaded.
 -spec agents_for_plugin(binary()) -> [pid()].
@@ -108,13 +154,17 @@ list_agents(Limit, Cursor) ->
     %% ETS ordered_set would give us ordered traversal natively, but
     %% the table is a `set` — so we use a guard condition on the key
     %% and fetch Limit+1 to detect whether more pages exist.
-    MatchHead = {'$1', '$2', '$3', '$4', '$5', '$6', '$7'},
+    %%
+    %% '$8' (the verbatim RegisterRequest) is matched but deliberately
+    %% not projected — it is an internal replay artifact, not dashboard
+    %% data — so we select only the seven display fields explicitly.
+    MatchHead = {'$1', '$2', '$3', '$4', '$5', '$6', '$7', '$8'},
     Guard = case Cursor of
         undefined -> [];
         <<>>      -> [];
         _         -> [{'>', '$1', {const, Cursor}}]
     end,
-    Result = ['$$'],  %% return all bound variables as list
+    Result = [{{'$1', '$2', '$3', '$4', '$5', '$6', '$7'}}],
     MatchSpec = [{MatchHead, Guard, Result}],
 
     %% Select all matching rows, then sort only this subset and take Limit+1.
@@ -135,12 +185,12 @@ list_agents(Limit, Cursor) ->
                 plugins      => Plugins,
                 connected_at => T,
                 hostname     => Hn}
-              || [Id, Pid, Node, Sid, Plugins, T, Hn] <- Page],
+              || {Id, Pid, Node, Sid, Plugins, T, Hn} <- Page],
 
     NextCursor = case HasMore andalso Page =/= [] of
         true  ->
             LastRow = lists:last(Page),
-            hd(LastRow);  %% agent_id is the first element
+            element(1, LastRow);  %% agent_id is the first tuple element
         false ->
             undefined
     end,
@@ -175,14 +225,16 @@ init([]) ->
     TRef = erlang:send_after(?PENDING_SWEEP_MS, self(), sweep_pending),
     {ok, #state{monitor_refs = #{}, sweep_timer = TRef}}.
 
-handle_call({register, AgentId, Pid, SessionId, Plugins, Hostname}, _From,
+handle_call({register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq}, _From,
             #state{monitor_refs = Mons} = State) ->
     %% Remove any stale entry for this agent_id (returns cleaned Mons).
     Mons1 = maybe_cleanup(AgentId, Mons),
 
-    %% Insert into ETS.
+    %% Insert into ETS. The trailing field is the verbatim RegisterRequest,
+    %% kept so yuzu_gw_upstream can re-proxy it on upstream reconnect.
     Now = erlang:system_time(millisecond),
-    ets:insert(?TABLE, {AgentId, Pid, node(Pid), SessionId, Plugins, Now, Hostname}),
+    ets:insert(?TABLE, {AgentId, Pid, node(Pid), SessionId, Plugins, Now,
+                        Hostname, RegisterReq}),
 
     %% Join pg groups.
     pg:join(?PG_SCOPE, all_agents, Pid),
@@ -247,7 +299,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, Pid, _, _, Plugins, _, _}] ->
+        [{_, Pid, _, _, Plugins, _, _, _}] ->
             ets:delete(?TABLE, AgentId),
             %% pg auto-removes on process exit, but leave explicitly for clarity.
             catch pg:leave(?PG_SCOPE, all_agents, Pid),
@@ -264,7 +316,7 @@ do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
 %% @doc Clean up a stale agent entry and return the updated monitor map.
 maybe_cleanup(AgentId, Mons) ->
     case ets:lookup(?TABLE, AgentId) of
-        [{_, OldPid, _, _, OldPlugins, _, _}] ->
+        [{_, OldPid, _, _, OldPlugins, _, _, _}] ->
             catch pg:leave(?PG_SCOPE, all_agents, OldPid),
             lists:foreach(fun(Plugin) ->
                 catch pg:leave(?PG_SCOPE, {plugin, Plugin}, OldPid)

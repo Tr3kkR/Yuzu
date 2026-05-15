@@ -40,6 +40,7 @@
     stream_pid  :: pid() | undefined,     %% subscribe handler process
     stream_mon  :: reference() | undefined, %% monitor ref for stream_pid
     agent_info  :: map(),
+    register_req :: map(),                %% verbatim RegisterRequest (for upstream-reconnect replay)
     plugins     :: [binary()],
     pending     :: #{binary() => {pid(), reference(), integer()}},  %% command_id => {reply_to, fanout_ref, dispatched_at}
     connected_at :: integer() | undefined,
@@ -79,6 +80,10 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
        stream_pid := StreamPid, peer_addr := PeerAddr} = Args) ->
     SessionId = maps:get(session_id, Args, undefined),
     Plugins = extract_plugin_names(AgentInfo),
+    %% Verbatim RegisterRequest, threaded from the subscribe handler.
+    %% Defaulted so an agent started without it (older callers, tests)
+    %% still works — replay just skips agents whose req is empty.
+    RegisterReq = maps:get(register_req, Args, #{}),
 
     %% Monitor the stream handler process.
     StreamMon = case StreamPid of
@@ -92,16 +97,20 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
         stream_pid  = StreamPid,
         stream_mon  = StreamMon,
         agent_info  = AgentInfo,
+        register_req = RegisterReq,
         plugins     = Plugins,
         pending     = #{},
         connected_at = erlang:system_time(millisecond),
         peer_addr   = PeerAddr
     },
 
-    %% Register in routing table and join pg groups.
+    %% Register in routing table and join pg groups. The RegisterRequest
+    %% is stashed in the registry so yuzu_gw_upstream can re-proxy it
+    %% when the upstream connection re-establishes.
     Hostname = maps:get(<<"hostname">>, AgentInfo,
                         maps:get(hostname, AgentInfo, <<>>)),
-    yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins, Hostname),
+    yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
+                                    Hostname, RegisterReq),
 
     %% Notify WatchEvents subscribers.
     notify_watchers(#{agent_id    => AgentId,
