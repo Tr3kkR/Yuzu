@@ -17,8 +17,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -841,6 +844,22 @@ struct RecordingMetricSink final : public TransportMetricSink {
                           0,
                           {}});
     }
+    void on_bidi_pool_size(std::string_view backend, std::uint32_t size) override {
+        std::lock_guard<std::mutex> lock(mtx);
+        events.push_back({"bidi_pool_size", std::string(backend), "", size, {}});
+    }
+    void on_bidi_pool_in_flight_delta(std::string_view backend, std::int32_t delta) override {
+        std::lock_guard<std::mutex> lock(mtx);
+        events.push_back({"bidi_pool_in_flight_delta",
+                          std::string(backend),
+                          delta >= 0 ? "+1" : "-1",
+                          static_cast<std::size_t>(delta < 0 ? -delta : delta),
+                          {}});
+    }
+    void on_bidi_pool_saturated(std::string_view backend, std::string_view method) override {
+        std::lock_guard<std::mutex> lock(mtx);
+        events.push_back({"bidi_pool_saturated", std::string(backend), std::string(method), 0, {}});
+    }
 
     bool has(const std::string& kind) const {
         std::lock_guard<std::mutex> lock(mtx);
@@ -962,6 +981,121 @@ TEST_CASE("msquic metric sink fires on_unexpected_dispatch_throw on a thrown han
 
     REQUIRE(
         server_sink->has_with_method("dispatch_throw_std_exception", "yuzu.test.v1.Echo/Throws"));
+}
+
+// ── Bounded bidi-dispatcher pool (#376 PR 3 increment 7) ─────────────────────
+
+TEST_CASE("msquic bidi dispatcher rejects beyond the configured pool cap",
+          "[transport][msquic][round-trip][bidi][pool]") {
+    // qe-S7a: cap the bidi pool at 2; open 3 bidi streams whose handlers
+    // sleep long enough that none has released its slot when the third
+    // arrives. The third must reject with the EXACT-string Unavailable
+    // detail that mirrors the gRPC backend (operators can grep one
+    // string across both backends).
+    auto sink = std::make_shared<RecordingMetricSink>();
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    std::atomic<int> concurrent{0};
+    std::atomic<int> accepted{0};
+    std::atomic<int> max_concurrent{0};
+    std::condition_variable barrier_cv;
+    std::mutex barrier_mtx;
+    std::atomic<bool> release{false};
+
+    auto handler = [&](const CallContext&, BidiStream& s) -> Status {
+        accepted.fetch_add(1, std::memory_order_relaxed);
+        int now = concurrent.fetch_add(1, std::memory_order_acq_rel) + 1;
+        int prev = max_concurrent.load(std::memory_order_relaxed);
+        while (now > prev &&
+               !max_concurrent.compare_exchange_weak(prev, now, std::memory_order_relaxed)) {}
+        // Block until the test releases — so the third call hits the
+        // saturation cap.
+        std::unique_lock<std::mutex> lock(barrier_mtx);
+        barrier_cv.wait(lock, [&] { return release.load(std::memory_order_relaxed); });
+        concurrent.fetch_sub(1, std::memory_order_acq_rel);
+        StringMessage in;
+        while (s.read(in)) { /* drain */
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/PoolBidi", handler);
+
+    Credentials creds = make_test_creds();
+    ListenerOptions opts;
+    opts.metric_sink = sink;
+    opts.bidi_dispatcher_pool_size = 2;
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds, opts);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    // Open 2 bidi streams, write a frame each so the server actually
+    // begins dispatching (handler starts running -> accepted++).
+    CallContext ctx;
+    auto bidi1 = ch->bidi_stream("yuzu.test.v1.Echo/PoolBidi", ctx);
+    REQUIRE(bidi1 != nullptr);
+    StringMessage out("a");
+    REQUIRE(bidi1->write(out));
+    auto bidi2 = ch->bidi_stream("yuzu.test.v1.Echo/PoolBidi", ctx);
+    REQUIRE(bidi2 != nullptr);
+    REQUIRE(bidi2->write(out));
+
+    // Wait for both to enter the handler (or up to 2 s).
+    auto t0 = std::chrono::steady_clock::now();
+    while (accepted.load(std::memory_order_relaxed) < 2 &&
+           std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    REQUIRE(accepted.load() == 2);
+
+    // Third call: hit the cap.
+    auto bidi3 = ch->bidi_stream("yuzu.test.v1.Echo/PoolBidi", ctx);
+    REQUIRE(bidi3 != nullptr);
+    REQUIRE(bidi3->write(out));
+    bidi3->writes_done();
+    Status fs3 = bidi3->final_status();
+    REQUIRE(fs3.code == StatusCode::Unavailable);
+    REQUIRE(fs3.detail == "transport: bidi dispatcher saturated");
+
+    // Release the held handlers and tear down cleanly.
+    {
+        std::lock_guard<std::mutex> lock(barrier_mtx);
+        release.store(true, std::memory_order_relaxed);
+    }
+    barrier_cv.notify_all();
+    bidi1->writes_done();
+    bidi2->writes_done();
+    REQUIRE(bidi1->final_status().code == StatusCode::Ok);
+    REQUIRE(bidi2->final_status().code == StatusCode::Ok);
+    REQUIRE(max_concurrent.load() == 2);
+
+    ch->close();
+    listener->shutdown();
+
+    // Metric sink contract — pool gauge AND saturation marker AND in-
+    // flight delta sequence all fired with the "msquic" backend label.
+    REQUIRE(sink->has_with_method("bidi_pool_saturated", "yuzu.test.v1.Echo/PoolBidi"));
+    REQUIRE(sink->has("bidi_pool_size"));
+    int plus = 0, minus = 0;
+    {
+        std::lock_guard<std::mutex> lock(sink->mtx);
+        for (const auto& e : sink->events) {
+            if (e.kind == "bidi_pool_in_flight_delta") {
+                if (e.method == "+1")
+                    ++plus;
+                else if (e.method == "-1")
+                    ++minus;
+            }
+        }
+    }
+    // Two accepted dispatches -> two +1s and two -1s. The rejected call
+    // never enters in-flight -> no delta for it.
+    REQUIRE(plus == 2);
+    REQUIRE(minus == 2);
 }
 
 TEST_CASE("msquic bidi stream destroyed without final_status terminates cleanly",

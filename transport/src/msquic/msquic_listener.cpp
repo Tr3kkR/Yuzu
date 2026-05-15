@@ -665,6 +665,42 @@ bool MsquicServerListener::listener_submit(std::function<void()> task) {
     return worker_pool_->submit(std::move(task));
 }
 
+// ── Bounded bidi-dispatcher pool ─────────────────────────────────────────────
+
+std::uint32_t MsquicServerListener::resolve_bidi_pool_size() const noexcept {
+    if (opts_.bidi_dispatcher_pool_size > 0) {
+        return opts_.bidi_dispatcher_pool_size;
+    }
+    // Auto-compute. hardware_concurrency() can return 0 on some
+    // freestanding/containerised systems; treat 0 as 4 so the formula
+    // still produces a sensible default. Mirrors GrpcServerListener::
+    // resolve_bidi_pool_size — same {64, hw*8, 4096} clamp so a dual-
+    // stack deployment has identical capacity on both backends.
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw == 0) hw = 4;
+    std::uint64_t computed = static_cast<std::uint64_t>(hw) * 8;
+    if (computed < 64) computed   = 64;
+    if (computed > 4096) computed = 4096;
+    return static_cast<std::uint32_t>(computed);
+}
+
+bool MsquicServerListener::try_accept_bidi_slot() noexcept {
+    std::uint32_t cur = bidi_in_flight_.load(std::memory_order_relaxed);
+    while (cur < bidi_pool_size_) {
+        if (bidi_in_flight_.compare_exchange_weak(cur, cur + 1,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_relaxed)) {
+            return true;
+        }
+        // cur was updated by the failed CAS; loop and re-check the cap.
+    }
+    return false;
+}
+
+void MsquicServerListener::release_bidi_slot() noexcept {
+    bidi_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
 void MsquicServerListener::track_stream(
     HQUIC stream, std::shared_ptr<ServerStreamCall> call) {
     std::lock_guard<std::mutex> lock(mtx_);
@@ -742,27 +778,67 @@ void MsquicServerListener::dispatch_stream_call(ServerStreamCall* call,
             sink->on_stream_opened("msquic", call->method);
         }
 
+        // Bounded bidi-dispatcher pool (#376 PR 3 increment 7). Reject
+        // the call BEFORE constructing the worker task / capturing
+        // `keep` if the cap is hit — the exact-string detail matches
+        // the gRPC backend so operators do not have to learn two
+        // strings.
+        if (!try_accept_bidi_slot()) {
+            if (auto& sink = metric_sink(); sink) {
+                sink->on_bidi_pool_saturated("msquic", call->method);
+            }
+            feed_bidi_error(
+                *call->bidi_state,
+                Status{StatusCode::Unavailable,
+                       "transport: bidi dispatcher saturated"});
+            send_trailing_status(
+                call, Status{StatusCode::Unavailable,
+                             "transport: bidi dispatcher saturated"});
+            call->phase = ServerStreamCall::Phase::Done;
+            return;
+        }
+        if (auto& sink = metric_sink(); sink) {
+            sink->on_bidi_pool_in_flight_delta("msquic", +1);
+        }
+
         auto keep = call->self.lock();
         if (!keep) {
+            release_bidi_slot();
+            if (auto& sink = metric_sink(); sink) {
+                sink->on_bidi_pool_in_flight_delta("msquic", -1);
+            }
             call->phase = ServerStreamCall::Phase::Done;
             return;
         }
         // Snapshot what the worker needs and submit. The worker runs the
         // BidiStreamHandler with a server-side MsquicBidiStream wrapping
         // the bidi_state, then emits the trailer + FIN with the handler's
-        // RETURN status (run_bidi_handler).
+        // RETURN status (run_bidi_handler). The pool slot is released
+        // AFTER run_bidi_handler returns so a long-lived bidi handler
+        // holds 1 slot for its entire lifetime — matches gRPC parity.
         auto bidi_state_for_worker = call->bidi_state;
         auto handler_copy          = call->bidi_handler;
         CallContext ctx_copy       = call->ctx;
+        auto* listener_ptr         = this;
+        std::shared_ptr<TransportMetricSink> sink_for_worker = opts_.metric_sink;
         bool submitted = listener_submit(
             [keep, bidi_state_for_worker, handler_copy,
-             ctx_copy = std::move(ctx_copy)]() mutable {
+             ctx_copy = std::move(ctx_copy), listener_ptr,
+             sink_for_worker]() mutable {
                 run_bidi_handler(std::move(keep),
                                  std::move(bidi_state_for_worker),
                                  std::move(handler_copy),
                                  std::move(ctx_copy));
+                listener_ptr->release_bidi_slot();
+                if (sink_for_worker) {
+                    sink_for_worker->on_bidi_pool_in_flight_delta("msquic", -1);
+                }
             });
         if (!submitted) {
+            release_bidi_slot();
+            if (auto& sink = metric_sink(); sink) {
+                sink->on_bidi_pool_in_flight_delta("msquic", -1);
+            }
             // Pool gone — listener shutting down. Emit Unavailable on
             // the bidi state so any future read on the (yet to be
             // constructed) MsquicBidiStream sees a final status.
@@ -882,6 +958,16 @@ std::expected<void, Status> MsquicServerListener::start(
 
     // Worker pool for handler dispatch.
     worker_pool_ = std::make_unique<WorkerPool>(4);
+
+    // Resolve the bounded bidi-dispatcher pool size and emit the gauge
+    // (#376 PR 3 increment 7). The cap is enforced in the bidi branch
+    // of dispatch_stream_call via try_accept_bidi_slot; the underlying
+    // worker_pool_ above is the executor for both unary and bidi.
+    bidi_pool_size_ = resolve_bidi_pool_size();
+    bidi_in_flight_.store(0, std::memory_order_release);
+    if (opts.metric_sink) {
+        opts.metric_sink->on_bidi_pool_size("msquic", bidi_pool_size_);
+    }
 
     st = api->ListenerOpen(api_handle.registration(), msquic_listener_callback,
                            this, &listener_);
@@ -1004,6 +1090,12 @@ void MsquicServerListener::shutdown() {
         api->ConfigurationClose(configuration_);
         configuration_ = nullptr;
     }
+    // Pool gauge to 0 (#376 PR 3 increment 7). Mirrors gRPC backend.
+    if (auto& sink = metric_sink(); sink) {
+        sink->on_bidi_pool_size("msquic", 0);
+    }
+    bidi_pool_size_ = 0;
+    bidi_in_flight_.store(0, std::memory_order_release);
     shutdown_cv_.notify_all();
 }
 

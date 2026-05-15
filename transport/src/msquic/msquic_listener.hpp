@@ -124,6 +124,22 @@ private:
     // listener is shutting down (pool gone).
     bool listener_submit(std::function<void()> task);
 
+    // ── Bounded bidi-dispatcher pool (#376 PR 3 increment 7) ────────────────
+    //
+    // The bidi dispatcher pool caps concurrent bidi handlers at
+    // `bidi_pool_size_` (resolved at start() from
+    // ListenerOptions::bidi_dispatcher_pool_size, or auto-computed via
+    // resolve_bidi_pool_size). New bidi calls past the cap are rejected
+    // with `Unavailable("transport: bidi dispatcher saturated")` —
+    // exact-string contract, byte-identical to the gRPC backend so
+    // operators can grep responses or trigger their incident playbook
+    // without backend-specific aliases.
+    std::uint32_t           resolve_bidi_pool_size() const noexcept;
+    bool                    try_accept_bidi_slot() noexcept;
+    void                    release_bidi_slot() noexcept;
+    std::uint32_t           bidi_pool_size_         = 0;
+    std::atomic<std::uint32_t> bidi_in_flight_      = 0;
+
     mutable std::mutex                       mtx_;
     std::condition_variable                  shutdown_cv_;
     std::condition_variable                  conn_drain_cv_;  // live_connections_ empties
