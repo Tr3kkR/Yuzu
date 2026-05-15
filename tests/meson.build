@@ -130,10 +130,12 @@ tar_test_exe = executable(
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
+    'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
     '../agents/plugins/tar/src/tar_schema_registry.cpp',
     '../agents/plugins/tar/src/tar_aggregator.cpp',
+    '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
@@ -209,6 +211,8 @@ if build_server
       'unit/server/test_rest_response_templates.cpp',
       'unit/server/test_offload_target_store.cpp',
       'unit/server/test_rest_offload_targets.cpp',
+      'unit/server/test_fleet_topology_store.cpp',
+      'unit/server/test_viz_routes.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

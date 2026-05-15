@@ -41,6 +41,7 @@ import contextlib
 import http.cookiejar
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -154,48 +155,114 @@ def load_definitions(content_dir: Path, risk_table: dict[str, str]) -> list[Defi
     return defs
 
 
+# ── host detection ─────────────────────────────────────────────────────────
+
+def _detect_host() -> str:
+    """Map platform.system() to the YAML platforms: vocabulary (darwin/linux/windows)."""
+    s = platform.system().lower()
+    if s == "darwin":
+        return "darwin"
+    if s == "windows":
+        return "windows"
+    return "linux"
+
+
+HOST = _detect_host()
+
+
 # ── parameter synthesis ────────────────────────────────────────────────────
+
+# Per-host string defaults for common parameter names. Keys are matched as
+# substrings against the lowercased parameter name, in declaration order —
+# more-specific keys first.
+_HOST_PATHS = {
+    "linux":   {"file": "/bin/ls", "dir": "/tmp", "user_dir": "/tmp"},
+    "darwin":  {"file": "/bin/ls", "dir": "/tmp", "user_dir": "/tmp"},
+    "windows": {"file": r"C:\Windows\System32\notepad.exe",
+                "dir": r"C:\Windows\Temp",
+                "user_dir": r"C:\Windows\Temp"},
+}
+
+_HOST_GROUPS = {
+    "linux": "root",
+    "darwin": "wheel",
+    "windows": "Administrators",
+}
+
+
+def _synth_string(name: str, schema: dict) -> str:
+    """Best-effort string default for a parameter, host-aware."""
+    nl = name.lower()
+    paths = _HOST_PATHS[HOST]
+
+    # Order matters: longer/more-specific tokens first.
+    if nl == "sql" or nl.endswith("_sql") or "query" == nl:
+        return "SELECT 1"
+    if "sha256" in nl or nl == "hash" or nl.endswith("_hash"):
+        return "0" * 64
+    if "sha1" in nl:
+        return "0" * 40
+    if "md5" in nl:
+        return "0" * 32
+    if "thumbprint" in nl or "fingerprint" in nl:
+        return "0" * 40
+    if "url" in nl:
+        return "https://example.invalid/yuzu-uat"
+    if "domain" in nl:
+        return "example.invalid"
+    if nl == "ip" or nl.endswith("_ip") or "address" in nl or "host" in nl:
+        return "127.0.0.1"
+    if "filename" in nl or nl == "file_name":
+        return "yuzu-uat-synth.bin"
+    if "pattern" in nl or "glob" in nl:
+        return "*.txt"
+    if "extension" in nl:
+        return "txt"
+    if nl in ("root", "directory") or nl.endswith("_dir") or nl.endswith("_directory") or "folder" in nl:
+        return paths["dir"]
+    if nl == "path" or nl.endswith("_path") or nl == "file" or nl.endswith("_file"):
+        return paths["file"]
+    if "group" in nl:
+        return _HOST_GROUPS[HOST]
+    if "username" in nl or nl == "user":
+        return "root" if HOST != "windows" else "Administrator"
+    if "command" in nl or "cmd" in nl or "script" in nl:
+        return "echo yuzu-uat-test"
+    if nl == "id" or nl.endswith("_id") or "key" in nl or "name" in nl:
+        return "yuzu-uat-test-id"
+    if "regex" in nl or "expression" in nl:
+        return ".*"
+    validation = schema.get("validation", {}) or {}
+    min_len = validation.get("minLength", 1)
+    return "x" * max(int(min_len), 1)
+
 
 def _value_for_property(name: str, schema: dict) -> Any:
     """Synthesise a sane default for a single parameter property.
 
-    The runner targets schema-shape coverage, not semantic correctness — for
-    that, pair this with scripts/test/instructions-params-override.json
-    (PR C) which lets a hand-written entry replace the synthesised value.
+    Honours, in order: explicit YAML `default:`, `enum:`, then a per-host
+    name-based table for common parameter shapes (path, sql, url, sha256,
+    group, thumbprint, ioc_*, directory, etc.).
     """
-    t = schema.get("type", "string")
+    # 1. Honour an explicit default if the YAML provides one.
+    if "default" in schema and schema["default"] not in (None, ""):
+        return schema["default"]
+
     enum = schema.get("enum") or schema.get("validation", {}).get("enum")
     if enum:
         return enum[0]
 
+    t = schema.get("type", "string")
+
     if t in ("string", None):
-        v = schema.get("default", "")
-        if v:
-            return v
-        # Try to give common parameter names a sensible default
-        nl = name.lower()
-        if "path" in nl:
-            return "/tmp/yuzu-uat-instructions"
-        if "name" in nl:
-            return "yuzu-uat-test"
-        if "host" in nl or "address" in nl:
-            return "127.0.0.1"
-        if "url" in nl:
-            return "http://127.0.0.1:8080"
-        if "command" in nl or "cmd" in nl or "script" in nl:
-            return "echo yuzu-uat-test"
-        if "id" in nl or "key" in nl:
-            return "yuzu-uat-test-id"
-        validation = schema.get("validation", {}) or {}
-        min_len = validation.get("minLength", 1)
-        return "x" * max(int(min_len), 1)
+        return _synth_string(name, schema)
 
     if t in ("integer", "int", "int32", "int64", "number"):
         validation = schema.get("validation", {}) or {}
-        return int(validation.get("minimum", schema.get("default", 0)) or 0)
+        return int(validation.get("minimum", 0) or 0) or 10
 
     if t in ("boolean", "bool"):
-        return bool(schema.get("default", False))
+        return False
 
     if t == "array":
         return []
@@ -218,6 +285,13 @@ def synthesise_params(spec_params: dict, override: dict[str, Any] | None = None)
     for prop_name in required:
         prop_schema = properties.get(prop_name, {}) or {}
         out[prop_name] = _value_for_property(prop_name, prop_schema)
+    # If the definition has no `required:` block but does declare properties
+    # (e.g. security.ioc.check — all optional, but at least one must be
+    # supplied), synthesise one property so dispatch exercises the plugin
+    # rather than erroring at "no parameters provided".
+    if not required and properties:
+        first_name = next(iter(properties))
+        out[first_name] = _value_for_property(first_name, properties[first_name] or {})
     if override:
         out.update(override)
     return out
@@ -287,6 +361,16 @@ def exercise(client: YuzuClient, defn: Definition,
              param_overrides: dict[str, dict[str, Any]],
              poll_timeout_s: int) -> Outcome:
     started = time.monotonic()
+
+    # Honour YAML `platforms:` — definitions that don't list the current
+    # host should be skipped, not dispatched. `server` is a virtual platform
+    # for server-internal instructions and always runs.
+    if defn.platforms:
+        eligible = set(defn.platforms)
+        if "server" not in eligible and HOST not in eligible:
+            return Outcome(defn.id, defn.risk, "skip",
+                           int((time.monotonic() - started) * 1000),
+                           note=f"host={HOST} not in platforms={sorted(eligible)}")
 
     try:
         params = synthesise_params(defn.parameters, param_overrides.get(defn.id))
@@ -361,14 +445,22 @@ def exercise(client: YuzuClient, defn: Definition,
                        execution_id=execution_id,
                        note=f"no response within {poll_timeout_s}s")
 
-    # Loose shape validation: each response should have a non-error output.
+    # Loose shape validation: trust the agent's structured `status` and
+    # `rc` fields rather than greping the body for "error|". Several
+    # legitimate-empty cases (event_logs.errors returning rows whose
+    # column-0 label is "error", agent_logging emitting an empty marker)
+    # would otherwise be misclassified.
     sane_count = 0
     error_count = 0
     for r in last_payload.get("responses", []):
         out = r.get("output", "")
         if not out:
             continue
-        if "error" in out.lower()[:32] or r.get("status") == "error":
+        status = r.get("status", "")
+        # Agent reports rc explicitly when available; non-zero rc or
+        # status=="error" is the authoritative failure signal.
+        rc = r.get("rc", r.get("return_code", 0))
+        if status == "error" or (isinstance(rc, int) and rc != 0):
             error_count += 1
         else:
             sane_count += 1
@@ -480,10 +572,11 @@ def run(args: argparse.Namespace) -> int:
     total_ms = int((time.monotonic() - started_at) * 1000)
 
     # Tally
-    counts = {"pass": 0, "fail": 0, "pending_approval": 0, "error": 0}
+    counts = {"pass": 0, "fail": 0, "pending_approval": 0, "error": 0, "skip": 0}
     for o in outcomes:
         counts[o.status] = counts.get(o.status, 0) + 1
-    counts["skip"] = len(skipped)
+    # Risk-filtered defs never enter the executor; add them to the skip tally.
+    counts["skip"] += len(skipped)
 
     summary = (f"instructions_runner: {counts['pass']} pass / "
                f"{counts['fail']} fail / {counts['pending_approval']} pending / "

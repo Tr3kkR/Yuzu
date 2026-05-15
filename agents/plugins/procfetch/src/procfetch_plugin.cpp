@@ -32,9 +32,16 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <openssl/evp.h>
-#elif defined(_WIN32)
+#endif
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/proc_info.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
+#endif
+#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -66,27 +73,10 @@ std::string escape_pipes(std::string_view sv) {
     return out;
 }
 
-// -- Linux implementation -----------------------------------------------------
-#ifdef __linux__
+// -- POSIX (Linux + macOS) shared SHA-1 ---------------------------------------
+#if defined(__linux__) || defined(__APPLE__)
 
-std::string read_first_line(const std::filesystem::path& path) {
-    std::ifstream f(path);
-    if (!f)
-        return {};
-    std::string line;
-    std::getline(f, line);
-    return line;
-}
-
-std::string resolve_exe(const std::filesystem::path& link) {
-    try {
-        return std::filesystem::read_symlink(link).string();
-    } catch (const std::filesystem::filesystem_error&) {
-        return {};
-    }
-}
-
-std::string sha1_of_file(const std::filesystem::path& path) {
+std::string sha1_of_file_posix(const std::filesystem::path& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f)
         return {};
@@ -126,6 +116,28 @@ std::string sha1_of_file(const std::filesystem::path& path) {
     return hex;
 }
 
+#endif // POSIX
+
+// -- Linux implementation -----------------------------------------------------
+#ifdef __linux__
+
+std::string read_first_line(const std::filesystem::path& path) {
+    std::ifstream f(path);
+    if (!f)
+        return {};
+    std::string line;
+    std::getline(f, line);
+    return line;
+}
+
+std::string resolve_exe(const std::filesystem::path& link) {
+    try {
+        return std::filesystem::read_symlink(link).string();
+    } catch (const std::filesystem::filesystem_error&) {
+        return {};
+    }
+}
+
 void enumerate_and_stream(yuzu::CommandContext& ctx) {
     std::unordered_map<std::string, std::string> sha_cache;
     std::error_code ec;
@@ -155,7 +167,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
                 if (it != sha_cache.end()) {
                     sha1 = it->second;
                 } else {
-                    sha1 = sha1_of_file(exe_path);
+                    sha1 = sha1_of_file_posix(exe_path);
                     sha_cache.emplace(exe_path, sha1);
                 }
             }
@@ -163,6 +175,68 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 
         ctx.write_output(
             std::format("{}|{}|{}|{}", pid, escape_pipes(name), escape_pipes(exe_path), sha1));
+    }
+}
+
+// -- macOS implementation -----------------------------------------------------
+#elif defined(__APPLE__)
+
+void enumerate_and_stream(yuzu::CommandContext& ctx) {
+    // First call returns required buffer size.
+    int needed = proc_listpids(PROC_ALL_PIDS, 0, nullptr, 0);
+    if (needed <= 0)
+        return;
+
+    std::vector<pid_t> pids(static_cast<size_t>(needed) / sizeof(pid_t) + 64, 0);
+    int got =
+        proc_listpids(PROC_ALL_PIDS, 0, pids.data(), static_cast<int>(pids.size() * sizeof(pid_t)));
+    if (got <= 0)
+        return;
+    size_t pid_count = static_cast<size_t>(got) / sizeof(pid_t);
+
+    std::unordered_map<std::string, std::string> sha_cache;
+    char path_buf[PROC_PIDPATHINFO_MAXSIZE];
+
+    for (size_t i = 0; i < pid_count; ++i) {
+        pid_t pid = pids[i];
+        if (pid <= 0)
+            continue;
+
+        path_buf[0] = '\0';
+        int n = proc_pidpath(pid, path_buf, sizeof(path_buf));
+        std::string exe_path;
+        if (n > 0)
+            exe_path.assign(path_buf, static_cast<size_t>(n));
+
+        std::string name;
+        if (!exe_path.empty()) {
+            auto pos = exe_path.find_last_of('/');
+            name = (pos == std::string::npos) ? exe_path : exe_path.substr(pos + 1);
+        } else {
+            // Fallback to short name via proc_name.
+            char name_buf[PROC_PIDPATHINFO_MAXSIZE] = {0};
+            if (proc_name(pid, name_buf, sizeof(name_buf)) > 0)
+                name = name_buf;
+        }
+        if (name.empty())
+            continue;
+
+        std::string sha1;
+        if (!exe_path.empty()) {
+            std::error_code fe;
+            if (std::filesystem::exists(exe_path, fe)) {
+                auto it = sha_cache.find(exe_path);
+                if (it != sha_cache.end()) {
+                    sha1 = it->second;
+                } else {
+                    sha1 = sha1_of_file_posix(exe_path);
+                    sha_cache.emplace(exe_path, sha1);
+                }
+            }
+        }
+
+        ctx.write_output(std::format("{}|{}|{}|{}", static_cast<int>(pid), escape_pipes(name),
+                                     escape_pipes(exe_path), sha1));
     }
 }
 
@@ -313,7 +387,7 @@ public:
 
 private:
     int do_fetch(yuzu::CommandContext& ctx) {
-#if defined(__linux__) || defined(_WIN32)
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
         enumerate_and_stream(ctx);
         return 0;
 #else

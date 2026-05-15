@@ -2612,6 +2612,233 @@ Get infrastructure topology data. For full topology rendering, use the HTMX frag
 
 ---
 
+### Fleet Visualization (3D)
+
+The fleet-visualization endpoints expose a single aggregate `fleet_topology.v1` document that the `/viz/fleet` 3D renderer consumes. The endpoint dispatches `tar.fleet_snapshot` to every connected agent on cache miss, aggregates per-agent snapshots into machine cubes + interior process nodes + connection edges, and applies a 60 s LRU-of-2 cache (keyed on `include_vuln`).
+
+#### `GET /viz/fleet`
+
+Browser-facing page that renders the 3D fleet topology. The page itself is auth-gated only; per-request RBAC enforcement happens when the page's JS hits `GET /api/v1/viz/fleet/topology` (see below).
+
+**Permission:** Session auth only (`require_auth`); redirects to `/login` on no session. The `--viz-disable` / `YUZU_VIZ_DISABLE` kill switch disables only the API endpoint, not the page shell — the page continues to load and the `503` from the disabled API surfaces in the browser console.
+
+**Browser requirements:** importmap support is required (Chrome 89+, Firefox 108+, Safari 16.4+, Edge 89+). On unsupported browsers the page detects via `HTMLScriptElement.supports('importmap')` and surfaces a visible error overlay instead of a blank canvas.
+
+**Cache posture:** the response sets `Cache-Control: no-cache, no-store, must-revalidate`. Vendored static assets (Three.js, OrbitControls, yuzu-viz.js) cache for 24 hours; the page itself revalidates on every navigation so a server upgrade cannot leave operators with a stale page that references the new assets.
+
+**Deployment constraint:** the page hard-codes static asset paths (`/static/three.module.min.js`, `/static/three-orbit-controls.js`, `/static/yuzu-viz.js`) and the API path (`/api/v1/viz/fleet/topology`). Reverse-proxy deployments under a sub-path (e.g. `location /yuzu/`) are not currently supported — the absolute paths would 404 against the rewritten origin. Mount Yuzu at the root path of its host or fronting domain.
+
+**Controls:**
+- Drag — rotate camera around scene origin (OrbitControls)
+- Mouse wheel — dolly in/out (clamped to `[4, 400]` units)
+- `W`/`A`/`S`/`D` — pan the view in camera screen space (window-level listener; suppressed when a text-editable target has focus, so typing in a future overlay-panel input does not eat keystrokes)
+- **Hover a machine cube body** — surfaces a fixed-position tooltip with the cube's hostname, OS, process count, and connection count. The cube tooltip is shown only when no interior process dot is intersected (process dots are raycasted first; see the process tooltip below). The wireframe outline overlay is excluded from hit-testing. Tooltip follows the cursor with a small offset to avoid flicker.
+- **Hover a process dot (interior of a cube)** — surfaces a process tooltip with the process's pid, name, user account, and category. Process dots are raycasted *before* cube meshes so an operator can hover a dot through the translucent cube face and still see process details (otherwise the cube's outer face would always win by ray distance and dots would be unreachable). Agent-controlled fields (name, user, category) are HTML-escaped before render and capped at 256 characters before escaping to bound CPU cost on pathological 1MB cmdline-as-comm payloads.
+
+**Renderer behaviour (PR 6):**
+
+The page renders one translucent cube per fleet machine on a deterministic grid. Per-OS palette: Linux `#f0c674`, macOS/Darwin `#a0a0a0`, Windows `#5294e2`, default `#666666`. Live agents render at opacity `0.18`; stale agents (no response within the 5 s `tar.fleet_snapshot` deadline) render at opacity `0.08` so they remain visible without competing for attention. Hostname labels appear above each cube as `Sprite` text and always face the camera; labels longer than 24 characters truncate with an ellipsis (the full hostname is visible in the hover tooltip). Layout is seeded by an FNV-1a 32-bit hash of `agent_id` so the same fleet renders identically across reloads even when the server returns rows in a different order.
+
+**Renderer behaviour (PR 7):**
+
+Each machine cube contains interior `SphereGeometry` dots, one per process reported in the `processes` array of the topology payload. Dots are coloured by process category using a fixed six-colour palette: system `#6e7681`, browser `#58a6ff`, database `#d29922`, web `#56d364`, runtime `#bc8cff`, other `#8b949e`. Category values in the JSON payload are lowercase strings matching `category_to_string()` in the server's process classifier (`server/core/src/process_category.hpp`); the renderer normalises with `String(category).trim().toLowerCase()` and uses `Object.prototype.hasOwnProperty.call` for the palette lookup so unknown / mixed-case / whitespace-padded values fall through to `other` and prototype keys (`constructor`, `__proto__`) cannot poison the colour pipeline.
+
+Dot positions are deterministic across reloads — `hash(pid|ppid)`-mod-bucket layout inside 78% of the cube's interior volume, with per-process `hash('j|pid')` jitter to break visual stripes. Per-machine processes are attached as a named child group (`yuzu-processes`) of each cube so they orbit and pan with the cube under OrbitControls without synchronisation overhead. To bound the worst-case render cost on heavily-threaded hosts (e.g. JVM thread pools), the renderer soft-caps at **1000 dots per cube**; the cube tooltip's `processes` count still reflects the true total reported by the agent.
+
+Hover-then-tooltip is rAF-throttled — `mousemove` fires up to ~120 Hz on macOS trackpads but the bidirectional raycast (process dots + cube meshes) only runs once per `requestAnimationFrame` tick (~60 Hz) so the dominant CPU cost stays bounded even at large fleets.
+
+To suppress process-level visibility for specific agents (privacy-sensitive hosts, regulated workloads, etc.), set `process_enabled=false` on those agents via `tar.configure` — see [`docs/user-manual/agent-plugins.md`](agent-plugins.md) §TAR for the per-source enable/disable surface. The `tar.fleet_snapshot` action will skip the process collector on those agents and the corresponding cubes will render with no interior dots (cube body and hover tooltip remain functional).
+
+**Browser error handling.** When the JS renderer's fetch to `/api/v1/viz/fleet/topology` fails, the renderer surfaces a visible overlay (`#viz-error.shown`) on the canvas rather than leaving the scene blank. Any previously-rendered cubes are removed before the overlay is shown so the operator does not see "live data" cubes alongside a denial message.
+
+| API response | Overlay message |
+|---|---|
+| `401` | "Session expired. Please reload the page." |
+| `403` | "Access denied. Your role no longer permits viewing the fleet topology." |
+| `413` | "Fleet exceeds the configured `machines_max` cap. Ask an administrator to raise `--viz-machines-max` or scope the request via a management group." |
+| `503` | "Fleet visualization is currently disabled by an administrator." |
+| Other 4xx/5xx | "Failed to fetch fleet topology (HTTP <status>). Try reloading." |
+| Network failure | "Cannot reach server: <message>" |
+| Truncated JSON / malformed body | "Malformed JSON from server (truncated response or proxy issue): <message>" |
+| Schema mismatch | "Unexpected topology schema: <schema>. Reload the page (Ctrl+Shift+R) to pick up the new dashboard." |
+| Empty `machines` field (server bug) | "Server returned no machines field. This is a server-side bug; check the server log." |
+
+These overlays are in addition to the standard browser console entry. Previous releases (PR 5 and earlier) left the scene blank on every error condition.
+
+#### `GET /api/v1/viz/fleet/topology`
+
+Returns the full topology as JSON.
+
+**Permission:** `Response:Read`.
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `include_vuln` | bool (`0`/`1`) | `0` | When `1`, the per-process `worst_severity` and `cve_count` fields are populated from NVD CPE matching. (PR 2 hardening note: this overlay is wired but inert today because the agent payload doesn't carry installed versions; PR 10 of the ladder activates it.) Selects a separate cache slot from the default. |
+| `fresh` | bool (`0`/`1`) | `0` | When `1`, the cache slot is invalidated before the get. A separate audit row (`viz.fleet_topology.invalidate`) is emitted. Use sparingly — concurrent `?fresh=1` storms force every dispatch to wait on the single-flight refill. |
+| `machines_max` | integer in `[1, 100000]` | `5000` | Soft cap on the number of fleet machines returned. If the materialised snapshot has more than this, the route returns `413` rather than truncating (truncation would mislead operators about which subset they're seeing). |
+
+**Responses**
+
+| Status | When | Body |
+|---|---|---|
+| `200` | Success | `fleet_topology.v1` JSON envelope (see schema below) |
+| `400` | `machines_max` non-numeric, out of `[1, 100000]`, or overflows `int` | `{"error":{"code":400,"message":"..."}, "meta":{"api_version":"v1"}}` |
+| `403` | RBAC denied | Standard auth error envelope |
+| `413` | Snapshot exceeds `machines_max` | `{"error":{"code":413,"message":"fleet topology exceeds machines_max..."}, "meta":{"api_version":"v1"}}` |
+| `503` | Kill switch on (`--viz-disable`) or store unavailable | `{"error":{"code":503,"message":"..."}, "meta":{"api_version":"v1"}}` |
+
+**Schema (`fleet_topology.v1`)**
+
+```json
+{
+  "schema": "fleet_topology.v1",
+  "schema_minor": 3,
+  "generated_at": 1715299200,
+  "include_vuln": false,
+  "machines": [
+    {
+      "agent_id": "...",
+      "hostname": "host-1",
+      "os": "linux",
+      "local_ips": ["10.0.0.1"],
+      "ts": 1715299200,
+      "stale": false,
+      "processes": [
+        {"pid": 1234, "ppid": 1, "name": "postgres", "user": "postgres", "category": "database"},
+        {"pid": 5678, "ppid": 1, "name": "psql",     "user": "alice",    "category": "database"}
+      ],
+      "listeners": [
+        {"proto": "tcp", "port": 5432, "pid": 1234, "process_name": "postgres", "local_addr": "0.0.0.0"}
+      ],
+      "connections": [
+        {"proto": "tcp", "src_pid": 1234, "src_addr": "10.0.0.1", "src_port": 5432,
+         "dst_addr": "10.0.0.2", "dst_port": 54321, "scope": "internal_fleet",
+         "dst_agent_id": "...", "state": "ESTABLISHED"},
+        {"proto": "tcp", "src_pid": 1234, "src_addr": "127.0.0.1", "src_port": 5432,
+         "dst_addr": "127.0.0.1", "dst_port": 53210, "scope": "local",
+         "dst_pid": 5678, "state": "ESTABLISHED"}
+      ]
+    }
+  ]
+}
+```
+
+`schema_minor` is bumped (not `schema`) on additive evolution; renderers MUST ignore unknown keys.
+
+**`schema_minor` history:**
+
+| Version | Change |
+|---|---|
+| 1 | Initial shape (PR 2–7) |
+| 2 | PR 8 — `dst_pid` (uint32) added to `ConnectionEdge`. Present only on `scope: local` edges with a resolved peer process on the same machine; omitted (not zero) on non-local edges. Unmatched `local` edges (no reciprocal half visible in the same snapshot) are dropped server-side before serialisation, so a `local` edge in the response always carries a non-zero `dst_pid`. Strict-validating consumers pinned to minor version 1 should relax their validator to `minimum: 1` rather than exact-match. |
+| 3 | PR 9 — `listeners[]` array added to each `MachineNode`. Each entry is a `ListenerSocket` (`proto`, `port`, optional `pid`, optional `process_name`). LISTEN-state rows continue to appear in `connections[]` during the deprecation window so consumers filtering `connections` by `state: LISTEN` are not broken; a future release will remove them from `connections[]` with a `Breaking` CHANGELOG entry. Strict consumers should migrate to `listeners[]` now. Ingestion path also flipped: agents push `tar.fleet_snapshot` JSON via `HeartbeatRequest.fleet_snapshot_json` every 30 s (PR 10), so cache-miss latency drops from ~800 ms (full agent dispatch) to ~2 ms (in-process map walk). The dispatch path remains as a cold-start fallback. |
+| 4 | PR 12 — `ListenerSocket` grows an optional `local_addr` field (the kernel-reported bind address: `0.0.0.0`, `::`, a NIC IP, `127.0.0.1`, etc., bounded server-side at 64 bytes per field). Omitted from the wire envelope when the agent did not populate it (older snapshots). The renderer reads this field and drops loopback-only listeners (`127.0.0.0/8`, `::1`, including bracketed and v4-mapped-in-v6 forms `[::ffff:127.x]`) from the cube-surface socket ring — those sockets are by definition not reachable from any other instance. `0.0.0.0` and `::` survive the filter; specific NIC IPs survive. Strict consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. |
+
+**Audit emissions**
+
+Every request produces a `viz.fleet_topology` row (target_type `FleetTopology`, target_id empty). `?fresh=1` additionally produces a `viz.fleet_topology.invalidate` row immediately before the get. See [Audit Log](audit-log.md) for the full vocabulary.
+
+**Metrics**
+
+- `yuzu_viz_topology_request_seconds` (histogram) — end-to-end request latency on the success path (auth + RBAC + store + serialisation + response).
+- `yuzu_viz_topology_fetch_duration_seconds` (histogram) — duration of the inner agent-dispatch path (`tar.fleet_snapshot` fan-out + response aggregation), measured only on cache-miss refills. Use to distinguish slow agent dispatch from slow auth / serialisation. Observed even on fetcher exception so a hung fetcher produces a visible upper-bound observation. (PR 6 / OBS-2.)
+- `yuzu_viz_cache_hit_total` / `yuzu_viz_cache_miss_total` (counters).
+- `yuzu_viz_oversize_response_total` (counter) — 413 cap-check fires.
+- `yuzu_viz_agent_dispatch_timeout_total` (counter) — agents that didn't respond within the 5 s fetcher deadline.
+- `yuzu_viz_refill_oversize_drops_total` (gauge) — store-level 256 MiB cap exceeded; refill not cached.
+- `yuzu_viz_refill_wait_timeouts_total` (gauge) — single-flight waiters that timed out on the refill.
+- `yuzu_viz_refill_waiters_total` (gauge) — single-flight piggyback depth.
+- `yuzu_viz_topology_pushed_total{via=direct|gateway}` (counter, PR 10) — agent-pushed `fleet_snapshot.v1` payloads accepted via heartbeat. `via=direct` counts direct-to-server agents; `via=gateway` counts gateway-routed agents. A zero value across both labels after agents have been running for >30 s indicates agents have not upgraded to push-enabled binaries; the server falls back to the dispatch path automatically.
+- `yuzu_viz_topology_push_parse_errors_total{via=direct|gateway}` (counter, PR 10) — agent-pushed payloads rejected by the shared parser (oversized > 2 MiB, `processes[]`/`connections[]` exceeding the 4096-row cap, or malformed JSON). A non-zero value indicates agent/server version skew, a corrupt heartbeat, or a compromised agent attempting to inject malformed data. Each rejection also emits a `topology.push.rejected` audit event. The parser also length-clamps every agent-controlled string field (`hostname`, process `name`/`cmdline`/`user`, connection meta strings) — truncation is logged but not counted here.
+- `yuzu_viz_topology_push_rejected_total` (gauge) — pushes rejected by the IP-spoof guard because a claimed `local_ip` is owned by a *live* agent (an agent that has pushed within the 5-minute reclaim window). Non-zero signals a spoofing campaign or a NAT/DHCP misconfiguration.
+- `yuzu_viz_pushed_cap_evictions_total` (gauge) — `pushed_` map entries evicted because the map hit the 100 000-agent hard cap. The victim is the least-recently-seen agent by *server* receipt time (not the agent-controlled `ts`); each eviction emits a `topology.push.evicted_for_cap` audit event.
+- `yuzu_viz_pushed_map_size` (gauge) — current `pushed_` map occupancy; the memory-pressure signal to alert on before evictions begin.
+
+**`fleet_snapshot.v1` (agent-emitted payload).** The `fleet_topology.v1` document above is the server-aggregated shape; the per-agent payload the agent pushes (via `HeartbeatRequest.fleet_snapshot_json`) or returns from a dispatched `tar.fleet_snapshot` is `fleet_snapshot.v1`. Its `schema_minor` is at **2** — the `1 → 2` bump added an optional `connections[].last_seen_seconds_ago` field, emitted only when non-zero, alongside the operator-tunable TAR plugin config key `fleet_snapshot_window_seconds` (default `3600`): connections seen within that window are merged into the snapshot even if not ESTABLISHED at the exact `/proc` sample instant. `fleet_snapshot_window_seconds` is a TAR plugin config key set via `tar.configure`, not a server CLI flag.
+
+**Example**
+
+```bash
+curl -H 'Authorization: Bearer <token>' \
+     'http://localhost:8080/api/v1/viz/fleet/topology?include_vuln=0&machines_max=2000'
+```
+
+#### `GET /fragments/viz/fleet/topology`
+
+Identical data, wrapped in `<script type="application/json" id="viz-data">...</script>` for HTMX-driven swap-and-parse rendering. The `<` characters in JSON strings are escaped (`<\/`) before wrapping so an agent-controlled hostname or `cmdline` containing `</script>` cannot break out of the script element.
+
+**Permission, query params, status codes:** identical to the JSON route above.
+
+**Content-Type:** `text/html; charset=utf-8` (the body is HTML wrapping JSON, not JSON proper).
+
+#### `GET /api/v1/viz/host/<agent_id>/topology`
+
+Returns a single host's topology — one `MachineNode` sliced out of the
+current fleet snapshot — for the per-host IPC-graph drill-down page. The
+`agent_id` is taken from the path.
+
+**Permission:** `Response:Read`.
+
+**Responses**
+
+| Status | When | Body |
+|---|---|---|
+| `200` | Success | `host_topology.v1` JSON envelope (see schema below) |
+| `404` | No machine with that `agent_id` in the current snapshot | `{"error":{"code":404,"message":"host not found"}, ...}` |
+| `403` | RBAC denied | Standard auth error envelope |
+| `500` | Topology fetch threw or returned null | `{"error":{"code":500,"message":"..."}, ...}` |
+| `503` | Kill switch on (`--viz-disable`) or store unavailable | `{"error":{"code":503,"message":"..."}, ...}` |
+
+**Schema (`host_topology.v1`)**
+
+```json
+{
+  "schema": "host_topology.v1",
+  "schema_minor": 1,
+  "generated_at": 1715299200,
+  "stale": false,
+  "machine": { "agent_id": "...", "hostname": "host-1", "...": "MachineNode — same shape as a fleet_topology.v1 machines[] entry" }
+}
+```
+
+The `stale` flag is promoted from `machine.stale` to the envelope so a
+renderer can decide whether to show a stale banner without reaching into
+`machine`. The embedded `machine` object is byte-for-byte the same
+`MachineNode` shape served by `/api/v1/viz/fleet/topology`.
+
+**Audit emissions:** every request produces a `viz.host_topology` row
+(target_type `HostTopology`, target_id = `agent_id`), with result
+`success` / `denied` / `failure` and a detail of `kill_switch`,
+`store_null`, `fetch_threw`, `snap_null`, `not_found`, or `fragment=1`.
+
+**Example**
+
+```bash
+curl -H 'Authorization: Bearer <token>' \
+     'http://localhost:8080/api/v1/viz/host/cedar-01/topology'
+```
+
+#### `GET /fragments/viz/host/<agent_id>/topology`
+
+Identical data, wrapped in `<script type="application/json" id="viz-data">...</script>`
+for HTMX rendering — same escaping and `Content-Type` posture as
+`/fragments/viz/fleet/topology`. Permission and status codes identical to
+the JSON route above.
+
+#### `GET /viz/host/<agent_id>`
+
+Browser-facing per-host drill-down page (the 2D Cytoscape IPC graph above
+the TAR process tree), opened by double-clicking a cube in `/viz/fleet`.
+Auth-gated only (`require_auth`); redirects to `/login` on no session.
+The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` — any
+other character returns `400` — before it is templated into the page
+shell. Per-request RBAC is enforced when the page's JS fetches
+`/api/v1/viz/host/<agent_id>/topology`.
+
+---
+
 ### Fleet Statistics
 
 #### `GET /api/v1/statistics`

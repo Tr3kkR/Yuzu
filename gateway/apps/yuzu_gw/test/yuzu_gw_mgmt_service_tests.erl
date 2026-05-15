@@ -64,14 +64,26 @@ list_agents_passes_ctx_test_() ->
       {"get_agent returns caller's ctx on success", fun get_agent_ctx/0}]}.
 
 ctx_setup() ->
-    case whereis(yuzu_gw) of
-        undefined -> pg:start_link(yuzu_gw);
-        _ -> ok
-    end,
-    case whereis(yuzu_gw_registry) of
-        undefined -> {ok, _} = yuzu_gw_registry:start_link();
-        _ -> ok
-    end,
+    %% The previous setup only checked `whereis(yuzu_gw_registry)` to
+    %% decide whether to start_link the registry. That misses the case
+    %% where a prior test left the registered name in place but the
+    %% registry's `?TABLE` (`yuzu_gw_agents`) ETS table was destroyed
+    %% (sibling test ran `ets:delete`, gen_server crashed-and-rerouted,
+    %% or — most commonly — an earlier EUnit suite tore down its own
+    %% registry between phases). When that mismatch holds,
+    %% `ets:select(yuzu_gw_agents, ...)` from `yuzu_gw_registry:list_agents/2`
+    %% blows up with `badarg` and the test fails as
+    %% `list_agents_ctx ...*failed*` (eunit run `1778588897-12585`).
+    %%
+    %% Repair invariant: the registry must be alive AND its `?TABLE`
+    %% ETS table must exist before any test in this suite runs. If
+    %% either condition is violated we recreate cleanly. We don't blow
+    %% up on `{already_started, _}` because a parallel EUnit gate may
+    %% have started the registry between our `whereis` check and our
+    %% `start_link` call (this is a real race under
+    %% `REBAR_BASE_DIR=_build_eunit` parallel fan-out).
+    ensure_yuzu_gw_pg(),
+    ensure_registry_with_ets(),
     catch meck:unload(yuzu_gw_upstream),
     catch meck:unload(telemetry),
     meck:new(yuzu_gw_upstream, [non_strict, no_link]),
@@ -79,6 +91,61 @@ ctx_setup() ->
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
     ok.
+
+ensure_yuzu_gw_pg() ->
+    case whereis(yuzu_gw) of
+        undefined ->
+            case pg:start_link(yuzu_gw) of
+                {ok, _}                          -> ok;
+                {error, {already_started, _}}    -> ok
+            end;
+        _ -> ok
+    end.
+
+ensure_registry_with_ets() ->
+    HasRegistry  = is_pid(whereis(yuzu_gw_registry)),
+    HasEtsTable  = ets:info(yuzu_gw_agents, size) =/= undefined,
+    case {HasRegistry, HasEtsTable} of
+        {true, true} ->
+            ok;
+        _ ->
+            %% Empirically observed (eunit run 1778588897-12585): when
+            %% an earlier suite tears down, the registry's gen_server
+            %% remains alive but its ETS tables have already been
+            %% destroyed (the cleanup races between the gen_server's
+            %% terminate/2 and the OS-level table reaper). The
+            %% gen_server in that "zombie-but-still-registered" state
+            %% does NOT respond to `gen_server:stop` because it has no
+            %% useful state left to drain — stop succeeds without
+            %% actually exiting the process, so a subsequent
+            %% `gen_server:start` returns `{already_started, Pid}` and
+            %% the test fires `ets:select` against the missing table.
+            %%
+            %% Force-kill the zombie via `exit(Pid, kill)` (untrappable;
+            %% bypasses the misbehaving terminate path), wait for the
+            %% registered name to clear, then start a fresh registry.
+            %% Unlinked so the EUnit setup process's eventual exit
+            %% doesn't propagate.
+            case whereis(yuzu_gw_registry) of
+                undefined -> ok;
+                ZombiePid ->
+                    exit(ZombiePid, kill),
+                    wait_unregistered(yuzu_gw_registry, 50, 20)
+            end,
+            {ok, _} = gen_server:start({local, yuzu_gw_registry},
+                                       yuzu_gw_registry, [], [])
+    end.
+
+%% Spin until the given registered name is `undefined`, max Attempts × WaitMs.
+wait_unregistered(_Name, 0, _WaitMs) ->
+    ok;
+wait_unregistered(Name, Attempts, WaitMs) ->
+    case whereis(Name) of
+        undefined -> ok;
+        _ ->
+            timer:sleep(WaitMs),
+            wait_unregistered(Name, Attempts - 1, WaitMs)
+    end.
 
 ctx_cleanup(_) ->
     catch meck:unload(yuzu_gw_upstream),

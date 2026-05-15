@@ -6,35 +6,21 @@
  */
 
 #include "tar_db.hpp"
+#include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <chrono>
-#include <cstdlib>
 #include <filesystem>
 #include <string>
-#include <thread>
 #include <vector>
-
-#ifndef _WIN32
-#  include <unistd.h>
-#endif
 
 namespace fs = std::filesystem;
 using namespace yuzu::tar;
 
-// Per-uid suffix so multi-user hosts (e.g. WSL2 with both an interactive
-// user and the github-runner CI account) don't collide on /tmp ownership.
-static std::string yuzu_test_uid_suffix() {
-#ifdef _WIN32
-    if (const char* u = std::getenv("USERNAME")) return std::string("_") + u;
-    return "_unknown";
-#else
-    return "_" + std::to_string(static_cast<unsigned long>(::geteuid()));
-#endif
-}
-
 // Helper: create a TarDatabase in a unique temp file, clean up on destruction.
+// Uniqueness comes from yuzu::test::unique_temp_path -- never salt with
+// std::hash<thread::id> / steady_clock, which collide under Defender-induced
+// I/O serialisation on the Windows runner (CLAUDE.md test conventions, #473).
 struct TestTarDb {
     TarDatabase db;
     fs::path path;
@@ -49,12 +35,7 @@ struct TestTarDb {
 };
 
 static TestTarDb make_test_db() {
-    auto tmp = fs::temp_directory_path() / ("yuzu_test_tar" + yuzu_test_uid_suffix()) /
-               ("tar_" +
-                std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) +
-                "_" +
-                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
-                ".db");
+    auto tmp = yuzu::test::unique_temp_path("tar_");
     auto result = TarDatabase::open(tmp);
     REQUIRE(result.has_value());
     return TestTarDb{std::move(*result), tmp};
@@ -133,6 +114,144 @@ TEST_CASE("TarDatabase: insert and query network events", "[tar][store][crud]") 
     CHECK(results->rows[0][0] == "tcp");
     CHECK(results->rows[0][1] == "8080");
     CHECK(results->rows[0][2] == "10.0.0.1");
+}
+
+// ── query_recent_tcp_connections — last-N-seconds window for the viz ─────────
+//
+// Tracer bullet: TAR keeps every observed TCP connection in tcp_live with
+// its observation timestamp. The viz wants to render any connection that
+// existed within the last hour as a tube, not just the currently-ESTABLISHED
+// ones from /proc/net/tcp. So `tar.fleet_snapshot` needs a way to ask the
+// warehouse for the rolling window of connections seen recently.
+//
+// Behaviour: returns one row per unique (proto, local_addr, local_port,
+// remote_addr, remote_port, pid) 5-tuple, with `ts` set to the most recent
+// observation timestamp. Rows older than `since_ts` are dropped. State
+// values other than ESTABLISHED are filtered out (LISTEN, TIME_WAIT, etc.
+// — those aren't "this box talks to that box" edges).
+TEST_CASE("TarDatabase: query_recent_tcp_connections returns rows newer than the window",
+          "[tar][store][recent-tcp]") {
+    auto t = make_test_db();
+
+    NetworkEvent in_window;
+    in_window.ts = 5000;
+    in_window.action = "connected";
+    in_window.proto = "tcp";
+    in_window.local_addr = "10.0.0.10";
+    in_window.local_port = 50001;
+    in_window.remote_addr = "10.0.0.20";
+    in_window.remote_port = 5432;
+    in_window.state = "ESTABLISHED";
+    in_window.pid = 100;
+    in_window.process_name = "node";
+
+    NetworkEvent out_of_window;
+    out_of_window.ts = 1000; // 4000 seconds before in_window
+    out_of_window.action = "connected";
+    out_of_window.proto = "tcp";
+    out_of_window.local_addr = "10.0.0.10";
+    out_of_window.local_port = 49999;
+    out_of_window.remote_addr = "10.0.0.30";
+    out_of_window.remote_port = 6379;
+    out_of_window.state = "ESTABLISHED";
+    out_of_window.pid = 100;
+    out_of_window.process_name = "node";
+
+    REQUIRE(t.db.insert_network_events({in_window, out_of_window}));
+
+    // Window: [5000 - 3600, 5000] = [1400, 5000]. The t=1000 row is outside.
+    auto recent = t.db.query_recent_tcp_connections(/*since_ts=*/1400);
+    REQUIRE(recent.has_value());
+    REQUIRE(recent->size() == 1);
+    CHECK(recent->at(0).proto == "tcp");
+    CHECK(recent->at(0).local_addr == "10.0.0.10");
+    CHECK(recent->at(0).local_port == 50001);
+    CHECK(recent->at(0).remote_addr == "10.0.0.20");
+    CHECK(recent->at(0).remote_port == 5432);
+    CHECK(recent->at(0).pid == 100u);
+    CHECK(recent->at(0).ts == 5000);
+}
+
+TEST_CASE("TarDatabase: query_recent_tcp_connections dedups by 5-tuple, keeps latest ts",
+          "[tar][store][recent-tcp]") {
+    auto t = make_test_db();
+
+    // Same 5-tuple+pid observed three times. The result MUST be a single
+    // row with ts set to the most recent observation (3000).
+    NetworkEvent base;
+    base.action = "connected";
+    base.proto = "tcp";
+    base.local_addr = "10.0.0.10";
+    base.local_port = 60001;
+    base.remote_addr = "10.0.0.20";
+    base.remote_port = 5432;
+    base.state = "ESTABLISHED";
+    base.pid = 200;
+    base.process_name = "node";
+
+    base.ts = 1500;
+    NetworkEvent first = base;
+    base.ts = 2500;
+    NetworkEvent middle = base;
+    base.ts = 3000;
+    NetworkEvent latest = base;
+
+    REQUIRE(t.db.insert_network_events({first, middle, latest}));
+
+    auto recent = t.db.query_recent_tcp_connections(/*since_ts=*/1000);
+    REQUIRE(recent.has_value());
+    REQUIRE(recent->size() == 1);
+    CHECK(recent->at(0).ts == 3000);
+    CHECK(recent->at(0).local_port == 60001);
+}
+
+TEST_CASE("TarDatabase: query_recent_tcp_connections filters out LISTEN and TIME_WAIT",
+          "[tar][store][recent-tcp]") {
+    auto t = make_test_db();
+
+    NetworkEvent established;
+    established.ts = 4000;
+    established.action = "connected";
+    established.proto = "tcp";
+    established.local_addr = "10.0.0.10";
+    established.local_port = 50100;
+    established.remote_addr = "10.0.0.20";
+    established.remote_port = 5432;
+    established.state = "ESTABLISHED";
+    established.pid = 300;
+    established.process_name = "node";
+
+    NetworkEvent listen;
+    listen.ts = 4001;
+    listen.action = "connected";
+    listen.proto = "tcp";
+    listen.local_addr = "0.0.0.0";
+    listen.local_port = 3000;
+    listen.remote_addr = "0.0.0.0";
+    listen.remote_port = 0;
+    listen.state = "LISTEN";
+    listen.pid = 300;
+    listen.process_name = "node";
+
+    NetworkEvent time_wait;
+    time_wait.ts = 4002;
+    time_wait.action = "connected";
+    time_wait.proto = "tcp";
+    time_wait.local_addr = "10.0.0.10";
+    time_wait.local_port = 50101;
+    time_wait.remote_addr = "10.0.0.20";
+    time_wait.remote_port = 5432;
+    time_wait.state = "TIME_WAIT";
+    time_wait.pid = 300;
+    time_wait.process_name = "node";
+
+    REQUIRE(t.db.insert_network_events({established, listen, time_wait}));
+
+    auto recent = t.db.query_recent_tcp_connections(/*since_ts=*/0);
+    REQUIRE(recent.has_value());
+    REQUIRE(recent->size() == 1);
+    CHECK(recent->at(0).state == "ESTABLISHED");
+    CHECK(recent->at(0).local_port == 50100);
 }
 
 TEST_CASE("TarDatabase: query with time range filter", "[tar][store][query]") {

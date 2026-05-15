@@ -7,6 +7,545 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-host IPC-graph drill-down (`/viz/host/<agent_id>`).** Double-clicking
+  a cube in `/viz/fleet` opens a new tab with a 2D bipartite IPC graph
+  (processes + sockets, Cytoscape `cose` layout) above the existing TAR
+  process tree, with cross-pane select-to-highlight and a resizable
+  splitter. New REST routes `GET /api/v1/viz/host/<agent_id>/topology`
+  and `GET /fragments/viz/host/<agent_id>/topology` return a
+  `host_topology.v1` envelope (one `MachineNode` sliced from the fleet
+  snapshot); both require `Response:Read` and honour the `--viz-disable`
+  kill switch. The `/viz/host/<id>` page route is auth-gated and
+  allow-lists the `agent_id` (`[A-Za-z0-9._-]`) before templating.
+  Vendored Cytoscape.js 3.33.3 (MIT).
+- **`tar.fleet_snapshot` connection window.** `fleet_snapshot` now merges
+  connections seen recently from the `tcp_live` warehouse, not only those
+  ESTABLISHED at the exact `/proc` sample instant, so short-lived flows
+  reach the viz. New operator-tunable `fleet_snapshot_window_seconds`
+  (default `3600`). `fleet_snapshot.v1` `schema_minor` bumps `1 → 2`
+  (additive `connections[].last_seen_seconds_ago`, emitted only when
+  non-zero).
+- **`/viz/fleet` three-tier layout + talking-socket layer + curved tube
+  wires (PR 12 of the 11-PR `/viz/fleet` 3D fleet network-topology
+  ladder).** Machines now organise into three architectural Y planes:
+  frontends on top, applications in the middle, databases on the
+  bottom. Classification is a heuristic over listener ports (a
+  curated `DB_PORTS` / `WEB_PORTS` set) and the agent's process
+  category, priority `db > web > app`; tier placement is a visual
+  cue only and carries no authorisation weight. **`ListenerSocket`
+  grows an optional `local_addr` field** (`schema_minor` bumps
+  `3 → 4`) carrying the kernel-reported bind address; the renderer
+  reads it to drop loopback-only listeners (`127.0.0.0/8`, `::1`,
+  including bracketed and v4-mapped-in-v6 `[::ffff:127.x]` forms)
+  from the cube-surface socket ring — they're not reachable from
+  other instances. **Talking-socket primitive:** each cube grows a
+  ring of cool-blue dots on its BOTTOM face, one per unique
+  outbound `(proto, dst_ip, dst_port)`; hover surfaces
+  `talking: tcp → ip:port`. **Cross-machine wires render as
+  `THREE.TubeGeometry` along a `THREE.CubicBezierCurve3` with
+  vertical end-tangents** so the wire exits the source cube floor
+  going straight down, runs nearly-straight through free space,
+  and re-enters the destination cube ceiling going straight up
+  into the listener sphere — `LineBasicMaterial.linewidth` is
+  silently clamped to 1px on every shipping browser, so the
+  switch to tubes is what makes the wires visible at typical
+  zoom. Parallel wires fan opposite sides via a deterministic
+  hash on `(srcAgentId, dst_ip:dst_port)` so two cubes both
+  talking to the same destination don't trace the same arc.
+  Per-field size cap of 64 bytes applies to `local_addr` and
+  `remote_addr` at the parser to bound the wire payload
+  regardless of agent behaviour. Test-pinned JS bundle ceiling
+  raised 80 KB → 96 KB to fit the new primitives.
+
+### Changed
+
+- **`/viz/fleet` `WEB_PORTS` trimmed** — dev-server ports (3000 etc.) no
+  longer score as "web", so a node app classifies application-tier not
+  frontend.
+- **`/static/yuzu-viz.js` cache posture** flipped to
+  `no-cache, no-store, must-revalidate` (was `max-age=86400`) — the
+  renderer bundle changes every viz PR and a `max-age` silently served a
+  stale renderer after a server upgrade.
+- **`/viz/fleet` cube layout** moved from a single flat grid to a
+  three-tier stacked layout (PR 12). Operators with bookmarked URLs
+  will land on the new camera framing `(45, 60, 45)` looking at the
+  middle tier (was `(35, 30, 35)` looking at origin).
+- **`/api/v1/viz/fleet/topology` `schema_minor`** bumped `3 → 4`
+  (additive — strict consumers pinned to `== 3` should relax to
+  `>= 3`).
+
+### Fixed
+
+- **Agent interval triggers now fire.** `yuzu_register_trigger` /
+  `yuzu_unregister_trigger` were no-op stubs — no `TriggerEngine` was
+  instantiated, so `collect_fast` / `collect_slow` / `rollup` never ran
+  for any plugin. The TAR warehouse `*_live` tables sat permanently empty
+  in the field. The agent now owns a `TriggerEngine`, wires it into the
+  plugin context before plugin init, and starts it after plugins load.
+  See the upgrade note below.
+- **Gateway replays agent registrations on upstream reconnect.** After an
+  upstream connection drop, the gateway reconnected the transport but
+  never re-proxied the agent registrations it still held, leaving a
+  freshly-restarted server with an empty registry. The gateway now
+  drip-replays a `ProxyRegister` per held agent on upstream recovery.
+- **34 InstructionDefinitions now pass on macOS.** `procfetch` gained a
+  libproc/OpenSSL macOS branch, the instructions test runner gained
+  host-aware parameter synthesis and platform-aware skip (definitions
+  with a `platforms:` list now emit `skip` on a non-matching host
+  instead of a spurious `FAIL`).
+- **Mixed-fleet split-brain in `/viz/fleet` (governance Gate 7 UP-9).**
+  Once any agent pushed a snapshot, the topology was built solely from
+  the pushed map and the dispatch fallback was skipped — so any
+  registered agent that had *not* pushed (a pre-`tar.fleet_snapshot`
+  build mid rolling-upgrade, the TAR plugin disabled, a pump wedged on
+  its first cycle) silently vanished from the visualization. The store
+  now emits a `stale=true` placeholder cube for every
+  registered-but-unpushed agent.
+- **Gateway registration-replay storm (governance Gate 7 UP-5).** An
+  in-flight replay drip was restarted from scratch on every redundant
+  `replay_registrations` trigger, so under packet-loss flapping the
+  gateway re-proxied the whole fleet repeatedly and, at scale, never
+  drained. Redundant triggers while a drip is running are now dropped;
+  each outage event arms at most one full replay that runs to
+  completion.
+
+### Security
+
+- **Fleet-topology push-ingestion hardening (governance Gate 7).**
+  Round of fixes to `FleetTopologyStore` push ingestion:
+  - **Parser field caps (UP-1 / sec-M1).** `processes[].name`,
+    `.cmdline`, `.user`, `hostname`, and the connection meta strings
+    are now length-clamped at parse time (previously only the address
+    fields were), so a single oversize row can no longer balloon the
+    in-memory map or every `/viz/fleet/topology` response.
+  - **IP-claim reclaim window (UP-3).** The IP-spoof guard is still
+    first-claim-wins, but a claim whose owner has not pushed within
+    five minutes is now reclaimable — an agent that crashed without a
+    clean deregister no longer strands its `local_ips` forever, so a
+    re-imaged host re-enrolling on the same DHCP lease is not rejected
+    indefinitely.
+  - **CAP-1 LRU victim by server clock (UP-4).** Cap-eviction victim
+    selection now keys on the server-stamped receipt time, not the
+    agent-controlled `ts`, so a hostile agent can no longer choose
+    which legitimate agent gets evicted by lying about its emit time.
+    Cap evictions now also emit a `topology.push.evicted_for_cap`
+    audit event.
+  - **Push-staleness by server clock (UP-14).** The stuck-pump
+    staleness gate keys on server receipt time, so a clock-skewed
+    agent cannot render itself permanently fresh.
+  - **Batch-heartbeat isolation (UP-10).** A single malformed entry in
+    a gateway `BatchHeartbeat` (or an exception out of the direct
+    `Heartbeat` ingest) is now caught per-entry and can no longer
+    abort the whole batch.
+  - **Kill-switch hardening.** `--viz-disable` now also 503s the
+    `/viz/fleet` and `/viz/host/<id>` page shells (previously only the
+    REST/fragment endpoints), and emits a durable `server.viz_disabled`
+    audit event at startup so the disabled state is provable from the
+    audit store, not just process logs.
+
+### Upgrade notes
+
+- **Interval triggers were previously non-functional.** After upgrading
+  the agent daemon, registered interval triggers begin firing for the
+  first time. Operators should expect the TAR `*_live` warehouse tables
+  to start populating (on the first `collect_fast` cycle, default 60 s)
+  and may see a small increase in per-agent CPU/IO. Any plugin that
+  registered an interval trigger expecting the old no-op behaviour will
+  now have that trigger fire.
+- **Gateway registry ETS row and upstream state record changed shape.**
+  A hot upgrade from a pre-change gateway build is not supported (no
+  `code_change/3`); the documented gateway deploy path — container
+  replacement — is unaffected.
+- **Rolling agent upgrades and `/viz/fleet`.** During a rolling agent
+  upgrade, agents on a build older than the `tar.fleet_snapshot` action
+  (the push-ingestion source) appear in `/viz/fleet` as dimmed `stale`
+  cubes until their agent is upgraded — they have no topology to push
+  yet. This is expected, not a regression; the cubes populate fully once
+  the agent is current.
+
+### Removed
+
+- **Origin RGB `AxesHelper`** from the `/viz/fleet` empty-scene
+  scaffold (PR 12). The three-tier Y planes replace it as the
+  spatial orientation cue; the gizmo was clipping through the
+  bottom tier.
+
+- **`/viz/fleet` cross-machine edges + socket-layer primitive (PR 9 of
+  the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** Each
+  machine cube now displays a ring of cream-coloured socket spheres on
+  its top face, one per listening port (e.g. `:80`, `:3000`, `:5432`),
+  with a `:port` label sprite floating just above each sphere. Hover
+  surfaces port + proto + owning pid + process name. ESTABLISHED
+  outbound connections render as cool-blue `THREE.Line` edges from the
+  source cube anchored at the destination's matching socket sphere on
+  the peer cube — operators see "frontend → app:3000" as a line that
+  literally lands on `:3000`. External destinations (off-fleet
+  endpoints like the agent control channel) get a short grey stub line
+  ending in a small ring marker; hover reveals the off-cluster
+  `ip:port`. Hover order is sockets → processes → edges → cubes.
+- **Push-based fleet topology ingestion (PR 10).** Agents now push
+  their `tar.fleet_snapshot.v1` JSON every ~30 s via a new
+  `HeartbeatRequest.fleet_snapshot_json` proto field (field 4,
+  additive). Server-side `FleetTopologyStore::push_snapshot` ingests
+  into a per-agent `pushed_` map keyed by session-authenticated
+  agent_id; `/api/v1/viz/fleet/topology` reads from this map.
+  Cache-miss latency drops from ~800 ms (full agent dispatch fan-out)
+  to ~2 ms (in-process map walk). Pull-based dispatch is retained as a
+  cold-start fallback. New metrics
+  `yuzu_viz_topology_pushed_total{via=direct|gateway}` and
+  `yuzu_viz_topology_push_parse_errors_total{via=direct|gateway}`
+  count accepted and rejected pushes; new audit events
+  `topology.push.first` (first push per agent per process lifetime —
+  CC6.1/CC7.3 evidence) and `topology.push.rejected` (parse failure
+  or IP-spoof guard).
+- **`MachineNode.listeners[]` field (schema_minor `2 → 3`).** Each
+  entry is a `ListenerSocket` (`proto`, `port`, optional `pid`,
+  optional `process_name`). Server-side `build_snapshot()` lifts
+  LISTEN-state rows from the agent's `connections[]` into this typed
+  array. LISTEN rows continue to appear in `connections[]` during the
+  deprecation window (see **Deprecated** below).
+- **`/viz/fleet` intra-cube localhost edges (PR 8 of the 11-PR
+  `/viz/fleet` 3D fleet network-topology ladder).** Faint white
+  `LineSegments` (opacity `0.3`) now connect process dots inside each
+  machine cube when two processes are reciprocal ends of a loopback
+  TCP socket (127.0.0.1 ↔ 127.0.0.1 or ::1 ↔ ::1). The visible flow:
+  Prometheus scraping node_exporter inside the same host renders as
+  one line between the two dots and refreshes on each topology poll.
+  Server-side `build_snapshot()` pairs reciprocal halves by exact
+  4-tuple swap and writes the peer's `src_pid` into a new
+  `ConnectionEdge.dst_pid` field; unmatched halves are dropped before
+  serialisation. JSON `schema_minor` bumps `1 → 2` to advertise the
+  additive `dst_pid` field (mirrors the `dst_agent_id`-when-non-empty
+  pattern). Renderer builds a per-cube `pidToPos` Map and adds one
+  `THREE.LineSegments(BufferGeometry, LineBasicMaterial({color:0xffffff,
+  transparent:true, opacity:0.3}))` per paired Local edge into the
+  per-cube `processGroup` — disposal is free via `clearFleet`'s
+  existing `traverse(disposeNode)` walk. `Number.isFinite` guards on
+  both pid endpoints before `Map.get` so a malformed agent payload
+  cannot crash the render loop.
+
+### Changed
+
+- **`/api/v1/viz/fleet/topology` envelope `schema_minor` bumped `2 → 3`.**
+  PR 9 additive evolution — adds per-`MachineNode` `listeners[]` array.
+- **Hostname labels in the 3D viz render below cubes** (was above; UAT
+  request 2026-05-12) so the cube top face is unoccluded for the new
+  socket-sphere ring.
+- **`/api/v1/viz/fleet/topology` cache-miss latency reduced ~800 ms →
+  ~2 ms** under PR 10's push ingestion; steady-state stale-flicker
+  eliminated.
+- **`HeartbeatRequest` gained proto field 4 (`bytes fleet_snapshot_json`,
+  additive).** Recommended upgrade order: server → gateway → agents.
+- **`/api/v1/viz/fleet/topology` envelope `schema_minor` bumped `1 → 2`.**
+  Additive evolution per the existing contract — renderers MUST ignore
+  unknown keys, so consumers ignoring `schema_minor` see no break.
+  Strict-validating consumers pinned to `schema_minor: 1` exactly
+  should relax their validator to `minimum: 1` rather than exact-match.
+  Wire change: new optional `dst_pid` (uint32) on `EdgeScope::Local`
+  connection edges; non-Local edges and edges with no resolved peer
+  omit the field.
+- **`/api/v1/viz/fleet/topology` no longer emits unmatched `local`-scope
+  connection edges.** Loopback edges where the reciprocal half is not
+  visible in the same agent snapshot (race during teardown, agent's
+  4096-connection cap cuts the partner, kernel-namespace asymmetry) are
+  now dropped server-side before serialisation. **Integrations counting
+  `connections` array length per machine as a proxy for "active IPC
+  pairs" should re-baseline after upgrade** — the count will trend lower
+  by the unmatched-half count, which is typically small but non-zero.
+
+### Deprecated
+
+- **`connections[]` entries with `state: "LISTEN"`** are now duplicated
+  in the new `listeners[]` array (PR 9). For one release
+  `connections[]` continues to emit LISTEN rows alongside the new
+  array so consumers filtering `connections` by `state: LISTEN` are
+  not broken silently. A future release will remove LISTEN entries
+  from `connections[]` with a **Breaking** CHANGELOG entry; migrate
+  strict consumers to read `listeners[]` now.
+
+### Build / Dev infrastructure
+
+- **viz-UAT compose: per-service `NO_PROXY=*` to bypass OrbStack's
+  gRPC-incompatible HTTP proxy.** OrbStack injects
+  `HTTP_PROXY=http://proxyproxy.orb.internal:8305` into containers; gRPC's
+  HTTP/2 client honours it and 502s on cross-container traffic
+  (`gateway↔server` upstream and `agent→gateway` registration). The
+  fix is scoped to `deploy/docker/docker-compose.viz-uat.yml` only;
+  production compose files are untouched.
+- **viz-UAT: gateway port `50051` exposed to host.** Lets a `yuzu-agent`
+  running *outside* the compose stack (OrbStack VM, bare metal, host
+  process) register through the dev gateway. The in-container agent
+  still reaches the gateway via the internal `gateway` service hostname
+  and doesn't need this binding.
+- **`scripts/start-viz-uat.sh` adds `VIZ_UAT_AGENT_MODE` switch.** Modes:
+  `container` (default, prior behaviour, in-container agent under the
+  new `in-container-agent` compose profile); `vm` (skip the in-container
+  agent, print the enrollment token + host-exposed gateway address for
+  running a native `yuzu-agent` on an external host — enables PR 8+
+  visual demos against real loopback workloads); `none` (skip agent
+  startup entirely, useful for empty-fleet renderer iteration).
+
+### Added
+
+- **`/viz/fleet` interior process nodes coloured by category (PR 7 of the
+  11-PR `/viz/fleet` 3D fleet network-topology ladder).** Each fleet machine
+  cube now contains one `SphereGeometry` dot per process reported by
+  `tar.fleet_snapshot`, coloured from a fixed six-colour palette:
+  system `#6e7681`, browser `#58a6ff`, database `#d29922`, web `#56d364`,
+  runtime `#bc8cff`, other `#8b949e`. Categories are computed server-side
+  by `classify(process_name, user)` in `process_category.hpp`; the renderer
+  treats unknown / mixed-case / prototype-key inputs (`constructor`,
+  `__proto__`, `"DATABASE "`) as `other` via `String(...).trim().toLowerCase()`
+  + `Object.prototype.hasOwnProperty.call(palette, k)`. Dot positions are
+  deterministic across reloads — `hash(pid|ppid)`-mod-bucket inside 78% of
+  the cube's interior volume, jittered to break stripes. Hovering a dot
+  surfaces a tooltip with pid, name, user, and category; agent-controlled
+  string fields are HTML-escaped and clamped to 256 chars before escape to
+  bound the worst-case CPU cost on pathological 1MB names. Process dots
+  raycast *before* cube meshes so the operator can drill into a dot through
+  the translucent cube face. Per-machine `processGroup` is attached as a
+  child of each cube (architectural pick over a single sibling group to
+  keep PR 8 per-cube edges + PR 11 per-cube LOD trivial) and `clearFleet`'s
+  existing recursive `traverse(disposeNode)` walk releases all per-instance
+  geometry+material on every refresh. `mousemove` raycasts are
+  rAF-throttled (~60 Hz cap) and processes-per-cube are soft-capped at
+  1000 for graceful degradation on heavily-threaded hosts (the cube
+  tooltip's process-count still reports the true total reported by the
+  agent). PR 11 polish migrates the per-process Mesh pattern to
+  `InstancedMesh` for the 100k-machine ceiling.
+- **`/viz/fleet` cube renderer + Sprite labels + hover tooltip (PR 6 of
+  the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** The fleet
+  page now renders one translucent cube per fleet machine on a deterministic
+  grid (FNV-1a 32-bit hash of `agent_id` for stable cross-reload layout).
+  Per-OS palette: Linux `#f0c674`, macOS `#a0a0a0`, Windows `#5294e2`,
+  default `#666666`. Live agents render at opacity `0.18`; stale agents
+  (no `tar.fleet_snapshot` response within the 5 s deadline) drop to
+  `0.08` so they remain visible without competing for visual attention.
+  Hostname `Sprite` labels appear above each cube and always face the
+  camera (truncated at 24 chars; full hostname visible in tooltip).
+  Hovering a cube surfaces a fixed-position tooltip via `THREE.Raycaster`
+  with hostname / OS / process count / connection count. Renderer also
+  guards against agent-controlled XSS via Array-spoofed `processes.length`
+  by coercing through `Number(...) | 0` and validates `Array.isArray` on
+  the topology payload before iteration.
+- **`yuzu_viz_topology_fetch_duration_seconds` Prometheus histogram (PR 6 / OBS-2).**
+  Times the inner agent-dispatch path (`tar.fleet_snapshot` fan-out +
+  aggregation) on cache-miss refills only, distinguishing "agent dispatch
+  is slow" from "the rest of the request is slow" (the existing
+  `yuzu_viz_topology_request_seconds` covers the full HTTP path). Wired
+  via a new opt-in `FleetTopologyStore::set_fetch_duration_observer()`
+  setter and a recommended `VizFleetSlowAgentDispatch` alert at p99 > 5 s
+  (the `tar.fleet_snapshot` deadline).
+
+### Changed
+
+- **`/viz/fleet` renderer module migrated from hand-written TU to
+  `embed_js.py` codegen** (PR 6). The renderer source of truth is now
+  `server/core/static/yuzu-viz.js`; the previous hand-written
+  `server/core/src/yuzu_viz_js_bundle.cpp` was deleted. The migration
+  was forced by the renderer bundle exceeding MSVC's 16,380-byte raw-
+  string-literal limit (C2026) at PR 6's additions; codegen via the
+  same `embed_js.py` pipeline used for ECharts and Three.js sidesteps
+  the limit by chunking. The `kYuzuVizJs` symbol name and consumer
+  contract are unchanged.
+
+### Security
+
+- **Fleet renderer hardens tooltip against agent-controlled Array-spoof
+  XSS** (gov R6 UP-1 / sec-MEDIUM). The hover tooltip previously
+  interpolated `machine.processes.length` and `machine.connections.length`
+  raw into `innerHTML`. A hostile or compromised agent could ship
+  `processes: {length: "<svg/onload=...>"}` (a non-array object with a
+  string `length`) and the truthy `|| 0` short-circuit would return the
+  malicious string. Both fields now coerce through
+  `Array.isArray(...) ? Number(...) | 0 : 0`, so a 32-bit integer is the
+  only thing the template ever writes. The fetch path additionally
+  validates `Array.isArray(data.machines)` before iteration so a malformed
+  payload surfaces a payload-error overlay instead of a TypeError
+  misclassified as a network error.
+- **Distinct fetch-failure overlays for 401/403/503/413/network/schema
+  errors on `/viz/fleet`** (gov R6 UP-9 / UP-10 / UP-15 / UP-17). The
+  renderer surfaces a granular error message for each fetch outcome
+  rather than leaving the scene blank: session expiry, RBAC denial,
+  kill-switch flip, oversize fleet, network failure, truncated JSON,
+  schema mismatch, and missing/non-array `machines` field each get a
+  distinct operator-visible message. On 401/403/503/413 the renderer
+  also calls `clearFleet()` so previously-rendered cubes do not persist
+  alongside the denial overlay (mixed-signal regression noted in R6).
+- **Tooltip caps visual footprint against hostile-hostname DoS** (gov R6
+  UP-3). Hostnames up to 100 KB no longer break tooltip layout — the
+  tooltip pins `max-width:320px`, `max-height:240px`, `overflow:hidden`,
+  `word-break:break-all`. The full hostname is still escaped via
+  `escapeHtml` before innerHTML write.
+
+- **`/viz/fleet` page response now sets `Cache-Control: no-cache, no-store,
+  must-revalidate`** (gov R4 UP-10 / DEP-1 / CHAOS-C3). The page references
+  vendored static assets that cache for 24 hours via `max-age=86400`. Without
+  page revalidation, a heuristically-cached stale page after a server upgrade
+  could pair with new asset bytes (or vice versa), producing a silent blank
+  canvas with a module-resolution console error and no operator-visible
+  diagnostic. The revalidation forces a server round-trip per navigation but
+  the body is ~7 KB; the overhead is negligible vs the failure mode.
+- **WASD pan listener now skips text-editable focus targets** (gov R4
+  sec-M1 / UP-6). The window-level keydown listener calls
+  `e.preventDefault()` on W/A/S/D; previously this would silently eat
+  keystrokes destined for any future overlay-panel `<input>` /
+  `<textarea>` / `contenteditable` element. The listener now bails early
+  when `e.target` is `INPUT`, `TEXTAREA`, `SELECT`, or `isContentEditable`.
+- **Fleet visualization page surfaces a visible error on importmap-
+  incapable browsers** (gov R4 UP-16 / ER-SHOULD-1). Previously, browsers
+  shipped before early 2023 (Chromium <89, Firefox <108, Safari <16.4)
+  would silently fail at module-evaluation time before the renderer
+  could mount, leaving a blank canvas with no diagnostic. The page now
+  detects via `HTMLScriptElement.supports('importmap')` in a classic
+  inline script that runs before the importmap declaration, and surfaces
+  a "Fleet visualization requires Chrome 89+, Firefox 108+, or Safari
+  16.4+" message via the `#viz-error` overlay if support is missing.
+- **WebGL context loss now produces an operator-visible error** (gov R4
+  UP-3 / CHAOS-2). The renderer registers `webglcontextlost` and
+  `webglcontextrestored` handlers on the canvas. On loss (GPU driver
+  crash, OS GPU reset, sleep/wake, dGPU↔iGPU switch), the rAF loop stops
+  rendering and `#viz-error` shows "WebGL context lost (GPU reset or
+  driver issue). Reload the page to recover." Three.js does not auto-
+  recover scene state, so manual reload is the cleanest path; a future
+  PR may add automatic re-mount on `webglcontextrestored`.
+
+### Added
+
+- **`/viz/fleet` page scaffold + WASD/orbit/zoom camera controls (PR 5
+  of the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** New
+  page route `GET /viz/fleet` (auth-gated, same posture as `/tar`) that
+  serves an HTMX-style page shell with a persistent `<div id="viz-root"
+  data-yuzu-viz-url="/api/v1/viz/fleet/topology">` containing
+  `<canvas id="viz-canvas">` and a swappable `<div id="viz-overlay-panel">`
+  for future per-machine drill-in detail. The page declares an importmap
+  resolving `"three"` and `"three/addons/controls/OrbitControls.js"` to
+  the vendored bundles from PR 4. New static asset route
+  `GET /static/yuzu-viz.js` serves the renderer module (`kYuzuVizJs`,
+  hand-written ~6 KB ES module): mounts once on `DOMContentLoaded` and
+  on every `htmx:afterSettle` (idempotent — guarded by
+  `root.dataset.yuzuVizMounted` so HTMX swaps of the overlay panel
+  cannot blow away the WebGLRenderer's GPU context); builds scene +
+  perspective camera + ambient + directional light + ground grid (40
+  divisions) + axes helper; OrbitControls drives drag-rotate +
+  wheel-zoom with `enablePan = false` so a custom keyup/keydown WASD
+  listener owns translation in camera-screen-space (W=+screenY,
+  S=−screenY, A=−screenX, D=+screenX, requestAnimationFrame-throttled).
+  ResizeObserver on the canvas keeps the renderer + camera aspect in
+  sync without a window-resize listener. Empty `tick()` placeholder for
+  PR 6+ to fill in topology rendering. The Fleet Viz nav link is added
+  to all sibling page shells (dashboard / instructions / compliance /
+  TAR / settings / help) so navigation is consistent. (#viz-engine
+  ladder PR 5.)
+
+- **Vendored Three.js r168 + OrbitControls (PR 4 of the 11-PR
+  `/viz/fleet` 3D fleet network-topology ladder).** Two new build-time
+  embeds: `kThreeJs` (685 KB, three.js r168 minified ES module) and
+  `kThreeOrbitJs` (32 KB, OrbitControls ES module from
+  `examples/jsm/controls/OrbitControls.js`), wired through the existing
+  `embed_js.py` chunked-raw-string pipeline that ECharts already uses.
+  Static asset routes `GET /static/three.module.min.js` and
+  `GET /static/three-orbit-controls.js` serve them with
+  `Cache-Control: public, max-age=86400`. Both files MIT licensed; full
+  attribution in `server/core/vendor/three-NOTICE.txt` and
+  `three-orbit-NOTICE.txt`, summary line added to top-level NOTICE.
+  PR 5's page scaffold (`/viz/fleet`) loads them via
+  `<script type="importmap">` so the OrbitControls module's
+  `import ... from 'three'` resolves to the vendored bundle. Modern
+  Three.js (r150+) ships only as ES modules — the planned
+  `three.min.js` UMD path no longer exists upstream, so the file naming
+  reflects the ES-module reality. (#viz-engine ladder PR 4.)
+
+### Security
+
+- **Fleet visualization fragment route now escapes `</script>` in the JSON
+  body before wrapping** (gov R3 sec-M2 / UP-16). nlohmann::json's `dump()`
+  does not escape `<` by default; an agent-controlled `hostname` or
+  `cmdline` containing the literal substring `</script>` would otherwise
+  terminate the `<script type="application/json" id="viz-data">` wrapper
+  early, allowing HTML to be injected into a dashboard or HTMX consumer
+  that swapped the fragment. The fix replaces `</` with `<\/` (a JSON-spec
+  alternate escape for `/`) before wrapping, with a regression test that
+  injects `</script><script>alert(1)</script>` as a hostname and verifies
+  exactly one closing `</script>` tag in the response.
+- **Fleet visualization audit result vocabulary realigned with siblings**
+  (gov R3 C-1 / ER-BLOCK-1). Previous `"ok"` / `"error"` / `"oversize"`
+  values landed in the `events_other_` Prometheus bucket and were silently
+  invisible to SOC 2 SIEM filters keyed on the canonical `"success"` /
+  `"failure"` / `"denied"` vocabulary. All `viz.fleet_topology` and
+  `viz.fleet_topology.invalidate` audit emissions now use the canonical
+  vocabulary; `target_type` switched from `"viz_topology"` to
+  `"FleetTopology"` (PascalCase per sibling convention) and `target_id`
+  from `"*"` to `""` (empty per `policy.invalidate_all` precedent at
+  `compliance_routes.cpp:696`). The 413 oversize branch maps to `denied`
+  with `oversize` in the detail field rather than a non-canonical result
+  value.
+
+### Added
+
+- **`/viz/fleet` REST surface (PR 3 of the 11-PR `/viz/fleet` 3D fleet
+  network-topology ladder).** New `VizRoutes` exposes
+  `GET /api/v1/viz/fleet/topology` (JSON) and
+  `GET /fragments/viz/fleet/topology` (HTMX-friendly `<script
+  type="application/json">` wrapping the same JSON for parser-on-swap),
+  both gated on `Response.Read`, audited per request, and metered via
+  `yuzu_viz_topology_request_seconds` / `yuzu_viz_cache_{hit,miss}_total` /
+  `yuzu_viz_oversize_response_total` / `yuzu_viz_agent_dispatch_timeout_total`,
+  plus three store-internal counters now exported to Prometheus
+  (`yuzu_viz_refill_oversize_drops_total`, `yuzu_viz_refill_wait_timeouts_total`,
+  `yuzu_viz_refill_waiters_total`) so the 256 MiB store-level oversize cap
+  and single-flight refill timeouts are observable (gov R3 OBS-1).
+  Query params: `include_vuln=1` flips to the vuln-overlay cache slot;
+  `fresh=1` invalidates the cache (separately audited) before the get;
+  `machines_max=N` (default 5000, ceiling 100000) caps response shape and
+  returns 413 + `denied`/`oversize` audit when the materialised fleet
+  exceeds it (M-1 cap-check DoS gate). Kill switch via `--viz-disable` /
+  `YUZU_VIZ_DISABLE` returns 503 and audits `denied`/`kill_switch`;
+  tier-before-permission ordering means the kill switch takes effect even
+  for callers who would otherwise fail RBAC (gov R3 sec-M1/arch-B1), and
+  startup logs `[VIZ] viz endpoint disabled by configuration` when the
+  flag is set so operators have explicit evidence the kill switch took
+  effect (gov R3 F-1). `FleetTopologyStore` is now in the `/readyz`
+  store conjunction so a construction-failed store surfaces as
+  503-not-ready rather than a silent viz outage (gov R3 HC-1). The store's
+  PR-2 fetcher seam is wired: on cache miss, dispatches `tar.fleet_snapshot`
+  to every connected agent via `AgentRegistry::send_to`, drains
+  `forward_gateway_pending()` for gateway-proxied agents, polls the
+  response store for matches keyed on a synthesised `tar-<hex>` command_id
+  until the 5 s deadline, and returns whatever arrived; missing agents
+  come back as `stale=true` rows so the renderer dims rather than
+  disappears them. The fetcher dispatch intentionally opts out of the
+  executions tracker (`record_send_time` only, no `record_execution_id`)
+  -- a 60 s automated refresh would otherwise spam the operator-facing
+  executions pane. release.yml gains an explicit
+  `--build-arg TRIPLET=x64-linux` ahead of arm64 publishing (QE-R2-02).
+  (#viz-engine ladder PR 3.)
+
+- **`tar.fleet_snapshot` action + server-side `FleetTopologyStore` (PRs 1+2
+  of the 11-PR `/viz/fleet` 3D fleet network-topology ladder).** New TAR
+  plugin action enumerates running processes, open network connections,
+  and host-bound IPs and emits a single `fleet_snapshot.v1` JSON document
+  on demand. Cmdlines are redacted using the union of operator config and
+  compiled-in default patterns. Source-pause states (`process_enabled`,
+  `tcp_enabled`) are honoured: when a source is paused, the corresponding
+  list is empty and `process_source_paused` / `tcp_source_paused` markers
+  appear in the document. Each list is hard-capped at 4096 entries with
+  truncation flags. New server-side `FleetTopologyStore` (memory-only,
+  LRU-of-2 by `include_vuln`, 60 s TTL, single-flight refill, fetcher
+  injected at construction, soft 256 MB memory cap, `wait_for`-bounded
+  caller wait) aggregates per-agent snapshots into a `fleet_topology.v1`
+  document for the upcoming `/viz/fleet` renderer. Cross-machine connection
+  scope (Local / InternalFleet / External) and `dst_agent_id` resolution
+  are computed via an `ip_to_agent` map built from each agent's `local_ips`,
+  with bracketed/zone-id IPv6 normalization and link-local defence-in-depth
+  filtering. Process categorisation (`process_category.hpp`) maps ~70 known
+  executable basenames to System / Browser / Database / Web / Runtime /
+  Other for renderer colouring. REST route + dashboard renderer arrive in
+  PR 3+; the action is dispatchable today via direct gRPC. (#viz-engine
+  ladder PRs 1, 2 and governance hardening round 1.)
+
 ### Fixed
 
 - **Executions drawer: dashboard "Fan-out" cell stuck at "0/0 of N".**

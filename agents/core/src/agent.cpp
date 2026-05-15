@@ -31,6 +31,7 @@ __declspec(allocate(".CRT$XCB"))
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
+#include "local_dispatcher.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -224,9 +225,52 @@ struct CommandContextImpl {
     size_t output_buffer_bytes{0};
     std::mutex buf_mu;
 
+    // PR 10 / UAT 2026-05-12 — Push-based snapshot ingestion.
+    //
+    // When `capture` is non-null, plugin output is accumulated into
+    // this string (newline-joined between calls) instead of being
+    // streamed back to the server. The snapshot-pump thread uses this
+    // path to invoke `tar.fleet_snapshot` locally and harvest the JSON
+    // payload without touching the gRPC channel. `stream` and
+    // `write_mu` are nullptr/unused in that mode; `flush_output_locked`
+    // short-circuits.
+    std::string* capture{nullptr};
+
+    // PR 10 hardening — capture-mode upper bound (UP-9). The pump
+    // ships the captured string in the next HeartbeatRequest; gRPC's
+    // default 4 MiB inbound cap is the hard server-side ceiling, but
+    // we want a tighter agent-side cap so an oversized snapshot is
+    // *truncated with a marker* rather than retained-and-failing. The
+    // 2 MiB value matches `FleetTopologyStore::kPushedSnapshotMaxBytes`
+    // on the server (in-tree convention: same constant in two places
+    // until typed proto lands and renders both moot).
+    static constexpr std::size_t kCaptureMaxBytes = 2ull * 1024 * 1024;
+    bool capture_truncated{false};
+
     void append_output(const char* text) {
         std::lock_guard lock(buf_mu);
         size_t len = std::strlen(text);
+        if (capture) {
+            // Capture mode: append directly to the operator-owned buffer
+            // with a newline separator between successive writes, matching
+            // the wire format the plugin would have emitted if streamed.
+            if (capture_truncated)
+                return;
+            std::size_t prospective = capture->size() + (capture->empty() ? 0 : 1) + len;
+            if (prospective > kCaptureMaxBytes) {
+                // Truncate with a sentinel suffix so the server-side
+                // parser cleanly rejects the payload as malformed JSON
+                // rather than ingesting a half-finished structure. The
+                // pump emits a WARN; next pump cycle overwrites.
+                capture->append("\n/* TRUNCATED — exceeded kCaptureMaxBytes */");
+                capture_truncated = true;
+                return;
+            }
+            if (!capture->empty())
+                capture->push_back('\n');
+            capture->append(text, len);
+            return;
+        }
         output_buffer.emplace_back(text, len);
         output_buffer_bytes += len;
         if (output_buffer_bytes >= kOutputFlushThreshold) {
@@ -241,6 +285,11 @@ struct CommandContextImpl {
 
 private:
     void flush_output_locked() {
+        // Capture mode keeps everything in `capture` already; nothing to
+        // flush over the wire. Skipping this guard would call into
+        // `stream->Write` on a null stream and crash the pump thread.
+        if (capture)
+            return;
         if (output_buffer.empty())
             return;
 
@@ -272,6 +321,36 @@ template <typename F> struct ScopeExit {
 template <typename F> ScopeExit(F) -> ScopeExit<F>;
 
 } // anonymous namespace
+
+// #1001 / arch-S3 — shim used by LocalDispatcher to invoke a plugin
+// descriptor in-process with output captured into a caller-owned buffer.
+// Kept here (rather than in local_dispatcher.cpp) because CommandContextImpl
+// carries gRPC-typed streaming fields that would force local_dispatcher.cpp
+// to pull in grpcpp; this shim is the narrow boundary that contains that
+// coupling.
+int dispatch_with_capture(const YuzuPluginDescriptor* descriptor, const char* action,
+                          const YuzuParam* params, std::size_t param_count,
+                          std::string* capture_out, bool* truncated_out, std::size_t capture_cap) {
+    CommandContextImpl ctx_impl{};
+    ctx_impl.command_id = "__local_dispatch__";
+    ctx_impl.start_time = std::chrono::steady_clock::now();
+    ctx_impl.capture = capture_out;
+    // CommandContextImpl currently bakes the cap into its append_output
+    // (kCaptureMaxBytes constant). LocalDispatcher::kCaptureMaxBytes
+    // tracks the same value so the externally-visible policy lives in
+    // one place; the static_assert below catches divergence at compile
+    // time if either side drifts.
+    static_assert(CommandContextImpl::kCaptureMaxBytes ==
+                  yuzu::agent::LocalDispatcher::kCaptureMaxBytes);
+    (void)capture_cap;
+
+    auto* raw_ctx = reinterpret_cast<YuzuCommandContext*>(&ctx_impl);
+    int rc = descriptor->execute(raw_ctx, action, params, param_count);
+    ctx_impl.flush_output(); // no-op in capture mode
+    if (truncated_out)
+        *truncated_out = ctx_impl.capture_truncated;
+    return rc;
+}
 
 // C ABI context function implementations
 
@@ -385,17 +464,57 @@ YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char
     return result;
 }
 
-YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* /*ctx*/, const char* /*trigger_id*/,
-                                      const char* /*trigger_type*/, const char* /*config_json*/) {
-    // Trigger registration is handled by the trigger engine at the agent level.
-    // Plugins call this to express intent; the agent wires it during init.
-    // For now, return success — the agent's init sequence reads trigger configs
-    // from the plugin's init() call and routes them to the TriggerEngine.
-    return 0;
+YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigger_id,
+                                      const char* trigger_type, const char* config_json) {
+    if (!ctx || !trigger_id || !trigger_type || !config_json)
+        return -1;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    if (!impl->trigger_engine) {
+        // The agent did not wire a TriggerEngine into this context. Without
+        // it the registration cannot take effect — fail loudly rather than
+        // returning success and silently dropping the trigger (the old
+        // stub's bug — it cost the whole interval-trigger feature).
+        spdlog::error("yuzu_register_trigger('{}'): no TriggerEngine in plugin context",
+                      trigger_id);
+        return -2;
+    }
+    // No exception may cross this C ABI boundary -- doing so is UB. Catch
+    // everything (parse_trigger_config is exception-safe, but
+    // register_trigger does map/vector insertion that can throw bad_alloc).
+    try {
+        auto cfg = yuzu::agent::parse_trigger_config(trigger_id, trigger_type, config_json);
+        if (!cfg) {
+            // parse_trigger_config already logged the specific reason.
+            return -3;
+        }
+        impl->trigger_engine->register_trigger(std::move(*cfg));
+        return 0;
+    } catch (const std::exception& e) {
+        spdlog::error("yuzu_register_trigger('{}'): threw: {}", trigger_id, e.what());
+        return -4;
+    } catch (...) {
+        spdlog::error("yuzu_register_trigger('{}'): threw non-std exception", trigger_id);
+        return -4;
+    }
 }
 
-YUZU_EXPORT int yuzu_unregister_trigger(YuzuPluginContext* /*ctx*/, const char* /*trigger_id*/) {
-    return 0;
+YUZU_EXPORT int yuzu_unregister_trigger(YuzuPluginContext* ctx, const char* trigger_id) {
+    if (!ctx || !trigger_id)
+        return -1;
+    auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    if (!impl->trigger_engine)
+        return -2;
+    // No exception may cross this C ABI boundary.
+    try {
+        impl->trigger_engine->unregister_trigger(trigger_id);
+        return 0;
+    } catch (const std::exception& e) {
+        spdlog::error("yuzu_unregister_trigger('{}'): threw: {}", trigger_id, e.what());
+        return -4;
+    } catch (...) {
+        spdlog::error("yuzu_unregister_trigger('{}'): threw non-std exception", trigger_id);
+        return -4;
+    }
 }
 
 } // extern "C"
@@ -455,6 +574,14 @@ public:
         plugin_ctx_.config["agent.debug_mode"] = cfg_.debug_mode ? "true" : "false";
         plugin_ctx_.config["agent.verbose_logging"] = cfg_.verbose_logging ? "true" : "false";
         plugin_ctx_.config["agent.reconnect_count"] = "0";
+
+        // Wire the trigger engine into the master plugin context BEFORE the
+        // per-plugin contexts are snapshotted from it (the load loop copies
+        // plugin_ctx_.trigger_engine into each pctx). Plugins call
+        // ctx.register_trigger() inside their own init(), which routes
+        // through yuzu_register_trigger -> pctx->trigger_engine; if this
+        // pointer is still null at init time, every registration is dropped.
+        plugin_ctx_.trigger_engine = &trigger_engine_;
 
         // 1b. Open KV store for plugin persistent storage
         {
@@ -595,6 +722,11 @@ public:
 
         // Scope guard: shutdown plugins and destroy thread pool on any exit path
         ScopeExit cleanup{[this]() {
+            // Stop the trigger engine FIRST — before plugins are torn down —
+            // so an in-flight interval/file/service trigger can't dispatch
+            // into a plugin that's mid-shutdown. stop() joins the worker
+            // threads, so once it returns no further dispatch can occur.
+            trigger_engine_.stop();
             for (auto& handle : plugins_) {
                 if (handle.descriptor()->shutdown) {
                     // Use per-plugin context if available, fall back to shared
@@ -609,6 +741,44 @@ public:
             thread_pool_.reset();
             spdlog::info("Yuzu agent stopped");
         }};
+
+        // Wire trigger dispatch + start the engine. Plugins registered their
+        // triggers during init() (above); the engine has been holding them
+        // inert until now. The dispatch callback resolves the plugin by name
+        // and runs the action in-process via LocalDispatcher — the same
+        // mechanism the snapshot pump uses. start() spins up the interval /
+        // file-watch / service-watch worker threads and fires any
+        // AgentStartup triggers immediately.
+        trigger_engine_.set_dispatch([this](const std::string& plugin, const std::string& action,
+                                            const std::map<std::string, std::string>& params) {
+            const YuzuPluginDescriptor* descriptor = nullptr;
+            for (const auto& handle : plugins_) {
+                if (std::string_view{handle.descriptor()->name} == plugin) {
+                    descriptor = handle.descriptor();
+                    break;
+                }
+            }
+            if (!descriptor) {
+                spdlog::warn("Trigger dispatch: plugin '{}' not loaded — skipping action '{}'",
+                             plugin, action);
+                return;
+            }
+            // Convert the param map into the C-ABI YuzuParam span. The map
+            // outlives this synchronous run() call (it's owned by the
+            // TriggerConfig snapshot in the engine's worker loop), so the
+            // c_str() views stay valid for the duration of the dispatch.
+            std::vector<YuzuParam> yparams;
+            yparams.reserve(params.size());
+            for (const auto& [k, v] : params)
+                yparams.push_back(YuzuParam{k.c_str(), v.c_str()});
+
+            LocalDispatcher dispatcher;
+            auto result = dispatcher.run(descriptor, action, yparams);
+            if (result.rc != 0) {
+                spdlog::warn("Trigger dispatch: {}.{} returned rc={}", plugin, action, result.rc);
+            }
+        });
+        trigger_engine_.start();
 
         // 2. Connect to server (tuned for low-latency bidirectional streaming)
         grpc::ChannelArguments ch_args;
@@ -692,6 +862,69 @@ public:
             if (cloud_id.valid()) {
                 spdlog::info("Cloud identity detected: provider={}, instance={}, region={}",
                              cloud_id.provider, cloud_id.instance_id, cloud_id.region);
+            }
+        }
+
+        // PR 10 / UAT 2026-05-12 — snapshot pump is spawned ONCE, not
+        // per-reconnect. The pump runs through reconnects, keeping the
+        // shared `latest_snapshot_` buffer warm; the heartbeat thread
+        // (which IS re-spawned per connection) reads from it and ships
+        // it on the next heartbeat. This means a brief disconnect does
+        // not cost us the next push — the pump kept producing while
+        // the link was down, the first reconnected heartbeat carries
+        // the latest snapshot.
+        //
+        // Pump is gated on the TAR plugin being loaded; minimal /
+        // embedded agent variants without TAR simply leave the slot
+        // empty and the server falls back to dispatch-on-get.
+        {
+            const YuzuPluginDescriptor* tar_descriptor = nullptr;
+            for (const auto& handle : plugins_) {
+                if (std::string_view{handle.descriptor()->name} == "tar") {
+                    tar_descriptor = handle.descriptor();
+                    break;
+                }
+            }
+            if (tar_descriptor) {
+                snapshot_pump_thread_ = std::thread([this, tar_descriptor]() {
+                    spdlog::info("Snapshot pump started (interval=30s, action=tar.fleet_snapshot)");
+                    constexpr auto kFirstDelay = std::chrono::seconds{5};
+                    constexpr auto kInterval = std::chrono::seconds{30};
+                    auto sleep_for = [this](std::chrono::seconds total) {
+                        auto remaining = total;
+                        while (remaining.count() > 0 &&
+                               !stop_requested_.load(std::memory_order_acquire)) {
+                            auto step = std::min(remaining, std::chrono::seconds{2});
+                            std::this_thread::sleep_for(step);
+                            remaining -= step;
+                        }
+                    };
+                    sleep_for(kFirstDelay);
+                    LocalDispatcher dispatcher;
+                    while (!stop_requested_.load(std::memory_order_acquire)) {
+                        // #1001 / arch-S3 — local-dispatch concerns
+                        // (capture buffer, byte cap, truncation sentinel)
+                        // live in LocalDispatcher. The pump just decides
+                        // what to do with each cycle's result.
+                        auto result = dispatcher.run(tar_descriptor, "fleet_snapshot");
+                        if (result.truncated) {
+                            spdlog::warn("Snapshot pump: capture truncated at {}B; "
+                                         "dropping this cycle's snapshot",
+                                         result.captured.size());
+                        } else if (result.rc == 0 && !result.captured.empty()) {
+                            std::lock_guard lock(snapshot_mu_);
+                            latest_snapshot_ = std::move(result.captured);
+                            latest_snapshot_seq_.fetch_add(1, std::memory_order_acq_rel);
+                        } else if (result.rc != 0) {
+                            spdlog::warn("Snapshot pump: tar.fleet_snapshot rc={}, captured={}B",
+                                         result.rc, result.captured.size());
+                        }
+                        sleep_for(kInterval);
+                    }
+                    spdlog::info("Snapshot pump stopped");
+                });
+            } else {
+                spdlog::info("Snapshot pump skipped: TAR plugin not loaded");
             }
         }
 
@@ -959,6 +1192,12 @@ public:
                             return stop_requested_.load(std::memory_order_acquire) ||
                                    heartbeat_stop_.load(std::memory_order_acquire);
                         };
+                        // PR 10: per-thread last-shipped snapshot generation.
+                        // Stays inside the heartbeat lambda so reconnects
+                        // see seq=0 first and re-ship whatever the pump
+                        // last produced — important so a flapping link
+                        // doesn't leave the server reading a stale slot.
+                        uint64_t last_attached_seq = 0;
                         while (!should_stop()) {
                             // Sleep in small increments for responsive shutdown
                             auto remaining = cfg_.heartbeat_interval;
@@ -992,6 +1231,26 @@ public:
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
                             tags["yuzu.healthy"] = "1";
+
+                            // PR 10: attach pushed fleet snapshot if the
+                            // pump produced something newer than what
+                            // we last shipped. `last_attached_seq` is a
+                            // per-heartbeat-thread local; the pump's
+                            // monotonic counter is the source of truth.
+                            // Empty attach when no new snapshot is
+                            // available — keeps quiescent heartbeats at
+                            // their pre-PR-10 size.
+                            {
+                                const auto cur_seq =
+                                    latest_snapshot_seq_.load(std::memory_order_acquire);
+                                if (cur_seq > last_attached_seq) {
+                                    std::lock_guard lock(snapshot_mu_);
+                                    if (!latest_snapshot_.empty()) {
+                                        req.set_fleet_snapshot_json(latest_snapshot_);
+                                        last_attached_seq = cur_seq;
+                                    }
+                                }
+                            }
 
                             pb::HeartbeatResponse resp;
                             auto status = hb_stub->Heartbeat(&ctx, req, &resp);
@@ -1185,8 +1444,34 @@ public:
                             params.push_back(YuzuParam{k.c_str(), v.c_str()});
                         }
 
-                        int rc = target->execute(raw_ctx, cmd.action().c_str(), params.data(),
+                        // Defence-in-depth: wrap the plugin's execute() so a
+                        // thrown C++ exception cannot propagate up into the
+                        // command-dispatch thread and terminate() the whole
+                        // agent process. Plugins are expected to convert
+                        // failures into a non-zero `rc`; this is the safety
+                        // net for the cases they miss. Observed 2026-05-12:
+                        // agent_logging.get_log threw filesystem_error from
+                        // fs::exists on EACCES and brought the agent down
+                        // mid-test. The plugin bug is fixed separately;
+                        // this catch is so the next plugin's mistake
+                        // doesn't have the same blast radius.
+                        int rc;
+                        try {
+                            rc = target->execute(raw_ctx, cmd.action().c_str(), params.data(),
                                                  params.size());
+                        } catch (const std::exception& e) {
+                            spdlog::error("Plugin {} action {} threw std::exception: {}",
+                                          cmd.plugin(), cmd.action(), e.what());
+                            std::string msg = "plugin threw exception: ";
+                            msg += e.what();
+                            ctx_impl.append_output(msg.c_str());
+                            rc = 1;
+                        } catch (...) {
+                            spdlog::error("Plugin {} action {} threw non-std exception",
+                                          cmd.plugin(), cmd.action());
+                            ctx_impl.append_output("plugin threw non-std exception");
+                            rc = 1;
+                        }
 
                         // Flush any buffered output before sending timing/status
                         ctx_impl.flush_output();
@@ -1264,6 +1549,12 @@ public:
                 if (heartbeat_thread_.joinable()) {
                     heartbeat_thread_.join();
                 }
+                // PR 10: the snapshot pump is intentionally NOT joined
+                // here. It is a Run()-lifetime thread that survives
+                // reconnects, so the heartbeat thread of the next
+                // connection cycle finds a warm latest_snapshot_ and
+                // ships it immediately. The pump joins only at final
+                // shutdown, below — see the Run()-exit cleanup.
 
                 // Only shutdown plugins on final exit — keep them loaded for reconnect
                 if (stop_requested_.load(std::memory_order_acquire)) {
@@ -1294,6 +1585,15 @@ public:
             }
             break; // stop_requested
         }          // end while (reconnect loop)
+
+        // PR 10: snapshot pump joined here, post reconnect loop. The
+        // pump observes `stop_requested_` (set in stop() above) and
+        // exits at the next 2 s slice boundary; joining at final
+        // shutdown means the thread is collected before Run() returns
+        // and the AgentImpl dtor sees a default-constructed thread.
+        if (snapshot_pump_thread_.joinable()) {
+            snapshot_pump_thread_.join();
+        }
     }
 
     void stop() noexcept override {
@@ -1326,6 +1626,12 @@ private:
     std::unordered_map<std::string, std::unique_ptr<PluginContextImpl>> per_plugin_ctx_;
     std::unique_ptr<KvStore> kv_store_;
     std::unique_ptr<GuardianEngine> guardian_;
+    // Drives interval / file-change / service-status triggers that plugins
+    // register during init(). Owned here; a non-owning pointer is handed to
+    // every per-plugin context so yuzu_register_trigger can reach it.
+    // start() is called once plugins are loaded; stop() runs before plugin
+    // shutdown so a trigger never fires into a half-torn-down plugin.
+    TriggerEngine trigger_engine_;
     yuzu::MetricsRegistry metrics_;
     std::chrono::steady_clock::time_point start_time_;
     std::string session_id_;
@@ -1340,6 +1646,22 @@ private:
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;
     std::thread heartbeat_thread_;
+
+    // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
+    //
+    // `snapshot_pump_thread_` runs `tar.fleet_snapshot` locally on a
+    // 30 s interval, captures the JSON, and stashes it under
+    // `snapshot_mu_`. The heartbeat thread reads `latest_snapshot_`
+    // each iteration; if `latest_snapshot_seq_` advanced since the
+    // heartbeat's `last_attached_snapshot_seq_`, the snapshot rides
+    // out on the next HeartbeatRequest.fleet_snapshot_json field.
+    // Together they replace the previous dispatch-on-get path for
+    // /api/v1/viz/fleet/topology, so the renderer reads from
+    // per-agent slots that the agents themselves keep current.
+    std::thread snapshot_pump_thread_;
+    std::mutex snapshot_mu_;
+    std::string latest_snapshot_;                  // last JSON produced by pump
+    std::atomic<uint64_t> latest_snapshot_seq_{0}; // monotonically increases on each new snapshot
 
     // M8: Command replay protection — double-buffer dedup of command IDs.
     // Two sets: "current" and "previous". When current fills, previous is

@@ -64,11 +64,11 @@ Overall      [======================---------]   169/225 done (75%)
 | 25. Connector Framework | 5 | 0 | 0 | 5 |
 | 26. Inventory Repositories | 4 | 0 | 0 | 4 |
 | 27. Software Catalog & Licensing | 5 | 0 | 0 | 5 |
-| 28. Response Visualization | 6 | 0 | 2 | 4 |
+| 28. Response Visualization | 9 | 0 | 3 | 6 |
 | 29. Consumer Applications | 4 | 0 | 0 | 4 |
 | 30. Scope Walking & Result Sets | 4 | 0 | 0 | 4 |
 | 31. System Guardian | 10 | 1 | 2 | 7 |
-| **TOTAL** | **225** | **169** | **3** | **53** |
+| **TOTAL** | **228** | **169** | **5** | **54** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. Foundation and Advanced tiers reach 100% on the "implemented and functional" bar — they do not yet reach "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -1088,6 +1088,23 @@ Not implemented (Phase 15.H). Reconstructs the per-device process tree from `pro
 ### 28.6 Retention Awareness Surface :large_orange_diamond: `T2`
 
 In progress (Phase 15.A). Operator-facing aggregate view of every device × source pair where `<source>_enabled=false` — the operational consequence of issue #539's per-source retention pause. Surfaces "paused since" timestamp, live-row count, oldest timestamp; supports one-click re-enable (per-source, the #539 invariant) and a typed-confirmation purge for the "we have what we need, drop the rows but keep the collector paused" case. Without this surface, operators who disabled a collector for forensic preservation have no way to know which boxes are accumulating non-aging data. Design: `docs/tar-dashboard.md` §3.
+
+### 28.7 Fleet Topology 3D Visualization :large_orange_diamond: `T2`
+
+In progress (`feat/viz-engine` branch, 11-PR ladder; PRs 1–7 shipped). `/viz/fleet` page renders the fleet as translucent cubes (one per agent) with interior process dots coloured by category (`system`, `browser`, `database`, `web`, `runtime`, `other`). Backed by an aggregating `FleetTopologyStore` (60s LRU-of-2 cache, single-flight refill) producing a `fleet_topology.v1` JSON envelope. REST: `GET /api/v1/viz/fleet/topology` + HTMX fragment `/fragments/viz/fleet/topology`. WASD/orbit/zoom camera, hostname `Sprite` labels, hover tooltip with raycaster, kill switch (`--viz-disable` / `YUZU_VIZ_DISABLE`), `machines_max` DoS cap (default 5000 / ceiling 100000), tier-before-permission ordering, audit actions `viz.fleet_topology` + `viz.fleet_topology.invalidate`. Remaining rungs: PR 8 intra-cube localhost edges, PR 9 cross-machine + external edges, PR 10 vulnerability overlay, PR 11 polish (LOD, edge bundling, a11y, InstancedMesh). Design: `docs/plans/feat-viz-engine-plan-2026-05-09.md`. Standing invariants: `docs/fleet-viz-invariants.md`.
+
+### 28.8 Threat Graph Mode :x: `T2`
+
+Not implemented. Mode toggle on `/viz/fleet` (`?mode=threat` / `T` shortcut, persisted in `localStorage`) that overlays:
+1. **Per-host IPC graph** — all same-host IPC channels, not just TCP loopback. New `EdgeKind` enum on `ConnectionEdge`: `TcpLoopback` (today), `UnixSocket`, `NamedPipe`, `SharedMemory`, `DBus`, `ALPC`, `EbpfMap`. Each renders with a distinct line style + colour. `world_accessible` boolean per edge surfaces a red glow on edges whose endpoints any process can join (Unix socket with `0666`, abstract socket, world-rw `/dev/shm`).
+2. **Per-process posture overlay** — composite glyph synthesising vulnerability scan + AV status + signed-binary verification + firewall exposure + disk encryption into a single character (`!` warning, `⚠` high risk, `?` unknown, hidden when hardened). Sprite-child of each process Sphere, reuses PR 6 sprite infrastructure.
+3. **Cross-host network graph** with TLS-termination annotation on listening sockets carrying cert subject / issuer / expiry; new `Containerised` scope classification for inter-container traffic on private RFC1918 / Docker default ranges.
+
+Anti-Mythos framing: Yuzu is the defender's mirror of LLM-driven offensive enumeration; operators read the Threat Graph to decide where to insert controls (WAF, IPS, API gateway, VxLAN separation, firewall, network-parser hardening). Design: `docs/plans/threat-graph-roadmap.md`.
+
+### 28.9 Defender Recommendation Engine :x: `T2`
+
+Not implemented. An external **agentic AI worker** (running as a managed per-customer sprint cadence) consumes Threat Graph snapshots and produces hardening recommendations — "insert WAF here", "VxLAN-separate these services", "harden this network parser against direct injection" — posted to a new `recommendations.db` server store via REST + MCP using a service-scoped API token. Recommendations are ghost-overlaid in Threat mode; operators *accept* / *dismiss* / *apply* via the existing approval workflow (`workflows` store). "Apply" calls existing plugin actions (firewall rule add, etc.). Schema: `customer_id`, `generated_by`, `kind` (insert_waf / vxlan_separate / firewall_rule / harden_parser / kill_world_socket), `target_node_ids`, `target_edge_keys`, `rationale`, `status` (open / accepted / dismissed / applied), `yaml_source`. Design: `docs/plans/threat-graph-roadmap.md` § Recommendation engine.
 
 ---
 
