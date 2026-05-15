@@ -12,7 +12,9 @@
 
 #include "msquic_bidi_stream.hpp"
 
+#include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -33,6 +35,21 @@ namespace yuzu::transport::msquic_backend {
 namespace pb = ::yuzu::transport::framing::v1;
 
 namespace {
+
+// ── Back-pressure thresholds (#376 PR 3 increment 3.5) ───────────────────────
+//
+// Production defaults: pause RECEIVE delivery once 1 MiB of decoded
+// payload is buffered for the user; resume once the buffer drops to
+// 256 KiB. The QUIC layer cascades flow-control credits back to the
+// peer, so a chronic slow reader eventually stalls the wire-level
+// sender too. Tests can override via debug::bidi_set_backpressure_thresholds.
+constexpr std::size_t kDefaultBackpressureHighWatermark = 1 * 1024 * 1024;
+constexpr std::size_t kDefaultBackpressureLowWatermark  = 256 * 1024;
+
+std::atomic<std::size_t> g_high_water{kDefaultBackpressureHighWatermark};
+std::atomic<std::size_t> g_low_water{kDefaultBackpressureLowWatermark};
+std::atomic<std::uint64_t> g_receive_disabled_count{0};
+std::atomic<std::uint64_t> g_receive_enabled_count{0};
 
 // Owned outbound buffer; the SendBuf* is the StreamSend client context,
 // freed on SEND_COMPLETE. Raw new/delete: ownership is transferred
@@ -85,27 +102,48 @@ bool encode_trailing_status_frame(const Status& status, std::string& out) {
 // ── Feeders ──────────────────────────────────────────────────────────────────
 
 void feed_bidi_frame(BidiStreamState& state, std::string frame) {
-    std::lock_guard<std::mutex> lock(state.mtx);
-    if (state.peer_fin || state.final_valid) {
-        // Frame after FIN — wire corruption per transport.proto.
-        if (!state.final_valid) {
-            state.final_status = Status{
-                StatusCode::DataLoss,
-                "transport: frame received after TrailingStatus / FIN"};
-            state.final_valid = true;
-            state.peer_fin    = true;
+    HQUIC pause_stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(state.mtx);
+        if (state.peer_fin || state.final_valid) {
+            // Frame after FIN — wire corruption per transport.proto.
+            if (!state.final_valid) {
+                state.final_status = Status{
+                    StatusCode::DataLoss,
+                    "transport: frame received after TrailingStatus / FIN"};
+                state.final_valid = true;
+                state.peer_fin    = true;
+            }
+            state.cv.notify_all();
+            return;
         }
+        // One-frame lookahead: the previous pending frame is now confirmed
+        // as a data frame (because another frame arrived after it). Bytes
+        // already counted at the time it was first held.
+        if (state.pending_frame) {
+            state.inbound.push_back(std::move(*state.pending_frame));
+            state.pending_frame.reset();
+        }
+        state.inbound_bytes += frame.size();
+        state.pending_frame = std::move(frame);
         state.cv.notify_all();
-        return;
+
+        // Engage RECEIVE pause when the buffered payload crosses the
+        // high-water mark. snapshot HQUIC and call StreamReceiveSetEnabled
+        // OUTSIDE the lock — msquic does not synchronously re-enter our
+        // callbacks but releasing the lock before the C-API call keeps the
+        // discipline clean (other threads may be in write() / cancel()).
+        if (!state.receive_paused &&
+            state.inbound_bytes >= g_high_water.load(std::memory_order_relaxed) &&
+            state.stream != nullptr && !state.stream_closed) {
+            state.receive_paused = true;
+            pause_stream         = state.stream;
+        }
     }
-    // One-frame lookahead: the previous pending frame is now confirmed
-    // as a data frame (because another frame arrived after it).
-    if (state.pending_frame) {
-        state.inbound.push_back(std::move(*state.pending_frame));
-        state.pending_frame.reset();
+    if (pause_stream != nullptr) {
+        MsQuicApi::instance().api()->StreamReceiveSetEnabled(pause_stream, FALSE);
+        g_receive_disabled_count.fetch_add(1, std::memory_order_relaxed);
     }
-    state.pending_frame = std::move(frame);
-    state.cv.notify_all();
 }
 
 void feed_bidi_fin(BidiStreamState& state) {
@@ -113,7 +151,9 @@ void feed_bidi_fin(BidiStreamState& state) {
     if (state.peer_fin) return;  // idempotent
     state.peer_fin = true;
     if (state.pending_frame) {
-        // The held-back frame is the TrailingStatus.
+        // The held-back frame is the TrailingStatus. It leaves the
+        // back-pressure byte count when consumed here.
+        state.inbound_bytes -= state.pending_frame->size();
         pb::TrailingStatus trailer;
         if (!trailer.ParseFromString(*state.pending_frame)) {
             state.final_status = Status{
@@ -182,6 +222,7 @@ bool MsquicBidiStream::write(const SerializableMessage& msg,
 bool MsquicBidiStream::read(SerializableMessage& msg,
                             std::chrono::milliseconds /*deadline*/) {
     std::string frame;
+    HQUIC       resume_stream = nullptr;
     {
         std::unique_lock<std::mutex> lock(state_->mtx);
         state_->cv.wait(lock, [this] {
@@ -195,6 +236,19 @@ bool MsquicBidiStream::read(SerializableMessage& msg,
         }
         frame = std::move(state_->inbound.front());
         state_->inbound.pop_front();
+        // Bytes leave the back-pressure window when the user takes them.
+        state_->inbound_bytes -= frame.size();
+        if (state_->receive_paused &&
+            state_->inbound_bytes <=
+                g_low_water.load(std::memory_order_relaxed) &&
+            state_->stream != nullptr && !state_->stream_closed) {
+            state_->receive_paused = false;
+            resume_stream          = state_->stream;
+        }
+    }
+    if (resume_stream != nullptr) {
+        MsQuicApi::instance().api()->StreamReceiveSetEnabled(resume_stream, TRUE);
+        g_receive_enabled_count.fetch_add(1, std::memory_order_relaxed);
     }
     return msg.parse(frame);
 }
@@ -282,5 +336,37 @@ void MsquicBidiStream::cancel() {
             state_->stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
     }
 }
+
+// ── debug:: probes (test-only) ───────────────────────────────────────────────
+
+namespace debug {
+
+std::uint64_t bidi_receive_disabled_count() {
+    return g_receive_disabled_count.load(std::memory_order_relaxed);
+}
+
+std::uint64_t bidi_receive_enabled_count() {
+    return g_receive_enabled_count.load(std::memory_order_relaxed);
+}
+
+void bidi_reset_backpressure_counters() {
+    g_receive_disabled_count.store(0, std::memory_order_relaxed);
+    g_receive_enabled_count.store(0, std::memory_order_relaxed);
+}
+
+void bidi_set_backpressure_thresholds(std::size_t high_bytes,
+                                      std::size_t low_bytes) {
+    g_high_water.store(high_bytes, std::memory_order_relaxed);
+    g_low_water.store(low_bytes, std::memory_order_relaxed);
+}
+
+void bidi_reset_backpressure_thresholds() {
+    g_high_water.store(kDefaultBackpressureHighWatermark,
+                       std::memory_order_relaxed);
+    g_low_water.store(kDefaultBackpressureLowWatermark,
+                      std::memory_order_relaxed);
+}
+
+}  // namespace debug
 
 }  // namespace yuzu::transport::msquic_backend

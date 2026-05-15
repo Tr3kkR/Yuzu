@@ -27,6 +27,7 @@
 #include "yuzu/transport/transport.hpp"
 
 #ifdef YUZU_TRANSPORT_HAVE_MSQUIC
+#include "msquic_bidi_stream.hpp" // debug:: probes for back-pressure
 #include "test_certs.hpp"
 #endif
 
@@ -389,6 +390,79 @@ TEST_CASE("msquic bidi concurrent reader and writer threads coexist",
 
     REQUIRE(received.load(std::memory_order_relaxed) == N);
     REQUIRE(bidi->final_status().code == StatusCode::Ok);
+
+    ch->close();
+    listener->shutdown();
+}
+
+// ── Back-pressure (#376 PR 3 increment 3.5) ──────────────────────────────────
+
+TEST_CASE("msquic bidi back-pressure pauses receives when inbound queue grows",
+          "[transport][msquic][round-trip][bidi][backpressure]") {
+    // qe-S3.5: a fast sender + slow reader must not grow inbound_bytes
+    // unboundedly. Lower the watermarks so the path engages without
+    // streaming megabytes of payload, then assert (1) every frame still
+    // arrives, (2) the final status is Ok, (3) StreamReceiveSetEnabled was
+    // toggled off and back on at least once each.
+    namespace dbg = ::yuzu::transport::msquic_backend::debug;
+
+    dbg::bidi_reset_backpressure_counters();
+    dbg::bidi_set_backpressure_thresholds(/*high=*/4 * 1024, /*low=*/1 * 1024);
+    // Ensure thresholds are restored even if the test aborts.
+    struct ThresholdRestore {
+        ~ThresholdRestore() { dbg::bidi_reset_backpressure_thresholds(); }
+    } _restore;
+
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    constexpr int kFrames = 64;
+    constexpr int kFrameSize = 256; // 64 * 256 = 16 KiB, well above 4 KiB
+
+    std::atomic<int> received{0};
+    auto handler = [&received](const CallContext&, BidiStream& s) -> Status {
+        StringMessage in;
+        // Slow drain: 2 ms between reads ensures the sender outpaces us
+        // long enough that the buffered payload crosses the high-water
+        // mark before we drain it back below the low-water mark.
+        while (s.read(in)) {
+            received.fetch_add(1, std::memory_order_relaxed);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiBackpressure", handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    CallContext ctx;
+    auto bidi = ch->bidi_stream("yuzu.test.v1.Echo/BidiBackpressure", ctx);
+    REQUIRE(bidi != nullptr);
+
+    const std::string payload(kFrameSize, 'X');
+    for (int i = 0; i < kFrames; ++i) {
+        StringMessage out(payload);
+        REQUIRE(bidi->write(out));
+    }
+    bidi->writes_done();
+
+    Status fs = bidi->final_status();
+    REQUIRE(fs.code == StatusCode::Ok);
+    REQUIRE(received.load(std::memory_order_relaxed) == kFrames);
+
+    // The slow handler MUST have caused at least one pause/resume cycle on
+    // the server's inbound stream. Both counters are process-global so
+    // any spurious increments from prior cases would have been zeroed at
+    // the top of this case.
+    REQUIRE(dbg::bidi_receive_disabled_count() > 0);
+    REQUIRE(dbg::bidi_receive_enabled_count() > 0);
 
     ch->close();
     listener->shutdown();

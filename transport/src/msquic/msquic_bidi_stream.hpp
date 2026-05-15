@@ -18,6 +18,8 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -88,5 +90,24 @@ bool encode_trailing_status_frame(const Status& status, std::string& out);
 // dtor sees `wire_fin_sent` and skips the abort path). Idempotent w.r.t.
 // already-cancelled / already-closed streams (no-op).
 void send_server_trailer_and_fin(BidiStreamState& state, const Status& status);
+
+// ── Test-only probes for back-pressure (#376 PR 3 increment 3.5) ─────────────
+//
+// The feeder + read() path engages msquic flow control via
+// StreamReceiveSetEnabled when `inbound_bytes` crosses the high-water
+// mark and re-enables once it drops to the low-water mark. The default
+// thresholds are sized for production traffic (1 MiB / 256 KiB); tests
+// can lower them to exercise the path without sending megabytes of
+// payload. Counters are process-global and increment monotonically; tests
+// MUST call `bidi_reset_backpressure_counters()` at start to avoid
+// inheriting counts from prior cases.
+namespace debug {
+std::uint64_t bidi_receive_disabled_count();
+std::uint64_t bidi_receive_enabled_count();
+void          bidi_reset_backpressure_counters();
+void          bidi_set_backpressure_thresholds(std::size_t high_bytes,
+                                               std::size_t low_bytes);
+void          bidi_reset_backpressure_thresholds();
+}  // namespace debug
 
 }  // namespace yuzu::transport::msquic_backend

@@ -17,6 +17,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstddef>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -74,6 +75,21 @@ struct BidiStreamState {
     Status                             final_status;
     std::map<std::string, std::string> trailing_metadata;
     bool                               final_valid = false;
+
+    // ── Receive back-pressure (#376 PR 3 increment 3.5) ──────────────────────
+    //
+    // gRPC got back-pressure free from HTTP/2 flow control; QUIC streams
+    // are raw, so the msquic backend has to pause RECEIVE delivery itself
+    // to prevent a fast sender + slow reader from growing `inbound`
+    // unboundedly. `inbound_bytes` is the running total of payload bytes
+    // currently buffered (sum of `inbound` frame sizes plus `pending_frame`
+    // size if held). When it crosses the high-water mark the feeder calls
+    // StreamReceiveSetEnabled(FALSE) and sets `receive_paused`; once it
+    // drops to the low-water mark, read() calls SetEnabled(TRUE) and
+    // clears the flag. msquic flow-control credits cascade outward so the
+    // wire-level peer eventually slows down too.
+    std::size_t inbound_bytes  = 0;
+    bool        receive_paused = false;
 };
 
 }  // namespace yuzu::transport::msquic_backend
