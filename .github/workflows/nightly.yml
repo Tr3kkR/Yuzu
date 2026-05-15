@@ -256,14 +256,128 @@ jobs:
       - name: Build
         run: meson compile -C build-linux-tsan
 
+      - name: Build gai_sync_shim (TSan + glibc getaddrinfo_a workaround)
+        # cpp-httplib enables CPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO by
+        # default (HTTPLIB_IS_USING_NON_BLOCKING_GETADDRINFO=ON in
+        # httplibConfig.cmake), routing Client::create_socket through
+        # getaddrinfo_a(). glibc implements that by spawning an async DNS
+        # helper thread via clone3 directly — bypassing TSan's
+        # pthread_create interceptor — so the helper's per-thread
+        # allocator state never initialises and its first malloc() segfaults
+        # inside __tsan::SizeClassAllocator64LocalCache::Allocate (this=0x8).
+        # That bare SIGSEGV (#438) is what the #1031 race fix was unmasking;
+        # the diagnostic step below captured the stack in run 25901174628.
+        #
+        # The shim interposes getaddrinfo_a/gai_suspend/gai_error/gai_cancel
+        # with synchronous getaddrinfo on the calling thread — no async
+        # helper, no crash. Scoped to the TSan job only via LD_PRELOAD on
+        # the Test and gdb steps; production keeps the non-blocking-DNS
+        # behaviour (DNS timeouts still interruptible there).
+        run: |
+          cat > /tmp/gai_sync_shim.c << 'SHIM_EOF'
+          #define _GNU_SOURCE
+          #include <netdb.h>
+          #include <stddef.h>
+          #include <signal.h>
+          #include <time.h>
+
+          int getaddrinfo_a(int mode, struct gaicb *list[], int nitems,
+                             struct sigevent *sig) {
+              (void)mode; (void)sig;
+              for (int i = 0; i < nitems; ++i) {
+                  if (!list[i]) continue;
+                  list[i]->ar_result = NULL;
+                  list[i]->__return = getaddrinfo(list[i]->ar_name,
+                                                    list[i]->ar_service,
+                                                    list[i]->ar_request,
+                                                    &list[i]->ar_result);
+              }
+              return 0;
+          }
+
+          int gai_suspend(const struct gaicb *const list[], int nitems,
+                           const struct timespec *timeout) {
+              (void)list; (void)nitems; (void)timeout;
+              return 0; /* already completed synchronously */
+          }
+
+          int gai_error(struct gaicb *req) {
+              return req ? req->__return : 0;
+          }
+
+          int gai_cancel(struct gaicb *req) {
+              (void)req;
+              return EAI_NOTCANCELED;
+          }
+          SHIM_EOF
+          gcc -shared -fPIC -O2 -Wall -Wextra \
+            -o /tmp/libgai_sync_shim.so /tmp/gai_sync_shim.c
+          file /tmp/libgai_sync_shim.so
+
       - name: Test
+        id: test
+        env:
+          LD_PRELOAD: /tmp/libgai_sync_shim.so
         run: meson test -C build-linux-tsan --print-errorlogs
+
+      - name: Capture stack trace under gdb (#438 diagnostic)
+        # With the gai_sync_shim active, the originally-documented #438
+        # getaddrinfo_a crash is suppressed and the TSan suite should pass.
+        # This step only runs when the Test step itself failed — so any
+        # stack captured here is a NEW failure mode worth investigating.
+        # Best-effort: SIGSEGV reproduction is Catch2-shuffle-dependent, so
+        # we replay the seed the meson run used when extractable.
+        #
+        # `if: steps.test.outcome == 'failure'` (rather than `failure()`)
+        # ensures we don't gdb against a non-test failure (e.g. ccache
+        # binary corrupt, artifact upload error) where there's no
+        # meaningful binary to inspect.
+        if: steps.test.outcome == 'failure'
+        env:
+          LD_PRELOAD: /tmp/libgai_sync_shim.so
+        run: |
+          sudo apt-get install -y gdb >/dev/null 2>&1 || true
+          if ! command -v gdb >/dev/null; then
+            echo "gdb unavailable on this runner — skipping stack capture"
+            exit 0
+          fi
+          cd build-linux-tsan
+          seed=$(grep -oE 'Randomness seeded to: [0-9]+' meson-logs/testlog.txt 2>/dev/null | head -1 | awk '{print $NF}') || true
+          if [ -n "$seed" ]; then
+            echo "replaying Catch2 seed: $seed"
+            seed_args="--rng-seed $seed --order rand"
+          else
+            seed_args="--order rand"
+          fi
+          export TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1"
+          # gdb's default SIGSEGV disposition (stop + don't pass to inferior)
+          # leaves us at the crashing frame; subsequent commands then dump
+          # every thread's stack plus the crashing thread's registers.
+          # `timeout 300` caps a non-reproducing run so it can't consume
+          # the rest of the 60-min job budget (unhappy-path R-07).
+          timeout 300 gdb -batch \
+            -ex 'set pagination off' \
+            -ex 'set print thread-events off' \
+            -ex 'set backtrace limit 80' \
+            -ex "run $seed_args" \
+            -ex 'printf "\n=== thread backtraces (full) ===\n"' \
+            -ex 'thread apply all bt full' \
+            -ex 'printf "\n=== info registers ===\n"' \
+            -ex 'info registers' \
+            -ex 'quit' \
+            ./tests/yuzu_server_tests 2>&1 | tee stack-capture.log || true
+          # Match TSan-aborted runs (SIGABRT after a printed race report) and
+          # bus errors as well as SIGSEGV. Otherwise non-allocator TSan races
+          # produce a false-negative "did not crash" annotation (R-13).
+          if ! grep -qE 'received signal|SIGSEGV|SIGABRT|SIGBUS|ThreadSanitizer:' stack-capture.log; then
+            echo "(test binary did not crash this run — Catch2 shuffle non-determinism; re-dispatch nightly for another attempt)" >> stack-capture.log
+          fi
 
       - name: ccache stats
         if: always()
         run: ccache -s
 
-      - name: Upload meson testlog (on failure)
+      - name: Upload meson testlog and stack capture (on failure)
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -271,6 +385,7 @@ jobs:
           path: |
             build-linux-tsan/meson-logs/testlog.txt
             build-linux-tsan/meson-logs/testlog.junit.xml
+            build-linux-tsan/stack-capture.log
           retention-days: 14
           if-no-files-found: warn
 

@@ -101,7 +101,7 @@ metadata:
   tags: [deployment, server, management, query]
 
 spec:
-  type: query
+  type: question
   platforms: [windows, linux, darwin]
 
   execution:

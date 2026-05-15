@@ -76,6 +76,24 @@ message HeartbeatRequest {
   yuzu.common.v1.Timestamp sent_at = 2;
   // Lightweight status fields; full inventory uses ReportInventory
   map<string, string> status_tags = 3;
+  // PR 10 / UAT 2026-05-12 — Push-based fleet topology ingestion.
+  //
+  // Optional inline fleet_snapshot.v1 JSON document. The agent attaches
+  // this on the first heartbeat after its local snapshot-pump thread
+  // produces a newer snapshot than was last attached. Empty on every
+  // other heartbeat. Server-side `AgentServiceImpl::Heartbeat` parses
+  // the document and feeds it into `FleetTopologyStore::push_snapshot`,
+  // so `/api/v1/viz/fleet/topology` reads from a per-agent slot map
+  // populated by the agents themselves and does not need to dispatch
+  // `tar.fleet_snapshot` on cache miss. Old agents send empty and the
+  // server falls back to the previous dispatch path.
+  //
+  // Wire cost: a snapshot is typically 5–20 KB JSON per host; the
+  // agent gates attachment on "produced something newer since last
+  // heartbeat" so even at the 30 s heartbeat cadence the average
+  // bandwidth tracks the 60 s TAR fast-tick rate — about once per
+  // two heartbeats per agent.
+  bytes fleet_snapshot_json = 4;
 }
 
 message HeartbeatResponse {

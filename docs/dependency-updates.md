@@ -155,6 +155,43 @@ a gateway change is blocked on an upstream fix. Checklist:
 6. Commit the `rebar.config` change with a conventional
    `build(deps): bump <dep> to <version>` message.
 
+## Vendored JavaScript assets
+
+Yuzu embeds third-party JavaScript at build time via `embed_js.py` (chunked raw-string-literal output to fit MSVC's 16,380-byte C2026 limit). These files are **not** tracked by Dependabot and must be refreshed manually. Each upstream version is pinned in `tests/unit/server/test_static_js_bundle.cpp` by exact byte count + canary substring; a silent CDN substitution fails the test loud.
+
+| Asset | Vendor file | Symbol | Upstream | Current pin |
+|---|---|---|---|---|
+| HTMX runtime | `server/core/src/static_js_bundle.cpp` (chunked at hand) | `kHtmxJs` | https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js | 2.0.4, 50,918 bytes |
+| HTMX SSE extension | same TU | `kSseJs` | https://unpkg.com/htmx-ext-sse@2.2.2/sse.js | 2.2.2, 8,897 bytes |
+| Apache ECharts | `server/core/vendor/echarts.min.js` | `kEChartsJs` | unpkg.com/echarts/dist/echarts.min.js | 5.6.0, 1,034,102 bytes |
+| Inter variable webfont | `server/core/vendor/inter/InterVariable.woff2` | `kInterVariableWoff2` | https://github.com/rsms/inter | 4.0, 345,588 bytes |
+| Three.js (ES module) | `server/core/vendor/three.module.min.js` | `kThreeJs` | https://unpkg.com/three@0.168.0/build/three.module.min.js | r168, 685,408 bytes |
+| Three.js OrbitControls | `server/core/vendor/three-orbit-controls.js` | `kThreeOrbitJs` | https://unpkg.com/three@0.168.0/examples/jsm/controls/OrbitControls.js | r168, 32,134 bytes |
+| Yuzu chart adapter | `server/core/src/charts_js_bundle.cpp` (hand-written) | `kYuzuChartsJs` | first-party | n/a |
+| Yuzu fleet renderer | `server/core/src/yuzu_viz_js_bundle.cpp` (hand-written) | `kYuzuVizJs` | first-party | n/a |
+
+### Refresh procedure (vendored vendor JS only)
+
+For HTMX / ECharts / Three.js / OrbitControls — anything we did NOT author:
+
+1. Download the new file from the upstream `unpkg.com/<pkg>@<version>/...` URL into the matching `server/core/vendor/` path. Keep the same filename.
+2. Update the corresponding NOTICE file at `server/core/vendor/<pkg>-NOTICE.txt` if the upstream license header changed.
+3. Update the top-level `NOTICE` row if the version naming changed.
+4. Update `tests/unit/server/test_static_js_bundle.cpp`:
+   - Bump the byte-count constant (`kExpectedFooBytes`).
+   - Bump the version-token canary if upstream changed it (e.g. for Three.js, the bundle exposes `REVISION = "<n>"` once — pin the quoted form per gov R4 QA-B1).
+5. Build with `meson compile -C build-{linux,macos,windows}`. The `embed_js.py` chunking + DELIM-collision check runs at build time; a refresh that smuggles in the close-delimiter token `)ECHARTSEMBED"` fails build cleanly.
+6. Run `yuzu_server_tests "[static-js]"` to confirm pinned invariants pass.
+7. Commit with a `chore(deps): bump <pkg> to <version>` message and reference the upstream changelog.
+
+For Three.js specifically: r150+ is ES-module-only upstream. The OrbitControls module's top-level `import { ... } from 'three'` MUST resolve through the importmap declared in `viz_page_ui.cpp`. A refresh that splits OrbitControls into multiple files (e.g. PR-bundled with TransformControls) requires extending the importmap in lockstep. The `[viz][page]` test pins `from 'three'` and `class OrbitControls` substrings in the vendored file as a refresh canary.
+
+For Inter font: a binary `.woff2` refresh follows the same pattern but uses `embed_binary.py`, not `embed_js.py`.
+
+### Why these aren't in Dependabot
+
+Dependabot's npm ecosystem requires a `package.json` in the repository root, which Yuzu doesn't have (these are flat vendored files, not an npm-managed dependency tree). The cost of a manual quarterly review against the pinned byte counts is small relative to the cost of standing up an npm toolchain just for staleness tracking. If the vendored JS surface grows past 8–10 packages, reconsider.
+
 ## Staleness query — "what's the oldest pinned dep?"
 
 - **Dependabot-tracked** (`github-actions`, `docker`, `pip`) — open the

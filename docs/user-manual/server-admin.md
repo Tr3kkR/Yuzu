@@ -62,6 +62,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
+| `--viz-disable` | off | Disable the fleet visualization feature. When set, the REST endpoints (`GET /api/v1/viz/fleet/topology`, `GET /fragments/viz/fleet/topology`, and the per-host drill-down routes) **and** the page shells (`GET /viz/fleet`, `GET /viz/host/<id>`) all return `503`. Tier-before-permission ordering: the kill switch takes effect even for callers who would otherwise fail RBAC. Two pieces of durable evidence that the switch took effect: the startup log line `[VIZ] viz endpoint disabled by configuration`, and a `server.viz_disabled` audit event (`target_type = FleetTopology`) written to the audit store at boot — so an auditor can confirm the disabled state from the audit trail even on a deployment with no viz traffic. Env: `YUZU_VIZ_DISABLE`. |
 | `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
 
 ### Example
@@ -172,6 +173,68 @@ The new `/tar` dashboard page (issue #547) surfaces every device × source pair 
 **Per-operator scan state caveat.** Scan results are held in the server's memory keyed by operator username, with a 30-second per-operator cooldown to defend against retry-storms. Restarting the server clears all scan state; operators will see "No scan data yet — click Scan fleet" after a restart and a fresh scan returns within seconds. Persistence across restarts and multi-server coordination land in Phase 15.G operational hardening.
 
 **Audit log additions.** Two new audit actions emit on operator activity: `tar.status.scan` (every Scan-fleet click; `result=success`/`denied`/`failure` with detail) and `tar.source.reenable` (every Re-enable click; `result=success`/`denied`/`failure`). SIEM rules can distinguish forged form submissions from genuine connectivity failures via the `detail=scope_violation` vs `detail=agent_not_connected` distinction even though the HTTP response body is identical (`Agent not reachable.` 404) for both cases — the body identity is load-bearing for the no-enumeration-oracle property.
+
+### vNEXT — Fleet visualization (3D) (`/viz/fleet`)
+
+The fleet-visualization feature ladder lands across the `feat/viz-engine` branch. PRs 1–12 are shipped: agent collector + server store + REST/fragment routes + page scaffold + camera controls + cube renderer + Sprite labels + hover tooltip + interior process nodes coloured by category + intra-cube localhost edges + per-cube listening-socket spheres + cross-machine connection edges + push-based topology ingestion + **three-tier stacked layout, talking-socket dots, curved tube wires, loopback-bind filter (PR 12)**. Remaining ladder PRs add the vulnerability overlay and final polish (LOD, edge bundling, a11y, perf).
+
+**Operator-visible state today (PRs 1–12).** Navigating to `/viz/fleet` shows one translucent cube per fleet machine, **organized into three architectural tiers** — frontend cubes on the top Y plane, applications in the middle plane, databases on the bottom plane. Within each tier, machines fall onto a deterministic per-tier grid (FNV-1a hash on `agent_id`). Live agents render at opacity `0.18`; stale agents (no `tar.fleet_snapshot` push within the staleness threshold) drop to `0.08`. Per-OS palette: Linux `#f0c674`, macOS/Darwin `#a0a0a0`, Windows `#5294e2`. Hostname `Sprite` labels render below each cube. Inside each cube, one `SphereGeometry` dot per process is laid out deterministically (`hash(pid|ppid)`-mod-bucket inside the cube's interior) and coloured from a six-category palette: system `#6e7681`, browser `#58a6ff`, database `#d29922`, web `#56d364`, runtime `#bc8cff`, other `#8b949e`. Each cube's TOP face carries a ring of cream-coloured listening-socket spheres (one per `listeners[]` row) with `:port` labels; **loopback-only listeners (`127.x`, `::1`) are now hidden from the surface** — they aren't reachable from other instances. Each cube's BOTTOM face carries a ring of cool-blue **talking-socket** dots (one per unique outbound `(proto, dst_ip, dst_port)`). **Cross-machine connections render as thick curved tubes** (`THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents) that drop from the source's talking dot down/across to the destination's listener sphere. External (off-fleet) destinations render as short grey stub lines with ring markers. Hover order: listener sockets → talking sockets → process dots → edges → cubes. WASD pans, drag rotates, wheel zooms.
+
+**Tier classification heuristic.** `classifyTier` reads `listeners[]` port hints (`DB_PORTS = {3306, 5432, 6379, 27017, 1521, 1433, 9042, 9200, 5984, 8086, 11211}` / `WEB_PORTS = {80, 443, 8080, 8443, 8088}`) plus process-category strings (`'database'`, `'web'`). Priority is **db > web > app**: a host with any DB signal lands on the database tier regardless of whether it also serves web traffic. A host with no DB or web signal defaults to the application tier. **Known limitations:** (a) databases on non-standard ports (e.g. Postgres on 5431 for a sharded cluster) fall through to the application tier unless one of the host's processes is classified as `database` by `process_category.hpp`; (b) `WEB_PORTS` is intentionally narrow — it covers reverse proxies / load balancers / API gateways on ports 80/443/8080/8443/8088 but **not** dev-server defaults (3000/4200/5173/8000), because in a classic three-tier deployment a nodejs/django/vite server listening on those ports is application work, not the front edge. There is no operator-accessible override today; both limitations are tracked as a follow-up issue on function-aware tier classification.
+
+**Why empty cubes show no lines.** Intra-cube edges appear only for processes with *active* loopback socket pairs (e.g. Prometheus scraping node_exporter, a client connected to a local Redis / Postgres). A fresh agent with no inter-process loopback traffic shows process dots but no lines — this is expected, not a bug. Lines appear as workloads generate loopback flows.
+
+**Browser requirements.** The page uses ES module imports resolved through an `<script type="importmap">` declaration. importmap is supported in Chrome 89+, Firefox 108+, Safari 16.4+, and Edge 89+ (all browsers shipped after early 2023). Older browsers receive a visible error overlay on the page rather than a blank canvas — the page detects via `HTMLScriptElement.supports('importmap')` before attempting the module load. **`MeshPhysicalMaterial` cubes additionally require WebGL 2.0**, which is bundled with all browsers in the import-map support floor but can be disabled by enterprise group policy on locked-down terminals. Browsers without WebGL 2 will see the grid but the cubes will fail to render with a black or missing material; verify WebGL 2 is enabled in browser policy before pilot rollout. Operators on enterprise-locked browser configurations that lag 2+ years should test on a representative deployment. **Page weight:** the `/viz/fleet` route pulls three.js (~685 KB), three-orbit (~32 KB), htmx (~51 KB), the yuzu-viz renderer (~84 KB), plus the design-system CSS. Approximate first-load total is ~1.5 MB of JS (uncompressed). For metered-link or low-bandwidth deployments, consider `--viz-disable` as a default and enabling it selectively for ops staff.
+
+**Reverse-proxy deployment constraint.** The page hard-codes static asset paths (`/static/three.module.min.js`, `/static/three-orbit-controls.js`, `/static/yuzu-viz.js`) and the API path (`/api/v1/viz/fleet/topology`). Sub-path proxy deployments (e.g. nginx `location /yuzu/`) are NOT supported — the absolute paths would 404 against the rewritten origin. Mount Yuzu at the root path of its host or a fronting domain.
+
+**Cache posture.** The `/viz/fleet` page response sets `Cache-Control: no-cache, no-store, must-revalidate` so a server upgrade cannot leave operators with a stale page that references the new vendored assets (which themselves cache for 24 hours via `max-age=86400`). The vendored asset bundles are content-addressed by server binary version — a fresh page revalidation after upgrade picks up any bundle changes immediately.
+
+**Kill switch behaviour.** `--viz-disable` / `YUZU_VIZ_DISABLE` disables the **whole feature**: the REST/fragment endpoints, the per-host drill-down routes, **and** the `/viz/fleet` and `/viz/host/<id>` page shells all return `503` (a plain-text "fleet visualization is disabled by an administrator" body). An operator who sets the flag will not see a half-working page. The static asset routes (`/static/yuzu-viz.js` etc.) are not gated — they are inert without the page — so gating them at a reverse proxy is optional, not required. The kill switch is **boot-time only** (seeded from config at startup); there is no runtime toggle, so disabling viz under a live incident requires a server restart.
+
+**Sizing and capacity.** Push-based ingestion holds one `RawAgentSnapshot` per agent in an in-memory `pushed_` map. Per-agent footprint is bounded by the parser caps (4096 processes + 4096 connections per snapshot, ~1–2 MB worst case, typically 5–20 KB). The map is hard-capped at **100 000 agents** (`kPushedMapHardCap`); at the cap, a new agent's push evicts the least-recently-seen entry (LRU by server receipt time) and emits a `topology.push.evicted_for_cap` audit event. Watch `yuzu_viz_pushed_map_size` and alert before it approaches the cap. The store is **in-memory only** — on server restart it is empty until agents re-push (recovery window ≈ one agent push cycle, ~30–60 s); the pull-based dispatch fetcher serves as the cold-start fallback during that window.
+
+**Permission model.** The page route is auth-gated only (`require_auth`); the data fetch at `GET /api/v1/viz/fleet/topology` enforces `Response:Read`. An operator with a session but without `Response:Read` can land on the page (sees the grid and the "Access denied" overlay when the JS fetch fires) but every JSON fetch returns 403. The `viz.fleet_topology` audit row is emitted on the API path, not the page path — auditors querying "who accessed fleet visualization?" should filter on the `FleetTopology` `target_type` (covered in detail in `audit-log.md`).
+
+**Browser-side errors are not server-logged.** WebGL context loss, module-fetch 503, and importmap-resolution failures surface only in the operator's browser console. A future polish PR will add a client-error beacon; today, support engineers diagnosing "viz is blank" reports should ask for a screenshot of the browser console.
+
+**Per-host drill-down (`/viz/host/<agent_id>`).** Double-clicking a cube
+opens a new tab with a 2D bipartite IPC graph (processes + sockets,
+Cytoscape `cose` layout) above the existing TAR process tree, with
+cross-pane select-to-highlight and a resizable splitter. The page route
+is auth-gated only; the data fetch (`GET /api/v1/viz/host/<agent_id>/topology`)
+enforces `Response:Read` and honours the `--viz-disable` kill switch.
+Audit rows are emitted as `viz.host_topology` (`target_type = HostTopology`).
+The `agent_id` path segment is allow-listed to `[A-Za-z0-9._-]` before
+templating; any other character returns `400`.
+
+**Connection window — `fleet_snapshot_window_seconds` (TAR plugin config).**
+`tar.fleet_snapshot` reports not only the connections ESTABLISHED at the
+exact `/proc` sample instant but also connections TAR observed recently
+in its `tcp_live` warehouse, so short-lived flows still reach the viz.
+The look-back window is operator-tunable via the TAR plugin's KV config
+key `fleet_snapshot_window_seconds` (default `3600`). It is a TAR plugin
+config key, not a server CLI flag — set it through the TAR plugin's
+configuration surface. The 60 s sampler still cannot see sub-interval
+connections; that needs kernel eventing (tracked separately).
+
+### vNEXT — Agent interval triggers now functional
+
+`yuzu_register_trigger` / `yuzu_unregister_trigger` were previously no-op
+stubs — no `TriggerEngine` was instantiated on the agent, so interval
+triggers were silently discarded and never fired. As a result the TAR
+warehouse `*_live` tables (`tcp_live` and friends) sat permanently empty
+in the field, and any plugin that registered an interval trigger had it
+silently dropped.
+
+**Upgrade caveat.** After upgrading the **agent** daemon, registered
+interval triggers begin firing for the first time. On the first
+`collect_fast` cycle (default 60 s) the TAR `*_live` tables start
+populating, and operators may see a small increase in per-agent CPU/IO
+proportional to the number of registered triggers. Any plugin that
+registered an interval trigger expecting the old no-op behaviour will now
+have that trigger fire — this is the fix, not a regression. Server-only
+upgrades are unaffected; the change is entirely agent-side.
 
 ### vNEXT — Plugin code signing (#80)
 

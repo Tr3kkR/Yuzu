@@ -192,7 +192,8 @@ if [[ $NO_AGENT -eq 1 ]]; then
 else
     T3_START=$(now_ms)
     T3_COUNT=$(curl -s --max-time "$TIMEOUT_S" "$DASHBOARD_URL/metrics" 2>/dev/null \
-        | grep -oP 'yuzu_agents_registered_total \K[0-9]+' || echo "0")
+        | awk '/^yuzu_agents_registered_total /{print $2; exit}')
+    T3_COUNT="${T3_COUNT:-0}"
     T3_MS=$(elapsed_ms "$T3_START")
     if [[ "$T3_COUNT" -ge 1 ]]; then
         ok "server sees $T3_COUNT registered agent(s) (${T3_MS}ms)"
@@ -213,7 +214,8 @@ if [[ -z "$GATEWAY_METRICS_URL" ]]; then
 else
     T4_START=$(now_ms)
     T4_COUNT=$(curl -s --max-time "$TIMEOUT_S" "$GATEWAY_METRICS_URL/metrics" 2>/dev/null \
-        | grep -oP 'yuzu_gw_agents_connected_total\{[^}]*\} \K[0-9]+' || echo "0")
+        | awk '/^yuzu_gw_agents_connected_total\{/{print $2; exit}')
+    T4_COUNT="${T4_COUNT:-0}"
     T4_MS=$(elapsed_ms "$T4_START")
     if [[ "$T4_COUNT" -ge 1 ]]; then
         ok "gateway sees $T4_COUNT connected agent(s) (${T4_MS}ms)"

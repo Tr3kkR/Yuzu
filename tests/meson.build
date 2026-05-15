@@ -130,10 +130,12 @@ tar_test_exe = executable(
     'unit/test_tar_schema_registry.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
+    'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
     '../agents/plugins/tar/src/tar_schema_registry.cpp',
     '../agents/plugins/tar/src/tar_aggregator.cpp',
+    '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
@@ -209,6 +211,8 @@ if build_server
       'unit/server/test_rest_response_templates.cpp',
       'unit/server/test_offload_target_store.cpp',
       'unit/server/test_rest_offload_targets.cpp',
+      'unit/server/test_fleet_topology_store.cpp',
+      'unit/server/test_viz_routes.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
@@ -230,7 +234,12 @@ if build_server
     # hardening round 1, qe-B2).
     dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
   )
-  test('server unit tests', server_test_exe, suite: 'server', timeout: 180)
+  # 600s: the server suite has grown to ~1200 test cases (#1032 added viz-engine
+  # coverage) and ASan instrumentation slows the full run past the previous
+  # 180s cap. TSan with halt_on_error usually exits earlier, but a sanitizer-
+  # instrumented full pass easily hits 4-5 min. A real hang is still bounded
+  # by the 60-min job-level timeout in nightly.yml.
+  test('server unit tests', server_test_exe, suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────

@@ -408,6 +408,8 @@ The gateway exposes Prometheus metrics on a configurable HTTP port (default:
 | `yuzu_gw_heartbeats_batched_total` | counter | Total heartbeats sent in batch RPCs |
 | `yuzu_gw_upstream_rpc_duration_seconds` | histogram | Upstream RPC latency by method |
 | `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC failures by method |
+| `yuzu_gw_registration_replay_total` | counter | Agents re-proxied upstream by the registration-replay drip after an upstream reconnect |
+| `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay (0 = idle). A persistently non-zero value indicates a replay that never drains — alert on it. |
 
 ### Planned Metrics (Not Yet Implemented)
 

@@ -36,6 +36,8 @@ class OffloadTargetStore;
 class InventoryStore;
 class UpdateRegistry;
 class ExecutionTracker;
+class FleetTopologyStore;
+class HeartbeatIngestion;
 struct UpdatePackage;
 struct StoredResponse;
 struct AnalyticsEvent;
@@ -63,6 +65,25 @@ public:
     void set_webhook_store(WebhookStore* store) { webhook_store_ = store; }
     void set_offload_target_store(OffloadTargetStore* store) { offload_target_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
+
+    /// UAT 2026-05-12: after a fresh agent registers, the next
+    /// `/api/v1/viz/fleet/topology` call must not return a snapshot
+    /// computed before this agent was on the dispatch list. Without
+    /// this hook the cube renders as `stale, ts=0, procs=[]` for the
+    /// remainder of the 60 s TTL window, which UAT flagged as a
+    /// "this should not happen" state. nullptr disables the wiring —
+    /// used by tests that don't build a topology store.
+    ///
+    /// Plain raw pointer (not atomic): registration runs on the gRPC
+    /// dispatcher; setter runs once during server bring-up before the
+    /// dispatcher accepts traffic.
+    void set_fleet_topology_store(FleetTopologyStore* store) { fleet_topology_store_ = store; }
+
+    /// #1000 / arch-S2: HeartbeatIngestion encapsulates the shared
+    /// per-heartbeat work (health upsert, metrics, fleet_snapshot push)
+    /// so both this service and GatewayUpstreamServiceImpl funnel
+    /// through one entry point. Set after bring-up alongside the stores.
+    void set_heartbeat_ingestion(HeartbeatIngestion* hi) { heartbeat_ingestion_ = hi; }
 
     /// UAT 2026-05-06 #8: when set, response-receipt paths (Subscribe +
     /// process_gateway_response) call `update_agent_status` so the
@@ -197,6 +218,8 @@ private:
     WebhookStore* webhook_store_{nullptr};
     OffloadTargetStore* offload_target_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
+    FleetTopologyStore* fleet_topology_store_{nullptr};
+    HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     /// Atomic — see `set_execution_tracker` doc for why detached
     /// gateway-forward threads require the lock-free release/acquire
     /// pair instead of a plain raw pointer.

@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -17,7 +18,7 @@
 #include <vector>
 
 #ifndef _WIN32
-#  include <unistd.h>
+#include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -29,7 +30,8 @@ using namespace yuzu::agent;
 // and locks the other uid out until someone runs `sudo rm`.
 static std::string yuzu_test_uid_suffix() {
 #ifdef _WIN32
-    if (const char* u = std::getenv("USERNAME")) return std::string("_") + u;
+    if (const char* u = std::getenv("USERNAME"))
+        return std::string("_") + u;
     return "_unknown";
 #else
     return "_" + std::to_string(static_cast<unsigned long>(::geteuid()));
@@ -376,7 +378,8 @@ TEST_CASE("KvStore: multiple sets then clear returns correct count", "[kv_store]
 // ═══════════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("KvStore: move constructor transfers ownership", "[kv_store][lifecycle]") {
-    auto tmp = fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_ctor.db";
+    auto tmp =
+        fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_ctor.db";
     auto result = KvStore::open(tmp);
     REQUIRE(result.has_value());
 
@@ -397,8 +400,10 @@ TEST_CASE("KvStore: move constructor transfers ownership", "[kv_store][lifecycle
 }
 
 TEST_CASE("KvStore: move assignment transfers ownership", "[kv_store][lifecycle]") {
-    auto tmp1 = fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_a1.db";
-    auto tmp2 = fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_a2.db";
+    auto tmp1 =
+        fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_a1.db";
+    auto tmp2 =
+        fs::temp_directory_path() / ("yuzu_test_kv" + yuzu_test_uid_suffix()) / "move_a2.db";
 
     auto r1 = KvStore::open(tmp1);
     auto r2 = KvStore::open(tmp2);
@@ -437,8 +442,13 @@ TEST_CASE("KvStore: concurrent set/get from multiple threads", "[kv_store][concu
     std::vector<std::thread> threads;
     threads.reserve(kThreads);
 
+    // Catch2 assertion macros are not thread-safe (they write a process-global
+    // line-info object), so worker threads record into an atomic and the
+    // assertion happens on the main thread after join.
+    std::atomic<bool> all_present{true};
+
     for (int tid = 0; tid < kThreads; ++tid) {
-        threads.emplace_back([&store = t.store, tid]() {
+        threads.emplace_back([&store = t.store, &all_present, tid]() {
             std::string plugin = "plugin-" + std::to_string(tid);
             for (int i = 0; i < kOpsPerThread; ++i) {
                 std::string key = "key-" + std::to_string(i);
@@ -446,10 +456,10 @@ TEST_CASE("KvStore: concurrent set/get from multiple threads", "[kv_store][concu
 
                 store.set(plugin, key, val);
                 auto got = store.get(plugin, key);
-                // Value should always be present (we just set it), though
-                // it may have been overwritten by another thread if they share
-                // the same plugin+key — but here each thread has its own plugin.
-                REQUIRE(got.has_value());
+                // Value should always be present (we just set it); each thread
+                // has its own plugin so there is no cross-thread overwrite.
+                if (!got.has_value())
+                    all_present.store(false, std::memory_order_relaxed);
             }
         });
     }
@@ -457,6 +467,8 @@ TEST_CASE("KvStore: concurrent set/get from multiple threads", "[kv_store][concu
     for (auto& th : threads) {
         th.join();
     }
+
+    CHECK(all_present.load());
 
     // Verify each thread's final state is intact
     for (int tid = 0; tid < kThreads; ++tid) {
@@ -503,6 +515,8 @@ TEST_CASE("KvStore: concurrent list while writing", "[kv_store][concurrency]") {
     }
 
     std::atomic<bool> done{false};
+    // Catch2 macros are not thread-safe; the reader records into an atomic.
+    std::atomic<bool> list_consistent{true};
 
     // Writer thread
     std::thread writer([&]() {
@@ -517,11 +531,14 @@ TEST_CASE("KvStore: concurrent list while writing", "[kv_store][concurrency]") {
         while (!done.load()) {
             auto keys = t.store.list("p1", "");
             // Should always get a consistent snapshot (at least the 20 pre-populated)
-            CHECK(keys.size() >= 20);
+            if (keys.size() < 20)
+                list_consistent.store(false, std::memory_order_relaxed);
         }
     });
 
     writer.join();
     done.store(true);
     reader.join();
+
+    CHECK(list_consistent.load());
 }
