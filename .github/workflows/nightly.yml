@@ -315,6 +315,7 @@ jobs:
           file /tmp/libgai_sync_shim.so
 
       - name: Test
+        id: test
         env:
           LD_PRELOAD: /tmp/libgai_sync_shim.so
         run: meson test -C build-linux-tsan --print-errorlogs
@@ -322,11 +323,16 @@ jobs:
       - name: Capture stack trace under gdb (#438 diagnostic)
         # With the gai_sync_shim active, the originally-documented #438
         # getaddrinfo_a crash is suppressed and the TSan suite should pass.
-        # This step only runs on failure, so any stack captured here is a
-        # NEW failure mode worth investigating. Best-effort: SIGSEGV
-        # reproduction is Catch2-shuffle-dependent, so we replay the seed
-        # the meson run used when extractable.
-        if: failure()
+        # This step only runs when the Test step itself failed — so any
+        # stack captured here is a NEW failure mode worth investigating.
+        # Best-effort: SIGSEGV reproduction is Catch2-shuffle-dependent, so
+        # we replay the seed the meson run used when extractable.
+        #
+        # `if: steps.test.outcome == 'failure'` (rather than `failure()`)
+        # ensures we don't gdb against a non-test failure (e.g. ccache
+        # binary corrupt, artifact upload error) where there's no
+        # meaningful binary to inspect.
+        if: steps.test.outcome == 'failure'
         env:
           LD_PRELOAD: /tmp/libgai_sync_shim.so
         run: |
@@ -347,7 +353,9 @@ jobs:
           # gdb's default SIGSEGV disposition (stop + don't pass to inferior)
           # leaves us at the crashing frame; subsequent commands then dump
           # every thread's stack plus the crashing thread's registers.
-          gdb -batch \
+          # `timeout 300` caps a non-reproducing run so it can't consume
+          # the rest of the 60-min job budget (unhappy-path R-07).
+          timeout 300 gdb -batch \
             -ex 'set pagination off' \
             -ex 'set print thread-events off' \
             -ex 'set backtrace limit 80' \
@@ -358,7 +366,10 @@ jobs:
             -ex 'info registers' \
             -ex 'quit' \
             ./tests/yuzu_server_tests 2>&1 | tee stack-capture.log || true
-          if ! grep -qE 'received signal|SIGSEGV' stack-capture.log; then
+          # Match TSan-aborted runs (SIGABRT after a printed race report) and
+          # bus errors as well as SIGSEGV. Otherwise non-allocator TSan races
+          # produce a false-negative "did not crash" annotation (R-13).
+          if ! grep -qE 'received signal|SIGSEGV|SIGABRT|SIGBUS|ThreadSanitizer:' stack-capture.log; then
             echo "(test binary did not crash this run — Catch2 shuffle non-determinism; re-dispatch nightly for another attempt)" >> stack-capture.log
           fi
 

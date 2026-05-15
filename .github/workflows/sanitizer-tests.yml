@@ -260,7 +260,57 @@ jobs:
       - name: Build (TSan)
         run: meson compile -C build-linux-tsan 2>&1 | tee sanitizer-tsan-build.log
 
+      - name: Build gai_sync_shim (TSan + glibc getaddrinfo_a workaround)
+        # Mirrors the same shim used by nightly.yml's TSan job — see #438
+        # for full context. cpp-httplib's non-blocking DNS path routes
+        # through getaddrinfo_a(), which glibc implements via a clone3-
+        # spawned helper thread that bypasses TSan's pthread_create
+        # interceptor. Without this shim, /test --full crashes the TSan
+        # suite the same way the nightly used to.
+        run: |
+          cat > /tmp/gai_sync_shim.c << 'SHIM_EOF'
+          #define _GNU_SOURCE
+          #include <netdb.h>
+          #include <stddef.h>
+          #include <signal.h>
+          #include <time.h>
+
+          int getaddrinfo_a(int mode, struct gaicb *list[], int nitems,
+                             struct sigevent *sig) {
+              (void)mode; (void)sig;
+              for (int i = 0; i < nitems; ++i) {
+                  if (!list[i]) continue;
+                  list[i]->ar_result = NULL;
+                  list[i]->__return = getaddrinfo(list[i]->ar_name,
+                                                    list[i]->ar_service,
+                                                    list[i]->ar_request,
+                                                    &list[i]->ar_result);
+              }
+              return 0;
+          }
+
+          int gai_suspend(const struct gaicb *const list[], int nitems,
+                           const struct timespec *timeout) {
+              (void)list; (void)nitems; (void)timeout;
+              return 0;
+          }
+
+          int gai_error(struct gaicb *req) {
+              return req ? req->__return : 0;
+          }
+
+          int gai_cancel(struct gaicb *req) {
+              (void)req;
+              return EAI_NOTCANCELED;
+          }
+          SHIM_EOF
+          gcc -shared -fPIC -O2 -Wall -Wextra \
+            -o /tmp/libgai_sync_shim.so /tmp/gai_sync_shim.c
+          file /tmp/libgai_sync_shim.so
+
       - name: Test (TSan)
+        env:
+          LD_PRELOAD: /tmp/libgai_sync_shim.so
         run: |
           set -o pipefail
           meson test -C build-linux-tsan --print-errorlogs --no-stdsplit \
