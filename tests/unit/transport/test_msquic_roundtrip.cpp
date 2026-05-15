@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -29,6 +30,27 @@
 #ifdef YUZU_TRANSPORT_HAVE_MSQUIC
 #include "msquic_bidi_stream.hpp" // debug:: probes for back-pressure
 #include "test_certs.hpp"
+#endif
+
+#ifdef YUZU_TRANSPORT_HAVE_MSQUIC
+namespace {
+// Inc 5: every existing round-trip case uses the test fixture credentials
+// (verify_peer = false + ClientCertMode::None — server-auth-only TLS),
+// which the new posture gate refuses unless YUZU_ALLOW_INSECURE_TLS=1.
+// Set the env var process-wide before any TEST_CASE runs so the existing
+// suite keeps passing; the dedicated gate cases below toggle it
+// explicitly to verify the rejection path.
+struct InsecureTlsEnvSetup {
+    InsecureTlsEnvSetup() {
+#ifdef _WIN32
+        _putenv_s("YUZU_ALLOW_INSECURE_TLS", "1");
+#else
+        ::setenv("YUZU_ALLOW_INSECURE_TLS", "1", /*overwrite=*/1);
+#endif
+    }
+};
+const InsecureTlsEnvSetup g_insecure_tls_env_setup;
+} // namespace
 #endif
 
 using namespace yuzu::transport;
@@ -647,6 +669,126 @@ TEST_CASE("msquic unary CallContext::deadline expires client-side on slow handle
 //  server-side optimisation is exercised when deadline_unix_millis lands
 //  in the past for any reason — clock skew, queueing, or client-side
 //  scheduling delay.)
+
+// ── TLS posture + ALPN (#376 PR 3 increment 5a) ──────────────────────────────
+
+TEST_CASE("msquic insecure credentials are refused without YUZU_ALLOW_INSECURE_TLS",
+          "[transport][msquic][round-trip][tls][posture]") {
+    // qe-S5a / sec invariant: the gate refuses verify_peer=false on the
+    // client and ClientCertMode::None on the server unless the env var
+    // is explicitly set to "1". Any other value (unset, "0", "true")
+    // rejects.
+#ifdef _WIN32
+    _putenv_s("YUZU_ALLOW_INSECURE_TLS", "");
+#else
+    ::unsetenv("YUZU_ALLOW_INSECURE_TLS");
+#endif
+    struct EnvRestore {
+        ~EnvRestore() {
+#ifdef _WIN32
+            _putenv_s("YUZU_ALLOW_INSECURE_TLS", "1");
+#else
+            ::setenv("YUZU_ALLOW_INSECURE_TLS", "1", /*overwrite=*/1);
+#endif
+        }
+    } _restore;
+
+    // Server side: ClientCertMode::None refused.
+    {
+        auto listener = make_server_listener(Backend::Msquic);
+        REQUIRE(listener != nullptr);
+        Credentials creds = make_test_creds(); // verify_peer=false + None
+        auto r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(r.error().code == StatusCode::FailedPrecondition);
+        REQUIRE(r.error().detail.find("YUZU_ALLOW_INSECURE_TLS") != std::string::npos);
+    }
+
+    // Client side: verify_peer=false refused at first connect attempt.
+    {
+        Credentials creds = make_test_creds(); // verify_peer=false
+        auto ch = make_channel(Backend::Msquic, Endpoint{"127.0.0.1", 1}, creds);
+        REQUIRE(ch != nullptr);
+        REQUIRE_FALSE(ch->wait_for_connected(std::chrono::milliseconds(100)));
+        // Issue a no-op unary to surface the FailedPrecondition (the
+        // channel returns this for every call until creds are reloaded).
+        StringMessage req("x"), resp;
+        CallContext ctx;
+        auto r = ch->unary("yuzu.test.v1.Echo/X", ctx, req, resp);
+        REQUIRE(r.status.code == StatusCode::FailedPrecondition);
+    }
+}
+
+TEST_CASE("msquic ALPN mismatch surfaces as Unavailable on the client",
+          "[transport][msquic][round-trip][tls][alpn]") {
+    // qe-S5b: client offers an ALPN the server does not advertise; the
+    // QUIC handshake fails before any RPC. The msquic backend maps
+    // QUIC_STATUS_ALPN_NEG_FAILURE to StatusCode::Unavailable
+    // (msquic_internal_helpers.cpp).
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    Credentials server_creds = make_test_creds();
+    server_creds.alpn_protocols = {"yuzu/1"};
+    auto handler = [](const CallContext&, const SerializableMessage&,
+                      SerializableMessage&) -> Status {
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Echo", string_factory, string_factory, handler);
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, server_creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    Credentials client_creds = make_test_creds();
+    client_creds.alpn_protocols = {"yuzu/never-spoken-here"};
+    auto ch = make_channel(Backend::Msquic, bound, client_creds);
+    REQUIRE(ch != nullptr);
+
+    StringMessage req("x"), resp;
+    CallContext ctx;
+    auto r = ch->unary("yuzu.test.v1.Echo/Echo", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Unavailable);
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic ALPN multi-protocol negotiation picks a common entry",
+          "[transport][msquic][round-trip][tls][alpn]") {
+    // qe-S5c: server offers {"yuzu/1", "yuzu-test"}, client offers
+    // {"yuzu-test"}. Handshake succeeds; the round trip completes.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    Credentials server_creds = make_test_creds();
+    server_creds.alpn_protocols = {"yuzu/1", "yuzu-test"};
+    auto handler = [](const CallContext&, const SerializableMessage& req,
+                      SerializableMessage& resp) -> Status {
+        const auto& sreq = static_cast<const StringMessage&>(req);
+        auto& sresp = static_cast<StringMessage&>(resp);
+        sresp.set_data("ack:" + sreq.data());
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Echo", string_factory, string_factory, handler);
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, server_creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    Credentials client_creds = make_test_creds();
+    client_creds.alpn_protocols = {"yuzu-test"};
+    auto ch = make_channel(Backend::Msquic, bound, client_creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    StringMessage req("hi"), resp;
+    CallContext ctx;
+    auto r = ch->unary("yuzu.test.v1.Echo/Echo", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Ok);
+    REQUIRE(resp.data() == "ack:hi");
+
+    ch->close();
+    listener->shutdown();
+}
 
 TEST_CASE("msquic bidi stream destroyed without final_status terminates cleanly",
           "[transport][msquic][round-trip][bidi]") {

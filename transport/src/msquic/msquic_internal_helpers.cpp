@@ -5,9 +5,12 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #include <ws2tcpip.h>
@@ -163,6 +166,68 @@ bool make_quic_addr(std::string_view host, uint16_t port,
     QuicAddrSetFamily(&out, QUIC_ADDRESS_FAMILY_INET);
     QuicAddrSetPort(&out, port);
     return true;
+}
+
+// ── Insecure-TLS posture gate ────────────────────────────────────────────────
+
+namespace {
+
+bool insecure_tls_env_authorized() noexcept {
+    const char* v = std::getenv("YUZU_ALLOW_INSECURE_TLS");
+    if (v == nullptr) return false;
+    return std::string_view{v} == "1";
+}
+
+}  // namespace
+
+Status check_insecure_tls_posture(const Credentials& creds,
+                                  bool role_is_client) noexcept {
+    bool insecure = false;
+    if (role_is_client) {
+        insecure = !creds.verify_peer;
+    } else {
+        // Server-side: either verify_peer=false OR ClientCertMode::None
+        // is an insecure posture relative to the documented default.
+        insecure = !creds.verify_peer ||
+                   creds.client_cert_mode == ClientCertMode::None;
+    }
+    if (!insecure) return Status{};
+
+    // Insecure material observed — log regardless of whether the gate
+    // accepts it (per transport.hpp Credentials contract).
+    spdlog::warn(
+        "yuzu::transport[msquic]: insecure TLS material observed "
+        "(role={}, verify_peer={}, client_cert_mode={})",
+        role_is_client ? "client" : "server",
+        creds.verify_peer,
+        static_cast<int>(creds.client_cert_mode));
+
+    if (insecure_tls_env_authorized()) {
+        return Status{};
+    }
+    return Status{
+        StatusCode::FailedPrecondition,
+        "transport: insecure TLS material refused; set "
+        "YUZU_ALLOW_INSECURE_TLS=1 in the environment to override "
+        "(see transport.hpp Credentials contract)"};
+}
+
+// ── ALPN buffer construction ─────────────────────────────────────────────────
+
+AlpnBuffers build_alpn_buffers(std::vector<std::string> alpn_protocols) {
+    AlpnBuffers out;
+    out.backing = std::move(alpn_protocols);
+    if (out.backing.empty()) {
+        out.backing.emplace_back("yuzu/1");
+    }
+    out.buffers.reserve(out.backing.size());
+    for (auto& s : out.backing) {
+        QUIC_BUFFER b{};
+        b.Length = static_cast<uint32_t>(s.size());
+        b.Buffer = reinterpret_cast<uint8_t*>(s.data());
+        out.buffers.push_back(b);
+    }
+    return out;
 }
 
 }  // namespace yuzu::transport::msquic_backend

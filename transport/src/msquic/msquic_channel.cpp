@@ -377,6 +377,15 @@ Status MsquicChannel::connect_and_wait(std::chrono::milliseconds deadline) {
     }
 
     if (conn_state_ == ConnState::Idle) {
+        // YUZU_ALLOW_INSECURE_TLS posture gate (#376 PR 3 increment 5).
+        if (Status posture =
+                check_insecure_tls_posture(creds_, /*client=*/true);
+            !posture.ok()) {
+            conn_state_ = ConnState::Failed;
+            conn_error_ = posture;
+            return conn_error_;
+        }
+
         auto& handle = MsQuicApi::instance();
         if (!handle.ok()) {
             conn_state_ = ConnState::Failed;
@@ -386,18 +395,17 @@ Status MsquicChannel::connect_and_wait(std::chrono::milliseconds deadline) {
         }
         const auto* api = handle.api();
 
-        std::string alpn_str = creds_.alpn_protocols.empty()
-                                   ? "yuzu/1"
-                                   : creds_.alpn_protocols.front();
-        QUIC_BUFFER alpn{};
-        alpn.Length = static_cast<uint32_t>(alpn_str.size());
-        alpn.Buffer = reinterpret_cast<uint8_t*>(alpn_str.data());
+        // Multi-ALPN (#376 PR 3 increment 5): all configured protocols
+        // are offered. Empty list is promoted to {"yuzu/1"}.
+        auto       alpn       = build_alpn_buffers(creds_.alpn_protocols);
+        const auto alpn_count = static_cast<uint32_t>(alpn.buffers.size());
 
         QUIC_SETTINGS settings{};
         settings.IdleTimeoutMs       = 5000;
         settings.IsSet.IdleTimeoutMs = TRUE;
 
-        QUIC_STATUS st = api->ConfigurationOpen(handle.registration(), &alpn, 1,
+        QUIC_STATUS st = api->ConfigurationOpen(handle.registration(),
+                                                alpn.buffers.data(), alpn_count,
                                                 &settings, sizeof(settings),
                                                 nullptr, &configuration_);
         if (QUIC_FAILED(st)) {

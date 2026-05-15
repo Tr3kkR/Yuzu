@@ -746,18 +746,21 @@ std::expected<void, Status> MsquicServerListener::start(
             "transport: max_frame_size exceeds kAbsoluteMaxFrameSize"});
     }
 
+    // YUZU_ALLOW_INSECURE_TLS posture gate (#376 PR 3 increment 5).
+    if (Status posture = check_insecure_tls_posture(creds, /*client=*/false);
+        !posture.ok()) {
+        return std::unexpected(posture);
+    }
+
     {
         std::lock_guard<std::mutex> lock(mtx_);
         opts_ = opts;
     }
 
-    // ALPN — increment 2 uses the first offered protocol (default
-    // "yuzu/1"); full multi-ALPN handling lands in increment 5.
-    std::string alpn_str =
-        creds.alpn_protocols.empty() ? "yuzu/1" : creds.alpn_protocols.front();
-    QUIC_BUFFER alpn{};
-    alpn.Length = static_cast<uint32_t>(alpn_str.size());
-    alpn.Buffer = reinterpret_cast<uint8_t*>(alpn_str.data());
+    // ALPN — full multi-protocol list (#376 PR 3 increment 5). Empty
+    // input is promoted to {"yuzu/1"}.
+    auto alpn = build_alpn_buffers(creds.alpn_protocols);
+    const auto alpn_count = static_cast<uint32_t>(alpn.buffers.size());
 
     QUIC_SETTINGS settings{};
     settings.IdleTimeoutMs            = 5000;
@@ -769,8 +772,8 @@ std::expected<void, Status> MsquicServerListener::start(
     settings.IsSet.PeerBidiStreamCount = TRUE;
 
     QUIC_STATUS st = api->ConfigurationOpen(
-        api_handle.registration(), &alpn, 1, &settings, sizeof(settings),
-        nullptr, &configuration_);
+        api_handle.registration(), alpn.buffers.data(), alpn_count, &settings,
+        sizeof(settings), nullptr, &configuration_);
     if (QUIC_FAILED(st)) {
         configuration_ = nullptr;
         return std::unexpected(Status{
@@ -847,7 +850,7 @@ std::expected<void, Status> MsquicServerListener::start(
             "transport: bind host is not a valid IP literal: " + bind.host});
     }
 
-    st = api->ListenerStart(listener_, &alpn, 1, &addr);
+    st = api->ListenerStart(listener_, alpn.buffers.data(), alpn_count, &addr);
     if (QUIC_FAILED(st)) {
         api->ListenerClose(listener_);
         listener_ = nullptr;

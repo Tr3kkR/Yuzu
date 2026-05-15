@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "msquic.h"
 
@@ -80,5 +81,40 @@ std::string quic_status_hex(QUIC_STATUS status);
 // that does not parse as an IP literal.
 bool make_quic_addr(std::string_view host, uint16_t port,
                     QUIC_ADDR& out) noexcept;
+
+// ── Insecure-TLS posture gate (#376 PR 3 increment 5) ────────────────────────
+//
+// Mirrors the existing `server::security::insecure_tls_env_authorized` gate
+// in `server/core/src/insecure_tls_gate.hpp`: production-mode use of
+// `verify_peer = false` (client) or `client_cert_mode = ClientCertMode::None`
+// (server) is refused unless the operator explicitly opted in by setting
+// `YUZU_ALLOW_INSECURE_TLS=1` in the process environment. The check is
+// exact-match against "1"; "true", "0", "" and unset all reject. Returns
+// Status::Ok when the supplied Credentials are acceptable; otherwise
+// FailedPrecondition with a human-readable detail. Side effect: ALWAYS
+// logs an audit-equivalent spdlog::warn when insecure material is
+// observed (regardless of whether the gate ultimately accepts), per the
+// transport.hpp Credentials contract.
+//
+// `role_is_client` is true for MsquicChannel (only verify_peer is
+// security-relevant on the client) and false for MsquicServerListener
+// (both verify_peer and client_cert_mode are checked).
+Status check_insecure_tls_posture(const Credentials& creds,
+                                  bool role_is_client) noexcept;
+
+// ── ALPN buffer construction (#376 PR 3 increment 5) ─────────────────────────
+//
+// QUIC_BUFFER points into mutable bytes; for the multi-ALPN call paths
+// (ConfigurationOpen + ListenerStart) the QUIC_BUFFER array AND the
+// strings backing each entry must outlive the C-API call. AlpnBuffers
+// holds both: callers move `Credentials::alpn_protocols` in, then pass
+// `buffers.data()` + `buffers.size()` to msquic. An empty input is
+// promoted to a single-element `{"yuzu/1"}` (the documented default).
+struct AlpnBuffers {
+    std::vector<std::string> backing;
+    std::vector<QUIC_BUFFER> buffers;
+};
+
+AlpnBuffers build_alpn_buffers(std::vector<std::string> alpn_protocols);
 
 }  // namespace yuzu::transport::msquic_backend
