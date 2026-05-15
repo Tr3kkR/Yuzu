@@ -259,11 +259,53 @@ jobs:
       - name: Test
         run: meson test -C build-linux-tsan --print-errorlogs
 
+      - name: Capture stack trace under gdb (#438 diagnostic)
+        # The TSan nightly fails with a bare SIGSEGV (no TSan report) in the
+        # server unit suite — instrumentation-sensitive, not the originally-
+        # documented #438 httplib mechanism (whose fix landed in 7bd823e and is
+        # already in main). Re-run the failing binary under gdb so the next
+        # nightly captures a real all-thread backtrace at the crash site.
+        # Best-effort: SIGSEGV reproduction is Catch2-shuffle-dependent, so we
+        # replay the seed the meson run used when extractable.
+        if: failure()
+        run: |
+          sudo apt-get install -y gdb >/dev/null 2>&1 || true
+          if ! command -v gdb >/dev/null; then
+            echo "gdb unavailable on this runner — skipping stack capture"
+            exit 0
+          fi
+          cd build-linux-tsan
+          seed=$(grep -oE 'Randomness seeded to: [0-9]+' meson-logs/testlog.txt 2>/dev/null | head -1 | awk '{print $NF}') || true
+          if [ -n "$seed" ]; then
+            echo "replaying Catch2 seed: $seed"
+            seed_args="--rng-seed $seed --order rand"
+          else
+            seed_args="--order rand"
+          fi
+          export TSAN_OPTIONS="halt_on_error=1:second_deadlock_stack=1"
+          # gdb's default SIGSEGV disposition (stop + don't pass to inferior)
+          # leaves us at the crashing frame; subsequent commands then dump
+          # every thread's stack plus the crashing thread's registers.
+          gdb -batch \
+            -ex 'set pagination off' \
+            -ex 'set print thread-events off' \
+            -ex 'set backtrace limit 80' \
+            -ex "run $seed_args" \
+            -ex 'printf "\n=== thread backtraces (full) ===\n"' \
+            -ex 'thread apply all bt full' \
+            -ex 'printf "\n=== info registers ===\n"' \
+            -ex 'info registers' \
+            -ex 'quit' \
+            ./tests/yuzu_server_tests 2>&1 | tee stack-capture.log || true
+          if ! grep -qE 'received signal|SIGSEGV' stack-capture.log; then
+            echo "(test binary did not crash this run — Catch2 shuffle non-determinism; re-dispatch nightly for another attempt)" >> stack-capture.log
+          fi
+
       - name: ccache stats
         if: always()
         run: ccache -s
 
-      - name: Upload meson testlog (on failure)
+      - name: Upload meson testlog and stack capture (on failure)
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -271,6 +313,7 @@ jobs:
           path: |
             build-linux-tsan/meson-logs/testlog.txt
             build-linux-tsan/meson-logs/testlog.junit.xml
+            build-linux-tsan/stack-capture.log
           retention-days: 14
           if-no-files-found: warn
 
