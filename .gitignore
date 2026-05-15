@@ -150,3 +150,5 @@ __pycache__/
 # activation, ss/df flags, /var/lib/docker). Per the Darwin policy in
 # CLAUDE.md the shims are local-only — never tracked.
 /scripts/darwin-*.sh
+.aider*
+.lora/
