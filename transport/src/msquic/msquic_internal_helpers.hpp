@@ -12,9 +12,14 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <typeinfo>
+#include <utility>
 #include <vector>
+
+#include <spdlog/spdlog.h>
 
 #include "msquic.h"
 
@@ -116,5 +121,32 @@ struct AlpnBuffers {
 };
 
 AlpnBuffers build_alpn_buffers(std::vector<std::string> alpn_protocols);
+
+// ── safe_sink_invoke (UP-5) ──────────────────────────────────────────────────
+//
+// Invoke a TransportMetricSink callback under try/catch. Per
+// transport.hpp the sink "MUST NOT throw" — but a buggy sink (Prometheus
+// push allocator failure, label-cardinality blowup, hot-reloaded broken
+// implementation) must NOT terminate the msquic worker thread it runs
+// on. Swallow + spdlog::warn; the next callback gets another shot.
+// Defined in this header (template) so the channel + listener + bidi
+// stream TUs share the same implementation without a separate library.
+template <typename F>
+inline void safe_sink_invoke(
+    const std::shared_ptr<TransportMetricSink>& sink, F&& fn) {
+    if (!sink) return;
+    try {
+        std::forward<F>(fn)(*sink);
+    } catch (const std::exception& e) {
+        spdlog::warn(
+            "yuzu::transport[msquic]: metric sink callback raised "
+            "exception (swallowed): type={} what={}",
+            typeid(e).name(), sanitise_status_detail(e.what()));
+    } catch (...) {
+        spdlog::warn(
+            "yuzu::transport[msquic]: metric sink callback raised non-std "
+            "exception (swallowed)");
+    }
+}
 
 }  // namespace yuzu::transport::msquic_backend

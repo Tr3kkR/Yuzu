@@ -101,6 +101,13 @@ void send_server_trailer_and_fin(BidiStreamState& state, const Status& status);
 // payload. Counters are process-global and increment monotonically; tests
 // MUST call `bidi_reset_backpressure_counters()` at start to avoid
 // inheriting counts from prior cases.
+//
+// **Compile-time gated**: declared (and defined in the .cpp) only when
+// the test build sets `YUZU_TRANSPORT_TESTING`. In a production build
+// the symbols do not exist, so a malicious / buggy plugin loaded into
+// the same process cannot dlsym them to disable back-pressure or
+// override thresholds at runtime (cpp-SHOULD-3 / qe-SHOULD-2 / UP-9).
+#ifdef YUZU_TRANSPORT_TESTING
 namespace debug {
 std::uint64_t bidi_receive_disabled_count();
 std::uint64_t bidi_receive_enabled_count();
@@ -109,5 +116,6 @@ void          bidi_set_backpressure_thresholds(std::size_t high_bytes,
                                                std::size_t low_bytes);
 void          bidi_reset_backpressure_thresholds();
 }  // namespace debug
+#endif
 
 }  // namespace yuzu::transport::msquic_backend

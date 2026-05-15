@@ -147,8 +147,9 @@ enum class StatusCode : int {
 //     any deployment-internal state.
 //   * For exception-driven error paths, the transport's dispatcher
 //     replaces a thrown std::exception with the static literal
-//     "handler raised exception" on the wire (and "handler raised
-//     non-std exception" for non-std throws). The original e.what()
+//     "transport: handler raised exception" on the wire (and
+//     "transport: handler raised non-std exception" for non-std
+//     throws). The original e.what()
 //     text is logged server-side at error level and never crosses the
 //     process boundary. Application handlers wishing to deliver
 //     caller-diagnosable detail must populate Status::detail
@@ -242,10 +243,9 @@ struct Endpoint {
 //     enforces the same posture on every reload(). If the gate is off
 //     and a reload returns insecure material, the reload FAILS as
 //     `StatusCode::FailedPrecondition`; the existing Credentials remain
-//     in force. The transport logs an audit event of category
-//     `transport.insecure_tls_observed` whenever insecure material is
-//     observed, regardless of whether the connection ultimately
-//     proceeded.
+//     in force. See the "Insecure-TLS observation logging" bullet
+//     below for the current logging surface; the structured-audit-
+//     event upgrade is tracked at #1042.
 //   * `reload` callback contract: invoked before each new connection
 //     (client) or each new TLS handshake (server). If the callback
 //     throws, the connection attempt FAILS with StatusCode::Unauthenticated.
@@ -272,6 +272,16 @@ struct Endpoint {
 //     The PEM material itself (cert, key, CA bundle) may rotate freely
 //     under reload; this contract regulates only the protocol-selector
 //     fields above.
+//   * **Insecure-TLS observation logging.** When `verify_peer == false`
+//     or `client_cert_mode == ClientCertMode::None` is observed at
+//     start() / connect() / reload(), the transport emits a WARN-level
+//     spdlog line regardless of whether the gate ultimately accepts.
+//     A structured `transport.insecure_tls_observed` audit event is a
+//     pre-PR-5 prerequisite (#1042 — required before the msquic backend
+//     becomes runtime-selectable). The gRPC backend has no transport-
+//     side gate today; the server-side
+//     `server::security::insecure_tls_env_authorized` CLI gate is the
+//     existing canonical control surface.
 //   * `cert_lifecycle_policy_url` (when set) names a documented policy
 //     for cert validity, revocation, and rotation cadence — required
 //     before PR 3 merges per Workstream B. May be empty during

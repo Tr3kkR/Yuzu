@@ -147,6 +147,8 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | File | Component | What's Covered |
 |------|-----------|----------------|
 | `test_transport_smoke.cpp` | Transport abstraction smoke + bidi deadline battery | Channel + ServerListener happy paths, bidi round-trip, in-proc gRPC fixture, ALPN negotiation, **bidi read deadline (#902)**, **bidi write deadline (#911)** including negative-deadline-clamp + cancel-short-circuit + happy-path-with-deadline (closet-clean Round-1, 6 cases / 63 assertions in `[deadline]` battery), pool fanout + saturation reject path, `bound_endpoint()` semantics |
+| `test_msquic_framing.cpp` | msquic length-prefix framing codec | Whole-frame round-trip, byte-at-a-time feed, two concatenated frames, oversize-length → ResourceExhausted (no allocation), split length prefix. Pure codec; no msquic dependency — runs on every transport configuration including grpc-only |
+| `test_msquic_roundtrip.cpp` | msquic backend round-trip integration (#376 PR 3, all 9 increments) | **Unary** (5 cases): handler-registered round trip, unknown-method Unimplemented, handler-error propagation, parse-failure DataLoss, handler-thrown exception scrub. **Bidi** (4): echo N frames, handler-error propagation, concurrent reader+writer, destroyed without final_status. **Back-pressure** (1): fast-sender + slow-handler, asserts pause+resume counters via `debug::` probes. **Deadlines** (4): read deadline expiry, negative-deadline-clamp, write deadline non-firing on prompt peer, unary `CallContext::deadline` client-side timeout. **TLS posture + ALPN** (3): insecure credentials refused without `YUZU_ALLOW_INSECURE_TLS=1`, ALPN mismatch → Unavailable, multi-protocol negotiation. **Metrics** (2): RecordingSink fires `on_connection_*` / `on_stream_*` / `on_bytes_*`; dispatch-throw label "std_exception". **Bidi pool** (1): saturation cap, exact-string `"transport: bidi dispatcher saturated"` reject + `ResourceExhausted` (parity with gRPC), in-flight delta sequence. **Parity sweep** (3): peer_uri (`ipv4:`/`ipv6:` prefix matching gRPC), Status::detail wire-boundary scrub, oversize max_frame_size rejection. Total: 38 cases, 1015 lines. Compiled only when `-Dtransport=msquic` or `both`; degrades to a single "backend not linked" assertion on `-Dtransport=grpc`. |
 
 ### Untested Transport Paths
 
@@ -155,6 +157,9 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | **Bidi write deadline expiry under HTTP/2 flow-control fill** | Engineering an HTTP/2 flow-control fill in CI is rejected as flake-prone; structurally identical to the read-side path which is covered | Low |
 | **Bidi pool gauge under-read on transient saturation** | UP-218 — needs synthetic burst harness | Medium |
 | **Token-bucket refill arithmetic** | Implementation is straightforward; deferred unit test would synthesize a stale `last_refill_at` and assert refill | Low |
+| **msquic mTLS — `ClientCertMode::Require` round-trip + `peer_san_identities` populated** | Deferred to #1042 (PEM->PKCS12 + cert validation callback). Pre-PR-5 hard gate | High |
+| **msquic on heterogeneous-backend Subscribe peer-mismatch** | Cons-BLOCKING-3 — needs PR-5 dual-stack flag to fully exercise | High (post PR 5) |
+| **msquic deadline-expired-before-dispatch (server-side rejection)** | Loopback test races: handler returns faster than 1 ms client deadline; documented in test file. Server path IS implemented and exercised by clock-skew scenarios in real deployments | Low |
 
 ---
 

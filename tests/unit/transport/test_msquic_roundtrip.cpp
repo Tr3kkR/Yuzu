@@ -1058,7 +1058,9 @@ TEST_CASE("msquic bidi dispatcher rejects beyond the configured pool cap",
     REQUIRE(bidi3->write(out));
     bidi3->writes_done();
     Status fs3 = bidi3->final_status();
-    REQUIRE(fs3.code == StatusCode::Unavailable);
+    // sec-HIGH-1: ResourceExhausted matches the gRPC backend so operators
+    // routing on `code` get identical behaviour across backends.
+    REQUIRE(fs3.code == StatusCode::ResourceExhausted);
     REQUIRE(fs3.detail == "transport: bidi dispatcher saturated");
 
     // Release the held handlers and tear down cleanly.
@@ -1102,7 +1104,9 @@ TEST_CASE("msquic bidi dispatcher rejects beyond the configured pool cap",
 
 TEST_CASE("msquic CallContext exposes peer_uri and HandshakeHello metadata to handler",
           "[transport][msquic][round-trip][parity]") {
-    // qe-S8a: handler observes a populated peer_uri (msquic://ip:port)
+    // qe-S8a: handler observes a populated peer_uri ("ipv4:1.2.3.4:5678"
+    // or "ipv6:[::1]:5678" — byte-for-byte parity with gRPC's
+    // gctx.peer() per cons-BLOCKING-2)
     // and the per-call metadata the client placed on CallContext.
     auto listener = make_server_listener(Backend::Msquic);
     REQUIRE(listener != nullptr);
@@ -1141,7 +1145,7 @@ TEST_CASE("msquic CallContext exposes peer_uri and HandshakeHello metadata to ha
 
     {
         std::lock_guard<std::mutex> lock(capture_mtx);
-        REQUIRE(captured_peer_uri.starts_with("msquic://"));
+        REQUIRE((captured_peer_uri.starts_with("ipv4:") || captured_peer_uri.starts_with("ipv6:")));
         REQUIRE(captured_metadata["x-yuzu-trace"] == "abc-123");
         REQUIRE(captured_metadata["x-yuzu-tenant"] == "acme");
     }

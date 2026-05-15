@@ -616,7 +616,7 @@ public:
             handler_status = handler_(ctx, *bidi_stream_);
         } catch (const std::exception& e) {
             handler_status = {StatusCode::Internal,
-                              "handler raised exception"};
+                              "transport: handler raised exception"};
             spdlog::error(
                 "yuzu::transport: bidi handler raised std::exception in "
                 "{} — type={} what={}",
@@ -628,7 +628,7 @@ public:
             }
         } catch (...) {
             handler_status = {StatusCode::Internal,
-                              "handler raised non-std exception"};
+                              "transport: handler raised non-std exception"};
             spdlog::error(
                 "yuzu::transport: bidi handler raised non-std exception "
                 "in {}", method_cache_);
@@ -708,7 +708,7 @@ private:
             handler_status = handler(ctx, *req_msg, *resp_msg);
         } catch (const std::exception& e) {
             handler_status = {StatusCode::Internal,
-                              "handler raised exception"};
+                              "transport: handler raised exception"};
             spdlog::error(
                 "yuzu::transport: handler raised std::exception in {} — "
                 "type={} what={}", method, typeid(e).name(),
@@ -719,7 +719,7 @@ private:
             }
         } catch (...) {
             handler_status = {StatusCode::Internal,
-                              "handler raised non-std exception"};
+                              "transport: handler raised non-std exception"};
             spdlog::error(
                 "yuzu::transport: handler raised non-std exception in {}",
                 method);

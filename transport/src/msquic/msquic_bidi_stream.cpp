@@ -388,8 +388,15 @@ void MsquicBidiStream::cancel() {
     }
 }
 
-// ── debug:: probes (test-only) ───────────────────────────────────────────────
-
+// ── debug:: probes (test-only, gated by YUZU_TRANSPORT_TESTING) ──────────────
+//
+// Defined only when the test build sets YUZU_TRANSPORT_TESTING — see the
+// header for the rationale (cpp-SHOULD-3 / qe-SHOULD-2 / UP-9: production
+// builds must not export these symbols, or a malicious / buggy plugin
+// loaded into the same process could call
+// bidi_set_backpressure_thresholds(0,0) at runtime and disable
+// back-pressure entirely).
+#ifdef YUZU_TRANSPORT_TESTING
 namespace debug {
 
 std::uint64_t bidi_receive_disabled_count() {
@@ -419,5 +426,6 @@ void bidi_reset_backpressure_thresholds() {
 }
 
 }  // namespace debug
+#endif  // YUZU_TRANSPORT_TESTING
 
 }  // namespace yuzu::transport::msquic_backend

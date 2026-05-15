@@ -29,8 +29,11 @@
 #include <utility>
 #include <vector>
 
-#ifndef _WIN32
-#include <unistd.h>  // close, unlink
+#ifdef _WIN32
+#include <ws2tcpip.h>  // inet_ntop, INET6_ADDRSTRLEN
+#else
+#include <arpa/inet.h>  // inet_ntop, INET6_ADDRSTRLEN
+#include <unistd.h>     // close, unlink
 #endif
 
 #include <spdlog/spdlog.h>
@@ -163,33 +166,23 @@ QUIC_STATUS map_decoder_error_to_quic(StatusCode) noexcept {
     return QUIC_STATUS_ABORTED;
 }
 
-}  // namespace
-
-// inet_ntop / INET6_ADDRSTRLEN — Windows winsock vs POSIX. Out of the
-// anon namespace so the system headers do not pollute later TUs that
-// only saw the anon-namespace declarations.
-#ifdef _WIN32
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#endif
-
-namespace {
-
-// Format a QUIC_ADDR as "ip:port" for CallContext::peer_uri (the
-// `msquic://` scheme is added by the caller). IPv4 produces
-// "1.2.3.4:5678"; IPv6 produces "[abcd::1]:5678" — bracketed per RFC.
-// On formatting failure returns "?:0" so the call still completes.
+// Format a QUIC_ADDR as the parity-aligned peer_uri form. Cons-BLOCKING-2:
+// the gRPC backend's gctx.peer() yields strings like "ipv4:1.2.3.4:5678"
+// / "ipv6:[::1]:5678"; consumers (notably AgentServiceImpl peer_ip
+// extraction at agent_service_impl.cpp ~:268) parse on that prefix.
+// Match the gRPC format byte-for-byte so a future dual-stack deployment
+// does not silently break those consumers. On formatting failure returns
+// "?:0" so the call still completes.
 std::string format_quic_addr(const QUIC_ADDR& addr) {
     char     buf[INET6_ADDRSTRLEN] = {};
     uint16_t port                  = QuicAddrGetPort(&addr);
     if (QuicAddrGetFamily(&addr) == QUIC_ADDRESS_FAMILY_INET) {
         if (inet_ntop(AF_INET, &addr.Ipv4.sin_addr, buf, sizeof(buf))) {
-            return std::string(buf) + ":" + std::to_string(port);
+            return std::string("ipv4:") + buf + ":" + std::to_string(port);
         }
     } else if (QuicAddrGetFamily(&addr) == QUIC_ADDRESS_FAMILY_INET6) {
         if (inet_ntop(AF_INET6, &addr.Ipv6.sin6_addr, buf, sizeof(buf))) {
-            return "[" + std::string(buf) + "]:" + std::to_string(port);
+            return std::string("ipv6:[") + buf + "]:" + std::to_string(port);
         }
     }
     return "?:0";
@@ -227,9 +220,9 @@ bool send_frame(ServerStreamCall* call, std::string payload, bool fin) {
         delete sb;
         return false;
     }
-    if (auto& sink = call->listener->metric_sink(); sink) {
-        sink->on_bytes_sent("msquic", bytes);
-    }
+    safe_sink_invoke(call->listener->metric_sink(), [&](auto& s) {
+        s.on_bytes_sent("msquic", bytes);
+    });
     return true;
 }
 
@@ -281,24 +274,28 @@ void run_unary_handler(std::shared_ptr<ServerStreamCall> keep,
         try {
             status = call->unary_handler(call->ctx, *request, *response);
         } catch (const std::exception& e) {
+            // sec-MEDIUM-3 / cpp-SHOULD-4: scrub e.what() before it
+            // crosses spdlog's text-output surface. Wire-side scrub is
+            // already in send_trailing_status (static literal) — this
+            // closes the LOG-side parity gap with the gRPC backend.
             spdlog::error(
                 "yuzu::transport[msquic]: unary handler raised std::exception "
                 "— type={} what={}",
-                typeid(e).name(), e.what());
-            if (auto& sink = call->listener->metric_sink(); sink) {
-                sink->on_unexpected_dispatch_throw("msquic", call->method,
-                                                   "std_exception");
-            }
+                typeid(e).name(), sanitise_status_detail(e.what()));
+            safe_sink_invoke(call->listener->metric_sink(), [&](auto& s) {
+                s.on_unexpected_dispatch_throw("msquic", call->method,
+                                               "std_exception");
+            });
             status = Status{StatusCode::Internal,
                             "transport: handler raised exception"};
         } catch (...) {
             spdlog::error(
                 "yuzu::transport[msquic]: unary handler raised non-std "
                 "exception");
-            if (auto& sink = call->listener->metric_sink(); sink) {
-                sink->on_unexpected_dispatch_throw("msquic", call->method,
-                                                   "non_std_exception");
-            }
+            safe_sink_invoke(call->listener->metric_sink(), [&](auto& s) {
+                s.on_unexpected_dispatch_throw("msquic", call->method,
+                                               "non_std_exception");
+            });
             status = Status{StatusCode::Internal,
                             "transport: handler raised non-std exception"};
         }
@@ -343,16 +340,27 @@ void run_bidi_handler(std::shared_ptr<ServerStreamCall> keep,
         try {
             status = handler(ctx, bidi_stream);
         } catch (const std::exception& e) {
+            // sec-MEDIUM-3: scrub e.what() before spdlog (parity with
+            // unary path above). Also fire the dispatch_throw metric
+            // so bidi handler-throw observability matches unary.
             spdlog::error(
                 "yuzu::transport[msquic]: bidi handler raised std::exception "
                 "— type={} what={}",
-                typeid(e).name(), e.what());
+                typeid(e).name(), sanitise_status_detail(e.what()));
+            safe_sink_invoke(keep->listener->metric_sink(), [&](auto& s) {
+                s.on_unexpected_dispatch_throw("msquic", keep->method,
+                                               "std_exception");
+            });
             status = Status{StatusCode::Internal,
                             "transport: handler raised exception"};
         } catch (...) {
             spdlog::error(
                 "yuzu::transport[msquic]: bidi handler raised non-std "
                 "exception");
+            safe_sink_invoke(keep->listener->metric_sink(), [&](auto& s) {
+                s.on_unexpected_dispatch_throw("msquic", keep->method,
+                                               "non_std_exception");
+            });
             status = Status{StatusCode::Internal,
                             "transport: handler raised non-std exception"};
         }
@@ -382,9 +390,9 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                 total_bytes += ev->RECEIVE.Buffers[i].Length;
             }
             if (total_bytes != 0) {
-                if (auto& sink = call->listener->metric_sink(); sink) {
-                    sink->on_bytes_received("msquic", total_bytes);
-                }
+                safe_sink_invoke(call->listener->metric_sink(), [&](auto& s) {
+                    s.on_bytes_received("msquic", total_bytes);
+                });
             }
             for (uint32_t i = 0; i < ev->RECEIVE.BufferCount; ++i) {
                 const auto& b = ev->RECEIVE.Buffers[i];
@@ -451,8 +459,13 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                             call->connection,
                             QUIC_PARAM_CONN_REMOTE_ADDRESS, &size, &remote);
                         if (QUIC_SUCCEEDED(qs)) {
-                            call->ctx.peer_uri =
-                                "msquic://" + format_quic_addr(remote);
+                            // cons-BLOCKING-2: format_quic_addr produces
+                            // "ipv4:1.2.3.4:5678" / "ipv6:[::1]:5678" —
+                            // byte-for-byte parity with gRPC's
+                            // gctx.peer() so consumers like
+                            // AgentServiceImpl peer_ip extraction work
+                            // identically across backends.
+                            call->ctx.peer_uri = format_quic_addr(remote);
                         }
                     }
                     if (hello.deadline_unix_millis() != 0) {
@@ -565,8 +578,7 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                                 Status{StatusCode::Cancelled,
                                        "transport: stream closed"});
             }
-            if (auto& sink = listener->metric_sink();
-                sink && !call->method.empty()) {
+            if (!call->method.empty()) {
                 Status final_status;
                 if (call->bidi_state) {
                     std::lock_guard<std::mutex> lock(call->bidi_state->mtx);
@@ -574,7 +586,9 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                         final_status = call->bidi_state->final_status;
                     }
                 }
-                sink->on_stream_closed("msquic", call->method, final_status);
+                safe_sink_invoke(listener->metric_sink(), [&](auto& s) {
+                    s.on_stream_closed("msquic", call->method, final_status);
+                });
             }
             // Dropping the registry's shared_ptr; if a worker still holds
             // one the ServerStreamCall outlives this call until it
@@ -595,9 +609,9 @@ QUIC_STATUS QUIC_API msquic_conn_callback(HQUIC conn, void* ctx,
     const auto* api = MsQuicApi::instance().api();
     switch (ev->Type) {
         case QUIC_CONNECTION_EVENT_CONNECTED:
-            if (auto& sink = listener->metric_sink(); sink) {
-                sink->on_connection_opened("msquic");
-            }
+            safe_sink_invoke(listener->metric_sink(), [](auto& s) {
+                s.on_connection_opened("msquic");
+            });
             return QUIC_STATUS_SUCCESS;
 
         case QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED: {
@@ -620,12 +634,12 @@ QUIC_STATUS QUIC_API msquic_conn_callback(HQUIC conn, void* ctx,
             // removes the (now-stale) handle value from the registry and
             // wakes a draining shutdown(). After SHUTDOWN_COMPLETE msquic
             // delivers no further events for this connection.
-            if (auto& sink = listener->metric_sink(); sink) {
-                // Connection-final status is best-effort: msquic does not
-                // surface a peer-supplied close reason here in a portable
-                // way, so we report Ok unless the local listener failed.
-                sink->on_connection_closed("msquic", Status{});
-            }
+            // Connection-final status is best-effort: msquic does not
+            // surface a peer-supplied close reason here in a portable
+            // way, so we report Ok unless the local listener failed.
+            safe_sink_invoke(listener->metric_sink(), [](auto& s) {
+                s.on_connection_closed("msquic", Status{});
+            });
             api->ConnectionClose(conn);
             listener->untrack_connection(conn);
             return QUIC_STATUS_SUCCESS;
@@ -816,9 +830,9 @@ void MsquicServerListener::dispatch_stream_call(ServerStreamCall* call,
         call->response_factory = std::move(unary_reg.response_factory);
         call->unary_handler    = std::move(unary_reg.handler);
         call->phase            = ServerStreamCall::Phase::AwaitingRequest;
-        if (auto& sink = metric_sink(); sink) {
-            sink->on_stream_opened("msquic", call->method);
-        }
+        safe_sink_invoke(metric_sink(), [&](auto& s) {
+            s.on_stream_opened("msquic", call->method);
+        });
         return;
     }
     if (kind == Bidi) {
@@ -828,39 +842,42 @@ void MsquicServerListener::dispatch_stream_call(ServerStreamCall* call,
         call->bidi_state->stream  = call->stream;
         call->bidi_state->self    = call->bidi_state;
         call->phase               = ServerStreamCall::Phase::Bidi;
-        if (auto& sink = metric_sink(); sink) {
-            sink->on_stream_opened("msquic", call->method);
-        }
 
         // Bounded bidi-dispatcher pool (#376 PR 3 increment 7). Reject
         // the call BEFORE constructing the worker task / capturing
-        // `keep` if the cap is hit — the exact-string detail matches
-        // the gRPC backend so operators do not have to learn two
-        // strings.
+        // `keep` if the cap is hit. on_stream_opened fires only on the
+        // accept path so dashboards subtracting closed from opened
+        // produce a stable count (cons-SHOULD-1: gRPC backend never
+        // emits stream_opened on the saturation reject path either).
+        // sec-HIGH-1: ResourceExhausted matches the gRPC backend's
+        // saturation StatusCode so operators routing on `code` get
+        // identical results across backends.
         if (!try_accept_bidi_slot()) {
-            if (auto& sink = metric_sink(); sink) {
-                sink->on_bidi_pool_saturated("msquic", call->method);
-            }
+            safe_sink_invoke(metric_sink(), [&](auto& s) {
+                s.on_bidi_pool_saturated("msquic", call->method);
+            });
             feed_bidi_error(
                 *call->bidi_state,
-                Status{StatusCode::Unavailable,
+                Status{StatusCode::ResourceExhausted,
                        "transport: bidi dispatcher saturated"});
             send_trailing_status(
-                call, Status{StatusCode::Unavailable,
+                call, Status{StatusCode::ResourceExhausted,
                              "transport: bidi dispatcher saturated"});
             call->phase = ServerStreamCall::Phase::Done;
             return;
         }
-        if (auto& sink = metric_sink(); sink) {
-            sink->on_bidi_pool_in_flight_delta("msquic", +1);
-        }
+        // Slot accepted — emit stream_opened + delta(+1).
+        safe_sink_invoke(metric_sink(), [&](auto& s) {
+            s.on_stream_opened("msquic", call->method);
+            s.on_bidi_pool_in_flight_delta("msquic", +1);
+        });
 
         auto keep = call->self.lock();
         if (!keep) {
             release_bidi_slot();
-            if (auto& sink = metric_sink(); sink) {
-                sink->on_bidi_pool_in_flight_delta("msquic", -1);
-            }
+            safe_sink_invoke(metric_sink(), [](auto& s) {
+                s.on_bidi_pool_in_flight_delta("msquic", -1);
+            });
             call->phase = ServerStreamCall::Phase::Done;
             return;
         }
@@ -879,20 +896,32 @@ void MsquicServerListener::dispatch_stream_call(ServerStreamCall* call,
             [keep, bidi_state_for_worker, handler_copy,
              ctx_copy = std::move(ctx_copy), listener_ptr,
              sink_for_worker]() mutable {
+                // cpp-SHOULD-1 / UP-1: RAII slot guard so the in-flight
+                // gauge AND the slot counter are released even if
+                // run_bidi_handler / send_server_trailer_and_fin / the
+                // MsquicBidiStream dtor throws. Without this guard a
+                // future allocation failure inside the handler chain
+                // would pin bidi_in_flight_ above 0 forever.
+                struct SlotGuard {
+                    MsquicServerListener*                listener;
+                    std::shared_ptr<TransportMetricSink> sink;
+                    ~SlotGuard() {
+                        listener->release_bidi_slot();
+                        safe_sink_invoke(sink, [](auto& s) {
+                            s.on_bidi_pool_in_flight_delta("msquic", -1);
+                        });
+                    }
+                } slot_guard{listener_ptr, sink_for_worker};
                 run_bidi_handler(std::move(keep),
                                  std::move(bidi_state_for_worker),
                                  std::move(handler_copy),
                                  std::move(ctx_copy));
-                listener_ptr->release_bidi_slot();
-                if (sink_for_worker) {
-                    sink_for_worker->on_bidi_pool_in_flight_delta("msquic", -1);
-                }
             });
         if (!submitted) {
             release_bidi_slot();
-            if (auto& sink = metric_sink(); sink) {
-                sink->on_bidi_pool_in_flight_delta("msquic", -1);
-            }
+            safe_sink_invoke(metric_sink(), [](auto& s) {
+                s.on_bidi_pool_in_flight_delta("msquic", -1);
+            });
             // Pool gone — listener shutting down. Emit Unavailable on
             // the bidi state so any future read on the (yet to be
             // constructed) MsquicBidiStream sees a final status.
@@ -1019,9 +1048,9 @@ std::expected<void, Status> MsquicServerListener::start(
     // worker_pool_ above is the executor for both unary and bidi.
     bidi_pool_size_ = resolve_bidi_pool_size();
     bidi_in_flight_.store(0, std::memory_order_release);
-    if (opts.metric_sink) {
-        opts.metric_sink->on_bidi_pool_size("msquic", bidi_pool_size_);
-    }
+    safe_sink_invoke(opts.metric_sink, [this](auto& s) {
+        s.on_bidi_pool_size("msquic", bidi_pool_size_);
+    });
 
     st = api->ListenerOpen(api_handle.registration(), msquic_listener_callback,
                            this, &listener_);
@@ -1145,9 +1174,9 @@ void MsquicServerListener::shutdown() {
         configuration_ = nullptr;
     }
     // Pool gauge to 0 (#376 PR 3 increment 7). Mirrors gRPC backend.
-    if (auto& sink = metric_sink(); sink) {
-        sink->on_bidi_pool_size("msquic", 0);
-    }
+    safe_sink_invoke(metric_sink(), [](auto& s) {
+        s.on_bidi_pool_size("msquic", 0);
+    });
     bidi_pool_size_ = 0;
     bidi_in_flight_.store(0, std::memory_order_release);
     shutdown_cv_.notify_all();

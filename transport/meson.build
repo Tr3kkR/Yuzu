@@ -69,6 +69,25 @@ if transport_opt == 'msquic' or transport_opt == 'both'
   ]
   yuzu_transport_backend_deps += [msquic_dep]
   yuzu_transport_defines += ['-DYUZU_TRANSPORT_HAVE_MSQUIC']
+  # Windows: format_quic_addr in msquic_listener.cpp calls inet_ntop and
+  # make_quic_addr in msquic_internal_helpers.cpp calls inet_pton. Both
+  # resolve from ws2_32.dll. msquic's CMake config exports a transitive
+  # link to ws2_32 but pinning belt-and-braces eliminates one Windows-
+  # build failure mode (xp-SHOULD-2).
+  if host_machine.system() == 'windows'
+    cxx = meson.get_compiler('cpp')
+    yuzu_transport_backend_deps += [cxx.find_library('ws2_32', required: true)]
+  endif
+endif
+
+# YUZU_TRANSPORT_TESTING gates the msquic debug:: back-pressure probes
+# (cpp-SHOULD-3 / qe-SHOULD-2 / UP-9). Compile the library WITH the
+# probes when tests are enabled so the test exe can link them; OMIT
+# them in production builds so the symbols are not exported (a buggy
+# plugin in the same process cannot dlsym
+# bidi_set_backpressure_thresholds(0,0) to disable back-pressure).
+if get_option('build_tests')
+  yuzu_transport_defines += ['-DYUZU_TRANSPORT_TESTING']
 endif
 
 yuzu_transport_common_deps = [

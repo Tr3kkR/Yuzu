@@ -59,6 +59,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- **#376 PR 3 — msquic native-QUIC transport backend complete (incs 0-8).**
+  Full implementation of the `yuzu::transport::` interface over the
+  msquic C library: bidi streams (shared `MsquicBidiStream` over a
+  per-stream `BidiStreamState` with mutex+CV blocking bridge), receive
+  back-pressure (`StreamReceiveSetEnabled` high/low-water), per-call
+  deadlines (`HandshakeHello.deadline_unix_millis` + negative-clamp),
+  insecure-TLS posture gate (`YUZU_ALLOW_INSECURE_TLS=1` env opt-in,
+  mirrors the existing server-side gate), multi-ALPN, full
+  `TransportMetricSink` parity (conn/stream open+close, bytes_*,
+  on_unexpected_dispatch_throw, on_bidi_pool_*), bounded bidi-dispatcher
+  pool (resolve_bidi_pool_size = `clamp(64, hw*8, 4096)`,
+  `ResourceExhausted` "transport: bidi dispatcher saturated" reject —
+  gRPC backend's handler-throw detail strings updated to the same
+  "transport: ..." prefix for byte-for-byte parity), `peer_uri`
+  populated as `ipv4:host:port` / `ipv6:[host]:port` matching gRPC
+  `gctx.peer()`. **Backend remains dormant** — server/agent still
+  construct `Backend::Grpc`; no shipped behaviour change. Becomes
+  runtime-selectable in PR 5. Open follow-ups: **#1041** (singleton
+  teardown + IdleTimeoutMs configurability), **#1042** (full mTLS —
+  PEM->PKCS12, ClientCertMode::Require, peer_san_identities, CA-pinned
+  validation; pre-PR-5 hard gate), **#1025** (CI matrix coverage for
+  `-Dtransport=both`). Two governance rounds (8 gates, 13 review agents
+  + chaos analysis); BLOCKING/SHOULD folded into the hardening commit
+  before push (sec-HIGH-1 saturation status, cons-BLOCKING-1 string
+  parity, cons-BLOCKING-2 peer_uri scheme, sec-MEDIUM-3 sanitise
+  e.what(), UP-5 sink-throw try/catch, cpp-SHOULD-1 RAII slot guard,
+  cpp-SHOULD-3 debug:: probes gated behind `YUZU_TRANSPORT_TESTING`).
+  Test-only msquic back-pressure probes are NOT exported in production
+  builds.
+
 - **#376 PR 1c-6 — closes the PR 1c lift ladder.** Three pieces:
   (1) gateway `/readyz` checks grpcbox listeners (#896 third bullet, via
   `grpcbox_services_sup:services_sup_name/1` supervisor-atom probe).

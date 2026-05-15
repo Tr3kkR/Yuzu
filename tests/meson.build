@@ -247,6 +247,10 @@ if build_server
 endif
 
 # ── Transport unit tests (#376 PR 1+) ─────────────────────────────────────────
+# YUZU_TRANSPORT_TESTING gates the msquic debug:: probes (back-pressure
+# threshold overrides + counters). Defined ONLY for this test exe — the
+# production libyuzu_transport.a does NOT export these symbols
+# (cpp-SHOULD-3 / qe-SHOULD-2 / UP-9).
 transport_test_exe = executable(
   'yuzu_transport_tests',
   files(
@@ -257,6 +261,7 @@ transport_test_exe = executable(
   # The framing codec header lives in the msquic backend's private source
   # dir (it is backend-internal, not part of the public transport API).
   include_directories: include_directories('../transport/src/msquic'),
+  cpp_args: ['-DYUZU_TRANSPORT_TESTING'],
   # yuzu_proto_dep provides the link to libyuzu_proto.a so generated
   # symbols (HandshakeHello, TrailingStatus) resolve. yuzu_transport_dep
   # alone exposes only proto headers.

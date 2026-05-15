@@ -12,7 +12,7 @@ This document analyzes the capabilities of leading commercial endpoint-managemen
 |-----------|---------------|-------------|
 | **Language** | C# / .NET (server), proprietary scripting language (agent) | C++23 (server+agent), Erlang/OTP (gateway) |
 | **Agent Instruction Model** | proprietary scripting language (SQL + control flow) | Plugin ABI (C/C++ shared libraries) |
-| **Wire Protocol** | WebSocket Secure (TCP 4000) | gRPC/Protobuf with mTLS |
+| **Wire Protocol** | WebSocket Secure (TCP 4000) | gRPC/Protobuf with mTLS (default); native QUIC/TLS 1.3 (UDP 443) on roadmap — backend implementation merged (#376 PR 3, dormant), runtime-selectable in PR 5, default flip in PR 6 |
 | **Server Database** | SQL Server (multiple DBs) | SQLite (embedded, WAL mode) |
 | **Scaling Architecture** | Switches (50K devices each, 5 per stack) | Erlang/OTP gateway (10K+ tested) |
 | **Content Definition** | XML with XSD schema, digital signing | YAML with `yuzu.io/v1alpha1` DSL, Ed25519 signing |

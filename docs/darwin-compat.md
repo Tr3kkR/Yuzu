@@ -28,6 +28,7 @@ After **any** cross-platform change, always run `bash scripts/run-tests.sh all` 
 | Erlang rebar3 ct | Always pass `--dir apps/yuzu_gw/test` together with `--suite` flags. |
 | `curl -f` in tests | Do **not** use `-f` where 4xx is an acceptable response — it causes `|| echo "000"` fallbacks to contaminate the status code variable. |
 | `prometheus_httpd` | Use `start/0` with `application:set_env(prometheus, prometheus_http, [{port, P}, {path, "/metrics"}])` — `start/1` does not exist. Call `application:ensure_all_started(prometheus_httpd)` first so `prometheus_http_impl:setup/0` runs before the first scrape. |
+| msquic process exit | `~MsQuicApi` (`transport/src/msquic/msquic_internal_helpers.cpp`) **deliberately leaks** the registration + API table at process exit. `RegistrationClose` blocks the calling thread waiting for per-connection grace work to drain — observed to hang the transport meson test suite for the full 180 s timeout while the test cases themselves complete in <2 s. The OS reclaims everything on exit; long-lived production processes never destroy this singleton in normal operation. Do NOT "fix" the leak. Tracked as #1041. |
 
 ## Per-OS build directory
 
