@@ -234,7 +234,12 @@ if build_server
     # hardening round 1, qe-B2).
     dependencies: [yuzu_server_core_dep, catch2_dep, dependency('openssl', required: true, include_type: 'system')],
   )
-  test('server unit tests', server_test_exe, suite: 'server', timeout: 180)
+  # 600s: the server suite has grown to ~1200 test cases (#1032 added viz-engine
+  # coverage) and ASan instrumentation slows the full run past the previous
+  # 180s cap. TSan with halt_on_error usually exits earlier, but a sanitizer-
+  # instrumented full pass easily hits 4-5 min. A real hang is still bounded
+  # by the 60-min job-level timeout in nightly.yml.
+  test('server unit tests', server_test_exe, suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
