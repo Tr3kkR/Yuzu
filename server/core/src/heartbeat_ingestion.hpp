@@ -1,0 +1,69 @@
+#pragma once
+
+/**
+ * heartbeat_ingestion.hpp — shared ingestion pipeline for heartbeat payloads.
+ *
+ * #1000 / arch-S2: both AgentServiceImpl::Heartbeat (direct) and
+ * GatewayUpstreamServiceImpl::BatchHeartbeat (gateway-batch) perform the
+ * same fan-out of work for each accepted heartbeat:
+ *   • health_store_->upsert(agent_id, status_tags)
+ *   • yuzu_heartbeats_received_total{via=...}++
+ *   • optional fleet_snapshot.v1 parse + FleetTopologyStore::push_snapshot
+ *   • yuzu_viz_topology_pushed_total{via=...}++ / push_parse_errors_total++
+ *
+ * Three independent ingestion features have followed this pattern. The
+ * next will drift between the two paths in production unless the work
+ * lives behind one entry point. HeartbeatIngestion owns that entry point;
+ * each gRPC service is reduced to one call per heartbeat.
+ *
+ * The class holds non-owning pointers to the shared stores wired in
+ * server bring-up. The `via` label is the only per-call difference
+ * between the direct and gateway paths.
+ */
+
+#include <string>
+#include <string_view>
+
+namespace yuzu {
+class MetricsRegistry;
+}
+
+namespace yuzu::server {
+class FleetTopologyStore;
+}
+
+namespace yuzu::server::detail {
+class AgentRegistry;
+class AgentHealthStore;
+} // namespace yuzu::server::detail
+
+namespace yuzu::agent::v1 {
+class HeartbeatRequest;
+}
+
+namespace yuzu::server {
+
+class HeartbeatIngestion {
+public:
+    HeartbeatIngestion(detail::AgentRegistry& registry, detail::AgentHealthStore* health_store,
+                       FleetTopologyStore* fleet_topology_store, MetricsRegistry* metrics)
+        : registry_(registry), health_store_(health_store),
+          fleet_topology_store_(fleet_topology_store), metrics_(metrics) {}
+
+    HeartbeatIngestion(const HeartbeatIngestion&) = delete;
+    HeartbeatIngestion& operator=(const HeartbeatIngestion&) = delete;
+
+    /// Ingest one heartbeat. `agent_id` is the session-resolved agent id
+    /// (already validated by the caller). `via` is "direct" or "gateway"
+    /// — the only label that varies between the two ingestion paths.
+    void ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb, std::string_view agent_id,
+                std::string_view via);
+
+private:
+    detail::AgentRegistry& registry_;
+    detail::AgentHealthStore* health_store_;
+    FleetTopologyStore* fleet_topology_store_;
+    MetricsRegistry* metrics_;
+};
+
+} // namespace yuzu::server

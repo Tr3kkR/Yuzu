@@ -60,6 +60,8 @@ section is maintained manually; see `vcpkg.json` and
   HTMX (vendored) ....................... 0BSD
   htmx-ext-sse (vendored) ............... 0BSD
   Apache ECharts (vendored) ............. Apache-2.0
+  Three.js r168 (vendored) .............. MIT
+  Three.js OrbitControls (vendored) ..... MIT
   Inter typeface (vendored) ............. SIL OFL 1.1
 
 Before cutting the first AGPL-era release, run an SBOM / attribution

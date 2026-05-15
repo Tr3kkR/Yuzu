@@ -82,13 +82,14 @@ run_erlang_unit() {
         return
     fi
 
-    cd "$GATEWAY_DIR"
     echo "  Running EUnit tests..."
-    # rebar3 3.27 auto-discovery rejects test modules without a 1:1 src/
-    # counterpart (e.g., yuzu_gw_circuit_breaker_tests has no
-    # yuzu_gw_circuit_breaker.erl). Pass --dir to scan the test/ directory
-    # directly instead.
-    if rebar3 eunit --dir=apps/yuzu_gw/test 2>&1 | tail -20; then
+    # eunit-gate.sh wraps rebar3 eunit so the script's exit code reflects
+    # the EUnit summary (Failed: N), not rebar3's process-exit-on-cancel
+    # behavior. Cancellations come from EUnit discovering non-test helper
+    # modules and from order-dependent registry_tests flakes — they're
+    # not regressions worth gating on. See scripts/test/eunit-gate.sh for
+    # the full rationale (#1005).
+    if bash "$PROJECT_ROOT/scripts/test/eunit-gate.sh" 2>&1 | tail -20; then
         pass "Erlang EUnit tests"
     else
         fail "Erlang EUnit tests"
@@ -107,7 +108,10 @@ run_erlang_ct() {
 
     cd "$GATEWAY_DIR"
 
-    CT_DIR="apps/yuzu_gw/test"
+    # #1005: CT *_SUITE.erl files live in test/ct/ (separate from
+    # *_tests.erl in test/) so EUnit's dir-scan no longer discovers
+    # them and emits "tests were cancelled" trailers that fail the gate.
+    CT_DIR="apps/yuzu_gw/test/ct"
 
     # E2E suite
     echo "  Running e2e suite..."

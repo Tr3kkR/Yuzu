@@ -1089,6 +1089,16 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # TRIPLET is the vcpkg triplet baked into the Dockerfile for
+          # vcpkg install + meson configure. The Dockerfile defaults to
+          # `x64-linux`, but pinning explicitly here is QE-R2-02 follow-up
+          # from feat/viz-engine governance round 2: when arm64 publishing
+          # lands the matrix will need to set this per-row, and the
+          # explicit build-arg becomes load-bearing rather than aspirational.
+          # Dockerfile.gateway does not consume TRIPLET (rebar3 path); the
+          # build-arg is still safe -- unused build-args are ignored.
+          build-args: |
+            TRIPLET=x64-linux
           # Registry cache lives in GHCR itself under a :buildcache tag.
           # mode=max caches intermediate layers too (best hit rate).
           cache-from: type=local,src=/mnt/d/docker-buildcache/${{ matrix.image }}

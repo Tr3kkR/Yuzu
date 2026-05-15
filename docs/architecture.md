@@ -214,6 +214,81 @@ Agent                           Server                        External
 
 **Why design for ClickHouse/Splunk?** Endpoint management platforms generate massive volumes of structured data (inventory, command responses, compliance events). ClickHouse excels at columnar analytics over this data. Splunk excels at correlation and search. By using typed schemas, consistent timestamps, and structured JSON events, Yuzu data is immediately useful in these systems without ETL transformation.
 
+### 7. Fleet Visualization (3D)
+
+```
+Operator                     Server                                  Agent
+   │                           │                                       │
+   │── GET /viz/fleet ────────►│  Auth gate; emit static HTML shell    │
+   │   (browser)               │  (Cache-Control: no-cache, no-store)  │
+   │                           │                                       │
+   │◄── HTML shell ────────────│  importmap → /static/three.module.min.js
+   │                           │             /static/three-orbit-controls.js
+   │                           │             /static/yuzu-viz.js (renderer)
+   │                           │                                       │
+   │── GET /api/v1/viz/fleet/topology
+   │   (or /fragments/...)     │                                       │
+   │                           ├── Kill switch (--viz-disable)?  503   │
+   │                           ├── Store null?                   503   │
+   │                           ├── RBAC (Response.Read)?         403   │
+   │                           ├── Parse params (machines_max,         │
+   │                           │   include_vuln, fresh)                │
+   │                           ├── FleetTopologyStore::get(...)        │
+   │                           │     ├── cache hit (5 s TTL) → return  │
+   │                           │     └── miss → single-flight refill:  │
+   │                           │           dispatch tar.fleet_snapshot │
+   │                           │           via fetcher seam            │
+   │                           │                                       │
+   │                           │── tar.fleet_snapshot ────────────────►│
+   │                           │   (CommandRequest, fan-out per agent) │
+   │                           │                                       ├── Collect
+   │                           │                                       │   processes,
+   │                           │                                       │   connections,
+   │                           │                                       │   local_ips
+   │                           │◄── CommandResponse (per agent) ───────│
+   │                           │                                       │
+   │                           ├── ResponseStore correlation by command_id
+   │                           ├── 5 s aggregation timeout (partial OK)
+   │                           ├── Categorise processes (Database / Browser /
+   │                           │   Web / Runtime / System / Other) via
+   │                           │   process_category.hpp heuristics
+   │                           ├── Resolve cross-machine connections by
+   │                           │   matching remote_addr against the
+   │                           │   union of every agent's local_ips
+   │                           ├── machines_max cap (default 5000,
+   │                           │   ceiling 100000) — over cap → 413
+   │                           ├── Audit emit (viz.fleet_topology +
+   │                           │   viz.fleet_topology.invalidate when
+   │                           │   ?fresh=1)
+   │                           │
+   │◄── JSON envelope ─────────│  fleet_topology.v1 — agents[], processes[],
+   │   (or <script>-wrapped    │  connections[], categorisation, vuln overlay
+   │    fragment)              │  if ?include_vuln=1
+   │
+   │── render() ───────────────┐
+   │   (renderer module)       │  WebGLRenderer + OrbitControls camera +
+   │                           │  WASD pan; machine cubes (one per agent,
+   │                           │  deterministic FNV-1a grid, per-OS
+   │                           │  palette) + Sprite hostname labels +
+   │                           │  Raycaster hover tooltip; PR-7+ adds
+   │                           │  process nodes, connection edges, vuln
+   │                           │  overlays.
+```
+
+**Why a separate page route + REST surface?** Dashboard parity (agentic-first invariant A1) means every dashboard action must have a REST equivalent. The page (`/viz/fleet`) is the HTML shell + static asset bundle that browsers load; the REST endpoints (`/api/v1/viz/fleet/topology` and the `/fragments/...` companion) are what the renderer (and any LLM client / automation) actually call for data. Both go through the same `FleetTopologyStore`, the same kill-switch, RBAC, and audit gates.
+
+**Why store-side categorisation?** The TAR (Telemetry, Acquisition, Response) plugin on each agent ships a flat process list with `cmdline` and `path`. Categorising client-side would mean every browser holds its own copy of the heuristics; doing it on the server lets the JSON envelope carry a single canonical category per process and lets the rules evolve without a renderer roll-out.
+
+**Why a single-flight cache?** A topology fetch fans out to every agent in scope, so concurrent operator requests would otherwise dispatch N parallel `tar.fleet_snapshot` storms. The store coalesces concurrent misses onto one refill goroutine; in-flight waiters block on a condition variable up to a bounded timeout; subsequent gets within the 5 s TTL hit the cache.
+
+**Why ES modules + importmap rather than UMD?** Three.js dropped UMD in r150+ — modern releases only publish `three.module.min.js`. The page declares an importmap mapping the bare specifier `"three"` to the vendored bundle, so OrbitControls' own `import { ... } from 'three'` resolves through the same map without a build-time bundler. Browser support floor: Chrome 89 / Firefox 108 / Safari 16.4 (importmap), all comfortably below the dashboard's existing baseline.
+
+**Why a kill switch?** WebGL has a much larger attack surface than HTML, the renderer module is large (~6 KB hand-written + ~717 KB vendored), and the data path fans out to every agent. Operators who never use the feature should be able to disable it cleanly. `--viz-disable` (or `YUZU_VIZ_DISABLE=1`) makes both the page and the REST surface return 503 with an audit row, ahead of any RBAC check (tier-before-permission per `docs/auth-architecture.md` §3).
+
+**Static-asset packaging.** The renderer was Pattern-A (hand-written `yuzu_viz_js_bundle.cpp`) through PR 5; at PR 6 the bundle exceeded MSVC's 16,380-byte raw-string-literal limit (C2026), and the renderer source migrated to `server/core/static/yuzu-viz.js` with `embed_js.py` codegen (Pattern B), matching the Three.js and OrbitControls pattern. The page HTML remains a Pattern-A hand-written TU (`viz_page_ui.cpp`). Vendored Three.js core and OrbitControls are Pattern-B over `vendor/three.module.min.js` and `vendor/three-orbit-controls.js`. See `docs/cpp-conventions.md` "Static-asset translation units" for when to use each pattern; `static/` houses our authoritative assets, `vendor/` houses upstream drops.
+
+**Extension seam.** PR 6 filled the renderer's `mount() → buildScene()` callouts with machine cubes + Sprite hostname labels + Raycaster hover tooltip. PR 7+ fills the same seam with process nodes (interior of the cube), edges (intra-machine + cross-machine), and a vulnerability overlay when `?include_vuln=1`. The store, REST surface, audit, and kill switch are stable; renderer ships incrementally without further surface changes.
+
 ## Storage Architecture
 
 | Component | Backend | Purpose |
@@ -225,6 +300,8 @@ Agent                           Server                        External
 | Server config | Config files (`.cfg`) | Users, tokens, enrollment, settings |
 | NVD/CVE data | SQLite | Vulnerability database |
 | Policy state | SQLite | Rule evaluation history, compliance |
+| Threat-graph recommendations *(proposed, §28.9)* | SQLite (`recommendations.db`) | Agentic-AI-produced hardening suggestions awaiting operator accept/dismiss/apply |
+| VirusTotal hash cache *(proposed, §28.8)* | SQLite (`virustotal_cache.db`) | Rate-limited hash→verdict cache; 7-day TTL; keyed on SHA-256 |
 
 **Why SQLite everywhere?** Zero configuration, single-file deployment, fast reads, supports concurrent readers with WAL mode. For the agent (which must be lightweight), SQLite adds ~600KB to the binary and requires no external database. For the server, SQLite scales to millions of rows per shard. If the server outgrows SQLite, the storage layer can be swapped to PostgreSQL with minimal code change — the query patterns are simple (insert, filter, paginate).
 

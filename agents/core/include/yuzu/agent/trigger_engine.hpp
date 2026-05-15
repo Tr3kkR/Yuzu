@@ -8,7 +8,9 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -17,11 +19,11 @@ namespace yuzu::agent {
 // ── Trigger types ────────────────────────────────────────────────────────────
 
 enum class TriggerType {
-    Interval,       // Fires on a time interval (e.g., every 300 seconds)
-    FileChange,     // Fires when a file/directory mtime changes
-    ServiceStatus,  // Fires when a service state matches expected_status
-    AgentStartup,   // Fires once when the agent starts
-    RegistryChange  // Fires when a Windows registry key changes (Windows-only)
+    Interval,      // Fires on a time interval (e.g., every 300 seconds)
+    FileChange,    // Fires when a file/directory mtime changes
+    ServiceStatus, // Fires when a service state matches expected_status
+    AgentStartup,  // Fires once when the agent starts
+    RegistryChange // Fires when a Windows registry key changes (Windows-only)
 };
 
 /// Convert a TriggerType to its string representation.
@@ -59,23 +61,43 @@ enum class TriggerType {
 // ── Trigger configuration ────────────────────────────────────────────────────
 
 struct TriggerConfig {
-    std::string id;    // unique trigger ID
+    std::string id; // unique trigger ID
     TriggerType type;
-    std::string plugin;  // plugin to invoke when triggered
-    std::string action;  // action to invoke when triggered
+    std::string plugin;                            // plugin to invoke when triggered
+    std::string action;                            // action to invoke when triggered
     std::map<std::string, std::string> parameters; // params passed to the plugin
 
     // Type-specific configuration
-    int interval_seconds = 0;     // for Interval triggers (minimum 30)
-    std::string watch_path;       // for FileChange triggers (file or directory)
-    std::string service_name;     // for ServiceStatus triggers
-    std::string expected_status;  // for ServiceStatus triggers (e.g. "stopped", "running")
-    std::string registry_hive;    // for RegistryChange triggers (e.g. "HKLM", "HKCU")
-    std::string registry_key;     // for RegistryChange triggers (key path to watch)
+    int interval_seconds = 0;    // for Interval triggers (minimum 30)
+    std::string watch_path;      // for FileChange triggers (file or directory)
+    std::string service_name;    // for ServiceStatus triggers
+    std::string expected_status; // for ServiceStatus triggers (e.g. "stopped", "running")
+    std::string registry_hive;   // for RegistryChange triggers (e.g. "HKLM", "HKCU")
+    std::string registry_key;    // for RegistryChange triggers (key path to watch)
 
     // Debounce
     int debounce_seconds = 0; // suppress re-fires within this window (0 = no debounce)
 };
+
+/**
+ * Parse a plugin-supplied trigger registration into a TriggerConfig.
+ *
+ * Plugins register triggers across the C ABI by passing a `trigger_id`, a
+ * `trigger_type` string, and a JSON `config_json` blob (the shape the SDK's
+ * `Plugin::register_trigger` forwards). This is the single parse point that
+ * turns that wire form into a typed TriggerConfig the engine accepts.
+ *
+ * Returns std::nullopt when the JSON is malformed, or when the resulting
+ * trigger could never dispatch (empty `plugin` or `action`) — a useless
+ * trigger is a registration bug, not something to silently keep.
+ *
+ * Recognised config_json keys: `plugin`, `action`, `interval_seconds`,
+ * `watch_path`, `service_name`, `expected_status`, `registry_hive`,
+ * `registry_key`, `debounce_seconds`, and an optional `parameters` object
+ * (string values forwarded verbatim; non-string values are JSON-dumped).
+ */
+[[nodiscard]] YUZU_EXPORT std::optional<TriggerConfig>
+parse_trigger_config(std::string_view id, std::string_view type, std::string_view config_json);
 
 // ── Trigger engine ───────────────────────────────────────────────────────────
 
@@ -94,8 +116,7 @@ public:
     static constexpr size_t kDefaultMaxTriggers = 2000;
 
     /// Callback type for dispatching triggered actions.
-    using DispatchFn = std::function<void(const std::string& plugin,
-                                          const std::string& action,
+    using DispatchFn = std::function<void(const std::string& plugin, const std::string& action,
                                           const std::map<std::string, std::string>& params)>;
 
     TriggerEngine();

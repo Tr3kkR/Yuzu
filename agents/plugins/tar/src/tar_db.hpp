@@ -27,13 +27,13 @@ struct sqlite3; // Forward declaration
 namespace yuzu::tar {
 
 struct TarEvent {
-    int64_t id{0};              // row id (0 for new events)
-    int64_t timestamp{0};       // epoch seconds
-    std::string event_type;     // process, network, service, user
-    std::string event_action;   // started, stopped, connected, disconnected, state_changed,
-                                // login, logout
-    std::string detail_json;    // JSON object with type-specific details
-    int64_t snapshot_id{0};     // groups events from same collection cycle
+    int64_t id{0};            // row id (0 for new events)
+    int64_t timestamp{0};     // epoch seconds
+    std::string event_type;   // process, network, service, user
+    std::string event_action; // started, stopped, connected, disconnected, state_changed,
+                              // login, logout
+    std::string detail_json;  // JSON object with type-specific details
+    int64_t snapshot_id{0};   // groups events from same collection cycle
 };
 
 // ── Typed event structs for warehouse tables ────────────────────────────────
@@ -41,7 +41,7 @@ struct TarEvent {
 struct ProcessEvent {
     int64_t ts{0};
     int64_t snapshot_id{0};
-    std::string action;   // started, stopped
+    std::string action; // started, stopped
     uint32_t pid{0};
     uint32_t ppid{0};
     std::string name;
@@ -52,7 +52,7 @@ struct ProcessEvent {
 struct NetworkEvent {
     int64_t ts{0};
     int64_t snapshot_id{0};
-    std::string action;       // connected, disconnected
+    std::string action; // connected, disconnected
     std::string proto;
     std::string local_addr;
     int local_port{0};
@@ -67,7 +67,7 @@ struct NetworkEvent {
 struct ServiceEvent {
     int64_t ts{0};
     int64_t snapshot_id{0};
-    std::string action;           // started, stopped, state_changed
+    std::string action; // started, stopped, state_changed
     std::string name;
     std::string display_name;
     std::string status;
@@ -79,7 +79,7 @@ struct ServiceEvent {
 struct UserEvent {
     int64_t ts{0};
     int64_t snapshot_id{0};
-    std::string action;   // login, logout
+    std::string action; // login, logout
     std::string user;
     std::string domain;
     std::string logon_type;
@@ -90,7 +90,7 @@ struct UserEvent {
 using QueryRow = std::vector<std::string>;
 
 struct QueryResult {
-    std::vector<std::string> columns;  // column names
+    std::vector<std::string> columns; // column names
     std::vector<QueryRow> rows;
 };
 
@@ -165,6 +165,22 @@ public:
     bool insert_service_events(const std::vector<ServiceEvent>& events);
     bool insert_user_events(const std::vector<UserEvent>& events);
 
+    /**
+     * Return one row per unique (proto, local_addr, local_port, remote_addr,
+     * remote_port, pid) ESTABLISHED connection observed at or after
+     * `since_ts`. Each row's `ts` is set to MAX(ts) across observations of
+     * that 5-tuple — i.e. the most recent time TAR saw the connection. Used
+     * by `tar.fleet_snapshot` to widen the per-host viz from "currently
+     * established at sample time" to "established within the rolling
+     * window", so the viz draws blue tubes for connections that have
+     * existed recently even if they're closed at the moment of the call.
+     *
+     * LISTEN / TIME_WAIT / CLOSE_WAIT / etc. are filtered out — they aren't
+     * "this box talks to that box" edges.
+     */
+    std::expected<std::vector<NetworkEvent>, std::string>
+    query_recent_tcp_connections(int64_t since_ts);
+
     // ── Generic SQL execution (for warehouse queries and aggregation) ────────
 
     /**
@@ -174,7 +190,7 @@ public:
      * Enforces a maximum row limit to prevent agent DoS.
      */
     std::expected<QueryResult, std::string> execute_query(const std::string& sql,
-                                                           int max_rows = 10000);
+                                                          int max_rows = 10000);
 
     /**
      * Execute arbitrary DDL/DML SQL (for rollup inserts, retention deletes).

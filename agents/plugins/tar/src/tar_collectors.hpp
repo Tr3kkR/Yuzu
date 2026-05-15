@@ -31,15 +31,20 @@ namespace yuzu::tar {
 // ── Collector data types ─────────────────────────────────────────────────────
 
 struct NetConnection {
-    std::string proto;        // tcp, tcp6, udp, udp6
+    std::string proto; // tcp, tcp6, udp, udp6
     std::string local_addr;
     std::string remote_addr;
-    std::string remote_host;  // reverse-DNS of remote_addr (resolved at collection time)
+    std::string remote_host; // reverse-DNS of remote_addr (resolved at collection time)
     int local_port{0};
     int remote_port{0};
-    std::string state;        // ESTABLISHED, LISTEN, etc.
+    std::string state; // ESTABLISHED, LISTEN, etc.
     uint32_t pid{0};
     std::string process_name;
+    // 0 = currently observed in /proc (live). >0 = observed in the TAR
+    // warehouse N seconds ago; renderer can fade tubes older than live.
+    // Wire-schema-gated emission: omitted when zero so old consumers and
+    // pre-PR-9-pre snapshots stay byte-compatible (schema_minor 1 -> 2).
+    int64_t last_seen_seconds_ago{0};
 };
 
 struct ServiceInfo {
@@ -52,7 +57,7 @@ struct ServiceInfo {
 struct UserSession {
     std::string user;
     std::string domain;
-    std::string logon_type;   // interactive, remote, service
+    std::string logon_type; // interactive, remote, service
     std::string session_id;
 };
 
@@ -110,8 +115,7 @@ inline const std::vector<std::string> kDefaultRedactionPatterns = {
  */
 std::vector<TarEvent> compute_process_diff(
     const std::vector<yuzu::agent::ProcessInfo>& previous,
-    const std::vector<yuzu::agent::ProcessInfo>& current,
-    int64_t timestamp, int64_t snapshot_id,
+    const std::vector<yuzu::agent::ProcessInfo>& current, int64_t timestamp, int64_t snapshot_id,
     const std::vector<std::string>& redaction_patterns = kDefaultRedactionPatterns);
 
 /**
@@ -119,10 +123,9 @@ std::vector<TarEvent> compute_process_diff(
  * Key: proto + local_addr + local_port + remote_addr + remote_port.
  * Detects new connections (connected) and closed connections (disconnected).
  */
-std::vector<TarEvent> compute_network_diff(
-    const std::vector<NetConnection>& previous,
-    const std::vector<NetConnection>& current,
-    int64_t timestamp, int64_t snapshot_id);
+std::vector<TarEvent> compute_network_diff(const std::vector<NetConnection>& previous,
+                                           const std::vector<NetConnection>& current,
+                                           int64_t timestamp, int64_t snapshot_id);
 
 /**
  * Compute service diff.
@@ -130,42 +133,36 @@ std::vector<TarEvent> compute_network_diff(
  * Detects service births (started), deaths (stopped), and state changes
  * (status or startup_type changed).
  */
-std::vector<TarEvent> compute_service_diff(
-    const std::vector<ServiceInfo>& previous,
-    const std::vector<ServiceInfo>& current,
-    int64_t timestamp, int64_t snapshot_id);
+std::vector<TarEvent> compute_service_diff(const std::vector<ServiceInfo>& previous,
+                                           const std::vector<ServiceInfo>& current,
+                                           int64_t timestamp, int64_t snapshot_id);
 
 /**
  * Compute user session diff.
  * Key: user + session_id.
  * Detects logins (login) and logouts (logout).
  */
-std::vector<TarEvent> compute_user_diff(
-    const std::vector<UserSession>& previous,
-    const std::vector<UserSession>& current,
-    int64_t timestamp, int64_t snapshot_id);
+std::vector<TarEvent> compute_user_diff(const std::vector<UserSession>& previous,
+                                        const std::vector<UserSession>& current, int64_t timestamp,
+                                        int64_t snapshot_id);
 
 // ── Typed event diff functions (for warehouse live tables) ──────────────────
 
 std::vector<ProcessEvent> compute_process_events(
     const std::vector<yuzu::agent::ProcessInfo>& previous,
-    const std::vector<yuzu::agent::ProcessInfo>& current,
-    int64_t timestamp, int64_t snapshot_id,
+    const std::vector<yuzu::agent::ProcessInfo>& current, int64_t timestamp, int64_t snapshot_id,
     const std::vector<std::string>& redaction_patterns = kDefaultRedactionPatterns);
 
-std::vector<NetworkEvent> compute_network_events(
-    const std::vector<NetConnection>& previous,
-    const std::vector<NetConnection>& current,
-    int64_t timestamp, int64_t snapshot_id);
+std::vector<NetworkEvent> compute_network_events(const std::vector<NetConnection>& previous,
+                                                 const std::vector<NetConnection>& current,
+                                                 int64_t timestamp, int64_t snapshot_id);
 
-std::vector<ServiceEvent> compute_service_events(
-    const std::vector<ServiceInfo>& previous,
-    const std::vector<ServiceInfo>& current,
-    int64_t timestamp, int64_t snapshot_id);
+std::vector<ServiceEvent> compute_service_events(const std::vector<ServiceInfo>& previous,
+                                                 const std::vector<ServiceInfo>& current,
+                                                 int64_t timestamp, int64_t snapshot_id);
 
-std::vector<UserEvent> compute_user_events(
-    const std::vector<UserSession>& previous,
-    const std::vector<UserSession>& current,
-    int64_t timestamp, int64_t snapshot_id);
+std::vector<UserEvent> compute_user_events(const std::vector<UserSession>& previous,
+                                           const std::vector<UserSession>& current,
+                                           int64_t timestamp, int64_t snapshot_id);
 
 } // namespace yuzu::tar

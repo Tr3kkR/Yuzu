@@ -65,6 +65,90 @@ echarts_embed = custom_target(
   ],
 )
 
+# Build-time embed of vendored Three.js r168 + OrbitControls (PR 4 of
+# feat/viz-engine ladder). Same chunked-raw-string pattern as ECharts;
+# fragment loader in PR 5 wires `<script type="importmap">` so the
+# OrbitControls module's `import ... from 'three'` resolves to the
+# vendored file. We ship the ES-module form rather than UMD because
+# Three.js dropped UMD in r150+ -- modern releases only publish
+# `three.module.min.js`. Symbols: kThreeJs (~685 KB), kThreeOrbitControlsJs (~32 KB).
+three_embed = custom_target(
+  'three_js_bundle',
+  input: 'vendor/three.module.min.js',
+  output: 'three_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'ThreeJs',
+  ],
+)
+
+three_orbit_embed = custom_target(
+  'three_orbit_controls_js_bundle',
+  input: 'vendor/three-orbit-controls.js',
+  output: 'three_orbit_controls_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'ThreeOrbitControlsJs',
+  ],
+)
+
+# Build-time embed of the Yuzu fleet-viz renderer module (PR 5 + PR 6 of
+# feat/viz-engine ladder). Hand-written before PR 6 (~10 KB) when it fit
+# under MSVC's 16,380-byte raw-string-literal limit; PR 6 took the bundle
+# past that limit, so we now codegen via embed_js.py like ECharts and
+# Three.js. Symbol: kYuzuVizJs (std::string).
+yuzu_viz_js_embed = custom_target(
+  'yuzu_viz_js_bundle',
+  input: 'static/yuzu-viz.js',
+  output: 'yuzu_viz_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuVizJs',
+  ],
+)
+
+# PR 9-pre: per-host renderer module + vendored Cytoscape.js 3.33.3 (MIT).
+# Cytoscape ships as ESM minified (cytoscape.esm.min.mjs from the npm
+# tarball) so the importmap entry in viz_host_page_ui.cpp can resolve
+# `import cytoscape from "cytoscape"`. The renderer uses cytoscape's
+# built-in `cose` force-directed layout — no layout extension is vendored
+# (the faster `fcose` is a UMD bundle with an external cose-base
+# dependency that doesn't resolve cleanly against an ESM importmap).
+yuzu_viz_host_js_embed = custom_target(
+  'yuzu_viz_host_js_bundle',
+  input: 'static/yuzu-viz-host.js',
+  output: 'yuzu_viz_host_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'YuzuVizHostJs',
+  ],
+)
+
+cytoscape_js_embed = custom_target(
+  'cytoscape_js_bundle',
+  input: 'static/cytoscape.min.js',
+  output: 'cytoscape_js_bundle.cpp',
+  command: [
+    find_program('python3', 'python'),
+    files('scripts/embed_js.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'CytoscapeJs',
+  ],
+)
+
 # Build-time embed of the Yuzu Design System CSS bundle. The source
 # kYuzuCss exceeded MSVC's 16,380-byte raw-string-literal limit (C2026)
 # after the design-token expansion. Chunking into ~14 KB
@@ -135,7 +219,9 @@ content_embed = custom_target(
 
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
-  [echarts_embed, yuzu_css_embed, inter_embed, content_embed,
+  [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
+   yuzu_viz_host_js_embed, cytoscape_js_embed,
+   yuzu_css_embed, inter_embed, content_embed,
   files(
     'src/server.cpp',
     'src/agent_registry.cpp',
@@ -167,6 +253,8 @@ yuzu_server_core_lib = static_library(
     'src/instruction_store.cpp',
     'src/execution_tracker.cpp',
     'src/execution_event_bus.cpp',
+    'src/fleet_topology_store.cpp',
+    'src/heartbeat_ingestion.cpp',
     'src/approval_manager.cpp',
     'src/schedule_engine.cpp',
     'src/help_ui.cpp',
@@ -194,6 +282,9 @@ yuzu_server_core_lib = static_library(
     'src/webhook_routes.cpp',
     'src/offload_routes.cpp',
     'src/discovery_routes.cpp',
+    'src/viz_routes.cpp',
+    'src/viz_page_ui.cpp',
+    'src/viz_host_page_ui.cpp',
     'src/compliance_ui.cpp',
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',
