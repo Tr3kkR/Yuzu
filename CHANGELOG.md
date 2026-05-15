@@ -548,6 +548,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ConcurrencyManager::try_acquire`: data race + cross-thread count
+  corruption on `sqlite3_changes()`.** The post-`sqlite3_step()` call to
+  `sqlite3_changes(db_)` read `db->nChange` without the per-connection
+  mutex. `SQLITE_OPEN_FULLMUTEX` serialises individual SQLite API calls
+  but not the `step → changes` pair, so a concurrent `step()` on the same
+  connection both data-raced the read (TSan-flagged) and could corrupt
+  the observed change count — a caller could see another thread's row
+  count and either let an execution past the cap or reject one that
+  should have been admitted. Fixed by adding a `RETURNING 1` clause to
+  the conditional INSERT so "was a row inserted?" is the result of
+  stepping that single atomic statement; `sqlite3_changes()` is no
+  longer called. Honours the `dbbe01f` (#330) design intent ("one atomic
+  statement, no app mutex"). The same `step + changes` anti-pattern
+  exists across 24 other store sites; tracked separately as #1033.
+  Also fixes `tests/unit/test_kv_store.cpp`: `REQUIRE`/`CHECK` calls
+  from worker threads wrote Catch2's process-global
+  `g_lastKnownLineInfo` non-atomically (TSan-flagged as #918). Workers
+  now record into `std::atomic<bool>`; assertions run on the main
+  thread after join. Closes #949's ConcurrencyManager half and #918's
+  kv_store instance.
 - **Executions drawer: dashboard "Fan-out" cell stuck at "0/0 of N".**
   `ExecutionTracker::update_agent_status` wrote to `agent_exec_status`
   and published `agent-transition` SSE events but never invoked
