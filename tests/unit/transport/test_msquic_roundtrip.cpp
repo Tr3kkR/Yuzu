@@ -1098,6 +1098,121 @@ TEST_CASE("msquic bidi dispatcher rejects beyond the configured pool cap",
     REQUIRE(minus == 2);
 }
 
+// ── Parity sweep + lifecycle hardening (#376 PR 3 increment 8) ───────────────
+
+TEST_CASE("msquic CallContext exposes peer_uri and HandshakeHello metadata to handler",
+          "[transport][msquic][round-trip][parity]") {
+    // qe-S8a: handler observes a populated peer_uri (msquic://ip:port)
+    // and the per-call metadata the client placed on CallContext.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    std::string captured_peer_uri;
+    std::map<std::string, std::string> captured_metadata;
+    std::mutex capture_mtx;
+
+    auto handler = [&](const CallContext& ctx, const SerializableMessage&,
+                       SerializableMessage& resp) -> Status {
+        {
+            std::lock_guard<std::mutex> lock(capture_mtx);
+            captured_peer_uri = ctx.peer_uri;
+            captured_metadata = ctx.metadata;
+        }
+        static_cast<StringMessage&>(resp).set_data("ok");
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Probe", string_factory, string_factory, handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    StringMessage req("x"), resp;
+    CallContext ctx;
+    ctx.metadata["x-yuzu-trace"] = "abc-123";
+    ctx.metadata["x-yuzu-tenant"] = "acme";
+    auto r = ch->unary("yuzu.test.v1.Echo/Probe", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::Ok);
+
+    {
+        std::lock_guard<std::mutex> lock(capture_mtx);
+        REQUIRE(captured_peer_uri.starts_with("msquic://"));
+        REQUIRE(captured_metadata["x-yuzu-trace"] == "abc-123");
+        REQUIRE(captured_metadata["x-yuzu-tenant"] == "acme");
+    }
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic Status::detail is sanitised at the wire boundary",
+          "[transport][msquic][round-trip][parity][security]") {
+    // qe-S8b: an attacker-supplied byte string in handler-returned
+    // Status::detail must be scrubbed by sanitise_status_detail before
+    // crossing the wire — control characters, embedded NULs and other
+    // non-printables are replaced with '?', preventing log-injection /
+    // header-smuggling style attacks at the trailing-status surface.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, const SerializableMessage&,
+                      SerializableMessage&) -> Status {
+        std::string evil = "denied\x00 then \x07 then \x1b[31m injected";
+        evil.resize(40); // include the NUL
+        return Status{StatusCode::PermissionDenied, evil};
+    };
+    listener->register_unary("yuzu.test.v1.Echo/EvilDetail", string_factory, string_factory,
+                             handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    StringMessage req("x"), resp;
+    CallContext ctx;
+    auto r = ch->unary("yuzu.test.v1.Echo/EvilDetail", ctx, req, resp);
+    REQUIRE(r.status.code == StatusCode::PermissionDenied);
+    // Control characters must be gone — verify the prefix surfaces and
+    // no NUL or ESC escapes leak through.
+    REQUIRE(r.status.detail.find('\0') == std::string::npos);
+    REQUIRE(r.status.detail.find('\x07') == std::string::npos);
+    REQUIRE(r.status.detail.find('\x1b') == std::string::npos);
+    REQUIRE(r.status.detail.find("denied") == 0);
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic ListenerOptions::max_frame_size beyond cap is rejected at start",
+          "[transport][msquic][round-trip][parity]") {
+    // qe-S8c / cons-S1: an over-cap max_frame_size must be refused at
+    // start() with InvalidArgument, matching the gRPC backend's
+    // rejection. Below the cap the listener starts normally.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    Credentials creds = make_test_creds();
+    ListenerOptions bad;
+    bad.max_frame_size = kAbsoluteMaxFrameSize + 1;
+    auto r = listener->start(Endpoint{"127.0.0.1", 0}, creds, bad);
+    REQUIRE_FALSE(r.has_value());
+    REQUIRE(r.error().code == StatusCode::InvalidArgument);
+    REQUIRE(r.error().detail.find("max_frame_size") != std::string::npos);
+
+    // Must NOT have been started.
+    REQUIRE_FALSE(listener->is_serving());
+}
+
 TEST_CASE("msquic bidi stream destroyed without final_status terminates cleanly",
           "[transport][msquic][round-trip][bidi]") {
     // transport.hpp: "destroying the BidiStream cancels the stream if

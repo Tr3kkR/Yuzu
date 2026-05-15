@@ -76,6 +76,11 @@ struct ServerStreamCall {
     // controlled handler map; never from attacker-controlled bytes.
     std::string method;
 
+    // The msquic connection this stream belongs to. Set in the
+    // PEER_STREAM_STARTED conn callback. Used to populate
+    // CallContext::peer_uri at dispatch time (#376 PR 3 inc 8).
+    HQUIC connection = nullptr;
+
     // Resolved unary registration (copied out of the listener's handler
     // map once the HandshakeHello method is known).
     bool                                                  is_unary = false;
@@ -156,6 +161,38 @@ QUIC_STATUS map_decoder_error_to_quic(StatusCode) noexcept {
     // The decoder only ever yields ResourceExhausted; the stream is
     // aborted regardless of which non-Ok code it is.
     return QUIC_STATUS_ABORTED;
+}
+
+}  // namespace
+
+// inet_ntop / INET6_ADDRSTRLEN — Windows winsock vs POSIX. Out of the
+// anon namespace so the system headers do not pollute later TUs that
+// only saw the anon-namespace declarations.
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#endif
+
+namespace {
+
+// Format a QUIC_ADDR as "ip:port" for CallContext::peer_uri (the
+// `msquic://` scheme is added by the caller). IPv4 produces
+// "1.2.3.4:5678"; IPv6 produces "[abcd::1]:5678" — bracketed per RFC.
+// On formatting failure returns "?:0" so the call still completes.
+std::string format_quic_addr(const QUIC_ADDR& addr) {
+    char     buf[INET6_ADDRSTRLEN] = {};
+    uint16_t port                  = QuicAddrGetPort(&addr);
+    if (QuicAddrGetFamily(&addr) == QUIC_ADDRESS_FAMILY_INET) {
+        if (inet_ntop(AF_INET, &addr.Ipv4.sin_addr, buf, sizeof(buf))) {
+            return std::string(buf) + ":" + std::to_string(port);
+        }
+    } else if (QuicAddrGetFamily(&addr) == QUIC_ADDRESS_FAMILY_INET6) {
+        if (inet_ntop(AF_INET6, &addr.Ipv6.sin6_addr, buf, sizeof(buf))) {
+            return "[" + std::string(buf) + "]:" + std::to_string(port);
+        }
+    }
+    return "?:0";
 }
 
 }  // namespace
@@ -402,6 +439,22 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                     for (const auto& [k, v] : hello.metadata()) {
                         call->ctx.metadata.emplace(k, v);
                     }
+                    // peer_uri (#376 PR 3 inc 8): query the connection's
+                    // remote address and format as "msquic://ip:port".
+                    // Best-effort — a query failure leaves peer_uri
+                    // empty, which mirrors the gRPC backend's behaviour
+                    // when the peer-identity probe fails.
+                    if (call->connection != nullptr) {
+                        QUIC_ADDR remote{};
+                        uint32_t  size = sizeof(remote);
+                        QUIC_STATUS qs = MsQuicApi::instance().api()->GetParam(
+                            call->connection,
+                            QUIC_PARAM_CONN_REMOTE_ADDRESS, &size, &remote);
+                        if (QUIC_SUCCEEDED(qs)) {
+                            call->ctx.peer_uri =
+                                "msquic://" + format_quic_addr(remote);
+                        }
+                    }
                     if (hello.deadline_unix_millis() != 0) {
                         const auto now_ms =
                             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -551,9 +604,10 @@ QUIC_STATUS QUIC_API msquic_conn_callback(HQUIC conn, void* ctx,
             HQUIC stream = ev->PEER_STREAM_STARTED.Stream;
             std::size_t max_frame = listener->stream_max_frame();
             auto call = std::make_shared<ServerStreamCall>(max_frame);
-            call->listener = listener;
-            call->stream   = stream;
-            call->self     = call;
+            call->listener   = listener;
+            call->stream     = stream;
+            call->connection = conn;
+            call->self       = call;
             listener->track_stream(stream, call);
             api->SetCallbackHandler(
                 stream, reinterpret_cast<void*>(msquic_stream_callback),
