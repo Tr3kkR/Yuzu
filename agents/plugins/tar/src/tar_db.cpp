@@ -190,9 +190,12 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         int mrc = sqlite3_exec(raw_db, "DROP TABLE IF EXISTS tar_events", nullptr, nullptr, &emsg);
         if (mrc == SQLITE_OK) {
             sqlite3_free(emsg);
-            sqlite3_exec(raw_db, "DROP INDEX IF EXISTS idx_tar_events_ts", nullptr, nullptr, nullptr);
-            sqlite3_exec(raw_db, "DROP INDEX IF EXISTS idx_tar_events_type_ts", nullptr, nullptr, nullptr);
-            sqlite3_exec(raw_db, "DROP INDEX IF EXISTS idx_tar_events_snapshot", nullptr, nullptr, nullptr);
+            sqlite3_exec(raw_db, "DROP INDEX IF EXISTS idx_tar_events_ts", nullptr, nullptr,
+                         nullptr);
+            sqlite3_exec(raw_db, "DROP INDEX IF EXISTS idx_tar_events_type_ts", nullptr, nullptr,
+                         nullptr);
+            sqlite3_exec(raw_db, "DROP INDEX IF EXISTS idx_tar_events_snapshot", nullptr, nullptr,
+                         nullptr);
             // Only set version to 3 if DROP succeeded
             db.set_config_locked("schema_version", "3");
             sqlite3_exec(raw_db, "RELEASE v3_migration", nullptr, nullptr, nullptr);
@@ -220,10 +223,10 @@ TarStats TarDatabase::stats() {
     // Aggregate record count across all live tables
     {
         const char* sql = "SELECT "
-            "(SELECT COUNT(*) FROM process_live) + "
-            "(SELECT COUNT(*) FROM tcp_live) + "
-            "(SELECT COUNT(*) FROM service_live) + "
-            "(SELECT COUNT(*) FROM user_live)";
+                          "(SELECT COUNT(*) FROM process_live) + "
+                          "(SELECT COUNT(*) FROM tcp_live) + "
+                          "(SELECT COUNT(*) FROM service_live) + "
+                          "(SELECT COUNT(*) FROM user_live)";
         sqlite3_stmt* raw_stmt = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
             StmtPtr stmt(raw_stmt);
@@ -235,10 +238,10 @@ TarStats TarDatabase::stats() {
     // Oldest timestamp across all live tables
     {
         const char* sql = "SELECT MIN(m) FROM ("
-            "SELECT MIN(ts) AS m FROM process_live UNION ALL "
-            "SELECT MIN(ts) FROM tcp_live UNION ALL "
-            "SELECT MIN(ts) FROM service_live UNION ALL "
-            "SELECT MIN(ts) FROM user_live)";
+                          "SELECT MIN(ts) AS m FROM process_live UNION ALL "
+                          "SELECT MIN(ts) FROM tcp_live UNION ALL "
+                          "SELECT MIN(ts) FROM service_live UNION ALL "
+                          "SELECT MIN(ts) FROM user_live)";
         sqlite3_stmt* raw_stmt = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
             StmtPtr stmt(raw_stmt);
@@ -250,10 +253,10 @@ TarStats TarDatabase::stats() {
     // Newest timestamp
     {
         const char* sql = "SELECT MAX(m) FROM ("
-            "SELECT MAX(ts) AS m FROM process_live UNION ALL "
-            "SELECT MAX(ts) FROM tcp_live UNION ALL "
-            "SELECT MAX(ts) FROM service_live UNION ALL "
-            "SELECT MAX(ts) FROM user_live)";
+                          "SELECT MAX(ts) AS m FROM process_live UNION ALL "
+                          "SELECT MAX(ts) FROM tcp_live UNION ALL "
+                          "SELECT MAX(ts) FROM service_live UNION ALL "
+                          "SELECT MAX(ts) FROM user_live)";
         sqlite3_stmt* raw_stmt = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
             StmtPtr stmt(raw_stmt);
@@ -264,7 +267,8 @@ TarStats TarDatabase::stats() {
 
     // DB size (page_count * page_size)
     {
-        const char* sql = "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()";
+        const char* sql =
+            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()";
         sqlite3_stmt* raw_stmt = nullptr;
         if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
             StmtPtr stmt(raw_stmt);
@@ -282,7 +286,11 @@ TarStats TarDatabase::stats() {
             if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
                 auto text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
                 if (text) {
-                    try { s.retention_days = std::stoi(text); } catch (...) { s.retention_days = 7; }
+                    try {
+                        s.retention_days = std::stoi(text);
+                    } catch (...) {
+                        s.retention_days = 7;
+                    }
                 }
             }
         }
@@ -413,7 +421,11 @@ void TarDatabase::set_config_locked(const std::string& key, const std::string& v
 
 int TarDatabase::schema_version() {
     auto v = get_config("schema_version", "0");
-    try { return std::stoi(v); } catch (...) { return 0; }
+    try {
+        return std::stoi(v);
+    } catch (...) {
+        return 0;
+    }
 }
 
 bool TarDatabase::create_warehouse_tables() {
@@ -426,7 +438,7 @@ bool TarDatabase::create_warehouse_tables() {
     int rc = sqlite3_exec(db_, ddl.c_str(), nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
         spdlog::error("TarDatabase::create_warehouse_tables failed: {}",
-                       err_msg ? err_msg : "unknown");
+                      err_msg ? err_msg : "unknown");
         sqlite3_free(err_msg);
         return false;
     }
@@ -557,6 +569,61 @@ bool TarDatabase::insert_network_events(const std::vector<NetworkEvent>& events)
     return true;
 }
 
+std::expected<std::vector<NetworkEvent>, std::string>
+TarDatabase::query_recent_tcp_connections(int64_t since_ts) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return std::unexpected{"database not open"};
+
+    // Group by 5-tuple+pid; surface the most recent observation per group.
+    // Filter to ESTABLISHED — LISTEN/TIME_WAIT/CLOSE_WAIT/etc. are not
+    // "this box talks to that box" edges and would pollute the viz.
+    // remote_host (reverse-DNS) is taken from the latest row in the group
+    // via a correlated subquery; if two rows in the same group resolved
+    // differently, we accept the newest.
+    const char* sql = R"(
+        SELECT proto, local_addr, local_port, remote_addr, remote_port, pid,
+               MAX(process_name) AS process_name,
+               MAX(remote_host)  AS remote_host,
+               MAX(state)        AS state,
+               MAX(ts)           AS ts
+        FROM tcp_live
+        WHERE ts >= ?
+          AND state = 'ESTABLISHED'
+        GROUP BY proto, local_addr, local_port, remote_addr, remote_port, pid
+        ORDER BY ts DESC
+    )";
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK)
+        return std::unexpected{std::string{"prepare: "} + sqlite3_errmsg(db_)};
+    StmtPtr stmt(raw_stmt);
+
+    sqlite3_bind_int64(stmt.get(), 1, since_ts);
+
+    std::vector<NetworkEvent> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        NetworkEvent ev;
+        auto col_text = [&](int i) -> std::string {
+            const unsigned char* p = sqlite3_column_text(stmt.get(), i);
+            return p ? std::string{reinterpret_cast<const char*>(p)} : std::string{};
+        };
+        ev.proto = col_text(0);
+        ev.local_addr = col_text(1);
+        ev.local_port = sqlite3_column_int(stmt.get(), 2);
+        ev.remote_addr = col_text(3);
+        ev.remote_port = sqlite3_column_int(stmt.get(), 4);
+        ev.pid = static_cast<uint32_t>(sqlite3_column_int(stmt.get(), 5));
+        ev.process_name = col_text(6);
+        ev.remote_host = col_text(7);
+        ev.state = col_text(8);
+        ev.ts = sqlite3_column_int64(stmt.get(), 9);
+        out.push_back(std::move(ev));
+    }
+    return out;
+}
+
 bool TarDatabase::insert_service_events(const std::vector<ServiceEvent>& events) {
     std::lock_guard lock(mu_);
     if (!db_ || events.empty())
@@ -677,7 +744,7 @@ bool TarDatabase::insert_user_events(const std::vector<UserEvent>& events) {
 // ── Generic SQL execution ───────────────────────────────────────────────────
 
 std::expected<QueryResult, std::string> TarDatabase::execute_query(const std::string& sql,
-                                                                     int max_rows) {
+                                                                   int max_rows) {
     std::lock_guard lock(mu_);
     QueryResult result;
     if (!db_)
@@ -753,7 +820,7 @@ bool TarDatabase::execute_sql_range(const std::string& sql, int64_t from, int64_
     int param_count = sqlite3_bind_parameter_count(stmt.get());
     if (param_count % 2 != 0) {
         spdlog::error("execute_sql_range: odd parameter count {} — expected (from,to) pairs",
-                       param_count);
+                      param_count);
         return false;
     }
     for (int i = 1; i <= param_count; i += 2) {

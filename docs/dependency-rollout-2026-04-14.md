@@ -124,8 +124,15 @@ opens a new PR against `dev`. The new PR numbers go in the
 Lowest-risk tier. Both bumps are docker-only, no Node 24 exposure.
 Independent — can merge in either order once green.
 
-- **#3 (was #335)** — `ubuntu:24.04` digest bump for Dockerfile.agent +
-  Dockerfile.server. Risk: apt package version drift on the new digest.
+- **#3 (was #335) — SUPERSEDED.** `ubuntu:24.04` was replaced by
+  `debian:trixie-slim@sha256:109e2c65...` in feat/viz-engine commit
+  `a826d3e` because the build host network blocked Canonical's apt
+  mirrors (`archive.ubuntu.com` / `ports.ubuntu.com` 100% packet loss).
+  Debian's deb.debian.org CDN is reliably reachable. Future digest bumps
+  should track `debian:trixie-slim` instead. The asan/tsan/local
+  Dockerfile variants are still on Ubuntu and will need a parallel
+  migration before they share runtime ABI assumptions with the
+  released images.
 - **#4 (was #248)** — `alpine 3.22 → 3.23` for Dockerfile.gateway
   runtime stage. Risk: musl/openssl/libstdc++ minor version bump that
   the gateway release links against. Local sanity: `docker build -f

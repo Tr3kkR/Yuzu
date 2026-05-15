@@ -19,6 +19,7 @@ shared_library(
     'src/tar_network_collector.cpp',
     'src/tar_service_collector.cpp',
     'src/tar_user_collector.cpp',
+    'src/tar_fleet_snapshot.cpp',
   ),
   name_prefix: '',
   dependencies: tar_deps,

@@ -1,0 +1,39 @@
+Three.js
+========
+
+The MIT License
+
+Copyright © 2010-2024 three.js authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+Source
+------
+https://github.com/mrdoob/three.js (release r168)
+Vendored file: server/core/vendor/three.module.min.js
+SPDX-License-Identifier: MIT
+
+Integrity
+---------
+SHA-256: ee08b04912b21d9bf71f13658a65da65c113827601377076663e710c0b1772d0
+
+Recompute with `shasum -a 256 server/core/vendor/three.module.min.js`. The
+test suite pins the byte count (see tests/unit/server/test_static_js_bundle.cpp
+kExpectedThreeJsBytes). When refreshing the upstream release, update both
+this hash and the byte-count constant in lock-step.

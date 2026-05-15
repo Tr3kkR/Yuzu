@@ -24,6 +24,8 @@
 namespace yuzu::server {
 class ManagementGroupStore;
 class InventoryStore;
+class FleetTopologyStore;
+class HeartbeatIngestion;
 } // namespace yuzu::server
 
 namespace yuzu::server::detail {
@@ -40,6 +42,16 @@ public:
 
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
+    // PR 10 / UAT 2026-05-12: gateway-proxied heartbeats carry the
+    // same fleet_snapshot_json field as direct heartbeats. Wire the
+    // topology store so BatchHeartbeat ingests pushes from agents that
+    // connect via the gateway. Without this hook, gateway-routed
+    // fleets would still see /viz/fleet/topology fall back to the
+    // dispatch path. nullptr disables for tests.
+    void set_fleet_topology_store(FleetTopologyStore* store) { fleet_topology_store_ = store; }
+
+    /// #1000 / arch-S2: shared HeartbeatIngestion (see AgentServiceImpl).
+    void set_heartbeat_ingestion(HeartbeatIngestion* hi) { heartbeat_ingestion_ = hi; }
 
     grpc::Status ProxyRegister(grpc::ServerContext* context, const pb::RegisterRequest* request,
                                pb::RegisterResponse* response) override;
@@ -48,8 +60,7 @@ public:
                                 const gw::BatchHeartbeatRequest* request,
                                 gw::BatchHeartbeatResponse* response) override;
 
-    grpc::Status ProxyInventory(grpc::ServerContext* context,
-                                const pb::InventoryReport* request,
+    grpc::Status ProxyInventory(grpc::ServerContext* context, const pb::InventoryReport* request,
                                 pb::InventoryAck* response) override;
 
     grpc::Status NotifyStreamStatus(grpc::ServerContext* context,
@@ -68,6 +79,8 @@ private:
     AgentHealthStore* health_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
+    FleetTopologyStore* fleet_topology_store_{nullptr};
+    HeartbeatIngestion* heartbeat_ingestion_{nullptr};
 
     // Map of gateway session_id -> agent_id for validation.
     mutable std::mutex sessions_mu_;

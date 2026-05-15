@@ -4,6 +4,8 @@
 
 #include "analytics_event_store.hpp"
 #include "execution_tracker.hpp"
+#include "fleet_topology_store.hpp"
+#include "heartbeat_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
@@ -202,6 +204,13 @@ enrolled:
     if (mgmt_group_store_ && mgmt_group_store_->is_open())
         mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());
 
+    // UAT 2026-05-12: invalidate any cached topology snapshot so the
+    // next /api/v1/viz/fleet/topology refill dispatches to the new
+    // agent and the renderer doesn't show this cube as stale (`ts=0,
+    // procs=[]`) for up to the 60 s TTL window.
+    if (fleet_topology_store_)
+        fleet_topology_store_->invalidate();
+
     if (analytics_store_) {
         AnalyticsEvent ae;
         ae.event_type = "agent.registered";
@@ -309,12 +318,29 @@ grpc::Status AgentServiceImpl::Heartbeat(grpc::ServerContext* /*context*/,
         return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown session");
     }
 
-    // Store health snapshot and update session activity timestamp
-    if (health_store_) {
-        health_store_->upsert(agent_id, request->status_tags());
-    }
+    // #1000 / arch-S2: per-heartbeat work (health upsert, metrics,
+    // fleet_snapshot push) lives in HeartbeatIngestion so the direct and
+    // gateway-batch paths cannot drift. `touch_activity` is direct-only
+    // — gateway-routed agents have their activity timestamp refreshed
+    // through ProxyRegister + the gateway's own bookkeeping.
     registry_.touch_activity(agent_id);
-    metrics_.counter("yuzu_heartbeats_received_total", {{"via", "direct"}}).increment();
+    if (heartbeat_ingestion_) {
+        // Gate 7 UP-10 — isolate ingest failures. An exception here would
+        // otherwise fail the whole Heartbeat RPC; the agent would retry,
+        // but a deterministically-bad payload would wedge the agent in a
+        // heartbeat-retry loop. Swallow + log so the heartbeat still acks
+        // (the snapshot push is best-effort; health/metrics already ran).
+        try {
+            heartbeat_ingestion_->ingest(*request, agent_id, "direct");
+        } catch (const std::exception& ex) {
+            spdlog::warn("Heartbeat: ingest threw for agent {} — heartbeat still acked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            spdlog::warn("Heartbeat: ingest threw unknown exception for agent {} — "
+                         "heartbeat still acked",
+                         agent_id);
+        }
+    }
 
     response->set_acknowledged(true);
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -601,6 +627,11 @@ grpc::Status AgentServiceImpl::Subscribe(
     // handler doesn't clobber a newer connection from the same agent_id.
     registry_.clear_stream_if_session(agent_id, session_id);
     registry_.remove_agent_if_session(agent_id, session_id);
+    // PR 10 hardening — evict pushed-snapshot slot too (sec-M4 / UP-5).
+    // Without this, deregistered agents render as ghost cubes
+    // indefinitely from the cached last-known-good snapshot.
+    if (fleet_topology_store_)
+        fleet_topology_store_->evict_pushed(agent_id);
     spdlog::info("Agent subscribe stream closed for {} (session={})", agent_id, session_id);
 
     if (analytics_store_) {
