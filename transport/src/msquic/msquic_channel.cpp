@@ -524,13 +524,31 @@ CallResult MsquicChannel::unary(std::string_view method,
             {}};
     }
 
+    // Negative-deadline clamp (#915 / UP-110 / arch-S1) and absolute-
+    // deadline encoding (#376 PR 3 increment 4). zero ctx.deadline means
+    // "no deadline" — encode as deadline_unix_millis=0; positive values
+    // become an absolute system-clock millisecond deadline that the
+    // server can compare against its own clock to detect already-expired
+    // calls before the handler runs.
+    auto effective_deadline = ctx.deadline;
+    if (effective_deadline < std::chrono::milliseconds::zero()) {
+        effective_deadline = std::chrono::milliseconds::zero();
+    }
+    std::uint64_t deadline_unix_millis = 0;
+    if (effective_deadline > std::chrono::milliseconds::zero()) {
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        deadline_unix_millis =
+            static_cast<std::uint64_t>(now_ms + effective_deadline.count());
+    }
+
     pb::HandshakeHello hello;
     hello.set_method(std::string(method));
     for (const auto& [k, v] : ctx.metadata) {
         (*hello.mutable_metadata())[k] = v;
     }
-    // Deadline plumbing is increment 4; increment 2 sends "no deadline".
-    hello.set_deadline_unix_millis(0);
+    hello.set_deadline_unix_millis(deadline_unix_millis);
     std::string hello_body;
     if (!hello.SerializeToString(&hello_body)) {
         return CallResult{Status{StatusCode::Internal,
@@ -586,20 +604,26 @@ CallResult MsquicChannel::unary(std::string_view method,
     }
 
     // Block until the stream completes (peer FIN, abort, or shutdown).
-    // Bounded wait: a CI/production safety net until increment 4 wires
-    // the real per-call deadline from CallContext::deadline — without
-    // the bound a wedged handler or a lost QUIC event hangs the caller
-    // indefinitely (governance UP-5 / qe-BLOCKING).
+    // The wait is bounded by the caller's CallContext::deadline if
+    // positive (#376 PR 3 increment 4); otherwise a 10 s safety net
+    // protects against a wedged handler or a lost QUIC event hanging
+    // the caller indefinitely (governance UP-5 / qe-BLOCKING).
+    const auto wait_cap =
+        effective_deadline > std::chrono::milliseconds::zero()
+            ? effective_deadline
+            : std::chrono::milliseconds(10000);
     bool completed = false;
     {
         std::unique_lock<std::mutex> lock(call->mtx);
-        completed = call->cv.wait_for(lock, std::chrono::seconds(10),
+        completed = call->cv.wait_for(lock, wait_cap,
                                       [&call] { return call->done; });
         if (!completed) {
             call->done            = true;  // a late finish_call no-ops
             call->transport_error = Status{
                 StatusCode::DeadlineExceeded,
-                "transport: unary call did not complete within 10s"};
+                effective_deadline > std::chrono::milliseconds::zero()
+                    ? "transport: unary deadline expired"
+                    : "transport: unary call did not complete within 10s"};
         }
     }
     if (!completed) {
@@ -708,13 +732,27 @@ std::unique_ptr<BidiStream> MsquicChannel::bidi_stream(std::string_view method,
 
     // Encode the HandshakeHello. For unary the FIN rides the request
     // frame; for bidi the client keeps writing, so the hello is sent
-    // without FIN.
+    // without FIN. CallContext::deadline becomes an absolute system-
+    // clock millisecond deadline on the wire (#376 PR 3 increment 4);
+    // negative is clamped to zero (#915 / UP-110 / arch-S1).
+    auto bidi_deadline = ctx.deadline;
+    if (bidi_deadline < std::chrono::milliseconds::zero()) {
+        bidi_deadline = std::chrono::milliseconds::zero();
+    }
+    std::uint64_t bidi_deadline_unix_millis = 0;
+    if (bidi_deadline > std::chrono::milliseconds::zero()) {
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        bidi_deadline_unix_millis =
+            static_cast<std::uint64_t>(now_ms + bidi_deadline.count());
+    }
     pb::HandshakeHello hello;
     hello.set_method(std::string(method));
     for (const auto& [k, v] : ctx.metadata) {
         (*hello.mutable_metadata())[k] = v;
     }
-    hello.set_deadline_unix_millis(0);  // increment 4 wires deadline
+    hello.set_deadline_unix_millis(bidi_deadline_unix_millis);
     std::string hello_body;
     if (!hello.SerializeToString(&hello_body)) {
         return fail_with(Status{

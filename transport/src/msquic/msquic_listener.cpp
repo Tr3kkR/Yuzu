@@ -364,10 +364,36 @@ QUIC_STATUS QUIC_API msquic_stream_callback(HQUIC stream, void* ctx,
                         break;
                     }
                     // Populate the CallContext from the hello. The
-                    // deadline field is plumbed through but not yet
-                    // enforced — deadline handling lands in increment 4.
+                    // deadline (#376 PR 3 increment 4) is an absolute
+                    // system-clock millisecond timestamp; convert to a
+                    // remaining-millis duration the handler can pass to
+                    // BidiStream::read/write. If the deadline has
+                    // already passed by the time we see the hello,
+                    // reject immediately with DeadlineExceeded — no
+                    // handler dispatch.
                     for (const auto& [k, v] : hello.metadata()) {
                         call->ctx.metadata.emplace(k, v);
+                    }
+                    if (hello.deadline_unix_millis() != 0) {
+                        const auto now_ms =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+                        const auto remaining_ms =
+                            static_cast<std::int64_t>(
+                                hello.deadline_unix_millis()) -
+                            now_ms;
+                        if (remaining_ms <= 0) {
+                            send_trailing_status(
+                                call,
+                                Status{StatusCode::DeadlineExceeded,
+                                       "transport: deadline expired before "
+                                       "dispatch"});
+                            call->phase = ServerStreamCall::Phase::Done;
+                            break;
+                        }
+                        call->ctx.deadline =
+                            std::chrono::milliseconds(remaining_ms);
                     }
                     // Resolve the method (strip an optional leading '/').
                     std::string method = hello.method();

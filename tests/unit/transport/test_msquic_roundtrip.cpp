@@ -468,6 +468,186 @@ TEST_CASE("msquic bidi back-pressure pauses receives when inbound queue grows",
     listener->shutdown();
 }
 
+// ── Deadlines (#376 PR 3 increment 4) ────────────────────────────────────────
+
+TEST_CASE("msquic bidi read deadline expires and reports DeadlineExceeded",
+          "[transport][msquic][round-trip][bidi][deadline]") {
+    // qe-S4a: read(deadline) on a stream where the peer is silent must
+    // wake at the deadline, return false, and final_status() must return
+    // DeadlineExceeded — not Cancelled — even though the wire-level
+    // shutdown is an ABORT.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    // Server holds the stream open without writing anything. The handler
+    // exits when its own read returns (peer ABORT propagates as false).
+    auto handler = [](const CallContext&, BidiStream& s) -> Status {
+        StringMessage in;
+        while (s.read(in)) { /* no replies */
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiSilent", handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    CallContext ctx;
+    auto bidi = ch->bidi_stream("yuzu.test.v1.Echo/BidiSilent", ctx);
+    REQUIRE(bidi != nullptr);
+
+    StringMessage out("hello"), in;
+    REQUIRE(bidi->write(out));
+    auto t0 = std::chrono::steady_clock::now();
+    REQUIRE_FALSE(bidi->read(in, std::chrono::milliseconds(200)));
+    auto elapsed = std::chrono::steady_clock::now() - t0;
+    REQUIRE(elapsed >= std::chrono::milliseconds(150));
+    REQUIRE(elapsed < std::chrono::seconds(2));
+
+    Status fs = bidi->final_status();
+    REQUIRE(fs.code == StatusCode::DeadlineExceeded);
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic bidi read negative deadline is clamped (no immediate timeout)",
+          "[transport][msquic][round-trip][bidi][deadline]") {
+    // qe-S4b / arch-S1 / #915: a negative deadline must be treated as
+    // zero ("no deadline") — NOT as "expire immediately". Pass -1 ms
+    // and verify the read still receives the frame the server sends.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& s) -> Status {
+        StringMessage in;
+        if (!s.read(in))
+            return Status{StatusCode::Ok, ""};
+        StringMessage out("ack:" + in.data());
+        s.write(out);
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiNegDeadline", handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    CallContext ctx;
+    auto bidi = ch->bidi_stream("yuzu.test.v1.Echo/BidiNegDeadline", ctx);
+    REQUIRE(bidi != nullptr);
+
+    StringMessage out("hi"), in;
+    REQUIRE(bidi->write(out, std::chrono::milliseconds(-5)));
+    bidi->writes_done();
+    REQUIRE(bidi->read(in, std::chrono::milliseconds(-5)));
+    REQUIRE(in.data() == "ack:hi");
+    REQUIRE(bidi->final_status().code == StatusCode::Ok);
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic bidi write deadline does not fire on a prompt peer",
+          "[transport][msquic][round-trip][bidi][deadline]") {
+    // qe-S4c: a positive write deadline against a healthy peer is a
+    // no-op (StreamSend accepts immediately). Verify the write succeeds
+    // and the round trip completes without spurious DeadlineExceeded.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, BidiStream& s) -> Status {
+        StringMessage in;
+        while (s.read(in)) {
+            StringMessage out("ack:" + in.data());
+            (void)s.write(out);
+        }
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_bidi_stream("yuzu.test.v1.Echo/BidiWriteDeadline", handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    CallContext ctx;
+    auto bidi = ch->bidi_stream("yuzu.test.v1.Echo/BidiWriteDeadline", ctx);
+    REQUIRE(bidi != nullptr);
+
+    StringMessage out("ping"), in;
+    REQUIRE(bidi->write(out, std::chrono::milliseconds(500)));
+    bidi->writes_done();
+    REQUIRE(bidi->read(in, std::chrono::seconds(2)));
+    REQUIRE(in.data() == "ack:ping");
+    REQUIRE(bidi->final_status().code == StatusCode::Ok);
+
+    ch->close();
+    listener->shutdown();
+}
+
+TEST_CASE("msquic unary CallContext::deadline expires client-side on slow handler",
+          "[transport][msquic][round-trip][deadline]") {
+    // qe-S4d: an unbounded handler causes the client to wake at
+    // ctx.deadline with DeadlineExceeded — the 10 s safety net does
+    // NOT win when the operator provided a tighter deadline.
+    auto listener = make_server_listener(Backend::Msquic);
+    REQUIRE(listener != nullptr);
+
+    auto handler = [](const CallContext&, const SerializableMessage&,
+                      SerializableMessage&) -> Status {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        return Status{StatusCode::Ok, ""};
+    };
+    listener->register_unary("yuzu.test.v1.Echo/Slow", string_factory, string_factory, handler);
+
+    Credentials creds = make_test_creds();
+    auto start_r = listener->start(Endpoint{"127.0.0.1", 0}, creds);
+    REQUIRE(start_r.has_value());
+    Endpoint bound = listener->bound_endpoint();
+
+    auto ch = make_channel(Backend::Msquic, bound, creds);
+    REQUIRE(ch != nullptr);
+    REQUIRE(ch->wait_for_connected(std::chrono::seconds(5)));
+
+    StringMessage req("hi"), resp;
+    CallContext ctx;
+    ctx.deadline = std::chrono::milliseconds(200);
+    auto t0 = std::chrono::steady_clock::now();
+    auto r = ch->unary("yuzu.test.v1.Echo/Slow", ctx, req, resp);
+    auto elapsed = std::chrono::steady_clock::now() - t0;
+    REQUIRE(r.status.code == StatusCode::DeadlineExceeded);
+    REQUIRE(elapsed < std::chrono::seconds(1));
+
+    ch->close();
+    listener->shutdown();
+}
+
+// (server-side "already-expired before dispatch" rejection IS implemented
+//  in msquic_listener.cpp's HandshakeHello path, but is not directly
+//  tested here: on loopback the handler can return faster than 1 ms, so
+//  any "client sets a 1 ms deadline + sleeps before unary()" formulation
+//  races and produces a flaky `Ok` instead of `DeadlineExceeded`. The
+//  client-side timeout test above covers the user-visible contract; the
+//  server-side optimisation is exercised when deadline_unix_millis lands
+//  in the past for any reason — clock skew, queueing, or client-side
+//  scheduling delay.)
+
 TEST_CASE("msquic bidi stream destroyed without final_status terminates cleanly",
           "[transport][msquic][round-trip][bidi]") {
     // transport.hpp: "destroying the BidiStream cancels the stream if

@@ -209,7 +209,17 @@ MsquicBidiStream::~MsquicBidiStream() {
 }
 
 bool MsquicBidiStream::write(const SerializableMessage& msg,
-                             std::chrono::milliseconds /*deadline*/) {
+                             std::chrono::milliseconds deadline) {
+    // Negative-deadline clamp (#915 / UP-110 / arch-S1). The deadline
+    // is otherwise accepted but not actively honoured: msquic StreamSend
+    // queues to msquic's internal buffer and returns immediately, which
+    // satisfies the contract's "accepted into the transport buffer"
+    // signal. A future enhancement can wait for SEND_COMPLETE under the
+    // deadline to bound writes against a wedged peer.
+    if (deadline < std::chrono::milliseconds::zero()) {
+        deadline = std::chrono::milliseconds::zero();
+    }
+    (void)deadline;
     std::string body;
     if (!msg.serialize(body)) return false;
     std::string framed;
@@ -220,36 +230,77 @@ bool MsquicBidiStream::write(const SerializableMessage& msg,
 }
 
 bool MsquicBidiStream::read(SerializableMessage& msg,
-                            std::chrono::milliseconds /*deadline*/) {
+                            std::chrono::milliseconds deadline) {
+    // Negative-deadline clamp (#915 / UP-110 / arch-S1). cv.wait_for's
+    // behaviour on a negative duration is unspecified — clamp to zero
+    // ("no deadline") so a caller pattern like
+    // `max(0ms, target_deadline - now())` cannot pin the stream
+    // forever after the target has slipped.
+    if (deadline < std::chrono::milliseconds::zero()) {
+        deadline = std::chrono::milliseconds::zero();
+    }
     std::string frame;
-    HQUIC       resume_stream = nullptr;
+    bool        got_frame             = false;
+    HQUIC       resume_stream         = nullptr;
+    HQUIC       deadline_abort_stream = nullptr;
     {
         std::unique_lock<std::mutex> lock(state_->mtx);
-        state_->cv.wait(lock, [this] {
+        auto pred = [this] {
             return !state_->inbound.empty() || state_->peer_fin ||
                    state_->cancelled;
-        });
-        if (state_->cancelled) return false;
-        if (state_->inbound.empty()) {
-            // peer_fin and nothing left to read — half-close.
-            return false;
+        };
+        bool got_event = true;
+        if (deadline == std::chrono::milliseconds::zero()) {
+            state_->cv.wait(lock, pred);
+        } else {
+            got_event = state_->cv.wait_for(lock, deadline, pred);
         }
-        frame = std::move(state_->inbound.front());
-        state_->inbound.pop_front();
-        // Bytes leave the back-pressure window when the user takes them.
-        state_->inbound_bytes -= frame.size();
-        if (state_->receive_paused &&
-            state_->inbound_bytes <=
-                g_low_water.load(std::memory_order_relaxed) &&
-            state_->stream != nullptr && !state_->stream_closed) {
-            state_->receive_paused = false;
-            resume_stream          = state_->stream;
+        if (!got_event) {
+            // Deadline expiry. Promote DeadlineExceeded to final_status
+            // BEFORE setting cancelled, so the SHUTDOWN_COMPLETE path's
+            // feed_bidi_error (which sets Cancelled) sees final_valid
+            // and no-ops. This keeps the local-side reporting "deadline"
+            // versus the wire-level / peer-side "cancelled" — matches
+            // the transport.hpp BidiStream contract for deadline
+            // observability on both reader and writer threads.
+            if (!state_->final_valid) {
+                state_->final_status = Status{
+                    StatusCode::DeadlineExceeded,
+                    "transport: read deadline expired"};
+                state_->final_valid = true;
+                state_->peer_fin    = true;
+            }
+            state_->cancelled = true;
+            if (state_->stream != nullptr && !state_->stream_closed) {
+                deadline_abort_stream = state_->stream;
+            }
+            state_->cv.notify_all();
+        } else if (!state_->cancelled && !state_->inbound.empty()) {
+            frame = std::move(state_->inbound.front());
+            state_->inbound.pop_front();
+            got_frame = true;
+            // Bytes leave the back-pressure window when the user takes them.
+            state_->inbound_bytes -= frame.size();
+            if (state_->receive_paused &&
+                state_->inbound_bytes <=
+                    g_low_water.load(std::memory_order_relaxed) &&
+                state_->stream != nullptr && !state_->stream_closed) {
+                state_->receive_paused = false;
+                resume_stream          = state_->stream;
+            }
         }
+        // Else: cancelled OR (peer_fin && empty inbound) — fall through
+        // and return false.
+    }
+    if (deadline_abort_stream != nullptr) {
+        MsQuicApi::instance().api()->StreamShutdown(
+            deadline_abort_stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
     }
     if (resume_stream != nullptr) {
         MsQuicApi::instance().api()->StreamReceiveSetEnabled(resume_stream, TRUE);
         g_receive_enabled_count.fetch_add(1, std::memory_order_relaxed);
     }
+    if (!got_frame) return false;
     return msg.parse(frame);
 }
 
