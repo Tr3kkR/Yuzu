@@ -196,6 +196,40 @@ void AgentRegistry::set_gateway_node(const std::string& agent_id, const std::str
     }
 }
 
+void AgentRegistry::sweep_and_publish_trusted_gateway_locked() {
+    // Caller MUST hold trusted_gateway_mu_.
+    const auto now = std::chrono::steady_clock::now();
+
+    // Pass 1: drop anything past the TTL window.
+    for (auto it = trusted_gateway_peer_ips_.begin(); it != trusted_gateway_peer_ips_.end();) {
+        if (now - it->second > kTrustedGatewayTtl) {
+            it = trusted_gateway_peer_ips_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Pass 2: if at cap, evict the single oldest entry to make room.
+    // We're called from `note_trusted_gateway_peer` BEFORE the insert,
+    // so being AT the cap means the imminent insert would push over —
+    // drop one now. Linear scan is fine: the map is bounded at
+    // kTrustedGatewayCap, and this only runs on the (rare) insert path.
+    if (trusted_gateway_peer_ips_.size() >= kTrustedGatewayCap) {
+        auto oldest = trusted_gateway_peer_ips_.begin();
+        for (auto it = std::next(oldest); it != trusted_gateway_peer_ips_.end(); ++it) {
+            if (it->second < oldest->second) {
+                oldest = it;
+            }
+        }
+        if (oldest != trusted_gateway_peer_ips_.end()) {
+            trusted_gateway_peer_ips_.erase(oldest);
+        }
+    }
+
+    metrics_.gauge("yuzu_trusted_gateway_peer_set_size")
+        .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
+}
+
 void AgentRegistry::note_trusted_gateway_peer(std::string_view peer_ip) {
     // #826: defence-in-depth — never record an empty string. An empty
     // peer IP would later satisfy `is_trusted_gateway_peer("")` and
@@ -203,7 +237,21 @@ void AgentRegistry::note_trusted_gateway_peer(std::string_view peer_ip) {
     if (peer_ip.empty())
         return;
     std::lock_guard lock(trusted_gateway_mu_);
-    trusted_gateway_peer_ips_.emplace(peer_ip);
+
+    // W1.3 R2 / UP-2: opportunistic sweep + cap enforcement BEFORE the
+    // insert so a fresh entry never causes the map to exceed
+    // kTrustedGatewayCap. Sweep also refreshes the published gauge,
+    // which is important so an operator sees the set shrinking as TTL
+    // expirations land — without the sweep, a quiet system would show
+    // a stale max-size gauge until the next insert hit cap.
+    sweep_and_publish_trusted_gateway_locked();
+
+    // Insert OR refresh — repeat ProxyRegisters from the same gateway
+    // update last_seen so an active gateway stays trusted indefinitely.
+    trusted_gateway_peer_ips_[std::string(peer_ip)] = std::chrono::steady_clock::now();
+
+    metrics_.gauge("yuzu_trusted_gateway_peer_set_size")
+        .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
 }
 
 bool AgentRegistry::is_trusted_gateway_peer(std::string_view peer_ip) const {
@@ -213,7 +261,28 @@ bool AgentRegistry::is_trusted_gateway_peer(std::string_view peer_ip) const {
     if (peer_ip.empty())
         return false;
     std::lock_guard lock(trusted_gateway_mu_);
-    return trusted_gateway_peer_ips_.contains(std::string(peer_ip));
+    auto it = trusted_gateway_peer_ips_.find(std::string(peer_ip));
+    if (it == trusted_gateway_peer_ips_.end())
+        return false;
+    // W1.3 R2 / UP-3: stale entries do not satisfy the trusted check.
+    // We do not erase here (const method, would require shared→unique
+    // upgrade); the next `note_trusted_gateway_peer` sweep evicts it.
+    const auto age = std::chrono::steady_clock::now() - it->second;
+    return age <= kTrustedGatewayTtl;
+}
+
+std::size_t AgentRegistry::trusted_gateway_peer_count() const {
+    std::lock_guard lock(trusted_gateway_mu_);
+    return trusted_gateway_peer_ips_.size();
+}
+
+void AgentRegistry::expire_trusted_gateway_for_test(std::chrono::seconds offset) {
+    std::lock_guard lock(trusted_gateway_mu_);
+    for (auto& [ip, last_seen] : trusted_gateway_peer_ips_) {
+        last_seen -= offset;
+    }
+    metrics_.gauge("yuzu_trusted_gateway_peer_set_size")
+        .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
 }
 
 bool AgentRegistry::send_to(const std::string& agent_id, const pb::CommandRequest& cmd) {

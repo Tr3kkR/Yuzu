@@ -6,6 +6,7 @@
 #include "heartbeat_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
+#include "peer_ip.hpp"
 
 namespace yuzu::server::detail {
 
@@ -21,54 +22,28 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
 
 // -- ProxyRegister ------------------------------------------------------------
 
-namespace {
-/// Extract bare IP from a gRPC peer string. Duplicates AgentServiceImpl's
-/// helper deliberately — this TU does not include agent_service_impl.hpp
-/// and we don't want to hoist a shared helper into agent_registry just
-/// for two callers. Both copies trace to the gRPC peer encoding
-/// documented at `parse_address.cc`. If a third caller appears, fold
-/// into a shared `peer_ip.hpp`.
-std::string extract_peer_ip(std::string_view peer) {
-    auto colon = peer.find(':');
-    if (colon == std::string_view::npos)
-        return {};
-    auto scheme = peer.substr(0, colon);
-    auto rest = peer.substr(colon + 1);
-    if (scheme == "ipv6") {
-        if (rest.empty() || rest.front() != '[')
-            return {};
-        auto close = rest.find(']');
-        if (close == std::string_view::npos)
-            return {};
-        return std::string(rest.substr(1, close - 1));
-    }
-    if (scheme == "ipv4") {
-        auto port_colon = rest.rfind(':');
-        if (port_colon == std::string_view::npos)
-            return std::string(rest);
-        return std::string(rest.substr(0, port_colon));
-    }
-    return {};
-}
-} // namespace
-
 grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* context,
                                                        const pb::RegisterRequest* request,
                                                        pb::RegisterResponse* response) {
     const auto& info = request->info();
 
-    // #826: record the gateway's peer IP as a trusted gateway. Any
-    // subsequent Subscribe stream arriving from this IP under
-    // `--gateway-mode` is allowed to bypass the strict per-IP register/
-    // subscribe match — which is the legitimate gateway-relayed flow.
-    // We capture this BEFORE the enrollment branches so even denied
-    // enrollments contribute to gateway-trust discovery (the gateway is
-    // still trusted regardless of whether the proxied agent enrolls).
-    if (context) {
-        registry_.note_trusted_gateway_peer(extract_peer_ip(context->peer()));
-    }
-
     // -- Tiered enrollment (same logic as AgentServiceImpl::Register) ----------
+    //
+    // W1.3 R2 / UP-7 / sec-G MEDIUM-1: trusted-peer noting moved to the
+    // success path below (after `gw_enrolled:`). The prior implementation
+    // recorded the peer BEFORE the enrollment branches with the rationale
+    // that denied enrollments still contribute to gateway-trust discovery.
+    // That inverts the trust model: any peer that can reach :50055 with
+    // ANY ProxyRegister payload (forged enrollment token, garbage agent_id,
+    // anything that fails token validation or admin denial) would become
+    // trusted for the rest of the process lifetime.
+    //
+    // The trusted-set is now populated ONLY when the proxy enrollment
+    // succeeds. The set still assumes the gateway-upstream listener (:50055)
+    // is itself authenticated via TLS/mTLS at the operator's network
+    // boundary — without that, an attacker who reaches the port AND knows
+    // a valid enrollment token could still add themselves; the post-PR-3
+    // native-QUIC redesign tightens this with mandatory peer-cert pinning.
 
     // Fast path: agent already enrolled from a prior connection
     {
@@ -155,6 +130,16 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
 
 gw_enrolled:
     // -- Enrolled -- register the agent ----------------------------------------
+    //
+    // W1.3 R2 / UP-7: trust-after-auth. Only record the gateway's peer IP
+    // in the trusted set AFTER enrollment succeeds. Re-registration (fast
+    // path at the top of the function) also lands here, so a gateway that
+    // re-proxies an already-enrolled agent keeps refreshing the trust
+    // entry — exactly the lifetime the TTL eviction (UP-2 / UP-3) expects.
+    if (context) {
+        registry_.note_trusted_gateway_peer(extract_peer_ip(context->peer()));
+    }
+
     registry_.register_agent(info);
     // Auto-add to root management group
     if (mgmt_group_store_ && mgmt_group_store_->is_open())

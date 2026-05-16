@@ -10,6 +10,7 @@
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
+#include "peer_ip.hpp"
 #include "response_store.hpp"
 #include "result_parsing.hpp"
 #include "tag_store.hpp"
@@ -1249,41 +1250,13 @@ std::string AgentServiceImpl::client_metadata_value(const grpc::ServerContext& c
 }
 
 std::string AgentServiceImpl::extract_peer_ip(std::string_view peer) {
-    // gRPC peer encoding (per src/core/lib/iomgr/parse_address.cc):
-    //   ipv4:1.2.3.4:5678
-    //   ipv6:[::1]:5678        — brackets always present for v6
-    //   ipv6:[2001:db8::1]:443
-    //   unix:/tmp/sock         — no IP, return empty (caller treats as mismatch)
-    //
-    // We extract just the address part:
-    //   "ipv4:1.2.3.4:5678"      -> "1.2.3.4"
-    //   "ipv6:[::1]:5678"        -> "::1"
-    //   "ipv6:[2001:db8::1]:443" -> "2001:db8::1"
-    //   "unix:/tmp/sock"         -> ""
-    //   ""                       -> ""
-    auto colon = peer.find(':');
-    if (colon == std::string_view::npos)
-        return {};
-    auto scheme = peer.substr(0, colon);
-    auto rest = peer.substr(colon + 1);
-    if (scheme == "ipv6") {
-        // [addr]:port  — strip brackets, drop trailing :port
-        if (rest.empty() || rest.front() != '[')
-            return {}; // malformed
-        auto close = rest.find(']');
-        if (close == std::string_view::npos)
-            return {};
-        return std::string(rest.substr(1, close - 1));
-    }
-    if (scheme == "ipv4") {
-        // addr:port
-        auto port_colon = rest.rfind(':');
-        if (port_colon == std::string_view::npos)
-            return std::string(rest);
-        return std::string(rest.substr(0, port_colon));
-    }
-    // unix / other — no IP to extract
-    return {};
+    // W1.3 R2 / consistency MEDIUM-1: thin shim to the shared parser in
+    // peer_ip.hpp. Kept as a static member for ABI continuity — the unit
+    // tests address it as `AgentServiceImpl::extract_peer_ip(...)` and
+    // production call sites in this TU use the unqualified `extract_peer_ip`
+    // pulled in by the header include. Keeping the static delegate avoids a
+    // mass-rename in the test surface without forking the parser.
+    return ::yuzu::server::detail::extract_peer_ip(peer);
 }
 
 bool AgentServiceImpl::has_identity_overlap(const std::vector<std::string>& lhs,
