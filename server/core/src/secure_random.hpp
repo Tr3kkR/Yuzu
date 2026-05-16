@@ -50,4 +50,20 @@ fill_random(std::span<std::uint8_t> out) noexcept;
 /// common token-generation case.
 [[nodiscard]] std::expected<std::string, SecureRandomError> random_hex(std::size_t byte_count);
 
+namespace test_hooks {
+
+/// Force the next `fill_random` / `random_hex` call on the current thread to
+/// return `PrngFailure` without touching the underlying CSPRNG, then auto-clear.
+/// Test-only: lets governance Gate 2 F-002 verify that token-create handlers
+/// emit a `failure` audit row when entropy is unavailable, without faking
+/// an entropy-exhaustion environment. Thread-local so concurrent test cases
+/// do not poison one another. Never call from production code.
+void force_next_failure_for_this_thread();
+
+/// Inspect the thread-local force flag — exposed for asserting the override
+/// has been consumed. Production code must not branch on this.
+bool is_failure_forced_for_this_thread();
+
+} // namespace test_hooks
+
 } // namespace yuzu::server
