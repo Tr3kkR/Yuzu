@@ -44,12 +44,12 @@ TEST_CASE("DeviceTokenStore: create and validate round-trip", "[device_token][cr
     DeviceTokenStore store(tmp.path);
     REQUIRE(store.is_open());
 
-    auto result = store.create_token("Test Token", "admin", "", "", 0);
+    auto result = store.create_token("Test Token", "admin", "device-RT", "", 0);
     REQUIRE(result.has_value());
 
-    // Any-device token (device_id="") accepts any presenter — empty presenter
-    // works for the round-trip case.
-    auto validated = store.validate_token(*result, "");
+    // Round-trip requires an explicitly bound token now that any-device
+    // tokens (empty device_id) are rejected as unbound_legacy (W1.2 R2).
+    auto validated = store.validate_token(*result, "device-RT");
     REQUIRE(validated.has_value());
     CHECK(validated->name == "Test Token");
     CHECK(validated->principal_id == "admin");
@@ -93,11 +93,13 @@ TEST_CASE("DeviceTokenStore: expired token rejected", "[device_token][auth]") {
     DeviceTokenStore store(tmp.path);
     REQUIRE(store.is_open());
 
-    // Create token that already expired (expires_at = 1 second since epoch)
-    auto result = store.create_token("Expired Token", "admin", "", "", 1);
+    // Create token that already expired (expires_at = 1 second since epoch).
+    // Bound to a real device so the failure mode is purely "expired" and not
+    // unbound_legacy (which must precede binding but follow expired).
+    auto result = store.create_token("Expired Token", "admin", "device-X", "", 1);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result, "");
+    auto validated = store.validate_token(*result, "device-X");
     REQUIRE(!validated.has_value());
     CHECK(validated.error() == DeviceTokenValidateError::expired);
 }
@@ -107,11 +109,11 @@ TEST_CASE("DeviceTokenStore: revoked token rejected", "[device_token][auth]") {
     DeviceTokenStore store(tmp.path);
     REQUIRE(store.is_open());
 
-    auto raw = store.create_token("Revocable", "admin", "", "", 0);
+    auto raw = store.create_token("Revocable", "admin", "device-R", "", 0);
     REQUIRE(raw.has_value());
 
     // Validate before revocation
-    auto valid1 = store.validate_token(*raw, "");
+    auto valid1 = store.validate_token(*raw, "device-R");
     REQUIRE(valid1.has_value());
 
     // Revoke by token_id
@@ -119,7 +121,7 @@ TEST_CASE("DeviceTokenStore: revoked token rejected", "[device_token][auth]") {
     CHECK(revoked);
 
     // Validate after revocation should fail
-    auto valid2 = store.validate_token(*raw, "");
+    auto valid2 = store.validate_token(*raw, "device-R");
     REQUIRE(!valid2.has_value());
     CHECK(valid2.error() == DeviceTokenValidateError::revoked);
 }
@@ -182,7 +184,7 @@ TEST_CASE("DeviceTokenStore: validate updates last_used_at", "[device_token][aut
     DeviceTokenStore store(tmp.path);
     REQUIRE(store.is_open());
 
-    auto raw = store.create_token("Usage Token", "admin", "", "", 0);
+    auto raw = store.create_token("Usage Token", "admin", "device-U", "", 0);
     REQUIRE(raw.has_value());
 
     // Before validation, last_used_at should be 0
@@ -191,7 +193,7 @@ TEST_CASE("DeviceTokenStore: validate updates last_used_at", "[device_token][aut
     CHECK(before[0].last_used_at == 0);
 
     // Validate the token (triggers last_used_at update)
-    auto validated = store.validate_token(*raw, "");
+    auto validated = store.validate_token(*raw, "device-U");
     REQUIRE(validated.has_value());
 
     // After validation, last_used_at should be updated
@@ -224,13 +226,15 @@ TEST_CASE("DeviceTokenStore: definition scope stored correctly", "[device_token]
     DeviceTokenStore store(tmp.path);
     REQUIRE(store.is_open());
 
-    auto result = store.create_token("Def Scoped Token", "admin", "", "get-os-info", 0);
+    // Bind to a device so we can validate; the assertion is that definition
+    // scope is recorded independently of device scope. (Pre-W1.2-R2 this used
+    // an empty device_id, which is now rejected as unbound_legacy.)
+    auto result = store.create_token("Def Scoped Token", "admin", "device-D", "get-os-info", 0);
     REQUIRE(result.has_value());
 
-    // device_id is empty -> any-device token, presenter can be empty.
-    auto validated = store.validate_token(*result, "");
+    auto validated = store.validate_token(*result, "device-D");
     REQUIRE(validated.has_value());
-    CHECK(validated->device_id.empty());
+    CHECK(validated->device_id == "device-D");
     CHECK(validated->definition_id == "get-os-info");
 }
 
@@ -258,10 +262,10 @@ TEST_CASE("DeviceTokenStore: non-expiring token (expires_at=0) is valid", "[devi
     DeviceTokenStore store(tmp.path);
     REQUIRE(store.is_open());
 
-    auto result = store.create_token("Perpetual Token", "admin", "", "", 0);
+    auto result = store.create_token("Perpetual Token", "admin", "device-P", "", 0);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result, "");
+    auto validated = store.validate_token(*result, "device-P");
     REQUIRE(validated.has_value());
     CHECK(validated->expires_at == 0);
 }
@@ -272,10 +276,10 @@ TEST_CASE("DeviceTokenStore: future expiry token is valid", "[device_token][auth
     REQUIRE(store.is_open());
 
     auto future = now_epoch() + 86400 * 365; // 1 year from now
-    auto result = store.create_token("Future Token", "admin", "", "", future);
+    auto result = store.create_token("Future Token", "admin", "device-F", "", future);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result, "");
+    auto validated = store.validate_token(*result, "device-F");
     REQUIRE(validated.has_value());
     CHECK(validated->expires_at == future);
 }
@@ -334,33 +338,73 @@ TEST_CASE("DeviceTokenStore: device-bound token rejected when presenter empty",
     CHECK(bad.error() == DeviceTokenValidateError::binding_mismatch);
 }
 
-TEST_CASE("DeviceTokenStore: any-device token (device_id empty) accepts any presenter",
-          "[device_token][binding]") {
-    // Org-wide / bootstrap any-device tokens (device_id="") accept any
-    // presenter. These are an org policy choice — the binding check still
-    // structurally cannot fail because there is no subject to bind to. The
-    // caller still owns the outer principal check.
+TEST_CASE(
+    "DeviceTokenStore: validate_token rejects unbound legacy token with unbound_legacy variant",
+    "[device_token][binding]") {
+    // W1.2 R2 HIGH-1/HIGH-2: a token created with empty device_id (the
+    // pre-#824 default) is a back-door — the old `if (!device_id.empty() && ...)`
+    // would short-circuit and accept any presenter. The new contract refuses
+    // to validate such rows loudly with unbound_legacy, regardless of presenter.
     TempDb tmp;
     DeviceTokenStore store(tmp.path);
     REQUIRE(store.is_open());
 
-    auto raw = store.create_token("AnyDevice", "admin", "", "", 0);
+    auto raw = store.create_token("LegacyAny", "admin", "", "", 0);
     REQUIRE(raw.has_value());
 
-    auto a = store.validate_token(*raw, "device-A");
-    REQUIRE(a.has_value());
-    auto b = store.validate_token(*raw, "device-B");
-    REQUIRE(b.has_value());
+    // Empty presenter — historical caller pattern.
     auto e = store.validate_token(*raw, "");
-    REQUIRE(e.has_value());
+    REQUIRE(!e.has_value());
+    CHECK(e.error() == DeviceTokenValidateError::unbound_legacy);
+
+    // Any non-empty presenter is equally rejected — confirms the
+    // empty-comparison short-circuit is closed.
+    auto a = store.validate_token(*raw, "device-A");
+    REQUIRE(!a.has_value());
+    CHECK(a.error() == DeviceTokenValidateError::unbound_legacy);
+
+    auto b = store.validate_token(*raw, "device-B");
+    REQUIRE(!b.has_value());
+    CHECK(b.error() == DeviceTokenValidateError::unbound_legacy);
+}
+
+TEST_CASE("DeviceTokenStore: validate_token unbound_legacy precedes binding_mismatch and follows "
+          "expired",
+          "[device_token][binding]") {
+    // Ordering invariant: not_found → revoked → expired → unbound_legacy →
+    // binding_mismatch. unbound_legacy comes AFTER expired (so an expired
+    // legacy token reports expired, not unbound_legacy) and BEFORE
+    // binding_mismatch (so an unbound row never reaches the binding check
+    // and thus can never accidentally pass via the empty-comparison
+    // short-circuit).
+    TempDb tmp;
+    DeviceTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    // (a) expired beats unbound_legacy: expired token with empty device_id
+    auto expired_raw = store.create_token("ExpiredLegacy", "admin", "", "", 1);
+    REQUIRE(expired_raw.has_value());
+    auto exp = store.validate_token(*expired_raw, "anything");
+    REQUIRE(!exp.has_value());
+    CHECK(exp.error() == DeviceTokenValidateError::expired);
+
+    // (b) unbound_legacy beats binding_mismatch: a row with empty device_id
+    // never falls through to the binding check, so even a non-matching
+    // presenter reports unbound_legacy (not binding_mismatch).
+    auto legacy_raw = store.create_token("Legacy", "admin", "", "", 0);
+    REQUIRE(legacy_raw.has_value());
+    auto leg = store.validate_token(*legacy_raw, "device-X");
+    REQUIRE(!leg.has_value());
+    CHECK(leg.error() == DeviceTokenValidateError::unbound_legacy);
 }
 
 TEST_CASE("DeviceTokenStore: binding_mismatch precedes neither expired nor revoked",
           "[device_token][binding]") {
-    // Ordering invariant: not_found / revoked / expired are checked before
-    // binding_mismatch because (a) revoked/expired tokens MUST always be
-    // rejected even if the right presenter shows up, and (b) returning
-    // binding_mismatch for a revoked token would leak that the hash exists.
+    // Full ordering invariant: not_found / revoked / expired / unbound_legacy
+    // all precede binding_mismatch. revoked/expired MUST always be rejected
+    // even if the right presenter shows up, and returning binding_mismatch
+    // for a revoked or expired token would leak that the hash exists (worse
+    // disclosure than a generic not_found).
     TempDb tmp;
     DeviceTokenStore store(tmp.path);
     REQUIRE(store.is_open());

@@ -384,12 +384,14 @@ TEST_CASE("T2 REST: device token revoke invalidates validation", "[rest_api_t2][
     DeviceTokenStore store(path);
     REQUIRE(store.is_open());
 
-    auto token_result = store.create_token("revoke-me", "admin", "", "", 0);
+    // Bind to an explicit device — empty device_id tokens are rejected as
+    // unbound_legacy after W1.2 R2.
+    auto token_result = store.create_token("revoke-me", "admin", "device-RV", "", 0);
     REQUIRE(token_result.has_value());
     auto raw_token = *token_result;
 
-    // Validate before revoke succeeds (any-device token: device_id="")
-    auto pre_revoke = store.validate_token(raw_token, "");
+    // Validate before revoke succeeds (presenter matches stored device_id)
+    auto pre_revoke = store.validate_token(raw_token, "device-RV");
     REQUIRE(pre_revoke.has_value());
 
     // Get the token_id from the list so we can revoke by id
@@ -399,7 +401,7 @@ TEST_CASE("T2 REST: device token revoke invalidates validation", "[rest_api_t2][
     CHECK(revoked == true);
 
     // Validate after revoke should fail
-    auto post_revoke = store.validate_token(raw_token, "");
+    auto post_revoke = store.validate_token(raw_token, "device-RV");
     REQUIRE(!post_revoke.has_value());
     CHECK(post_revoke.error() == DeviceTokenValidateError::revoked);
 }
@@ -410,11 +412,13 @@ TEST_CASE("T2 REST: device token expired token fails validation", "[rest_api_t2]
     DeviceTokenStore store(path);
     REQUIRE(store.is_open());
 
-    // Expires at epoch 1 (long past)
-    auto result = store.create_token("expired", "admin", "", "", 1);
+    // Expires at epoch 1 (long past). Bind to a device so the failure is
+    // purely "expired" — unbound_legacy precedes binding_mismatch but follows
+    // expired, so a bound expired token still reports expired.
+    auto result = store.create_token("expired", "admin", "device-E", "", 1);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result, "");
+    auto validated = store.validate_token(*result, "device-E");
     REQUIRE(!validated.has_value());
     CHECK(validated.error() == DeviceTokenValidateError::expired);
 }

@@ -40,8 +40,15 @@ enum class DeviceTokenValidateError {
     revoked,
     /// Row exists and `expires_at > 0 && now > expires_at`.
     expired,
-    /// Row exists, not revoked, not expired, but the agent presenting the
-    /// token does not match `device_id` (#824 stolen-token impersonation).
+    /// Row exists, not revoked, not expired, but the stored `device_id` is
+    /// empty — a legacy / pre-#824 row that has no enforceable binding. We
+    /// refuse to validate such tokens loudly rather than allow any presenter
+    /// to pass the empty-comparison short-circuit (W1.2 R2 HIGH-1/HIGH-2).
+    /// Operator must re-issue with explicit binding.
+    unbound_legacy,
+    /// Row exists, not revoked, not expired, stored `device_id` is non-empty,
+    /// but the agent presenting the token does not match `device_id` (#824
+    /// stolen-token impersonation).
     binding_mismatch,
 };
 
@@ -67,12 +74,14 @@ public:
     /// has authenticated by an independent channel (TLS client cert subject,
     /// gateway-side agent identity, etc.) and is matched against the token's
     /// `device_id` (#824 — prevents a stolen token being replayed by a
-    /// different agent). Pass `""` only when no agent identity is available
-    /// (e.g. early bootstrap before any agent identity exists); the call then
-    /// matches only when the token row's `device_id` is also empty (any-device
-    /// token), and audits the empty-binding case for review. Callers MUST NOT
-    /// silently treat an empty `presenting_agent_id` as "skip the check" —
-    /// that recreates the #824 vulnerability.
+    /// different agent).
+    ///
+    /// As of W1.2 R2 (HIGH-1/HIGH-2) tokens with empty stored `device_id` are
+    /// rejected with `unbound_legacy` rather than treated as any-device, so a
+    /// pre-#824 row cannot be replayed from any presenter. Operators wanting a
+    /// legitimate any-device token must opt in via a future explicit API.
+    /// Callers MUST NOT silently treat an empty `presenting_agent_id` as
+    /// "skip the check" — that recreates the #824 vulnerability.
     [[nodiscard]] std::expected<DeviceAuthToken, DeviceTokenValidateError>
     validate_token(const std::string& raw_token, const std::string& presenting_agent_id) const;
 

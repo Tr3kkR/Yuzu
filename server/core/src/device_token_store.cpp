@@ -254,26 +254,21 @@ DeviceTokenStore::validate_token(const std::string& raw_token,
     if (t.expires_at > 0 && now > t.expires_at)
         return std::unexpected(DeviceTokenValidateError::expired);
 
-    // Binding enforcement: prevents stolen-token impersonation (#824).
-    // The token row stores `device_id` = the agent authorized to present
-    // it. If the caller supplies a `presenting_agent_id` and it does not
-    // match, reject. Empty `device_id` means any-device — those tokens
-    // existed pre-#824 for org-wide bootstrap and remain permissible, but
-    // the caller MUST still authenticate by another channel before issuing
-    // privileges. Empty `presenting_agent_id` is treated as "no claimed
-    // identity"; we permit only the any-device token case so a misuse of
-    // the API (forgetting to pass the agent id) cannot silently bypass
-    // the check.
-    if (!t.device_id.empty() && presenting_agent_id != t.device_id)
-        return std::unexpected(DeviceTokenValidateError::binding_mismatch);
-    if (t.device_id.empty() && !presenting_agent_id.empty()) {
-        // Any-device token claimed by a specific agent — allowed but worth
-        // logging at debug so an auditor can see the broader-than-needed
-        // token in use. No audit row here; the caller owns the per-RPC
-        // audit decision.
-        spdlog::debug("DeviceTokenStore: any-device token '{}' used by agent '{}'", t.token_id,
-                      presenting_agent_id);
+    // HIGH-1/HIGH-2 (PR #824 round 2): tokens stored with empty device_id are
+    // a back-door — any presenter would pass the empty-comparison short-circuit.
+    // Refuse to validate them; the operator must re-issue with explicit binding.
+    if (t.device_id.empty()) {
+        return std::unexpected(DeviceTokenValidateError::unbound_legacy);
     }
+
+    // Binding enforcement: prevents stolen-token impersonation (#824). The
+    // token row stores `device_id` = the agent authorized to present it. If
+    // `presenting_agent_id` does not match, reject. An empty
+    // `presenting_agent_id` is also a mismatch (the stored device_id is
+    // guaranteed non-empty by the unbound_legacy check above), so a caller
+    // that forgets to pass the agent id cannot silently bypass the check.
+    if (presenting_agent_id != t.device_id)
+        return std::unexpected(DeviceTokenValidateError::binding_mismatch);
 
     // Update last_used_at (already holding unique_lock)
     sqlite3_stmt* upd = nullptr;
