@@ -195,6 +195,7 @@ if build_server
       'unit/server/test_inventory_eval.cpp',
       'unit/server/test_execution_statistics.cpp',
       'unit/server/test_device_token_store.cpp',
+      'unit/server/test_device_token_rejection.cpp',
       'unit/server/test_software_deployment_store.cpp',
       'unit/server/test_license_store.cpp',
       'unit/server/test_rest_api_t2.cpp',

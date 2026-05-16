@@ -46,7 +46,7 @@ struct PluginMeta {
 
 struct AgentSession {
     std::string agent_id;
-    std::string session_id;  // Unique per connection — used to prevent stale cleanup races
+    std::string session_id; // Unique per connection — used to prevent stale cleanup races
     std::string hostname;
     std::string os;
     std::string arch;
@@ -54,7 +54,7 @@ struct AgentSession {
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
     std::unordered_map<std::string, std::string> scopable_tags;
-    std::string gateway_node;  // Non-empty if agent is connected via gateway
+    std::string gateway_node; // Non-empty if agent is connected via gateway
 
     // Stream pointer -- valid only while Subscribe() RPC is active.
     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream = nullptr;
@@ -65,7 +65,8 @@ struct AgentSession {
     // Atomic to avoid acquiring the registry mutex on every stream Read.
     std::atomic<int64_t> last_activity_epoch_ms{
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count()};
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count()};
 };
 
 // -- Agent registry -----------------------------------------------------------
@@ -98,6 +99,29 @@ public:
     void clear_stream_if_session(const std::string& agent_id, const std::string& session_id);
 
     void set_gateway_node(const std::string& agent_id, const std::string& node);
+
+    /// #826: record a peer-IP (e.g. `1.2.3.4`, no port, no scheme) as a
+    /// trusted gateway. Populated by `GatewayUpstreamServiceImpl` when a
+    /// gateway successfully proxy-registers an agent — the gateway's own
+    /// peer becomes "known good" for the lifetime of the process.
+    ///
+    /// Subscribe's peer-mismatch check (`agent_service_impl.cpp`) consults
+    /// this set IN ADDITION to checking that the Subscribe peer IP equals
+    /// the Register peer IP. A peer that is NEITHER the original Register
+    /// peer NOR a recorded trusted gateway is always rejected, even when
+    /// `--gateway-mode` is on (the old code skipped the check entirely
+    /// under gateway-mode — the #826 vulnerability).
+    ///
+    /// The set is process-lifetime — there's no eviction. In practice a
+    /// deployment has O(few) gateway peers; even with churn the set is
+    /// bounded by the number of distinct gateway IPs ever seen.
+    void note_trusted_gateway_peer(std::string_view peer_ip);
+
+    /// Returns true if `peer_ip` was previously recorded via
+    /// `note_trusted_gateway_peer`. Empty `peer_ip` always returns false
+    /// — a defence-in-depth guard so a caller that fails to extract the
+    /// IP cannot accidentally satisfy the trusted check.
+    bool is_trusted_gateway_peer(std::string_view peer_ip) const;
 
     // Send a command to a specific agent. Returns false if agent not found or write failed.
     // For gateway agents (no local stream), adds to gateway_pending and returns true.
@@ -157,9 +181,9 @@ public:
     std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const;
 
     // Evaluate a scope expression against all agents, return matching agent IDs.
-    std::vector<std::string> evaluate_scope(const yuzu::scope::Expression& expr,
-                                            const TagStore* tag_store,
-                                            const CustomPropertiesStore* props_store = nullptr) const;
+    std::vector<std::string>
+    evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
+                   const CustomPropertiesStore* props_store = nullptr) const;
 
 private:
     mutable std::mutex mu_;
@@ -169,6 +193,14 @@ private:
     yuzu::MetricsRegistry& metrics_;
     std::mutex gw_pending_mu_;
     std::vector<GatewayPendingCmd> gw_pending_;
+
+    /// #826: trusted gateway peer-IPs (no port, no scheme prefix).
+    /// Lookups are read-mostly (every Subscribe consults the set,
+    /// inserts happen only on ProxyRegister). Could be a
+    /// `shared_mutex`, but the set is tiny (O(few)) and contention
+    /// is negligible — keep a plain `mutex` for simplicity.
+    mutable std::mutex trusted_gateway_mu_;
+    std::unordered_set<std::string> trusted_gateway_peer_ips_;
 };
 
 // -- AgentHealthStore ---------------------------------------------------------

@@ -205,11 +205,16 @@ DeviceTokenStore::create_token(const std::string& name, const std::string& princ
     return raw; // Return raw token (shown once to user)
 }
 
-std::expected<DeviceAuthToken, DeviceTokenValidateError>
+std::expected<DeviceAuthToken, RejectedToken>
 DeviceTokenStore::validate_token(const std::string& raw_token,
                                  const std::string& presenting_agent_id) const {
+    auto reject_input = []() {
+        RejectedToken r;
+        r.error = DeviceTokenValidateError::invalid_input;
+        return r;
+    };
     if (!db_ || raw_token.empty())
-        return std::unexpected(DeviceTokenValidateError::invalid_input);
+        return std::unexpected(reject_input());
 
     auto hashed = hash_token(raw_token);
 
@@ -223,8 +228,11 @@ DeviceTokenStore::validate_token(const std::string& raw_token,
                            "SELECT token_id, name, principal_id, device_id, definition_id, "
                            "created_at, expires_at, last_used_at, revoked "
                            "FROM device_auth_tokens WHERE token_hash = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(DeviceTokenValidateError::not_found);
+                           -1, &s, nullptr) != SQLITE_OK) {
+        RejectedToken r;
+        r.error = DeviceTokenValidateError::not_found;
+        return std::unexpected(std::move(r));
+    }
     sqlite3_bind_text(s, 1, hashed.c_str(), -1, SQLITE_TRANSIENT);
 
     DeviceAuthToken t;
@@ -243,23 +251,45 @@ DeviceTokenStore::validate_token(const std::string& raw_token,
     }
     sqlite3_finalize(s);
 
-    if (!row_found)
-        return std::unexpected(DeviceTokenValidateError::not_found);
+    // #1053: every rejection from this point on has row context that the
+    // W1.3 handler needs to emit a complete audit row WITHOUT a second
+    // SELECT. The helper populates the common (token_id, principal_id)
+    // fields and lets the caller decide whether `bound_device_id` is
+    // meaningful per-variant (unbound_legacy explicitly leaves it empty).
+    auto reject_with_context = [&t](DeviceTokenValidateError err, bool include_bound_device) {
+        RejectedToken r;
+        r.error = err;
+        r.token_id = t.token_id;
+        r.bound_principal_id = t.principal_id;
+        if (include_bound_device)
+            r.bound_device_id = t.device_id;
+        return r;
+    };
+
+    if (!row_found) {
+        RejectedToken r;
+        r.error = DeviceTokenValidateError::not_found;
+        return std::unexpected(std::move(r));
+    }
 
     if (t.revoked)
-        return std::unexpected(DeviceTokenValidateError::revoked);
+        return std::unexpected(
+            reject_with_context(DeviceTokenValidateError::revoked, /*include_bound_device=*/true));
 
     // expires_at == 0 means no expiry
     auto now = now_epoch();
     if (t.expires_at > 0 && now > t.expires_at)
-        return std::unexpected(DeviceTokenValidateError::expired);
+        return std::unexpected(
+            reject_with_context(DeviceTokenValidateError::expired, /*include_bound_device=*/true));
 
     // HIGH-1/HIGH-2 (PR #824 round 2): tokens stored with empty device_id are
     // a back-door — any presenter would pass the empty-comparison short-circuit.
     // Refuse to validate them; the operator must re-issue with explicit binding.
-    if (t.device_id.empty()) {
-        return std::unexpected(DeviceTokenValidateError::unbound_legacy);
-    }
+    // bound_device_id is left empty because the row literally has no binding;
+    // propagating "" would mislead the audit reader.
+    if (t.device_id.empty())
+        return std::unexpected(reject_with_context(DeviceTokenValidateError::unbound_legacy,
+                                                   /*include_bound_device=*/false));
 
     // Binding enforcement: prevents stolen-token impersonation (#824). The
     // token row stores `device_id` = the agent authorized to present it. If
@@ -268,7 +298,8 @@ DeviceTokenStore::validate_token(const std::string& raw_token,
     // guaranteed non-empty by the unbound_legacy check above), so a caller
     // that forgets to pass the agent id cannot silently bypass the check.
     if (presenting_agent_id != t.device_id)
-        return std::unexpected(DeviceTokenValidateError::binding_mismatch);
+        return std::unexpected(reject_with_context(DeviceTokenValidateError::binding_mismatch,
+                                                   /*include_bound_device=*/true));
 
     // Update last_used_at (already holding unique_lock)
     sqlite3_stmt* upd = nullptr;

@@ -332,3 +332,62 @@ TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
     REQUIRE(new_rows.size() == 1);
     CHECK(new_rows[0].status == static_cast<int>(apb::CommandResponse::SUCCESS));
 }
+
+// ── #826 — Subscribe peer-mismatch IP extraction ───────────────────────────
+
+TEST_CASE("AgentServiceImpl::extract_peer_ip handles ipv4/ipv6/unix peer encodings",
+          "[agent_service][peer_mismatch][issue826]") {
+    // gRPC peer encoding is documented at
+    // src/core/lib/iomgr/parse_address.cc; the parser must round-trip
+    // every shape it produces so the Subscribe peer-mismatch check can
+    // operate on IPs (ports differ per-RPC, IPs do not).
+    using yuzu::server::detail::AgentServiceImpl;
+
+    CHECK(AgentServiceImpl::extract_peer_ip("ipv4:1.2.3.4:5678") == "1.2.3.4");
+    CHECK(AgentServiceImpl::extract_peer_ip("ipv4:127.0.0.1:50051") == "127.0.0.1");
+    CHECK(AgentServiceImpl::extract_peer_ip("ipv6:[::1]:50051") == "::1");
+    CHECK(AgentServiceImpl::extract_peer_ip("ipv6:[2001:db8::1]:443") == "2001:db8::1");
+    // unix-domain sockets have no IP to extract → empty. Caller MUST
+    // treat empty as a mismatch (never as a wild match) to avoid #826.
+    CHECK(AgentServiceImpl::extract_peer_ip("unix:/tmp/sock").empty());
+    CHECK(AgentServiceImpl::extract_peer_ip("").empty());
+    // Malformed/unknown scheme → empty
+    CHECK(AgentServiceImpl::extract_peer_ip("garbage").empty());
+    CHECK(AgentServiceImpl::extract_peer_ip("ipv6:no-brackets:8080").empty());
+    CHECK(AgentServiceImpl::extract_peer_ip("ipv6:[unclosed").empty());
+}
+
+TEST_CASE("AgentRegistry::note_trusted_gateway_peer round-trips, refuses empty",
+          "[agent_service][peer_mismatch][issue826]") {
+    // The trusted-gateway set is the second leg of the #826 fix —
+    // gateway-mode Subscribe is allowed if the peer IP was previously
+    // noted via ProxyRegister. Empty IP must NEVER round-trip (would
+    // recreate the bypass).
+    GatewayResponseHarness h;
+    CHECK_FALSE(h.registry.is_trusted_gateway_peer("10.0.0.1"));
+    h.registry.note_trusted_gateway_peer("10.0.0.1");
+    CHECK(h.registry.is_trusted_gateway_peer("10.0.0.1"));
+    CHECK_FALSE(h.registry.is_trusted_gateway_peer("10.0.0.2"));
+
+    // Empty is rejected on insert AND on lookup.
+    h.registry.note_trusted_gateway_peer("");
+    CHECK_FALSE(h.registry.is_trusted_gateway_peer(""));
+    // The original entry survives — the empty insert was a no-op,
+    // not an accidental clear.
+    CHECK(h.registry.is_trusted_gateway_peer("10.0.0.1"));
+}
+
+TEST_CASE("AgentRegistry::is_trusted_gateway_peer holds multiple gateways",
+          "[agent_service][peer_mismatch][issue826]") {
+    // A fleet may have multiple gateway nodes (load-balanced cluster).
+    // Each gateway noted via ProxyRegister joins the trusted set; none
+    // of them displaces another.
+    GatewayResponseHarness h;
+    h.registry.note_trusted_gateway_peer("10.0.0.1");
+    h.registry.note_trusted_gateway_peer("10.0.0.2");
+    h.registry.note_trusted_gateway_peer("::1");
+    CHECK(h.registry.is_trusted_gateway_peer("10.0.0.1"));
+    CHECK(h.registry.is_trusted_gateway_peer("10.0.0.2"));
+    CHECK(h.registry.is_trusted_gateway_peer("::1"));
+    CHECK_FALSE(h.registry.is_trusted_gateway_peer("10.0.0.3"));
+}

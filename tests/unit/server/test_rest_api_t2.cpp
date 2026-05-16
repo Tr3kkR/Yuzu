@@ -403,7 +403,8 @@ TEST_CASE("T2 REST: device token revoke invalidates validation", "[rest_api_t2][
     // Validate after revoke should fail
     auto post_revoke = store.validate_token(raw_token, "device-RV");
     REQUIRE(!post_revoke.has_value());
-    CHECK(post_revoke.error() == DeviceTokenValidateError::revoked);
+    // W1.3 (#1053): error() now returns RejectedToken — reach for `.error`.
+    CHECK(post_revoke.error().error == DeviceTokenValidateError::revoked);
 }
 
 TEST_CASE("T2 REST: device token expired token fails validation", "[rest_api_t2][device_token]") {
@@ -420,7 +421,7 @@ TEST_CASE("T2 REST: device token expired token fails validation", "[rest_api_t2]
 
     auto validated = store.validate_token(*result, "device-E");
     REQUIRE(!validated.has_value());
-    CHECK(validated.error() == DeviceTokenValidateError::expired);
+    CHECK(validated.error().error == DeviceTokenValidateError::expired);
 }
 
 // ============================================================================

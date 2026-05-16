@@ -139,6 +139,18 @@ public:
                                   const std::string& line,
                                   const std::vector<std::string>& col_names);
 
+    /// #826: extract the bare IP from a gRPC peer string. gRPC encodes
+    /// peer as `ipv4:1.2.3.4:5678` (and `ipv6:[::1]:5678`, `unix:/tmp/s`,
+    /// etc.). Subscribe's peer-mismatch check operates on IPs because the
+    /// port differs across the Register and Subscribe RPCs from the same
+    /// agent — the meaningful security check is "same network endpoint",
+    /// not "same TCP four-tuple". Returns an empty string for unparseable
+    /// inputs; the caller MUST treat empty as a mismatch (never as a wild
+    /// match) to avoid recreating the #826 skip.
+    ///
+    /// Public for unit testability — exercised in test_agent_service_impl.cpp.
+    static std::string extract_peer_ip(std::string_view peer);
+
     void publish_output_rows(const std::string& agent_id, const std::string& plugin,
                              const std::string& raw_output);
 
@@ -232,6 +244,7 @@ private:
                                              std::string_view key);
     static bool has_identity_overlap(const std::vector<std::string>& lhs,
                                      const std::vector<std::string>& rhs);
+
     void prune_expired_pending_locked();
     static std::string extract_plugin(const std::string& command_id);
 

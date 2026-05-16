@@ -378,8 +378,45 @@ grpc::Status AgentServiceImpl::Subscribe(
                                 "invalid or expired session");
         }
 
-        if (!gateway_mode_ && it->second.register_peer != context->peer()) {
-            spdlog::warn("Subscribe rejected: peer mismatch for session {}", session_id);
+        // #826 — peer-mismatch enforcement. The old code skipped this
+        // check ENTIRELY when `gateway_mode_` was set, on the theory
+        // that gateway-proxied agents present the gateway's IP rather
+        // than their own. That justified relaxing the per-IP check but
+        // NOT skipping all peer validation: an attacker on the gateway
+        // network segment could intercept a Register response, read
+        // the session_id (plaintext in non-mTLS deployments), then
+        // open Subscribe from an arbitrary IP with the stolen session
+        // and the server would accept it.
+        //
+        // The correct rule is:
+        //   (a) Always allow Subscribe peer IP == Register peer IP
+        //       (same agent, possibly different ephemeral port).
+        //   (b) IF gateway-mode, also allow Subscribe peer IP to be a
+        //       previously-recorded trusted gateway IP. Trusted gateway
+        //       IPs are noted at GatewayUpstreamServiceImpl::ProxyRegister
+        //       time — the gateway's own peer becomes known-good for
+        //       the lifetime of the process.
+        //   (c) Reject anything else.
+        //
+        // Per-port matching is too tight (gRPC opens separate
+        // connections for Register vs Subscribe in some clients) and
+        // unconditional skip is too loose (#826). Per-IP with a
+        // trusted-gateway whitelist is the middle ground.
+        const auto subscribe_peer_ip = extract_peer_ip(context->peer());
+        const auto register_peer_ip = extract_peer_ip(it->second.register_peer);
+        bool peer_ok = !subscribe_peer_ip.empty() && subscribe_peer_ip == register_peer_ip;
+        if (!peer_ok && gateway_mode_) {
+            peer_ok = registry_.is_trusted_gateway_peer(subscribe_peer_ip);
+        }
+        if (!peer_ok) {
+            metrics_
+                .counter("yuzu_grpc_subscribe_peer_mismatch_total",
+                         {{"gateway_mode", gateway_mode_ ? "true" : "false"}})
+                .increment();
+            spdlog::warn("Subscribe rejected: peer mismatch for session {} (register_ip={}, "
+                         "subscribe_ip={}, gateway_mode={})",
+                         session_id, register_peer_ip, subscribe_peer_ip,
+                         gateway_mode_ ? "true" : "false");
             return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "peer mismatch");
         }
 
@@ -1209,6 +1246,44 @@ std::string AgentServiceImpl::client_metadata_value(const grpc::ServerContext& c
     if (it == md.end())
         return {};
     return std::string(it->second.data(), it->second.length());
+}
+
+std::string AgentServiceImpl::extract_peer_ip(std::string_view peer) {
+    // gRPC peer encoding (per src/core/lib/iomgr/parse_address.cc):
+    //   ipv4:1.2.3.4:5678
+    //   ipv6:[::1]:5678        — brackets always present for v6
+    //   ipv6:[2001:db8::1]:443
+    //   unix:/tmp/sock         — no IP, return empty (caller treats as mismatch)
+    //
+    // We extract just the address part:
+    //   "ipv4:1.2.3.4:5678"      -> "1.2.3.4"
+    //   "ipv6:[::1]:5678"        -> "::1"
+    //   "ipv6:[2001:db8::1]:443" -> "2001:db8::1"
+    //   "unix:/tmp/sock"         -> ""
+    //   ""                       -> ""
+    auto colon = peer.find(':');
+    if (colon == std::string_view::npos)
+        return {};
+    auto scheme = peer.substr(0, colon);
+    auto rest = peer.substr(colon + 1);
+    if (scheme == "ipv6") {
+        // [addr]:port  — strip brackets, drop trailing :port
+        if (rest.empty() || rest.front() != '[')
+            return {}; // malformed
+        auto close = rest.find(']');
+        if (close == std::string_view::npos)
+            return {};
+        return std::string(rest.substr(1, close - 1));
+    }
+    if (scheme == "ipv4") {
+        // addr:port
+        auto port_colon = rest.rfind(':');
+        if (port_colon == std::string_view::npos)
+            return std::string(rest);
+        return std::string(rest.substr(0, port_colon));
+    }
+    // unix / other — no IP to extract
+    return {};
 }
 
 bool AgentServiceImpl::has_identity_overlap(const std::vector<std::string>& lhs,

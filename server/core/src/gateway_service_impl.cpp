@@ -21,10 +21,52 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
 
 // -- ProxyRegister ------------------------------------------------------------
 
-grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* /*context*/,
+namespace {
+/// Extract bare IP from a gRPC peer string. Duplicates AgentServiceImpl's
+/// helper deliberately — this TU does not include agent_service_impl.hpp
+/// and we don't want to hoist a shared helper into agent_registry just
+/// for two callers. Both copies trace to the gRPC peer encoding
+/// documented at `parse_address.cc`. If a third caller appears, fold
+/// into a shared `peer_ip.hpp`.
+std::string extract_peer_ip(std::string_view peer) {
+    auto colon = peer.find(':');
+    if (colon == std::string_view::npos)
+        return {};
+    auto scheme = peer.substr(0, colon);
+    auto rest = peer.substr(colon + 1);
+    if (scheme == "ipv6") {
+        if (rest.empty() || rest.front() != '[')
+            return {};
+        auto close = rest.find(']');
+        if (close == std::string_view::npos)
+            return {};
+        return std::string(rest.substr(1, close - 1));
+    }
+    if (scheme == "ipv4") {
+        auto port_colon = rest.rfind(':');
+        if (port_colon == std::string_view::npos)
+            return std::string(rest);
+        return std::string(rest.substr(0, port_colon));
+    }
+    return {};
+}
+} // namespace
+
+grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* context,
                                                        const pb::RegisterRequest* request,
                                                        pb::RegisterResponse* response) {
     const auto& info = request->info();
+
+    // #826: record the gateway's peer IP as a trusted gateway. Any
+    // subsequent Subscribe stream arriving from this IP under
+    // `--gateway-mode` is allowed to bypass the strict per-IP register/
+    // subscribe match — which is the legitimate gateway-relayed flow.
+    // We capture this BEFORE the enrollment branches so even denied
+    // enrollments contribute to gateway-trust discovery (the gateway is
+    // still trusted regardless of whether the proxied agent enrolls).
+    if (context) {
+        registry_.note_trusted_gateway_peer(extract_peer_ip(context->peer()));
+    }
 
     // -- Tiered enrollment (same logic as AgentServiceImpl::Register) ----------
 

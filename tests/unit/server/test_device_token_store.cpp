@@ -75,7 +75,12 @@ TEST_CASE("DeviceTokenStore: invalid token rejected", "[device_token][auth]") {
 
     auto validated = store.validate_token("ydt_this_is_not_a_valid_token_abcdef0123456789", "");
     REQUIRE(!validated.has_value());
-    CHECK(validated.error() == DeviceTokenValidateError::not_found);
+    CHECK(validated.error().error == DeviceTokenValidateError::not_found);
+    // not_found row has no context — token_id / bound_* must be empty
+    // so the audit row can't leak that the hash matched anything.
+    CHECK(validated.error().token_id.empty());
+    CHECK(validated.error().bound_device_id.empty());
+    CHECK(validated.error().bound_principal_id.empty());
 }
 
 TEST_CASE("DeviceTokenStore: empty token rejected", "[device_token][auth]") {
@@ -85,7 +90,8 @@ TEST_CASE("DeviceTokenStore: empty token rejected", "[device_token][auth]") {
 
     auto validated = store.validate_token("", "");
     REQUIRE(!validated.has_value());
-    CHECK(validated.error() == DeviceTokenValidateError::invalid_input);
+    CHECK(validated.error().error == DeviceTokenValidateError::invalid_input);
+    CHECK(validated.error().token_id.empty());
 }
 
 TEST_CASE("DeviceTokenStore: expired token rejected", "[device_token][auth]") {
@@ -101,7 +107,13 @@ TEST_CASE("DeviceTokenStore: expired token rejected", "[device_token][auth]") {
 
     auto validated = store.validate_token(*result, "device-X");
     REQUIRE(!validated.has_value());
-    CHECK(validated.error() == DeviceTokenValidateError::expired);
+    CHECK(validated.error().error == DeviceTokenValidateError::expired);
+    // #1053: rich-rejection context — `expired` populates bound_device_id +
+    // bound_principal_id so the audit row can record what was being attempted
+    // without a second SELECT.
+    CHECK(!validated.error().token_id.empty());
+    CHECK(validated.error().bound_device_id == "device-X");
+    CHECK(validated.error().bound_principal_id == "admin");
 }
 
 TEST_CASE("DeviceTokenStore: revoked token rejected", "[device_token][auth]") {
@@ -123,7 +135,11 @@ TEST_CASE("DeviceTokenStore: revoked token rejected", "[device_token][auth]") {
     // Validate after revocation should fail
     auto valid2 = store.validate_token(*raw, "device-R");
     REQUIRE(!valid2.has_value());
-    CHECK(valid2.error() == DeviceTokenValidateError::revoked);
+    CHECK(valid2.error().error == DeviceTokenValidateError::revoked);
+    // #1053: revoked also carries full bound context — auditor needs to
+    // see WHICH token was being replayed-after-revoke.
+    CHECK(valid2.error().bound_device_id == "device-R");
+    CHECK(valid2.error().bound_principal_id == "admin");
 }
 
 // ============================================================================
@@ -317,7 +333,14 @@ TEST_CASE("DeviceTokenStore: device-bound token rejected from different presente
 
     auto bad = store.validate_token(*raw, "device-B");
     REQUIRE(!bad.has_value());
-    CHECK(bad.error() == DeviceTokenValidateError::binding_mismatch);
+    CHECK(bad.error().error == DeviceTokenValidateError::binding_mismatch);
+    // #1053: binding_mismatch is THE high-signal rejection — `bound_device_id`
+    // + `bound_principal_id` must be set so the audit row can record
+    // "presenter=device-B bound=device-A bound_principal=admin" without
+    // a second SELECT (which would create a timing oracle).
+    CHECK(bad.error().bound_device_id == "device-A");
+    CHECK(bad.error().bound_principal_id == "admin");
+    CHECK(!bad.error().token_id.empty());
 }
 
 TEST_CASE("DeviceTokenStore: device-bound token rejected when presenter empty",
@@ -335,7 +358,9 @@ TEST_CASE("DeviceTokenStore: device-bound token rejected when presenter empty",
 
     auto bad = store.validate_token(*raw, "");
     REQUIRE(!bad.has_value());
-    CHECK(bad.error() == DeviceTokenValidateError::binding_mismatch);
+    CHECK(bad.error().error == DeviceTokenValidateError::binding_mismatch);
+    CHECK(bad.error().bound_device_id == "device-A");
+    CHECK(bad.error().bound_principal_id == "admin");
 }
 
 TEST_CASE(
@@ -355,17 +380,24 @@ TEST_CASE(
     // Empty presenter — historical caller pattern.
     auto e = store.validate_token(*raw, "");
     REQUIRE(!e.has_value());
-    CHECK(e.error() == DeviceTokenValidateError::unbound_legacy);
+    CHECK(e.error().error == DeviceTokenValidateError::unbound_legacy);
+    // #1053: unbound_legacy explicitly leaves bound_device_id empty (the
+    // row literally has no binding — propagating "" would mislead the
+    // auditor). bound_principal_id IS propagated so the operator can find
+    // which admin issued the legacy token and rotate it.
+    CHECK(e.error().bound_device_id.empty());
+    CHECK(e.error().bound_principal_id == "admin");
+    CHECK(!e.error().token_id.empty());
 
     // Any non-empty presenter is equally rejected — confirms the
     // empty-comparison short-circuit is closed.
     auto a = store.validate_token(*raw, "device-A");
     REQUIRE(!a.has_value());
-    CHECK(a.error() == DeviceTokenValidateError::unbound_legacy);
+    CHECK(a.error().error == DeviceTokenValidateError::unbound_legacy);
 
     auto b = store.validate_token(*raw, "device-B");
     REQUIRE(!b.has_value());
-    CHECK(b.error() == DeviceTokenValidateError::unbound_legacy);
+    CHECK(b.error().error == DeviceTokenValidateError::unbound_legacy);
 }
 
 TEST_CASE("DeviceTokenStore: validate_token unbound_legacy precedes binding_mismatch and follows "
@@ -386,7 +418,7 @@ TEST_CASE("DeviceTokenStore: validate_token unbound_legacy precedes binding_mism
     REQUIRE(expired_raw.has_value());
     auto exp = store.validate_token(*expired_raw, "anything");
     REQUIRE(!exp.has_value());
-    CHECK(exp.error() == DeviceTokenValidateError::expired);
+    CHECK(exp.error().error == DeviceTokenValidateError::expired);
 
     // (b) unbound_legacy beats binding_mismatch: a row with empty device_id
     // never falls through to the binding check, so even a non-matching
@@ -395,7 +427,7 @@ TEST_CASE("DeviceTokenStore: validate_token unbound_legacy precedes binding_mism
     REQUIRE(legacy_raw.has_value());
     auto leg = store.validate_token(*legacy_raw, "device-X");
     REQUIRE(!leg.has_value());
-    CHECK(leg.error() == DeviceTokenValidateError::unbound_legacy);
+    CHECK(leg.error().error == DeviceTokenValidateError::unbound_legacy);
 }
 
 TEST_CASE("DeviceTokenStore: binding_mismatch precedes neither expired nor revoked",
@@ -416,10 +448,10 @@ TEST_CASE("DeviceTokenStore: binding_mismatch precedes neither expired nor revok
     // Even with the right presenter, expired wins
     auto exp_ok = store.validate_token(*raw, "device-A");
     REQUIRE(!exp_ok.has_value());
-    CHECK(exp_ok.error() == DeviceTokenValidateError::expired);
+    CHECK(exp_ok.error().error == DeviceTokenValidateError::expired);
     auto exp_bad = store.validate_token(*raw, "device-B");
     REQUIRE(!exp_bad.has_value());
-    CHECK(exp_bad.error() == DeviceTokenValidateError::expired);
+    CHECK(exp_bad.error().error == DeviceTokenValidateError::expired);
 }
 
 // ============================================================================

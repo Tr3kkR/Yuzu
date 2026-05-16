@@ -196,6 +196,26 @@ void AgentRegistry::set_gateway_node(const std::string& agent_id, const std::str
     }
 }
 
+void AgentRegistry::note_trusted_gateway_peer(std::string_view peer_ip) {
+    // #826: defence-in-depth — never record an empty string. An empty
+    // peer IP would later satisfy `is_trusted_gateway_peer("")` and
+    // re-create the bypass we're trying to close.
+    if (peer_ip.empty())
+        return;
+    std::lock_guard lock(trusted_gateway_mu_);
+    trusted_gateway_peer_ips_.emplace(peer_ip);
+}
+
+bool AgentRegistry::is_trusted_gateway_peer(std::string_view peer_ip) const {
+    // #826: empty is NEVER trusted. Without this guard a caller that
+    // failed to extract the peer IP from the gRPC context would pass
+    // an empty string and the check would pass spuriously.
+    if (peer_ip.empty())
+        return false;
+    std::lock_guard lock(trusted_gateway_mu_);
+    return trusted_gateway_peer_ips_.contains(std::string(peer_ip));
+}
+
 bool AgentRegistry::send_to(const std::string& agent_id, const pb::CommandRequest& cmd) {
     std::shared_ptr<AgentSession> session;
     {

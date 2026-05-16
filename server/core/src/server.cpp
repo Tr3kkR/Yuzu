@@ -274,6 +274,41 @@ public:
                           "CSPRNG (RAND_bytes / BCryptGenRandom) failures during token "
                           "issuance, labelled by reason and call site",
                           "counter");
+        // W1.3 (#826 + #1052 + #1053): device-token rejection counters.
+        // Three high-signal variants each get their own counter so SRE
+        // can alert directly without a labels selector. The remaining
+        // variants bucket under yuzu_device_token_rejected_total{variant=...}
+        // so they're still visible without flooding paging surface.
+        // Alert recipes:
+        //   rate(yuzu_device_token_binding_mismatch_total[5m]) > 0
+        //     — stolen-token impersonation attempt in progress (#826)
+        //   rate(yuzu_device_token_unbound_legacy_total[5m]) > 0
+        //     — legacy any-device token is being presented; rotate
+        //   rate(yuzu_device_token_revoked_attempt_total[5m]) > 0
+        //     — revoked token replay; investigate originating IP
+        metrics_.describe("yuzu_device_token_binding_mismatch_total",
+                          "Device-token presenter did not match the bound device_id "
+                          "(#826 stolen-token impersonation attempt)",
+                          "counter");
+        metrics_.describe("yuzu_device_token_unbound_legacy_total",
+                          "Device-token validation refused because the stored row has "
+                          "empty device_id (W1.2 R2 HIGH-1/HIGH-2 — pre-#824 legacy)",
+                          "counter");
+        metrics_.describe("yuzu_device_token_revoked_attempt_total",
+                          "Replay attempt against a revoked device token", "counter");
+        metrics_.describe("yuzu_device_token_rejected_total",
+                          "Low-signal device-token validation rejections (not_found, "
+                          "expired, invalid_input), labelled by variant",
+                          "counter");
+        // #826 sec-S1: Subscribe peer-mismatch rejections, labelled by
+        // gateway_mode so an operator can distinguish "agent reconnected
+        // from a new IP" (steady state in gateway deployments) from
+        // "stolen session_id in non-gateway deployment" (active attack).
+        metrics_.describe("yuzu_grpc_subscribe_peer_mismatch_total",
+                          "Subscribe RPC rejected because the peer IP differs from "
+                          "the Register peer IP and is not a trusted gateway, labelled "
+                          "by gateway_mode (true|false)",
+                          "counter");
         // Login-latency observability (governance PR4 OBS-2). Histogram of
         // PBKDF2 verify duration, labelled by result so alerts can fire on
         // success-path regressions independently of brute-force noise on
