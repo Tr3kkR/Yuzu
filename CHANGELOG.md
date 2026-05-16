@@ -113,11 +113,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- **Gateway peer-mismatch enforcement + wire-boundary rejection collapse
-  (Sprint 1 W1.3 — closes #826 and folds prereqs #1052 + #1053).** The
-  three changes ship together because the W1.3 caller-side handler design
-  depends on the new `RejectedToken` shape, and the wire-collapse rule
-  depends on the public `make_public_rejection` helper.
+- **Gateway peer-mismatch enforcement (Sprint 1 W1.3 — closes #826).**
+  Plus rejection-collapse + enriched-error-payload **infrastructure**
+  for #1052 / #1053 — those issues remain OPEN; W1.4 will be the first
+  consumer to exercise the new helpers and the audit/counter signals.
   - **#826 (P1 security).** `AgentServiceImpl::Subscribe` no longer skips
     peer validation when `--gateway-mode` is set. The blanket skip
     enabled session-id hijacking — an attacker on the gateway network
@@ -126,46 +125,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     arbitrary IP. The new rule: Subscribe peer IP must match the
     Register peer IP, OR (under `--gateway-mode`) be a previously
     recorded trusted gateway IP. Trusted gateways are noted at
-    `GatewayUpstreamServiceImpl::ProxyRegister` time and the set is
-    process-lifetime. A new helper `extract_peer_ip` normalises the
-    gRPC peer encoding (`ipv4:1.2.3.4:5678`, `ipv6:[::1]:443`,
-    `unix:/...`) so port-rotation between Register and Subscribe RPCs
-    doesn't trigger spurious mismatches. New counter
+    `GatewayUpstreamServiceImpl::ProxyRegister` time **only on a
+    successful enrollment branch** (round-2 hardening); the set is in-
+    memory with 1h TTL + 1024-entry LRU cap + new
+    `yuzu_trusted_gateway_peer_set_size` gauge. A new helper
+    `extract_peer_ip` (now in `peer_ip.hpp`) normalises the gRPC peer
+    encoding (`ipv4:1.2.3.4:5678`, `ipv6:[::1]:443`, `unix:/...`) so
+    port-rotation between Register and Subscribe RPCs doesn't trigger
+    spurious mismatches. New counter
     `yuzu_grpc_subscribe_peer_mismatch_total{gateway_mode}` lets SRE
     distinguish "agent reconnected from a new IP" (steady state) from
-    "stolen session_id" (active attack).
-  - **#1053 (W1.3 prereq).** `DeviceTokenStore::validate_token` now
-    returns `std::expected<DeviceAuthToken, RejectedToken>` (was
-    `std::expected<DeviceAuthToken, DeviceTokenValidateError>`). The
-    new `RejectedToken` struct carries typed `error` plus `token_id`,
-    `bound_device_id`, and `bound_principal_id` so the W1.3 handler
-    can emit a complete audit row (`binding_mismatch: presenter=X
-    bound=Y bound_principal=Z`) WITHOUT a second SELECT. A second
-    SELECT would (a) add latency and (b) create a timing oracle
-    distinguishing `binding_mismatch` from `not_found`. Per-variant
-    population rules in `RejectedToken` docstring; `unbound_legacy`
-    explicitly leaves `bound_device_id` empty because the row has no
-    binding by construction.
-  - **#1052 (W1.3 prereq).** New `device_token_rejection.hpp` makes
-    the wire-collapse contract callable and reviewable in one place:
-    `make_public_rejection()` and `make_grpc_rejection_status()`
-    return the SAME 401 / `UNAUTHENTICATED` envelope across every
-    rejection variant. The typed variant surfaces only in
-    `rejection_detail()` (audit-row `detail` field) and
-    `rejection_metric_name()` (Prometheus counter name). An attacker
-    holding a stolen valid token can no longer discriminate
-    `binding_mismatch` from `not_found` to confirm token existence or
-    binding. Latency-band parity (the third leg of the #1052
-    acceptance criterion) is an integration-test follow-up — unit
-    tests can't reliably measure microsecond-band timing in CI noise.
-  - **Operator counters.** Three high-signal device-token counters
-    each get their own metric (no labels selector required):
-    `yuzu_device_token_binding_mismatch_total` (stolen-token
-    impersonation in progress), `yuzu_device_token_unbound_legacy_total`
-    (rotate the legacy any-device token), and
-    `yuzu_device_token_revoked_attempt_total` (replay attempt).
-    Low-signal variants (`not_found`, `expired`, `invalid_input`)
-    bucket under `yuzu_device_token_rejected_total{variant=...}`.
+    "stolen session_id" (active attack). **Layered defence note:** an
+    attacker who sits inside the gateway's IP space (sidecar container,
+    compromised host on the same node) AND has a sniffed `session_id`
+    still passes. W1.4 (atomic enrollment + session-token binding,
+    #827) is the layer that closes that. Don't claim "session theft
+    mitigated" from this PR alone.
+  - **#1053 infrastructure (W1.4 prereq, NOT closed by W1.3).**
+    `DeviceTokenStore::validate_token` now returns
+    `std::expected<DeviceAuthToken, RejectedToken>` (was the bare
+    enum). The new `RejectedToken` struct carries typed `error` plus
+    `token_id`, `bound_device_id`, and `bound_principal_id` so the
+    eventual W1.4 handler can emit a complete audit row WITHOUT a
+    second SELECT (which would add latency and create a timing oracle
+    distinguishing `binding_mismatch` from `not_found`). The type
+    signature is now W1.4's hard predecessor — the compiler refuses to
+    let the handler skip the rich-context path. **No production
+    consumer exists in this PR.** Per-variant population rules in the
+    `RejectedToken` docstring; `unbound_legacy` explicitly leaves
+    `bound_device_id` empty because the row has no binding by
+    construction.
+  - **#1052 infrastructure (W1.4 prereq, NOT closed by W1.3).**
+    New `device_token_rejection.hpp` defines the wire-collapse
+    contract in one reviewable place: `make_public_rejection()` and
+    `make_grpc_rejection_status()` return the SAME 401 /
+    `UNAUTHENTICATED` envelope across every rejection variant. The
+    typed variant surfaces only in `rejection_detail()` (audit-row
+    `detail` field) and `rejection_metric_name()` (Prometheus counter
+    name). **No production code calls these helpers in this PR**
+    (`validate_token` has no caller yet). Unit tests pin the byte-
+    identical envelope contract; latency-band parity (the third leg
+    of the #1052 acceptance criterion) is an integration-test follow-
+    up. W1.4 must wire the first consumer and verify the integration-
+    level latency assertion before #1052 closes.
+  - **Operator counters (DESCRIBED, not yet incremented).** Three
+    high-signal device-token counter names are reserved by
+    `metrics_.describe(...)` in `server.cpp` for W1.4 to start
+    incrementing: `yuzu_device_token_binding_mismatch_total`
+    (stolen-token impersonation in progress),
+    `yuzu_device_token_unbound_legacy_total` (rotate the legacy
+    any-device token), and `yuzu_device_token_revoked_attempt_total`
+    (replay attempt). Plus a low-signal bucket
+    `yuzu_device_token_rejected_total{variant=...}`. These will
+    return 0 from `/metrics` until W1.4 wires the consumer.
 - **Fleet-topology push-ingestion hardening (governance Gate 7).**
   Round of fixes to `FleetTopologyStore` push ingestion:
   - **Parser field caps (UP-1 / sec-M1).** `processes[].name`,
