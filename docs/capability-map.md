@@ -30,9 +30,9 @@ Each capability is rated on two axes:
 Foundation   [================================]  33/33 done  (100%)
 Advanced     [================================]  101/101 done (100%)
 Future       [=====================-----------]  33/50 done  (66%)
-New (Ph 8-16)[=---------------------------]     2/41 done   (5%) (3 partial — Guardian PRs 1-2 + Guardian pre-login activation done; 15.A + 28.4 + 28.6 in flight)
+New (Ph 8-16)[=---------------------------]     2/44 done   (5%) (5 partial — Guardian PRs 1-2 + Guardian pre-login activation done; 15.A + 28.4 + 28.6 + 28.7 fleet-viz in flight)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================---------]   169/225 done (75%)
+Overall      [======================---------]   169/228 done (74%)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
