@@ -219,6 +219,11 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
 
     auto hash = sha256_hex(raw_token);
 
+    // Snapshot the revoke generation BEFORE the cache lookup so that any
+    // revoke that races with our DB read is observable at the cache-write
+    // step below (HIGH-1 defence-in-depth).
+    const auto gen_before = revoke_generation_.load(std::memory_order_acquire);
+
     // Check cache first (avoids SHA256 recomputation is already done, but avoids SQLite query)
     {
         std::lock_guard cache_lock(cache_mtx_);
@@ -296,9 +301,18 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
         sqlite3_step(upd);
         sqlite3_finalize(upd);
 
-        // Store in cache
-        std::lock_guard cache_lock(cache_mtx_);
-        token_cache_[hash] = CachedToken{*result, std::chrono::steady_clock::now()};
+        // Store in cache, but skip the write if a revoke raced our SELECT.
+        // The db_mtx_ exclusive serialization already prevents this
+        // interleave, but the explicit generation re-check survives any
+        // future refactor that narrows the db_lock scope (HIGH-1 on PR
+        // #883). load/load with acquire ordering against the
+        // revoke-path's release-store is sufficient — we only need to
+        // observe that *some* revoke ran, not its ordering vs. other
+        // operations.
+        if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
+            std::lock_guard cache_lock(cache_mtx_);
+            token_cache_[hash] = CachedToken{*result, std::chrono::steady_clock::now()};
+        }
     }
 
     return result;
@@ -390,6 +404,11 @@ bool ApiTokenStore::revoke_token(const std::string& token_id) {
         return false;
 
     std::unique_lock db_lock(db_mtx_);
+    // Bump the revoke generation BEFORE the UPDATE so any concurrent
+    // validate_token whose SELECT outraces this UPDATE will observe the
+    // generation move at its cache-write step and skip the stale write
+    // (HIGH-1).
+    revoke_generation_.fetch_add(1, std::memory_order_release);
     // Look up the token_hash before revoking so we can invalidate the cache
     std::string token_hash;
     {
@@ -417,11 +436,75 @@ bool ApiTokenStore::revoke_token(const std::string& token_id) {
     return changed;
 }
 
+std::size_t ApiTokenStore::revoke_for_principal(const std::string& principal_id) {
+    if (!db_ || principal_id.empty())
+        return 0;
+
+    std::unique_lock db_lock(db_mtx_);
+    // Bump revoke generation BEFORE the UPDATE — same contract as
+    // `revoke_token` (HIGH-1).
+    revoke_generation_.fetch_add(1, std::memory_order_release);
+
+    // Snapshot the hashes of every non-revoked token for the principal so
+    // we can invalidate the in-memory validate_token cache after the
+    // UPDATE. Without this, a freshly-revoked token would still validate
+    // for up to `kTokenCacheTtl` seconds (60 s) — long enough for a
+    // stolen API token to keep working through the entire incident
+    // response window of someone clicking "Sign out everywhere".
+    std::vector<std::string> hashes_to_invalidate;
+    {
+        sqlite3_stmt* q = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                               "SELECT token_hash FROM api_tokens "
+                               "WHERE principal_id = ? AND revoked = 0;",
+                               -1, &q, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(q, 1, principal_id.c_str(), -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(q) == SQLITE_ROW) {
+                hashes_to_invalidate.emplace_back(
+                    safe(reinterpret_cast<const char*>(sqlite3_column_text(q, 0))));
+            }
+            sqlite3_finalize(q);
+        }
+    }
+
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "UPDATE api_tokens SET revoked = 1 "
+                           "WHERE principal_id = ? AND revoked = 0;",
+                           -1, &s, nullptr) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(s, 1, principal_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+
+    // The hashes we snapshotted under db_mtx_ exclusive at lines 453-467
+    // are exactly the rows the UPDATE just transitioned to revoked=1: the
+    // SELECT and UPDATE share the same `WHERE principal_id = ? AND
+    // revoked = 0` predicate, and no other writer can sneak in while we
+    // hold db_mtx_ exclusively. So `hashes_to_invalidate.size()` is the
+    // count — no need for `sqlite3_changes()`.
+    //
+    // Also dodges two distinct foot-guns:
+    //   1. Windows: `std::max(sqlite3_changes(db_), 0)` mangles to garbage
+    //      because `<windows.h>` defines `max` as a macro when NOMINMAX
+    //      is not set, and the macro fight loses to `std::max`.
+    //   2. CLAUDE.md issue #1033: `sqlite3_changes()` after `sqlite3_step()`
+    //      on a FULLMUTEX handle is a documented data race against any
+    //      concurrent step() on the same handle.
+    for (const auto& h : hashes_to_invalidate)
+        invalidate_cache(h);
+    return hashes_to_invalidate.size();
+}
+
 bool ApiTokenStore::delete_token(const std::string& token_id) {
     if (!db_)
         return false;
 
     std::unique_lock db_lock(db_mtx_);
+    // Bump revoke generation BEFORE the DELETE — a delete is a stronger
+    // form of revoke from the cache's perspective, so the same TOCTOU
+    // applies (HIGH-1).
+    revoke_generation_.fetch_add(1, std::memory_order_release);
     // Look up the token_hash before deleting so we can invalidate the cache
     std::string token_hash;
     {

@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **HIGH-2 (PR #883 governance review): session-revocation REST surface
+  now reports audit-emission outcome on the response so a silent audit
+  persistence failure (locked audit DB, disk full, pipeline exception)
+  cannot masquerade as 200 OK SOC 2 CC6.6 evidence.** The `AuditFn`
+  callback (`std::function<…>` in `rest_api_v1.hpp`) and the underlying
+  `AuditStore::log` primitive now return `bool` rather than `void`; the
+  bool propagates through `AuthRoutes::audit_log` and `Server::audit_log`.
+  Existing call sites that fire-and-forget continue to compile — the
+  bool is just discarded. The two session-revocation handlers
+  (`DELETE /api/v1/sessions` and `DELETE /api/v1/sessions/me`) now wrap
+  `audit_fn` in try/catch and surface failure via:
+  - `Sec-Audit-Failed: true` response header (out-of-band signal for
+    SREs scraping responses or evidence integrity dashboards).
+  - `audit_emitted: false` field in the success-body JSON envelope.
+  The revoke side-effect still completes when audit emission fails —
+  operator's "stop NOW" intent takes precedence over evidence
+  integrity, and the partial-success signal lets the operator decide
+  whether to retry. Closes the silent-failure gap flagged in the PR
+  #883 governance review.
+- **HIGH-1 (PR #883 governance review): `ApiTokenStore::validate_token`
+  cache write now skipped when a revoke races our DB SELECT.** Added a
+  `revoke_generation_` atomic counter bumped by `revoke_token`,
+  `revoke_for_principal`, and `delete_token` before each UPDATE/DELETE.
+  `validate_token` snapshots the generation before its SELECT and
+  re-reads before the cache write — if it moved, we lost the race and
+  do not populate the cache with the now-stale (revoked=false) view
+  that would otherwise survive for up to 60 s (the
+  `kTokenCacheTtl`). Belt-and-suspenders: the existing `db_mtx_`
+  exclusive lock already spans SELECT through cache write and prevents
+  the interleave, but the explicit generation re-check survives any
+  future refactor that narrows the lock scope.
+
 ### Added
 
 - **Per-host IPC-graph drill-down (`/viz/host/<agent_id>`).** Double-clicking
@@ -58,6 +92,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `remote_addr` at the parser to bound the wire payload
   regardless of agent behaviour. Test-pinned JS bundle ceiling
   raised 80 KB → 96 KB to fit the new primitives.
+
+- **Session revocation REST surface (SOC 2 CC6.3 revocation, CC6.7
+  disposition, CC6.8 termination evidence).**
+  - `DELETE /api/v1/sessions?username=<name>` — admin force-logout via
+    `UserManagement:Write`. Wipes cookie sessions only; API tokens are
+    deliberately left intact (operator may be revoking a leaked cookie
+    while leaving CI/CD automation running). `username` is validated
+    via `is_valid_username` so NUL bytes / control characters / newlines
+    cannot truncate the SQL bind in a way that diverges from the
+    in-memory `==` compare and silently mis-targets revocation.
+  - `DELETE /api/v1/sessions/me` — authenticated self-revoke "Sign out
+    everywhere". Wipes cookie sessions AND revokes every API token
+    belonging to the caller, so a stolen-laptop scenario kills every
+    credential bearing the user's identity in one call. Sets
+    `Set-Cookie: yuzu_session=; Max-Age=0` on the response so the
+    client side completes the disposition. Rejected with 403 for
+    MCP-tier and service-scoped tokens — those credential classes have
+    no other write privilege and accepting them here would create a
+    novel DoS surface against the human owner.
+  - `AuthManager::invalidate_user_sessions` is now public, returns a
+    `RevokeResult { count, db_persisted }`, and performs the dual-write
+    explicitly. The in-memory wipe runs even on AuthDB DELETE failure
+    (the operator's "stop NOW" mental model demands the active session
+    die immediately), but `db_persisted=false` propagates up so the
+    REST handler audits with `result="partial"` and `detail` includes
+    `db_error=true`. A SOC 2 auditor reading the audit log can
+    distinguish a confirmed durable revocation from a partial one
+    awaiting retry/restart. Defence-in-depth: the AuthDB primitive
+    `invalidate_all_sessions` itself now validates username (sibling
+    primitives `add_user`, `update_role` already did).
+  - `ApiTokenStore::revoke_for_principal` — new public method,
+    transactionally marks every non-revoked token for a principal as
+    revoked and invalidates the in-memory validate-token cache so the
+    revocation takes effect within the next request, not after the
+    60-second TTL.
+  - Two distinct audit actions: `session.revoke_all` (admin cross-user)
+    and `session.revoke_all.self` (self via either route, including
+    admin self-target through the admin path; recoverable by re-auth,
+    distinguishable in SIEM). Audit `target_type` is the project-wide
+    PascalCase `User`. `result` is one of `success`/`partial`/`denied`.
+  - New Prometheus counter
+    `yuzu_auth_sessions_revoked_total{caller, result, scope}` — CC7.2
+    anomaly-detection signal for "100 revokes/minute" patterns.
+  - Settings → Users grows "Revoke sessions" (`btn-danger`) per non-self
+    row and "Sign out everywhere" on the operator's own row, with
+    `hx-confirm` blast-radius messaging that explicitly states whether
+    API tokens are revoked. The admin button uses
+    `hx-target="#user-section" hx-swap="innerHTML"` so the section
+    re-renders cleanly after a revoke (without it, HTMX swapped the
+    raw JSON into the button itself).
+  - Operator runbook in `docs/user-manual/server-admin.md` ("Force-
+    logging out a user (incident response)") and emergency manual-
+    revocation recipe in `docs/ops-runbooks/auth-db-recovery.md`.
+  - 16 unit tests in `tests/unit/server/test_rest_sessions.cpp` and 3
+    direct AuthManager tests in `tests/unit/server/test_auth.cpp`
+    pinning the REST contract, the dual-write semantics, the
+    multi-token wipe, and idempotency.
+
+  Self-target through the admin path is permitted (recoverable by
+  re-auth) and audited as `.self`; this is a deliberately weaker
+  guard than the `#397/#403` self-target guard on DELETE-user /
+  role-demote, which exists to prevent admin-role self-lockout (an
+  unrecoverable state).
 
 ### Changed
 

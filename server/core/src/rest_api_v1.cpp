@@ -5,6 +5,8 @@
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
 
+#include <yuzu/server/auth_db.hpp>  // is_valid_username
+
 // nlohmann/json is retained ONLY for parsing request bodies (json::parse).
 // All response JSON is built via the lightweight JObj/JArr helpers below,
 // which produce strings directly and avoid the template-instantiation
@@ -504,14 +506,15 @@ void RestApiV1::register_routes(
     ServiceGroupFn service_group_fn, TagPushFn tag_push_fn, InventoryStore* inventory_store,
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
-    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry) {
+    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
+    SessionRevokeFn session_revoke_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
                     execution_tracker, schedule_engine, approval_manager, tag_store, audit_store,
                     std::move(service_group_fn), std::move(tag_push_fn), inventory_store,
                     product_pack_store, sw_deploy_store, device_token_store, license_store,
-                    guaranteed_state_store, metrics_registry);
+                    guaranteed_state_store, metrics_registry, std::move(session_revoke_fn));
 }
 
 void RestApiV1::register_routes(
@@ -523,7 +526,8 @@ void RestApiV1::register_routes(
     ServiceGroupFn service_group_fn, TagPushFn tag_push_fn, InventoryStore* inventory_store,
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
-    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry) {
+    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
+    SessionRevokeFn session_revoke_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1197,6 +1201,208 @@ void RestApiV1::register_routes(
         audit_fn(req, "api_token.revoke", "success", "ApiToken", token_id,
                  "owner=" + existing->principal_id);
         res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
+    });
+
+    // ── Sessions (/api/v1/sessions) ──────────────────────────────────────
+    //
+    // Two entry points to `AuthManager::invalidate_user_sessions` (the
+    // dual-write primitive that wipes both `auth.db` rows and the
+    // in-memory `sessions_` map):
+    //   - DELETE /api/v1/sessions?username=<name> — admin force-logout
+    //     of another user. Cookie sessions only; API tokens deliberately
+    //     left intact (operator might be revoking a leaked cookie while
+    //     leaving CI/CD automation running).
+    //   - DELETE /api/v1/sessions/me — caller signs out everywhere.
+    //     BOTH cookie sessions AND API tokens are revoked, because the
+    //     operator mental model for "Sign out everywhere" is the
+    //     stolen-laptop scenario where every credential bearing the
+    //     user's identity must die. Closes UP-13.
+    //
+    // Self-target guard differs from the DELETE-user / role-demotion
+    // guards in `settings_routes.cpp`: revoking your own sessions is
+    // *recoverable* (re-auth and you are back), so the admin path
+    // permits self-target but routes through the `session.revoke_all.self`
+    // audit action so SIEM rules can distinguish operator self-service
+    // from a sibling-admin force-logout. Compliance officer's CC6.6
+    // evidence chain depends on that split.
+
+    // DELETE /api/v1/sessions/me — self-revoke. No admin gate; auth
+    // alone is sufficient. Rejected for MCP-tier and service-scoped
+    // tokens — those credential classes have no other write privilege
+    // and accepting them here would create a novel DoS surface against
+    // the human owner (sec-M2 / UP-14).
+    sink.Delete("/api/v1/sessions/me", [auth_fn, audit_fn, session_revoke_fn](
+                                          const httplib::Request& req, httplib::Response& res) {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
+        if (session->username.empty()) {
+            // Defence-in-depth (sec-M1): require_auth shouldn't ever
+            // produce an empty username, but if it does we must NOT fall
+            // through to revoke — comparing two empty strings would
+            // mis-attribute the action.
+            res.status = 500;
+            res.set_content(error_json("session has empty username", 500),
+                            "application/json");
+            return;
+        }
+        // Audit emission helper — wraps audit_fn so we can capture both
+        // silent persistence failures (bool=false) and exceptions, and
+        // surface either via `Sec-Audit-Failed: true` + `audit_emitted`
+        // in the response body. HIGH-2 on PR #883: a 200 OK response
+        // that hides a lost audit row is fictional SOC 2 CC6.6/CC7.2
+        // evidence.
+        auto try_audit = [&audit_fn, &req](const std::string& action, const std::string& result,
+                                           const std::string& target_type,
+                                           const std::string& target_id,
+                                           const std::string& detail) -> RestApiV1::AuditEmission {
+            try {
+                bool ok = audit_fn(req, action, result, target_type, target_id, detail);
+                return RestApiV1::AuditEmission{ok, /*threw=*/false};
+            } catch (const std::exception& e) {
+                spdlog::error("audit_fn threw on session-revoke action={} target={}: {}",
+                              action, target_id, e.what());
+                return RestApiV1::AuditEmission{false, /*threw=*/true};
+            } catch (...) {
+                spdlog::error("audit_fn threw unknown on session-revoke action={} target={}",
+                              action, target_id);
+                return RestApiV1::AuditEmission{false, /*threw=*/true};
+            }
+        };
+
+        if (!session->mcp_tier.empty() || !session->token_scope_service.empty()) {
+            // sec-M2: a leaked readonly MCP token, or a service-scoped
+            // automation token, must not be able to wipe its principal's
+            // interactive cookies. Use the dashboard or a session cookie
+            // for that.
+            const auto audit = try_audit(
+                "session.revoke_all.self", "denied", "User", session->username,
+                "non-interactive credential rejected (mcp_tier='"
+                + session->mcp_tier + "' scope='" + session->token_scope_service + "')");
+            if (!audit.emitted)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = 403;
+            res.set_content(
+                error_json("self-revoke requires an interactive session, not an API token", 403),
+                "application/json");
+            return;
+        }
+        if (!session_revoke_fn) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
+        const auto result = session_revoke_fn(session->username, /*revoke_api_tokens=*/true);
+        const std::string audit_result = result.db_persisted ? "success" : "partial";
+        const std::string detail =
+            "count=" + std::to_string(result.cookie_sessions_revoked)
+            + " api_tokens_revoked=" + std::to_string(result.api_tokens_revoked)
+            + (result.db_persisted ? "" : " db_error=true");
+        const auto audit = try_audit("session.revoke_all.self", audit_result, "User",
+                                     session->username, detail);
+        // CC6.7 disposition: clear the caller's cookie on the response so
+        // the client side completes the revocation. Mirrors POST /logout
+        // attribute set; the `Secure` flag (set on issuance based on
+        // https config) is omitted here to match the logout precedent —
+        // the cookie attributes only need to identify the cookie for
+        // browser deletion, not match the original issuance flags.
+        res.set_header("Set-Cookie",
+                       "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+        if (!audit.emitted)
+            res.set_header("Sec-Audit-Failed", "true");
+        res.set_content(ok_json(JObj()
+                                    .add("revoked",
+                                         static_cast<int64_t>(result.cookie_sessions_revoked))
+                                    .add("api_tokens_revoked",
+                                         static_cast<int64_t>(result.api_tokens_revoked))
+                                    .add("db_persisted", result.db_persisted)
+                                    .add("audit_emitted", audit.emitted)
+                                    .str()),
+                        "application/json");
+    });
+
+    // DELETE /api/v1/sessions?username=<name> — admin-only force-logout.
+    // Gated by `UserManagement:Write` because the action mutates a user's
+    // access state (parity with role change / disable). `username` query
+    // parameter is required AND validated with `is_valid_username` so a
+    // NUL byte in the input cannot truncate the SQL bind in a way that
+    // diverges from the in-memory `==` comparison (sec-H1 / UP-8).
+    sink.Delete("/api/v1/sessions", [auth_fn, perm_fn, audit_fn, session_revoke_fn](
+                                       const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "UserManagement", "Write"))
+            return;
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
+        if (session->username.empty()) {
+            // sec-M1: empty caller username would mis-attribute the
+            // self-vs-cross-user audit action selection below.
+            res.status = 500;
+            res.set_content(error_json("session has empty username", 500),
+                            "application/json");
+            return;
+        }
+        if (!session_revoke_fn) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
+        const auto username = req.get_param_value("username");
+        if (username.empty()) {
+            res.status = 400;
+            res.set_content(error_json("username query parameter required", 400),
+                            "application/json");
+            return;
+        }
+        if (!is_valid_username(username)) {
+            // sec-H1: reject NUL bytes, control characters, newlines.
+            // Without this the audit `target_id` records the full
+            // attacker-controlled string while the SQL bind silently
+            // truncates at NUL — different rows hit memory vs disk.
+            res.status = 400;
+            res.set_content(error_json("invalid username format", 400),
+                            "application/json");
+            return;
+        }
+        const auto result = session_revoke_fn(username, /*revoke_api_tokens=*/false);
+        // Self-revoke via the admin path — distinguish in audit so
+        // forensics can tell operator self-service apart from a sibling
+        // admin force-logout (CC6.6 evidence).
+        const std::string action =
+            (username == session->username) ? "session.revoke_all.self" : "session.revoke_all";
+        const std::string audit_result = result.db_persisted ? "success" : "partial";
+        const std::string detail =
+            "count=" + std::to_string(result.cookie_sessions_revoked)
+            + (result.db_persisted ? "" : " db_error=true");
+        // HIGH-2 on PR #883 — wrap in try/catch and capture the audit_fn
+        // bool return so a silent persist failure (audit DB locked /
+        // disk full) or an exception path doesn't masquerade as 200 OK
+        // SOC 2 evidence. The `Sec-Audit-Failed` response header gives
+        // SRE/SIEM scrapers an out-of-band signal; the `audit_emitted`
+        // body field gives the API client the same signal.
+        bool audit_emitted = true;
+        try {
+            audit_emitted =
+                audit_fn(req, action, audit_result, "User", username, detail);
+        } catch (const std::exception& e) {
+            spdlog::error("audit_fn threw on session-revoke action={} target={}: {}",
+                          action, username, e.what());
+            audit_emitted = false;
+        } catch (...) {
+            spdlog::error("audit_fn threw unknown on session-revoke action={} target={}",
+                          action, username);
+            audit_emitted = false;
+        }
+        if (!audit_emitted)
+            res.set_header("Sec-Audit-Failed", "true");
+        res.set_content(ok_json(JObj()
+                                    .add("username", username)
+                                    .add("revoked",
+                                         static_cast<int64_t>(result.cookie_sessions_revoked))
+                                    .add("db_persisted", result.db_persisted)
+                                    .add("audit_emitted", audit_emitted)
+                                    .str()),
+                        "application/json");
     });
 
     // ── Quarantine (/api/v1/quarantine) ──────────────────────────────────

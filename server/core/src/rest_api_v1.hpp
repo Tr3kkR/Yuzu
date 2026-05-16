@@ -54,6 +54,45 @@ public:
     using ServiceGroupFn = std::function<void(const std::string& service_value)>;
     using TagPushFn = std::function<void(const std::string& agent_id, const std::string& key)>;
 
+    /// Outcome of a session-revocation REST call. `cookie_sessions_revoked`
+    /// is the number of in-memory cookie sessions wiped (the operationally
+    /// meaningful "active session" count). `api_tokens_revoked` is the
+    /// number of API tokens marked revoked for the principal — non-zero
+    /// only when the caller asked for full-principal revocation
+    /// (`/me`'s "Sign out everywhere"; admin force-logout deliberately
+    /// leaves automation tokens intact). `db_persisted` reports whether
+    /// the AuthDB DELETE for cookie sessions succeeded; when false, the
+    /// caller MUST surface this in the audit row (a "success" audit row
+    /// hiding a DB write failure produces fictional CC6.3/CC6.6 evidence).
+    struct SessionRevokeResult {
+        std::size_t cookie_sessions_revoked{0};
+        std::size_t api_tokens_revoked{0};
+        bool db_persisted{true};
+    };
+
+    /// Carrier for the audit-emission outcome on a session-revocation
+    /// response. Populated by the handler from the AuditFn return value
+    /// (and an exception try/catch). Distinct from `SessionRevokeResult`
+    /// because the audit emission happens AFTER the revoke primitive
+    /// completes — operator's "stop NOW" still takes effect even when
+    /// the SOC 2 evidence row is lost (HIGH-2 on PR #883).
+    struct AuditEmission {
+        bool emitted{true};
+        // True iff AuditFn threw — distinguishes silent persist failure
+        // from an exception path. Both produce `emitted=false` and the
+        // `Sec-Audit-Failed: true` response header; the `threw` flag is
+        // only surfaced in the spdlog trail.
+        bool threw{false};
+    };
+
+    /// Revoke every credential bearing a username — cookie sessions
+    /// (`AuthManager::invalidate_user_sessions`) and, when
+    /// `revoke_api_tokens=true`, the user's API tokens (closes UP-13:
+    /// "Sign out everywhere" must mean everywhere, not just browser
+    /// cookies). Empty/missing callback = endpoint returns 503.
+    using SessionRevokeFn = std::function<SessionRevokeResult(
+        const std::string& username, bool revoke_api_tokens)>;
+
     /// Production overload — constructs an HttplibRouteSink and delegates
     /// to the sink-based overload below.
     ///
@@ -74,7 +113,8 @@ public:
                          DeviceTokenStore* device_token_store = nullptr,
                          LicenseStore* license_store = nullptr,
                          GuaranteedStateStore* guaranteed_state_store = nullptr,
-                         yuzu::MetricsRegistry* metrics_registry = nullptr);
+                         yuzu::MetricsRegistry* metrics_registry = nullptr,
+                         SessionRevokeFn session_revoke_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -92,7 +132,8 @@ public:
                          DeviceTokenStore* device_token_store = nullptr,
                          LicenseStore* license_store = nullptr,
                          GuaranteedStateStore* guaranteed_state_store = nullptr,
-                         yuzu::MetricsRegistry* metrics_registry = nullptr);
+                         yuzu::MetricsRegistry* metrics_registry = nullptr,
+                         SessionRevokeFn session_revoke_fn = {});
 };
 
 } // namespace yuzu::server

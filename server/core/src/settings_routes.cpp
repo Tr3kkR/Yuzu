@@ -450,13 +450,38 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
                 // also rejects self-targeted requests; both halves are load-
                 // bearing because the UI guard alone does not stop a hand-
                 // crafted HTTP DELETE.
+                //
+                // Self-revoke is permitted (recoverable — operator just
+                // re-authenticates) and routes through `/api/v1/sessions/me`
+                // so the audit row records `session.revoke_all.self`.
                 html += "<span class=\"current-user-badge\" "
                         "style=\"color:#484f58;font-size:0.7rem;"
-                        "font-style:italic\" "
+                        "font-style:italic;margin-right:0.5rem\" "
                         "title=\"You cannot remove your own account\">"
-                        "Current user</span>";
+                        "Current user</span>"
+                        "<button class=\"btn btn-secondary\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
+                        "hx-delete=\"/api/v1/sessions/me\" "
+                        "hx-confirm=\"Sign out of every device AND revoke "
+                        "every API token you own? You will be redirected to "
+                        "the login page; any of your CI/CD or automation "
+                        "tokens will need to be re-issued.\" "
+                        "hx-on::after-request=\"window.location='/login'\""
+                        ">Sign out everywhere</button>";
             } else {
                 html += "<button class=\"btn btn-danger\" "
+                        "style=\"padding:0.2rem 0.6rem;font-size:0.7rem;"
+                        "margin-right:0.3rem\" "
+                        "hx-delete=\"/api/v1/sessions?username=" +
+                        html_escape(u.username) +
+                        "\" "
+                        "hx-target=\"#user-section\" hx-swap=\"innerHTML\" "
+                        "hx-confirm=\"Force &quot;" +
+                        html_escape(u.username) +
+                        "&quot; to log in again? Active dashboard sessions "
+                        "will end immediately. Their API tokens are NOT revoked.\""
+                        ">Revoke sessions</button>"
+                        "<button class=\"btn btn-danger\" "
                         "style=\"padding:0.2rem 0.6rem;font-size:0.7rem\" "
                         "hx-delete=\"/api/settings/users/" +
                         html_escape(u.username) +
