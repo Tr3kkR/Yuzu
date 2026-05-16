@@ -192,6 +192,71 @@ TEST_CASE("DeviceTokenStore: revoke non-existent returns false", "[device_token]
 }
 
 // ============================================================================
+// W1.5 / #823 — revoke_by_principal
+// ============================================================================
+
+TEST_CASE("DeviceTokenStore: revoke_by_principal revokes every still-valid token for the principal",
+          "[device_token][823][crud]") {
+    TempDb tmp;
+    DeviceTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    // Two tokens for alice (different devices), one for bob — bob's must
+    // not be touched.
+    auto a1 = store.create_token("alice-1", "alice", "device-A1", "", 0);
+    auto a2 = store.create_token("alice-2", "alice", "device-A2", "", 0);
+    auto b1 = store.create_token("bob-1", "bob", "device-B1", "", 0);
+    REQUIRE(a1.has_value());
+    REQUIRE(a2.has_value());
+    REQUIRE(b1.has_value());
+
+    // Sanity: all three valid before revoke.
+    REQUIRE(store.validate_token(*a1, "device-A1").has_value());
+    REQUIRE(store.validate_token(*a2, "device-A2").has_value());
+    REQUIRE(store.validate_token(*b1, "device-B1").has_value());
+
+    auto revoked = store.revoke_by_principal("alice");
+    CHECK(revoked == 2);
+
+    // Alice's tokens are now rejected with the typed `revoked` variant.
+    auto v1 = store.validate_token(*a1, "device-A1");
+    REQUIRE(!v1.has_value());
+    CHECK(v1.error().error == DeviceTokenValidateError::revoked);
+
+    auto v2 = store.validate_token(*a2, "device-A2");
+    REQUIRE(!v2.has_value());
+    CHECK(v2.error().error == DeviceTokenValidateError::revoked);
+
+    // Bob's token is unaffected — the WHERE clause must filter by principal.
+    auto v3 = store.validate_token(*b1, "device-B1");
+    REQUIRE(v3.has_value());
+}
+
+TEST_CASE("DeviceTokenStore: revoke_by_principal is idempotent and skips already-revoked rows",
+          "[device_token][823][crud]") {
+    TempDb tmp;
+    DeviceTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    auto t = store.create_token("only", "alice", "device-A", "", 0);
+    REQUIRE(t.has_value());
+
+    // First call revokes the one row; second call sees it as already-revoked
+    // (the `AND revoked = 0` guard) and returns 0.
+    CHECK(store.revoke_by_principal("alice") == 1);
+    CHECK(store.revoke_by_principal("alice") == 0);
+
+    // Principal with no rows → 0.
+    CHECK(store.revoke_by_principal("nobody") == 0);
+
+    // Empty principal is rejected at the wrapper — must not match
+    // historical rows that happen to have an empty principal_id (no such
+    // rows in current schema, but the guard exists so a buggy caller
+    // passing the default empty string can't ever nuke the whole table).
+    CHECK(store.revoke_by_principal("") == 0);
+}
+
+// ============================================================================
 // Validate updates last_used_at
 // ============================================================================
 

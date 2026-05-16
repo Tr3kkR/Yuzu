@@ -134,6 +134,21 @@ public:
     /// Revoke a token by ID.
     bool revoke_token(const std::string& token_id);
 
+    /// W1.5 / #823: revoke every still-valid token whose `principal_id`
+    /// matches. Called from `AgentRegistry::register_agent` so a
+    /// re-registration invalidates any device tokens issued under the
+    /// previous incarnation of the same agent_id — an attacker who briefly
+    /// impersonated the agent (mTLS-disabled flow, #779) could otherwise
+    /// replay the previously issued token indefinitely. Returns the number
+    /// of rows newly revoked (0 = no matching tokens or all were already
+    /// revoked; idempotent).
+    ///
+    /// Uses `RETURNING` rather than `sqlite3_changes()` to avoid the
+    /// FULLMUTEX race documented in #1033 (CLAUDE.md routed concern).
+    /// Empty `principal_id` is a no-op so a forgotten id can't accidentally
+    /// match the empty-string default a buggy caller might pass.
+    int64_t revoke_by_principal(const std::string& principal_id);
+
 private:
     sqlite3* db_{nullptr};
     mutable std::shared_mutex mtx_;

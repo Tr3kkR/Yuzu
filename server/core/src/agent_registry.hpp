@@ -27,6 +27,7 @@
 namespace yuzu::server {
 class TagStore;
 class CustomPropertiesStore;
+class DeviceTokenStore;
 } // namespace yuzu::server
 
 namespace yuzu::server::detail {
@@ -154,6 +155,23 @@ public:
     /// no caller in `server/core/src/**` references it.
     void expire_trusted_gateway_for_test(std::chrono::seconds offset);
 
+    /// W1.5 / #823: install the device-token store so `register_agent`
+    /// revokes any device tokens issued under a previous incarnation of
+    /// the same agent_id whenever a re-registration is detected. Optional
+    /// — if never called, register_agent behaves as before and stale
+    /// tokens survive re-registration. Wiring lives behind a setter rather
+    /// than the constructor to avoid disturbing the existing AgentRegistry
+    /// construction sites, and because production `server.cpp` does not
+    /// yet construct a DeviceTokenStore (the call site exists in tests
+    /// today; the invariant lands now so it can't be forgotten when the
+    /// production wiring catches up).
+    ///
+    /// Thread contract: holds the registry mutex so a concurrent
+    /// `register_agent` cannot observe a partially-installed pointer.
+    /// In practice the only caller is the startup wiring path, but the
+    /// lock costs nothing and removes a footgun.
+    void set_device_token_store(DeviceTokenStore* store);
+
     // Send a command to a specific agent. Returns false if agent not found or write failed.
     // For gateway agents (no local stream), adds to gateway_pending and returns true.
     bool send_to(const std::string& agent_id, const pb::CommandRequest& cmd);
@@ -248,6 +266,11 @@ private:
     /// `trusted_gateway_mu_`. Republishes the Prometheus gauge after the
     /// edit lands.
     void sweep_and_publish_trusted_gateway_locked();
+
+    /// W1.5 / #823: optional device-token store used by `register_agent`
+    /// to revoke stale tokens on re-registration. Guarded by `mu_` (set
+    /// via `set_device_token_store`, read inside `register_agent`).
+    DeviceTokenStore* device_token_store_{nullptr};
 };
 
 // -- AgentHealthStore ---------------------------------------------------------

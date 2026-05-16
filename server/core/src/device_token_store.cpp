@@ -369,4 +369,35 @@ bool DeviceTokenStore::revoke_token(const std::string& token_id) {
     return sqlite3_changes(db_) > 0;
 }
 
+int64_t DeviceTokenStore::revoke_by_principal(const std::string& principal_id) {
+    // Empty principal_id is a no-op: a buggy caller passing the empty default
+    // must not be able to revoke the entire table or match historical rows
+    // that lack a principal binding. See header doc.
+    if (!db_ || principal_id.empty())
+        return 0;
+
+    std::unique_lock lock(mtx_);
+
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "UPDATE device_auth_tokens SET revoked = 1 "
+                           "WHERE principal_id = ? AND revoked = 0 "
+                           "RETURNING token_id;",
+                           -1, &s, nullptr) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(s, 1, principal_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    // RETURNING avoids the FULLMUTEX sqlite3_changes() race (#1033). Each
+    // SQLITE_ROW step yields one revoked token_id; we count and log.
+    int64_t revoked = 0;
+    while (sqlite3_step(s) == SQLITE_ROW)
+        ++revoked;
+    sqlite3_finalize(s);
+
+    if (revoked > 0)
+        spdlog::info("DeviceTokenStore: revoked {} device token(s) for principal '{}'", revoked,
+                     principal_id);
+    return revoked;
+}
+
 } // namespace yuzu::server

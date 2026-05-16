@@ -4,6 +4,7 @@
 #include <cctype>
 
 #include "custom_properties_store.hpp"
+#include "device_token_store.hpp"
 #include "tag_store.hpp"
 #include "web_utils.hpp"
 
@@ -16,6 +17,14 @@ using yuzu::server::html_escape;
 
 AgentRegistry::AgentRegistry(EventBus& bus, yuzu::MetricsRegistry& metrics)
     : bus_(bus), metrics_(metrics) {}
+
+void AgentRegistry::set_device_token_store(DeviceTokenStore* store) {
+    // Take mu_ so a concurrent register_agent cannot observe a half-written
+    // pointer. In practice this setter is called once during startup wiring,
+    // but the lock costs nothing under that pattern and removes a footgun.
+    std::lock_guard lock(mu_);
+    device_token_store_ = store;
+}
 
 void AgentRegistry::register_agent(const pb::AgentInfo& info) {
     auto session = std::make_shared<AgentSession>();
@@ -43,8 +52,20 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
         std::lock_guard lock(mu_);
         // Clean up stale session_to_agent_ entry from a prior connection
         auto old = agents_.find(info.agent_id());
-        if (old != agents_.end() && !old->second->session_id.empty()) {
-            session_to_agent_.erase(old->second->session_id);
+        if (old != agents_.end()) {
+            // W1.5 / #823: re-registration revokes any device tokens still
+            // bound to this agent_id BEFORE the new session is installed. An
+            // attacker who briefly held this identity (mTLS-disabled flow,
+            // #779) could otherwise replay tokens previously issued to it
+            // indefinitely. Done under `mu_` so the install and the revoke
+            // are observed atomically by any concurrent reader. First-time
+            // registrations skip the revoke (agents_ has no entry), which
+            // preserves the operator workflow of pre-issuing a token for an
+            // agent_id that has not registered yet.
+            if (device_token_store_)
+                device_token_store_->revoke_by_principal(info.agent_id());
+            if (!old->second->session_id.empty())
+                session_to_agent_.erase(old->second->session_id);
         }
         agents_[info.agent_id()] = session;
     }
