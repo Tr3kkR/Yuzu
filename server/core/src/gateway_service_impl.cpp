@@ -1,7 +1,12 @@
 #include "gateway_service_impl.hpp"
 
+#include <chrono>
+
 #include <nlohmann/json.hpp>
 
+#include "analytics_event_store.hpp"
+#include "audit_store.hpp"
+#include "enrollment_token_rejection.hpp"
 #include "fleet_topology_store.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_store.hpp"
@@ -58,15 +63,143 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
         const auto& enrollment_token = request->enrollment_token();
 
         if (!enrollment_token.empty()) {
-            if (!auth_mgr_.validate_enrollment_token(enrollment_token)) {
-                spdlog::warn("[gateway] Agent {} presented invalid enrollment token",
-                             info.agent_id());
+            // -- W1.1 UP-H2 length bound (mirrored from the direct path) ------
+            if (enrollment_token.size() > auth::kMaxEnrollmentTokenLength) {
+                spdlog::warn(
+                    "[gateway] Agent {} presented oversize enrollment token ({} chars > {})",
+                    info.agent_id(), enrollment_token.size(), auth::kMaxEnrollmentTokenLength);
+                if (metrics_) {
+                    metrics_
+                        ->counter("yuzu_enrollment_token_rejected_total",
+                                  {{"variant", "invalid_input_length"}})
+                        .increment();
+                }
+                if (analytics_store_) {
+                    AnalyticsEvent ae;
+                    ae.event_type = "agent.enrollment_denied";
+                    ae.agent_id = info.agent_id();
+                    ae.hostname = info.hostname();
+                    ae.os = info.platform().os();
+                    ae.arch = info.platform().arch();
+                    ae.severity = Severity::kWarn;
+                    ae.attributes = {{"reason", "invalid_input_length"},
+                                     {"token_length", enrollment_token.size()},
+                                     {"source", "gateway_proxy"}};
+                    analytics_store_->emit(std::move(ae));
+                }
                 response->set_accepted(false);
-                response->set_reject_reason("invalid, expired, or exhausted enrollment token");
+                response->set_reject_reason(
+                    std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
                 response->set_enrollment_status("denied");
                 return grpc::Status::OK;
             }
-            spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token", info.agent_id());
+
+            // -- W1.4 / #827 atomic consume (mirror of AgentServiceImpl) ------
+            auto claim_result =
+                auth_mgr_.consume_enrollment_token(enrollment_token, info.agent_id());
+            if (!claim_result.has_value()) {
+                auto err = claim_result.error();
+                auto variant = yuzu::server::enrollment_rejection_variant_name(err);
+                auto metric_name = yuzu::server::enrollment_rejection_metric_name(err);
+                spdlog::warn("[gateway] Agent {} enrollment-token consume rejected: variant={}",
+                             info.agent_id(), variant);
+                if (metrics_) {
+                    if (err == auth::EnrollmentTokenError::already_consumed) {
+                        metrics_->counter(std::string(metric_name), {}).increment();
+                    } else {
+                        metrics_
+                            ->counter(std::string(metric_name), {{"variant", std::string(variant)}})
+                            .increment();
+                    }
+                }
+
+                std::string already_consumed_by;
+                if (err == auth::EnrollmentTokenError::already_consumed) {
+                    auto hash = auth::AuthManager::sha256_hex(enrollment_token);
+                    already_consumed_by = auth_mgr_.last_consumer_for_token_hash(hash);
+                }
+
+                bool audit_ok = true;
+                if (audit_store_ && audit_store_->is_open()) {
+                    AuditEvent ev;
+                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                    ev.principal = "agent:" + info.agent_id();
+                    ev.principal_role = "agent";
+                    ev.action = std::string(yuzu::server::enrollment_event_action());
+                    ev.target_type = "enrollment_token";
+                    auto hash_for_audit = auth::AuthManager::sha256_hex(enrollment_token);
+                    ev.target_id = hash_for_audit.substr(0, 8);
+                    std::string detail = std::string("variant=")
+                                             .append(variant)
+                                             .append(" presenter=")
+                                             .append(info.agent_id())
+                                             .append(" source=gateway_proxy");
+                    if (!already_consumed_by.empty()) {
+                        detail.append(" already_consumed_by=").append(already_consumed_by);
+                    }
+                    ev.detail = std::move(detail);
+                    if (context)
+                        ev.source_ip = extract_peer_ip(context->peer());
+                    ev.result = "failure";
+                    audit_ok = audit_store_->log(ev);
+                }
+
+                if (analytics_store_) {
+                    AnalyticsEvent ae;
+                    ae.event_type = "agent.enrollment_denied";
+                    ae.agent_id = info.agent_id();
+                    ae.hostname = info.hostname();
+                    ae.os = info.platform().os();
+                    ae.arch = info.platform().arch();
+                    if (err == auth::EnrollmentTokenError::already_consumed || !audit_ok) {
+                        ae.severity = Severity::kError;
+                    } else {
+                        ae.severity = Severity::kWarn;
+                    }
+                    nlohmann::json attrs = {{"reason", std::string(variant)},
+                                            {"audit_emitted", audit_ok},
+                                            {"source", "gateway_proxy"}};
+                    if (!already_consumed_by.empty()) {
+                        attrs["already_consumed_by"] = already_consumed_by;
+                    }
+                    ae.attributes = std::move(attrs);
+                    analytics_store_->emit(std::move(ae));
+                }
+
+                response->set_accepted(false);
+                response->set_reject_reason(
+                    std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
+                response->set_enrollment_status("denied");
+                return grpc::Status::OK;
+            }
+            const auto& claim = claim_result.value();
+            spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token id={} ({}/{})",
+                         info.agent_id(), claim.token_id, claim.use_count_after,
+                         claim.max_uses == 0 ? -1 : claim.max_uses);
+
+            if (audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "agent:" + info.agent_id();
+                ev.principal_role = "agent";
+                ev.action = std::string(yuzu::server::enrollment_event_action());
+                ev.target_type = "enrollment_token";
+                ev.target_id = claim.token_id;
+                ev.detail = std::string("variant=success source=gateway_proxy use_count=")
+                                .append(std::to_string(claim.use_count_after))
+                                .append("/")
+                                .append(claim.max_uses == 0 ? std::string{"unlimited"}
+                                                            : std::to_string(claim.max_uses));
+                if (context)
+                    ev.source_ip = extract_peer_ip(context->peer());
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
             if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(), info.platform().os(),
                                            info.platform().arch(), info.agent_version())) {
                 response->set_accepted(false);

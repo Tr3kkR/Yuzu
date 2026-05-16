@@ -300,6 +300,29 @@ public:
                           "Low-signal device-token validation rejections (not_found, "
                           "expired, invalid_input), labelled by variant",
                           "counter");
+        // W1.4 / #827: enrollment-token race-loss counter. Fires when two
+        // agents concurrently presented the same one-time enrollment token
+        // and the second consumer lost the atomic-claim race. Each
+        // increment is one credential-leak signal — a non-zero rate over
+        // 5 min means a leaked enrollment token is in active use by more
+        // than one party. Alert recipe:
+        //   rate(yuzu_enrollment_token_race_lost_total[5m]) > 0
+        // Audit row with `variant=already_consumed already_consumed_by=
+        // <agent_id>` accompanies each increment.
+        metrics_.describe("yuzu_enrollment_token_race_lost_total",
+                          "Enrollment-token consume lost the atomic-claim race "
+                          "(#827 — leaked token presented by a second agent)",
+                          "counter");
+        // Low-signal enrollment-token rejection bucket. Variants are
+        // `not_found`, `revoked`, `expired`, `invalid_input`,
+        // `invalid_input_length`, `internal_error`. The high-signal
+        // `already_consumed` variant has its own dedicated counter above
+        // so SRE can page on race-loss without a label selector.
+        metrics_.describe("yuzu_enrollment_token_rejected_total",
+                          "Low-signal enrollment-token validation rejections "
+                          "(not_found, revoked, expired, invalid_input, "
+                          "invalid_input_length, internal_error), labelled by variant",
+                          "counter");
         // #826 sec-S1: Subscribe peer-mismatch rejections, labelled by
         // gateway_mode so an operator can distinguish "agent reconnected
         // from a new IP" (steady state in gateway deployments) from
@@ -889,6 +912,20 @@ public:
             agent_service_.set_tag_store(tag_store_.get());
         if (analytics_store_)
             agent_service_.set_analytics_store(analytics_store_.get());
+        // W1.4 / #827: AuditStore for enrollment-token consume rows.
+        // Direct path (AgentServiceImpl) AND gateway path
+        // (GatewayUpstreamServiceImpl) both get the same store so the
+        // success+failure audit trail is uniform regardless of how the
+        // agent reached us.
+        if (audit_store_ && audit_store_->is_open()) {
+            agent_service_.set_audit_store(audit_store_.get());
+            if (gateway_service_) {
+                gateway_service_->set_audit_store(audit_store_.get());
+            }
+        }
+        if (analytics_store_ && gateway_service_) {
+            gateway_service_->set_analytics_store(analytics_store_.get());
+        }
         if (notification_store_)
             agent_service_.set_notification_store(notification_store_.get());
         if (webhook_store_)

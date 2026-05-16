@@ -29,6 +29,7 @@ namespace yuzu::server {
 class ResponseStore;
 class TagStore;
 class AnalyticsEventStore;
+class AuditStore;
 class ManagementGroupStore;
 class NotificationStore;
 class WebhookStore;
@@ -59,6 +60,16 @@ public:
     void set_response_store(ResponseStore* store) { response_store_ = store; }
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
+    /// W1.4 / #827: AuditStore wired for enrollment-token consume rows.
+    /// SOC 2 CC7.2/CC7.3 require attributable credential-rejection logs;
+    /// the Register handler emits one audit row per successful consume AND
+    /// one per lost-race rejection (with `already_consumed_by=<agent_id>`
+    /// detail naming the race winner). nullptr disables emission — used
+    /// by the existing test harness that doesn't construct an AuditStore.
+    /// W1.1 audit_log → bool: the handler observes the return so a
+    /// dropped audit row surfaces as a counter increment plus an
+    /// analytics-event severity escalation, never a silent loss.
+    void set_audit_store(AuditStore* store) { audit_store_ = store; }
     void set_health_store(AgentHealthStore* store) { health_store_ = store; }
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_notification_store(NotificationStore* store) { notification_store_ = store; }
@@ -224,6 +235,7 @@ private:
     ResponseStore* response_store_{nullptr};
     TagStore* tag_store_{nullptr};
     AnalyticsEventStore* analytics_store_{nullptr};
+    AuditStore* audit_store_{nullptr};
     AgentHealthStore* health_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
     NotificationStore* notification_store_{nullptr};

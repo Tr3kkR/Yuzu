@@ -2,15 +2,21 @@
 
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
-namespace yuzu { class MetricsRegistry; }
-namespace yuzu::server { class AuthDB; }
+namespace yuzu {
+class MetricsRegistry;
+}
+namespace yuzu::server {
+class AuthDB;
+}
 
 namespace yuzu::server::auth {
 
@@ -33,10 +39,10 @@ struct Session {
     std::string username;
     Role role;
     std::chrono::steady_clock::time_point expires_at;
-    std::string auth_source{"local"};    // "local", "oidc", "api_token", or "mcp_token"
-    std::string oidc_sub;                // OIDC subject claim (empty for local auth)
-    std::string token_scope_service;     // Non-empty = token scoped to this service
-    std::string mcp_tier;                // "readonly", "operator", "supervised", or "" (not MCP)
+    std::string auth_source{"local"}; // "local", "oidc", "api_token", or "mcp_token"
+    std::string oidc_sub;             // OIDC subject claim (empty for local auth)
+    std::string token_scope_service;  // Non-empty = token scoped to this service
+    std::string mcp_tier;             // "readonly", "operator", "supervised", or "" (not MCP)
 };
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
@@ -50,7 +56,65 @@ struct EnrollmentToken {
     std::chrono::system_clock::time_point created_at;
     std::chrono::system_clock::time_point expires_at; // time_point::max() = never
     bool revoked;
+    /// Last agent_id that consumed this token (W1.4 / #827). Populated on
+    /// every successful consume so the lost-race audit detail can name the
+    /// winner ("already_consumed_by=<agent_id>"). Empty on a freshly-created
+    /// token or on a multi-use token before its first consume. Never the
+    /// raw token — only the agent_id presented to consume_enrollment_token.
+    std::string last_consumed_by_agent_id;
 };
+
+/// Typed rejection reason for `AuthManager::consume_enrollment_token`
+/// (W1.4 / #827). Naming style matches W1.2's `DeviceTokenValidateError`
+/// (snake_case variants) so SIEM filters can grep across both. Variants
+/// are operator-facing — they surface in audit `detail` rows and as
+/// Prometheus label values; the public wire shape is uniform ("invalid,
+/// expired, or exhausted enrollment token") so no token-shape oracle leaks.
+enum class EnrollmentTokenError {
+    /// Empty / oversize / structurally malformed raw token. Length-bound
+    /// enforced at handler entry (W1.1 UP-H2 pattern, > 256 chars → reject).
+    invalid_input,
+    /// Hash does not match any token in the store.
+    not_found,
+    /// Token row exists but `revoked = true`.
+    revoked,
+    /// Token row exists but `now > expires_at`.
+    expired,
+    /// Token row exists, not revoked, not expired, but `use_count >=
+    /// max_uses` at consume time — either it was previously exhausted, or
+    /// a concurrent consume won the race for the last available use. The
+    /// race-lost case is distinguishable from "stale exhausted" by
+    /// comparing `claim_when_consumed.last_consumed_by_agent_id` against
+    /// the current presenter; the caller surfaces this in audit detail.
+    already_consumed,
+    /// Internal error during consume (lock unavailable, persistence
+    /// failure). Caller treats as a hard reject and pages SRE.
+    internal_error,
+};
+
+/// Successful claim returned from `AuthManager::consume_enrollment_token`.
+/// Carries enough context for the success-path audit row and for telling
+/// "this consume won an actual race" from "this consume was uncontested".
+/// `prior_use_count` is the use_count BEFORE this consume — when it's > 0
+/// for a max_uses > 1 token, this consume shared the token with prior
+/// agents (legitimate multi-use). The token_id is the public-display
+/// short ID (8 hex chars), safe to emit in audit detail.
+struct EnrollmentClaim {
+    std::string token_id;
+    int max_uses{0};        // 0 = unlimited
+    int use_count_after{0}; // After this consume
+    bool single_use{false}; // max_uses == 1 → token is now exhausted
+};
+
+/// Maximum raw enrollment token length accepted at handler entry. Raw
+/// tokens are 64 hex chars (32-byte CSPRNG output → bytes_to_hex). Tighter
+/// than the 256-char W1.1 UP-H2 bound but uses the same `invalid_input_
+/// length` audit detail to keep operator filters consistent across the
+/// auth surfaces. Rationale: an enrollment token presented over the
+/// gRPC Register RPC has no legitimate path that exceeds this bound —
+/// anything longer is request-level garbage to be rejected before any
+/// SHA-256 / map lookup work.
+inline constexpr std::size_t kMaxEnrollmentTokenLength = 256;
 
 // ── Pending agents (Tier 1) ─────────────────────────────────────────────────
 
@@ -142,7 +206,10 @@ public:
 
     /// Re-load enrollment tokens and pending agents from the current state_dir().
     /// Call after set_data_dir() to pick up files from the new location.
-    void reload_state() { load_tokens(); load_pending(); }
+    void reload_state() {
+        load_tokens();
+        load_pending();
+    }
 
     // -- Enrollment tokens (Tier 2) ---------------------------------------
 
@@ -158,7 +225,56 @@ public:
 
     /// Validate a raw enrollment token. Returns true and increments use_count
     /// if valid. Returns false if expired, revoked, or exhausted.
+    ///
+    /// Thin compatibility wrapper around `consume_enrollment_token` —
+    /// pre-W1.4 callers that don't need the rich claim/error context use
+    /// this; new callers (Register / ProxyRegister) MUST use
+    /// `consume_enrollment_token` so they can emit the lost-race audit row.
+    /// The wrapper passes an empty `consuming_agent_id`, so race-loser
+    /// audit rows that go via this path will say `already_consumed_by=`
+    /// (empty). That's acceptable for legacy callers — the gRPC handlers
+    /// always pass the real agent_id.
     bool validate_enrollment_token(const std::string& raw_token);
+
+    /// Atomic check-and-consume of an enrollment token (W1.4 / #827).
+    ///
+    /// **The race the function closes.** The prior `validate_enrollment_
+    /// token` returned a bare bool. A second concurrent Register that
+    /// presented the same token could pass the validity check before the
+    /// first call's `++use_count` landed, allowing a single-use token to
+    /// enroll N agents in the race window. This function does the validity
+    /// check and the use-count increment under the SAME `unique_lock` so
+    /// no second consumer can interleave. The token's `last_consumed_by_
+    /// agent_id` is written under the same lock, giving the lost-race
+    /// audit row enough context to name the winner.
+    ///
+    /// **Why an `EnrollmentClaim` on success.** The handler needs the
+    /// public token_id (for audit detail), the new use_count (so a
+    /// successful multi-use consume can still emit a "M of N uses
+    /// remaining" log line), and `single_use` so the response can
+    /// summarise the token's lifecycle.
+    ///
+    /// **Why a typed error on failure.** Audit/metric variant lives in the
+    /// typed error; public wire response uniformly says "invalid, expired,
+    /// or exhausted enrollment token" so the response shape is the same
+    /// regardless of variant. This is the same wire-collapse rule that
+    /// W1.3 enforces for `DeviceTokenValidateError` — a presenter cannot
+    /// discriminate `not_found` from `already_consumed` (which would tell
+    /// them the token existed and someone beat them to it). Operator-
+    /// visible variance lives in audit rows + Prometheus counters.
+    ///
+    /// `consuming_agent_id` is the agent_id presented to Register. It is
+    /// written into the token's `last_consumed_by_agent_id` on a winning
+    /// consume so a subsequent loser can audit `already_consumed_by=<id>`.
+    [[nodiscard]] std::expected<EnrollmentClaim, EnrollmentTokenError>
+    consume_enrollment_token(std::string_view raw_token, std::string_view consuming_agent_id);
+
+    /// Look up the most-recent consumer's agent_id for a token (hash-keyed).
+    /// Used by the Register handler's lost-race audit emission so the
+    /// "already_consumed_by=<X>" detail can name the winning agent without
+    /// requiring a second locked traversal in the consume path.
+    /// Returns empty string if no record / token not found / never consumed.
+    std::string last_consumer_for_token_hash(std::string_view token_hash) const;
 
     /// List all enrollment tokens (for admin UI).
     std::vector<EnrollmentToken> list_enrollment_tokens() const;
