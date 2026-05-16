@@ -1987,13 +1987,13 @@ void SettingsRoutes::register_routes(
     UpdateRegistry* update_registry, RuntimeConfigStore* runtime_config_store,
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
-    std::unique_ptr<oidc::OidcProvider>& oidc_provider) {
+    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(admin_fn), std::move(perm_fn),
                     std::move(audit_fn), cfg, auth_mgr, auto_approve, api_token_store,
                     mgmt_group_store, tag_store, update_registry, runtime_config_store, audit_store,
                     gateway_enabled, std::move(gateway_session_count_fn), std::move(agents_json_fn),
-                    oidc_mu, oidc_provider);
+                    oidc_mu, oidc_provider, metrics_registry);
 }
 
 void SettingsRoutes::register_routes(
@@ -2003,7 +2003,7 @@ void SettingsRoutes::register_routes(
     UpdateRegistry* update_registry, RuntimeConfigStore* runtime_config_store,
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
-    std::unique_ptr<oidc::OidcProvider>& oidc_provider) {
+    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry) {
     // Store dependency pointers
     auth_fn_ = std::move(auth_fn);
     admin_fn_ = std::move(admin_fn);
@@ -2023,6 +2023,7 @@ void SettingsRoutes::register_routes(
     agents_json_fn_ = std::move(agents_json_fn);
     oidc_mu_ = &oidc_mu;
     oidc_provider_ = &oidc_provider;
+    metrics_registry_ = metrics_registry;
 
     // -- Settings page (admin only) -------------------------------------------
     sink.Get("/settings", [this](const httplib::Request& req, httplib::Response& res) {
@@ -3257,6 +3258,19 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // UP-H2 (gov Gate 4, unhappy-path): clamp `name` length BEFORE
+        // any audit emission. Same DoS-via-oversized-payload class as
+        // the REST /api/v1/tokens site — see comment there for the full
+        // rationale. The HTMX form input has an HTML `maxlength="64"`
+        // attribute but the server cannot trust client-side limits;
+        // mirror the same 256-char cap as the REST surface.
+        if (name.size() > 256) {
+            res.set_content("<span class=\"feedback-error\">invalid_input_length: name "
+                            "exceeds 256 chars.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+
         if (!mcp::is_valid_tier(mcp_tier)) {
             res.set_content("<span class=\"feedback-error\">Invalid MCP tier. Must be readonly, "
                             "operator, or supervised.</span>",
@@ -3284,6 +3298,19 @@ void SettingsRoutes::register_routes(
         auto result =
             api_token_store_->create_token(name, session->username, expires_at, {}, mcp_tier);
         if (!result) {
+            // sre-1 (gov Gate 6): Prometheus signal for CSPRNG failure
+            // on the HTMX surface (parity with the REST surfaces). Uses
+            // `site="api_token_htmx"` so SRE rules can distinguish
+            // dashboard-driven failures from API-driven failures if
+            // needed, while a label-agnostic alert
+            //   rate(yuzu_secure_random_failure_total[5m]) > 0
+            // still fires for both.
+            if (metrics_registry_) {
+                metrics_registry_
+                    ->counter("yuzu_secure_random_failure_total",
+                              {{"reason", "prng_failure"}, {"site", "api_token_htmx"}})
+                    .increment();
+            }
             // F-002 (gov Gate 2, security-guardian): mirror the REST
             // failure-path audit at the HTMX surface. Same SOC 2 CC7.2/CC7.3
             // requirement applies — a token-issuance attempt rejected for
@@ -3293,18 +3320,51 @@ void SettingsRoutes::register_routes(
             // `csprng_unavailable:` marker for SIEM correlation. Logged
             // before the response is sent so a mid-response crash still
             // leaves the audit trail (defensive ordering).
+            //
+            // UP-H1 (gov Gate 4): capture the AuditStore::log bool return
+            // and wrap in try/catch so an exception from the SQLite
+            // audit pipeline does not abort the dashboard fragment
+            // response. On silent persist failure or exception, set
+            // `Sec-Audit-Failed: true` header so HTMX-aware operator
+            // tooling can detect the partial-success on the dashboard
+            // surface (parity with the REST envelopes). The fragment
+            // body is also annotated with a hidden marker for tests.
+            bool audit_emitted = true;
             if (audit_store_) {
-                audit_store_->log({.principal = session->username,
-                                   .principal_role = auth::role_to_string(session->role),
-                                   .action = "api_token.create",
-                                   .target_type = "ApiToken",
-                                   .target_id = name,
-                                   .detail = "csprng_unavailable: " + result.error(),
-                                   .source_ip = req.remote_addr,
-                                   .result = "failure"});
+                try {
+                    audit_emitted =
+                        audit_store_->log({.principal = session->username,
+                                           .principal_role = auth::role_to_string(session->role),
+                                           .action = "api_token.create",
+                                           .target_type = "ApiToken",
+                                           .target_id = name,
+                                           .detail = "csprng_unavailable: " + result.error(),
+                                           .source_ip = req.remote_addr,
+                                           .result = "failure"});
+                } catch (const std::exception& ex) {
+                    spdlog::error("api_token.create (HTMX) audit emission threw: {}", ex.what());
+                    audit_emitted = false;
+                } catch (...) {
+                    spdlog::error("api_token.create (HTMX) audit emission threw unknown");
+                    audit_emitted = false;
+                }
             }
-            res.set_content("<span class=\"feedback-error\">" + html_escape(result.error()) +
-                                "</span>",
+            // sre-2 (gov Gate 6, sre): the HTMX surface returns 200 by
+            // default because htmx swaps the fragment regardless of
+            // status; the operator-facing signal is the rendered error
+            // span. To stay consistent with the REST surfaces (which
+            // closes #1046) we also set status=503 + Retry-After: 5 so
+            // HTTP-level monitoring (LB 5xx rate, browser dev tools)
+            // sees the failure correctly. htmx's hx-swap-oob fallback
+            // handling continues to render the feedback span as the
+            // dashboard surface for the operator.
+            res.status = 503;
+            res.set_header("Retry-After", "5");
+            if (!audit_emitted)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.set_content("<span class=\"feedback-error\"" +
+                                std::string(audit_emitted ? "" : " data-audit-emitted=\"false\"") +
+                                ">CSPRNG unavailable: " + html_escape(result.error()) + "</span>",
                             "text/html; charset=utf-8");
             return;
         }
@@ -3312,13 +3372,18 @@ void SettingsRoutes::register_routes(
         spdlog::info("API token '{}' created by {}", name, session->username);
 
         if (audit_store_) {
-            audit_store_->log({.principal = session->username,
-                               .principal_role = auth::role_to_string(session->role),
-                               .action = "api_token.create",
-                               .target_type = "ApiToken",
-                               .target_id = name,
-                               .source_ip = req.remote_addr,
-                               .result = "success"});
+            // Success-path audit fire-and-forget — bool intentionally
+            // discarded because the response is the success fragment
+            // regardless; if the audit row fails to persist, the
+            // AuditStore::emit_failed_ counter still increments and
+            // the operator-visible metric paths catch it.
+            (void)audit_store_->log({.principal = session->username,
+                                     .principal_role = auth::role_to_string(session->role),
+                                     .action = "api_token.create",
+                                     .target_type = "ApiToken",
+                                     .target_id = name,
+                                     .source_ip = req.remote_addr,
+                                     .result = "success"});
         }
 
         res.set_header("HX-Trigger",
@@ -3348,14 +3413,18 @@ void SettingsRoutes::register_routes(
                       session->role != auth::Role::admin;
         if (!existing || denied) {
             if (denied && audit_store_) {
-                audit_store_->log({.principal = session->username,
-                                   .principal_role = auth::role_to_string(session->role),
-                                   .action = "api_token.revoke",
-                                   .target_type = "ApiToken",
-                                   .target_id = token_id,
-                                   .detail = "owner=" + existing->principal_id,
-                                   .source_ip = req.remote_addr,
-                                   .result = "denied"});
+                // [[nodiscard]] on AuditStore::log is the SOC 2 CC6.6
+                // evidence-integrity flag (PR #883 HIGH-2 pattern); the
+                // denied audit path already returns 404 so the persist
+                // failure is bookkeeping-only here. Cast to void.
+                (void)audit_store_->log({.principal = session->username,
+                                         .principal_role = auth::role_to_string(session->role),
+                                         .action = "api_token.revoke",
+                                         .target_type = "ApiToken",
+                                         .target_id = token_id,
+                                         .detail = "owner=" + existing->principal_id,
+                                         .source_ip = req.remote_addr,
+                                         .result = "denied"});
             }
             // Return a minimal error-only fragment with zero token
             // data. An earlier iteration of this fix rendered the
@@ -3381,14 +3450,14 @@ void SettingsRoutes::register_routes(
         spdlog::info("API token '{}' revoked by {}", token_id, session->username);
 
         if (audit_store_) {
-            audit_store_->log({.principal = session->username,
-                               .principal_role = auth::role_to_string(session->role),
-                               .action = "api_token.revoke",
-                               .target_type = "ApiToken",
-                               .target_id = token_id,
-                               .detail = "owner=" + existing->principal_id,
-                               .source_ip = req.remote_addr,
-                               .result = "success"});
+            (void)audit_store_->log({.principal = session->username,
+                                     .principal_role = auth::role_to_string(session->role),
+                                     .action = "api_token.revoke",
+                                     .target_type = "ApiToken",
+                                     .target_id = token_id,
+                                     .detail = "owner=" + existing->principal_id,
+                                     .source_ip = req.remote_addr,
+                                     .result = "success"});
         }
 
         res.set_header("HX-Trigger",
@@ -3558,7 +3627,7 @@ void SettingsRoutes::register_routes(
             ae.target_id = *result;
             ae.detail = name;
             ae.result = "success";
-            audit_store_->log(ae);
+            (void)audit_store_->log(ae);
         }
         res.set_content(render_management_groups_fragment(), "text/html; charset=utf-8");
     });
@@ -3583,7 +3652,7 @@ void SettingsRoutes::register_routes(
                 ae.target_type = "ManagementGroup";
                 ae.target_id = id;
                 ae.result = "success";
-                audit_store_->log(ae);
+                (void)audit_store_->log(ae);
             }
             res.set_content(render_management_groups_fragment(), "text/html; charset=utf-8");
         });

@@ -17,26 +17,14 @@ namespace yuzu::server {
 // Construction
 // ---------------------------------------------------------------------------
 
-AuthRoutes::AuthRoutes(Config& cfg,
-                       auth::AuthManager& auth_mgr,
-                       RbacStore* rbac_store,
-                       ApiTokenStore* api_token_store,
-                       AuditStore* audit_store,
-                       ManagementGroupStore* mgmt_group_store,
-                       TagStore* tag_store,
-                       AnalyticsEventStore* analytics_store,
-                       std::shared_mutex& oidc_mu,
+AuthRoutes::AuthRoutes(Config& cfg, auth::AuthManager& auth_mgr, RbacStore* rbac_store,
+                       ApiTokenStore* api_token_store, AuditStore* audit_store,
+                       ManagementGroupStore* mgmt_group_store, TagStore* tag_store,
+                       AnalyticsEventStore* analytics_store, std::shared_mutex& oidc_mu,
                        std::unique_ptr<oidc::OidcProvider>& oidc_provider)
-    : cfg_(cfg)
-    , auth_mgr_(auth_mgr)
-    , rbac_store_(rbac_store)
-    , api_token_store_(api_token_store)
-    , audit_store_(audit_store)
-    , mgmt_group_store_(mgmt_group_store)
-    , tag_store_(tag_store)
-    , analytics_store_(analytics_store)
-    , oidc_mu_(oidc_mu)
-    , oidc_provider_(oidc_provider) {}
+    : cfg_(cfg), auth_mgr_(auth_mgr), rbac_store_(rbac_store), api_token_store_(api_token_store),
+      audit_store_(audit_store), mgmt_group_store_(mgmt_group_store), tag_store_(tag_store),
+      analytics_store_(analytics_store), oidc_mu_(oidc_mu), oidc_provider_(oidc_provider) {}
 
 // ---------------------------------------------------------------------------
 // Static utilities
@@ -128,7 +116,8 @@ std::optional<auth::Session> AuthRoutes::resolve_session(const httplib::Request&
 
     // 3. Try X-Yuzu-Token header (alternative API token header)
     auto custom_header = req.get_header_value("X-Yuzu-Token");
-    if (!custom_header.empty() && custom_header.size() <= auth::kMaxApiTokenLength && api_token_store_) {
+    if (!custom_header.empty() && custom_header.size() <= auth::kMaxApiTokenLength &&
+        api_token_store_) {
         auto api_token = api_token_store_->validate_token(custom_header);
         if (api_token)
             return synthesize_token_session(*api_token);
@@ -211,13 +200,13 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                       "MCP token tier '" + session->mcp_tier + "' does not allow " +
                           securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(
-                nlohmann::json({{"error", {{"code", 403},
-                                           {"message", "MCP token tier does not allow " +
-                                                           securable_type + ":" + operation}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
-                "application/json");
+            res.set_content(nlohmann::json({{"error",
+                                             {{"code", 403},
+                                              {"message", "MCP token tier does not allow " +
+                                                              securable_type + ":" + operation}}},
+                                            {"meta", {{"api_version", "v1"}}}})
+                                .dump(),
+                            "application/json");
             return false;
         }
         // Approval-gated operations (supervised tier on destructive ops) cannot
@@ -226,15 +215,16 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         // that behavior here so the REST transport cannot bypass it (#520).
         if (mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
             audit_log(req, "auth.approval_required", "denied", "", "",
-                      "MCP token tier '" + session->mcp_tier +
-                          "' requires approval for " + securable_type + ":" + operation +
-                          " (Phase 2 not implemented)");
+                      "MCP token tier '" + session->mcp_tier + "' requires approval for " +
+                          securable_type + ":" + operation + " (Phase 2 not implemented)");
             res.status = 403;
             res.set_content(
-                nlohmann::json({{"error", {{"code", 403},
-                                           {"message", "operation requires approval; "
-                                                       "approval-gated MCP execution is not yet implemented"}}},
-                                {"meta", {{"api_version", "v1"}}}})
+                nlohmann::json(
+                    {{"error",
+                      {{"code", 403},
+                       {"message", "operation requires approval; "
+                                   "approval-gated MCP execution is not yet implemented"}}},
+                     {"meta", {{"api_version", "v1"}}}})
                     .dump(),
                 "application/json");
             return false;
@@ -257,10 +247,12 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
-            std::string msg = "service-scoped token does not grant " + securable_type + ":" + operation + " (ITServiceOwner permission required)";
-            res.set_content(
-                nlohmann::json({{"error", {{"code", 403}, {"message", msg}}}, {"meta", {{"api_version", "v1"}}}}).dump(),
-                "application/json");
+            std::string msg = "service-scoped token does not grant " + securable_type + ":" +
+                              operation + " (ITServiceOwner permission required)";
+            res.set_content(nlohmann::json({{"error", {{"code", 403}, {"message", msg}}},
+                                            {"meta", {{"api_version", "v1"}}}})
+                                .dump(),
+                            "application/json");
             return false;
         }
         return true;
@@ -271,13 +263,13 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(
-                nlohmann::json({{"error", {{"code", 403},
-                                           {"message", "permission denied: " +
-                                                           securable_type + ":" + operation}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
-                "application/json");
+            res.set_content(nlohmann::json({{"error",
+                                             {{"code", 403},
+                                              {"message", "permission denied: " + securable_type +
+                                                              ":" + operation}}},
+                                            {"meta", {{"api_version", "v1"}}}})
+                                .dump(),
+                            "application/json");
             return false;
         }
         return true;
@@ -315,26 +307,27 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                       "MCP token tier '" + session->mcp_tier + "' does not allow " +
                           securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(
-                nlohmann::json({{"error", {{"code", 403},
-                                           {"message", "MCP token tier does not allow " +
-                                                           securable_type + ":" + operation}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
-                "application/json");
+            res.set_content(nlohmann::json({{"error",
+                                             {{"code", 403},
+                                              {"message", "MCP token tier does not allow " +
+                                                              securable_type + ":" + operation}}},
+                                            {"meta", {{"api_version", "v1"}}}})
+                                .dump(),
+                            "application/json");
             return false;
         }
         if (mcp::requires_approval(session->mcp_tier, securable_type, operation)) {
             audit_log(req, "auth.approval_required", "denied", "", "",
-                      "MCP token tier '" + session->mcp_tier +
-                          "' requires approval for " + securable_type + ":" + operation +
-                          " (Phase 2 not implemented)");
+                      "MCP token tier '" + session->mcp_tier + "' requires approval for " +
+                          securable_type + ":" + operation + " (Phase 2 not implemented)");
             res.status = 403;
             res.set_content(
-                nlohmann::json({{"error", {{"code", 403},
-                                           {"message", "operation requires approval; "
-                                                       "approval-gated MCP execution is not yet implemented"}}},
-                                {"meta", {{"api_version", "v1"}}}})
+                nlohmann::json(
+                    {{"error",
+                      {{"code", 403},
+                       {"message", "operation requires approval; "
+                                   "approval-gated MCP execution is not yet implemented"}}},
+                     {"meta", {{"api_version", "v1"}}}})
                     .dump(),
                 "application/json");
             return false;
@@ -358,10 +351,12 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
-            std::string msg = "service-scoped token does not grant " + securable_type + ":" + operation + " (ITServiceOwner permission required)";
-            res.set_content(
-                nlohmann::json({{"error", {{"code", 403}, {"message", msg}}}, {"meta", {{"api_version", "v1"}}}}).dump(),
-                "application/json");
+            std::string msg = "service-scoped token does not grant " + securable_type + ":" +
+                              operation + " (ITServiceOwner permission required)";
+            res.set_content(nlohmann::json({{"error", {{"code", 403}, {"message", msg}}},
+                                            {"meta", {{"api_version", "v1"}}}})
+                                .dump(),
+                            "application/json");
             return false;
         }
         // Verify the target agent's service tag matches the token's scope
@@ -369,21 +364,23 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: tag store unavailable");
             res.status = 503;
-            res.set_content(R"({"error":{"code":503,"message":"tag store unavailable, cannot verify scope"},"meta":{"api_version":"v1"}})",
-                            "application/json");
+            res.set_content(
+                R"({"error":{"code":503,"message":"tag store unavailable, cannot verify scope"},"meta":{"api_version":"v1"}})",
+                "application/json");
             return false;
         }
         if (!agent_id.empty()) {
             auto agent_service = tag_store_->get_tag(agent_id, "service");
             if (agent_service != session->token_scope_service) {
                 audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
-                          "agent service '" + agent_service + "' does not match token scope '" + session->token_scope_service + "'");
+                          "agent service '" + agent_service + "' does not match token scope '" +
+                              session->token_scope_service + "'");
                 res.status = 403;
-                res.set_content(
-                    nlohmann::json({{"error", "forbidden"},
-                                    {"detail", "agent is not in service '" + session->token_scope_service + "'"}})
-                        .dump(),
-                    "application/json");
+                res.set_content(nlohmann::json({{"error", "forbidden"},
+                                                {"detail", "agent is not in service '" +
+                                                               session->token_scope_service + "'"}})
+                                    .dump(),
+                                "application/json");
                 return false;
             }
         }
@@ -396,13 +393,13 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
                       "RBAC denied " + securable_type + ":" + operation);
             res.status = 403;
-            res.set_content(
-                nlohmann::json({{"error", {{"code", 403},
-                                           {"message", "permission denied: " +
-                                                           securable_type + ":" + operation}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
-                "application/json");
+            res.set_content(nlohmann::json({{"error",
+                                             {{"code", 403},
+                                              {"message", "permission denied: " + securable_type +
+                                                              ":" + operation}}},
+                                            {"meta", {{"api_version", "v1"}}}})
+                                .dump(),
+                            "application/json");
             return false;
         }
         return true;
@@ -449,16 +446,16 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
     return event;
 }
 
-void AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
+bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
                            const std::string& result, const std::string& target_type,
                            const std::string& target_id, const std::string& detail) {
     if (!audit_store_)
-        return;
+        return true; // audit-off deployment — not a failure relative to config
     auto event = make_audit_event(req, action, result);
     event.target_type = target_type;
     event.target_id = target_id;
     event.detail = detail;
-    audit_store_->log(event);
+    return audit_store_->log(event);
 }
 
 void AuthRoutes::emit_event(const std::string& event_type, const httplib::Request& req,
@@ -518,9 +515,9 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
         res.set_header("Set-Cookie", "yuzu_session=" + *token + session_cookie_attrs());
         res.set_content(R"({"status":"ok"})", "application/json");
         audit_log(req, "auth.login", "success", "user", username);
-        emit_event("auth.login", req,
-                   {{"source_ip", req.remote_addr},
-                    {"user_agent", req.get_header_value("User-Agent")}});
+        emit_event(
+            "auth.login", req,
+            {{"source_ip", req.remote_addr}, {"user_agent", req.get_header_value("User-Agent")}});
     });
 
     // -- Logout ---------------------------------------------------------------
@@ -531,8 +528,7 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
         if (!token.empty()) {
             auth_mgr_.invalidate_session(token);
         }
-        res.set_header("Set-Cookie",
-                       "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+        res.set_header("Set-Cookie", "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
         // HTMX clients get a redirect header; non-HTMX get JSON
         if (!req.get_header_value("HX-Request").empty()) {
             res.set_header("HX-Redirect", "/login");

@@ -4,6 +4,7 @@
 /// Extracted from server.cpp — Settings page HTMX routes, fragment renderers,
 /// and YAML helpers.  Phase 1 of the god-object decomposition.
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 
@@ -33,8 +34,7 @@ class SettingsRoutes {
 public:
     using AuthFn =
         std::function<std::optional<auth::Session>(const httplib::Request&, httplib::Response&)>;
-    using AdminFn =
-        std::function<bool(const httplib::Request&, httplib::Response&)>;
+    using AdminFn = std::function<bool(const httplib::Request&, httplib::Response&)>;
     using PermFn =
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
@@ -51,48 +51,36 @@ public:
     /// Register all settings-related routes on the given server.
     /// Production callers use this overload; internally it constructs an
     /// HttplibRouteSink and delegates to the sink-based overload below.
-    void register_routes(httplib::Server& svr,
-                         AuthFn auth_fn,
-                         AdminFn admin_fn,
-                         PermFn perm_fn,
-                         AuditFn audit_fn,
-                         Config& cfg,
-                         auth::AuthManager& auth_mgr,
-                         auth::AutoApproveEngine& auto_approve,
-                         ApiTokenStore* api_token_store,
-                         ManagementGroupStore* mgmt_group_store,
-                         TagStore* tag_store,
-                         UpdateRegistry* update_registry,
-                         RuntimeConfigStore* runtime_config_store,
-                         AuditStore* audit_store,
-                         bool gateway_enabled,
+    ///
+    /// `metrics_registry` (optional, may be null) — when non-null the HTMX
+    /// token-create handler increments
+    /// `yuzu_secure_random_failure_total{site="api_token_htmx"}` on CSPRNG
+    /// entropy-exhaustion failures so on-call has a paging signal short of
+    /// grepping audit logs (sre-1 on PR W1.1).
+    void register_routes(httplib::Server& svr, AuthFn auth_fn, AdminFn admin_fn, PermFn perm_fn,
+                         AuditFn audit_fn, Config& cfg, auth::AuthManager& auth_mgr,
+                         auth::AutoApproveEngine& auto_approve, ApiTokenStore* api_token_store,
+                         ManagementGroupStore* mgmt_group_store, TagStore* tag_store,
+                         UpdateRegistry* update_registry, RuntimeConfigStore* runtime_config_store,
+                         AuditStore* audit_store, bool gateway_enabled,
                          GatewaySessionCountFn gateway_session_count_fn,
-                         AgentsJsonFn agents_json_fn,
-                         std::shared_mutex& oidc_mu,
-                         std::unique_ptr<oidc::OidcProvider>& oidc_provider);
+                         AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
+                         std::unique_ptr<oidc::OidcProvider>& oidc_provider,
+                         yuzu::MetricsRegistry* metrics_registry = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink and dispatch synthesized requests directly,
     /// avoiding httplib::Server's TSan-hostile acceptor thread (#438).
-    void register_routes(class HttpRouteSink& sink,
-                         AuthFn auth_fn,
-                         AdminFn admin_fn,
-                         PermFn perm_fn,
-                         AuditFn audit_fn,
-                         Config& cfg,
-                         auth::AuthManager& auth_mgr,
-                         auth::AutoApproveEngine& auto_approve,
-                         ApiTokenStore* api_token_store,
-                         ManagementGroupStore* mgmt_group_store,
-                         TagStore* tag_store,
-                         UpdateRegistry* update_registry,
-                         RuntimeConfigStore* runtime_config_store,
-                         AuditStore* audit_store,
-                         bool gateway_enabled,
+    void register_routes(class HttpRouteSink& sink, AuthFn auth_fn, AdminFn admin_fn,
+                         PermFn perm_fn, AuditFn audit_fn, Config& cfg, auth::AuthManager& auth_mgr,
+                         auth::AutoApproveEngine& auto_approve, ApiTokenStore* api_token_store,
+                         ManagementGroupStore* mgmt_group_store, TagStore* tag_store,
+                         UpdateRegistry* update_registry, RuntimeConfigStore* runtime_config_store,
+                         AuditStore* audit_store, bool gateway_enabled,
                          GatewaySessionCountFn gateway_session_count_fn,
-                         AgentsJsonFn agents_json_fn,
-                         std::shared_mutex& oidc_mu,
-                         std::unique_ptr<oidc::OidcProvider>& oidc_provider);
+                         AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
+                         std::unique_ptr<oidc::OidcProvider>& oidc_provider,
+                         yuzu::MetricsRegistry* metrics_registry = nullptr);
 
 private:
     // -- Fragment renderers (called by route handlers) -------------------------
@@ -164,6 +152,7 @@ private:
     AgentsJsonFn agents_json_fn_;
     std::shared_mutex* oidc_mu_{};
     std::unique_ptr<oidc::OidcProvider>* oidc_provider_{};
+    yuzu::MetricsRegistry* metrics_registry_{};
 };
 
 } // namespace yuzu::server

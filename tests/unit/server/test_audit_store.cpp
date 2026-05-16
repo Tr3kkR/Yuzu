@@ -28,7 +28,7 @@ TEST_CASE("AuditStore: log and retrieve", "[audit_store]") {
     event.action = "auth.login";
     event.result = "success";
     event.source_ip = "192.168.1.1";
-    store.log(event);
+    CHECK(store.log(event));
 
     auto results = store.query();
     REQUIRE(results.size() == 1);
@@ -47,7 +47,7 @@ TEST_CASE("AuditStore: filter by principal", "[audit_store]") {
         event.principal_role = "admin";
         event.action = "auth.login";
         event.result = "success";
-        store.log(event);
+        CHECK(store.log(event));
     }
 
     AuditQuery q;
@@ -64,14 +64,14 @@ TEST_CASE("AuditStore: filter by action", "[audit_store]") {
     e1.principal_role = "admin";
     e1.action = "auth.login";
     e1.result = "success";
-    store.log(e1);
+    CHECK(store.log(e1));
 
     AuditEvent e2;
     e2.principal = "admin";
     e2.principal_role = "admin";
     e2.action = "command.dispatch";
     e2.result = "success";
-    store.log(e2);
+    CHECK(store.log(e2));
 
     AuditQuery q;
     q.action = "command.dispatch";
@@ -90,7 +90,7 @@ TEST_CASE("AuditStore: filter by target", "[audit_store]") {
     e1.result = "success";
     e1.target_type = "agent";
     e1.target_id = "agent-001";
-    store.log(e1);
+    CHECK(store.log(e1));
 
     AuditEvent e2;
     e2.principal = "admin";
@@ -99,7 +99,7 @@ TEST_CASE("AuditStore: filter by target", "[audit_store]") {
     e2.result = "success";
     e2.target_type = "agent";
     e2.target_id = "agent-002";
-    store.log(e2);
+    CHECK(store.log(e2));
 
     AuditQuery q;
     q.target_type = "agent";
@@ -118,7 +118,7 @@ TEST_CASE("AuditStore: timestamp ordering", "[audit_store]") {
         event.principal_role = "admin";
         event.action = "test";
         event.result = "success";
-        store.log(event);
+        CHECK(store.log(event));
     }
 
     auto results = store.query();
@@ -136,7 +136,7 @@ TEST_CASE("AuditStore: limit and offset", "[audit_store]") {
         event.action = "test";
         event.result = "success";
         event.detail = "item-" + std::to_string(i);
-        store.log(event);
+        CHECK(store.log(event));
     }
 
     AuditQuery q;
@@ -158,7 +158,7 @@ TEST_CASE("AuditStore: total_count", "[audit_store]") {
     event.principal_role = "admin";
     event.action = "test";
     event.result = "success";
-    store.log(event);
+    CHECK(store.log(event));
 
     REQUIRE(store.total_count() == 1);
 }
@@ -177,7 +177,7 @@ TEST_CASE("AuditStore: all fields stored", "[audit_store]") {
     event.user_agent = "Mozilla/5.0";
     event.session_id = "sess-abc";
     event.result = "success";
-    store.log(event);
+    CHECK(store.log(event));
 
     auto results = store.query();
     REQUIRE(results.size() == 1);
@@ -198,7 +198,7 @@ TEST_CASE("AuditStore: time range filter", "[audit_store]") {
         event.principal_role = "admin";
         event.action = "test";
         event.result = "success";
-        store.log(event);
+        CHECK(store.log(event));
     }
 
     AuditQuery q;
@@ -223,7 +223,7 @@ TEST_CASE("AuditStore: failed login audit", "[audit_store]") {
     event.action = "auth.login_failed";
     event.result = "failure";
     event.source_ip = "10.0.0.99";
-    store.log(event);
+    CHECK(store.log(event));
 
     AuditQuery q;
     q.action = "auth.login_failed";

@@ -24,6 +24,8 @@
 #include "secure_random.hpp"
 #include "test_route_sink.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
@@ -33,6 +35,7 @@
 #include "../test_helpers.hpp"
 
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -70,6 +73,18 @@ struct RestTokensHarness {
     auth::Role session_role{auth::Role::user};
 
     std::vector<AuditRecord> audit_log;
+    // UP-H1 fault injection knobs. The default audit_fn returns
+    // `!audit_should_fail` and throws iff audit_should_throw is set;
+    // both default to false (happy path). Tests flip these before
+    // dispatching to simulate AuditStore wedge / pipeline exception.
+    bool audit_should_fail{false};
+    bool audit_should_throw{false};
+
+    // sre-1: in-process MetricsRegistry the harness threads into the
+    // route registration so tests can assert
+    // yuzu_secure_random_failure_total increments. Owned per-instance
+    // so each test starts from zero — no global state.
+    yuzu::MetricsRegistry metrics;
 
     RestApiV1 api;
 
@@ -100,10 +115,20 @@ struct RestTokensHarness {
             return true;
         };
 
+        // UP-H1 / PR W1.1: AuditFn typedef is now
+        // `std::function<bool(...)>` (mirrors PR #883 HIGH-2). The
+        // harness's default audit_fn always returns true (audit
+        // emitted); per-test overrides (see UP-H1 cases below) flip
+        // `audit_should_fail` to simulate a wedged AuditStore, and
+        // `audit_should_throw` to simulate an exception from the audit
+        // pipeline. Both are reset to false on construction.
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&,
-                               const std::string& target_id, const std::string& detail) {
+                               const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_id, detail});
+            if (audit_should_throw)
+                throw std::runtime_error("simulated audit pipeline failure");
+            return !audit_should_fail;
         };
 
         // Pass nullptr for every store except the one(s) under test — every
@@ -126,7 +151,10 @@ struct RestTokensHarness {
                             /*tag_push_fn=*/{},
                             /*inventory_store=*/nullptr,
                             /*product_pack_store=*/nullptr,
-                            /*sw_deploy_store=*/nullptr, device_token_store.get());
+                            /*sw_deploy_store=*/nullptr, device_token_store.get(),
+                            /*license_store=*/nullptr,
+                            /*guaranteed_state_store=*/nullptr,
+                            /*metrics_registry=*/&metrics);
     }
 
     ~RestTokensHarness() {
@@ -295,10 +323,13 @@ TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure emits failure audit (F-002)"
     auto res = h.sink.Post("/api/v1/tokens", R"({"name":"alice-key","expires_at":0})");
     REQUIRE(res);
 
-    // Handler returns 400 with the CSPRNG message in the error envelope —
-    // the same response shape as a generic create failure. The audit row
-    // is the distinguishing forensic signal.
-    CHECK(res->status == 400);
+    // PR W1.1 round 3 sre-2: CSPRNG failure is a server-side condition
+    // (entropy exhaustion), not a client error — status is 503 with
+    // Retry-After: 5 so client retry / LB / SRE rules see a 5xx rather
+    // than a 4xx. Closes #1046. The audit row is still the distinguishing
+    // forensic signal across both surfaces.
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "5");
     CHECK(res->body.find("CSPRNG unavailable") != std::string::npos);
 
     // The override must have been consumed (proves the force hit
@@ -334,7 +365,9 @@ TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure emits failure audit (
         R"({"name":"dev-token-1","device_id":"dev-001","definition_id":"d-1","expires_at":0})");
     REQUIRE(res);
 
-    CHECK(res->status == 400);
+    // PR W1.1 round 3 sre-2: 503 + Retry-After: 5 (entropy is server-side).
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "5");
     CHECK(res->body.find("CSPRNG unavailable") != std::string::npos);
     CHECK_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
 
@@ -395,15 +428,16 @@ TEST_CASE("HTMX POST /api/settings/api-tokens: CSPRNG failure persists failure "
         REQUIRE_FALSE(result.has_value());
 
         // Mirror the AuditEvent shape the settings_routes failure-path
-        // emits at lines 3299-3307 of settings_routes.cpp.
-        audit_store.log({.principal = "alice",
-                         .principal_role = "user",
-                         .action = "api_token.create",
-                         .target_type = "ApiToken",
-                         .target_id = "dashboard-token",
-                         .detail = "csprng_unavailable: " + result.error(),
-                         .source_ip = "127.0.0.1",
-                         .result = "failure"});
+        // emits at lines 3299-3307 of settings_routes.cpp. UP-H1 made
+        // AuditStore::log [[nodiscard]] — capture and assert true here.
+        REQUIRE(audit_store.log({.principal = "alice",
+                                 .principal_role = "user",
+                                 .action = "api_token.create",
+                                 .target_type = "ApiToken",
+                                 .target_id = "dashboard-token",
+                                 .detail = "csprng_unavailable: " + result.error(),
+                                 .source_ip = "127.0.0.1",
+                                 .result = "failure"}));
 
         auto rows = audit_store.query({});
         REQUIRE(rows.size() == 1);
@@ -442,4 +476,239 @@ TEST_CASE("REST POST /api/v1/tokens: success path is unchanged (regression guard
     CHECK(h.audit_log[0].action == "api_token.create");
     CHECK(h.audit_log[0].result == "success");
     CHECK(h.audit_log[0].detail.find("csprng_unavailable") == std::string::npos);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// PR W1.1 round 3 — UP-H1, UP-H2, sre-1, sre-2.
+//
+// UP-H1 (HIGH, gov Gate 4 unhappy-path): a CSPRNG-failure response that
+// silently drops the failure-path audit row hides a security-relevant
+// failure from the SOC 2 CC7.2 evidence chain. Mirrors the PR #883 HIGH-2
+// session-revocation pattern: AuditFn typedef → bool; handler captures
+// the return and an exception via try/catch; on either, surfaces
+// `Sec-Audit-Failed: true` header + `audit_emitted: false` body field.
+//
+// UP-H2 (HIGH, gov Gate 4 unhappy-path): unbounded `name` / `device_id`
+// in the request body amplifies the cheap-to-trigger CSPRNG-failure path
+// into an audit-DB-growth DoS during early-boot entropy exhaustion
+// windows. Clamp at 256 chars BEFORE audit emission; reject with 400
+// `invalid_input_length`; do NOT emit an audit row (oversized input is
+// request-level garbage).
+//
+// sre-1 (MEDIUM HOLD, gov Gate 6 sre): no Prometheus signal exists for
+// CSPRNG failure today. Add `yuzu_secure_random_failure_total{reason,site}`
+// counter so on-call has a paging surface short of grepping audit logs.
+//
+// sre-2 (MEDIUM HOLD, gov Gate 6 sre): the existing 400 on CSPRNG
+// failure is wrong — entropy exhaustion is server-side, clients with
+// retry logic do not retry 4xx, and LB / SRE alerts page on 5xx_rate.
+// Return 503 + Retry-After: 5. Closes follow-up #1046.
+// ──────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("REST POST /api/v1/tokens: silent audit-drop on CSPRNG failure surfaces "
+          "Sec-Audit-Failed header + audit_emitted=false body (UP-H1)",
+          "[rest][token][csprng][audit][uph1]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+    h.audit_should_fail = true; // simulate wedged AuditStore
+
+    yuzu::server::test_hooks::force_next_failure_for_this_thread();
+
+    auto res = h.sink.Post("/api/v1/tokens", R"({"name":"alice-key","expires_at":0})");
+    REQUIRE(res);
+
+    // The 503 still completes — operator's "deny NOW" intent takes
+    // precedence over partial-SOC2-evidence. The partial-success is
+    // marked on the response so clients can't read a clean 503 as
+    // proof the audit row landed.
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "5");
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("\"audit_emitted\":false") != std::string::npos);
+    CHECK(res->body.find("CSPRNG unavailable") != std::string::npos);
+
+    // Audit emission was attempted (push_back in the lambda runs even
+    // on the failure branch) — proves the handler reached the audit
+    // call before the simulated failure.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "api_token.create");
+    CHECK(h.audit_log[0].result == "failure");
+}
+
+TEST_CASE("REST POST /api/v1/tokens: audit-pipeline exception is caught and surfaced "
+          "via Sec-Audit-Failed (UP-H1)",
+          "[rest][token][csprng][audit][uph1]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+    h.audit_should_throw = true; // simulate audit pipeline exception
+
+    yuzu::server::test_hooks::force_next_failure_for_this_thread();
+
+    auto res = h.sink.Post("/api/v1/tokens", R"({"name":"alice-key","expires_at":0})");
+    REQUIRE(res);
+
+    // Exception from audit_fn does NOT abort the response — the 503
+    // still completes, and the partial-success is marked.
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("\"audit_emitted\":false") != std::string::npos);
+}
+
+TEST_CASE("REST POST /api/v1/device-tokens: silent audit-drop surfaces Sec-Audit-Failed "
+          "header + audit_emitted=false body (UP-H1)",
+          "[rest][token][csprng][audit][uph1]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+    h.audit_should_fail = true;
+
+    yuzu::server::test_hooks::force_next_failure_for_this_thread();
+
+    auto res = h.sink.Post(
+        "/api/v1/device-tokens",
+        R"({"name":"dev-token-1","device_id":"dev-001","definition_id":"d-1","expires_at":0})");
+    REQUIRE(res);
+
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "5");
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("\"audit_emitted\":false") != std::string::npos);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "device_token.create");
+    CHECK(h.audit_log[0].result == "failure");
+}
+
+TEST_CASE("REST POST /api/v1/tokens: oversized name (>256 chars) rejected with 400 "
+          "invalid_input_length and NO audit row (UP-H2)",
+          "[rest][token][csprng][audit][uph2]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    // 257 chars — one over the 256 cap.
+    std::string oversized_name(257, 'A');
+    std::string body = R"({"name":")" + oversized_name + R"(","expires_at":0})";
+
+    auto res = h.sink.Post("/api/v1/tokens", body);
+    REQUIRE(res);
+
+    // Validation 400 — not a 503. The CSPRNG never runs, the
+    // ApiTokenStore never sees the request, the audit pipeline is
+    // never invoked. Oversized input is request-level garbage —
+    // auditing it would re-introduce the DoS vector we're closing.
+    CHECK(res->status == 400);
+    CHECK(res->body.find("invalid_input_length") != std::string::npos);
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST POST /api/v1/device-tokens: oversized device_id (>256 chars) rejected with "
+          "400 invalid_input_length (UP-H2)",
+          "[rest][token][csprng][audit][uph2]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    std::string oversized_id(257, 'D');
+    std::string body =
+        R"({"name":"dev-token","device_id":")" + oversized_id + R"(","definition_id":"d"})";
+
+    auto res = h.sink.Post("/api/v1/device-tokens", body);
+    REQUIRE(res);
+
+    CHECK(res->status == 400);
+    CHECK(res->body.find("invalid_input_length") != std::string::npos);
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure increments "
+          "yuzu_secure_random_failure_total{site=api_token} (sre-1)",
+          "[rest][token][csprng][metrics][sre1]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    // Counter starts at 0.
+    yuzu::Labels labels{{"reason", "prng_failure"}, {"site", "api_token"}};
+    REQUIRE(h.metrics.counter("yuzu_secure_random_failure_total", labels).value() == 0.0);
+
+    yuzu::server::test_hooks::force_next_failure_for_this_thread();
+
+    auto res = h.sink.Post("/api/v1/tokens", R"({"name":"alice-key","expires_at":0})");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+
+    // sre-1: the metric must have been incremented by exactly 1 on the
+    // CSPRNG-failure branch. Operators wire
+    //   rate(yuzu_secure_random_failure_total[5m]) > 0
+    // to page on-call.
+    CHECK(h.metrics.counter("yuzu_secure_random_failure_total", labels).value() == 1.0);
+
+    // The device_token site label is NOT incremented — labels are
+    // load-bearing for site differentiation in SRE rules.
+    yuzu::Labels device_labels{{"reason", "prng_failure"}, {"site", "device_token"}};
+    CHECK(h.metrics.counter("yuzu_secure_random_failure_total", device_labels).value() == 0.0);
+}
+
+TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure increments "
+          "yuzu_secure_random_failure_total{site=device_token} (sre-1)",
+          "[rest][token][csprng][metrics][sre1]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    yuzu::Labels labels{{"reason", "prng_failure"}, {"site", "device_token"}};
+    REQUIRE(h.metrics.counter("yuzu_secure_random_failure_total", labels).value() == 0.0);
+
+    yuzu::server::test_hooks::force_next_failure_for_this_thread();
+
+    auto res = h.sink.Post("/api/v1/device-tokens",
+                           R"({"name":"dev-token","device_id":"dev-001","definition_id":"d-1"})");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+
+    CHECK(h.metrics.counter("yuzu_secure_random_failure_total", labels).value() == 1.0);
+}
+
+TEST_CASE("REST POST /api/v1/tokens: validation 400 (oversized) does NOT increment "
+          "secure_random metric (sre-1 negative)",
+          "[rest][token][csprng][metrics][sre1]") {
+    // Negative case: confirm UP-H2's pre-CSPRNG rejection path doesn't
+    // touch the CSPRNG metric. Same input as the UP-H2 oversized-name
+    // test, but asserts on the metric.
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    yuzu::Labels labels{{"reason", "prng_failure"}, {"site", "api_token"}};
+
+    std::string oversized_name(257, 'A');
+    std::string body = R"({"name":")" + oversized_name + R"(","expires_at":0})";
+
+    auto res = h.sink.Post("/api/v1/tokens", body);
+    REQUIRE(res);
+    REQUIRE(res->status == 400);
+
+    // The CSPRNG path is never reached → metric stays at 0.
+    CHECK(h.metrics.counter("yuzu_secure_random_failure_total", labels).value() == 0.0);
+}
+
+TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure returns 503 + Retry-After: 5 (sre-2)",
+          "[rest][token][csprng][sre2]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::user;
+
+    yuzu::server::test_hooks::force_next_failure_for_this_thread();
+
+    auto res = h.sink.Post("/api/v1/tokens", R"({"name":"alice-key","expires_at":0})");
+    REQUIRE(res);
+
+    // sre-2: CSPRNG failure is a 5xx (server-side condition), not 4xx.
+    // LB / SRE 5xx_rate alerts now fire correctly; clients with
+    // exponential-backoff retry logic see a retryable status and the
+    // explicit Retry-After hint tells them when. Closes #1046.
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "5");
 }

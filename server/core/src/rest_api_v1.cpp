@@ -504,14 +504,14 @@ void RestApiV1::register_routes(
     ServiceGroupFn service_group_fn, TagPushFn tag_push_fn, InventoryStore* inventory_store,
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
-    GuaranteedStateStore* guaranteed_state_store) {
+    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
                     execution_tracker, schedule_engine, approval_manager, tag_store, audit_store,
                     std::move(service_group_fn), std::move(tag_push_fn), inventory_store,
                     product_pack_store, sw_deploy_store, device_token_store, license_store,
-                    guaranteed_state_store);
+                    guaranteed_state_store, metrics_registry);
 }
 
 void RestApiV1::register_routes(
@@ -523,7 +523,7 @@ void RestApiV1::register_routes(
     ServiceGroupFn service_group_fn, TagPushFn tag_push_fn, InventoryStore* inventory_store,
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
-    GuaranteedStateStore* guaranteed_state_store) {
+    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -998,7 +998,8 @@ void RestApiV1::register_routes(
              });
 
     sink.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, token_store, rbac_store, mgmt_store,
-                                 tag_store](const httplib::Request& req, httplib::Response& res) {
+                                 tag_store, metrics_registry](const httplib::Request& req,
+                                                              httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Write"))
             return;
         if (!token_store) {
@@ -1015,6 +1016,30 @@ void RestApiV1::register_routes(
         auto name = body.value("name", "");
         auto expires_at = body.value("expires_at", int64_t{0});
         auto scope_service = body.value("scope_service", "");
+
+        // UP-H2 (gov Gate 4, unhappy-path): clamp user-controlled string
+        // length BEFORE any audit emission. An unbounded `name` would be
+        // bound into SQLite per request and (combined with the cheap-to-
+        // trigger CSPRNG-failure path) hand an attacker an audit-DB DoS
+        // during early-boot entropy exhaustion windows. 256 chars is well
+        // above any legitimate token name (cf. settings_routes HTMX name
+        // input cap) and well below the SQLite text-bind buffer cost
+        // worth worrying about. Validation 400s are deliberately not
+        // audited — oversized input is request-level garbage and we
+        // already audit on success; not auditing here closes the audit-
+        // amplification vector outright.
+        if (name.size() > 256) {
+            res.status = 400;
+            res.set_content(error_json("invalid_input_length: name exceeds 256 chars"),
+                            "application/json");
+            return;
+        }
+        if (scope_service.size() > 256) {
+            res.status = 400;
+            res.set_content(error_json("invalid_input_length: scope_service exceeds 256 chars"),
+                            "application/json");
+            return;
+        }
 
         if (!scope_service.empty()) {
             if (!rbac_store || !rbac_store->is_rbac_enabled()) {
@@ -1049,6 +1074,16 @@ void RestApiV1::register_routes(
 
         auto result = token_store->create_token(name, session->username, expires_at, scope_service);
         if (!result) {
+            // sre-1 (gov Gate 6): Prometheus signal for CSPRNG failure so
+            // on-call has a paging surface short of grepping audit logs.
+            // Increment BEFORE the audit-emission try/catch so the metric
+            // is never lost to an audit-pipeline exception.
+            if (metrics_registry) {
+                metrics_registry
+                    ->counter("yuzu_secure_random_failure_total",
+                              {{"reason", "prng_failure"}, {"site", "api_token"}})
+                    .increment();
+            }
             // F-002 (gov Gate 2, security-guardian): on CSPRNG entropy
             // exhaustion the request returns an error but historically emitted
             // no audit. SOC 2 CC7.2/CC7.3 require security-relevant failure
@@ -1056,14 +1091,53 @@ void RestApiV1::register_routes(
             // response so a crash mid-response still leaves the audit trail.
             // The `csprng_unavailable:` marker lets SIEM rules filter this
             // distinct failure class from generic create failures.
-            audit_fn(req, "api_token.create", "failure", "ApiToken", name,
-                     "csprng_unavailable: " + result.error());
-            res.status = 400;
-            res.set_content(error_json(result.error()), "application/json");
+            //
+            // UP-H1 (gov Gate 4): wrap the audit call in try/catch so an
+            // exception from the audit pipeline does not abort the 503
+            // response, and capture the bool return so a silent persist
+            // failure (audit DB locked / wedged) surfaces as a
+            // `Sec-Audit-Failed: true` header and an `audit_emitted=false`
+            // envelope field. Mirrors the PR #883 HIGH-2 session-revocation
+            // pattern: operator's "deny NOW" intent (returning the 503)
+            // takes precedence over a partial-SOC2-evidence chain — but
+            // we mark the partial-success on the response so clients/SIEM
+            // cannot read a clean 503 as proof the audit row landed.
+            bool audit_emitted = false;
+            try {
+                audit_emitted = audit_fn(req, "api_token.create", "failure", "ApiToken", name,
+                                         "csprng_unavailable: " + result.error());
+            } catch (const std::exception& ex) {
+                spdlog::error("api_token.create audit emission threw: {}", ex.what());
+                audit_emitted = false;
+            } catch (...) {
+                spdlog::error("api_token.create audit emission threw unknown");
+                audit_emitted = false;
+            }
+            // sre-2 (gov Gate 6, sre): CSPRNG failure is a server-side
+            // condition (entropy exhaustion) — clients with retry logic
+            // need a 5xx so they back off and retry, and LB / SRE rules
+            // page on 5xx_rate not 4xx_rate. Retry-After: 5 gives the
+            // entropy pool a window to refill before the next attempt.
+            // Closes follow-up #1046.
+            res.status = 503;
+            res.set_header("Retry-After", "5");
+            if (!audit_emitted)
+                res.set_header("Sec-Audit-Failed", "true");
+            JObj envelope_err;
+            envelope_err.add("code", 503).add("message", "CSPRNG unavailable: " + result.error());
+            JObj envelope;
+            envelope.raw("error", envelope_err.str())
+                .add("audit_emitted", audit_emitted)
+                .raw("meta", R"({"api_version":"v1"})");
+            res.set_content(envelope.str(), "application/json");
             return;
         }
         auto detail = scope_service.empty() ? "" : "scope_service=" + scope_service;
-        audit_fn(req, "api_token.create", "success", "ApiToken", name, detail);
+        // Success-path audit fire-and-forget — bool intentionally discarded
+        // because the response is 201 Created regardless; if the audit row
+        // fails to persist, the AuditStore::emit_failed_ counter still
+        // increments and the operator-visible metric paths catch it.
+        (void)audit_fn(req, "api_token.create", "success", "ApiToken", name, detail);
         res.status = 201;
         JObj resp;
         resp.add("token", *result).add("name", name);
@@ -2294,9 +2368,9 @@ void RestApiV1::register_routes(
                             "application/json");
         });
 
-        sink.Post("/api/v1/device-tokens", [auth_fn, perm_fn, audit_fn,
-                                            device_token_store](const httplib::Request& req,
-                                                                httplib::Response& res) {
+        sink.Post("/api/v1/device-tokens", [auth_fn, perm_fn, audit_fn, device_token_store,
+                                            metrics_registry](const httplib::Request& req,
+                                                              httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -2313,9 +2387,43 @@ void RestApiV1::register_routes(
             auto definition_id = body.value("definition_id", "");
             int64_t expires_at = body.value("expires_at", int64_t{0});
 
+            // UP-H2 (gov Gate 4, unhappy-path): clamp user-controlled
+            // string length on `name`, `device_id`, and `definition_id`
+            // BEFORE any audit emission. Same DoS-via-oversized-payload
+            // class as the /api/v1/tokens site — see comment there for
+            // the full rationale. device_id is bound into the audit row
+            // as target_id, so it's the highest-priority field to clamp,
+            // but name and definition_id ride the same SQLite bind path.
+            if (name.size() > 256) {
+                res.status = 400;
+                res.set_content(error_json("invalid_input_length: name exceeds 256 chars"),
+                                "application/json");
+                return;
+            }
+            if (device_id.size() > 256) {
+                res.status = 400;
+                res.set_content(error_json("invalid_input_length: device_id exceeds 256 chars"),
+                                "application/json");
+                return;
+            }
+            if (definition_id.size() > 256) {
+                res.status = 400;
+                res.set_content(error_json("invalid_input_length: definition_id exceeds 256 chars"),
+                                "application/json");
+                return;
+            }
+
             auto result = device_token_store->create_token(name, session->username, device_id,
                                                            definition_id, expires_at);
             if (!result) {
+                // sre-1: Prometheus signal for CSPRNG failure (see
+                // /api/v1/tokens comment for full rationale).
+                if (metrics_registry) {
+                    metrics_registry
+                        ->counter("yuzu_secure_random_failure_total",
+                                  {{"reason", "prng_failure"}, {"site", "device_token"}})
+                        .increment();
+                }
                 // F-002 (gov Gate 2, security-guardian): same audit
                 // gap as POST /api/v1/tokens — CSPRNG failure on
                 // device-token issuance silently dropped the audit
@@ -2323,15 +2431,41 @@ void RestApiV1::register_routes(
                 // be auditable. `device_id` is the natural target_id
                 // for a device-scoped token (matches the eventual
                 // success-path subject) and `csprng_unavailable:`
-                // is the SIEM marker. Emit before the response so
-                // a mid-response crash still leaves the trail.
-                audit_fn(req, "device_token.create", "failure", "DeviceToken", device_id,
-                         "csprng_unavailable: " + result.error());
-                res.status = 400;
-                res.set_content(error_json(result.error()), "application/json");
+                // is the SIEM marker.
+                //
+                // UP-H1 (gov Gate 4): wrap audit in try/catch and
+                // capture bool return so a wedged AuditStore surfaces
+                // as Sec-Audit-Failed: true header + audit_emitted=false
+                // envelope field. See /api/v1/tokens for the full
+                // rationale.
+                bool audit_emitted = false;
+                try {
+                    audit_emitted = audit_fn(req, "device_token.create", "failure", "DeviceToken",
+                                             device_id, "csprng_unavailable: " + result.error());
+                } catch (const std::exception& ex) {
+                    spdlog::error("device_token.create audit emission threw: {}", ex.what());
+                    audit_emitted = false;
+                } catch (...) {
+                    spdlog::error("device_token.create audit emission threw unknown");
+                    audit_emitted = false;
+                }
+                // sre-2: 503 + Retry-After: 5 (entropy is server-side,
+                // not client error). Closes #1046.
+                res.status = 503;
+                res.set_header("Retry-After", "5");
+                if (!audit_emitted)
+                    res.set_header("Sec-Audit-Failed", "true");
+                JObj envelope_err;
+                envelope_err.add("code", 503)
+                    .add("message", "CSPRNG unavailable: " + result.error());
+                JObj envelope;
+                envelope.raw("error", envelope_err.str())
+                    .add("audit_emitted", audit_emitted)
+                    .raw("meta", R"({"api_version":"v1"})");
+                res.set_content(envelope.str(), "application/json");
                 return;
             }
-            audit_fn(req, "device_token.create", "success", "DeviceToken", "", name);
+            (void)audit_fn(req, "device_token.create", "success", "DeviceToken", "", name);
             res.status = 201;
             res.set_content(ok_json(JObj().add("raw_token", *result).str()), "application/json");
         });

@@ -264,6 +264,16 @@ public:
         // operators that the audit chain itself is degraded.
         metrics_.describe("yuzu_server_audit_emit_failed_total",
                           "Audit events that failed to persist (sqlite3_step != DONE)", "counter");
+        // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
+        // Increments in the token-create handlers (api_token, device_token)
+        // when `secure_random::fill_random` returns PrngFailure (entropy
+        // exhaustion). Operators wire a Prometheus rule like
+        //   rate(yuzu_secure_random_failure_total[5m]) > 0
+        // to page on-call short of grepping audit logs.
+        metrics_.describe("yuzu_secure_random_failure_total",
+                          "CSPRNG (RAND_bytes / BCryptGenRandom) failures during token "
+                          "issuance, labelled by reason and call site",
+                          "counter");
         // Login-latency observability (governance PR4 OBS-2). Histogram of
         // PBKDF2 verify duration, labelled by result so alerts can fire on
         // success-path regressions independently of brute-force noise on
@@ -793,7 +803,7 @@ public:
                 ev.detail = "fleet visualization endpoints disabled at startup "
                             "(--viz-disable / YUZU_VIZ_DISABLE)";
                 ev.result = "success";
-                audit_store_->log(ev);
+                (void)audit_store_->log(ev);
             }
 
             // CAP-1 (#1002) — bound the pushed_ map so a churning fleet or
@@ -929,7 +939,7 @@ public:
                         ev.target_id = target_id;
                         ev.detail = detail;
                         ev.result = std::string(result);
-                        audit_store_->log(ev);
+                        (void)audit_store_->log(ev);
                     };
                     auto envelope_id = [](const std::string& env) -> std::string {
                         auto p = nlohmann::json::parse(env, nullptr, false);
@@ -1402,14 +1412,14 @@ public:
                                   "--ca-cert (and --management-ca-cert if applicable).";
                         spdlog::error("[INSECURE-TLS] ({}) {}", posture, detail);
                         if (audit_store_ && audit_store_->is_open()) {
-                            audit_store_->log({.timestamp = std::time(nullptr),
-                                               .principal = "system",
-                                               .principal_role = "system",
-                                               .action = "server.tls_degraded",
-                                               .target_type = "server",
-                                               .target_id = posture,
-                                               .detail = detail,
-                                               .result = "warning"});
+                            (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                                     .principal = "system",
+                                                     .principal_role = "system",
+                                                     .action = "server.tls_degraded",
+                                                     .target_type = "server",
+                                                     .target_id = posture,
+                                                     .detail = detail,
+                                                     .result = "warning"});
                         }
                     }
                 });
@@ -1972,10 +1982,10 @@ private:
         return auth_routes_->make_audit_event(req, action, result);
     }
 
-    void audit_log(const httplib::Request& req, const std::string& action,
+    bool audit_log(const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type = {},
                    const std::string& target_id = {}, const std::string& detail = {}) {
-        auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
+        return auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
     }
 
     // Apply stored runtime config overrides on startup
@@ -3043,7 +3053,8 @@ private:
                 return gateway_service_->session_count();
             })
                              : SettingsRoutes::GatewaySessionCountFn{},
-            [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_);
+            [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
+            /*metrics_registry=*/&metrics_);
 
         // Legacy routes — redirect to dashboard
         web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
@@ -5381,8 +5392,8 @@ private:
         };
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) {
-            audit_log(req, action, result, target_type, target_id, detail);
+                               const std::string& target_id, const std::string& detail) -> bool {
+            return audit_log(req, action, result, target_type, target_id, detail);
         };
 
         // ComplianceRoutes — /compliance, /fragments/compliance/*, /api/policies/*,
@@ -5643,8 +5654,8 @@ private:
             },
             [this](const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type,
-                   const std::string& target_id, const std::string& detail) {
-                audit_log(req, action, result, target_type, target_id, detail);
+                   const std::string& target_id, const std::string& detail) -> bool {
+                return audit_log(req, action, result, target_type, target_id, detail);
             },
             rbac_store_.get(), mgmt_group_store_.get(), api_token_store_.get(),
             quarantine_store_.get(), response_store_.get(), instruction_store_.get(),
@@ -5669,7 +5680,8 @@ private:
             inventory_store_.get(), product_pack_store_.get(),
             /*sw_deploy_store=*/nullptr,
             /*device_token_store=*/nullptr,
-            /*license_store=*/nullptr, guaranteed_state_store_.get());
+            /*license_store=*/nullptr, guaranteed_state_store_.get(),
+            /*metrics_registry=*/&metrics_);
 
         // -- Register MCP server routes ----------------------------------------
 
