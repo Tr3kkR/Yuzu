@@ -177,6 +177,7 @@ if build_server
       'unit/server/test_legacy_shim.cpp',
       'unit/server/test_management_group_store.cpp',
       'unit/server/test_api_token_store.cpp',
+      'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_policy_store.cpp',
       'unit/server/test_guaranteed_state_store.cpp',

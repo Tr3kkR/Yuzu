@@ -92,7 +92,11 @@ private:
     mutable std::atomic<uint64_t> cache_misses_{0};
 
     void create_tables();
-    std::string generate_raw_token() const;
+    /// Generate a fresh `yuzu_` Bearer token from the platform CSPRNG.
+    /// Returns the raw token on success; std::unexpected when the system
+    /// entropy source is unavailable (caller must surface as 503, never
+    /// fall back to weak entropy). See `secure_random.hpp` for details.
+    std::expected<std::string, std::string> generate_raw_token() const;
     std::string sha256_hex(const std::string& input) const;
     void invalidate_cache(const std::string& token_hash);
 };

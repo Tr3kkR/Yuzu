@@ -6,23 +6,25 @@
  */
 
 #include "device_token_store.hpp"
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
 #include <filesystem>
+#include <set>
 #include <string>
 
 using namespace yuzu::server;
 
 namespace {
 
+// Adopts the shared TempDbFile RAII to dodge flake #473 — the previous
+// fixed-name temp path collided under parallel Catch2 runs (also see CLAUDE.md
+// "Test conventions — shared helpers").
 struct TempDb {
-    std::filesystem::path path;
-    TempDb() : path(std::filesystem::temp_directory_path() / "test_device_tokens.db") {
-        std::filesystem::remove(path);
-    }
-    ~TempDb() { std::filesystem::remove(path); }
+    yuzu::test::TempDbFile file{std::string_view{"test_device_tokens-"}};
+    const std::filesystem::path& path = file.path;
 };
 
 int64_t now_epoch() {
@@ -268,4 +270,53 @@ TEST_CASE("DeviceTokenStore: future expiry token is valid", "[device_token][auth
     auto validated = store.validate_token(*result);
     REQUIRE(validated.has_value());
     CHECK(validated->expires_at == future);
+}
+
+// ============================================================================
+// CSPRNG contract (#801) — replaces std::mt19937_64 with OpenSSL/BCrypt CSPRNG
+// ============================================================================
+
+TEST_CASE("DeviceTokenStore: consecutive tokens differ", "[device_token][csprng]") {
+    TempDb tmp;
+    DeviceTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    auto a = store.create_token("A", "admin", "", "", 0);
+    auto b = store.create_token("B", "admin", "", "", 0);
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    CHECK(*a != *b);
+}
+
+TEST_CASE("DeviceTokenStore: 256 consecutive tokens are all unique", "[device_token][csprng]") {
+    // 256 bits of entropy per token; the chance of a real-world collision in
+    // any feasible sample is negligible. Any duplicate here is a CSPRNG
+    // correctness failure (e.g. mt19937 regression).
+    TempDb tmp;
+    DeviceTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    std::set<std::string> seen;
+    for (int i = 0; i < 256; ++i) {
+        auto r = store.create_token("bulk", "admin", "", "", 0);
+        REQUIRE(r.has_value());
+        CHECK(seen.insert(*r).second);
+    }
+    CHECK(seen.size() == 256);
+}
+
+TEST_CASE("DeviceTokenStore: token shape — 'ydt_' + 64 lowercase hex chars",
+          "[device_token][csprng][format]") {
+    TempDb tmp;
+    DeviceTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    auto r = store.create_token("Shape", "admin", "", "", 0);
+    REQUIRE(r.has_value());
+    REQUIRE(r->size() == 68);
+    CHECK(r->starts_with("ydt_"));
+    for (std::size_t i = 4; i < r->size(); ++i) {
+        char c = (*r)[i];
+        CHECK(((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')));
+    }
 }

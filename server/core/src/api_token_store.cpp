@@ -1,12 +1,14 @@
 #include "api_token_store.hpp"
 #include "mcp_policy.hpp"
 #include "migration_runner.hpp"
+#include "secure_random.hpp"
 
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <cstdint>
 #include <mutex>
-#include <random>
+#include <span>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -18,7 +20,6 @@
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 #else
-#include <openssl/rand.h>
 #include <openssl/sha.h>
 #endif
 
@@ -105,25 +106,22 @@ void ApiTokenStore::create_tables() {
 
 // ── Token generation and hashing ─────────────────────────────────────────────
 
-std::string ApiTokenStore::generate_raw_token() const {
-    // Use CSPRNG for token generation (G2-SEC-A2-001)
-    unsigned char buf[32]{};
-#ifdef _WIN32
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCryptOpenAlgorithmProvider(&alg, BCRYPT_RNG_ALGORITHM, nullptr, 0);
-    if (alg) {
-        BCryptGenRandom(alg, buf, sizeof(buf), 0);
-        BCryptCloseAlgorithmProvider(alg, 0);
-    }
-#else
-    RAND_bytes(buf, sizeof(buf));
-#endif
+std::expected<std::string, std::string> ApiTokenStore::generate_raw_token() const {
+    // Cryptographic PRNG required — pre-#801 this swallowed CSPRNG failures
+    // and produced a token derived from zero-initialised bytes (all 'A'
+    // chars). secure_random surfaces entropy exhaustion as a hard error so
+    // the request becomes a 503 instead of issuing a known-weak token.
+    std::uint8_t buf[32]{};
+    auto rc = fill_random(std::span{buf, sizeof(buf)});
+    if (!rc.has_value())
+        return std::unexpected(std::string{"CSPRNG unavailable (entropy exhausted)"});
+
     static constexpr char chars[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     std::string token = "yuzu_";
     token.reserve(37);
-    for (int i = 0; i < 32; ++i)
-        token += chars[buf[i] % 62];
+    for (std::uint8_t b : buf)
+        token += chars[b % 62];
     return token;
 }
 
@@ -160,11 +158,10 @@ std::string ApiTokenStore::sha256_hex(const std::string& input) const {
 
 // ── CRUD ─────────────────────────────────────────────────────────────────────
 
-std::expected<std::string, std::string> ApiTokenStore::create_token(const std::string& name,
-                                                                    const std::string& principal_id,
-                                                                    int64_t expires_at,
-                                                                    const std::string& scope_service,
-                                                                    const std::string& mcp_tier) {
+std::expected<std::string, std::string>
+ApiTokenStore::create_token(const std::string& name, const std::string& principal_id,
+                            int64_t expires_at, const std::string& scope_service,
+                            const std::string& mcp_tier) {
     if (!db_)
         return std::unexpected("database not open");
     if (name.empty())
@@ -172,7 +169,8 @@ std::expected<std::string, std::string> ApiTokenStore::create_token(const std::s
     if (!scope_service.empty() && expires_at <= 0)
         return std::unexpected("service-scoped tokens must have an expiration time");
     if (!mcp_tier.empty() && !mcp::is_valid_tier(mcp_tier))
-        return std::unexpected("invalid MCP tier — must be 'readonly', 'operator', or 'supervised'");
+        return std::unexpected(
+            "invalid MCP tier — must be 'readonly', 'operator', or 'supervised'");
     if (!mcp_tier.empty() && expires_at <= 0)
         return std::unexpected("MCP tokens must have an expiration time (max 90 days)");
     if (!mcp_tier.empty() && expires_at > 0) {
@@ -182,7 +180,10 @@ std::expected<std::string, std::string> ApiTokenStore::create_token(const std::s
             return std::unexpected("MCP token TTL cannot exceed 90 days");
     }
 
-    auto raw = generate_raw_token();
+    auto raw_result = generate_raw_token();
+    if (!raw_result.has_value())
+        return std::unexpected(raw_result.error());
+    auto raw = std::move(*raw_result);
     auto hash = sha256_hex(raw);
     auto token_id = hash.substr(0, 24); // Display ID — 24 hex chars (96 bits, collision-resistant)
     auto now = now_epoch();
