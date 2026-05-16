@@ -477,10 +477,23 @@ std::size_t ApiTokenStore::revoke_for_principal(const std::string& principal_id)
     sqlite3_step(s);
     sqlite3_finalize(s);
 
-    const auto changed = static_cast<std::size_t>(std::max(sqlite3_changes(db_), 0));
+    // The hashes we snapshotted under db_mtx_ exclusive at lines 453-467
+    // are exactly the rows the UPDATE just transitioned to revoked=1: the
+    // SELECT and UPDATE share the same `WHERE principal_id = ? AND
+    // revoked = 0` predicate, and no other writer can sneak in while we
+    // hold db_mtx_ exclusively. So `hashes_to_invalidate.size()` is the
+    // count — no need for `sqlite3_changes()`.
+    //
+    // Also dodges two distinct foot-guns:
+    //   1. Windows: `std::max(sqlite3_changes(db_), 0)` mangles to garbage
+    //      because `<windows.h>` defines `max` as a macro when NOMINMAX
+    //      is not set, and the macro fight loses to `std::max`.
+    //   2. CLAUDE.md issue #1033: `sqlite3_changes()` after `sqlite3_step()`
+    //      on a FULLMUTEX handle is a documented data race against any
+    //      concurrent step() on the same handle.
     for (const auto& h : hashes_to_invalidate)
         invalidate_cache(h);
-    return changed;
+    return hashes_to_invalidate.size();
 }
 
 bool ApiTokenStore::delete_token(const std::string& token_id) {
