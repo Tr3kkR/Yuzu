@@ -233,8 +233,10 @@ TEST_CASE("T2 REST: get_definition_statistics returns per-definition aggregates"
 
     bool found_alpha = false, found_beta = false;
     for (auto& ds : def_stats) {
-        if (ds.definition_id == "def-alpha") found_alpha = true;
-        if (ds.definition_id == "def-beta") found_beta = true;
+        if (ds.definition_id == "def-alpha")
+            found_alpha = true;
+        if (ds.definition_id == "def-beta")
+            found_beta = true;
     }
     CHECK(found_alpha);
     CHECK(found_beta);
@@ -265,8 +267,10 @@ TEST_CASE("T2 REST: inventory eval with conditions matches correct agents",
     for (auto& r : results) {
         CHECK(r.match == true);
         CHECK(r.matched_value == "Windows");
-        if (r.agent_id == "agent-1") found_1 = true;
-        if (r.agent_id == "agent-3") found_3 = true;
+        if (r.agent_id == "agent-1")
+            found_1 = true;
+        if (r.agent_id == "agent-3")
+            found_3 = true;
     }
     CHECK(found_1);
     CHECK(found_3);
@@ -317,8 +321,7 @@ TEST_CASE("T2 REST: inventory eval empty conditions returns all agents",
     CHECK(results.size() == 3);
 }
 
-TEST_CASE("T2 REST: inventory eval with contains operator",
-          "[rest_api_t2][inventory_eval]") {
+TEST_CASE("T2 REST: inventory eval with contains operator", "[rest_api_t2][inventory_eval]") {
     Records records = {
         {"agent-1|software", R"({"packages": "vim,git,curl"})"},
         {"agent-2|software", R"({"packages": "nano,wget"})"},
@@ -337,8 +340,7 @@ TEST_CASE("T2 REST: inventory eval with contains operator",
 // Device Token flow (POST/GET/DELETE /api/v1/device-tokens)
 // ============================================================================
 
-TEST_CASE("T2 REST: device token create and validate round-trip",
-          "[rest_api_t2][device_token]") {
+TEST_CASE("T2 REST: device token create and validate round-trip", "[rest_api_t2][device_token]") {
     auto path = unique_temp_path("device-token-test");
     TempFileGuard guard(path);
     DeviceTokenStore store(path);
@@ -349,7 +351,8 @@ TEST_CASE("T2 REST: device token create and validate round-trip",
     auto raw_token = *token_result;
     CHECK(!raw_token.empty());
 
-    auto validated = store.validate_token(raw_token);
+    // Token is bound to device-001 — present matching agent_id (#824).
+    auto validated = store.validate_token(raw_token, "device-001");
     REQUIRE(validated.has_value());
     CHECK(validated->name == "test-token");
     CHECK(validated->principal_id == "admin");
@@ -358,8 +361,7 @@ TEST_CASE("T2 REST: device token create and validate round-trip",
     CHECK(validated->revoked == false);
 }
 
-TEST_CASE("T2 REST: device token list shows created tokens",
-          "[rest_api_t2][device_token]") {
+TEST_CASE("T2 REST: device token list shows created tokens", "[rest_api_t2][device_token]") {
     auto path = unique_temp_path("device-token-list");
     TempFileGuard guard(path);
     DeviceTokenStore store(path);
@@ -376,8 +378,7 @@ TEST_CASE("T2 REST: device token list shows created tokens",
     CHECK(admin_only.size() == 2);
 }
 
-TEST_CASE("T2 REST: device token revoke invalidates validation",
-          "[rest_api_t2][device_token]") {
+TEST_CASE("T2 REST: device token revoke invalidates validation", "[rest_api_t2][device_token]") {
     auto path = unique_temp_path("device-token-revoke");
     TempFileGuard guard(path);
     DeviceTokenStore store(path);
@@ -387,8 +388,8 @@ TEST_CASE("T2 REST: device token revoke invalidates validation",
     REQUIRE(token_result.has_value());
     auto raw_token = *token_result;
 
-    // Validate before revoke succeeds
-    auto pre_revoke = store.validate_token(raw_token);
+    // Validate before revoke succeeds (any-device token: device_id="")
+    auto pre_revoke = store.validate_token(raw_token, "");
     REQUIRE(pre_revoke.has_value());
 
     // Get the token_id from the list so we can revoke by id
@@ -398,12 +399,12 @@ TEST_CASE("T2 REST: device token revoke invalidates validation",
     CHECK(revoked == true);
 
     // Validate after revoke should fail
-    auto post_revoke = store.validate_token(raw_token);
-    CHECK(!post_revoke.has_value());
+    auto post_revoke = store.validate_token(raw_token, "");
+    REQUIRE(!post_revoke.has_value());
+    CHECK(post_revoke.error() == DeviceTokenValidateError::revoked);
 }
 
-TEST_CASE("T2 REST: device token expired token fails validation",
-          "[rest_api_t2][device_token]") {
+TEST_CASE("T2 REST: device token expired token fails validation", "[rest_api_t2][device_token]") {
     auto path = unique_temp_path("device-token-expire");
     TempFileGuard guard(path);
     DeviceTokenStore store(path);
@@ -413,16 +414,16 @@ TEST_CASE("T2 REST: device token expired token fails validation",
     auto result = store.create_token("expired", "admin", "", "", 1);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result);
-    CHECK(!validated.has_value());
+    auto validated = store.validate_token(*result, "");
+    REQUIRE(!validated.has_value());
+    CHECK(validated.error() == DeviceTokenValidateError::expired);
 }
 
 // ============================================================================
 // Software Deployment flow (software deployment endpoints)
 // ============================================================================
 
-TEST_CASE("T2 REST: create package and list packages",
-          "[rest_api_t2][software_deployment]") {
+TEST_CASE("T2 REST: create package and list packages", "[rest_api_t2][software_deployment]") {
     auto path = unique_temp_path("sw-deploy-pkg");
     TempFileGuard guard(path);
     SoftwareDeploymentStore store(path);
@@ -628,8 +629,7 @@ TEST_CASE("T2 REST: active_count reflects running deployments",
 // License flow (POST/GET /api/v1/license)
 // ============================================================================
 
-TEST_CASE("T2 REST: license activate and get active",
-          "[rest_api_t2][license]") {
+TEST_CASE("T2 REST: license activate and get active", "[rest_api_t2][license]") {
     auto path = unique_temp_path("license-test");
     TempFileGuard guard(path);
     LicenseStore store(path);
@@ -683,8 +683,7 @@ TEST_CASE("T2 REST: license validate with agent count generates alerts on exceed
     CHECK(found_exceeded);
 }
 
-TEST_CASE("T2 REST: license feature check",
-          "[rest_api_t2][license]") {
+TEST_CASE("T2 REST: license feature check", "[rest_api_t2][license]") {
     auto path = unique_temp_path("license-features");
     TempFileGuard guard(path);
     LicenseStore store(path);
@@ -704,8 +703,7 @@ TEST_CASE("T2 REST: license feature check",
     CHECK(store.has_feature("nonexistent_feature") == false);
 }
 
-TEST_CASE("T2 REST: license alert acknowledge",
-          "[rest_api_t2][license]") {
+TEST_CASE("T2 REST: license alert acknowledge", "[rest_api_t2][license]") {
     auto path = unique_temp_path("license-ack");
     TempFileGuard guard(path);
     LicenseStore store(path);
@@ -729,14 +727,14 @@ TEST_CASE("T2 REST: license alert acknowledge",
         auto unacked = store.list_alerts(true);
         bool found_acked = false;
         for (auto& a : unacked) {
-            if (a.id == alerts[0].id) found_acked = true;
+            if (a.id == alerts[0].id)
+                found_acked = true;
         }
         CHECK(found_acked == false);
     }
 }
 
-TEST_CASE("T2 REST: license remove",
-          "[rest_api_t2][license]") {
+TEST_CASE("T2 REST: license remove", "[rest_api_t2][license]") {
     auto path = unique_temp_path("license-remove");
     TempFileGuard guard(path);
     LicenseStore store(path);
@@ -854,8 +852,9 @@ TEST_CASE("T2 REST: device tokens and software deployment independent stores",
     auto dep_id = deploy_store.create_deployment(dep);
     REQUIRE(dep_id.has_value());
 
-    // Both stores are functional and independent
-    auto validated = token_store.validate_token(*token);
+    // Both stores are functional and independent. Token is bound to
+    // device-001 — present matching presenter to pass binding check (#824).
+    auto validated = token_store.validate_token(*token, "device-001");
     CHECK(validated.has_value());
     auto deployment = deploy_store.get_deployment(*dep_id);
     CHECK(deployment.has_value());

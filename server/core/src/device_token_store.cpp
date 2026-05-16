@@ -205,10 +205,11 @@ DeviceTokenStore::create_token(const std::string& name, const std::string& princ
     return raw; // Return raw token (shown once to user)
 }
 
-std::optional<DeviceAuthToken>
-DeviceTokenStore::validate_token(const std::string& raw_token) const {
+std::expected<DeviceAuthToken, DeviceTokenValidateError>
+DeviceTokenStore::validate_token(const std::string& raw_token,
+                                 const std::string& presenting_agent_id) const {
     if (!db_ || raw_token.empty())
-        return std::nullopt;
+        return std::unexpected(DeviceTokenValidateError::invalid_input);
 
     auto hashed = hash_token(raw_token);
 
@@ -223,12 +224,13 @@ DeviceTokenStore::validate_token(const std::string& raw_token) const {
                            "created_at, expires_at, last_used_at, revoked "
                            "FROM device_auth_tokens WHERE token_hash = ?;",
                            -1, &s, nullptr) != SQLITE_OK)
-        return std::nullopt;
+        return std::unexpected(DeviceTokenValidateError::not_found);
     sqlite3_bind_text(s, 1, hashed.c_str(), -1, SQLITE_TRANSIENT);
 
-    std::optional<DeviceAuthToken> result;
+    DeviceAuthToken t;
+    bool row_found = false;
     if (sqlite3_step(s) == SQLITE_ROW) {
-        DeviceAuthToken t;
+        row_found = true;
         t.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
         t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
         t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
@@ -238,39 +240,54 @@ DeviceTokenStore::validate_token(const std::string& raw_token) const {
         t.expires_at = sqlite3_column_int64(s, 6);
         t.last_used_at = sqlite3_column_int64(s, 7);
         t.revoked = sqlite3_column_int(s, 8) != 0;
-
-        // Check revocation
-        if (t.revoked) {
-            sqlite3_finalize(s);
-            return std::nullopt;
-        }
-
-        // Check expiration (expires_at == 0 means no expiry)
-        auto now = now_epoch();
-        if (t.expires_at > 0 && now > t.expires_at) {
-            sqlite3_finalize(s);
-            return std::nullopt;
-        }
-
-        result = std::move(t);
     }
     sqlite3_finalize(s);
 
-    // Update last_used_at (already holding unique_lock)
-    if (result) {
-        sqlite3_stmt* upd = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "UPDATE device_auth_tokens SET last_used_at = ? "
-                               "WHERE token_hash = ?;",
-                               -1, &upd, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(upd, 1, now_epoch());
-            sqlite3_bind_text(upd, 2, hashed.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(upd);
-            sqlite3_finalize(upd);
-        }
+    if (!row_found)
+        return std::unexpected(DeviceTokenValidateError::not_found);
+
+    if (t.revoked)
+        return std::unexpected(DeviceTokenValidateError::revoked);
+
+    // expires_at == 0 means no expiry
+    auto now = now_epoch();
+    if (t.expires_at > 0 && now > t.expires_at)
+        return std::unexpected(DeviceTokenValidateError::expired);
+
+    // Binding enforcement: prevents stolen-token impersonation (#824).
+    // The token row stores `device_id` = the agent authorized to present
+    // it. If the caller supplies a `presenting_agent_id` and it does not
+    // match, reject. Empty `device_id` means any-device — those tokens
+    // existed pre-#824 for org-wide bootstrap and remain permissible, but
+    // the caller MUST still authenticate by another channel before issuing
+    // privileges. Empty `presenting_agent_id` is treated as "no claimed
+    // identity"; we permit only the any-device token case so a misuse of
+    // the API (forgetting to pass the agent id) cannot silently bypass
+    // the check.
+    if (!t.device_id.empty() && presenting_agent_id != t.device_id)
+        return std::unexpected(DeviceTokenValidateError::binding_mismatch);
+    if (t.device_id.empty() && !presenting_agent_id.empty()) {
+        // Any-device token claimed by a specific agent — allowed but worth
+        // logging at debug so an auditor can see the broader-than-needed
+        // token in use. No audit row here; the caller owns the per-RPC
+        // audit decision.
+        spdlog::debug("DeviceTokenStore: any-device token '{}' used by agent '{}'", t.token_id,
+                      presenting_agent_id);
     }
 
-    return result;
+    // Update last_used_at (already holding unique_lock)
+    sqlite3_stmt* upd = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "UPDATE device_auth_tokens SET last_used_at = ? "
+                           "WHERE token_hash = ?;",
+                           -1, &upd, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(upd, 1, now_epoch());
+        sqlite3_bind_text(upd, 2, hashed.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(upd);
+        sqlite3_finalize(upd);
+    }
+
+    return t;
 }
 
 std::vector<DeviceAuthToken> DeviceTokenStore::list_tokens(const std::string& principal_id) const {

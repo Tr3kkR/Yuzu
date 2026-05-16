@@ -47,7 +47,9 @@ TEST_CASE("DeviceTokenStore: create and validate round-trip", "[device_token][cr
     auto result = store.create_token("Test Token", "admin", "", "", 0);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result);
+    // Any-device token (device_id="") accepts any presenter — empty presenter
+    // works for the round-trip case.
+    auto validated = store.validate_token(*result, "");
     REQUIRE(validated.has_value());
     CHECK(validated->name == "Test Token");
     CHECK(validated->principal_id == "admin");
@@ -71,8 +73,9 @@ TEST_CASE("DeviceTokenStore: invalid token rejected", "[device_token][auth]") {
     DeviceTokenStore store(tmp.path);
     REQUIRE(store.is_open());
 
-    auto validated = store.validate_token("ydt_this_is_not_a_valid_token_abcdef0123456789");
-    CHECK(!validated.has_value());
+    auto validated = store.validate_token("ydt_this_is_not_a_valid_token_abcdef0123456789", "");
+    REQUIRE(!validated.has_value());
+    CHECK(validated.error() == DeviceTokenValidateError::not_found);
 }
 
 TEST_CASE("DeviceTokenStore: empty token rejected", "[device_token][auth]") {
@@ -80,8 +83,9 @@ TEST_CASE("DeviceTokenStore: empty token rejected", "[device_token][auth]") {
     DeviceTokenStore store(tmp.path);
     REQUIRE(store.is_open());
 
-    auto validated = store.validate_token("");
-    CHECK(!validated.has_value());
+    auto validated = store.validate_token("", "");
+    REQUIRE(!validated.has_value());
+    CHECK(validated.error() == DeviceTokenValidateError::invalid_input);
 }
 
 TEST_CASE("DeviceTokenStore: expired token rejected", "[device_token][auth]") {
@@ -93,8 +97,9 @@ TEST_CASE("DeviceTokenStore: expired token rejected", "[device_token][auth]") {
     auto result = store.create_token("Expired Token", "admin", "", "", 1);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result);
-    CHECK(!validated.has_value());
+    auto validated = store.validate_token(*result, "");
+    REQUIRE(!validated.has_value());
+    CHECK(validated.error() == DeviceTokenValidateError::expired);
 }
 
 TEST_CASE("DeviceTokenStore: revoked token rejected", "[device_token][auth]") {
@@ -106,7 +111,7 @@ TEST_CASE("DeviceTokenStore: revoked token rejected", "[device_token][auth]") {
     REQUIRE(raw.has_value());
 
     // Validate before revocation
-    auto valid1 = store.validate_token(*raw);
+    auto valid1 = store.validate_token(*raw, "");
     REQUIRE(valid1.has_value());
 
     // Revoke by token_id
@@ -114,8 +119,9 @@ TEST_CASE("DeviceTokenStore: revoked token rejected", "[device_token][auth]") {
     CHECK(revoked);
 
     // Validate after revocation should fail
-    auto valid2 = store.validate_token(*raw);
-    CHECK(!valid2.has_value());
+    auto valid2 = store.validate_token(*raw, "");
+    REQUIRE(!valid2.has_value());
+    CHECK(valid2.error() == DeviceTokenValidateError::revoked);
 }
 
 // ============================================================================
@@ -185,7 +191,7 @@ TEST_CASE("DeviceTokenStore: validate updates last_used_at", "[device_token][aut
     CHECK(before[0].last_used_at == 0);
 
     // Validate the token (triggers last_used_at update)
-    auto validated = store.validate_token(*raw);
+    auto validated = store.validate_token(*raw, "");
     REQUIRE(validated.has_value());
 
     // After validation, last_used_at should be updated
@@ -206,7 +212,8 @@ TEST_CASE("DeviceTokenStore: device scope stored correctly", "[device_token][sco
     auto result = store.create_token("Scoped Token", "admin", "device-42", "", 0);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result);
+    // Bound to device-42 — must present matching agent_id.
+    auto validated = store.validate_token(*result, "device-42");
     REQUIRE(validated.has_value());
     CHECK(validated->device_id == "device-42");
     CHECK(validated->definition_id.empty());
@@ -220,7 +227,8 @@ TEST_CASE("DeviceTokenStore: definition scope stored correctly", "[device_token]
     auto result = store.create_token("Def Scoped Token", "admin", "", "get-os-info", 0);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result);
+    // device_id is empty -> any-device token, presenter can be empty.
+    auto validated = store.validate_token(*result, "");
     REQUIRE(validated.has_value());
     CHECK(validated->device_id.empty());
     CHECK(validated->definition_id == "get-os-info");
@@ -235,7 +243,7 @@ TEST_CASE("DeviceTokenStore: both scopes stored correctly", "[device_token][scop
         store.create_token("Dual Scoped Token", "admin", "device-99", "restart-service", 0);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result);
+    auto validated = store.validate_token(*result, "device-99");
     REQUIRE(validated.has_value());
     CHECK(validated->device_id == "device-99");
     CHECK(validated->definition_id == "restart-service");
@@ -253,7 +261,7 @@ TEST_CASE("DeviceTokenStore: non-expiring token (expires_at=0) is valid", "[devi
     auto result = store.create_token("Perpetual Token", "admin", "", "", 0);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result);
+    auto validated = store.validate_token(*result, "");
     REQUIRE(validated.has_value());
     CHECK(validated->expires_at == 0);
 }
@@ -267,9 +275,107 @@ TEST_CASE("DeviceTokenStore: future expiry token is valid", "[device_token][auth
     auto result = store.create_token("Future Token", "admin", "", "", future);
     REQUIRE(result.has_value());
 
-    auto validated = store.validate_token(*result);
+    auto validated = store.validate_token(*result, "");
     REQUIRE(validated.has_value());
     CHECK(validated->expires_at == future);
+}
+
+// ============================================================================
+// Binding enforcement (#824) — token presenter MUST equal token subject
+// ============================================================================
+
+TEST_CASE("DeviceTokenStore: device-bound token accepted from matching presenter",
+          "[device_token][binding]") {
+    TempDb tmp;
+    DeviceTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    auto raw = store.create_token("Bound", "admin", "device-A", "", 0);
+    REQUIRE(raw.has_value());
+
+    auto ok = store.validate_token(*raw, "device-A");
+    REQUIRE(ok.has_value());
+    CHECK(ok->device_id == "device-A");
+}
+
+TEST_CASE("DeviceTokenStore: device-bound token rejected from different presenter",
+          "[device_token][binding]") {
+    // Core #824 case: token issued for device A is presented by device B.
+    // The hash matches and the row is found, but binding enforcement must
+    // reject with the typed binding_mismatch error so the handler can emit
+    // the right audit row.
+    TempDb tmp;
+    DeviceTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    auto raw = store.create_token("Bound", "admin", "device-A", "", 0);
+    REQUIRE(raw.has_value());
+
+    auto bad = store.validate_token(*raw, "device-B");
+    REQUIRE(!bad.has_value());
+    CHECK(bad.error() == DeviceTokenValidateError::binding_mismatch);
+}
+
+TEST_CASE("DeviceTokenStore: device-bound token rejected when presenter empty",
+          "[device_token][binding]") {
+    // Empty presenter on a bound token is also a mismatch — passing "" is
+    // not a back-door to skip the check. Callers that genuinely have no
+    // agent identity (early bootstrap) should only ever encounter any-device
+    // tokens (device_id="").
+    TempDb tmp;
+    DeviceTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    auto raw = store.create_token("Bound", "admin", "device-A", "", 0);
+    REQUIRE(raw.has_value());
+
+    auto bad = store.validate_token(*raw, "");
+    REQUIRE(!bad.has_value());
+    CHECK(bad.error() == DeviceTokenValidateError::binding_mismatch);
+}
+
+TEST_CASE("DeviceTokenStore: any-device token (device_id empty) accepts any presenter",
+          "[device_token][binding]") {
+    // Org-wide / bootstrap any-device tokens (device_id="") accept any
+    // presenter. These are an org policy choice — the binding check still
+    // structurally cannot fail because there is no subject to bind to. The
+    // caller still owns the outer principal check.
+    TempDb tmp;
+    DeviceTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    auto raw = store.create_token("AnyDevice", "admin", "", "", 0);
+    REQUIRE(raw.has_value());
+
+    auto a = store.validate_token(*raw, "device-A");
+    REQUIRE(a.has_value());
+    auto b = store.validate_token(*raw, "device-B");
+    REQUIRE(b.has_value());
+    auto e = store.validate_token(*raw, "");
+    REQUIRE(e.has_value());
+}
+
+TEST_CASE("DeviceTokenStore: binding_mismatch precedes neither expired nor revoked",
+          "[device_token][binding]") {
+    // Ordering invariant: not_found / revoked / expired are checked before
+    // binding_mismatch because (a) revoked/expired tokens MUST always be
+    // rejected even if the right presenter shows up, and (b) returning
+    // binding_mismatch for a revoked token would leak that the hash exists.
+    TempDb tmp;
+    DeviceTokenStore store(tmp.path);
+    REQUIRE(store.is_open());
+
+    // Expired token bound to device-A
+    auto raw = store.create_token("ExpiredBound", "admin", "device-A", "", 1);
+    REQUIRE(raw.has_value());
+
+    // Even with the right presenter, expired wins
+    auto exp_ok = store.validate_token(*raw, "device-A");
+    REQUIRE(!exp_ok.has_value());
+    CHECK(exp_ok.error() == DeviceTokenValidateError::expired);
+    auto exp_bad = store.validate_token(*raw, "device-B");
+    REQUIRE(!exp_bad.has_value());
+    CHECK(exp_bad.error() == DeviceTokenValidateError::expired);
 }
 
 // ============================================================================
