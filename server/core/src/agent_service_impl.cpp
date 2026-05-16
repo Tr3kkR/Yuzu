@@ -50,6 +50,27 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         .increment();
     const auto& info = request->info();
 
+    // -- W1.4 R2 / UP-H1 agent_id length bound -------------------------------
+    // Cap agent_id BEFORE any audit emission, mTLS check, or auth-mgr
+    // lookup so a presenter with a 1 MiB agent_id can't inflate audit
+    // rows, exhaust SQLite row budgets, or force SHA-256 work on a giant
+    // string. The protobuf has no length constraint on agent_id and W1.4
+    // PR1 audits the value verbatim — this is the gate. Empty agent_id
+    // is also rejected: every downstream code path assumes a non-empty
+    // string (registry keys, audit principal, pending_agents lookup).
+    // INVALID_ARGUMENT chosen (not UNAUTHENTICATED) because the request
+    // is structurally malformed, not credential-rejected. Counter has
+    // a distinct metric name from token rejections so SRE alerts on
+    // input-shape attacks don't bucket into credential-failure noise.
+    if (info.agent_id().empty() || info.agent_id().size() > auth::kMaxAgentIdLength) {
+        spdlog::warn("Register rejected: agent_id length {} (max {}, empty disallowed)",
+                     info.agent_id().size(), auth::kMaxAgentIdLength);
+        metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "length"}})
+            .increment();
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "agent_id length exceeds 256 chars or empty");
+    }
+
     if (require_client_identity_) {
         if (!context || !peer_identity_matches_agent_id(*context, info.agent_id())) {
             spdlog::warn("mTLS identity mismatch: claimed agent_id={}", info.agent_id());

@@ -784,13 +784,36 @@ AuthManager::create_enrollment_tokens_batch(const std::string& label_prefix, int
 }
 
 bool AuthManager::validate_enrollment_token(const std::string& raw_token) {
-    // W1.4 / #827: legacy thin wrapper around consume_enrollment_token.
-    // We pass an empty `consuming_agent_id` because pre-W1.4 callers had no
-    // notion of "who is consuming this token" — gRPC handlers are migrated
-    // to call `consume_enrollment_token` directly so their lost-race audit
-    // rows can name the winning presenter.
-    auto result = consume_enrollment_token(raw_token, std::string_view{});
-    return result.has_value();
+    // W1.4 R2 / UP-H2: read-only observability check. The W1.4 PR1 pass
+    // of this wrapper silently delegated to consume_enrollment_token,
+    // which burned a use on every call — a semantic break with the
+    // function name and the doc comment ("validate, not consume"). A
+    // caller checking "is this token still usable?" would unintentionally
+    // exhaust a max_uses=1 token. The behaviour was acceptable in PR1
+    // because the only callers were tests asserting the exhaustion
+    // behaviour, but a future caller would not know to expect the
+    // mutation. Restored to true read-only.
+    //
+    // Length-bound applied here as well (defence-in-depth) so a caller
+    // of validate can't bypass the consume-path length check.
+    if (raw_token.empty() || raw_token.size() > kMaxEnrollmentTokenLength) {
+        return false;
+    }
+    auto hash = sha256_hex(raw_token);
+    auto now = std::chrono::system_clock::now();
+    std::shared_lock lock(mu_);
+    for (const auto& [_, et] : enrollment_tokens_) {
+        if (!constant_time_compare(et.token_hash, hash))
+            continue;
+        if (et.revoked)
+            return false;
+        if (now > et.expires_at)
+            return false;
+        if (et.max_uses > 0 && et.use_count >= et.max_uses)
+            return false;
+        return true;
+    }
+    return false;
 }
 
 std::expected<EnrollmentClaim, EnrollmentTokenError>
@@ -810,68 +833,111 @@ AuthManager::consume_enrollment_token(std::string_view raw_token,
     auto hash = sha256_hex(std::string{raw_token});
     auto now = std::chrono::system_clock::now();
 
-    // The atomic-claim critical section. Everything from validity check
-    // through ++use_count and last_consumed_by_agent_id write happens
-    // under one unique_lock so no second consumer can interleave between
-    // "this token is valid" and "this token's use_count is now N+1".
-    // Loosening this lock is the bug #827 closes; do not split into a
-    // shared_lock for the SELECT + unique_lock for the UPDATE without
-    // re-reading the issue's race scenario.
-    std::unique_lock lock(mu_);
+    EnrollmentClaim claim;
+    bool consumed = false;
 
-    for (auto& [id, et] : enrollment_tokens_) {
-        if (!constant_time_compare(et.token_hash, hash))
-            continue;
+    {
+        // The atomic-claim critical section. Everything from validity check
+        // through ++use_count and last_consumed_by_agent_id write happens
+        // under one unique_lock so no second consumer can interleave between
+        // "this token is valid" and "this token's use_count is now N+1".
+        // Loosening this lock is the bug #827 closes; do not split into a
+        // shared_lock for the SELECT + unique_lock for the UPDATE without
+        // re-reading the issue's race scenario.
+        std::unique_lock lock(mu_);
 
-        if (et.revoked) {
-            spdlog::warn("Enrollment token {} is revoked", id);
-            return std::unexpected(EnrollmentTokenError::revoked);
+        for (auto& [id, et] : enrollment_tokens_) {
+            if (!constant_time_compare(et.token_hash, hash))
+                continue;
+
+            if (et.revoked) {
+                spdlog::warn("Enrollment token {} is revoked", id);
+                return std::unexpected(EnrollmentTokenError::revoked);
+            }
+            if (now > et.expires_at) {
+                spdlog::warn("Enrollment token {} has expired", id);
+                return std::unexpected(EnrollmentTokenError::expired);
+            }
+            if (et.max_uses > 0 && et.use_count >= et.max_uses) {
+                // The race-lost case is structurally indistinguishable from a
+                // "stale exhausted" case at this point — both look like
+                // use_count >= max_uses. The handler discriminates via the
+                // `last_consumed_by_agent_id` value (already set by the prior
+                // winner) and emits an audit row naming the winner so the
+                // operator can see the contention. We just classify as
+                // already_consumed and let the handler do the attribution.
+                spdlog::warn("Enrollment token {} exhausted ({}/{}) — race lost or stale", id,
+                             et.use_count, et.max_uses);
+                return std::unexpected(EnrollmentTokenError::already_consumed);
+            }
+
+            // The atomic claim. ++use_count and the agent_id stamp happen
+            // before we drop the lock. The use_count value we return to the
+            // caller is the POST-increment value, so a successful single-use
+            // consume returns use_count_after == 1.
+            ++et.use_count;
+            if (!consuming_agent_id.empty()) {
+                et.last_consumed_by_agent_id.assign(consuming_agent_id.data(),
+                                                    consuming_agent_id.size());
+            }
+
+            claim.token_id = id;
+            claim.max_uses = et.max_uses;
+            claim.use_count_after = et.use_count;
+            claim.single_use = (et.max_uses == 1);
+            consumed = true;
+
+            spdlog::info("Enrollment token {} consumed by '{}' ({}/{})", id,
+                         consuming_agent_id.empty() ? std::string_view{"<unknown>"}
+                                                    : consuming_agent_id,
+                         et.use_count, et.max_uses == 0 ? -1 : et.max_uses);
+            break;
         }
-        if (now > et.expires_at) {
-            spdlog::warn("Enrollment token {} has expired", id);
-            return std::unexpected(EnrollmentTokenError::expired);
-        }
-        if (et.max_uses > 0 && et.use_count >= et.max_uses) {
-            // The race-lost case is structurally indistinguishable from a
-            // "stale exhausted" case at this point — both look like
-            // use_count >= max_uses. The handler discriminates via the
-            // `last_consumed_by_agent_id` value (already set by the prior
-            // winner) and emits an audit row naming the winner so the
-            // operator can see the contention. We just classify as
-            // already_consumed and let the handler do the attribution.
-            spdlog::warn("Enrollment token {} exhausted ({}/{}) — race lost or stale", id,
-                         et.use_count, et.max_uses);
-            return std::unexpected(EnrollmentTokenError::already_consumed);
-        }
-
-        // The atomic claim. ++use_count and the agent_id stamp happen
-        // before we drop the lock. The use_count value we return to the
-        // caller is the POST-increment value, so a successful single-use
-        // consume returns use_count_after == 1.
-        ++et.use_count;
-        if (!consuming_agent_id.empty()) {
-            et.last_consumed_by_agent_id.assign(consuming_agent_id.data(),
-                                                consuming_agent_id.size());
-        }
-
-        EnrollmentClaim claim;
-        claim.token_id = id;
-        claim.max_uses = et.max_uses;
-        claim.use_count_after = et.use_count;
-        claim.single_use = (et.max_uses == 1);
-
-        spdlog::info("Enrollment token {} consumed by '{}' ({}/{})", id,
-                     consuming_agent_id.empty() ? std::string_view{"<unknown>"}
-                                                : consuming_agent_id,
-                     et.use_count, et.max_uses == 0 ? -1 : et.max_uses);
-        // Persistence is best-effort; we don't roll back the in-memory
-        // claim on disk-write failure because the agent has already been
-        // told their token is consumed. (Pre-W1.4 behaviour — kept.)
-        return claim;
     }
 
-    spdlog::warn("Enrollment token not found (hash prefix={})", hash.substr(0, 8));
-    return std::unexpected(EnrollmentTokenError::not_found);
+    if (!consumed) {
+        spdlog::warn("Enrollment token not found (hash prefix={})", hash.substr(0, 8));
+        return std::unexpected(EnrollmentTokenError::not_found);
+    }
+
+    // W1.4 R2 / UP-C1: persist immediately after the in-memory claim.
+    // The PR1 implementation left persistence to whatever next mutation
+    // (revoke, create, manager destruction) happened to call save_tokens(),
+    // which left a crash-replay window: a server SIGKILL between the
+    // in-memory ++use_count and any disk write meant the next boot's
+    // load_tokens() read use_count=0 and the consumed token would
+    // re-enroll. Now save_tokens() lands before we return, closing the
+    // window to "crash inside save_tokens() itself" (atomic file write
+    // via ofstream::trunc + close, so the on-disk file is either the
+    // pre-consume or post-consume snapshot, never a torn intermediate).
+    //
+    // Lock-release first because save_tokens() acquires shared_lock(mu_)
+    // itself — holding unique_lock across the call would deadlock. Once
+    // the in-memory claim has landed, releasing the unique_lock is safe:
+    // parallel consumers see exhausted, parallel saves serialise via
+    // their own shared_lock so the on-disk snapshot only ever advances.
+    //
+    // Failure handling: do NOT roll back the in-memory consume on save
+    // failure. The agent will be told their token is consumed (success
+    // response in flight) and rolling back would create a different
+    // bug (token reuse under disk-failure injection). Log loudly so SRE
+    // sees it; the prior best-effort behaviour for non-consume paths
+    // (revoke, create) is preserved by the existing save_tokens callers.
+    //
+    // Note on AuthDB: AuthManager has an `auth_db_` member, but
+    // create_enrollment_token never inserts into the AuthDB enrollment
+    // _tokens table — that table is dead. Wiring AuthDB as the source
+    // of truth would require reconciling the AuthDB schema (single-use
+    // only) against the in-memory schema (max_uses, label, revoked)
+    // and porting create_enrollment_token. Out of scope for R2; the
+    // in-memory + file-snapshot path is the production-correct one.
+    if (!save_tokens()) {
+        spdlog::error("Enrollment token {} consume succeeded in-memory but save_tokens "
+                      "failed — on a crash before the next save, the consumed state will "
+                      "be lost and the token may replay",
+                      claim.token_id);
+    }
+    return claim;
 }
 
 std::string AuthManager::last_consumer_for_token_hash(std::string_view token_hash) const {

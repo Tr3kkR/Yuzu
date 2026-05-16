@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -258,12 +259,19 @@ TEST_CASE("validate fails after revocation", "[auth][enrollment]") {
     REQUIRE_FALSE(mgr->validate_enrollment_token(raw));
 }
 
-TEST_CASE("max_uses enforcement", "[auth][enrollment]") {
+TEST_CASE("max_uses enforcement via consume", "[auth][enrollment]") {
+    // W1.4 R2 / UP-H2: validate_enrollment_token is now read-only and no
+    // longer burns a use. Exhaustion still works — but it must be tested
+    // through consume_enrollment_token, which is what the gRPC handlers
+    // call. validate is the observability probe, not the consume path.
     auto mgr = make_temp_auth();
     auto raw = mgr->create_enrollment_token("once", 1, std::chrono::hours(1));
 
-    REQUIRE(mgr->validate_enrollment_token(raw));       // first use
-    REQUIRE_FALSE(mgr->validate_enrollment_token(raw)); // exhausted
+    auto first = mgr->consume_enrollment_token(raw, "agent-1");
+    REQUIRE(first.has_value());
+    auto second = mgr->consume_enrollment_token(raw, "agent-2");
+    REQUIRE_FALSE(second.has_value());
+    CHECK(second.error() == EnrollmentTokenError::already_consumed);
 }
 
 TEST_CASE("batch token creation", "[auth][enrollment]") {
@@ -486,15 +494,106 @@ TEST_CASE("consume_enrollment_token: concurrent claim on N-use token — exactly
     CHECK(tokens[0].use_count == kMaxUses);
 }
 
-TEST_CASE("validate_enrollment_token still works (legacy wrapper)", "[auth][enrollment][atomic]") {
-    // The legacy bool API must keep working — pre-W1.4 callers (tests,
-    // batch deployments) still call through this surface. It delegates to
-    // consume_enrollment_token with an empty consuming_agent_id.
+TEST_CASE("validate_enrollment_token is read-only — does NOT burn a use",
+          "[auth][enrollment][atomic][r2-up-h2]") {
+    // W1.4 R2 / UP-H2: the wrapper used to silently delegate to consume_,
+    // so two consecutive validates on a max_uses=1 token would burn the
+    // token. That was a semantic break with the function name. Restored
+    // to true read-only — N validates leave use_count untouched, and the
+    // subsequent consume still wins.
     auto mgr = make_temp_auth();
-    auto raw = mgr->create_enrollment_token("legacy", 1, std::chrono::hours(1));
+    auto raw = mgr->create_enrollment_token("readonly", 1, std::chrono::hours(1));
 
-    CHECK(mgr->validate_enrollment_token(raw));
+    // Five validates, no state change.
+    for (int i = 0; i < 5; ++i) {
+        CHECK(mgr->validate_enrollment_token(raw));
+    }
+    auto tokens = mgr->list_enrollment_tokens();
+    REQUIRE(tokens.size() == 1);
+    CHECK(tokens[0].use_count == 0);
+
+    // Consume still wins because validates did not burn the use.
+    auto claim = mgr->consume_enrollment_token(raw, "agent-1");
+    REQUIRE(claim.has_value());
+    CHECK(claim->use_count_after == 1);
+
+    // After exhaustion, validate reports false (read-only check still
+    // catches the exhausted state).
     CHECK_FALSE(mgr->validate_enrollment_token(raw));
+}
+
+TEST_CASE("validate_enrollment_token: revoked / expired / not-found return false",
+          "[auth][enrollment][atomic][r2-up-h2]") {
+    auto mgr = make_temp_auth();
+    // not_found
+    CHECK_FALSE(mgr->validate_enrollment_token("never-issued"));
+    // empty / oversize (length-bound)
+    CHECK_FALSE(mgr->validate_enrollment_token(""));
+    std::string oversize(kMaxEnrollmentTokenLength + 1, 'A');
+    CHECK_FALSE(mgr->validate_enrollment_token(oversize));
+    // revoked
+    auto raw = mgr->create_enrollment_token("to-revoke", 0, std::chrono::hours(1));
+    CHECK(mgr->validate_enrollment_token(raw));
+    auto tokens = mgr->list_enrollment_tokens();
+    REQUIRE(tokens.size() == 1);
+    REQUIRE(mgr->revoke_enrollment_token(tokens[0].token_id));
+    CHECK_FALSE(mgr->validate_enrollment_token(raw));
+}
+
+TEST_CASE("consume_enrollment_token persists state to disk (UP-C1 crash-replay)",
+          "[auth][enrollment][atomic][r2-up-c1]") {
+    // W1.4 R2 / UP-C1: the PR1 implementation atomically claimed in
+    // memory but did NOT persist the use_count change before returning.
+    // A server SIGKILL between consume and any later save_tokens() call
+    // (revoke, create, manager destruction) would leave on-disk
+    // use_count=0 and let the token replay on the next boot.
+    //
+    // Test the crash by NOT cleanly destructing the first manager. We
+    // instantiate manager A, create+consume a token, then construct a
+    // brand-new manager B against the same cfg path. If save_tokens()
+    // landed inside consume_, B's load_tokens() sees use_count=1 and
+    // a subsequent consume on B fails with already_consumed.
+    // The on-disk enrollment-tokens.cfg lives next to the user cfg
+    // (state_dir() defaults to cfg parent). Other tests share
+    // temp_directory_path(); to keep this test isolated we give it its
+    // own unique subdirectory so the load_tokens() call in mgr_b only
+    // sees the rows mgr_a wrote.
+    auto dir = yuzu::test::unique_temp_path("yuzu-test-auth-crashreplay-");
+    fs::create_directories(dir);
+    auto cfg = dir / "users.cfg";
+
+    // load_config short-circuits if the users cfg file is missing — but the
+    // enrollment-tokens.cfg load lives in load_tokens(), which is called
+    // unconditionally after the user-load loop. Touch an empty cfg so
+    // load_config follows through to load_tokens() in both phases.
+    { std::ofstream(cfg) << "# Version: 1\n"; }
+
+    std::string raw;
+    {
+        AuthManager mgr_a;
+        mgr_a.load_config(cfg);
+        raw = mgr_a.create_enrollment_token("crash-replay", 1, std::chrono::hours(1));
+        auto claim = mgr_a.consume_enrollment_token(raw, "agent-pre-crash");
+        REQUIRE(claim.has_value());
+        // SIMULATE CRASH: drop mgr_a without an explicit save call.
+        // The save inside consume_ is what we're proving works.
+    }
+
+    // Fresh manager rebuilds in-memory state from disk only.
+    AuthManager mgr_b;
+    mgr_b.load_config(cfg);
+    auto tokens = mgr_b.list_enrollment_tokens();
+    REQUIRE(tokens.size() == 1);
+    CHECK(tokens[0].use_count == 1);
+
+    // Replay attempt fails on the fresh instance — token is exhausted.
+    auto replay = mgr_b.consume_enrollment_token(raw, "agent-post-crash");
+    REQUIRE_FALSE(replay.has_value());
+    CHECK(replay.error() == EnrollmentTokenError::already_consumed);
+
+    // Cleanup
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 // ── Pending Agents ───────────────────────────────────────────────────────────

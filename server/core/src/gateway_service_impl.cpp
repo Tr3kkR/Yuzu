@@ -32,6 +32,25 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                                                        pb::RegisterResponse* response) {
     const auto& info = request->info();
 
+    // -- W1.4 R2 / UP-H1 agent_id length bound (mirror of direct Register) ----
+    // Same rationale as the direct-connect path in AgentServiceImpl::Register
+    // — cap before any audit emission, auth-mgr lookup, or SHA-256. Source
+    // label on the metric is `gateway_proxy` so SRE can see attacks coming
+    // through the gateway vs direct-connect agents.
+    if (info.agent_id().empty() || info.agent_id().size() > auth::kMaxAgentIdLength) {
+        spdlog::warn(
+            "[gateway] ProxyRegister rejected: agent_id length {} (max {}, empty disallowed)",
+            info.agent_id().size(), auth::kMaxAgentIdLength);
+        if (metrics_) {
+            metrics_
+                ->counter("yuzu_register_invalid_agent_id_total",
+                          {{"reason", "length"}, {"source", "gateway_proxy"}})
+                .increment();
+        }
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "agent_id length exceeds 256 chars or empty");
+    }
+
     // -- Tiered enrollment (same logic as AgentServiceImpl::Register) ----------
     //
     // W1.3 R2 / UP-7 / sec-G MEDIUM-1: trusted-peer noting moved to the

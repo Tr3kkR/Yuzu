@@ -605,3 +605,81 @@ TEST_CASE("peer_ip.hpp::extract_peer_ip matches AgentServiceImpl::extract_peer_i
         CHECK(AgentServiceImpl::extract_peer_ip(in) == extract_peer_ip(in));
     }
 }
+
+// ── W1.4 R2 / UP-H1 — agent_id length cap at handler entry ─────────────────
+
+TEST_CASE("Register: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-H1)",
+          "[agent_service][register][w1_4_r2][up_h1]") {
+    // The protobuf places no length constraint on agent_id and W1.4 PR1
+    // audits the value verbatim. Without this cap, a presenter can supply
+    // a 1 MiB agent_id and every downstream audit row carries it. Cap is
+    // checked BEFORE any audit emission, mTLS check, or auth-mgr lookup
+    // so attack traffic costs ~one strlen + counter increment.
+    using yuzu::server::auth::kMaxAgentIdLength;
+    GatewayResponseHarness h;
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(std::string(kMaxAgentIdLength + 1, 'A'));
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    // Counter ticked with the right label.
+    yuzu::Labels labels{{"reason", "length"}};
+    CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == 1.0);
+}
+
+TEST_CASE("Register: rejects empty agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-H1)",
+          "[agent_service][register][w1_4_r2][up_h1]") {
+    // Empty agent_id is structurally invalid — every downstream code path
+    // assumes a non-empty key (registry, audit principal, pending lookup).
+    // Same metric / status as the oversize case.
+    GatewayResponseHarness h;
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("");
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    yuzu::Labels labels{{"reason", "length"}};
+    CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == 1.0);
+}
+
+TEST_CASE("ProxyRegister: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 R2 / UP-H1)",
+          "[agent_service][register][gateway][w1_4_r2][up_h1]") {
+    // Mirror of the direct-Register path. ProxyRegister carries the same
+    // attack surface — the gateway proxies the agent's RegisterRequest
+    // unmodified, so an attacker who controls the agent payload can
+    // present an oversize agent_id here too. Source label on the metric
+    // discriminates gateway-proxied attacks from direct-connect ones.
+    using yuzu::server::auth::kMaxAgentIdLength;
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(std::string(kMaxAgentIdLength + 1, 'B'));
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+
+    CHECK(status.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
+    yuzu::Labels labels{{"reason", "length"}, {"source", "gateway_proxy"}};
+    CHECK(h.metrics.counter("yuzu_register_invalid_agent_id_total", labels).value() == 1.0);
+    // Trusted-peer set untouched — the early-reject path never reaches
+    // the post-success note_trusted_gateway_peer call.
+    CHECK(h.registry.trusted_gateway_peer_count() == 0);
+}

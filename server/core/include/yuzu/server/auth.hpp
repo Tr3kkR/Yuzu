@@ -116,6 +116,17 @@ struct EnrollmentClaim {
 /// SHA-256 / map lookup work.
 inline constexpr std::size_t kMaxEnrollmentTokenLength = 256;
 
+/// Maximum agent_id length accepted at handler entry (W1.4 R2 / UP-H1).
+/// Caps `RegisterRequest.info.agent_id` at the gRPC Register and gateway
+/// ProxyRegister entry, before any audit emission, any auth-mgr lookup,
+/// or any SHA-256 work. Without this cap a presenter can supply an
+/// arbitrarily long agent_id (the protobuf has no length constraint) and
+/// every downstream audit/analytics row carries the full string verbatim,
+/// inflating audit-store I/O and SQLite row size into the megabyte range.
+/// 256 chars matches `kMaxEnrollmentTokenLength` for parity — any legitimate
+/// hostname-derived or UUID-derived agent_id fits in well under 100 chars.
+inline constexpr std::size_t kMaxAgentIdLength = 256;
+
 // ── Pending agents (Tier 1) ─────────────────────────────────────────────────
 
 enum class PendingStatus { pending, approved, denied };
@@ -223,17 +234,21 @@ public:
                                                             int count, int max_uses_each,
                                                             std::chrono::seconds ttl);
 
-    /// Validate a raw enrollment token. Returns true and increments use_count
-    /// if valid. Returns false if expired, revoked, or exhausted.
+    /// Read-only validity check for a raw enrollment token. Returns true
+    /// iff the token exists, is not revoked, is not expired, and still has
+    /// at least one use remaining. Does NOT mutate `use_count` and does
+    /// NOT update `last_consumed_by_agent_id` — call
+    /// `consume_enrollment_token` for the atomic check-and-consume.
     ///
-    /// Thin compatibility wrapper around `consume_enrollment_token` —
-    /// pre-W1.4 callers that don't need the rich claim/error context use
-    /// this; new callers (Register / ProxyRegister) MUST use
-    /// `consume_enrollment_token` so they can emit the lost-race audit row.
-    /// The wrapper passes an empty `consuming_agent_id`, so race-loser
-    /// audit rows that go via this path will say `already_consumed_by=`
-    /// (empty). That's acceptable for legacy callers — the gRPC handlers
-    /// always pass the real agent_id.
+    /// W1.4 R2 / UP-H2 semantic restoration: pre-W1.4 R2 this wrapper
+    /// silently delegated to `consume_enrollment_token`, meaning any
+    /// "is this token usable" probe would burn a use. That broke the
+    /// caller's stated intent (name says "validate") and made
+    /// `max_uses=1` tokens unreachable to any caller that wanted to
+    /// observe-before-act. Restored to true read-only semantics. The
+    /// only callers in-tree are tests; production Register / ProxyRegister
+    /// handlers call `consume_enrollment_token` directly so they can
+    /// emit the lost-race audit row.
     bool validate_enrollment_token(const std::string& raw_token);
 
     /// Atomic check-and-consume of an enrollment token (W1.4 / #827).
