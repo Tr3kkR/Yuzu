@@ -239,7 +239,7 @@ After upgrade, calls to install a `ProductPack` without a `signature:`
 field are rejected with:
 
 ```
-pack '<name>' is unsigned and require_signed_packs is enabled
+pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)
 ```
 
 This is intentional. Unsigned packs are a fleet-wide arbitrary-code-

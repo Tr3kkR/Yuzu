@@ -1631,7 +1631,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
             return;
         }
-        audit_fn(req, "product_pack.install", "success", "product_pack", *result, "");
+        // gov W7.4 R2 sec-MEDIUM: target_type "ProductPack" matches the
+        // denied sibling above, the RBAC perm_fn calls in this file
+        // (1484/1533/1647/1692), and the audit-log.md docs entry. Was
+        // "product_pack" pre-W7.4 R2 — SIEM rules filtering on either
+        // string would have missed half the rows for this action.
+        audit_fn(req, "product_pack.install", "success", "ProductPack", *result, "");
         emit_fn("product_pack.installed", req);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Product pack installed","level":"success"}})");
@@ -1722,7 +1727,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
             return;
         }
-        audit_fn(req, "product_pack.uninstall", "success", "product_pack", id, "");
+        // gov W7.4 R2 sec-MEDIUM: target_type "ProductPack" sibling parity
+        // (see install handler above).
+        audit_fn(req, "product_pack.uninstall", "success", "ProductPack", id, "");
         emit_fn("product_pack.uninstalled", req);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Product pack uninstalled","level":"success"}})");
