@@ -42,18 +42,45 @@ std::string gen_id() {
     auto hi = dist(rng);
     auto lo = dist(rng);
     char buf[33];
-    std::snprintf(buf, sizeof(buf), "%016llx%016llx",
-                  static_cast<unsigned long long>(hi),
+    std::snprintf(buf, sizeof(buf), "%016llx%016llx", static_cast<unsigned long long>(hi),
                   static_cast<unsigned long long>(lo));
     return std::string(buf, 32);
+}
+
+/// Strip control characters (newlines, ANSI escapes, NUL, etc.) from a string
+/// before it is interpolated into an spdlog line. The pack `name` field is
+/// attacker-controlled YAML — without this scrubbing, a pack with
+/// `name: "evil\n[INFO] admin login OK\n\033[2K"` would inject forged log
+/// lines and terminal escape sequences into operator log files (UP-4 from
+/// W7.4 Gate 4). Replaces any byte < 0x20 or == 0x7F with `?`. The result
+/// is for human-readable logging only; the verbatim name is preserved in
+/// the error envelope returned to REST (where nlohmann::json::dump escapes
+/// it safely) and in the stored `pack_name` column.
+std::string sanitize_for_log(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if (c < 0x20 || c == 0x7F) {
+            out.push_back('?');
+        } else {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    // Bound the field — a multi-MB pack name in the log line is its own
+    // form of poisoning.
+    constexpr std::size_t kMaxLogField = 256;
+    if (out.size() > kMaxLogField) {
+        out.resize(kMaxLogField);
+        out.append("...");
+    }
+    return out;
 }
 
 } // namespace
 
 // ── Static helpers ──────────────────────────────────────────────────────────
 
-std::string ProductPackStore::extract_yaml_value(const std::string& yaml,
-                                                   const std::string& key) {
+std::string ProductPackStore::extract_yaml_value(const std::string& yaml, const std::string& key) {
     auto search = key + ":";
     auto pos = yaml.find(search);
     while (pos != std::string::npos) {
@@ -72,9 +99,8 @@ std::string ProductPackStore::extract_yaml_value(const std::string& yaml,
         auto val = yaml.substr(vstart, eol - vstart);
         while (!val.empty() && (val.back() == ' ' || val.back() == '\t' || val.back() == '\r'))
             val.pop_back();
-        if (val.size() >= 2 &&
-            ((val.front() == '"' && val.back() == '"') ||
-             (val.front() == '\'' && val.back() == '\''))) {
+        if (val.size() >= 2 && ((val.front() == '"' && val.back() == '"') ||
+                                (val.front() == '\'' && val.back() == '\''))) {
             val = val.substr(1, val.size() - 2);
         }
         if (val == ">" || val == "|")
@@ -90,7 +116,7 @@ std::vector<std::string> ProductPackStore::split_yaml_documents(const std::strin
 
     // Skip leading whitespace/newlines
     while (pos < bundle.size() && (bundle[pos] == '\n' || bundle[pos] == '\r' ||
-                                    bundle[pos] == ' ' || bundle[pos] == '\t'))
+                                   bundle[pos] == ' ' || bundle[pos] == '\t'))
         ++pos;
 
     while (pos < bundle.size()) {
@@ -148,9 +174,12 @@ bool hex_decode(const std::string& hex, std::vector<uint8_t>& out) {
         auto lo = hex[i + 1];
 
         auto hex_val = [](char c) -> int {
-            if (c >= '0' && c <= '9') return c - '0';
-            if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-            if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+            if (c >= '0' && c <= '9')
+                return c - '0';
+            if (c >= 'a' && c <= 'f')
+                return 10 + (c - 'a');
+            if (c >= 'A' && c <= 'F')
+                return 10 + (c - 'A');
             return -1;
         };
 
@@ -191,18 +220,19 @@ bool ProductPackStore::verify_signature(const std::string& content,
     NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_ECDSA_ALGORITHM, nullptr, 0);
     if (!BCRYPT_SUCCESS(status)) {
         spdlog::warn("ProductPackStore: BCryptOpenAlgorithmProvider failed: 0x{:08x}",
-                      static_cast<unsigned int>(status));
+                     static_cast<unsigned int>(status));
         return false;
     }
 
     // Set the Ed25519 curve
-    status = BCryptSetProperty(alg, BCRYPT_ECC_CURVE_NAME,
-                               reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_ECC_CURVE_25519)),
-                               static_cast<ULONG>((wcslen(BCRYPT_ECC_CURVE_25519) + 1) * sizeof(wchar_t)),
-                               0);
+    status = BCryptSetProperty(
+        alg, BCRYPT_ECC_CURVE_NAME,
+        reinterpret_cast<PUCHAR>(const_cast<wchar_t*>(BCRYPT_ECC_CURVE_25519)),
+        static_cast<ULONG>((wcslen(BCRYPT_ECC_CURVE_25519) + 1) * sizeof(wchar_t)), 0);
     if (!BCRYPT_SUCCESS(status)) {
         spdlog::warn("ProductPackStore: BCrypt Ed25519 curve not available (0x{:08x}). "
-                      "Ed25519 requires Windows 10 1809+", static_cast<unsigned int>(status));
+                     "Ed25519 requires Windows 10 1809+",
+                     static_cast<unsigned int>(status));
         BCryptCloseAlgorithmProvider(alg, 0);
         return false;
     }
@@ -217,22 +247,20 @@ bool ProductPackStore::verify_signature(const std::string& content,
     std::memcpy(key_blob.key_data, key_bytes.data(), 32);
 
     BCRYPT_KEY_HANDLE key_handle = nullptr;
-    status = BCryptImportKeyPair(alg, nullptr, BCRYPT_ECCPUBLIC_BLOB,
-                                  &key_handle, reinterpret_cast<PUCHAR>(&key_blob),
-                                  sizeof(key_blob), 0);
+    status = BCryptImportKeyPair(alg, nullptr, BCRYPT_ECCPUBLIC_BLOB, &key_handle,
+                                 reinterpret_cast<PUCHAR>(&key_blob), sizeof(key_blob), 0);
     if (!BCRYPT_SUCCESS(status)) {
         spdlog::warn("ProductPackStore: BCryptImportKeyPair failed: 0x{:08x}",
-                      static_cast<unsigned int>(status));
+                     static_cast<unsigned int>(status));
         BCryptCloseAlgorithmProvider(alg, 0);
         return false;
     }
 
     // Verify the signature
-    status = BCryptVerifySignature(key_handle, nullptr,
-                                   reinterpret_cast<PUCHAR>(const_cast<char*>(content.data())),
-                                   static_cast<ULONG>(content.size()),
-                                   const_cast<PUCHAR>(sig_bytes.data()),
-                                   static_cast<ULONG>(sig_bytes.size()), 0);
+    status = BCryptVerifySignature(
+        key_handle, nullptr, reinterpret_cast<PUCHAR>(const_cast<char*>(content.data())),
+        static_cast<ULONG>(content.size()), const_cast<PUCHAR>(sig_bytes.data()),
+        static_cast<ULONG>(sig_bytes.size()), 0);
 
     bool valid = BCRYPT_SUCCESS(status);
     BCryptDestroyKey(key_handle);
@@ -241,8 +269,8 @@ bool ProductPackStore::verify_signature(const std::string& content,
 
 #else
     // Unix: OpenSSL EVP Ed25519 verification
-    EVP_PKEY* pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr,
-                                                   key_bytes.data(), key_bytes.size());
+    EVP_PKEY* pkey =
+        EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, nullptr, key_bytes.data(), key_bytes.size());
     if (!pkey) {
         spdlog::warn("ProductPackStore: EVP_PKEY_new_raw_public_key (Ed25519) failed");
         return false;
@@ -256,10 +284,9 @@ bool ProductPackStore::verify_signature(const std::string& content,
 
     bool valid = false;
     if (EVP_DigestVerifyInit(md_ctx, nullptr, nullptr, nullptr, pkey) == 1) {
-        int rc = EVP_DigestVerify(md_ctx,
-                                   sig_bytes.data(), sig_bytes.size(),
-                                   reinterpret_cast<const unsigned char*>(content.data()),
-                                   content.size());
+        int rc = EVP_DigestVerify(md_ctx, sig_bytes.data(), sig_bytes.size(),
+                                  reinterpret_cast<const unsigned char*>(content.data()),
+                                  content.size());
         valid = (rc == 1);
     }
 
@@ -348,9 +375,8 @@ std::string ProductPackStore::generate_id() const {
 
 // ── Install ─────────────────────────────────────────────────────────────────
 
-std::expected<std::string, std::string> ProductPackStore::install(
-    const std::string& yaml_bundle,
-    ItemInstallFn install_fn) {
+std::expected<std::string, std::string> ProductPackStore::install(const std::string& yaml_bundle,
+                                                                  ItemInstallFn install_fn) {
 
     if (!install_fn)
         return std::unexpected("install callback is required");
@@ -416,32 +442,42 @@ std::expected<std::string, std::string> ProductPackStore::install(
 
         pack_verified = verify_signature(content_to_verify, pack_signature, pack_public_key);
         if (pack_verified) {
-            spdlog::info("ProductPackStore: signature verified for '{}'", pack_name);
+            spdlog::info("ProductPackStore: signature verified for '{}'",
+                         sanitize_for_log(pack_name));
         } else {
             // Signature was present but verification FAILED — reject the pack.
             // A failed signature means the content may have been tampered with.
             spdlog::error("ProductPackStore: signature verification FAILED for '{}' — "
-                           "rejecting pack (content may be tampered)", pack_name);
+                          "rejecting pack (content may be tampered)",
+                          sanitize_for_log(pack_name));
             return std::unexpected("signature verification failed for pack '" + pack_name +
-                                    "' — content may have been tampered with");
+                                   "' — content may have been tampered with");
         }
     } else if (!pack_signature.empty()) {
         // Signature present but no public key — cannot verify, reject
         spdlog::error("ProductPackStore: pack '{}' has signature but no publicKey — "
-                       "rejecting pack", pack_name);
+                      "rejecting pack",
+                      sanitize_for_log(pack_name));
         return std::unexpected("pack '" + pack_name +
-                                "' has signature but no publicKey — cannot verify");
+                               "' has signature but no publicKey — cannot verify");
     } else {
         // No signature field at all — unsigned pack. This is a separate policy
         // question controlled by require_signed_packs_.
-        if (require_signed_packs_) {
-            spdlog::error("ProductPackStore: pack '{}' is unsigned but "
-                           "require_signed_packs is enabled — rejecting", pack_name);
-            return std::unexpected("pack '" + pack_name +
-                                    "' is unsigned and require_signed_packs is enabled");
+        if (require_signed_packs_.load(std::memory_order_relaxed)) {
+            spdlog::error("ProductPackStore: pack '{}' is unsigned but signature "
+                          "enforcement is enabled — rejecting",
+                          sanitize_for_log(pack_name));
+            // gov W7.4 R1 CONS-BLOCKING-2: error message names the operator-
+            // facing CLI flag (--allow-unsigned-packs) rather than the
+            // internal field name (require_signed_packs). Operators reading
+            // the rejection see a knob that actually exists on the CLI.
+            return std::unexpected(
+                "pack '" + pack_name +
+                "' is unsigned and signature enforcement is enabled "
+                "(set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)");
         }
         spdlog::info("ProductPackStore: pack '{}' has no signature — installing as unverified",
-                      pack_name);
+                     sanitize_for_log(pack_name));
     }
 
     auto pack_id = generate_id();
@@ -522,8 +558,8 @@ std::expected<std::string, std::string> ProductPackStore::install(
     // Commit the transaction — all items installed successfully (or partial with warnings)
     sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr);
 
-    spdlog::info("ProductPackStore: installed '{}' v{} ({}), {} items, {} errors",
-                 pack_name, pack_version, pack_id, installed_count, errors.size());
+    spdlog::info("ProductPackStore: installed '{}' v{} ({}), {} items, {} errors", pack_name,
+                 pack_version, pack_id, installed_count, errors.size());
     return pack_id;
 }
 
@@ -598,9 +634,8 @@ std::optional<ProductPack> ProductPackStore::get(const std::string& id) const {
 
 // ── Uninstall ───────────────────────────────────────────────────────────────
 
-std::expected<void, std::string> ProductPackStore::uninstall(
-    const std::string& id,
-    ItemUninstallFn uninstall_fn) {
+std::expected<void, std::string> ProductPackStore::uninstall(const std::string& id,
+                                                             ItemUninstallFn uninstall_fn) {
 
     if (!uninstall_fn)
         return std::unexpected("uninstall callback is required");
@@ -617,7 +652,8 @@ std::expected<void, std::string> ProductPackStore::uninstall(
         if (uninstall_fn(item.kind, item.item_id))
             ++removed;
         else
-            spdlog::warn("ProductPackStore: failed to remove {} item '{}'", item.kind, item.item_id);
+            spdlog::warn("ProductPackStore: failed to remove {} item '{}'", item.kind,
+                         item.item_id);
     }
 
     // Delete pack items

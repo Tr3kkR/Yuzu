@@ -3945,6 +3945,58 @@ Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-sourc
 
 ---
 
+## Product Packs
+
+Product packs are bundles of `InstructionDefinition`, `PolicyFragment`, `Policy`, and other content shipped as a single signed multi-document YAML file. Pack signature enforcement is **on by default** (#802 / W7.4) — unsigned packs are rejected at install. See [server-admin.md](server-admin.md) for the `--allow-unsigned-packs` escape hatch and [upgrading.md](upgrading.md) for the pack-signing migration recipe.
+
+#### `POST /api/product-packs`
+
+Install a product pack from a multi-document YAML bundle.
+
+**Permission:** `ProductPack:Write`.
+
+**Request body (form-encoded or multipart):**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `yaml_bundle` | string | Yes | Multi-document YAML; each `---`-separated document is parsed for its `kind:` and delegated to the matching store (`InstructionDefinition` → instructions, `PolicyFragment` → policies, etc.). A `ProductPack` document carries the pack metadata (`name`, `version`, `description`, optional `signature` + `publicKey`). |
+
+**Response:**
+- `201 Created` `{"id": "<pack-id>", "status": "installed"}` on success.
+- `400 Bad Request` `{"error": "<message>"}` on rejection. Distinct error strings:
+  - `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` — the install was refused because the pack carried no `signature:` field and the server is enforcing signatures (default since #802). Either sign the pack or set the escape-hatch flag.
+  - `signature verification failed for pack '<name>' — content may have been tampered with` — the signature was present but did not verify against the supplied public key.
+  - `pack '<name>' has signature but no publicKey — cannot verify` — the bundle carried a `signature:` field but no `publicKey:`.
+- Other 4xx for malformed YAML, missing required fields, or item-install delegation failures.
+
+**Audit:** Emits `product_pack.install` with `result=success` and `target_id=<pack-id>` on accepted install, or `result=denied` with `target_type=ProductPack`, empty `target_id`, and the rejection message in `detail` on any 400 rejection (closes the SOC 2 CC6.7 logging gap from W7.4 governance).
+
+#### `GET /api/product-packs`
+
+List installed packs.
+
+**Permission:** `ProductPack:Read`.
+
+**Response:** JSON array of `{id, name, version, description, installed_at, verified}` objects.
+
+#### `GET /api/product-packs/:id`
+
+Get a single pack with its items.
+
+**Permission:** `ProductPack:Read`.
+
+**Response:** Single pack JSON object including the `items[]` array (each `{kind, item_id, name}`).
+
+#### `DELETE /api/product-packs/:id`
+
+Uninstall a pack, removing all delegated items.
+
+**Permission:** `ProductPack:Delete`.
+
+**Audit:** Emits `product_pack.uninstall`.
+
+---
+
 ## MCP (Model Context Protocol)
 
 The MCP endpoint enables AI models and automation tools to interact with Yuzu via JSON-RPC 2.0. Authentication is via Bearer token with an MCP tier. See [Authentication > MCP Tokens](authentication.md#mcp-tokens) for token creation details.

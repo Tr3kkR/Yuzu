@@ -270,9 +270,9 @@ every enrolled agent.
    it is not intended as a permanent configuration.
 
 **Pre-existing installed packs are unaffected.** The check fires only
-on the install path (`POST /api/v1/packs/install` and equivalent).
-List, get, and uninstall paths do not re-verify, so already-installed
-unsigned packs remain queryable and uninstallable after upgrade.
+on the install path (`POST /api/product-packs`). List, get, and
+uninstall paths do not re-verify, so already-installed unsigned packs
+remain queryable and uninstallable after upgrade.
 
 ### Executions-history PR 2 — `responses.execution_id` exact correlation
 

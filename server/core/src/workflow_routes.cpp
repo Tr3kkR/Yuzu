@@ -1612,6 +1612,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto result = product_pack_store->install(yaml_bundle, install_fn);
         if (!result) {
+            // gov W7.4 R1 UP-1 / compliance CC6.7 / sre B2: SOC 2 CC6.7
+            // requires "all access decisions logged". The pack-install
+            // rejection IS an access decision — without this audit row, an
+            // attacker probing enforcement state via repeated unsigned-pack
+            // POSTs leaves zero rows in the audit store. This becomes a
+            // primary code path once #802's default-true flip ships, so the
+            // audit gap goes from "MEDIUM, edge case" to "HIGH, every prod
+            // server with unsigned packs in its environment hits this".
+            //
+            // target_id is empty: install failed pre-id-generation, no
+            // pack_id exists yet. The pack-name field is attacker-controlled
+            // YAML so we don't echo it into target_id (would create an
+            // attacker-influenced audit key); the pack name is recoverable
+            // from the request body if forensics need it.
+            audit_fn(req, "product_pack.install", "denied", "ProductPack", "", result.error());
             res.status = 400;
             res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
             return;

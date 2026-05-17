@@ -2,6 +2,7 @@
 
 #include <sqlite3.h>
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -68,8 +69,20 @@ public:
     /// `--allow-unsigned-packs` / `YUZU_ALLOW_UNSIGNED_PACKS` server
     /// flag, which calls `set_require_signed_packs(false)` and emits a
     /// `server.unsigned_packs_allowed` startup audit event.
-    void set_require_signed_packs(bool require) { require_signed_packs_ = require; }
-    bool require_signed_packs() const { return require_signed_packs_; }
+    ///
+    /// gov W7.4 R1 SHOULD-1 (cpp-expert): the field is `std::atomic<bool>`
+    /// because `install` reads it OUTSIDE the `mtx_` (perf — the lock is
+    /// only acquired after the check, for the DB write phase). The setter
+    /// is called at startup, before any concurrent reader exists, but TSAN
+    /// has no way to know that — atomic load/store with relaxed memory
+    /// order silences TSAN AND future-proofs against any later runtime-
+    /// toggle endpoint.
+    void set_require_signed_packs(bool require) {
+        require_signed_packs_.store(require, std::memory_order_relaxed);
+    }
+    bool require_signed_packs() const {
+        return require_signed_packs_.load(std::memory_order_relaxed);
+    }
 
     ProductPackStore(const ProductPackStore&) = delete;
     ProductPackStore& operator=(const ProductPackStore&) = delete;
@@ -80,6 +93,20 @@ public:
     /// Each `---` separated document is parsed for its `kind:` field and
     /// delegated to the appropriate store via install_fn.
     /// The ProductPack metadata is extracted from the document with kind: ProductPack.
+    ///
+    /// SECURITY INVARIANT (#802 / W7.4): this is the SOLE gate for
+    /// `require_signed_packs_`. All code that materialises a `ProductPack`
+    /// from external (operator-supplied or network-fetched) input MUST
+    /// route through this method — direct writes via the underlying
+    /// `product_packs` SQLite table, or callbacks that bypass `install`,
+    /// defeat the #802 protection and re-introduce the fleet-wide
+    /// arbitrary-code-execution surface. If a future bulk-import,
+    /// hot-reload, sync-from-registry, or content-distribution feature is
+    /// added, it MUST either call `install()` (preferred) or implement an
+    /// equivalent signature check AND emit a `product_pack.install` audit
+    /// row with `result=denied` on rejection. The sole production caller
+    /// today is `workflow_routes.cpp` `POST /api/product-packs`; any new
+    /// caller must update this comment to remain accurate.
     std::expected<std::string, std::string> install(const std::string& yaml_bundle,
                                                     ItemInstallFn install_fn);
 
@@ -118,7 +145,9 @@ private:
     /// pack delivery, could install an unsigned pack containing
     /// `InstructionDefinition` or plugin payloads that would execute on
     /// every enrolled agent.
-    bool require_signed_packs_{true};
+    /// Atomic because `install` reads it outside the mtx_; see the setter
+    /// doc above.
+    std::atomic<bool> require_signed_packs_{true};
 
     void create_tables();
     std::string generate_id() const;

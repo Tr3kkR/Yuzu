@@ -888,7 +888,15 @@ public:
                 ev.principal = "system";
                 ev.action = "server.unsigned_packs_allowed";
                 ev.target_type = "ProductPack";
-                ev.target_id = "*";
+                // gov R1 CONS-BLOCKING-1: use a feature-name scope label
+                // rather than "*" wildcard. The audit_store query planner
+                // uses `WHERE target_id = ?` (audit_store.cpp:191) — "*"
+                // would only match this exact row, not "all packs". Mirrors
+                // the sibling `server.viz_disabled` row which uses
+                // `target_id="viz"`. Future startup-posture audit rows
+                // should follow `target_id=<feature_name>` (see
+                // docs/observability-conventions.md startup-posture pattern).
+                ev.target_id = "signature_enforcement";
                 ev.detail = "product pack signature enforcement disabled at startup "
                             "(--allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS) — "
                             "unsigned packs will be accepted at install";
@@ -2533,6 +2541,15 @@ private:
                 // the right probe. Without this, a store-construction failure
                 // would leave /readyz "ready" while every viz request 503s.
                 {"fleet_topology_store", fleet_topology_store_ != nullptr},
+                // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
+                // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
+                // that fails to open AND `--allow-unsigned-packs` set produces
+                // a silent half-state — the audit row at startup says "unsigned
+                // packs allowed" but every install returns 503 because the
+                // store is dead. Without this readyz entry, an LB or operator
+                // dashboard would not detect the half-state. Pairs with the
+                // workflow_routes.cpp install handler's `is_open()` guard.
+                {"product_pack_store", product_pack_store_ && product_pack_store_->is_open()},
             };
 
             std::string failed_list;
