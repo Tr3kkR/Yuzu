@@ -2,8 +2,18 @@ name: "CodeQL"
 
 # CodeQL C++ + GitHub Actions static analysis across BOTH self-hosted
 # runners, running in parallel:
-#   - yuzu-wsl2-linux (labels: self-hosted/Linux/X64)  — gcc-13 build
+#   - yuzu-wsl2-linux (labels: self-hosted/Linux/X64/yuzu-shulgi) — gcc-13 build
 #   - yuzu-local-windows (labels: self-hosted/Windows/X64) — MSVC build
+#
+# The Linux leg pins `yuzu-shulgi` explicitly so it can't drift to
+# `scw-eager-lumiere` (cloud builder, labels self-hosted/Linux/X64/
+# yuzu-cloud-builder). The cloud builder is sized for nightly Coverage
+# and routinely sits below the 40 GB disk threshold this workflow
+# requires; matching `[self-hosted, Linux, X64]` alone gives GH free
+# reign to assign whichever runner is idle, which produces non-
+# deterministic failures (run 25986790721 hit Scaleway at 23 GB free
+# and died at the disk check before any CodeQL work). Same selector
+# pattern nightly.yml uses for the equivalent meson workload.
 #
 # The two runs are separate matrix legs with `fail-fast: false`, so a
 # quirk on one platform doesn't kill the other. Each leg uploads SARIF
@@ -92,7 +102,10 @@ jobs:
       matrix:
         include:
           - os: linux
-            runner: [self-hosted, Linux, X64]
+            # yuzu-shulgi pin — see header comment. The cloud builder
+            # (scw-eager-lumiere) carries `yuzu-cloud-builder` instead;
+            # this list intentionally excludes it.
+            runner: [self-hosted, Linux, X64, yuzu-shulgi]
             triplet: x64-linux
             vcpkg_bin: vcpkg
             build_dir: build-linux-codeql
