@@ -120,18 +120,80 @@ std::string sha256_file(const std::filesystem::path& path) {
     return hex;
 }
 
-#ifndef _WIN32
-// ── Fd-scoped SHA-256 (W2.2 / #807) ──────────────────────────────────────────
+// ── Handle/fd-scoped SHA-256 (W2.2 / #807) ───────────────────────────────────
 //
 // `sha256_file` opens the path freshly, which is the bug behind #807: between
-// the hash and a later `dlopen` (which opens the path AGAIN) an attacker who
-// can write to the plugin directory can swap the file content. This helper
-// hashes from an already-open fd so the discovery loop can pin the inode
-// once with `open(O_NOFOLLOW|O_CLOEXEC)`, hash, and then load via the same
-// fd (on Linux) or accept a documented narrower race (on macOS).
+// the hash and a later `dlopen`/`LoadLibrary` (which opens the path AGAIN) an
+// attacker who can write to the plugin directory can swap the file content.
+// These helpers hash from an already-open fd/HANDLE so the discovery loop can
+// pin the inode once with O_NOFOLLOW (POSIX) or FILE_SHARE_READ+
+// FILE_FLAG_OPEN_REPARSE_POINT (Windows), hash, and then load via the same
+// fd-bridge (Linux) or rely on the share-mode pin preventing path-swap
+// (Windows). macOS keeps a documented narrower race.
 //
-// Errno is preserved across spdlog::error so callers retain the OS reason.
+// Errno / GetLastError is preserved across spdlog::error so callers retain
+// the OS reason.
 namespace {
+#ifdef _WIN32
+std::string sha256_from_handle(HANDLE h) {
+    if (h == INVALID_HANDLE_VALUE)
+        return {};
+    LARGE_INTEGER zero{};
+    if (!SetFilePointerEx(h, zero, nullptr, FILE_BEGIN)) {
+        spdlog::error("sha256_from_handle: SetFilePointerEx failed: {}", GetLastError());
+        return {};
+    }
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
+        return {};
+
+    DWORD obj_size = 0, data_len = 0;
+    BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&obj_size), sizeof(DWORD),
+                      &data_len, 0);
+    std::vector<unsigned char> hash_obj(obj_size);
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, hash_obj.data(),
+                                         static_cast<ULONG>(hash_obj.size()), nullptr, 0, 0))) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return {};
+    }
+
+    constexpr DWORD kBufSize = 64 * 1024;
+    std::vector<unsigned char> buf(kBufSize);
+    for (;;) {
+        DWORD bytes_read = 0;
+        if (!ReadFile(h, buf.data(), kBufSize, &bytes_read, nullptr)) {
+            spdlog::error("sha256_from_handle: ReadFile failed: {}", GetLastError());
+            BCryptDestroyHash(hash);
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return {};
+        }
+        if (bytes_read == 0)
+            break;
+        if (!BCRYPT_SUCCESS(BCryptHashData(hash, buf.data(), bytes_read, 0))) {
+            BCryptDestroyHash(hash);
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return {};
+        }
+    }
+
+    unsigned char digest[32]{};
+    bool ok = BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, sizeof(digest), 0));
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    if (!ok)
+        return {};
+
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(64);
+    for (unsigned char b : digest) {
+        hex.push_back(kHex[b >> 4]);
+        hex.push_back(kHex[b & 0x0F]);
+    }
+    return hex;
+}
+#else
 std::string sha256_from_fd(int fd) {
     if (fd < 0)
         return {};
@@ -175,8 +237,8 @@ std::string sha256_from_fd(int fd) {
     }
     return hex;
 }
+#endif // _WIN32
 } // namespace
-#endif // !_WIN32
 
 // ── Plugin code-signing verification ─────────────────────────────────────────
 //
@@ -492,16 +554,64 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
         if (entry.path().extension() != YUZU_SO_EXT)
             continue;
 
-#ifndef _WIN32
-        // W2.2 / #807: pin the inode by opening ONCE with O_NOFOLLOW + O_CLOEXEC.
-        // The previous flow `sha256_file(path) … is_symlink(path) … dlopen(path)`
-        // did three independent path resolutions, each racy against a writer in
-        // the plugin directory. We now hash via the held fd, and on Linux load
-        // via `/proc/self/fd/N` so dlopen sees the same inode the hash covered.
-        // On macOS there is no /proc/self/fd → dlopen bridge, so we close the
-        // fd and fall back to a path-based dlopen; the race window narrows
-        // (no separate symlink stat) but is not fully eliminated. Documented
-        // residual on darwin.
+            // W2.2 / #807: pin the inode by opening ONCE.
+            //
+            // POSIX: open with O_NOFOLLOW + O_CLOEXEC. The previous flow
+            //   sha256_file(path) → is_symlink(path) → dlopen(path)
+            // did three independent path resolutions, each racy against a writer
+            // in the plugin directory. We now hash via the held fd, and on Linux
+            // load via `/proc/self/fd/N` so dlopen sees the same inode the hash
+            // covered. On macOS there is no /proc/self/fd → dlopen bridge, so we
+            // close the fd and fall back to a path-based dlopen; the race window
+            // narrows (no separate symlink stat) but is not fully eliminated.
+            // Documented residual on darwin.
+            //
+            // Windows (cross-platform-debt closure): CreateFileW with
+            // FILE_SHARE_READ only (no SHARE_WRITE, no SHARE_DELETE) — while we
+            // hold the handle nothing can write to, delete, or rename our file,
+            // so the directory entry at this path cannot be re-pointed at a
+            // different inode. LoadLibraryW(path) therefore loads the same inode
+            // we hashed. FILE_FLAG_OPEN_REPARSE_POINT opens reparse points raw
+            // (matching POSIX O_NOFOLLOW) so we can refuse symlinks/junctions
+            // via the reparse-point attribute check.
+#ifdef _WIN32
+        struct ScopedHandle {
+            HANDLE h = INVALID_HANDLE_VALUE;
+            ~ScopedHandle() {
+                if (h != INVALID_HANDLE_VALUE)
+                    CloseHandle(h);
+            }
+        } guard;
+        guard.h = CreateFileW(entry.path().wstring().c_str(), GENERIC_READ,
+                              FILE_SHARE_READ, // path-swap blocked while held
+                              nullptr, OPEN_EXISTING,
+                              FILE_FLAG_OPEN_REPARSE_POINT, // don't follow symlinks
+                              nullptr);
+        if (guard.h == INVALID_HANDLE_VALUE) {
+            auto err = GetLastError();
+            spdlog::error("Plugin {} CreateFileW failed: {}", entry.path().string(), err);
+            result.errors.push_back(LoadError{
+                entry.path().string(), "CreateFileW failed with error " + std::to_string(err)});
+            continue;
+        }
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(guard.h, &info)) {
+            auto err = GetLastError();
+            spdlog::error("Plugin {} GetFileInformationByHandle failed: {}", entry.path().string(),
+                          err);
+            result.errors.push_back(
+                LoadError{entry.path().string(),
+                          "GetFileInformationByHandle failed with error " + std::to_string(err)});
+            continue;
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            spdlog::warn("Plugin {} is a reparse point (symlink/junction) — skipping",
+                         entry.path().string());
+            result.errors.push_back(
+                LoadError{entry.path().string(), "symlinks not allowed in plugin directory"});
+            continue;
+        }
+#else
         struct ScopedFd {
             int fd = -1;
             ~ScopedFd() {
@@ -538,10 +648,10 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
                 continue;
             }
 
-#ifndef _WIN32
-            auto actual_hash = sha256_from_fd(guard.fd);
+#ifdef _WIN32
+            auto actual_hash = sha256_from_handle(guard.h);
 #else
-            auto actual_hash = sha256_file(entry.path());
+            auto actual_hash = sha256_from_fd(guard.fd);
 #endif
             if (actual_hash.empty()) {
                 result.errors.push_back(
@@ -592,19 +702,14 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
         }
 
 #ifdef _WIN32
-        // Symlink check (Windows only — POSIX uses O_NOFOLLOW at open time).
-        // Windows does not yet have an equivalent of /proc/self/fd that
-        // dlopen / LoadLibrary can consume, so plugin loading on Windows
-        // remains path-based. Operators relying on this defence should
-        // additionally lock down the plugin directory ACL (mode 700
-        // equivalent on Windows = inherited Administrators-only ACE).
-        // Tracked follow-up: fd-based LoadLibrary alternative.
-        if (std::filesystem::is_symlink(entry.path())) {
-            spdlog::warn("Plugin {} is a symlink — skipping", entry.path().string());
-            result.errors.push_back(
-                LoadError{entry.path().string(), "symlinks not allowed in plugin directory"});
-            continue;
-        }
+        // Symlinks were refused at handle-open time via FILE_FLAG_OPEN_REPARSE_POINT
+        // + FILE_ATTRIBUTE_REPARSE_POINT check — no separate is_symlink stat
+        // needed (and using one would re-introduce a path resolution race).
+        // LoadLibraryW(path) is safe here even though it is path-based: the
+        // FILE_SHARE_READ-only handle we still hold in `guard` prevents any
+        // other party from writing to, deleting, or renaming our file, so the
+        // directory entry at this path cannot be re-pointed at a different
+        // inode while LoadLibrary resolves it.
         auto loaded = PluginHandle::load(entry.path());
 #elif defined(__linux__)
         // Linux: load via /proc/self/fd/N — the kernel resolves this to the
