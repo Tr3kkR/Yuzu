@@ -249,6 +249,83 @@ TEST_CASE("ExecutionTracker: get_agent_statuses multiple agents", "[execution_tr
     REQUIRE(statuses.size() == 4);
 }
 
+TEST_CASE("ExecutionTracker: update_agent_status on unknown execution_id is a no-op",
+          "[execution_tracker][issue872]") {
+    // Out-of-band dispatches that bypass the workflow-routes create path
+    // (CLI / direct gRPC / re-mapped command_id) can reach
+    // update_agent_status with an execution_id that has no row in the
+    // `executions` table. The mutator must tolerate this — no crash, no
+    // SQL constraint violation. The chained refresh_counts must likewise
+    // return cleanly when there is nothing to aggregate.
+    TestDb tdb;
+    ExecutionTracker tracker(tdb.db);
+    tracker.create_tables();
+
+    AgentExecStatus as;
+    as.agent_id = "agent-ghost";
+    as.status = "success";
+    as.dispatched_at = 1000;
+    as.completed_at = 1005;
+    as.exit_code = 0;
+    // Must not throw, must not abort the test process.
+    tracker.update_agent_status("exec-does-not-exist", as);
+
+    // No parent execution row was created; querying it returns empty.
+    auto fetched = tracker.get_execution("exec-does-not-exist");
+    CHECK_FALSE(fetched.has_value());
+
+    // The agent_exec_status schema has NO foreign-key constraint on
+    // execution_id (no `FOREIGN KEY(execution_id) REFERENCES executions(id)`
+    // at execution_tracker.cpp lines 105-115), so the orphan row IS written.
+    // Pin this as the canonical behaviour — if a future migration adds FK
+    // enforcement (so the upsert silently no-ops or sqlite3_step returns
+    // SQLITE_CONSTRAINT), this test will flip to size==0 and force a
+    // conscious decision about the new contract. Without an explicit size
+    // assertion the test would silently pass on either path, masking the
+    // schema regression.
+    auto statuses = tracker.get_agent_statuses("exec-does-not-exist");
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].agent_id == "agent-ghost");
+    CHECK(statuses[0].status == "success");
+}
+
+TEST_CASE("ExecutionTracker: update_agent_status alone advances parent aggregates "
+          "(chain invariant)",
+          "[execution_tracker][issue872]") {
+    // UAT 2026-05-06 fix 18e8766 chained refresh_counts inside
+    // update_agent_status so callers no longer need an explicit refresh.
+    // The `test_rest_api_t2.cpp` cleanup in PR #1068 dropped 7 redundant
+    // explicit calls based on this chain. If a future refactor breaks the
+    // chain (e.g. moves refresh behind a flag or an async queue),
+    // test_rest_api_t2.cpp's lower-bound assertions (>= 2) would still
+    // pass with stale aggregates — only the workflow_routes terminal-
+    // threshold test would bite. This case pins the chain at the mutator
+    // itself so any chain-break fails ONE focused test with a clear name.
+    TestDb tdb;
+    ExecutionTracker tracker(tdb.db);
+    tracker.create_tables();
+
+    auto exec = make_execution();
+    exec.agents_targeted = 1;
+    auto id_result = tracker.create_execution(exec);
+    REQUIRE(id_result.has_value());
+
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    as.dispatched_at = 1000;
+    as.completed_at = 1005;
+    as.exit_code = 0;
+    // Single call, no explicit refresh_counts. The chain inside
+    // update_agent_status MUST recompute aggregates and advance status.
+    tracker.update_agent_status(*id_result, as);
+
+    auto summary = tracker.get_summary(*id_result);
+    CHECK(summary.agents_responded == 1);
+    CHECK(summary.agents_success == 1);
+    CHECK(summary.agents_failure == 0);
+}
+
 // ── Summary ────────────────────────────────────────────────────────────────
 
 TEST_CASE("ExecutionTracker: get_summary", "[execution_tracker]") {

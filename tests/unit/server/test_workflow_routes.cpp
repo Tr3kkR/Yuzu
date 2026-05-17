@@ -992,11 +992,22 @@ TEST_CASE("SSE handler: refresh_counts on terminal threshold publishes "
     auto count = [&](const std::string& k) {
         return static_cast<int>(std::count(kinds.begin(), kinds.end(), k));
     };
-    CHECK(count("execution-progress") >= 1);
+    // #872 — exact counts (was `>= 1`): 2 agent_status calls, each chaining
+    // refresh_counts via update_agent_status, so we expect exactly 2
+    // agent-transition + 2 execution-progress, and the second refresh_counts
+    // crosses the terminal threshold → 1 execution-completed. A regression
+    // that publishes a stray progress event AFTER the completed event would
+    // bump count("execution-progress") to 3 and fail this assertion (the
+    // old `>= 1` would still pass it).
+    CHECK(count("agent-transition") == 2);
+    CHECK(count("execution-progress") == 2);
     CHECK(count("execution-completed") == 1);
 
-    // execution-completed must come AFTER the corresponding progress
-    // event so a client receiving them in order sees counts THEN status.
+    // execution-completed must come AFTER the FINAL execution-progress so
+    // a client receiving them in order sees counts THEN status. The loop
+    // tracks last_progress_idx (not first_progress_idx) so a regression
+    // that publishes progress→completed→progress would fail here too —
+    // last_progress_idx would land AFTER completed_idx.
     auto last_progress_idx = -1;
     auto completed_idx = -1;
     for (std::size_t i = 0; i < seen.size(); ++i) {
