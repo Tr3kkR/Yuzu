@@ -243,38 +243,37 @@ jobs:
             --triplet ${{ matrix.triplet }} \
             --x-manifest-root="$GITHUB_WORKSPACE"
 
-      - name: Ensure Erlang on PATH (gateway custom_target, linux only)
+      # Install Erlang/OTP + rebar3 for the gateway custom_target. The
+      # meson `gateway` custom_target fires when `find_program('rebar3')`
+      # succeeds at configure time; on the self-hosted Linux runner
+      # rebar3 sits at /home/github-runner/.local/bin/rebar3 so the
+      # custom_target IS scheduled, and the Build step then dies with
+      # `/usr/bin/env: 'escript': No such file or directory` if Erlang
+      # isn't on PATH. Gateway is Erlang and contributes zero TUs to
+      # C++ CodeQL — CodeQL has no Erlang extractor and dialyzer is
+      # the gateway's canonical static-analysis tool (see
+      # `.github/workflows/release.yml` line 296, the `gateway-dialyzer`
+      # skill, and CLAUDE.md "Always run rebar3 dialyzer"). But the
+      # custom_target must succeed or `meson compile` fails the whole
+      # job. Mirror ci.yml's "Install Erlang/OTP and rebar3" step
+      # verbatim — same pinned SHA, same OTP version, same ImageOS
+      # override. Runs reliably on the same yuzu-wsl2-linux runner on
+      # every Tier-2 PR build. Replaces the prior `scripts/ensure-erlang.sh`
+      # +`$GITHUB_PATH` plumbing (PR #923) which could not find Erlang
+      # at all when the runner lacked a kerl/asdf/brew install — the
+      # 2026-05-10 and 2026-05-17 scheduled runs both failed on this
+      # branch. Linux only — Windows uses build_gateway.py's C:\Erlang
+      # junction lookup.
+      - name: Install Erlang/OTP and rebar3 (linux)
         if: matrix.os == 'linux'
-        run: |
-          # The meson `gateway` custom_target fires when rebar3 is
-          # detected. If it is, set up the Erlang toolchain so the
-          # compile step doesn't fail on `.gateway_built`. Gateway is
-          # Erlang and doesn't contribute to C++ CodeQL, but the
-          # custom_target must succeed or meson compile fails. Linux
-          # only — Windows CodeQL leg does not build the gateway.
-          #
-          # `source scripts/ensure-erlang.sh` only mutates PATH in this
-          # step's shell. Subsequent steps (Configure, Build) run in fresh
-          # shells where Erlang is gone again, and the meson `gateway`
-          # custom_target dies with `/usr/bin/env: 'escript': No such
-          # file or directory` (run 25620458000). Echo the bin dirs of
-          # the resolved tools to $GITHUB_PATH so they are prepended for
-          # every subsequent step on the same runner.
-          if command -v rebar3 >/dev/null 2>&1; then
-            source scripts/ensure-erlang.sh
-            if command -v erl >/dev/null; then
-              for tool in erl escript rebar3; do
-                bin_dir=$(dirname "$(command -v "$tool" 2>/dev/null)" 2>/dev/null || true)
-                if [[ -n "$bin_dir" && -d "$bin_dir" ]]; then
-                  echo "$bin_dir" >> "$GITHUB_PATH"
-                fi
-              done
-            else
-              echo "::warning::ensure-erlang.sh did not resolve erl on PATH"
-            fi
-          else
-            echo "rebar3 not installed — gateway target will be skipped"
-          fi
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          # erlef/setup-beam can't auto-detect the self-hosted runner OS;
+          # the explicit ImageOS hint matches ci.yml:230.
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@e46ed2cbd01164d986452f91f178727624ae40d7 # v4.35.3
