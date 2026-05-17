@@ -94,7 +94,11 @@ TEST_CASE("T2 REST: get_fleet_summary with multiple statuses",
     auto id2 = tracker.create_execution(e2);
     REQUIRE(id2.has_value());
 
-    // Add agent statuses for e1: 7 success, 3 failure
+    // Add agent statuses for e1: 7 success, 3 failure.
+    // #872 — update_agent_status now chains refresh_counts internally; the
+    // explicit refresh_counts() after the loop is duplicate work and
+    // encoded the pre-UAT-2026-05-06 "decoupled mutator" contract that no
+    // longer holds. Dropping it.
     for (int i = 0; i < 10; ++i) {
         AgentExecStatus as;
         as.agent_id = "agent-" + std::to_string(i);
@@ -104,7 +108,6 @@ TEST_CASE("T2 REST: get_fleet_summary with multiple statuses",
         as.exit_code = (i < 7) ? 0 : 1;
         tracker.update_agent_status(*id1, as);
     }
-    tracker.refresh_counts(*id1);
 
     // Add agent statuses for e2: all success
     for (int i = 0; i < 5; ++i) {
@@ -116,7 +119,6 @@ TEST_CASE("T2 REST: get_fleet_summary with multiple statuses",
         as.exit_code = 0;
         tracker.update_agent_status(*id2, as);
     }
-    tracker.refresh_counts(*id2);
 
     auto summary = tracker.get_fleet_summary();
     CHECK(summary.total_executions >= 2);
@@ -160,7 +162,7 @@ TEST_CASE("T2 REST: get_agent_statistics with pagination (limit=5)",
         as.exit_code = (i % 3 == 0) ? 1 : 0;
         tracker.update_agent_status(*id, as);
     }
-    tracker.refresh_counts(*id);
+    // #872 — refresh chained inside update_agent_status; explicit call dropped.
 
     ExecutionStatsQuery q;
     q.limit = 5;
@@ -217,6 +219,7 @@ TEST_CASE("T2 REST: get_definition_statistics returns per-definition aggregates"
     REQUIRE(id2.has_value());
 
     // Add statuses and refresh counts to advance execution out of 'pending'
+    // #872 — refresh chained inside update_agent_status; explicit calls dropped.
     AgentExecStatus as;
     as.agent_id = "a1";
     as.status = "success";
@@ -224,9 +227,7 @@ TEST_CASE("T2 REST: get_definition_statistics returns per-definition aggregates"
     as.dispatched_at = 1000;
     as.completed_at = 1010;
     tracker.update_agent_status(*id1, as);
-    tracker.refresh_counts(*id1);
     tracker.update_agent_status(*id2, as);
-    tracker.refresh_counts(*id2);
 
     auto def_stats = tracker.get_definition_statistics();
     CHECK(def_stats.size() >= 2);
@@ -800,9 +801,7 @@ TEST_CASE("T2 REST: execution statistics work with concurrent agent updates",
         s2.exit_code = (i < 2) ? 0 : 1;
         tracker.update_agent_status(*id2, s2);
     }
-
-    tracker.refresh_counts(*id1);
-    tracker.refresh_counts(*id2);
+    // #872 — refresh chained inside update_agent_status; explicit calls dropped.
 
     // Fleet summary should reflect both executions
     auto fleet = tracker.get_fleet_summary();

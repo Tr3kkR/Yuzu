@@ -31,9 +31,11 @@
 #include "agent_service_impl.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <sqlite3.h>
 
 #include "agent_registry.hpp"
 #include "event_bus.hpp"
+#include "execution_tracker.hpp"
 #include "gateway_service_impl.hpp"
 #include "peer_ip.hpp"
 #include "response_store.hpp"
@@ -682,4 +684,206 @@ TEST_CASE("ProxyRegister: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 
     // Trusted-peer set untouched — the early-reject path never reaches
     // the post-success note_trusted_gateway_peer call.
     CHECK(h.registry.trusted_gateway_peer_count() == 0);
+}
+
+// ── #872 — notify_exec_tracker wiring through to ExecutionTracker ──────────
+//
+// Bare GatewayResponseHarness leaves execution_tracker_ at nullptr, so the
+// entire notify_exec_tracker body (5-status enum mapping, empty-execution_id
+// early-return, null-tracker early-return) was dead in test. TrackerScope
+// constructs a real in-memory ExecutionTracker and wires it via
+// set_execution_tracker; destruction order is managed so the borrowed pointer
+// in svc is nulled before the tracker destructs (mirrors the production
+// shutdown contract documented at agent_service_impl.hpp:113).
+
+namespace {
+
+struct TrackerScope {
+    sqlite3* db{nullptr};
+    std::unique_ptr<yuzu::server::ExecutionTracker> tracker;
+    AgentServiceImpl* svc{nullptr};
+
+    explicit TrackerScope(AgentServiceImpl& s) : svc(&s) {
+        REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+        tracker = std::make_unique<yuzu::server::ExecutionTracker>(db);
+        tracker->create_tables();
+        svc->set_execution_tracker(tracker.get());
+    }
+    ~TrackerScope() {
+        // Null the borrowed pointer BEFORE the tracker destructs — matches
+        // ServerImpl's "drain gRPC, null setter, then reset" shutdown
+        // ordering (agent_service_impl.hpp:113). Without this a future test
+        // ordering change that triggered another notify_exec_tracker after
+        // tracker destruction would crash, not just leak.
+        if (svc)
+            svc->set_execution_tracker(nullptr);
+        tracker.reset();
+        if (db)
+            sqlite3_close(db);
+    }
+
+    TrackerScope(const TrackerScope&) = delete;
+    TrackerScope& operator=(const TrackerScope&) = delete;
+};
+
+std::string make_exec_for_tracker(yuzu::server::ExecutionTracker& tracker,
+                                  int agents_targeted = 1) {
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-test";
+    exec.scope_expression = "agent_id = 'agent-1'";
+    exec.dispatched_by = "tester";
+    exec.status = "running";
+    exec.agents_targeted = agents_targeted;
+    auto id = tracker.create_execution(exec);
+    REQUIRE(id.has_value());
+    return *id;
+}
+
+} // namespace
+
+TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
+          "completed_at=0",
+          "[agent_service][executions][issue872]") {
+    // RUNNING is the only non-terminal mapping in the switch — it stamps
+    // first_response_at but leaves completed_at zero. A regression that
+    // unifies the RUNNING and terminal branches (treating RUNNING as
+    // completed) would flip executions to "done" on their first chunk.
+    GatewayResponseHarness h;
+    TrackerScope ts{h.svc};
+    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    h.svc.record_execution_id("cmd-A", exec_id);
+
+    auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::RUNNING,
+                                                      /*output=*/"row-1");
+    h.svc.process_gateway_response("agent-1", resp);
+
+    auto statuses = ts.tracker->get_agent_statuses(exec_id);
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].agent_id == "agent-1");
+    CHECK(statuses[0].status == "running");
+    CHECK(statuses[0].first_response_at > 0);
+    CHECK(statuses[0].completed_at == 0);
+}
+
+TEST_CASE("notify_exec_tracker: SUCCESS maps to status='success' and stamps "
+          "completed_at",
+          "[agent_service][executions][issue872]") {
+    GatewayResponseHarness h;
+    TrackerScope ts{h.svc};
+    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    h.svc.record_execution_id("cmd-A", exec_id);
+
+    auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS,
+                                                      /*output=*/"", /*exit_code=*/0);
+    h.svc.process_gateway_response("agent-1", resp);
+
+    auto statuses = ts.tracker->get_agent_statuses(exec_id);
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].status == "success");
+    CHECK(statuses[0].exit_code == 0);
+    CHECK(statuses[0].first_response_at > 0);
+    CHECK(statuses[0].completed_at > 0);
+}
+
+TEST_CASE("notify_exec_tracker: FAILURE preserves error_detail and exit_code",
+          "[agent_service][executions][issue872]") {
+    GatewayResponseHarness h;
+    TrackerScope ts{h.svc};
+    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    h.svc.record_execution_id("cmd-A", exec_id);
+
+    auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::FAILURE,
+                                                      /*output=*/"", /*exit_code=*/3);
+    resp.mutable_error()->set_message("plugin returned non-zero");
+    h.svc.process_gateway_response("agent-1", resp);
+
+    auto statuses = ts.tracker->get_agent_statuses(exec_id);
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].status == "failure");
+    CHECK(statuses[0].exit_code == 3);
+    CHECK(statuses[0].error_detail == "plugin returned non-zero");
+    CHECK(statuses[0].completed_at > 0);
+}
+
+TEST_CASE("notify_exec_tracker: TIMEOUT maps to status='timeout'",
+          "[agent_service][executions][issue872]") {
+    GatewayResponseHarness h;
+    TrackerScope ts{h.svc};
+    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    h.svc.record_execution_id("cmd-A", exec_id);
+
+    auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::TIMEOUT);
+    h.svc.process_gateway_response("agent-1", resp);
+
+    auto statuses = ts.tracker->get_agent_statuses(exec_id);
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].status == "timeout");
+    CHECK(statuses[0].first_response_at > 0);
+    CHECK(statuses[0].completed_at > 0);
+}
+
+TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
+          "[agent_service][executions][issue872]") {
+    // notify_exec_tracker sets s.first_response_at=0 for REJECTED (the agent
+    // rejected the command at dispatch, never began executing — "first
+    // response" is conceptually undefined). The DB column still ends up
+    // stamped to `now` because the bind layer substitutes
+    // `s.first_response_at > 0 ? s.first_response_at : now`
+    // (execution_tracker.cpp:363), making the struct-field zero invisible
+    // to consumers. Pin the visible invariant — status='rejected',
+    // completed_at>0 — and leave the first_response_at quirk untested here
+    // (it's a tracker-layer concern, not a notify-mapping concern).
+    GatewayResponseHarness h;
+    TrackerScope ts{h.svc};
+    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    h.svc.record_execution_id("cmd-A", exec_id);
+
+    auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::REJECTED);
+    h.svc.process_gateway_response("agent-1", resp);
+
+    auto statuses = ts.tracker->get_agent_statuses(exec_id);
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].status == "rejected");
+    CHECK(statuses[0].completed_at > 0);
+}
+
+TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
+          "[agent_service][executions][issue872]") {
+    // Out-of-band dispatch (CLI / direct gRPC) never calls record_execution_id.
+    // notify_exec_tracker must early-return on empty execution_id rather than
+    // upserting under a fabricated id — those rows would be invisible to every
+    // tracker query (all filter by execution_id) but would still bloat the
+    // table and break the documented "out-of-band = no tracker side effect"
+    // contract referenced in agent_service_impl.cpp:1146.
+    GatewayResponseHarness h;
+    TrackerScope ts{h.svc};
+    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    // Deliberately do NOT call record_execution_id — cmd-orphan is unmapped.
+
+    auto resp = GatewayResponseHarness::make_response("cmd-orphan", apb::CommandResponse::SUCCESS);
+    h.svc.process_gateway_response("agent-1", resp);
+
+    CHECK(ts.tracker->get_agent_statuses(exec_id).empty());
+}
+
+TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contract)",
+          "[agent_service][executions][issue872]") {
+    // The atomic-load-acquire in notify_exec_tracker is the read half of the
+    // shutdown contract — ServerImpl drains gRPC, calls
+    // set_execution_tracker(nullptr) with release ordering, then resets the
+    // owning unique_ptr. A refactor that drops the null guard (e.g. assumes
+    // tracker stays non-null once set) would crash in the shutdown window.
+    // Pinned explicitly via the set→unset path, not just the never-set path
+    // every other GatewayResponseHarness test exercises implicitly.
+    GatewayResponseHarness h;
+    {
+        TrackerScope ts{h.svc};
+        // ~TrackerScope calls set_execution_tracker(nullptr) before destroying
+        // the tracker, leaving svc.execution_tracker_ at nullptr.
+    }
+    h.svc.record_execution_id("cmd-A", "exec-42");
+
+    auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
+    // Must not crash, must not dereference the destroyed tracker.
+    h.svc.process_gateway_response("agent-1", resp);
 }

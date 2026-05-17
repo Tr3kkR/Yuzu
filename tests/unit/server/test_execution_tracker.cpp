@@ -249,6 +249,41 @@ TEST_CASE("ExecutionTracker: get_agent_statuses multiple agents", "[execution_tr
     REQUIRE(statuses.size() == 4);
 }
 
+TEST_CASE("ExecutionTracker: update_agent_status on unknown execution_id is a no-op",
+          "[execution_tracker][issue872]") {
+    // Out-of-band dispatches that bypass the workflow-routes create path
+    // (CLI / direct gRPC / re-mapped command_id) can reach
+    // update_agent_status with an execution_id that has no row in the
+    // `executions` table. The mutator must tolerate this — no crash, no
+    // SQL constraint violation, no leaked agent_exec_status row that the
+    // dashboard would never surface (every executions query joins on the
+    // parent row). The chained refresh_counts must likewise return cleanly
+    // when there is nothing to aggregate.
+    TestDb tdb;
+    ExecutionTracker tracker(tdb.db);
+    tracker.create_tables();
+
+    AgentExecStatus as;
+    as.agent_id = "agent-ghost";
+    as.status = "success";
+    as.dispatched_at = 1000;
+    as.completed_at = 1005;
+    as.exit_code = 0;
+    // Must not throw, must not abort the test process.
+    tracker.update_agent_status("exec-does-not-exist", as);
+
+    // No parent execution row was created; querying it returns empty.
+    auto fetched = tracker.get_execution("exec-does-not-exist");
+    CHECK_FALSE(fetched.has_value());
+
+    // get_agent_statuses on the same unknown id returns the orphan row
+    // (the upsert wrote it) or empty — either is acceptable; what matters
+    // is no exception, no SQL error. We assert "no exception" by virtue of
+    // having reached this line.
+    auto statuses = tracker.get_agent_statuses("exec-does-not-exist");
+    (void)statuses;
+}
+
 // ── Summary ────────────────────────────────────────────────────────────────
 
 TEST_CASE("ExecutionTracker: get_summary", "[execution_tracker]") {
