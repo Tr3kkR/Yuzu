@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <new> // std::launder
 #include <string>
 #include <vector>
 
@@ -389,27 +390,44 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 #else
     struct ScopedHandle {
         HANDLE h = INVALID_HANDLE_VALUE;
+        ScopedHandle() = default;
         ~ScopedHandle() {
             if (h != INVALID_HANDLE_VALUE)
                 CloseHandle(h);
         }
+        ScopedHandle(const ScopedHandle&) = delete;
+        ScopedHandle& operator=(const ScopedHandle&) = delete;
+        ScopedHandle(ScopedHandle&&) = delete;
+        ScopedHandle& operator=(ScopedHandle&&) = delete;
     } h_guard;
     {
         // Same-volume requirement: FileRenameInfo will not cross volumes.
         // Placing the temp next to exe_path_ also keeps the download out
         // of the world-writable system temp (defense-in-depth against the
-        // very attack we're closing).
-        auto temp_dir = exe_path_.parent_path();
+        // very attack we're closing). Resolve to absolute first so an
+        // operator launching with a bare argv[0] doesn't land on an empty
+        // parent_path.
+        std::error_code abs_ec;
+        auto abs_exe = std::filesystem::absolute(exe_path_, abs_ec);
+        if (abs_ec) {
+            return std::unexpected(
+                UpdateError{std::format("Failed to resolve absolute exe path '{}': {}",
+                                        exe_path_.string(), abs_ec.message())});
+        }
+        auto temp_dir = abs_exe.parent_path();
         std::error_code dir_ec;
-        if (!std::filesystem::exists(temp_dir, dir_ec)) {
+        if (temp_dir.empty() || !std::filesystem::exists(temp_dir, dir_ec)) {
             return std::unexpected(UpdateError{std::format(
                 "exe parent dir '{}' does not exist; cannot stage update", temp_dir.string())});
         }
 
         UCHAR rand_bytes[16];
-        if (BCryptGenRandom(nullptr, rand_bytes, sizeof(rand_bytes),
-                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
-            return std::unexpected(UpdateError{"BCryptGenRandom failed for temp filename"});
+        NTSTATUS rnd_status = BCryptGenRandom(nullptr, rand_bytes, sizeof(rand_bytes),
+                                              BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (!BCRYPT_SUCCESS(rnd_status)) {
+            return std::unexpected(
+                UpdateError{std::format("BCryptGenRandom for temp filename failed: 0x{:08x}",
+                                        static_cast<unsigned>(rnd_status))});
         }
         char hex[33]{};
         for (int i = 0; i < 16; ++i) {
@@ -417,8 +435,11 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
         }
         temp_path = temp_dir / (std::string{"yuzu-update-"} + hex + ".tmp");
 
-        // Owner-only DACL (matches yuzu_create_temp_file's posture) so a
-        // non-owner local user cannot even open the temp file for read.
+        // Owner-only DACL is defence-in-depth — it prevents non-owner readers
+        // from opening the temp file. The load-bearing defence against the
+        // close-then-rename race is dwShareMode=0 below, which makes the
+        // HANDLE exclusive: nobody else can open the temp file for read,
+        // write, or delete while we hold it.
         SECURITY_ATTRIBUTES sa{};
         PSECURITY_DESCRIPTOR sd = nullptr;
         sa.nLength = sizeof(sa);
@@ -432,8 +453,8 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
         sa.lpSecurityDescriptor = sd;
 
         h_guard.h = CreateFileW(temp_path.wstring().c_str(),
-                                GENERIC_WRITE | DELETE, // DELETE required for FileRenameInfo
-                                0,                      // No sharing — exclusive hold
+                                GENERIC_WRITE | DELETE, // DELETE required for FileRenameInfo*
+                                0, // No sharing — load-bearing exclusive hold
                                 &sa,
                                 CREATE_NEW, // Atomic create; fail if exists
                                 FILE_ATTRIBUTE_TEMPORARY, nullptr);
@@ -460,10 +481,25 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     grpc::ClientContext dl_ctx;
     auto reader = stub->DownloadUpdate(&dl_ctx, dl_req);
 
-    Sha256Hasher hasher;
-    if (!hasher.is_valid()) {
+    // Cleanup helper: on Windows the path-based fs::remove fails with
+    // ERROR_SHARING_VIOLATION while h_guard holds the file with dwShareMode=0,
+    // so we mark the file for delete-on-close via FileDispositionInfo — the
+    // RAII CloseHandle in ~ScopedHandle then deletes it for free. On POSIX
+    // unlink-while-open is fine, so fs::remove still works.
+    auto cleanup_temp = [&] {
+#ifdef _WIN32
+        FILE_DISPOSITION_INFO di{};
+        di.DeleteFile = TRUE;
+        SetFileInformationByHandle(h_guard.h, FileDispositionInfo, &di, sizeof(di));
+#else
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
+#endif
+    };
+
+    Sha256Hasher hasher;
+    if (!hasher.is_valid()) {
+        cleanup_temp();
         return std::unexpected(UpdateError{"Failed to initialize SHA-256 hasher"});
     }
 
@@ -471,15 +507,13 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     pb::DownloadUpdateChunk chunk;
 
     auto cleanup_and_fail = [&](const std::string& msg) -> std::expected<bool, UpdateError> {
-        std::error_code ec;
-        std::filesystem::remove(temp_path, ec);
+        cleanup_temp();
         return std::unexpected(UpdateError{msg});
     };
 
     while (reader->Read(&chunk)) {
         if (stop_requested_.load(std::memory_order_acquire)) {
-            std::error_code ec;
-            std::filesystem::remove(temp_path, ec);
+            cleanup_temp();
             return false;
         }
 
@@ -550,8 +584,7 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 #endif
 
     if (!dl_status.ok()) {
-        std::error_code ec;
-        std::filesystem::remove(temp_path, ec);
+        cleanup_temp();
         return std::unexpected(UpdateError{std::format("DownloadUpdate RPC failed: {} (code {})",
                                                        dl_status.error_message(),
                                                        static_cast<int>(dl_status.error_code()))});
@@ -563,23 +596,23 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     // ── Step 4: Verify SHA-256 ─────────────────────────────────────────────
     //
     // The hash is computed streaming from the bytes we wrote, NOT from a
-    // re-read of the file. So `actual_hash` covers what the fd holds, not
-    // what is currently at `temp_path` on disk — those can diverge if a
-    // local attacker raced us during the write loop. The inode-equivalence
-    // check after this step closes that gap before rename.
+    // re-read of the file. So `actual_hash` covers what the fd/HANDLE holds,
+    // not what is currently at `temp_path` on disk — on POSIX those can
+    // diverge if a local attacker raced us during the write loop, and the
+    // inode-equivalence check after this step closes that gap before rename.
+    // On Windows the HANDLE has dwShareMode=0 so no attacker can have
+    // touched our file; the equivalence check is unnecessary there.
 
     std::string actual_hash = hasher.finalize();
     if (actual_hash.empty()) {
-        std::error_code ec;
-        std::filesystem::remove(temp_path, ec);
+        cleanup_temp();
         return std::unexpected(UpdateError{"SHA-256 finalization failed"});
     }
 
     if (!iequal(actual_hash, check_resp.sha256())) {
         spdlog::error("SHA-256 mismatch: expected='{}', actual='{}'", check_resp.sha256(),
                       actual_hash);
-        std::error_code ec;
-        std::filesystem::remove(temp_path, ec);
+        cleanup_temp();
         return std::unexpected(UpdateError{std::format("SHA-256 mismatch: expected '{}', got '{}'",
                                                        check_resp.sha256(), actual_hash)});
     }
@@ -599,15 +632,13 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     struct stat fd_st {};
     struct stat path_st {};
     if (::fstat(fd_guard.fd, &fd_st) < 0) {
-        std::error_code ec;
-        std::filesystem::remove(temp_path, ec);
+        cleanup_temp();
         return std::unexpected(
             UpdateError{std::format("fstat on update temp fd failed: {}", std::strerror(errno))});
     }
     if (::stat(temp_path.c_str(), &path_st) < 0 || path_st.st_ino != fd_st.st_ino ||
         path_st.st_dev != fd_st.st_dev) {
-        std::error_code ec;
-        std::filesystem::remove(temp_path, ec);
+        cleanup_temp();
         return std::unexpected(
             UpdateError{"update temp file inode mismatch — possible TOCTOU swap attack detected"});
     }
@@ -636,7 +667,8 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 
     // Step 5a: rename the running .exe out of the way so the destination
     // is free for the handle-rename. The .exe is locked-against-overwrite
-    // by Windows but renamable, so this is safe.
+    // by Windows but renamable, so this is safe. The .old.exe also acts
+    // as the rollback target consumed by `rollback_if_needed` on next start.
     fs::rename(exe_path_, old_path, ec);
     if (ec) {
         return std::unexpected(
@@ -648,31 +680,49 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     // after the struct. FileNameLength is in bytes, NOT including any null
     // terminator. The destination path MUST be on the same volume as the
     // source — guaranteed because we placed the temp in exe_path_.parent_path().
+    //
+    // FileRenameInfoEx (Win10 1709+) is used instead of FileRenameInfo so
+    // we can pass FILE_RENAME_FLAG_REPLACE_IF_EXISTS|POSIX_SEMANTICS:
+    // even if an attacker raced us and created a stub at exe_path_ between
+    // step 5a and this call, the rename atomically replaces it. POSIX
+    // semantics keep any in-use handles to the original (now-orphaned)
+    // file functional, which matches the rollback contract on .old.exe.
+    //
+    // Buffer uses std::byte with std::launder for strict-aliasing
+    // correctness when the trailing array is reinterpreted as
+    // FILE_RENAME_INFO. std::vector<std::byte>::data() is aligned to
+    // __STDCPP_DEFAULT_NEW_ALIGNMENT__ which exceeds alignof(FILE_RENAME_INFO).
     auto target_w = exe_path_.wstring();
     const size_t fn_len_bytes = target_w.size() * sizeof(wchar_t);
-    std::vector<unsigned char> ri_buf(offsetof(FILE_RENAME_INFO, FileName) + fn_len_bytes);
-    auto* ri = reinterpret_cast<FILE_RENAME_INFO*>(ri_buf.data());
-    ri->ReplaceIfExists = FALSE; // exe_path was just renamed away
+    std::vector<std::byte> ri_buf(offsetof(FILE_RENAME_INFO, FileName) + fn_len_bytes);
+    auto* ri = std::launder(reinterpret_cast<FILE_RENAME_INFO*>(ri_buf.data()));
+    ri->Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
     ri->RootDirectory = nullptr;
     ri->FileNameLength = static_cast<DWORD>(fn_len_bytes);
     std::memcpy(ri->FileName, target_w.data(), fn_len_bytes);
 
-    if (!SetFileInformationByHandle(h_guard.h, FileRenameInfo, ri,
+    if (!SetFileInformationByHandle(h_guard.h, FileRenameInfoEx, ri,
                                     static_cast<DWORD>(ri_buf.size()))) {
         auto rename_err = GetLastError();
         // Rollback: put the running exe back. If the rollback also fails
-        // the agent is in a degraded state — surface critically.
+        // the agent is in a degraded state — the binary is at old_path
+        // only and the operator must manually rename or invoke
+        // `yuzu-agent --rollback`. Surface that explicitly.
         std::error_code rb_ec;
         fs::rename(old_path, exe_path_, rb_ec);
         if (rb_ec) {
-            spdlog::error("CRITICAL: Rollback also failed after rename failure: {}",
-                          rb_ec.message());
+            spdlog::error("CRITICAL: rollback also failed: cannot rename '{}' -> '{}': {}. "
+                          "Manual intervention required: rename the binary at '{}' back to '{}' "
+                          "before restarting.",
+                          old_path.string(), exe_path_.string(), rb_ec.message(), old_path.string(),
+                          exe_path_.string());
         }
         // Drop the temp file too so we don't leave a half-applied artefact.
-        std::error_code drop_ec;
-        fs::remove(temp_path, drop_ec);
+        // FileDispositionInfo + RAII close handles the deletion against our
+        // exclusive-share hold.
+        cleanup_temp();
         return std::unexpected(UpdateError{
-            std::format("SetFileInformationByHandle(FileRenameInfo) for '{}' failed: {}",
+            std::format("SetFileInformationByHandle(FileRenameInfoEx) for '{}' failed: {}",
                         exe_path_.string(), rename_err)});
     }
 
@@ -684,22 +734,17 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 #endif
 }
 
+#ifndef _WIN32
+// apply_update is POSIX-only. On Windows the apply is performed inline in
+// check_and_apply via SetFileInformationByHandle on the held HANDLE (see
+// W2.3 cross-platform-debt closure). A path-based fallback on Windows
+// would re-introduce the close-then-rename race window — keep it
+// compile-time-absent on Windows so future refactors can't accidentally
+// re-wire it.
 std::expected<bool, UpdateError> Updater::apply_update(const std::filesystem::path& temp_path) {
     namespace fs = std::filesystem;
     std::error_code ec;
 
-#ifdef _WIN32
-    // The Windows apply is done inline in check_and_apply via
-    // SetFileInformationByHandle on the held HANDLE — see W2.3 cross-
-    // platform-debt closure note above. This path-based apply_update is
-    // retained as a private POSIX-only implementation; on Windows it is
-    // unreachable from the update flow and would re-introduce the
-    // close-then-rename race window if called.
-    (void)temp_path;
-    return std::unexpected(
-        UpdateError{"Updater::apply_update path-based fallback is not used on Windows; "
-                    "the handle-based rename is performed inline in check_and_apply"});
-#else
     // POSIX: set executable permissions on the temp file first
     fs::permissions(temp_path,
                     fs::perms::owner_exec | fs::perms::owner_read | fs::perms::owner_write, ec);
@@ -737,8 +782,8 @@ std::expected<bool, UpdateError> Updater::apply_update(const std::filesystem::pa
 
     spdlog::info("Update applied successfully; old binary preserved at '{}'", old_path.string());
     return true; // Caller should restart the process
-#endif
 }
+#endif
 
 void Updater::cleanup_old_binary() {
     namespace fs = std::filesystem;

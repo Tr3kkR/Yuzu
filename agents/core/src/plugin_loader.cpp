@@ -145,15 +145,28 @@ std::string sha256_from_handle(HANDLE h) {
     }
     BCRYPT_ALG_HANDLE alg = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
-    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0)))
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        spdlog::error("sha256_from_handle: BCryptOpenAlgorithmProvider failed: 0x{:08x}",
+                      static_cast<unsigned>(status));
         return {};
+    }
 
     DWORD obj_size = 0, data_len = 0;
-    BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&obj_size), sizeof(DWORD),
-                      &data_len, 0);
+    status = BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&obj_size),
+                               sizeof(DWORD), &data_len, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        spdlog::error("sha256_from_handle: BCryptGetProperty failed: 0x{:08x}",
+                      static_cast<unsigned>(status));
+        BCryptCloseAlgorithmProvider(alg, 0);
+        return {};
+    }
     std::vector<unsigned char> hash_obj(obj_size);
-    if (!BCRYPT_SUCCESS(BCryptCreateHash(alg, &hash, hash_obj.data(),
-                                         static_cast<ULONG>(hash_obj.size()), nullptr, 0, 0))) {
+    status = BCryptCreateHash(alg, &hash, hash_obj.data(), static_cast<ULONG>(hash_obj.size()),
+                              nullptr, 0, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        spdlog::error("sha256_from_handle: BCryptCreateHash failed: 0x{:08x}",
+                      static_cast<unsigned>(status));
         BCryptCloseAlgorithmProvider(alg, 0);
         return {};
     }
@@ -170,7 +183,10 @@ std::string sha256_from_handle(HANDLE h) {
         }
         if (bytes_read == 0)
             break;
-        if (!BCRYPT_SUCCESS(BCryptHashData(hash, buf.data(), bytes_read, 0))) {
+        status = BCryptHashData(hash, buf.data(), bytes_read, 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            spdlog::error("sha256_from_handle: BCryptHashData failed: 0x{:08x}",
+                          static_cast<unsigned>(status));
             BCryptDestroyHash(hash);
             BCryptCloseAlgorithmProvider(alg, 0);
             return {};
@@ -178,11 +194,14 @@ std::string sha256_from_handle(HANDLE h) {
     }
 
     unsigned char digest[32]{};
-    bool ok = BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, sizeof(digest), 0));
+    status = BCryptFinishHash(hash, digest, sizeof(digest), 0);
     BCryptDestroyHash(hash);
     BCryptCloseAlgorithmProvider(alg, 0);
-    if (!ok)
+    if (!BCRYPT_SUCCESS(status)) {
+        spdlog::error("sha256_from_handle: BCryptFinishHash failed: 0x{:08x}",
+                      static_cast<unsigned>(status));
         return {};
+    }
 
     static constexpr char kHex[] = "0123456789abcdef";
     std::string hex;
@@ -577,10 +596,15 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
 #ifdef _WIN32
         struct ScopedHandle {
             HANDLE h = INVALID_HANDLE_VALUE;
+            ScopedHandle() = default;
             ~ScopedHandle() {
                 if (h != INVALID_HANDLE_VALUE)
                     CloseHandle(h);
             }
+            ScopedHandle(const ScopedHandle&) = delete;
+            ScopedHandle& operator=(const ScopedHandle&) = delete;
+            ScopedHandle(ScopedHandle&&) = delete;
+            ScopedHandle& operator=(ScopedHandle&&) = delete;
         } guard;
         guard.h = CreateFileW(entry.path().wstring().c_str(), GENERIC_READ,
                               FILE_SHARE_READ, // path-swap blocked while held
