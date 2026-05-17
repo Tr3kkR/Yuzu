@@ -367,6 +367,8 @@ gateway-safe wire payloads): same doc §24; PR ladder:
 
 Use `yuzu::test::unique_temp_path(prefix)` / `yuzu::test::TempDbFile` from `tests/unit/test_helpers.hpp` for any test temp file or SQLite DB. **Never** salt uniqueness with `std::hash<std::thread::id>` or `std::chrono::steady_clock` — silent collisions under Defender-induced I/O serialisation on `yuzu-local-windows` (flake #473). Rationale and residual adoption: header comment + #482.
 
+For server tests that need a live `ExecutionTracker` wired into `AgentServiceImpl`, use the `TrackerScope` RAII helper in `tests/unit/server/test_agent_service_impl.cpp` — it opens a `:memory:` SQLite DB, constructs the tracker, calls `set_execution_tracker`, and nulls the borrowed pointer before the tracker destructs (matches the production shutdown contract at `agent_service_impl.hpp:113`). Pattern: `GatewayResponseHarness h; TrackerScope ts{h.svc}; auto exec_id = ts.make_exec();`. The `:memory:` choice deliberately sidesteps the `unique_temp_path` race for shutdown-ordered tests; promote to `test_helpers.hpp` once a second test file needs the pattern (tracked via the H-9 follow-up issue from PR #1068 governance).
+
 ## Agent skills
 
 Per-repo configuration for the Matt Pocock engineering skills (`to-issues`, `triage`, `to-prd`, `qa`, `improve-codebase-architecture`, `diagnose`, `tdd`, `zoom-out`, `grill-with-docs`). Re-run `/setup-matt-pocock-skills` to change.

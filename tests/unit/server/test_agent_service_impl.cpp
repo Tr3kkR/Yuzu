@@ -698,6 +698,17 @@ TEST_CASE("ProxyRegister: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 
 
 namespace {
 
+/// MEMBER ORDER LOAD-BEARING: members below are declared in the topological
+/// order required by the dtor's three-phase shutdown — `db` is the raw
+/// sqlite handle owned outright, `tracker` borrows it (via the
+/// `ExecutionTracker(sqlite3*)` ctor), `svc` borrows `tracker.get()` (via
+/// `set_execution_tracker`). The dtor MUST run set_execution_tracker(nullptr)
+/// → tracker.reset() → sqlite3_close(db), in that exact order, so the
+/// borrowed-pointer chain is unwound from the outside in. Reordering the
+/// member declarations or replacing the user-defined dtor with `= default`
+/// would silently break the contract — there is no compile-time guard.
+/// Mirrors the production ServerImpl "drain gRPC → null setter → reset"
+/// shutdown sequence at agent_service_impl.hpp:113.
 struct TrackerScope {
     sqlite3* db{nullptr};
     std::unique_ptr<yuzu::server::ExecutionTracker> tracker;
@@ -710,11 +721,6 @@ struct TrackerScope {
         svc->set_execution_tracker(tracker.get());
     }
     ~TrackerScope() {
-        // Null the borrowed pointer BEFORE the tracker destructs — matches
-        // ServerImpl's "drain gRPC, null setter, then reset" shutdown
-        // ordering (agent_service_impl.hpp:113). Without this a future test
-        // ordering change that triggered another notify_exec_tracker after
-        // tracker destruction would crash, not just leak.
         if (svc)
             svc->set_execution_tracker(nullptr);
         tracker.reset();
@@ -724,20 +730,23 @@ struct TrackerScope {
 
     TrackerScope(const TrackerScope&) = delete;
     TrackerScope& operator=(const TrackerScope&) = delete;
-};
 
-std::string make_exec_for_tracker(yuzu::server::ExecutionTracker& tracker,
-                                  int agents_targeted = 1) {
-    yuzu::server::Execution exec;
-    exec.definition_id = "def-test";
-    exec.scope_expression = "agent_id = 'agent-1'";
-    exec.dispatched_by = "tester";
-    exec.status = "running";
-    exec.agents_targeted = agents_targeted;
-    auto id = tracker.create_execution(exec);
-    REQUIRE(id.has_value());
-    return *id;
-}
+    /// Create an execution row on the bound tracker, return its id. Matches
+    /// the `GatewayResponseHarness::make_response` static-factory pattern —
+    /// keeps test bodies focused on the assertion, not boilerplate. Call
+    /// sites read `auto exec_id = ts.make_exec();`.
+    std::string make_exec(int agents_targeted = 1) {
+        yuzu::server::Execution exec;
+        exec.definition_id = "def-test";
+        exec.scope_expression = "agent_id = 'agent-1'";
+        exec.dispatched_by = "tester";
+        exec.status = "running";
+        exec.agents_targeted = agents_targeted;
+        auto id = tracker->create_execution(exec);
+        REQUIRE(id.has_value());
+        return *id;
+    }
+};
 
 } // namespace
 
@@ -750,7 +759,7 @@ TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
     // completed) would flip executions to "done" on their first chunk.
     GatewayResponseHarness h;
     TrackerScope ts{h.svc};
-    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::RUNNING,
@@ -770,7 +779,7 @@ TEST_CASE("notify_exec_tracker: SUCCESS maps to status='success' and stamps "
           "[agent_service][executions][issue872]") {
     GatewayResponseHarness h;
     TrackerScope ts{h.svc};
-    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS,
@@ -789,7 +798,7 @@ TEST_CASE("notify_exec_tracker: FAILURE preserves error_detail and exit_code",
           "[agent_service][executions][issue872]") {
     GatewayResponseHarness h;
     TrackerScope ts{h.svc};
-    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::FAILURE,
@@ -809,7 +818,7 @@ TEST_CASE("notify_exec_tracker: TIMEOUT maps to status='timeout'",
           "[agent_service][executions][issue872]") {
     GatewayResponseHarness h;
     TrackerScope ts{h.svc};
-    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::TIMEOUT);
@@ -817,9 +826,16 @@ TEST_CASE("notify_exec_tracker: TIMEOUT maps to status='timeout'",
 
     auto statuses = ts.tracker->get_agent_statuses(exec_id);
     REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].agent_id == "agent-1");
     CHECK(statuses[0].status == "timeout");
     CHECK(statuses[0].first_response_at > 0);
     CHECK(statuses[0].completed_at > 0);
+    // notify_exec_tracker only populates s.error_detail when resp.has_error().
+    // The TIMEOUT response was constructed with no error message, so the
+    // resulting column must be empty — pins the has_error()==false arm of
+    // the conditional at agent_service_impl.cpp:1157 against a regression
+    // that copies the field unconditionally.
+    CHECK(statuses[0].error_detail.empty());
 }
 
 TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
@@ -830,12 +846,10 @@ TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
     // stamped to `now` because the bind layer substitutes
     // `s.first_response_at > 0 ? s.first_response_at : now`
     // (execution_tracker.cpp:363), making the struct-field zero invisible
-    // to consumers. Pin the visible invariant — status='rejected',
-    // completed_at>0 — and leave the first_response_at quirk untested here
-    // (it's a tracker-layer concern, not a notify-mapping concern).
+    // to consumers.
     GatewayResponseHarness h;
     TrackerScope ts{h.svc};
-    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::REJECTED);
@@ -843,8 +857,19 @@ TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
 
     auto statuses = ts.tracker->get_agent_statuses(exec_id);
     REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].agent_id == "agent-1");
     CHECK(statuses[0].status == "rejected");
     CHECK(statuses[0].completed_at > 0);
+    // Both first_response_at and completed_at derive from the same
+    // `system_clock::now()` snapshot inside update_agent_status — first_response_at
+    // via the bind-layer substitution, completed_at via the direct bind. They
+    // are written from the same instant, so they cannot legitimately diverge
+    // by more than ~1 second. A regression that stops substituting `now` for
+    // a zero first_response_at would land first_response_at=0 vs
+    // completed_at>1e9, blowing this bound — catches the specific drift the
+    // bind-layer comment above warns about, without mocking the clock.
+    CHECK(statuses[0].first_response_at >= statuses[0].completed_at - 1);
+    CHECK(statuses[0].first_response_at <= statuses[0].completed_at + 1);
 }
 
 TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
@@ -857,7 +882,7 @@ TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
     // contract referenced in agent_service_impl.cpp:1146.
     GatewayResponseHarness h;
     TrackerScope ts{h.svc};
-    auto exec_id = make_exec_for_tracker(*ts.tracker);
+    auto exec_id = ts.make_exec();
     // Deliberately do NOT call record_execution_id — cmd-orphan is unmapped.
 
     auto resp = GatewayResponseHarness::make_response("cmd-orphan", apb::CommandResponse::SUCCESS);
