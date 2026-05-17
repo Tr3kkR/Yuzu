@@ -2535,8 +2535,8 @@ Register a new software package.
 | `content_hash` | string | No | SHA-256 hash of the installer |
 | `content_url` | string | No | Download URL for the installer binary |
 | `silent_args` | string | No | Silent install arguments |
-| `verify_command` | string | No | Post-install verification command |
-| `rollback_command` | string | No | Rollback command on failure |
+| `verify_command` | string | No | Post-install verification command. Max 512 chars. Rejects shell metacharacters (`;` `&` `|` `` ` `` `$` `<` `>` `(` `)` and newlines) at REST input time to prevent fleet-RCE via shell injection (#771). Examples that pass: `msiexec /x {GUID} /qn`, `reg query HKLM\Software\App`, `dpkg -s firefox`. |
+| `rollback_command` | string | No | Rollback command on failure. Same validation rules as `verify_command`. |
 | `size_bytes` | integer | No | Installer file size in bytes |
 
 **Response (201):**
