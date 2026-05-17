@@ -8,7 +8,6 @@
  */
 
 #include <yuzu/agent/updater.hpp>
-#include <yuzu/plugin.h> // yuzu_create_temp_file
 
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
@@ -36,7 +35,10 @@
 #include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
 // clang-format on
 #include <bcrypt.h>
+#include <sddl.h>
+#include <cstddef> // offsetof
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
 #else
 #include <openssl/evp.h>
 // W2.3 / #806: POSIX fd-pin across hash → rename. mkstemps directly
@@ -349,11 +351,15 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     // AFTER apply_update returns and AFTER a final inode-equivalence check
     // against the on-disk path.
     //
-    // Windows: still uses the path-based yuzu_create_temp_file helper.
-    // CreateFileW with no sharing + CREATE_NEW gives mode-equivalent
-    // protection at creation time, but the close-then-rename window is
-    // still present. Tracked as a follow-up for a Windows-side HANDLE
-    // hold via SetFileInformationByHandle(FileRenameInfo).
+    // Windows (W2.3 cross-platform-debt closure): CreateFileW with
+    // dwShareMode=0 + DELETE access, held across hash → rename. The held
+    // HANDLE makes the temp file unwritable, undeletable, and unrenamable
+    // by anyone else (no SHARE_WRITE, no SHARE_DELETE), and the final
+    // `SetFileInformationByHandle(FileRenameInfo)` atomically renames the
+    // inode the HANDLE points at — no path resolution between hash and
+    // rename, so the attack window present in the close-then-rename flow
+    // is fully closed. Temp file is created in exe_path_.parent_path()
+    // because FileRenameInfo requires same-volume source and destination.
 
     std::filesystem::path temp_path;
 #ifndef _WIN32
@@ -381,14 +387,64 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
         temp_path = tmpl;
     }
 #else
-    {
-        char path_buf[512]{};
-        int rc = yuzu_create_temp_file("yuzu-update-", ".tmp", nullptr, path_buf, sizeof(path_buf));
-        if (rc != 0) {
-            return std::unexpected(
-                UpdateError{"Failed to create temporary file for update download"});
+    struct ScopedHandle {
+        HANDLE h = INVALID_HANDLE_VALUE;
+        ~ScopedHandle() {
+            if (h != INVALID_HANDLE_VALUE)
+                CloseHandle(h);
         }
-        temp_path = path_buf;
+    } h_guard;
+    {
+        // Same-volume requirement: FileRenameInfo will not cross volumes.
+        // Placing the temp next to exe_path_ also keeps the download out
+        // of the world-writable system temp (defense-in-depth against the
+        // very attack we're closing).
+        auto temp_dir = exe_path_.parent_path();
+        std::error_code dir_ec;
+        if (!std::filesystem::exists(temp_dir, dir_ec)) {
+            return std::unexpected(UpdateError{std::format(
+                "exe parent dir '{}' does not exist; cannot stage update", temp_dir.string())});
+        }
+
+        UCHAR rand_bytes[16];
+        if (BCryptGenRandom(nullptr, rand_bytes, sizeof(rand_bytes),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            return std::unexpected(UpdateError{"BCryptGenRandom failed for temp filename"});
+        }
+        char hex[33]{};
+        for (int i = 0; i < 16; ++i) {
+            std::snprintf(hex + i * 2, 3, "%02x", rand_bytes[i]);
+        }
+        temp_path = temp_dir / (std::string{"yuzu-update-"} + hex + ".tmp");
+
+        // Owner-only DACL (matches yuzu_create_temp_file's posture) so a
+        // non-owner local user cannot even open the temp file for read.
+        SECURITY_ATTRIBUTES sa{};
+        PSECURITY_DESCRIPTOR sd = nullptr;
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = FALSE;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;OW)",
+                                                                  SDDL_REVISION_1, &sd, nullptr)) {
+            return std::unexpected(UpdateError{
+                std::format("ConvertStringSecurityDescriptorToSecurityDescriptorW failed: {}",
+                            GetLastError())});
+        }
+        sa.lpSecurityDescriptor = sd;
+
+        h_guard.h = CreateFileW(temp_path.wstring().c_str(),
+                                GENERIC_WRITE | DELETE, // DELETE required for FileRenameInfo
+                                0,                      // No sharing — exclusive hold
+                                &sa,
+                                CREATE_NEW, // Atomic create; fail if exists
+                                FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (sd)
+            LocalFree(sd);
+
+        if (h_guard.h == INVALID_HANDLE_VALUE) {
+            return std::unexpected(
+                UpdateError{std::format("CreateFileW for update temp file '{}' failed: {}",
+                                        temp_path.string(), GetLastError())});
+        }
     }
 #endif
 
@@ -404,23 +460,8 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     grpc::ClientContext dl_ctx;
     auto reader = stub->DownloadUpdate(&dl_ctx, dl_req);
 
-    // Writer: POSIX uses the held fd via write(); Windows opens std::ofstream
-    // against the path created by yuzu_create_temp_file.
-#ifdef _WIN32
-    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        std::error_code ec;
-        std::filesystem::remove(temp_path, ec);
-        return std::unexpected(UpdateError{
-            std::format("Failed to open temp file '{}' for writing", temp_path.string())});
-    }
-#endif
-
     Sha256Hasher hasher;
     if (!hasher.is_valid()) {
-#ifdef _WIN32
-        out.close();
-#endif
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
         return std::unexpected(UpdateError{"Failed to initialize SHA-256 hasher"});
@@ -430,9 +471,6 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     pb::DownloadUpdateChunk chunk;
 
     auto cleanup_and_fail = [&](const std::string& msg) -> std::expected<bool, UpdateError> {
-#ifdef _WIN32
-        out.close();
-#endif
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
         return std::unexpected(UpdateError{msg});
@@ -440,9 +478,6 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 
     while (reader->Read(&chunk)) {
         if (stop_requested_.load(std::memory_order_acquire)) {
-#ifdef _WIN32
-            out.close();
-#endif
             std::error_code ec;
             std::filesystem::remove(temp_path, ec);
             return false;
@@ -466,9 +501,22 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
             remaining -= static_cast<std::size_t>(n);
         }
 #else
-        out.write(data.data(), static_cast<std::streamsize>(data.size()));
-        if (!out) {
-            return cleanup_and_fail("Write to temp file failed during download");
+        // WriteFile to the held HANDLE — no std::ofstream re-open, so the
+        // close-then-rename race window is gone. Short writes loop until
+        // all bytes are committed or a real error fires.
+        const char* p = data.data();
+        DWORD remaining = static_cast<DWORD>(data.size());
+        while (remaining > 0) {
+            DWORD written = 0;
+            if (!WriteFile(h_guard.h, p, remaining, &written, nullptr)) {
+                return cleanup_and_fail(
+                    std::format("WriteFile to update temp handle failed: {}", GetLastError()));
+            }
+            if (written == 0) {
+                return cleanup_and_fail("WriteFile returned 0 bytes — disk full or quota?");
+            }
+            p += written;
+            remaining -= written;
         }
 #endif
 
@@ -485,7 +533,13 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 
     grpc::Status dl_status = reader->Finish();
 #ifdef _WIN32
-    out.close();
+    // FlushFileBuffers is the Windows analog of fsync — guarantees the
+    // bytes we hashed are on disk before the rename. Non-fatal on failure
+    // (the page cache will still service the rename atomically).
+    if (!FlushFileBuffers(h_guard.h)) {
+        spdlog::warn("FlushFileBuffers on update temp handle failed (non-fatal): {}",
+                     GetLastError());
+    }
 #else
     // Flush the fd to disk before the rename so the on-disk content matches
     // what we hashed. fsync failure is non-fatal (the bytes still land via
@@ -561,27 +615,28 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 
     // ── Step 5: Apply the update (platform-specific binary replace) ────────
     //
-    // On POSIX the fd in `fd_guard` is still open here; apply_update uses
+    // POSIX: the fd in `fd_guard` is still open here; apply_update uses
     // the path but the held fd ensures the inode stays alive (and matches
     // the hashed content per the pre-flight check above) for the duration
     // of the rename. RAII closes the fd after this function returns.
-
-    return apply_update(temp_path);
-}
-
-std::expected<bool, UpdateError> Updater::apply_update(const std::filesystem::path& temp_path) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
+    //
+    // Windows: we do the apply inline so we can rename via the held HANDLE
+    // (SetFileInformationByHandle / FileRenameInfo) instead of path-based
+    // fs::rename. This eliminates the residual race window — no path
+    // resolution between the hash and the rename, and the rename moves the
+    // inode we hashed (not whatever happens to be at `temp_path` now).
 
 #ifdef _WIN32
-    // On Windows the running .exe can be renamed but not overwritten.
+    namespace fs = std::filesystem;
     auto old_path = exe_path_;
     old_path.replace_extension(".old.exe");
 
-    // Remove stale .old if it exists from a prior update
-    fs::remove(old_path, ec);
+    std::error_code ec;
+    fs::remove(old_path, ec); // best-effort: stale .old from a prior update
 
-    // Rename the running exe out of the way
+    // Step 5a: rename the running .exe out of the way so the destination
+    // is free for the handle-rename. The .exe is locked-against-overwrite
+    // by Windows but renamable, so this is safe.
     fs::rename(exe_path_, old_path, ec);
     if (ec) {
         return std::unexpected(
@@ -589,18 +644,61 @@ std::expected<bool, UpdateError> Updater::apply_update(const std::filesystem::pa
                                     exe_path_.string(), old_path.string(), ec.message())});
     }
 
-    // Move new binary into place
-    fs::rename(temp_path, exe_path_, ec);
-    if (ec) {
-        // Rollback: move old binary back
+    // Step 5b: build FILE_RENAME_INFO with FileName payload immediately
+    // after the struct. FileNameLength is in bytes, NOT including any null
+    // terminator. The destination path MUST be on the same volume as the
+    // source — guaranteed because we placed the temp in exe_path_.parent_path().
+    auto target_w = exe_path_.wstring();
+    const size_t fn_len_bytes = target_w.size() * sizeof(wchar_t);
+    std::vector<unsigned char> ri_buf(offsetof(FILE_RENAME_INFO, FileName) + fn_len_bytes);
+    auto* ri = reinterpret_cast<FILE_RENAME_INFO*>(ri_buf.data());
+    ri->ReplaceIfExists = FALSE; // exe_path was just renamed away
+    ri->RootDirectory = nullptr;
+    ri->FileNameLength = static_cast<DWORD>(fn_len_bytes);
+    std::memcpy(ri->FileName, target_w.data(), fn_len_bytes);
+
+    if (!SetFileInformationByHandle(h_guard.h, FileRenameInfo, ri,
+                                    static_cast<DWORD>(ri_buf.size()))) {
+        auto rename_err = GetLastError();
+        // Rollback: put the running exe back. If the rollback also fails
+        // the agent is in a degraded state — surface critically.
         std::error_code rb_ec;
         fs::rename(old_path, exe_path_, rb_ec);
         if (rb_ec) {
-            spdlog::error("CRITICAL: Rollback also failed: {}", rb_ec.message());
+            spdlog::error("CRITICAL: Rollback also failed after rename failure: {}",
+                          rb_ec.message());
         }
-        return std::unexpected(UpdateError{std::format("Failed to place new binary at '{}': {}",
-                                                       exe_path_.string(), ec.message())});
+        // Drop the temp file too so we don't leave a half-applied artefact.
+        std::error_code drop_ec;
+        fs::remove(temp_path, drop_ec);
+        return std::unexpected(UpdateError{
+            std::format("SetFileInformationByHandle(FileRenameInfo) for '{}' failed: {}",
+                        exe_path_.string(), rename_err)});
     }
+
+    spdlog::info("Update applied successfully (handle-renamed); old binary preserved at '{}'",
+                 old_path.string());
+    return true; // Caller should restart the process
+#else
+    return apply_update(temp_path);
+#endif
+}
+
+std::expected<bool, UpdateError> Updater::apply_update(const std::filesystem::path& temp_path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+#ifdef _WIN32
+    // The Windows apply is done inline in check_and_apply via
+    // SetFileInformationByHandle on the held HANDLE — see W2.3 cross-
+    // platform-debt closure note above. This path-based apply_update is
+    // retained as a private POSIX-only implementation; on Windows it is
+    // unreachable from the update flow and would re-introduce the
+    // close-then-rename race window if called.
+    (void)temp_path;
+    return std::unexpected(
+        UpdateError{"Updater::apply_update path-based fallback is not used on Windows; "
+                    "the handle-based rename is performed inline in check_and_apply"});
 #else
     // POSIX: set executable permissions on the temp file first
     fs::permissions(temp_path,
@@ -636,10 +734,10 @@ std::expected<bool, UpdateError> Updater::apply_update(const std::filesystem::pa
         return std::unexpected(UpdateError{std::format("Failed to place new binary at '{}': {}",
                                                        exe_path_.string(), ec.message())});
     }
-#endif
 
     spdlog::info("Update applied successfully; old binary preserved at '{}'", old_path.string());
     return true; // Caller should restart the process
+#endif
 }
 
 void Updater::cleanup_old_binary() {
