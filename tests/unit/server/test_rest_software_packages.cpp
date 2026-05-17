@@ -193,7 +193,7 @@ TEST_CASE("REST POST software-packages: pipe-to-shell verify_command rejected",
     CHECK(res->status == 400);
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "software_package.create");
-    CHECK(h.audit_log[0].result == "rejected");
+    CHECK(h.audit_log[0].result == "denied");
     CHECK(h.audit_log[0].detail.find("verify_command") != std::string::npos);
     // No package was persisted.
     CHECK(h.sw_deploy_store->list_packages().empty());
@@ -212,7 +212,7 @@ TEST_CASE("REST POST software-packages: injection via rollback_command rejected"
     CHECK(res->status == 400);
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "software_package.create");
-    CHECK(h.audit_log[0].result == "rejected");
+    CHECK(h.audit_log[0].result == "denied");
     CHECK(h.audit_log[0].detail.find("rollback_command") != std::string::npos);
     CHECK(h.sw_deploy_store->list_packages().empty());
 }
@@ -280,6 +280,101 @@ TEST_CASE("REST POST software-packages: exactly-at-cap command accepted",
     SwPkgHarness h;
     std::string at_cap(512, 'a');
     auto res = h.post(SwPkgHarness::make_body(at_cap, "", "ExactCap"));
+    REQUIRE(res);
+    CHECK(res->status == 201);
+}
+
+// ── Sibling-gap: silent_args validated identically (round 1 governance) ──────
+
+TEST_CASE("REST POST software-packages: silent_args injection rejected",
+          "[rest][software_deployment][771][security]") {
+    SwPkgHarness h;
+    // Construct a body where verify+rollback are clean but silent_args carries
+    // the injection. Without R1 hardening this passed validation.
+    std::string body = R"({"name":"SiblingGap","version":"1.0",)"
+                       R"("platform":"linux","installer_type":"deb",)"
+                       R"("verify_command":"dpkg -s firefox","rollback_command":"",)"
+                       R"("silent_args":"/qn ; rm -rf /"})";
+    auto res = h.post(body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].detail.find("silent_args") != std::string::npos);
+    CHECK(h.sw_deploy_store->list_packages().empty());
+}
+
+TEST_CASE("REST POST software-packages: silent_args /qn /norestart accepted",
+          "[rest][software_deployment][771]") {
+    SwPkgHarness h;
+    // Standard MSI silent install args — must pass the validator.
+    std::string body = R"({"name":"SilentOK","version":"1.0",)"
+                       R"("platform":"windows","installer_type":"msi",)"
+                       R"("silent_args":"/qn /norestart"})";
+    auto res = h.post(body);
+    REQUIRE(res);
+    CHECK(res->status == 201);
+}
+
+// ── C0 control characters (security MEDIUM-2): tab / VT / FF blocked ─────────
+
+TEST_CASE("REST POST software-packages: tab character rejected",
+          "[rest][software_deployment][771][security]") {
+    SwPkgHarness h;
+    // Tab is a shell word-separator in bash/zsh — same risk class as space
+    // with extra log-injection nastiness. Should be blocked alongside other
+    // C0 controls.
+    auto res = h.post(SwPkgHarness::make_body("dpkg\t-s firefox"));
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+// ── Bad JSON payload types (unhappy #1): 400 not 500 ─────────────────────────
+
+TEST_CASE("REST POST software-packages: non-string verify_command returns 400 not 500",
+          "[rest][software_deployment][771][security]") {
+    SwPkgHarness h;
+    // body.value("verify_command", "") throws json::type_error on type
+    // mismatch. Without the try/catch wrapper the exception escapes the
+    // lambda → httplib 500 with no audit trail.
+    std::string body = R"({"name":"BadType","version":"1.0","verify_command":42})";
+    auto res = h.post(body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].detail.find("wrong JSON type") != std::string::npos);
+}
+
+TEST_CASE("REST POST software-packages: explicit null verify_command rejected as wrong type",
+          "[rest][software_deployment][771][security]") {
+    SwPkgHarness h;
+    // nlohmann::json::value(key, default) THROWS json::type_error when the
+    // key is present-but-null (because std::string is not nullable). The
+    // try/catch wrapper catches it and returns 400 with the
+    // "wrong JSON type" audit detail. This is the deliberately stricter
+    // posture: missing key → use default (accepted); explicit null →
+    // rejected as a wrong-type signal. Pin the contract so an operator
+    // client sending `null` knows the field requires an explicit string or
+    // omission.
+    std::string body = R"({"name":"NullField","version":"1.0",)"
+                       R"("verify_command":null})";
+    auto res = h.post(body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].detail.find("wrong JSON type") != std::string::npos);
+}
+
+TEST_CASE("REST POST software-packages: missing verify_command field defaults to empty",
+          "[rest][software_deployment][771]") {
+    SwPkgHarness h;
+    // Omitting the field entirely — the documented "no verify command"
+    // posture. value(key, "") returns "" for absent keys; the validator
+    // accepts empty strings.
+    std::string body = R"({"name":"NoVerify","version":"1.0","platform":"linux"})";
+    auto res = h.post(body);
     REQUIRE(res);
     CHECK(res->status == 201);
 }

