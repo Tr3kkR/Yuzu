@@ -16,9 +16,9 @@ namespace yuzu::server {
 // ── Data types ───────────────────────────────────────────────────────────────
 
 struct ProductPackItem {
-    std::string kind;       // "InstructionDefinition", "PolicyFragment", etc.
-    std::string item_id;    // ID assigned when the item was installed
-    std::string name;       // Display name from the YAML
+    std::string kind;        // "InstructionDefinition", "PolicyFragment", etc.
+    std::string item_id;     // ID assigned when the item was installed
+    std::string name;        // Display name from the YAML
     std::string yaml_source; // Verbatim YAML for this document
 };
 
@@ -27,9 +27,9 @@ struct ProductPack {
     std::string name;
     std::string version;
     std::string description;
-    std::string yaml_source;    // The full multi-document YAML bundle
+    std::string yaml_source; // The full multi-document YAML bundle
     int64_t installed_at{0};
-    bool verified{false};       // Whether the Ed25519 signature was verified
+    bool verified{false}; // Whether the Ed25519 signature was verified
 
     // Populated by get()
     std::vector<ProductPackItem> items;
@@ -45,13 +45,10 @@ struct ProductPackQuery {
 /// Called for each YAML document during install.
 /// Returns the assigned item ID on success, or an error string.
 using ItemInstallFn = std::function<std::expected<std::string, std::string>(
-    const std::string& kind,
-    const std::string& yaml_source)>;
+    const std::string& kind, const std::string& yaml_source)>;
 
 /// Called for each item during uninstall to remove it from its origin store.
-using ItemUninstallFn = std::function<bool(
-    const std::string& kind,
-    const std::string& item_id)>;
+using ItemUninstallFn = std::function<bool(const std::string& kind, const std::string& item_id)>;
 
 // ── ProductPackStore ────────────────────────────────────────────────────────
 
@@ -60,10 +57,17 @@ public:
     explicit ProductPackStore(const std::filesystem::path& db_path);
     ~ProductPackStore();
 
-    /// When true, packs that include a signature field MUST pass verification
-    /// or they are rejected. Unsigned packs (no signature field) are still
-    /// allowed as a separate policy question.
-    /// Defaults to false for backward compatibility.
+    /// When true, packs WITHOUT a `signature` field are rejected at install
+    /// time. Packs with a signature are always verified regardless of this
+    /// flag — failed verification rejects unconditionally. Defaults to
+    /// true since #802 / W7.4: unsigned packs are a fleet-wide arbitrary-
+    /// code-execution surface (MITM on pack delivery or an unprivileged
+    /// uploader with pack-install permission can inject malicious payloads
+    /// that execute on every enrolled agent). Operators with legacy
+    /// unsigned packs must explicitly opt out via the
+    /// `--allow-unsigned-packs` / `YUZU_ALLOW_UNSIGNED_PACKS` server
+    /// flag, which calls `set_require_signed_packs(false)` and emits a
+    /// `server.unsigned_packs_allowed` startup audit event.
     void set_require_signed_packs(bool require) { require_signed_packs_ = require; }
     bool require_signed_packs() const { return require_signed_packs_; }
 
@@ -76,9 +80,8 @@ public:
     /// Each `---` separated document is parsed for its `kind:` field and
     /// delegated to the appropriate store via install_fn.
     /// The ProductPack metadata is extracted from the document with kind: ProductPack.
-    std::expected<std::string, std::string> install(
-        const std::string& yaml_bundle,
-        ItemInstallFn install_fn);
+    std::expected<std::string, std::string> install(const std::string& yaml_bundle,
+                                                    ItemInstallFn install_fn);
 
     /// List installed product packs.
     std::vector<ProductPack> list(const ProductPackQuery& q = {}) const;
@@ -87,9 +90,7 @@ public:
     std::optional<ProductPack> get(const std::string& id) const;
 
     /// Uninstall a product pack, removing all contained items via uninstall_fn.
-    std::expected<void, std::string> uninstall(
-        const std::string& id,
-        ItemUninstallFn uninstall_fn);
+    std::expected<void, std::string> uninstall(const std::string& id, ItemUninstallFn uninstall_fn);
 
     // Minimal YAML value extraction — public so install callbacks can use it
     static std::string extract_yaml_value(const std::string& yaml, const std::string& key);
@@ -100,14 +101,24 @@ public:
     /// @param signature_hex  Hex-encoded Ed25519 signature (128 hex chars = 64 bytes)
     /// @param public_key_hex Hex-encoded Ed25519 public key (64 hex chars = 32 bytes)
     /// @return true if signature is valid, false otherwise
-    static bool verify_signature(const std::string& content,
-                                 const std::string& signature_hex,
+    static bool verify_signature(const std::string& content, const std::string& signature_hex,
                                  const std::string& public_key_hex);
 
 private:
     sqlite3* db_{nullptr};
     mutable std::shared_mutex mtx_;
-    bool require_signed_packs_{false};
+    /// Security-by-default since #802 (W7.4): packs without a `signature`
+    /// field are rejected at install time. Operators with legacy unsigned
+    /// packs must opt out explicitly via `--allow-unsigned-packs` /
+    /// `YUZU_ALLOW_UNSIGNED_PACKS=1`, which calls
+    /// `set_require_signed_packs(false)` at startup and emits a loud
+    /// `server.unsigned_packs_allowed` audit event. The historical default
+    /// (false) shipped a critical fleet-wide arbitrary-code-execution
+    /// surface: any operator with pack upload permission, or a MITM on
+    /// pack delivery, could install an unsigned pack containing
+    /// `InstructionDefinition` or plugin payloads that would execute on
+    /// every enrolled agent.
+    bool require_signed_packs_{true};
 
     void create_tables();
     std::string generate_id() const;

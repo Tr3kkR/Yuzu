@@ -230,6 +230,50 @@ If a migration fails:
 
 ## Upgrade notes by release
 
+### Product pack signature enforcement now on-by-default (#802 / W7.4) — **BREAKING**
+
+The `ProductPackStore` previously shipped with signature enforcement
+**disabled** by default and the setter to enable it was never wired to
+any operator-facing flag — the protection was effectively unreachable.
+After upgrade, calls to install a `ProductPack` without a `signature:`
+field are rejected with:
+
+```
+pack '<name>' is unsigned and require_signed_packs is enabled
+```
+
+This is intentional. Unsigned packs are a fleet-wide arbitrary-code-
+execution surface: any operator with `Pack:Install` permission, or a
+MITM on pack delivery, could install a pack containing
+`InstructionDefinition` or plugin payloads that would then execute on
+every enrolled agent.
+
+**Two migration paths, in order of preference:**
+
+1. **Sign your packs.** Generate an Ed25519 keypair, sign each pack's
+   non-metadata YAML content with the private key, and add
+   `signature: <hex>` + `publicKey: <hex>` fields to each pack's
+   `ProductPack` metadata document. The existing verify path
+   (`ProductPackStore::verify_signature`) accepts the result. Pack
+   install then succeeds and the `verified` column in the store is set
+   to true so a future "show only verified packs" query has the data
+   it needs.
+
+2. **Opt out temporarily** (legacy environments only). Pass
+   `--allow-unsigned-packs` to `yuzu-server` or set
+   `YUZU_ALLOW_UNSIGNED_PACKS=1` in the service environment. The
+   server emits a `[SECURITY] product pack signature enforcement
+   DISABLED by configuration` warning on every start and writes a
+   `server.unsigned_packs_allowed` audit row, so the relaxed posture
+   is recoverable from both operator logs and the audit store.
+   **Remove the flag** as soon as the pack-signing migration completes;
+   it is not intended as a permanent configuration.
+
+**Pre-existing installed packs are unaffected.** The check fires only
+on the install path (`POST /api/v1/packs/install` and equivalent).
+List, get, and uninstall paths do not re-verify, so already-installed
+unsigned packs remain queryable and uninstallable after upgrade.
+
 ### Executions-history PR 2 — `responses.execution_id` exact correlation
 
 PR 2 of the executions-history ladder closes a forensic-data correctness

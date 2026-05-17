@@ -122,6 +122,17 @@ struct Config {
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     bool viz_disable{false}; // Kill switch: reject all /viz/fleet requests (DEP-1)
+
+    // Product pack signature enforcement (#802 / W7.4)
+    /// When true, install_pack accepts packs WITHOUT a `signature` field
+    /// (legacy unsigned packs). Default false — the secure posture rejects
+    /// unsigned packs to close the fleet-wide arbitrary-code-execution
+    /// surface a MITM or unprivileged-uploader could otherwise exploit.
+    /// Wired via --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1.
+    /// Setting true at startup emits the `server.unsigned_packs_allowed`
+    /// audit event + a startup spdlog::warn so the relaxed posture is
+    /// loud in both audit log and operator-visible logs.
+    bool allow_unsigned_packs{false};
 };
 
 /**

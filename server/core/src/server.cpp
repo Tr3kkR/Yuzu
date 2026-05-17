@@ -344,8 +344,7 @@ public:
         // result=success|partial|denied, scope=cookies|all (all = /me's
         // "Sign out everywhere" which also revokes API tokens).
         metrics_.describe("yuzu_auth_sessions_revoked_total",
-                          "Total session revocations, by caller, result, and scope",
-                          "counter");
+                          "Total session revocations, by caller, result, and scope", "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -871,6 +870,32 @@ public:
                 (void)audit_store_->log(ev);
             }
 
+            // #802 / W7.4 — mirror the viz-disable audit emission pattern:
+            // when the operator has opted out of signed-pack enforcement,
+            // emit a startup-time audit row so the relaxed posture is
+            // recoverable from the audit store, not only from process logs.
+            // Auditors and incident-response queries asking "was unsigned
+            // pack acceptance enabled during window X?" can answer from
+            // the audit log. The matching `--allow-unsigned-packs` startup
+            // warn fires earlier at the ProductPackStore construction
+            // site; the audit row fires here because audit_store_ is only
+            // constructed at this phase.
+            if (cfg_.allow_unsigned_packs && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "server.unsigned_packs_allowed";
+                ev.target_type = "ProductPack";
+                ev.target_id = "*";
+                ev.detail = "product pack signature enforcement disabled at startup "
+                            "(--allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS) — "
+                            "unsigned packs will be accepted at install";
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
             // CAP-1 (#1002) — bound the pushed_ map so a churning fleet or
             // a session-management bug that leaves evict_pushed un-called
             // can't grow the map unbounded. Cap at the same hard ceiling
@@ -1170,6 +1195,21 @@ public:
             product_pack_store_ = std::make_unique<ProductPackStore>(pack_db);
             if (product_pack_store_ && product_pack_store_->is_open()) {
                 spdlog::info("ProductPackStore initialized at {}", pack_db.string());
+                // #802 / W7.4: enforce signed-pack-by-default. Default
+                // ProductPackStore ctor sets require_signed_packs_=true; we
+                // invert only when the operator opts in via the flag, and
+                // make the relaxed posture loud in operator logs + audit
+                // (audit emission deferred to post-audit_store_-construction
+                // block below to mirror the viz_disable pattern).
+                product_pack_store_->set_require_signed_packs(!cfg_.allow_unsigned_packs);
+                if (cfg_.allow_unsigned_packs) {
+                    spdlog::warn("[SECURITY] product pack signature enforcement DISABLED "
+                                 "by configuration (--allow-unsigned-packs / "
+                                 "YUZU_ALLOW_UNSIGNED_PACKS). Unsigned packs will be "
+                                 "accepted at install — this exposes the fleet to "
+                                 "arbitrary instruction/plugin execution. Sign packs and "
+                                 "remove the flag as soon as feasible.");
+                }
             }
         }
 
@@ -5766,8 +5806,8 @@ private:
             // when called from /me's "Sign out everywhere" flow. Exposes
             // the dual-write outcome (db_persisted) so the REST handler
             // can audit a partial failure honestly (CC6.6 evidence).
-            [this](const std::string& username, bool revoke_api_tokens)
-                -> RestApiV1::SessionRevokeResult {
+            [this](const std::string& username,
+                   bool revoke_api_tokens) -> RestApiV1::SessionRevokeResult {
                 const auto revoke = auth_mgr_.invalidate_user_sessions(username);
                 std::size_t tokens = 0;
                 if (revoke_api_tokens && api_token_store_ && api_token_store_->is_open()) {
@@ -5781,10 +5821,11 @@ private:
                 // path passes false (cookies only, automation tokens
                 // intact). Result dimension carries db_persisted so SOC 2
                 // partial-failure rows are filterable.
-                metrics_.counter("yuzu_auth_sessions_revoked_total",
-                                 {{"caller", revoke_api_tokens ? "self" : "admin"},
-                                  {"result", revoke.db_persisted ? "success" : "partial"},
-                                  {"scope", revoke_api_tokens ? "all" : "cookies"}})
+                metrics_
+                    .counter("yuzu_auth_sessions_revoked_total",
+                             {{"caller", revoke_api_tokens ? "self" : "admin"},
+                              {"result", revoke.db_persisted ? "success" : "partial"},
+                              {"scope", revoke_api_tokens ? "all" : "cookies"}})
                     .increment();
                 return RestApiV1::SessionRevokeResult{
                     revoke.count,
