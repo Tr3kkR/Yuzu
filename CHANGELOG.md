@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **CRITICAL (#802 / W7.4): product pack signature enforcement is now
+  on-by-default.** `ProductPackStore` previously defaulted
+  `require_signed_packs_` to `false`, AND the setter that would have
+  enabled it was never called from anywhere in production — the flag
+  was effectively unreachable. Any operator with pack-upload permission,
+  or a MITM on pack delivery, could install an unsigned `ProductPack`
+  containing arbitrary `InstructionDefinition` or plugin payloads that
+  executed fleet-wide. The default is now `true`; unsigned packs are
+  rejected at install with the error `pack '<name>' is unsigned and
+  require_signed_packs is enabled`. Operators with legacy unsigned packs
+  must explicitly opt out via the new `--allow-unsigned-packs` flag
+  / `YUZU_ALLOW_UNSIGNED_PACKS=1` env var, which emits a startup
+  `spdlog::warn` and a `server.unsigned_packs_allowed` audit row so the
+  relaxed posture is recoverable from both operator logs and the audit
+  store. **This is a breaking change** — see `### Upgrade notes` below.
+  Closes #802.
+
 - **HIGH-2 (PR #883 governance review): session-revocation REST surface
   now reports audit-emission outcome on the response so a silent audit
   persistence failure (locked audit DB, disk full, pipeline exception)
@@ -308,6 +325,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     audit store, not just process logs.
 
 ### Upgrade notes
+
+- **BREAKING — unsigned product packs no longer install by default
+  (#802 / W7.4).** Operators with unsigned packs in their environment
+  will see `install` calls fail after upgrade with `pack '<name>' is
+  unsigned and require_signed_packs is enabled`. Two recommended
+  migration paths:
+  1. **Sign the packs** (preferred) — generate an Ed25519 keypair, sign
+     each pack's content with the private key, and add `signature:` +
+     `publicKey:` fields to each pack's `ProductPack` document. Pack
+     install then routes through the existing verify path and succeeds.
+  2. **Opt out temporarily** — set `--allow-unsigned-packs` /
+     `YUZU_ALLOW_UNSIGNED_PACKS=1` to restore the pre-upgrade behaviour.
+     A startup `spdlog::warn` and a `server.unsigned_packs_allowed`
+     audit row will be emitted on every server start so the relaxed
+     posture is loud in both operator logs and the audit store.
+     Remove the flag as soon as the pack-signing migration completes.
+
+  Pre-existing installed packs are unaffected — the check fires only on
+  `install_pack` (new installs / upgrades). Pack list/get/uninstall
+  paths do not re-verify.
 
 - **Interval triggers were previously non-functional.** After upgrading
   the agent daemon, registered interval triggers begin firing for the
