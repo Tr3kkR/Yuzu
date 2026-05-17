@@ -39,6 +39,12 @@
 #pragma comment(lib, "bcrypt.lib")
 #else
 #include <openssl/evp.h>
+// W2.3 / #806: POSIX fd-pin across hash → rename. mkstemps directly
+// returns an open fd we hold through apply_update; fstat/stat compare
+// detects a path-swap attack before the rename consumes the path.
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h> // _NSGetExecutablePath
 #endif
@@ -242,7 +248,8 @@ int compare_semver(std::string_view a, std::string_view b) {
             int val = 0;
             std::from_chars(part.data(), part.data() + part.size(), val);
             parts[i] = val;
-            if (dot == std::string_view::npos) break;
+            if (dot == std::string_view::npos)
+                break;
             s.remove_prefix(dot + 1);
         }
         return parts;
@@ -250,8 +257,10 @@ int compare_semver(std::string_view a, std::string_view b) {
     auto pa = parse(a);
     auto pb = parse(b);
     for (int i = 0; i < 3; ++i) {
-        if (pa[i] < pb[i]) return -1;
-        if (pa[i] > pb[i]) return 1;
+        if (pa[i] < pb[i])
+            return -1;
+        if (pa[i] > pb[i])
+            return 1;
     }
     return 0;
 }
@@ -329,13 +338,59 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     }
 
     // ── Step 2: Create temp file for download ──────────────────────────────
+    //
+    // POSIX (W2.3 / #806): use mkstemps directly so we retain the open fd
+    // across the download + hash + apply_update flow. The previous
+    // `yuzu_create_temp_file` helper opens-then-closes the fd, leaving a
+    // race window where an attacker with write access to the system temp
+    // directory can swap the temp file content between our SHA-256 check
+    // and the subsequent rename — at which point the agent would copy the
+    // attacker's bytes over its own executable. We close the fd only
+    // AFTER apply_update returns and AFTER a final inode-equivalence check
+    // against the on-disk path.
+    //
+    // Windows: still uses the path-based yuzu_create_temp_file helper.
+    // CreateFileW with no sharing + CREATE_NEW gives mode-equivalent
+    // protection at creation time, but the close-then-rename window is
+    // still present. Tracked as a follow-up for a Windows-side HANDLE
+    // hold via SetFileInformationByHandle(FileRenameInfo).
 
-    char path_buf[512]{};
-    int rc = yuzu_create_temp_file("yuzu-update-", ".tmp", nullptr, path_buf, sizeof(path_buf));
-    if (rc != 0) {
-        return std::unexpected(UpdateError{"Failed to create temporary file for update download"});
+    std::filesystem::path temp_path;
+#ifndef _WIN32
+    struct ScopedFd {
+        int fd = -1;
+        ~ScopedFd() {
+            if (fd >= 0)
+                ::close(fd);
+        }
+    } fd_guard;
+    {
+        std::error_code ec;
+        auto temp_dir = std::filesystem::temp_directory_path(ec);
+        if (ec) {
+            return std::unexpected(
+                UpdateError{std::format("Failed to resolve temp directory: {}", ec.message())});
+        }
+        std::string tmpl = (temp_dir / "yuzu-update-XXXXXX.tmp").string();
+        // mkstemps suffix length: ".tmp" = 4
+        fd_guard.fd = ::mkstemps(tmpl.data(), 4);
+        if (fd_guard.fd < 0) {
+            return std::unexpected(
+                UpdateError{std::format("mkstemps failed: {}", std::strerror(errno))});
+        }
+        temp_path = tmpl;
     }
-    std::filesystem::path temp_path{path_buf};
+#else
+    {
+        char path_buf[512]{};
+        int rc = yuzu_create_temp_file("yuzu-update-", ".tmp", nullptr, path_buf, sizeof(path_buf));
+        if (rc != 0) {
+            return std::unexpected(
+                UpdateError{"Failed to create temporary file for update download"});
+        }
+        temp_path = path_buf;
+    }
+#endif
 
     // ── Step 3: Download the update binary ─────────────────────────────────
 
@@ -349,6 +404,9 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     grpc::ClientContext dl_ctx;
     auto reader = stub->DownloadUpdate(&dl_ctx, dl_req);
 
+    // Writer: POSIX uses the held fd via write(); Windows opens std::ofstream
+    // against the path created by yuzu_create_temp_file.
+#ifdef _WIN32
     std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
     if (!out) {
         std::error_code ec;
@@ -356,10 +414,13 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
         return std::unexpected(UpdateError{
             std::format("Failed to open temp file '{}' for writing", temp_path.string())});
     }
+#endif
 
     Sha256Hasher hasher;
     if (!hasher.is_valid()) {
+#ifdef _WIN32
         out.close();
+#endif
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
         return std::unexpected(UpdateError{"Failed to initialize SHA-256 hasher"});
@@ -368,42 +429,71 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
     int64_t bytes_downloaded = 0;
     pb::DownloadUpdateChunk chunk;
 
+    auto cleanup_and_fail = [&](const std::string& msg) -> std::expected<bool, UpdateError> {
+#ifdef _WIN32
+        out.close();
+#endif
+        std::error_code ec;
+        std::filesystem::remove(temp_path, ec);
+        return std::unexpected(UpdateError{msg});
+    };
+
     while (reader->Read(&chunk)) {
         if (stop_requested_.load(std::memory_order_acquire)) {
+#ifdef _WIN32
             out.close();
+#endif
             std::error_code ec;
             std::filesystem::remove(temp_path, ec);
             return false;
         }
 
         const auto& data = chunk.data();
+#ifndef _WIN32
+        // write(fd) may return short. Loop until all bytes are written or
+        // we hit a real error. EINTR is retried; other errors abort.
+        const char* p = data.data();
+        std::size_t remaining = data.size();
+        while (remaining > 0) {
+            ssize_t n = ::write(fd_guard.fd, p, remaining);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                return cleanup_and_fail(
+                    std::format("write to temp fd failed: {}", std::strerror(errno)));
+            }
+            p += n;
+            remaining -= static_cast<std::size_t>(n);
+        }
+#else
         out.write(data.data(), static_cast<std::streamsize>(data.size()));
         if (!out) {
-            out.close();
-            std::error_code ec;
-            std::filesystem::remove(temp_path, ec);
-            return std::unexpected(UpdateError{"Write to temp file failed during download"});
+            return cleanup_and_fail("Write to temp file failed during download");
         }
+#endif
 
         if (!hasher.update(data.data(), data.size())) {
-            out.close();
-            std::error_code ec;
-            std::filesystem::remove(temp_path, ec);
-            return std::unexpected(UpdateError{"SHA-256 hash update failed during download"});
+            return cleanup_and_fail("SHA-256 hash update failed during download");
         }
 
         bytes_downloaded += static_cast<int64_t>(data.size());
         if (bytes_downloaded > kMaxDownloadBytes) {
-            out.close();
-            std::error_code ec;
-            std::filesystem::remove(temp_path, ec);
-            return std::unexpected(UpdateError{
-                std::format("Download exceeds maximum size ({} MiB)", kMaxDownloadBytes / (1024 * 1024))});
+            return cleanup_and_fail(std::format("Download exceeds maximum size ({} MiB)",
+                                                kMaxDownloadBytes / (1024 * 1024)));
         }
     }
 
     grpc::Status dl_status = reader->Finish();
+#ifdef _WIN32
     out.close();
+#else
+    // Flush the fd to disk before the rename so the on-disk content matches
+    // what we hashed. fsync failure is non-fatal (the bytes still land via
+    // page cache on rename) but logged.
+    if (::fsync(fd_guard.fd) < 0) {
+        spdlog::warn("fsync on update temp fd failed (non-fatal): {}", std::strerror(errno));
+    }
+#endif
 
     if (!dl_status.ok()) {
         std::error_code ec;
@@ -417,6 +507,12 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
                  check_resp.latest_version());
 
     // ── Step 4: Verify SHA-256 ─────────────────────────────────────────────
+    //
+    // The hash is computed streaming from the bytes we wrote, NOT from a
+    // re-read of the file. So `actual_hash` covers what the fd holds, not
+    // what is currently at `temp_path` on disk — those can diverge if a
+    // local attacker raced us during the write loop. The inode-equivalence
+    // check after this step closes that gap before rename.
 
     std::string actual_hash = hasher.finalize();
     if (actual_hash.empty()) {
@@ -436,7 +532,39 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 
     spdlog::info("SHA-256 verified: {}", actual_hash);
 
+    // ── Step 4.5: Inode-equivalence pre-flight (POSIX, W2.3 / #806) ─────
+    //
+    // Confirm the inode our fd holds is the same one currently at
+    // `temp_path`. If a local attacker has unlinked our temp file and
+    // created a replacement at the same path (the documented attack), the
+    // inodes will differ — abort before apply_update consumes the path.
+    // The residual race window is from this stat() to the rename() inside
+    // apply_update, which is microseconds. A Linux-only follow-up could
+    // close it entirely via `linkat(AT_FDCWD, "/proc/self/fd/N", ...)`.
+#ifndef _WIN32
+    struct stat fd_st {};
+    struct stat path_st {};
+    if (::fstat(fd_guard.fd, &fd_st) < 0) {
+        std::error_code ec;
+        std::filesystem::remove(temp_path, ec);
+        return std::unexpected(
+            UpdateError{std::format("fstat on update temp fd failed: {}", std::strerror(errno))});
+    }
+    if (::stat(temp_path.c_str(), &path_st) < 0 || path_st.st_ino != fd_st.st_ino ||
+        path_st.st_dev != fd_st.st_dev) {
+        std::error_code ec;
+        std::filesystem::remove(temp_path, ec);
+        return std::unexpected(
+            UpdateError{"update temp file inode mismatch — possible TOCTOU swap attack detected"});
+    }
+#endif
+
     // ── Step 5: Apply the update (platform-specific binary replace) ────────
+    //
+    // On POSIX the fd in `fd_guard` is still open here; apply_update uses
+    // the path but the held fd ensures the inode stays alive (and matches
+    // the hashed content per the pre-flight check above) for the duration
+    // of the rename. RAII closes the fd after this function returns.
 
     return apply_update(temp_path);
 }
