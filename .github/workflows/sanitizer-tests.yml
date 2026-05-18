@@ -87,6 +87,26 @@ jobs:
           gcc-13 --version | head -1
           ccache --version | head -1
 
+      # Activate Erlang via the project's standard helper. Without this
+      # the `gateway eunit` and `gateway ct` meson test wrappers fail
+      # with `/usr/bin/env: 'escript': No such file or directory`
+      # (exit 127) because kerl's install dir isn't on the runner's
+      # default PATH. The helper probes kerl → asdf → Homebrew → MSYS2
+      # and always returns 0 — we verify via `command -v erl` and
+      # append the resolved dir to $GITHUB_PATH so subsequent steps
+      # inherit it. (Per CLAUDE.md: ensure-erlang.sh must be sourced;
+      # GHA shell steps don't persist env unless written to GITHUB_PATH
+      # or GITHUB_ENV.)
+      - name: Activate Erlang (kerl)
+        run: |
+          source scripts/ensure-erlang.sh
+          if ! command -v erl >/dev/null; then
+              echo "::error::erl not on PATH after ensure-erlang.sh — gateway tests will fail"
+              exit 1
+          fi
+          dirname "$(command -v erl)" >> "$GITHUB_PATH"
+          echo "erl=$(command -v erl) escript=$(command -v escript) rebar3=$(command -v rebar3)"
+
       # sre-5: fail fast if the runner is out of disk before we sink
       # time into a 15-min compile that's going to die with ENOSPC.
       # Full sanitizer build + vcpkg + checkout + ccache ≈ 30 GB.
@@ -203,6 +223,19 @@ jobs:
           meson --version
           gcc-13 --version | head -1
           ccache --version | head -1
+
+      # Activate Erlang via the project's standard helper (see ASan job
+      # for full rationale — without this, gateway eunit/ct tests fail
+      # at exit 127, "escript not found").
+      - name: Activate Erlang (kerl)
+        run: |
+          source scripts/ensure-erlang.sh
+          if ! command -v erl >/dev/null; then
+              echo "::error::erl not on PATH after ensure-erlang.sh — gateway tests will fail"
+              exit 1
+          fi
+          dirname "$(command -v erl)" >> "$GITHUB_PATH"
+          echo "erl=$(command -v erl) escript=$(command -v escript) rebar3=$(command -v rebar3)"
 
       - name: Assert runner disk (≥30 GB free)
         run: |
