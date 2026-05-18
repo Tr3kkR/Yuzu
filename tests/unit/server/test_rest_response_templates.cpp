@@ -62,6 +62,10 @@ struct RtHarness {
         fs::remove(inst_db);
         instruction_store = std::make_unique<InstructionStore>(inst_db);
         REQUIRE(instruction_store->is_open());
+        // #1073: opt out of signature enforcement for these tests — they
+        // exercise the import + response-templates normalisation, not the
+        // signature gate.
+        instruction_store->set_require_signed_definitions(false);
         register_with(/*store_present=*/true);
     }
 
@@ -70,6 +74,7 @@ struct RtHarness {
             fs::remove(inst_db);
             instruction_store = std::make_unique<InstructionStore>(inst_db);
             REQUIRE(instruction_store->is_open());
+            instruction_store->set_require_signed_definitions(false); // #1073
         }
         register_with(with_store);
     }

@@ -191,6 +191,18 @@ int main(int argc, char* argv[]) {
                  "audit event + startup warning when enabled.")
         ->envname("YUZU_ALLOW_UNSIGNED_PACKS");
 
+    // Instruction-definition signature enforcement (#1073 / W7.4 sibling-gap)
+    app.add_flag("--allow-unsigned-definitions", cfg.allow_unsigned_definitions,
+                 "Accept InstructionDefinition imports without an Ed25519 signature at "
+                 "import time. DANGEROUS — exposes the same fleet arbitrary-code-execution "
+                 "surface that --allow-unsigned-packs covers on the ProductPack side: an "
+                 "operator with InstructionDefinition:Write can publish a definition that "
+                 "dispatches a malicious plugin invocation. Default off; set only for "
+                 "legacy environments that have not yet adopted signing. Emits a "
+                 "`server.unsigned_definitions_allowed` audit event + startup warning "
+                 "when enabled.")
+        ->envname("YUZU_ALLOW_UNSIGNED_DEFINITIONS");
+
     // Batch token generation mode (runs and exits, no server startup)
     int generate_tokens = 0;
     std::string gen_label;

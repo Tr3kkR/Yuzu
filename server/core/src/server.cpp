@@ -904,6 +904,28 @@ public:
                 (void)audit_store_->log(ev);
             }
 
+            // #1073 / W7.4 sibling-gap — same startup-posture audit emission
+            // as the unsigned_packs row above, but for instruction-import.
+            // Auditors querying "was unsigned definition acceptance enabled
+            // during window X?" answer from the audit log, not from process
+            // logs. Mirrors the unsigned_packs target_id convention
+            // (`signature_enforcement` is the feature scope).
+            if (cfg_.allow_unsigned_definitions && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "server.unsigned_definitions_allowed";
+                ev.target_type = "InstructionDefinition";
+                ev.target_id = "signature_enforcement";
+                ev.detail = "instruction-definition signature enforcement disabled at startup "
+                            "(--allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS) "
+                            "— unsigned definitions will be accepted at import";
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
             // CAP-1 (#1002) — bound the pushed_ map so a churning fleet or
             // a session-management bug that leaves evict_pushed un-called
             // can't grow the map unbounded. Cap at the same hard ceiling
@@ -979,6 +1001,21 @@ public:
         {
             auto instr_db = cfg_.db_dir() / "instructions.db";
             instruction_store_ = std::make_unique<InstructionStore>(instr_db);
+            // #1073 / W7.4 sibling-gap: InstructionStore ctor sets
+            // require_signed_definitions_=true. Wire the operator opt-out
+            // immediately after construction, before any import path can
+            // execute, so legacy unsigned imports are accepted iff the
+            // operator explicitly enabled --allow-unsigned-definitions.
+            if (instruction_store_) {
+                instruction_store_->set_require_signed_definitions(
+                    !cfg_.allow_unsigned_definitions);
+                if (cfg_.allow_unsigned_definitions) {
+                    spdlog::warn("InstructionStore: signature enforcement DISABLED "
+                                 "by configuration (--allow-unsigned-definitions / "
+                                 "YUZU_ALLOW_UNSIGNED_DEFINITIONS) — unsigned "
+                                 "instruction imports will be accepted");
+                }
+            }
             if (instruction_store_ && instruction_store_->is_open()) {
                 // RAII pool owns the shared connection (fixes G3-ARCH-T2-002).
                 // Declare instr_db_pool_ before the consumers in the member list
@@ -1060,7 +1097,14 @@ public:
                     int defs_imported = 0, defs_skipped = 0, defs_errored = 0;
                     for (const auto& env : kBundledDefinitions) {
                         auto id = envelope_id(env);
-                        auto r = instruction_store_->import_definition_json(env);
+                        // #1073 / W7.4 sibling-gap: bundled content is
+                        // authenticated by build-time binary linkage; route
+                        // through the trusted variant so the runtime
+                        // signature gate doesn't reject definitions baked
+                        // into yuzu-server at compile time. The public
+                        // `import_definition_json` is reserved for
+                        // operator/network-supplied input.
+                        auto r = instruction_store_->import_definition_json_trusted(env);
                         if (r) {
                             ++defs_imported;
                             audit_bundle("InstructionDefinition", *r, "success",

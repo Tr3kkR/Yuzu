@@ -2,6 +2,7 @@
 
 #include <sqlite3.h>
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -75,6 +76,31 @@ public:
 
     bool is_open() const;
 
+    /// When true, `import_definition_json` rejects payloads that lack a
+    /// `signature` field. Payloads WITH a signature are always verified
+    /// regardless of the flag — failed verification rejects unconditionally.
+    /// Defaults to true since #1073 / W7.4 sibling-gap closure: unsigned
+    /// instruction imports are a fleet-wide arbitrary-code-execution surface
+    /// (an operator with InstructionDefinition:Write can publish a malicious
+    /// definition that executes on every targeted agent). Operators with
+    /// legacy unsigned import flows must explicitly opt out via the
+    /// `--allow-unsigned-definitions` / `YUZU_ALLOW_UNSIGNED_DEFINITIONS`
+    /// server flag, which calls `set_require_signed_definitions(false)` and
+    /// emits a `server.unsigned_definitions_allowed` startup audit event —
+    /// exact parity with #802 / `--allow-unsigned-packs`.
+    ///
+    /// Atomic for the same reason as ProductPackStore::require_signed_packs_:
+    /// the setter is called at startup before any concurrent reader, but
+    /// TSAN cannot prove that; atomic load/store with relaxed memory order
+    /// silences TSAN and future-proofs against any later runtime-toggle
+    /// endpoint.
+    void set_require_signed_definitions(bool require) {
+        require_signed_definitions_.store(require, std::memory_order_relaxed);
+    }
+    bool require_signed_definitions() const {
+        return require_signed_definitions_.load(std::memory_order_relaxed);
+    }
+
     // Definitions
     std::vector<InstructionDefinition> query_definitions(const InstructionQuery& q = {}) const;
     std::optional<InstructionDefinition> get_definition(const std::string& id) const;
@@ -84,7 +110,42 @@ public:
 
     // Import/Export
     std::string export_definition_json(const std::string& id) const;
+
+    /// Parse a JSON-encoded InstructionDefinition and create it.
+    ///
+    /// SECURITY INVARIANT (#1073): this is the SOLE gate for
+    /// `require_signed_definitions_`. All code that materialises an
+    /// `InstructionDefinition` from external (operator-supplied or
+    /// network-fetched) input MUST route through this method, or implement
+    /// an equivalent signature check AND emit an
+    /// `instruction.import / denied` audit row on rejection. Direct writes
+    /// via `create_definition` are gated on internal callers that already
+    /// hold the trust boundary (e.g. bundled-content seed at startup).
+    ///
+    /// Wire format for signing:
+    ///   * Optional top-level `signature` field — hex-encoded Ed25519
+    ///     signature over the `yaml_source` field's bytes verbatim.
+    ///   * Optional top-level `publicKey` field — hex-encoded Ed25519
+    ///     public key.
+    ///   * `yaml_source` is the authoritative signed-content carrier
+    ///     (mirrors ProductPack's YAML-document signing model). If the
+    ///     import lacks `yaml_source` the signature can never verify.
+    ///   * Both fields present + valid signature → accept.
+    ///   * Both present + invalid signature → reject (tampered).
+    ///   * Neither present → unsigned; gated by `require_signed_definitions_`.
+    ///   * Exactly one present → reject (incomplete signing metadata).
     std::expected<std::string, std::string> import_definition_json(const std::string& json);
+
+    /// Trusted-content variant — bypasses the signature gate. ONLY for
+    /// build-time-baked content (the `kBundledDefinitions` boot seed in
+    /// `bundled_content.cpp`), where the authenticity of the bytes is
+    /// established by the build-time linkage into the binary itself, not
+    /// by a runtime signature. The operator-facing
+    /// `--allow-unsigned-definitions` flag controls the public path only;
+    /// it does NOT affect this trusted path. Callers MUST be internal
+    /// boot-time code — there is no REST / MCP / network surface for this
+    /// method by design.
+    std::expected<std::string, std::string> import_definition_json_trusted(const std::string& json);
 
     // Instruction Sets
     std::vector<InstructionSet> list_sets() const;
@@ -94,10 +155,25 @@ public:
 private:
     sqlite3* db_{nullptr};
     mutable std::shared_mutex mtx_; // protects db_ access (G3-ARCH-003)
+    /// Security-by-default since #1073 (W7.4 sibling-gap closure): imports
+    /// without a `signature` field are rejected by `import_definition_json`.
+    /// See setter doc above for the operator opt-out flag.
+    std::atomic<bool> require_signed_definitions_{true};
 
     // Internal variants called under existing lock (no re-lock)
     std::optional<InstructionDefinition> get_definition_impl(const std::string& id) const;
-    std::expected<std::string, std::string> create_definition_impl(const InstructionDefinition& def);
+    std::expected<std::string, std::string>
+    create_definition_impl(const InstructionDefinition& def);
+
+    /// Shared implementation behind `import_definition_json` and
+    /// `import_definition_json_trusted`. When `check_signature` is true,
+    /// runs the #1073 Ed25519 signature gate against `signature` +
+    /// `publicKey` + `yaml_source` JSON fields before parsing the
+    /// definition. When false, bypasses the gate entirely. Public callers
+    /// must use one of the two named entry points so the trust boundary
+    /// is explicit at every call site.
+    std::expected<std::string, std::string> import_definition_json_impl(const std::string& json,
+                                                                        bool check_signature);
 };
 
 } // namespace yuzu::server
