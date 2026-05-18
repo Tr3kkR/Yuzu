@@ -111,22 +111,31 @@ public:
     // Import/Export
     std::string export_definition_json(const std::string& id) const;
 
-    /// Parse a JSON-encoded InstructionDefinition and create it.
+    /// Parse a JSON-encoded InstructionDefinition envelope and create it.
     ///
-    /// SECURITY INVARIANT (#1073): this is the SOLE gate for
-    /// `require_signed_definitions_`. All code that materialises an
-    /// `InstructionDefinition` from external (operator-supplied or
-    /// network-fetched) input MUST route through this method, or implement
-    /// an equivalent signature check AND emit an
-    /// `instruction.import / denied` audit row on rejection. Direct writes
-    /// via `create_definition` are gated on internal callers that already
-    /// hold the trust boundary (e.g. bundled-content seed at startup).
+    /// SECURITY SCOPE (#1073): this method gates the **import** surface
+    /// — definitions that arrive from outside the operator's authoring
+    /// session, e.g. CI-built packs, content distributed via the
+    /// supply chain, manifests fetched from a registry. The signature
+    /// + `require_signed_definitions_` gate authenticates the publisher,
+    /// not the operator pushing the import. Failed verification rejects
+    /// regardless of the flag.
+    ///
+    /// **NOT in scope of this method:** the authoring surfaces
+    /// (`POST /api/instructions`, `POST /api/instructions/yaml`, and
+    /// `PUT /api/instructions/{id}`) that go through `create_definition`
+    /// /`update_definition` directly. Those surfaces trust the
+    /// `InstructionDefinition:Write` RBAC permission as the author
+    /// trust boundary (the operator IS the source — there is no supply
+    /// chain to authenticate). See follow-up issue for the architectural
+    /// question of whether the authoring surfaces should ALSO require
+    /// signed envelopes (operator-decision-required, UX trade-off).
     ///
     /// Wire format for signing:
     ///   * Optional top-level `signature` field — hex-encoded Ed25519
     ///     signature over the `yaml_source` field's bytes verbatim.
     ///   * Optional top-level `publicKey` field — hex-encoded Ed25519
-    ///     public key.
+    ///     public key (64 hex chars / 32 bytes).
     ///   * `yaml_source` is the authoritative signed-content carrier
     ///     (mirrors ProductPack's YAML-document signing model). If the
     ///     import lacks `yaml_source` the signature can never verify.
@@ -134,6 +143,10 @@ public:
     ///   * Both present + invalid signature → reject (tampered).
     ///   * Neither present → unsigned; gated by `require_signed_definitions_`.
     ///   * Exactly one present → reject (incomplete signing metadata).
+    ///   * Field present but wrong JSON type (non-string) → reject as
+    ///     `incomplete signing metadata` (distinct error message).
+    ///   * Signature/publicKey wrong length → reject before allocation
+    ///     (DoS amplification guard).
     std::expected<std::string, std::string> import_definition_json(const std::string& json);
 
     /// Trusted-content variant — bypasses the signature gate. ONLY for

@@ -4479,10 +4479,19 @@ private:
                 // endpoint that exercises duplicate-id rejection most.
                 bool is_conflict = is_conflict_error(result.error());
                 res.status = is_conflict ? 409 : 400;
-                if (is_conflict) {
-                    audit_log(req, "instruction.import", "denied", "instruction", "",
-                              "duplicate_id");
-                }
+                // R4 (gov R1 unhappy/security HIGH): audit EVERY rejection
+                // path, not just conflicts. The #1073 signature gate adds
+                // five new rejection branches (signature_invalid,
+                // signature_incomplete, signature_wrong_length, signature_
+                // missing_content, unsigned_rejected); each is an access
+                // decision the SOC 2 CC6.7 audit trail must reflect. The
+                // detail is the store-returned error message classified
+                // either as "duplicate_id" (the legacy contract) or the
+                // raw error text (which begins with a stable token like
+                // "signature verification failed" / "instruction-import
+                // is unsigned" / etc. that SIEM rules can key on).
+                std::string detail = is_conflict ? "duplicate_id" : result.error();
+                audit_log(req, "instruction.import", "denied", "instruction", "", detail);
                 auto body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
                                             : result.error();
                 res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");

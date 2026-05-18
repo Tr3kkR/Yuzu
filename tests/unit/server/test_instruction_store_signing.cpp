@@ -276,3 +276,104 @@ TEST_CASE("InstructionStore: set_require_signed_definitions is idempotent and ro
     store.set_require_signed_definitions(true);
     CHECK(store.require_signed_definitions());
 }
+
+// ── R1 governance R5: wrong-JSON-type fields ─────────────────────────────────
+
+TEST_CASE("InstructionStore: signature field wrong JSON type rejected with typed error",
+          "[instruction_store][1073][security]") {
+    // {"signature": 42} previously silently fell into the "unsigned" branch
+    // because extract_str returned empty for non-strings. Now distinguished
+    // as its own error so attacker-corrupted payloads surface the actual
+    // type bug instead of a misleading "unsigned" rejection.
+    InstructionStore store(":memory:");
+    nlohmann::json j;
+    j["id"] = "def.badtype";
+    j["name"] = "badtype";
+    j["yaml_source"] = kSampleYaml;
+    j["signature"] = 42;       // wrong type
+    j["publicKey"] = "abcdef"; // any non-empty string
+    auto r = store.import_definition_json(j.dump());
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("wrong JSON type") != std::string::npos);
+}
+
+TEST_CASE("InstructionStore: publicKey field wrong JSON type rejected",
+          "[instruction_store][1073][security]") {
+    InstructionStore store(":memory:");
+    nlohmann::json j;
+    j["id"] = "def.badpub";
+    j["name"] = "badpub";
+    j["yaml_source"] = kSampleYaml;
+    j["signature"] = std::string(128, 'a');            // valid length
+    j["publicKey"] = nlohmann::json::array({1, 2, 3}); // wrong type
+    auto r = store.import_definition_json(j.dump());
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("wrong JSON type") != std::string::npos);
+}
+
+TEST_CASE("InstructionStore: null signing field treated as absent (matches existing semantics)",
+          "[instruction_store][1073]") {
+    // null is semantically "no value present" — distinct from a wrong-type
+    // scalar. Falls into the absent branch, then into the unsigned-policy
+    // path. Pin the contract so a json-lib bump can't silently flip it.
+    InstructionStore store(":memory:");
+    store.set_require_signed_definitions(false);
+    // Use the full envelope helper so create_definition's name/type/plugin
+    // requirements are satisfied — the test is about NULL signing fields,
+    // not about partial envelopes.
+    auto env = build_envelope("def.null.sig", kSampleYaml);
+    // Round-trip through nlohmann to add null fields without rebuilding.
+    auto j = nlohmann::json::parse(env);
+    j["signature"] = nullptr;
+    j["publicKey"] = nullptr;
+    auto r = store.import_definition_json(j.dump());
+    REQUIRE(r.has_value()); // accepted as unsigned (enforcement off)
+}
+
+// ── R6 governance: hex length validation before allocation ───────────────────
+
+TEST_CASE("InstructionStore: oversized signature_hex rejected before crypto verify",
+          "[instruction_store][1073][security]") {
+    // Without length-validation an attacker could post a 10 MB signature
+    // field and trigger a hex_decode allocation peak inside
+    // ProductPackStore::verify_signature. The early length check returns
+    // a typed error AND short-circuits the allocation.
+    InstructionStore store(":memory:");
+    nlohmann::json j;
+    j["id"] = "def.oversize.sig";
+    j["name"] = "oversize-sig";
+    j["yaml_source"] = kSampleYaml;
+    j["signature"] = std::string(10 * 1024 * 1024, 'a'); // 10 MB
+    j["publicKey"] = std::string(64, 'a');
+    auto r = store.import_definition_json(j.dump());
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("signature length invalid") != std::string::npos);
+}
+
+TEST_CASE("InstructionStore: oversized publicKey_hex rejected before crypto verify",
+          "[instruction_store][1073][security]") {
+    InstructionStore store(":memory:");
+    nlohmann::json j;
+    j["id"] = "def.oversize.pub";
+    j["name"] = "oversize-pub";
+    j["yaml_source"] = kSampleYaml;
+    j["signature"] = std::string(128, 'a');
+    j["publicKey"] = std::string(10 * 1024 * 1024, 'a'); // 10 MB
+    auto r = store.import_definition_json(j.dump());
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("publicKey length invalid") != std::string::npos);
+}
+
+TEST_CASE("InstructionStore: short signature_hex rejected (catches truncation bugs)",
+          "[instruction_store][1073][security]") {
+    InstructionStore store(":memory:");
+    nlohmann::json j;
+    j["id"] = "def.short.sig";
+    j["name"] = "short-sig";
+    j["yaml_source"] = kSampleYaml;
+    j["signature"] = std::string(64, 'a'); // half-length
+    j["publicKey"] = std::string(64, 'a');
+    auto r = store.import_definition_json(j.dump());
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("signature length invalid") != std::string::npos);
+}

@@ -619,34 +619,68 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
     // Wire format mirrors ProductPack: optional top-level `signature` +
     // `publicKey` fields, hex-encoded. The signed content is the
     // `yaml_source` field's bytes verbatim — yaml_source is the
-    // authoritative source-of-truth representation of the definition
-    // (every persisted column is derived from it on the canonical path).
-    // Signing yaml_source means the signature transitively covers every
-    // downstream field that the definition will dispatch with.
+    // authoritative source-of-truth representation of the definition.
     //
-    // This is the SOLE gate that closes #1073 on the public import path.
+    // This gates the IMPORT surface. Authoring surfaces (POST /api/instructions,
+    // POST /api/instructions/yaml, PUT /api/instructions/{id}) trust the
+    // InstructionDefinition:Write RBAC permission as the author trust
+    // boundary — see SECURITY SCOPE comment on the public method in the .hpp.
+    //
     // The trusted boot-content path (`import_definition_json_trusted`)
     // skips this gate by passing check_signature=false — bundled content
     // authenticity comes from build-time binary linkage, not runtime
     // signature.
     if (check_signature) {
-        auto extract_str = [&](const char* key) -> std::string {
+        // Round 1 governance unhappy-path R5: distinguish "field absent"
+        // from "field present but wrong JSON type". Returning empty-string
+        // silently for both made attacker-corrupted payloads
+        // ({"signature": 42}) reject with the misleading "unsigned" error.
+        // Use a tri-state so we can emit a precise rejection reason.
+        enum class FieldState { Absent, WrongType, Present };
+        auto extract_str = [&](const char* key, std::string& out) -> FieldState {
             if (!parsed.contains(key))
-                return {};
+                return FieldState::Absent;
             const auto& v = parsed[key];
+            if (v.is_null())
+                return FieldState::Absent; // null treated as absent
             if (!v.is_string())
-                return {};
-            return v.get<std::string>();
+                return FieldState::WrongType;
+            out = v.get<std::string>();
+            return out.empty() ? FieldState::Absent : FieldState::Present;
         };
-        const std::string sig_hex = extract_str("signature");
-        const std::string pub_hex = extract_str("publicKey");
-        const std::string yaml_source = extract_str("yaml_source");
+        std::string sig_hex, pub_hex, yaml_source;
+        const auto sig_state = extract_str("signature", sig_hex);
+        const auto pub_state = extract_str("publicKey", pub_hex);
+        const auto yaml_state = extract_str("yaml_source", yaml_source);
 
-        if (!sig_hex.empty() && !pub_hex.empty()) {
+        if (sig_state == FieldState::WrongType || pub_state == FieldState::WrongType ||
+            yaml_state == FieldState::WrongType) {
+            return std::unexpected(
+                "instruction-import has signing field of wrong JSON type — "
+                "signature, publicKey, and yaml_source must be strings when present");
+        }
+
+        // R6 (unhappy-path): length-validate hex strings BEFORE handing to
+        // ProductPackStore::verify_signature so an attacker can't post a
+        // multi-MB sig_hex and trigger a server-side allocation peak.
+        // Ed25519: signature = 64 bytes (128 hex chars), public key = 32
+        // bytes (64 hex chars). Reject any other length.
+        constexpr std::size_t kEd25519SigHexLen = 128;
+        constexpr std::size_t kEd25519PubHexLen = 64;
+        if (sig_state == FieldState::Present && sig_hex.size() != kEd25519SigHexLen) {
+            return std::unexpected("signature length invalid — Ed25519 signature must be "
+                                   "exactly 128 hex chars (64 bytes)");
+        }
+        if (pub_state == FieldState::Present && pub_hex.size() != kEd25519PubHexLen) {
+            return std::unexpected("publicKey length invalid — Ed25519 public key must be "
+                                   "exactly 64 hex chars (32 bytes)");
+        }
+
+        if (sig_state == FieldState::Present && pub_state == FieldState::Present) {
             // Both fields present → verify. Failure rejects unconditionally
             // regardless of `require_signed_definitions_` (a failed signature
             // is evidence of tampering, not a policy question).
-            if (yaml_source.empty()) {
+            if (yaml_state != FieldState::Present) {
                 return std::unexpected(
                     "instruction-import has signature + publicKey but no yaml_source — "
                     "yaml_source is the signed content carrier; cannot verify");
@@ -659,7 +693,7 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
                     "have been tampered with");
             }
             spdlog::info("InstructionStore::import_definition_json: signature verified");
-        } else if (!sig_hex.empty() || !pub_hex.empty()) {
+        } else if (sig_state == FieldState::Present || pub_state == FieldState::Present) {
             // Exactly one field present — incomplete signing metadata, reject.
             return std::unexpected(
                 "instruction-import has incomplete signing metadata — both "
