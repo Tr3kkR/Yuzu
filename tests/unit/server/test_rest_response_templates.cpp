@@ -82,25 +82,27 @@ struct RtHarness {
     }
 
     void register_with(bool with_store) {
-        auto auth_fn = [](const httplib::Request&, httplib::Response&)
-            -> std::optional<auth::Session> {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "tester";
             s.role = auth::Role::admin;
             return s;
         };
-        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
-                              const std::string&, const std::string&) -> bool {
+        auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                              const std::string&) -> bool {
             if (!perm_grant) {
                 res.status = 403;
                 return false;
             }
             return true;
         };
-        auto audit_fn = [this](const httplib::Request&, const std::string& a,
-                               const std::string& r, const std::string& tt,
-                               const std::string& ti, const std::string& d) {
+        // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>.
+        auto audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
+                               const std::string& tt, const std::string& ti,
+                               const std::string& d) -> bool {
             audit_log.push_back({a, r, tt, ti, d});
+            return true;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -165,8 +167,7 @@ TEST_CASE("REST templates: GET list synthesises default when none authored",
 TEST_CASE("REST templates: GET list uses result_schema when populated",
           "[rest][response_templates][list]") {
     RtHarness h;
-    auto def_id = h.make_def(
-        "procfetch", R"([{"name":"hostname","type":"string"},
+    auto def_id = h.make_def("procfetch", R"([{"name":"hostname","type":"string"},
                          {"name":"uptime","type":"int64"}])");
     auto res = h.sink.Get("/api/v1/definitions/" + def_id + "/response-templates");
     REQUIRE(res);
@@ -182,8 +183,7 @@ TEST_CASE("REST templates: GET /__default__ returns the synthesised default",
           "[rest][response_templates][get]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto res = h.sink.Get(
-        "/api/v1/definitions/" + def_id + "/response-templates/__default__");
+    auto res = h.sink.Get("/api/v1/definitions/" + def_id + "/response-templates/__default__");
     REQUIRE(res);
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
@@ -191,13 +191,11 @@ TEST_CASE("REST templates: GET /__default__ returns the synthesised default",
     CHECK(body["data"]["default"] == true);
 }
 
-TEST_CASE("REST templates: POST creates and assigns id",
-          "[rest][response_templates][create]") {
+TEST_CASE("REST templates: POST creates and assigns id", "[rest][response_templates][create]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto res = h.sink.Post(
-        "/api/v1/definitions/" + def_id + "/response-templates",
-        R"({"name":"Failures only",
+    auto res = h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates",
+                           R"({"name":"Failures only",
             "columns":["PID","Name"],
             "filters":[{"column":"Name","op":"contains","value":"chrome"}]})");
     REQUIRE(res);
@@ -215,8 +213,10 @@ TEST_CASE("REST templates: POST creates and assigns id",
     CHECK(list_body["data"].size() == 2); // synth default + new template
     bool found_synth = false, found_new = false;
     for (auto& t : list_body["data"]) {
-        if (t["id"] == "__default__") found_synth = true;
-        if (t["id"] == id) found_new = true;
+        if (t["id"] == "__default__")
+            found_synth = true;
+        if (t["id"] == id)
+            found_new = true;
     }
     CHECK(found_synth);
     CHECK(found_new);
@@ -226,9 +226,8 @@ TEST_CASE("REST templates: POST with operator default suppresses synth default",
           "[rest][response_templates][create][default]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto res = h.sink.Post(
-        "/api/v1/definitions/" + def_id + "/response-templates",
-        R"({"name":"My default","default":true})");
+    auto res = h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates",
+                           R"({"name":"My default","default":true})");
     REQUIRE(res);
     CHECK(res->status == 201);
 
@@ -245,9 +244,7 @@ TEST_CASE("REST templates: POST with malformed JSON → 400",
           "[rest][response_templates][create][validation]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto res = h.sink.Post(
-        "/api/v1/definitions/" + def_id + "/response-templates",
-        "not-json");
+    auto res = h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates", "not-json");
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(res->body.find("invalid JSON") != std::string::npos);
@@ -257,26 +254,22 @@ TEST_CASE("REST templates: POST missing name → 400",
           "[rest][response_templates][create][validation]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto res = h.sink.Post(
-        "/api/v1/definitions/" + def_id + "/response-templates", R"({})");
+    auto res = h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates", R"({})");
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(res->body.find("name") != std::string::npos);
 }
 
-TEST_CASE("REST templates: PUT replaces in place",
-          "[rest][response_templates][update]") {
+TEST_CASE("REST templates: PUT replaces in place", "[rest][response_templates][update]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto post = h.sink.Post(
-        "/api/v1/definitions/" + def_id + "/response-templates",
-        R"({"name":"orig"})");
+    auto post =
+        h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates", R"({"name":"orig"})");
     REQUIRE(post);
     auto id = nlohmann::json::parse(post->body)["data"]["id"].get<std::string>();
 
-    auto put = h.sink.Put(
-        "/api/v1/definitions/" + def_id + "/response-templates/" + id,
-        R"({"name":"updated"})");
+    auto put = h.sink.Put("/api/v1/definitions/" + def_id + "/response-templates/" + id,
+                          R"({"name":"updated"})");
     REQUIRE(put);
     CHECK(put->status == 200);
     CHECK(nlohmann::json::parse(put->body)["data"]["name"] == "updated");
@@ -286,26 +279,22 @@ TEST_CASE("REST templates: PUT __default__ → 400",
           "[rest][response_templates][update][validation]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto put = h.sink.Put(
-        "/api/v1/definitions/" + def_id + "/response-templates/__default__",
-        R"({"name":"hijack"})");
+    auto put = h.sink.Put("/api/v1/definitions/" + def_id + "/response-templates/__default__",
+                          R"({"name":"hijack"})");
     REQUIRE(put);
     CHECK(put->status == 400);
     CHECK(put->body.find("reserved") != std::string::npos);
 }
 
-TEST_CASE("REST templates: DELETE removes the entry",
-          "[rest][response_templates][delete]") {
+TEST_CASE("REST templates: DELETE removes the entry", "[rest][response_templates][delete]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto post = h.sink.Post(
-        "/api/v1/definitions/" + def_id + "/response-templates",
-        R"({"name":"transient"})");
+    auto post = h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates",
+                            R"({"name":"transient"})");
     REQUIRE(post);
     auto id = nlohmann::json::parse(post->body)["data"]["id"].get<std::string>();
 
-    auto del = h.sink.Delete(
-        "/api/v1/definitions/" + def_id + "/response-templates/" + id);
+    auto del = h.sink.Delete("/api/v1/definitions/" + def_id + "/response-templates/" + id);
     REQUIRE(del);
     CHECK(del->status == 200);
 
@@ -321,15 +310,13 @@ TEST_CASE("REST templates: DELETE __default__ → 400",
           "[rest][response_templates][delete][validation]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto del = h.sink.Delete(
-        "/api/v1/definitions/" + def_id + "/response-templates/__default__");
+    auto del = h.sink.Delete("/api/v1/definitions/" + def_id + "/response-templates/__default__");
     REQUIRE(del);
     CHECK(del->status == 400);
     CHECK(del->body.find("cannot be deleted") != std::string::npos);
 }
 
-TEST_CASE("REST templates: perm_fn denies → 403",
-          "[rest][response_templates][rbac]") {
+TEST_CASE("REST templates: perm_fn denies → 403", "[rest][response_templates][rbac]") {
     RtHarness h;
     h.perm_grant = false;
     auto res = h.sink.Get("/api/v1/definitions/foo/response-templates");
@@ -346,11 +333,9 @@ TEST_CASE("REST templates: null instruction_store → 503",
     CHECK(res->body.find("service unavailable") != std::string::npos);
 }
 
-TEST_CASE("REST templates: unknown definition_id → 404",
-          "[rest][response_templates][not_found]") {
+TEST_CASE("REST templates: unknown definition_id → 404", "[rest][response_templates][not_found]") {
     RtHarness h;
-    auto res = h.sink.Get(
-        "/api/v1/definitions/does-not-exist/response-templates");
+    auto res = h.sink.Get("/api/v1/definitions/does-not-exist/response-templates");
     REQUIRE(res);
     CHECK(res->status == 404);
     CHECK(res->body.find("definition not found") != std::string::npos);
@@ -362,9 +347,8 @@ TEST_CASE("REST templates: PUT with non-existent template_id → 404 (qe-B1)",
           "[rest][response_templates][update][not_found]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto res = h.sink.Put(
-        "/api/v1/definitions/" + def_id + "/response-templates/abcd1234",
-        R"({"name":"phantom"})");
+    auto res = h.sink.Put("/api/v1/definitions/" + def_id + "/response-templates/abcd1234",
+                          R"({"name":"phantom"})");
     REQUIRE(res);
     CHECK(res->status == 404);
     CHECK(res->body.find("template not found") != std::string::npos);
@@ -374,9 +358,8 @@ TEST_CASE("REST templates: DELETE operator-default re-instates synth (qe-B2)",
           "[rest][response_templates][delete][default]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto post = h.sink.Post(
-        "/api/v1/definitions/" + def_id + "/response-templates",
-        R"({"name":"My default","default":true})");
+    auto post = h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates",
+                            R"({"name":"My default","default":true})");
     REQUIRE(post);
     auto id = nlohmann::json::parse(post->body)["data"]["id"].get<std::string>();
     // Confirm synth is suppressed while operator default exists.
@@ -388,8 +371,7 @@ TEST_CASE("REST templates: DELETE operator-default re-instates synth (qe-B2)",
         CHECK(data[0]["id"] != "__default__");
     }
     // Delete the operator default; synth must re-emerge.
-    auto del = h.sink.Delete(
-        "/api/v1/definitions/" + def_id + "/response-templates/" + id);
+    auto del = h.sink.Delete("/api/v1/definitions/" + def_id + "/response-templates/" + id);
     REQUIRE(del);
     CHECK(del->status == 200);
     auto list2 = h.sink.Get("/api/v1/definitions/" + def_id + "/response-templates");
@@ -412,11 +394,11 @@ TEST_CASE("REST templates: malformed template_id rejected by route regex (qe-B4)
     // a/b — slash splits the path; httplib treats the trailing 'b' as
     // beyond the second capture group, so no route matches. Our sink
     // returns nullptr in that case.
-    auto res = h.sink.Get(
-        "/api/v1/definitions/" + def_id + "/response-templates/a%2Fb");
+    auto res = h.sink.Get("/api/v1/definitions/" + def_id + "/response-templates/a%2Fb");
     // Either nullptr (no route matched) or a 4xx — both prove the regex
     // gate held.
-    if (res) CHECK((res->status == 400 || res->status == 404));
+    if (res)
+        CHECK((res->status == 400 || res->status == 404));
 }
 
 TEST_CASE("REST templates: PUT/DELETE with perm denied → 403 (qe-S2)",
@@ -424,18 +406,15 @@ TEST_CASE("REST templates: PUT/DELETE with perm denied → 403 (qe-S2)",
     RtHarness h;
     auto def_id = h.make_def();
     h.perm_grant = false;
-    auto put = h.sink.Put(
-        "/api/v1/definitions/" + def_id + "/response-templates/x",
-        R"({"name":"x"})");
+    auto put =
+        h.sink.Put("/api/v1/definitions/" + def_id + "/response-templates/x", R"({"name":"x"})");
     REQUIRE(put);
     CHECK(put->status == 403);
-    auto del = h.sink.Delete(
-        "/api/v1/definitions/" + def_id + "/response-templates/x");
+    auto del = h.sink.Delete("/api/v1/definitions/" + def_id + "/response-templates/x");
     REQUIRE(del);
     CHECK(del->status == 403);
-    auto post = h.sink.Post(
-        "/api/v1/definitions/" + def_id + "/response-templates",
-        R"({"name":"x"})");
+    auto post =
+        h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates", R"({"name":"x"})");
     REQUIRE(post);
     CHECK(post->status == 403);
 }
@@ -443,12 +422,10 @@ TEST_CASE("REST templates: PUT/DELETE with perm denied → 403 (qe-S2)",
 TEST_CASE("REST templates: 503 on POST/PUT/DELETE with null store (qe-S6)",
           "[rest][response_templates][unavailable]") {
     RtHarness h(/*with_store=*/false);
-    auto post = h.sink.Post("/api/v1/definitions/foo/response-templates",
-                            R"({"name":"x"})");
+    auto post = h.sink.Post("/api/v1/definitions/foo/response-templates", R"({"name":"x"})");
     REQUIRE(post);
     CHECK(post->status == 503);
-    auto put = h.sink.Put("/api/v1/definitions/foo/response-templates/x",
-                          R"({"name":"x"})");
+    auto put = h.sink.Put("/api/v1/definitions/foo/response-templates/x", R"({"name":"x"})");
     REQUIRE(put);
     CHECK(put->status == 503);
     auto del = h.sink.Delete("/api/v1/definitions/foo/response-templates/x");
@@ -464,9 +441,7 @@ TEST_CASE("REST templates: oversized POST body → 413 + audit (UP-8)",
     // gate after perm_fn / regex, so even malformed bodies above the cap
     // hit 413 before parse.
     std::string huge_body = R"({"name":")" + std::string(65 * 1024, 'a') + R"("})";
-    auto res = h.sink.Post(
-        "/api/v1/definitions/" + def_id + "/response-templates",
-        huge_body);
+    auto res = h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates", huge_body);
     REQUIRE(res);
     CHECK(res->status == 413);
     CHECK(res->body.find("64 KiB") != std::string::npos);
@@ -478,7 +453,8 @@ TEST_CASE("REST templates: oversized POST body → 413 + audit (UP-8)",
         // (S-7 alignment); only 5xx persist failures use "failure".
         if (r.action == "response_template.create" && r.result == "denied" &&
             r.detail.find("body_too_large") != std::string::npos) {
-            found_audit = true; break;
+            found_audit = true;
+            break;
         }
     }
     CHECK(found_audit);
@@ -488,9 +464,8 @@ TEST_CASE("REST templates: success audits emitted (sec-M1 / qe-S1)",
           "[rest][response_templates][audit]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto post = h.sink.Post(
-        "/api/v1/definitions/" + def_id + "/response-templates",
-        R"({"name":"audited"})");
+    auto post = h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates",
+                            R"({"name":"audited"})");
     REQUIRE(post);
     REQUIRE(post->status == 201);
     auto id = nlohmann::json::parse(post->body)["data"]["id"].get<std::string>();
@@ -501,16 +476,14 @@ TEST_CASE("REST templates: success audits emitted (sec-M1 / qe-S1)",
     CHECK(h.audit_log[0].target_id == def_id);
     CHECK(h.audit_log[0].detail == id);
 
-    auto put = h.sink.Put(
-        "/api/v1/definitions/" + def_id + "/response-templates/" + id,
-        R"({"name":"audited2"})");
+    auto put = h.sink.Put("/api/v1/definitions/" + def_id + "/response-templates/" + id,
+                          R"({"name":"audited2"})");
     REQUIRE(put);
     REQUIRE(h.audit_log.size() == 2);
     CHECK(h.audit_log[1].action == "response_template.update");
     CHECK(h.audit_log[1].result == "success");
 
-    auto del = h.sink.Delete(
-        "/api/v1/definitions/" + def_id + "/response-templates/" + id);
+    auto del = h.sink.Delete("/api/v1/definitions/" + def_id + "/response-templates/" + id);
     REQUIRE(del);
     REQUIRE(h.audit_log.size() == 3);
     CHECK(h.audit_log[2].action == "response_template.delete");
@@ -521,9 +494,8 @@ TEST_CASE("REST templates: POST validation failure emits audit (sec-M1)",
           "[rest][response_templates][audit][validation]") {
     RtHarness h;
     auto def_id = h.make_def();
-    auto res = h.sink.Post(
-        "/api/v1/definitions/" + def_id + "/response-templates",
-        R"({})"); // missing name
+    auto res = h.sink.Post("/api/v1/definitions/" + def_id + "/response-templates",
+                           R"({})"); // missing name
     REQUIRE(res);
     CHECK(res->status == 400);
     REQUIRE(h.audit_log.size() == 1);
@@ -571,13 +543,12 @@ TEST_CASE("REST templates: import_definition_json drops oversized string form (s
     }
     huge.back() = ']';
     REQUIRE(huge.size() > 256 * 1024);
-    nlohmann::json payload = {
-        {"id", "import-oversize-test"},
-        {"name", "Oversize test"},
-        {"type", "question"},
-        {"plugin", "procfetch"},
-        {"action", "list"},
-        {"responseTemplates", huge}}; // string form, oversized
+    nlohmann::json payload = {{"id", "import-oversize-test"},
+                              {"name", "Oversize test"},
+                              {"type", "question"},
+                              {"plugin", "procfetch"},
+                              {"action", "list"},
+                              {"responseTemplates", huge}}; // string form, oversized
     auto created = h.instruction_store->import_definition_json(payload.dump());
     REQUIRE(created.has_value());
     auto def = h.instruction_store->get_definition(*created);
@@ -603,10 +574,9 @@ TEST_CASE("REST templates: migration v3 probe-and-stamp on pre-existing column (
     // stamp schema_meta to v1.
     {
         sqlite3* db = nullptr;
-        REQUIRE(sqlite3_open_v2(
-                    raw_db_path.string().c_str(), &db,
-                    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                    nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_open_v2(raw_db_path.string().c_str(), &db,
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                                nullptr) == SQLITE_OK);
         REQUIRE(sqlite3_exec(db, R"(
             CREATE TABLE schema_meta (store TEXT PRIMARY KEY, version INTEGER, upgraded_at INTEGER);
             CREATE TABLE instruction_definitions (
@@ -637,7 +607,8 @@ TEST_CASE("REST templates: migration v3 probe-and-stamp on pre-existing column (
                 response_templates_spec TEXT NOT NULL DEFAULT '[]'
             );
             INSERT INTO schema_meta (store, version, upgraded_at) VALUES ('instruction_store', 1, 0);
-        )", nullptr, nullptr, nullptr) == SQLITE_OK);
+        )",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
         sqlite3_close(db);
     }
 

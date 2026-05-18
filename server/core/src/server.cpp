@@ -264,6 +264,74 @@ public:
         // operators that the audit chain itself is degraded.
         metrics_.describe("yuzu_server_audit_emit_failed_total",
                           "Audit events that failed to persist (sqlite3_step != DONE)", "counter");
+        // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
+        // Increments in the token-create handlers (api_token, device_token)
+        // when `secure_random::fill_random` returns PrngFailure (entropy
+        // exhaustion). Operators wire a Prometheus rule like
+        //   rate(yuzu_secure_random_failure_total[5m]) > 0
+        // to page on-call short of grepping audit logs.
+        metrics_.describe("yuzu_secure_random_failure_total",
+                          "CSPRNG (RAND_bytes / BCryptGenRandom) failures during token "
+                          "issuance, labelled by reason and call site",
+                          "counter");
+        // W1.3 (#826 + #1052 + #1053): device-token rejection counters.
+        // Three high-signal variants each get their own counter so SRE
+        // can alert directly without a labels selector. The remaining
+        // variants bucket under yuzu_device_token_rejected_total{variant=...}
+        // so they're still visible without flooding paging surface.
+        // Alert recipes:
+        //   rate(yuzu_device_token_binding_mismatch_total[5m]) > 0
+        //     — stolen-token impersonation attempt in progress (#826)
+        //   rate(yuzu_device_token_unbound_legacy_total[5m]) > 0
+        //     — legacy any-device token is being presented; rotate
+        //   rate(yuzu_device_token_revoked_attempt_total[5m]) > 0
+        //     — revoked token replay; investigate originating IP
+        metrics_.describe("yuzu_device_token_binding_mismatch_total",
+                          "Device-token presenter did not match the bound device_id "
+                          "(#826 stolen-token impersonation attempt)",
+                          "counter");
+        metrics_.describe("yuzu_device_token_unbound_legacy_total",
+                          "Device-token validation refused because the stored row has "
+                          "empty device_id (W1.2 R2 HIGH-1/HIGH-2 — pre-#824 legacy)",
+                          "counter");
+        metrics_.describe("yuzu_device_token_revoked_attempt_total",
+                          "Replay attempt against a revoked device token", "counter");
+        metrics_.describe("yuzu_device_token_rejected_total",
+                          "Low-signal device-token validation rejections (not_found, "
+                          "expired, invalid_input), labelled by variant",
+                          "counter");
+        // W1.4 / #827: enrollment-token race-loss counter. Fires when two
+        // agents concurrently presented the same one-time enrollment token
+        // and the second consumer lost the atomic-claim race. Each
+        // increment is one credential-leak signal — a non-zero rate over
+        // 5 min means a leaked enrollment token is in active use by more
+        // than one party. Alert recipe:
+        //   rate(yuzu_enrollment_token_race_lost_total[5m]) > 0
+        // Audit row with `variant=already_consumed already_consumed_by=
+        // <agent_id>` accompanies each increment.
+        metrics_.describe("yuzu_enrollment_token_race_lost_total",
+                          "Enrollment-token consume lost the atomic-claim race "
+                          "(#827 — leaked token presented by a second agent)",
+                          "counter");
+        // Low-signal enrollment-token rejection bucket. Variants are
+        // `not_found`, `revoked`, `expired`, `invalid_input`,
+        // `invalid_input_length`, `internal_error`. The high-signal
+        // `already_consumed` variant has its own dedicated counter above
+        // so SRE can page on race-loss without a label selector.
+        metrics_.describe("yuzu_enrollment_token_rejected_total",
+                          "Low-signal enrollment-token validation rejections "
+                          "(not_found, revoked, expired, invalid_input, "
+                          "invalid_input_length, internal_error), labelled by variant",
+                          "counter");
+        // #826 sec-S1: Subscribe peer-mismatch rejections, labelled by
+        // gateway_mode so an operator can distinguish "agent reconnected
+        // from a new IP" (steady state in gateway deployments) from
+        // "stolen session_id in non-gateway deployment" (active attack).
+        metrics_.describe("yuzu_grpc_subscribe_peer_mismatch_total",
+                          "Subscribe RPC rejected because the peer IP differs from "
+                          "the Register peer IP and is not a trusted gateway, labelled "
+                          "by gateway_mode (true|false)",
+                          "counter");
         // Login-latency observability (governance PR4 OBS-2). Histogram of
         // PBKDF2 verify duration, labelled by result so alerts can fire on
         // success-path regressions independently of brute-force noise on
@@ -271,6 +339,12 @@ public:
         metrics_.describe("yuzu_auth_login_duration_seconds",
                           "Login PBKDF2 verify latency in seconds, by method and result",
                           "histogram");
+        // Session-revocation observability (CC7.2 anomaly-detection +
+        // capacity planning). Counter labels: caller=admin|self,
+        // result=success|partial|denied, scope=cookies|all (all = /me's
+        // "Sign out everywhere" which also revokes API tokens).
+        metrics_.describe("yuzu_auth_sessions_revoked_total",
+                          "Total session revocations, by caller, result, and scope", "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -793,7 +867,41 @@ public:
                 ev.detail = "fleet visualization endpoints disabled at startup "
                             "(--viz-disable / YUZU_VIZ_DISABLE)";
                 ev.result = "success";
-                audit_store_->log(ev);
+                (void)audit_store_->log(ev);
+            }
+
+            // #802 / W7.4 — mirror the viz-disable audit emission pattern:
+            // when the operator has opted out of signed-pack enforcement,
+            // emit a startup-time audit row so the relaxed posture is
+            // recoverable from the audit store, not only from process logs.
+            // Auditors and incident-response queries asking "was unsigned
+            // pack acceptance enabled during window X?" can answer from
+            // the audit log. The matching `--allow-unsigned-packs` startup
+            // warn fires earlier at the ProductPackStore construction
+            // site; the audit row fires here because audit_store_ is only
+            // constructed at this phase.
+            if (cfg_.allow_unsigned_packs && audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "system";
+                ev.action = "server.unsigned_packs_allowed";
+                ev.target_type = "ProductPack";
+                // gov R1 CONS-BLOCKING-1: use a feature-name scope label
+                // rather than "*" wildcard. The audit_store query planner
+                // uses `WHERE target_id = ?` (audit_store.cpp:191) — "*"
+                // would only match this exact row, not "all packs". Mirrors
+                // the sibling `server.viz_disabled` row which uses
+                // `target_id="viz"`. Future startup-posture audit rows
+                // should follow `target_id=<feature_name>` (see
+                // docs/observability-conventions.md startup-posture pattern).
+                ev.target_id = "signature_enforcement";
+                ev.detail = "product pack signature enforcement disabled at startup "
+                            "(--allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS) — "
+                            "unsigned packs will be accepted at install";
+                ev.result = "success";
+                (void)audit_store_->log(ev);
             }
 
             // CAP-1 (#1002) — bound the pushed_ map so a churning fleet or
@@ -844,6 +952,20 @@ public:
             agent_service_.set_tag_store(tag_store_.get());
         if (analytics_store_)
             agent_service_.set_analytics_store(analytics_store_.get());
+        // W1.4 / #827: AuditStore for enrollment-token consume rows.
+        // Direct path (AgentServiceImpl) AND gateway path
+        // (GatewayUpstreamServiceImpl) both get the same store so the
+        // success+failure audit trail is uniform regardless of how the
+        // agent reached us.
+        if (audit_store_ && audit_store_->is_open()) {
+            agent_service_.set_audit_store(audit_store_.get());
+            if (gateway_service_) {
+                gateway_service_->set_audit_store(audit_store_.get());
+            }
+        }
+        if (analytics_store_ && gateway_service_) {
+            gateway_service_->set_analytics_store(analytics_store_.get());
+        }
         if (notification_store_)
             agent_service_.set_notification_store(notification_store_.get());
         if (webhook_store_)
@@ -929,7 +1051,7 @@ public:
                         ev.target_id = target_id;
                         ev.detail = detail;
                         ev.result = std::string(result);
-                        audit_store_->log(ev);
+                        (void)audit_store_->log(ev);
                     };
                     auto envelope_id = [](const std::string& env) -> std::string {
                         auto p = nlohmann::json::parse(env, nullptr, false);
@@ -1081,6 +1203,21 @@ public:
             product_pack_store_ = std::make_unique<ProductPackStore>(pack_db);
             if (product_pack_store_ && product_pack_store_->is_open()) {
                 spdlog::info("ProductPackStore initialized at {}", pack_db.string());
+                // #802 / W7.4: enforce signed-pack-by-default. Default
+                // ProductPackStore ctor sets require_signed_packs_=true; we
+                // invert only when the operator opts in via the flag, and
+                // make the relaxed posture loud in operator logs + audit
+                // (audit emission deferred to post-audit_store_-construction
+                // block below to mirror the viz_disable pattern).
+                product_pack_store_->set_require_signed_packs(!cfg_.allow_unsigned_packs);
+                if (cfg_.allow_unsigned_packs) {
+                    spdlog::warn("[SECURITY] product pack signature enforcement DISABLED "
+                                 "by configuration (--allow-unsigned-packs / "
+                                 "YUZU_ALLOW_UNSIGNED_PACKS). Unsigned packs will be "
+                                 "accepted at install — this exposes the fleet to "
+                                 "arbitrary instruction/plugin execution. Sign packs and "
+                                 "remove the flag as soon as feasible.");
+                }
             }
         }
 
@@ -1402,14 +1539,14 @@ public:
                                   "--ca-cert (and --management-ca-cert if applicable).";
                         spdlog::error("[INSECURE-TLS] ({}) {}", posture, detail);
                         if (audit_store_ && audit_store_->is_open()) {
-                            audit_store_->log({.timestamp = std::time(nullptr),
-                                               .principal = "system",
-                                               .principal_role = "system",
-                                               .action = "server.tls_degraded",
-                                               .target_type = "server",
-                                               .target_id = posture,
-                                               .detail = detail,
-                                               .result = "warning"});
+                            (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                                     .principal = "system",
+                                                     .principal_role = "system",
+                                                     .action = "server.tls_degraded",
+                                                     .target_type = "server",
+                                                     .target_id = posture,
+                                                     .detail = detail,
+                                                     .result = "warning"});
                         }
                     }
                 });
@@ -1972,10 +2109,10 @@ private:
         return auth_routes_->make_audit_event(req, action, result);
     }
 
-    void audit_log(const httplib::Request& req, const std::string& action,
+    bool audit_log(const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type = {},
                    const std::string& target_id = {}, const std::string& detail = {}) {
-        auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
+        return auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
     }
 
     // Apply stored runtime config overrides on startup
@@ -2404,6 +2541,15 @@ private:
                 // the right probe. Without this, a store-construction failure
                 // would leave /readyz "ready" while every viz request 503s.
                 {"fleet_topology_store", fleet_topology_store_ != nullptr},
+                // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
+                // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
+                // that fails to open AND `--allow-unsigned-packs` set produces
+                // a silent half-state — the audit row at startup says "unsigned
+                // packs allowed" but every install returns 503 because the
+                // store is dead. Without this readyz entry, an LB or operator
+                // dashboard would not detect the half-state. Pairs with the
+                // workflow_routes.cpp install handler's `is_open()` guard.
+                {"product_pack_store", product_pack_store_ && product_pack_store_->is_open()},
             };
 
             std::string failed_list;
@@ -3043,7 +3189,8 @@ private:
                 return gateway_service_->session_count();
             })
                              : SettingsRoutes::GatewaySessionCountFn{},
-            [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_);
+            [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
+            /*metrics_registry=*/&metrics_);
 
         // Legacy routes — redirect to dashboard
         web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
@@ -5381,8 +5528,8 @@ private:
         };
         auto audit_fn = [this](const httplib::Request& req, const std::string& action,
                                const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) {
-            audit_log(req, action, result, target_type, target_id, detail);
+                               const std::string& target_id, const std::string& detail) -> bool {
+            return audit_log(req, action, result, target_type, target_id, detail);
         };
 
         // ComplianceRoutes — /compliance, /fragments/compliance/*, /api/policies/*,
@@ -5643,8 +5790,8 @@ private:
             },
             [this](const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type,
-                   const std::string& target_id, const std::string& detail) {
-                audit_log(req, action, result, target_type, target_id, detail);
+                   const std::string& target_id, const std::string& detail) -> bool {
+                return audit_log(req, action, result, target_type, target_id, detail);
             },
             rbac_store_.get(), mgmt_group_store_.get(), api_token_store_.get(),
             quarantine_store_.get(), response_store_.get(), instruction_store_.get(),
@@ -5669,7 +5816,40 @@ private:
             inventory_store_.get(), product_pack_store_.get(),
             /*sw_deploy_store=*/nullptr,
             /*device_token_store=*/nullptr,
-            /*license_store=*/nullptr, guaranteed_state_store_.get());
+            /*license_store=*/nullptr, guaranteed_state_store_.get(),
+            /*metrics_registry=*/&metrics_,
+            // session_revoke_fn — composes the cookie-session wipe
+            // (AuthManager dual-write) with optional API-token revocation
+            // when called from /me's "Sign out everywhere" flow. Exposes
+            // the dual-write outcome (db_persisted) so the REST handler
+            // can audit a partial failure honestly (CC6.6 evidence).
+            [this](const std::string& username,
+                   bool revoke_api_tokens) -> RestApiV1::SessionRevokeResult {
+                const auto revoke = auth_mgr_.invalidate_user_sessions(username);
+                std::size_t tokens = 0;
+                if (revoke_api_tokens && api_token_store_ && api_token_store_->is_open()) {
+                    tokens = api_token_store_->revoke_for_principal(username);
+                }
+                // CC7.2 anomaly-detection signal: a spike in this counter
+                // is the operator's automated alert for compromised-account
+                // response or rogue automation calling /me in a loop.
+                // Caller dimension is inferred from the api-tokens flag:
+                // /me passes true (self full-credential revoke), admin
+                // path passes false (cookies only, automation tokens
+                // intact). Result dimension carries db_persisted so SOC 2
+                // partial-failure rows are filterable.
+                metrics_
+                    .counter("yuzu_auth_sessions_revoked_total",
+                             {{"caller", revoke_api_tokens ? "self" : "admin"},
+                              {"result", revoke.db_persisted ? "success" : "partial"},
+                              {"scope", revoke_api_tokens ? "all" : "cookies"}})
+                    .increment();
+                return RestApiV1::SessionRevokeResult{
+                    revoke.count,
+                    tokens,
+                    revoke.db_persisted,
+                };
+            });
 
         // -- Register MCP server routes ----------------------------------------
 

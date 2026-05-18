@@ -1,6 +1,6 @@
 /**
  * auth_db.cpp — SQLite-backed authentication persistence for Yuzu Server
- * 
+ *
  * Fixes implemented from Red Team review:
  * - C1: Role parameter stripped from user creation (admin-only via separate endpoint)
  * - C2: Enrollment token consumption is atomic + persisted immediately
@@ -17,12 +17,12 @@
 // MSVC's STL does not transitively include these via <regex>/<chrono>/<filesystem>.
 // Keep them explicit (cf. governance round 7ea7be6 + xp-B1 / cpp-SH-2).
 #include <atomic>
-#include <cctype>     // std::isalnum
+#include <cctype> // std::isalnum
 #include <chrono>
 #include <cstring>
-#include <ctime>      // std::time_t (downstream dependency for chrono format)
+#include <ctime> // std::time_t (downstream dependency for chrono format)
 #include <filesystem>
-#include <format>     // std::format chrono — replaces thread-unsafe std::gmtime
+#include <format> // std::format chrono — replaces thread-unsafe std::gmtime
 #include <regex>
 #include <thread>
 
@@ -36,18 +36,16 @@ bool is_valid_username(const std::string& username) {
         spdlog::warn("Username validation failed: invalid length ({})", username.size());
         return false;
     }
-    
+
     // Character check: alphanumeric + . _ - only
     // Explicitly reject ':' to prevent config file format injection
     for (char c : username) {
-        if (!std::isalnum(static_cast<unsigned char>(c)) && 
-            c != '.' && c != '_' && c != '-') {
-            spdlog::warn("Username validation failed: invalid character '{}' in '{}'", 
-                        c, username);
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '_' && c != '-') {
+            spdlog::warn("Username validation failed: invalid character '{}' in '{}'", c, username);
             return false;
         }
     }
-    
+
     return true;
 }
 
@@ -72,8 +70,7 @@ std::string col_text(sqlite3_stmt* stmt, int idx) {
 // timestamps under load (governance round xp-S1). std::format chrono is
 // thread-safe and requires no scratch buffer.
 std::string format_sqlite_utc(std::chrono::system_clock::time_point tp) {
-    return std::format("{:%Y-%m-%d %H:%M:%S}",
-                       std::chrono::floor<std::chrono::seconds>(tp));
+    return std::format("{:%Y-%m-%d %H:%M:%S}", std::chrono::floor<std::chrono::seconds>(tp));
 }
 } // namespace
 
@@ -100,23 +97,23 @@ struct AuthDB::Impl {
     sqlite3_stmt* stmt_list_users = nullptr;
     sqlite3_stmt* stmt_remove_user = nullptr;
     sqlite3_stmt* stmt_user_exists = nullptr;
-    
+
     sqlite3_stmt* stmt_create_session = nullptr;
     sqlite3_stmt* stmt_get_session = nullptr;
     sqlite3_stmt* stmt_invalidate_session = nullptr;
     sqlite3_stmt* stmt_invalidate_all_sessions = nullptr;
     sqlite3_stmt* stmt_cleanup_expired_sessions = nullptr;
-    
+
     sqlite3_stmt* stmt_create_enrollment_token = nullptr;
-    sqlite3_stmt* stmt_consume_enrollment_token = nullptr;  // C2 FIX: Atomic operation
+    sqlite3_stmt* stmt_consume_enrollment_token = nullptr; // C2 FIX: Atomic operation
     sqlite3_stmt* stmt_get_enrollment_token = nullptr;
-    
+
     sqlite3_stmt* stmt_add_pending_agent = nullptr;
     sqlite3_stmt* stmt_get_pending_agent = nullptr;
     sqlite3_stmt* stmt_list_pending_agents = nullptr;
     sqlite3_stmt* stmt_approve_agent = nullptr;
     sqlite3_stmt* stmt_reject_agent = nullptr;
-    
+
     ~Impl() {
         // Stop the cleanup thread BEFORE finalizing statements / closing
         // the connection. The thread may be mid-step on
@@ -140,29 +137,29 @@ struct AuthDB::Impl {
         finalize_statement(stmt_list_users);
         finalize_statement(stmt_remove_user);
         finalize_statement(stmt_user_exists);
-        
+
         finalize_statement(stmt_create_session);
         finalize_statement(stmt_get_session);
         finalize_statement(stmt_invalidate_session);
         finalize_statement(stmt_invalidate_all_sessions);
         finalize_statement(stmt_cleanup_expired_sessions);
-        
+
         finalize_statement(stmt_create_enrollment_token);
         finalize_statement(stmt_consume_enrollment_token);
         finalize_statement(stmt_get_enrollment_token);
-        
+
         finalize_statement(stmt_add_pending_agent);
         finalize_statement(stmt_get_pending_agent);
         finalize_statement(stmt_list_pending_agents);
         finalize_statement(stmt_approve_agent);
         finalize_statement(stmt_reject_agent);
-        
+
         // Close database connection
         if (db) {
             sqlite3_close(db);
         }
     }
-    
+
     void finalize_statement(sqlite3_stmt*& stmt) {
         if (stmt) {
             sqlite3_finalize(stmt);
@@ -171,8 +168,7 @@ struct AuthDB::Impl {
     }
 };
 
-AuthDB::AuthDB(const std::filesystem::path& data_dir)
-    : impl_(std::make_unique<Impl>()) {
+AuthDB::AuthDB(const std::filesystem::path& data_dir) : impl_(std::make_unique<Impl>()) {
     impl_->db_path = data_dir / "auth.db";
 }
 
@@ -205,9 +201,8 @@ std::expected<void, AuthDBError> AuthDB::initialize() {
     // owner_all to a no-op; the production-deploy doc note covers the
     // ACL-equivalent posture there. Errors are logged but non-fatal so
     // deployments on read-only / squashfs / unusual mounts still boot.
-    fs::permissions(impl_->db_path.parent_path(),
-                    fs::perms::owner_all,
-                    fs::perm_options::replace, ec);
+    fs::permissions(impl_->db_path.parent_path(), fs::perms::owner_all, fs::perm_options::replace,
+                    ec);
     if (ec) {
         spdlog::warn("Failed to chmod 0700 auth DB parent dir: {}", ec.message());
         ec.clear();
@@ -238,8 +233,7 @@ std::expected<void, AuthDBError> AuthDB::initialize() {
     // immediately below; SQLite creates those lazily, so the chmod call
     // may no-op until WAL writes happen — re-running the tightening is
     // harmless.
-    fs::permissions(impl_->db_path,
-                    fs::perms::owner_read | fs::perms::owner_write,
+    fs::permissions(impl_->db_path, fs::perms::owner_read | fs::perms::owner_write,
                     fs::perm_options::replace, ec);
     if (ec) {
         spdlog::warn("Failed to chmod 0600 auth.db: {}", ec.message());
@@ -265,17 +259,17 @@ std::expected<void, AuthDBError> AuthDB::initialize() {
         }
         sqlite3_finalize(integrity_stmt);
     }
-    
+
     // Set busy timeout (5 seconds) — handles concurrent access gracefully
     sqlite3_busy_timeout(impl_->db, 5000);
-    
+
     // Enable WAL mode for better concurrency
     rc = sqlite3_exec(impl_->db, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::warn("Failed to enable WAL mode: {}", sqlite3_errmsg(impl_->db));
         // Non-fatal, continue anyway
     }
-    
+
     // Create schema (idempotent — safe to call multiple times)
     auto schema_result = create_schema();
     if (!schema_result) {
@@ -294,7 +288,8 @@ std::expected<void, AuthDBError> AuthDB::initialize() {
             for (int i = 0; i < kCleanupIntervalSec && !stop.stop_requested(); ++i) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
-            if (stop.stop_requested()) break;
+            if (stop.stop_requested())
+                break;
             auto result = cleanup_expired_sessions();
             if (!result) {
                 spdlog::warn("AuthDB: periodic session cleanup failed: error={}",
@@ -310,7 +305,8 @@ std::expected<void, AuthDBError> AuthDB::initialize() {
             for (int i = 0; i < kCleanupIntervalSec && !impl_->stop_cleanup.load(); ++i) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
-            if (impl_->stop_cleanup.load()) break;
+            if (impl_->stop_cleanup.load())
+                break;
             auto result = cleanup_expired_sessions();
             if (!result) {
                 spdlog::warn("AuthDB: periodic session cleanup failed: error={}",
@@ -418,21 +414,18 @@ std::expected<void, AuthDBError> AuthDB::create_schema() {
 
 // ── User Operations ──────────────────────────────────────────────────────────
 
-std::expected<void, AuthDBError> AuthDB::upsert_user(
-    const std::string& username,
-    const std::string& password_hash,
-    const std::string& salt_hex,
-    auth::Role role
-) {
+std::expected<void, AuthDBError> AuthDB::upsert_user(const std::string& username,
+                                                     const std::string& password_hash,
+                                                     const std::string& salt_hex, auth::Role role) {
     // H1 FIX: Validate username before any DB operations
     if (!is_valid_username(username)) {
         spdlog::warn("upsert_user rejected invalid username: '{}'", username);
         return std::unexpected(AuthDBError::InvalidUsername);
     }
-    
+
     // C1 FIX: Only allow 'admin' or 'user' roles — no arbitrary strings
     std::string role_str = (role == auth::Role::admin) ? "admin" : "user";
-    
+
     // Use INSERT ... ON CONFLICT DO NOTHING instead of DO UPDATE.
     // This prevents the TOCTOU race where two concurrent requests could both
     // pass user_exists(), then one overwrites the other's credentials.
@@ -444,27 +437,27 @@ std::expected<void, AuthDBError> AuthDB::upsert_user(
         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(username) DO NOTHING
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to prepare upsert_user statement: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, password_hash.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 3, salt_hex.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 4, role_str.c_str(), -1, SQLITE_STATIC);
-    
+
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("upsert_user failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    
+
     // Check if insert succeeded or user already existed
     int changes = sqlite3_changes(impl_->db);
     if (changes == 0) {
@@ -473,7 +466,7 @@ std::expected<void, AuthDBError> AuthDB::upsert_user(
         spdlog::warn("upsert_user: user already exists, not overwriting: '{}'", username);
         return std::unexpected(AuthDBError::UserAlreadyExists);
     }
-    
+
     spdlog::info("User upserted: {} (role={})", username, role_str);
     return {};
 }
@@ -484,40 +477,40 @@ std::expected<auth::UserEntry, AuthDBError> AuthDB::get_user(const std::string& 
         FROM users
         WHERE username = ? AND is_active = 1
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to prepare get_user statement: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
-    
+
     rc = sqlite3_step(stmt);
     if (rc == SQLITE_DONE) {
         sqlite3_finalize(stmt);
         return std::unexpected(AuthDBError::UserNotFound);
     }
-    
+
     if (rc != SQLITE_ROW) {
         sqlite3_finalize(stmt);
         spdlog::error("get_user query failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::QueryFailed);
     }
-    
+
     auth::UserEntry entry;
     // col_text is null-safe (cpp-SH-1) — every nullable column on the
     // users table goes through it. Schema declares NOT NULL on these
     // columns, so the safety net is defense-in-depth against schema
     // drift / missed migration.
     entry.username = col_text(stmt, 0);
-    entry.role     = auth::string_to_role(col_text(stmt, 1));
+    entry.role = auth::string_to_role(col_text(stmt, 1));
     entry.hash_hex = col_text(stmt, 2);
     entry.salt_hex = col_text(stmt, 3);
     // Note: is_active and last_login_at exist in DB but not in UserEntry struct.
     // DB query filters is_active=1, so all returned users are active.
-    
+
     sqlite3_finalize(stmt);
     return entry;
 }
@@ -529,29 +522,29 @@ std::expected<std::vector<auth::UserEntry>, AuthDBError> AuthDB::list_users() {
         WHERE is_active = 1
         ORDER BY username
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to prepare list_users statement: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     std::vector<auth::UserEntry> users;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         auth::UserEntry entry;
         entry.username = col_text(stmt, 0);
-        entry.role     = auth::string_to_role(col_text(stmt, 1));
+        entry.role = auth::string_to_role(col_text(stmt, 1));
         users.push_back(std::move(entry));
     }
-    
+
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("list_users query failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::QueryFailed);
     }
-    
+
     return users;
 }
 
@@ -560,23 +553,23 @@ std::expected<bool, AuthDBError> AuthDB::remove_user(const std::string& username
         UPDATE users SET is_active = 0, updated_at = CURRENT_TIMESTAMP
         WHERE username = ?
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to prepare remove_user statement: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("remove_user failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    
+
     bool removed = sqlite3_changes(impl_->db) > 0;
     if (removed) {
         spdlog::info("User removed: {}", username);
@@ -594,7 +587,7 @@ std::expected<bool, AuthDBError> AuthDB::remove_user(const std::string& username
     } else {
         spdlog::warn("User not found for removal: {}", username);
     }
-    
+
     return removed;
 }
 
@@ -602,38 +595,36 @@ std::expected<bool, AuthDBError> AuthDB::user_exists(const std::string& username
     static const char* sql = R"(
         SELECT COUNT(*) FROM users WHERE username = ?
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to prepare user_exists statement: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
     rc = sqlite3_step(stmt);
-    
+
     bool exists = false;
     if (rc == SQLITE_ROW) {
         exists = sqlite3_column_int(stmt, 0) > 0;
     }
-    
+
     sqlite3_finalize(stmt);
     return exists;
 }
 
 // ── Session Operations ───────────────────────────────────────────────────────
 
-std::expected<std::string, AuthDBError> AuthDB::create_session(
-    const std::string& username,
-    auth::Role role,
-    const std::string& auth_source,
-    const std::string& oidc_sub
-) {
+std::expected<std::string, AuthDBError> AuthDB::create_session(const std::string& username,
+                                                               auth::Role role,
+                                                               const std::string& auth_source,
+                                                               const std::string& oidc_sub) {
     // Generate secure random session token
     auto token_bytes = auth::AuthManager::random_bytes(32);
     std::string session_token = auth::AuthManager::bytes_to_hex(token_bytes);
-    
+
     // Calculate expiry (24 hours from now)
     auto now = std::chrono::system_clock::now();
     auto expires = now + std::chrono::hours(24);
@@ -648,14 +639,14 @@ std::expected<std::string, AuthDBError> AuthDB::create_session(
         INSERT INTO sessions (session_token, username, role, auth_source, oidc_sub, expires_at)
         VALUES (?, ?, ?, ?, ?, ?)
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to prepare create_session statement: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, session_token.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 3, auth::role_to_string(role).c_str(), -1, SQLITE_STATIC);
@@ -674,7 +665,7 @@ std::expected<std::string, AuthDBError> AuthDB::create_session(
         spdlog::error("create_session failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    
+
     spdlog::info("Session created for user: {} (expires={})", username, expires_str);
     return session_token;
 }
@@ -685,39 +676,40 @@ std::expected<auth::Session, AuthDBError> AuthDB::validate_session(const std::st
         FROM sessions
         WHERE session_token = ?
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("Failed to prepare validate_session statement: {}", sqlite3_errmsg(impl_->db));
+        spdlog::error("Failed to prepare validate_session statement: {}",
+                      sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, token.c_str(), -1, SQLITE_STATIC);
     rc = sqlite3_step(stmt);
-    
+
     if (rc == SQLITE_DONE) {
         sqlite3_finalize(stmt);
         return std::unexpected(AuthDBError::SessionNotFound);
     }
-    
+
     if (rc != SQLITE_ROW) {
         sqlite3_finalize(stmt);
         spdlog::error("validate_session query failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::QueryFailed);
     }
-    
+
     auth::Session session;
-    session.username    = col_text(stmt, 0);
-    session.role        = auth::string_to_role(col_text(stmt, 1));
+    session.username = col_text(stmt, 0);
+    session.role = auth::string_to_role(col_text(stmt, 1));
     session.auth_source = col_text(stmt, 2);
     // sessions.oidc_sub is genuinely nullable; col_text returns "" on
     // NULL which is the same shape as the previous explicit check.
-    session.oidc_sub    = col_text(stmt, 3);
-    
+    session.oidc_sub = col_text(stmt, 3);
+
     // Note: Expiry check is done by caller (AuthManager) — this is intentional
     // to allow session cleanup without modifying this function's signature.
-    
+
     sqlite3_finalize(stmt);
     return session;
 }
@@ -726,47 +718,61 @@ std::expected<void, AuthDBError> AuthDB::invalidate_session(const std::string& t
     static const char* sql = R"(
         DELETE FROM sessions WHERE session_token = ?
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("Failed to prepare invalidate_session statement: {}", sqlite3_errmsg(impl_->db));
+        spdlog::error("Failed to prepare invalidate_session statement: {}",
+                      sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, token.c_str(), -1, SQLITE_STATIC);
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("invalidate_session failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    
+
     return {};
 }
 
 std::expected<void, AuthDBError> AuthDB::invalidate_all_sessions(const std::string& username) {
+    // Defence-in-depth (authdb-H2): every public AuthDB write taking a
+    // username must validate. `sqlite3_bind_text(..., -1, SQLITE_STATIC)`
+    // truncates at the first NUL byte, so a NUL-embedded username would
+    // delete the wrong rows while the in-memory `==` comparison in
+    // AuthManager would match no one — the layers would silently
+    // diverge. Sibling primitives `add_user` and `update_role` validate
+    // here for the same reason.
+    if (!is_valid_username(username)) {
+        spdlog::warn("invalidate_all_sessions: invalid username");
+        return std::unexpected(AuthDBError::InvalidUsername);
+    }
+
     static const char* sql = R"(
         DELETE FROM sessions WHERE username = ?
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("Failed to prepare invalidate_all_sessions statement: {}", sqlite3_errmsg(impl_->db));
+        spdlog::error("Failed to prepare invalidate_all_sessions statement: {}",
+                      sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, username.c_str(), -1, SQLITE_STATIC);
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("invalidate_all_sessions failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    
+
     spdlog::info("All sessions invalidated for user: {}", username);
     return {};
 }
@@ -775,43 +781,42 @@ std::expected<int, AuthDBError> AuthDB::cleanup_expired_sessions() {
     static const char* sql = R"(
         DELETE FROM sessions WHERE expires_at < datetime('now')
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("Failed to prepare cleanup_expired_sessions statement: {}", sqlite3_errmsg(impl_->db));
+        spdlog::error("Failed to prepare cleanup_expired_sessions statement: {}",
+                      sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("cleanup_expired_sessions failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    
+
     int deleted = sqlite3_changes(impl_->db);
     if (deleted > 0) {
         spdlog::info("Cleaned up {} expired sessions", deleted);
     }
-    
+
     return deleted;
 }
 
 // ── Enrollment Token Operations (C2 FIX: Atomic Consumption) ─────────────────
 
-std::expected<std::string, AuthDBError> AuthDB::create_enrollment_token(
-    const std::string& created_by,
-    std::chrono::seconds validity
-) {
+std::expected<std::string, AuthDBError>
+AuthDB::create_enrollment_token(const std::string& created_by, std::chrono::seconds validity) {
     // Generate secure random token
     auto token_bytes = auth::AuthManager::random_bytes(32);
     std::string plain_token = auth::AuthManager::bytes_to_hex(token_bytes);
-    
+
     // Hash token for storage (like password hashing)
     std::string token_hash = auth::AuthManager::sha256_hex(plain_token);
-    
+
     // Calculate expiry
     auto now = std::chrono::system_clock::now();
     auto expires = now + validity;
@@ -827,148 +832,165 @@ std::expected<std::string, AuthDBError> AuthDB::create_enrollment_token(
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("Failed to prepare create_enrollment_token statement: {}", sqlite3_errmsg(impl_->db));
+        spdlog::error("Failed to prepare create_enrollment_token statement: {}",
+                      sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
 
     sqlite3_bind_text(stmt, 1, token_hash.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, created_by.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 3, expires_str.c_str(), -1, SQLITE_STATIC);
-    
+
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("create_enrollment_token failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    
+
     spdlog::info("Enrollment token created by {}", created_by);
-    return plain_token;  // Return plain token to user (hash is stored)
+    return plain_token; // Return plain token to user (hash is stored)
 }
 
 // C2 FIX: Atomic token consumption — persists BEFORE returning
-std::expected<bool, AuthDBError> AuthDB::consume_enrollment_token(
-    const std::string& plain_token,
-    const std::string& agent_id
-) {
+// W1.4 / #827 / #1033: switched from sqlite3_changes() to RETURNING. The
+// prior implementation called sqlite3_changes(impl_->db) immediately
+// after sqlite3_step() on a FULLMUTEX connection — that's the canonical
+// data race + correctness bug per #1033 (changes() reads db->nChange
+// without the per-connection mutex, which can race a concurrent step()
+// on the same handle from another thread). RETURNING carries the "did
+// my UPDATE affect a row" signal in the step return code itself, so
+// the answer is locked into the same per-statement write lock that
+// guarantees atomicity of the UPDATE. Pattern matches ConcurrencyManager
+// ::try_acquire which had the same migration in #1031.
+std::expected<bool, AuthDBError> AuthDB::consume_enrollment_token(const std::string& plain_token,
+                                                                  const std::string& agent_id) {
     // Hash the provided token
     std::string token_hash = auth::AuthManager::sha256_hex(plain_token);
-    
-    // C2 FIX: Atomic operation — mark as used in same query that validates
-    // This prevents race conditions and ensures persistence before return
-    // Defense-in-depth: Also check expiry in same query
+
+    // RETURNING 1 is a no-payload sentinel: sqlite3_step() returns
+    // SQLITE_ROW iff the UPDATE actually updated a row (a WHERE-excluded
+    // no-op returns SQLITE_DONE). Do not change the literal `1` to a
+    // column projection — the rc == SQLITE_ROW check is the sole signal
+    // driving control flow. Defence-in-depth: the WHERE clause still
+    // checks is_used = 0 AND expires_at > datetime('now') so a token
+    // that's already consumed OR expired never produces a RETURNING row.
     const char* sql = R"(
         UPDATE enrollment_tokens
         SET is_used = 1, used_at = datetime('now'), used_by_agent_id = ?
         WHERE token_hash = ? AND is_used = 0 AND expires_at > datetime('now')
+        RETURNING 1
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("Failed to prepare consume_enrollment_token statement: {}", sqlite3_errmsg(impl_->db));
+        spdlog::error("Failed to prepare consume_enrollment_token statement: {}",
+                      sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, agent_id.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, token_hash.c_str(), -1, SQLITE_STATIC);
-    
+
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
-    if (rc != SQLITE_DONE) {
-        spdlog::error("consume_enrollment_token failed: {}", sqlite3_errmsg(impl_->db));
-        return std::unexpected(AuthDBError::WriteFailed);
+
+    if (rc == SQLITE_ROW) {
+        // RETURNING produced a row → the UPDATE actually wrote.
+        spdlog::info("Enrollment token consumed: agent={}", agent_id);
+        return true;
     }
-    
-    // Check if any rows were affected
-    int changes = sqlite3_changes(impl_->db);
-    if (changes == 0) {
-        // Either token doesn't exist, already used, or expired
-        // (expired check would need additional query — done by caller)
-        spdlog::warn("Enrollment token consumption failed: token={}, agent={}", 
-                    plain_token.substr(0, 8) + "...", agent_id);
-        return false;  // Token invalid or already used
+    if (rc == SQLITE_DONE) {
+        // No row matched the WHERE clause: token doesn't exist, already
+        // consumed by a concurrent caller, or expired. The caller treats
+        // all three as the same "rejected" outcome — discriminating them
+        // here would leak token-shape oracles (see device_token_rejection
+        // .hpp comments). Operators see the variant in the in-memory
+        // AuthManager path's typed EnrollmentTokenError.
+        spdlog::warn("Enrollment token consumption failed (no matching row): token={}..., agent={}",
+                     plain_token.substr(0, 8), agent_id);
+        return false;
     }
-    
-    spdlog::info("Enrollment token consumed: agent={}", agent_id);
-    return true;  // Success — token marked as used in DB (PERSISTED)
+    // Anything else is a sqlite-layer failure.
+    spdlog::error("consume_enrollment_token sqlite step failed rc={}: {}", rc,
+                  sqlite3_errmsg(impl_->db));
+    return std::unexpected(AuthDBError::WriteFailed);
 }
 
 std::expected<bool, AuthDBError> AuthDB::validate_enrollment_token(const std::string& plain_token) {
     std::string token_hash = auth::AuthManager::sha256_hex(plain_token);
-    
+
     static const char* sql = R"(
         SELECT COUNT(*) FROM enrollment_tokens
         WHERE token_hash = ? AND is_used = 0 AND expires_at > datetime('now')
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("Failed to prepare validate_enrollment_token statement: {}", sqlite3_errmsg(impl_->db));
+        spdlog::error("Failed to prepare validate_enrollment_token statement: {}",
+                      sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, token_hash.c_str(), -1, SQLITE_STATIC);
     rc = sqlite3_step(stmt);
-    
+
     bool valid = false;
     if (rc == SQLITE_ROW) {
         valid = sqlite3_column_int(stmt, 0) > 0;
     }
-    
+
     sqlite3_finalize(stmt);
     return valid;
 }
 
 // ── Role Update (C1 FIX — Separate from upsert_user to avoid password overwrite) ──
 
-std::expected<void, AuthDBError> AuthDB::update_role(
-    const std::string& username,
-    auth::Role new_role
-) {
+std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username,
+                                                     auth::Role new_role) {
     // Validate username
     if (!is_valid_username(username)) {
         spdlog::warn("update_role rejected invalid username: '{}'", username);
         return std::unexpected(AuthDBError::InvalidUsername);
     }
-    
+
     // Allowlist role to 'admin' or 'user' only
     std::string role_str = (new_role == auth::Role::admin) ? "admin" : "user";
-    
+
     static const char* sql = R"(
         UPDATE users SET role = ?, updated_at = CURRENT_TIMESTAMP
         WHERE username = ? AND is_active = 1
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to prepare update_role statement: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, role_str.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_STATIC);
-    
+
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("update_role failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    
+
     int changes = sqlite3_changes(impl_->db);
     if (changes == 0) {
         spdlog::warn("update_role: user not found or inactive: '{}'", username);
         return std::unexpected(AuthDBError::UserNotFound);
     }
-    
+
     spdlog::info("User role updated: {} -> {}", username, role_str);
-    
+
     // Force re-authentication — session role must reflect the new role.
     // Without this, a demoted admin retains admin access for up to 24 hours
     // via their cached session. Consistent with remove_user() which also
@@ -979,11 +1001,11 @@ std::expected<void, AuthDBError> AuthDB::update_role(
     // their pre-change session. We log loudly; the in-memory sessions_
     // erasure that AuthManager performs in parallel is the v1 hard cut.
     if (auto inv = invalidate_all_sessions(username); !inv) {
-        spdlog::error("update_role: invalidate_all_sessions for '{}' failed: error={}",
-                      username, static_cast<int>(inv.error()));
+        spdlog::error("update_role: invalidate_all_sessions for '{}' failed: error={}", username,
+                      static_cast<int>(inv.error()));
     }
     spdlog::info("Sessions invalidated for role change: {}", username);
-    
+
     return {};
 }
 
@@ -997,28 +1019,29 @@ std::expected<void, AuthDBError> AuthDB::add_pending_agent(const auth::PendingAg
         VALUES (?, ?, ?, ?, ?, 'pending')
         ON CONFLICT(agent_id) DO NOTHING
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("Failed to prepare add_pending_agent statement: {}", sqlite3_errmsg(impl_->db));
+        spdlog::error("Failed to prepare add_pending_agent statement: {}",
+                      sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, agent.agent_id.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, agent.hostname.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 3, agent.os.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 4, agent.arch.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 5, agent.agent_version.c_str(), -1, SQLITE_STATIC);
-    
+
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("add_pending_agent failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    
+
     spdlog::info("Pending agent added: {} ({})", agent.agent_id, agent.hostname);
     return {};
 }
@@ -1030,65 +1053,64 @@ std::expected<std::vector<auth::PendingAgent>, AuthDBError> AuthDB::list_pending
         WHERE status = 'pending'
         ORDER BY requested_at DESC
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("Failed to prepare list_pending_agents statement: {}", sqlite3_errmsg(impl_->db));
+        spdlog::error("Failed to prepare list_pending_agents statement: {}",
+                      sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     std::vector<auth::PendingAgent> agents;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         auth::PendingAgent agent;
         // pending_agents.os/arch/agent_version are nullable per schema;
         // col_text guards the std::string ctor against the NULL case.
-        agent.agent_id      = col_text(stmt, 0);
-        agent.hostname      = col_text(stmt, 1);
-        agent.os            = col_text(stmt, 2);
-        agent.arch          = col_text(stmt, 3);
+        agent.agent_id = col_text(stmt, 0);
+        agent.hostname = col_text(stmt, 1);
+        agent.os = col_text(stmt, 2);
+        agent.arch = col_text(stmt, 3);
         agent.agent_version = col_text(stmt, 4);
         agents.push_back(agent);
     }
-    
+
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("list_pending_agents query failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::QueryFailed);
     }
-    
+
     return agents;
 }
 
-std::expected<void, AuthDBError> AuthDB::approve_agent(
-    const std::string& agent_id,
-    const std::string& approved_by
-) {
+std::expected<void, AuthDBError> AuthDB::approve_agent(const std::string& agent_id,
+                                                       const std::string& approved_by) {
     const char* sql = R"(
         UPDATE pending_agents
         SET status = 'approved', approved_at = datetime('now'), approved_by = ?
         WHERE agent_id = ?
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to prepare approve_agent statement: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, approved_by.c_str(), -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 2, agent_id.c_str(), -1, SQLITE_STATIC);
-    
+
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("approve_agent failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    
+
     spdlog::info("Agent approved: {} by {}", agent_id, approved_by);
     return {};
 }
@@ -1099,24 +1121,24 @@ std::expected<void, AuthDBError> AuthDB::reject_agent(const std::string& agent_i
         SET status = 'rejected'
         WHERE agent_id = ?
     )";
-    
+
     sqlite3_stmt* stmt = nullptr;
     int rc = sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("Failed to prepare reject_agent statement: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::StatementPrepareFailed);
     }
-    
+
     sqlite3_bind_text(stmt, 1, agent_id.c_str(), -1, SQLITE_STATIC);
-    
+
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    
+
     if (rc != SQLITE_DONE) {
         spdlog::error("reject_agent failed: {}", sqlite3_errmsg(impl_->db));
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    
+
     spdlog::info("Agent rejected: {}", agent_id);
     return {};
 }

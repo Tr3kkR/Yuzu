@@ -5,7 +5,11 @@ project(
   license: 'AGPL-3.0-or-later',
   meson_version: '>=1.3.0',
   default_options: [
-    'cpp_std=c++23',
+    # cpp_std is set per-compiler below: '/std:c++latest' for MSVC (meson's
+    # cpp_std validation list has no 'vc++23' / 'c++23' entry for MSVC since
+    # toolset 14.40 / meson 1.9), '-std=c++23' for GCC 13+ / Clang 18+ /
+    # Apple Clang 15+. Setting cpp_std here makes `meson setup` fail on
+    # Windows MSVC before per-compiler add_project_arguments runs.
     'warning_level=3',
     'werror=false',
     'default_library=shared',
@@ -19,13 +23,14 @@ host_os  = host_machine.system()   # 'linux', 'windows', 'darwin'
 host_cpu = host_machine.cpu_family() # 'x86_64', 'aarch64', ...
 if cxx.get_id() == 'msvc'
   add_project_arguments(
-    '/std:c++latest',           # upgrade beyond c++23 default for MSVC
+    '/std:c++latest',           # meson's cpp_std has no MSVC c++23 option
     '/wd4251', '/wd4127', '/wd4275',
     '/permissive-', '/Zc:__cplusplus', '/utf-8',
     language: 'cpp',
   )
 else
   add_project_arguments(
+    '-std=c++23',
     '-Wno-unused-parameter',
     '-fvisibility=hidden',
     '-fstack-protector-strong',

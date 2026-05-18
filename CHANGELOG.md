@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **CRITICAL (#802 / W7.4): product pack signature enforcement is now
+  on-by-default.** `ProductPackStore` previously defaulted
+  `require_signed_packs_` to `false`, AND the setter that would have
+  enabled it was never called from anywhere in production — the flag
+  was effectively unreachable. Any operator with pack-upload permission,
+  or a MITM on pack delivery, could install an unsigned `ProductPack`
+  containing arbitrary `InstructionDefinition` or plugin payloads that
+  executed fleet-wide. The default is now `true`; unsigned packs are
+  rejected at install with the error `pack '<name>' is unsigned and
+  require_signed_packs is enabled`. Operators with legacy unsigned packs
+  must explicitly opt out via the new `--allow-unsigned-packs` flag
+  / `YUZU_ALLOW_UNSIGNED_PACKS=1` env var, which emits a startup
+  `spdlog::warn` and a `server.unsigned_packs_allowed` audit row so the
+  relaxed posture is recoverable from both operator logs and the audit
+  store. **This is a breaking change** — see `### Upgrade notes` below.
+  Closes #802.
+
+- **HIGH-2 (PR #883 governance review): session-revocation REST surface
+  now reports audit-emission outcome on the response so a silent audit
+  persistence failure (locked audit DB, disk full, pipeline exception)
+  cannot masquerade as 200 OK SOC 2 CC6.6 evidence.** The `AuditFn`
+  callback (`std::function<…>` in `rest_api_v1.hpp`) and the underlying
+  `AuditStore::log` primitive now return `bool` rather than `void`; the
+  bool propagates through `AuthRoutes::audit_log` and `Server::audit_log`.
+  Existing call sites that fire-and-forget continue to compile — the
+  bool is just discarded. The two session-revocation handlers
+  (`DELETE /api/v1/sessions` and `DELETE /api/v1/sessions/me`) now wrap
+  `audit_fn` in try/catch and surface failure via:
+  - `Sec-Audit-Failed: true` response header (out-of-band signal for
+    SREs scraping responses or evidence integrity dashboards).
+  - `audit_emitted: false` field in the success-body JSON envelope.
+  The revoke side-effect still completes when audit emission fails —
+  operator's "stop NOW" intent takes precedence over evidence
+  integrity, and the partial-success signal lets the operator decide
+  whether to retry. Closes the silent-failure gap flagged in the PR
+  #883 governance review.
+- **HIGH-1 (PR #883 governance review): `ApiTokenStore::validate_token`
+  cache write now skipped when a revoke races our DB SELECT.** Added a
+  `revoke_generation_` atomic counter bumped by `revoke_token`,
+  `revoke_for_principal`, and `delete_token` before each UPDATE/DELETE.
+  `validate_token` snapshots the generation before its SELECT and
+  re-reads before the cache write — if it moved, we lost the race and
+  do not populate the cache with the now-stale (revoked=false) view
+  that would otherwise survive for up to 60 s (the
+  `kTokenCacheTtl`). Belt-and-suspenders: the existing `db_mtx_`
+  exclusive lock already spans SELECT through cache write and prevents
+  the interleave, but the explicit generation re-check survives any
+  future refactor that narrows the lock scope.
+
 ### Added
 
 - **Per-host IPC-graph drill-down (`/viz/host/<agent_id>`).** Double-clicking
@@ -58,6 +109,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `remote_addr` at the parser to bound the wire payload
   regardless of agent behaviour. Test-pinned JS bundle ceiling
   raised 80 KB → 96 KB to fit the new primitives.
+
+- **Session revocation REST surface (SOC 2 CC6.3 revocation, CC6.7
+  disposition, CC6.8 termination evidence).**
+  - `DELETE /api/v1/sessions?username=<name>` — admin force-logout via
+    `UserManagement:Write`. Wipes cookie sessions only; API tokens are
+    deliberately left intact (operator may be revoking a leaked cookie
+    while leaving CI/CD automation running). `username` is validated
+    via `is_valid_username` so NUL bytes / control characters / newlines
+    cannot truncate the SQL bind in a way that diverges from the
+    in-memory `==` compare and silently mis-targets revocation.
+  - `DELETE /api/v1/sessions/me` — authenticated self-revoke "Sign out
+    everywhere". Wipes cookie sessions AND revokes every API token
+    belonging to the caller, so a stolen-laptop scenario kills every
+    credential bearing the user's identity in one call. Sets
+    `Set-Cookie: yuzu_session=; Max-Age=0` on the response so the
+    client side completes the disposition. Rejected with 403 for
+    MCP-tier and service-scoped tokens — those credential classes have
+    no other write privilege and accepting them here would create a
+    novel DoS surface against the human owner.
+  - `AuthManager::invalidate_user_sessions` is now public, returns a
+    `RevokeResult { count, db_persisted }`, and performs the dual-write
+    explicitly. The in-memory wipe runs even on AuthDB DELETE failure
+    (the operator's "stop NOW" mental model demands the active session
+    die immediately), but `db_persisted=false` propagates up so the
+    REST handler audits with `result="partial"` and `detail` includes
+    `db_error=true`. A SOC 2 auditor reading the audit log can
+    distinguish a confirmed durable revocation from a partial one
+    awaiting retry/restart. Defence-in-depth: the AuthDB primitive
+    `invalidate_all_sessions` itself now validates username (sibling
+    primitives `add_user`, `update_role` already did).
+  - `ApiTokenStore::revoke_for_principal` — new public method,
+    transactionally marks every non-revoked token for a principal as
+    revoked and invalidates the in-memory validate-token cache so the
+    revocation takes effect within the next request, not after the
+    60-second TTL.
+  - Two distinct audit actions: `session.revoke_all` (admin cross-user)
+    and `session.revoke_all.self` (self via either route, including
+    admin self-target through the admin path; recoverable by re-auth,
+    distinguishable in SIEM). Audit `target_type` is the project-wide
+    PascalCase `User`. `result` is one of `success`/`partial`/`denied`.
+  - New Prometheus counter
+    `yuzu_auth_sessions_revoked_total{caller, result, scope}` — CC7.2
+    anomaly-detection signal for "100 revokes/minute" patterns.
+  - Settings → Users grows "Revoke sessions" (`btn-danger`) per non-self
+    row and "Sign out everywhere" on the operator's own row, with
+    `hx-confirm` blast-radius messaging that explicitly states whether
+    API tokens are revoked. The admin button uses
+    `hx-target="#user-section" hx-swap="innerHTML"` so the section
+    re-renders cleanly after a revoke (without it, HTMX swapped the
+    raw JSON into the button itself).
+  - Operator runbook in `docs/user-manual/server-admin.md` ("Force-
+    logging out a user (incident response)") and emergency manual-
+    revocation recipe in `docs/ops-runbooks/auth-db-recovery.md`.
+  - 16 unit tests in `tests/unit/server/test_rest_sessions.cpp` and 3
+    direct AuthManager tests in `tests/unit/server/test_auth.cpp`
+    pinning the REST contract, the dual-write semantics, the
+    multi-token wipe, and idempotency.
+
+  Self-target through the admin path is permitted (recoverable by
+  re-auth) and audited as `.self`; this is a deliberately weaker
+  guard than the `#397/#403` self-target guard on DELETE-user /
+  role-demote, which exists to prevent admin-role self-lockout (an
+  unrecoverable state).
 
 ### Changed
 
@@ -113,6 +227,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Gateway peer-mismatch enforcement (Sprint 1 W1.3 — closes #826).**
+  Plus rejection-collapse + enriched-error-payload **infrastructure**
+  for #1052 / #1053 — those issues remain OPEN; W1.4 will be the first
+  consumer to exercise the new helpers and the audit/counter signals.
+  - **#826 (P1 security).** `AgentServiceImpl::Subscribe` no longer skips
+    peer validation when `--gateway-mode` is set. The blanket skip
+    enabled session-id hijacking — an attacker on the gateway network
+    segment could intercept a Register response, lift the plaintext
+    `session_id` (non-mTLS deployment), and open Subscribe from an
+    arbitrary IP. The new rule: Subscribe peer IP must match the
+    Register peer IP, OR (under `--gateway-mode`) be a previously
+    recorded trusted gateway IP. Trusted gateways are noted at
+    `GatewayUpstreamServiceImpl::ProxyRegister` time **only on a
+    successful enrollment branch** (round-2 hardening); the set is in-
+    memory with 1h TTL + 1024-entry LRU cap + new
+    `yuzu_trusted_gateway_peer_set_size` gauge. A new helper
+    `extract_peer_ip` (now in `peer_ip.hpp`) normalises the gRPC peer
+    encoding (`ipv4:1.2.3.4:5678`, `ipv6:[::1]:443`, `unix:/...`) so
+    port-rotation between Register and Subscribe RPCs doesn't trigger
+    spurious mismatches. New counter
+    `yuzu_grpc_subscribe_peer_mismatch_total{gateway_mode}` lets SRE
+    distinguish "agent reconnected from a new IP" (steady state) from
+    "stolen session_id" (active attack). **Layered defence note:** an
+    attacker who sits inside the gateway's IP space (sidecar container,
+    compromised host on the same node) AND has a sniffed `session_id`
+    still passes. W1.4 (atomic enrollment + session-token binding,
+    #827) is the layer that closes that. Don't claim "session theft
+    mitigated" from this PR alone.
+  - **#1053 infrastructure (W1.4 prereq, NOT closed by W1.3).**
+    `DeviceTokenStore::validate_token` now returns
+    `std::expected<DeviceAuthToken, RejectedToken>` (was the bare
+    enum). The new `RejectedToken` struct carries typed `error` plus
+    `token_id`, `bound_device_id`, and `bound_principal_id` so the
+    eventual W1.4 handler can emit a complete audit row WITHOUT a
+    second SELECT (which would add latency and create a timing oracle
+    distinguishing `binding_mismatch` from `not_found`). The type
+    signature is now W1.4's hard predecessor — the compiler refuses to
+    let the handler skip the rich-context path. **No production
+    consumer exists in this PR.** Per-variant population rules in the
+    `RejectedToken` docstring; `unbound_legacy` explicitly leaves
+    `bound_device_id` empty because the row has no binding by
+    construction.
+  - **#1052 infrastructure (W1.4 prereq, NOT closed by W1.3).**
+    New `device_token_rejection.hpp` defines the wire-collapse
+    contract in one reviewable place: `make_public_rejection()` and
+    `make_grpc_rejection_status()` return the SAME 401 /
+    `UNAUTHENTICATED` envelope across every rejection variant. The
+    typed variant surfaces only in `rejection_detail()` (audit-row
+    `detail` field) and `rejection_metric_name()` (Prometheus counter
+    name). **No production code calls these helpers in this PR**
+    (`validate_token` has no caller yet). Unit tests pin the byte-
+    identical envelope contract; latency-band parity (the third leg
+    of the #1052 acceptance criterion) is an integration-test follow-
+    up. W1.4 must wire the first consumer and verify the integration-
+    level latency assertion before #1052 closes.
+  - **Operator counters (DESCRIBED, not yet incremented).** Three
+    high-signal device-token counter names are reserved by
+    `metrics_.describe(...)` in `server.cpp` for W1.4 to start
+    incrementing: `yuzu_device_token_binding_mismatch_total`
+    (stolen-token impersonation in progress),
+    `yuzu_device_token_unbound_legacy_total` (rotate the legacy
+    any-device token), and `yuzu_device_token_revoked_attempt_total`
+    (replay attempt). Plus a low-signal bucket
+    `yuzu_device_token_rejected_total{variant=...}`. These will
+    return 0 from `/metrics` until W1.4 wires the consumer.
 - **Fleet-topology push-ingestion hardening (governance Gate 7).**
   Round of fixes to `FleetTopologyStore` push ingestion:
   - **Parser field caps (UP-1 / sec-M1).** `processes[].name`,
@@ -146,6 +325,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     audit store, not just process logs.
 
 ### Upgrade notes
+
+- **BREAKING — unsigned product packs no longer install by default
+  (#802 / W7.4).** Operators with unsigned packs in their environment
+  will see `install` calls fail after upgrade with `pack '<name>' is
+  unsigned and require_signed_packs is enabled`. Two recommended
+  migration paths:
+  1. **Sign the packs** (preferred) — generate an Ed25519 keypair, sign
+     each pack's content with the private key, and add `signature:` +
+     `publicKey:` fields to each pack's `ProductPack` document. Pack
+     install then routes through the existing verify path and succeeds.
+  2. **Opt out temporarily** — set `--allow-unsigned-packs` /
+     `YUZU_ALLOW_UNSIGNED_PACKS=1` to restore the pre-upgrade behaviour.
+     A startup `spdlog::warn` and a `server.unsigned_packs_allowed`
+     audit row will be emitted on every server start so the relaxed
+     posture is loud in both operator logs and the audit store.
+     Remove the flag as soon as the pack-signing migration completes.
+
+  Pre-existing installed packs are unaffected — the check fires only on
+  `install_pack` (new installs / upgrades). Pack list/get/uninstall
+  paths do not re-verify.
 
 - **Interval triggers were previously non-functional.** After upgrading
   the agent daemon, registered interval triggers begin firing for the

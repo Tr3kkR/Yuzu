@@ -5,6 +5,8 @@
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
 
+#include <yuzu/server/auth_db.hpp>  // is_valid_username
+
 // nlohmann/json is retained ONLY for parsing request bodies (json::parse).
 // All response JSON is built via the lightweight JObj/JArr helpers below,
 // which produce strings directly and avoid the template-instantiation
@@ -34,22 +36,36 @@ void json_escape(std::string& out, std::string_view sv) {
     out.reserve(out.size() + sv.size());
     for (char c : sv) {
         switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b";  break;
-            case '\f': out += "\\f";  break;
-            case '\n': out += "\\n";  break;
-            case '\r': out += "\\r";  break;
-            case '\t': out += "\\t";  break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    char hex[8];
-                    std::snprintf(hex, sizeof(hex), "\\u%04x",
-                                  static_cast<unsigned int>(static_cast<unsigned char>(c)));
-                    out += hex;
-                } else {
-                    out += c;
-                }
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                char hex[8];
+                std::snprintf(hex, sizeof(hex), "\\u%04x",
+                              static_cast<unsigned int>(static_cast<unsigned char>(c)));
+                out += hex;
+            } else {
+                out += c;
+            }
         }
     }
 }
@@ -60,29 +76,46 @@ class JObj {
     int n_ = 0;
 
     void pre() { buf_ += (n_++ ? ',' : '{'); }
-    void key(std::string_view k) { pre(); buf_ += '"'; json_escape(buf_, k); buf_ += "\":"; }
+    void key(std::string_view k) {
+        pre();
+        buf_ += '"';
+        json_escape(buf_, k);
+        buf_ += "\":";
+    }
 
 public:
     JObj() = default;
 
     JObj& add(std::string_view k, std::string_view v) {
-        key(k); buf_ += '"'; json_escape(buf_, v); buf_ += '"'; return *this;
+        key(k);
+        buf_ += '"';
+        json_escape(buf_, v);
+        buf_ += '"';
+        return *this;
     }
     JObj& add(std::string_view k, const std::string& v) { return add(k, std::string_view(v)); }
-    JObj& add(std::string_view k, const char* v)        { return add(k, std::string_view(v)); }
+    JObj& add(std::string_view k, const char* v) { return add(k, std::string_view(v)); }
     JObj& add(std::string_view k, int64_t v) {
-        key(k); buf_ += std::to_string(v); return *this;
+        key(k);
+        buf_ += std::to_string(v);
+        return *this;
     }
-    JObj& add(std::string_view k, int v)    { return add(k, static_cast<int64_t>(v)); }
+    JObj& add(std::string_view k, int v) { return add(k, static_cast<int64_t>(v)); }
     JObj& add(std::string_view k, double v) {
-        key(k); buf_ += std::format("{:.2f}", v); return *this;
+        key(k);
+        buf_ += std::format("{:.2f}", v);
+        return *this;
     }
     JObj& add(std::string_view k, bool v) {
-        key(k); buf_ += v ? "true" : "false"; return *this;
+        key(k);
+        buf_ += v ? "true" : "false";
+        return *this;
     }
     /// Embed a pre-serialized JSON fragment (object, array, literal).
     JObj& raw(std::string_view k, std::string_view json) {
-        key(k); buf_ += json; return *this;
+        key(k);
+        buf_ += json;
+        return *this;
     }
 
     [[nodiscard]] std::string str() const { return n_ ? buf_ + '}' : "{}"; }
@@ -97,15 +130,21 @@ public:
     JArr() = default;
 
     JArr& add(const JObj& obj) {
-        buf_ += (n_++ ? ',' : '['); buf_ += obj.str(); return *this;
+        buf_ += (n_++ ? ',' : '[');
+        buf_ += obj.str();
+        return *this;
     }
     JArr& add(std::string_view s) {
         buf_ += (n_++ ? ',' : '[');
-        buf_ += '"'; json_escape(buf_, s); buf_ += '"';
+        buf_ += '"';
+        json_escape(buf_, s);
+        buf_ += '"';
         return *this;
     }
     JArr& add_raw(std::string_view json) {
-        buf_ += (n_++ ? ',' : '['); buf_ += json; return *this;
+        buf_ += (n_++ ? ',' : '[');
+        buf_ += json;
+        return *this;
     }
 
     [[nodiscard]] std::string str() const { return n_ ? buf_ + ']' : "[]"; }
@@ -131,7 +170,7 @@ std::string error_json(std::string_view message, int code = 0) {
 }
 
 std::string list_json(std::string_view data_json, int64_t total, int64_t start = 0,
-                       int64_t page_size = 50) {
+                      int64_t page_size = 50) {
     auto pag = JObj().add("total", total).add("start", start).add("page_size", page_size).str();
     return JObj()
         .raw("data", data_json)
@@ -146,7 +185,8 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
 // list that required 56 GB+ of compiler memory.
 
 const std::string& openapi_spec() {
-    static const std::string spec = R"json({
+    static const std::string spec =
+        R"json({
   "openapi": "3.0.3",
   "info": {
     "title": "Yuzu Server REST API",
@@ -336,10 +376,10 @@ const std::string& openapi_spec() {
       "post": {"summary": "Assign a role on a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"201": {"description": "Role assigned"}}},
       "delete": {"summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}}}
     })json"
-    // Split here so each raw-string literal stays under MSVC's 16,380-byte
-    // C2026 cap. Adjacent string literals are concatenated at compile time,
-    // so the emitted OpenAPI JSON is byte-identical to the unsplit form.
-    R"json(,
+        // Split here so each raw-string literal stays under MSVC's 16,380-byte
+        // C2026 cap. Adjacent string literals are concatenated at compile time,
+        // so the emitted OpenAPI JSON is byte-identical to the unsplit form.
+        R"json(,
     "/tokens": {
       "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "responses": {"200": {"description": "List of API tokens"}}},
       "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}}}
@@ -417,10 +457,10 @@ const std::string& openapi_spec() {
       "put": {"summary": "Replace a response template in place", "tags": ["Definitions"], "description": "Requires InstructionDefinition:Write. PUT against template_id=__default__ returns 400 (synthesised default cannot be overwritten). Body size capped at 64 KiB.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "template_id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ResponseTemplate"}}}}, "responses": {"200": {"description": "Template replaced"}, "400": {"description": "Reserved id / malformed / invalid JSON / validation failure"}, "404": {"description": "Definition or template not found"}, "413": {"description": "Body exceeds 64 KiB cap"}, "500": {"description": "Persist failure"}, "503": {"description": "Service unavailable"}}},
       "delete": {"summary": "Delete a response template", "tags": ["Definitions"], "description": "Requires InstructionDefinition:Write. Reserved id __default__ cannot be deleted (returns 400).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "template_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Template removed"}, "400": {"description": "Malformed id or reserved id"}, "404": {"description": "Definition or template not found"}, "500": {"description": "Persist failure"}, "503": {"description": "Service unavailable"}}}
     })json"
-    // Split here so each raw-string literal stays under MSVC's 16,380-byte
-    // C2026 cap. Adjacent string literals are concatenated at compile time,
-    // so the emitted OpenAPI JSON is byte-identical to the unsplit form.
-    R"json(,
+        // Split here so each raw-string literal stays under MSVC's 16,380-byte
+        // C2026 cap. Adjacent string literals are concatenated at compile time,
+        // so the emitted OpenAPI JSON is byte-identical to the unsplit form.
+        R"json(,
     "/guaranteed-state/rules": {
       "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "503": {"description": "service unavailable"}}},
       "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields or invalid JSON"}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
@@ -457,54 +497,45 @@ const std::string& openapi_spec() {
 // Production overload — wraps httplib::Server in an HttplibRouteSink and
 // delegates to the sink-based implementation below. Tests bypass this and
 // call the sink overload directly with their own TestRouteSink (#438).
-void RestApiV1::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
-                                AuditFn audit_fn, RbacStore* rbac_store,
-                                ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
-                                QuarantineStore* quarantine_store, ResponseStore* response_store,
-                                InstructionStore* instruction_store,
-                                ExecutionTracker* execution_tracker,
-                                ScheduleEngine* schedule_engine, ApprovalManager* approval_manager,
-                                TagStore* tag_store, AuditStore* audit_store,
-                                ServiceGroupFn service_group_fn, TagPushFn tag_push_fn,
-                                InventoryStore* inventory_store,
-                                ProductPackStore* product_pack_store,
-                                SoftwareDeploymentStore* sw_deploy_store,
-                                DeviceTokenStore* device_token_store,
-                                LicenseStore* license_store,
-                                GuaranteedStateStore* guaranteed_state_store) {
+void RestApiV1::register_routes(
+    httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn, RbacStore* rbac_store,
+    ManagementGroupStore* mgmt_store, ApiTokenStore* token_store, QuarantineStore* quarantine_store,
+    ResponseStore* response_store, InstructionStore* instruction_store,
+    ExecutionTracker* execution_tracker, ScheduleEngine* schedule_engine,
+    ApprovalManager* approval_manager, TagStore* tag_store, AuditStore* audit_store,
+    ServiceGroupFn service_group_fn, TagPushFn tag_push_fn, InventoryStore* inventory_store,
+    ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
+    DeviceTokenStore* device_token_store, LicenseStore* license_store,
+    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
+    SessionRevokeFn session_revoke_fn) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
-                    rbac_store, mgmt_store, token_store, quarantine_store, response_store,
-                    instruction_store, execution_tracker, schedule_engine, approval_manager,
-                    tag_store, audit_store, std::move(service_group_fn), std::move(tag_push_fn),
-                    inventory_store, product_pack_store, sw_deploy_store, device_token_store,
-                    license_store, guaranteed_state_store);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
+                    mgmt_store, token_store, quarantine_store, response_store, instruction_store,
+                    execution_tracker, schedule_engine, approval_manager, tag_store, audit_store,
+                    std::move(service_group_fn), std::move(tag_push_fn), inventory_store,
+                    product_pack_store, sw_deploy_store, device_token_store, license_store,
+                    guaranteed_state_store, metrics_registry, std::move(session_revoke_fn));
 }
 
-void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                                AuditFn audit_fn, RbacStore* rbac_store,
-                                ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
-                                QuarantineStore* quarantine_store, ResponseStore* response_store,
-                                InstructionStore* instruction_store,
-                                ExecutionTracker* execution_tracker,
-                                ScheduleEngine* schedule_engine, ApprovalManager* approval_manager,
-                                TagStore* tag_store, AuditStore* audit_store,
-                                ServiceGroupFn service_group_fn, TagPushFn tag_push_fn,
-                                InventoryStore* inventory_store,
-                                ProductPackStore* product_pack_store,
-                                SoftwareDeploymentStore* sw_deploy_store,
-                                DeviceTokenStore* device_token_store,
-                                LicenseStore* license_store,
-                                GuaranteedStateStore* guaranteed_state_store) {
+void RestApiV1::register_routes(
+    HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn, RbacStore* rbac_store,
+    ManagementGroupStore* mgmt_store, ApiTokenStore* token_store, QuarantineStore* quarantine_store,
+    ResponseStore* response_store, InstructionStore* instruction_store,
+    ExecutionTracker* execution_tracker, ScheduleEngine* schedule_engine,
+    ApprovalManager* approval_manager, TagStore* tag_store, AuditStore* audit_store,
+    ServiceGroupFn service_group_fn, TagPushFn tag_push_fn, InventoryStore* inventory_store,
+    ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
+    DeviceTokenStore* device_token_store, LicenseStore* license_store,
+    GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
+    SessionRevokeFn session_revoke_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
     // ── CORS preflight handler for /api/v1/* ─────────────────────────────
     // Actual CORS headers are added by the post-routing handler in server.cpp
     // with origin allowlist validation.
-    sink.Options(R"(/api/v1/.*)", [](const httplib::Request&, httplib::Response& res) {
-        res.status = 204;
-    });
+    sink.Options(R"(/api/v1/.*)",
+                 [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
 
     // ── OpenAPI spec endpoint (/api/v1/openapi.json) ─────────────────────
     sink.Get("/api/v1/openapi.json", [](const httplib::Request&, httplib::Response& res) {
@@ -513,14 +544,14 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
 
     // ── /api/v1/me ───────────────────────────────────────────────────────
 
-    sink.Get("/api/v1/me", [auth_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/api/v1/me", [auth_fn, rbac_store](const httplib::Request& req,
+                                                 httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session)
             return;
 
         JObj data;
-        data.add("username", session->username)
-            .add("role", auth::role_to_string(session->role));
+        data.add("username", session->username).add("role", auth::role_to_string(session->role));
 
         if (rbac_store && rbac_store->is_rbac_enabled()) {
             data.add("rbac_enabled", true);
@@ -533,8 +564,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             }
         } else {
             data.add("rbac_enabled", false);
-            data.add("rbac_role",
-                     session->role == auth::Role::admin ? "Administrator" : "Viewer");
+            data.add("rbac_role", session->role == auth::Role::admin ? "Administrator" : "Viewer");
         }
         res.set_content(ok_json(data.str()), "application/json");
     });
@@ -542,35 +572,36 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // ── Management Groups (/api/v1/management-groups) ────────────────────
 
     sink.Get("/api/v1/management-groups",
-            [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "ManagementGroup", "Read"))
-                    return;
-                if (!mgmt_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+             [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
+                     return;
+                 if (!mgmt_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
 
-                auto groups = mgmt_store->list_groups();
-                JArr arr;
-                for (const auto& g : groups) {
-                    arr.add(JObj()
-                                .add("id", g.id)
-                                .add("name", g.name)
-                                .add("description", g.description)
-                                .add("parent_id", g.parent_id)
-                                .add("membership_type", g.membership_type)
-                                .add("scope_expression", g.scope_expression)
-                                .add("created_by", g.created_by)
-                                .add("created_at", g.created_at)
-                                .add("updated_at", g.updated_at));
-                }
-                res.set_content(list_json(arr.str(), static_cast<int64_t>(groups.size())),
-                                "application/json");
-            });
+                 auto groups = mgmt_store->list_groups();
+                 JArr arr;
+                 for (const auto& g : groups) {
+                     arr.add(JObj()
+                                 .add("id", g.id)
+                                 .add("name", g.name)
+                                 .add("description", g.description)
+                                 .add("parent_id", g.parent_id)
+                                 .add("membership_type", g.membership_type)
+                                 .add("scope_expression", g.scope_expression)
+                                 .add("created_by", g.created_by)
+                                 .add("created_at", g.created_at)
+                                 .add("updated_at", g.updated_at));
+                 }
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(groups.size())),
+                                 "application/json");
+             });
 
-    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn, mgmt_store](
-                                              const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn,
+                                            mgmt_store](const httplib::Request& req,
+                                                        httplib::Response& res) {
         if (!perm_fn(req, res, "ManagementGroup", "Write"))
             return;
         if (!mgmt_store) {
@@ -609,117 +640,116 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     });
 
     sink.Get(R"(/api/v1/management-groups/([a-f0-9]+))",
-            [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "ManagementGroup", "Read"))
-                    return;
-                if (!mgmt_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+             [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
+                     return;
+                 if (!mgmt_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
 
-                auto id = req.matches[1].str();
-                auto g = mgmt_store->get_group(id);
-                if (!g) {
-                    res.status = 404;
-                    res.set_content(error_json("group not found"), "application/json");
-                    return;
-                }
-                auto members = mgmt_store->get_members(id);
-                JArr member_arr;
-                for (const auto& m : members)
-                    member_arr.add(JObj()
-                                       .add("agent_id", m.agent_id)
-                                       .add("source", m.source)
-                                       .add("added_at", m.added_at));
+                 auto id = req.matches[1].str();
+                 auto g = mgmt_store->get_group(id);
+                 if (!g) {
+                     res.status = 404;
+                     res.set_content(error_json("group not found"), "application/json");
+                     return;
+                 }
+                 auto members = mgmt_store->get_members(id);
+                 JArr member_arr;
+                 for (const auto& m : members)
+                     member_arr.add(JObj()
+                                        .add("agent_id", m.agent_id)
+                                        .add("source", m.source)
+                                        .add("added_at", m.added_at));
 
-                auto data = JObj()
-                                .add("id", g->id)
-                                .add("name", g->name)
-                                .add("description", g->description)
-                                .add("parent_id", g->parent_id)
-                                .add("membership_type", g->membership_type)
-                                .add("scope_expression", g->scope_expression)
-                                .add("created_by", g->created_by)
-                                .add("created_at", g->created_at)
-                                .add("updated_at", g->updated_at)
-                                .raw("members", member_arr.str());
-                res.set_content(ok_json(data.str()), "application/json");
-            });
+                 auto data = JObj()
+                                 .add("id", g->id)
+                                 .add("name", g->name)
+                                 .add("description", g->description)
+                                 .add("parent_id", g->parent_id)
+                                 .add("membership_type", g->membership_type)
+                                 .add("scope_expression", g->scope_expression)
+                                 .add("created_by", g->created_by)
+                                 .add("created_at", g->created_at)
+                                 .add("updated_at", g->updated_at)
+                                 .raw("members", member_arr.str());
+                 res.set_content(ok_json(data.str()), "application/json");
+             });
 
     // Update group (rename, re-parent, change description/membership)
-    sink.Put(R"(/api/v1/management-groups/([a-f0-9]+))",
-            [auth_fn, perm_fn, audit_fn, mgmt_store](const httplib::Request& req,
-                                                      httplib::Response& res) {
-                if (!perm_fn(req, res, "ManagementGroup", "Write"))
-                    return;
-                if (!mgmt_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+    sink.Put(R"(/api/v1/management-groups/([a-f0-9]+))", [auth_fn, perm_fn, audit_fn,
+                                                          mgmt_store](const httplib::Request& req,
+                                                                      httplib::Response& res) {
+        if (!perm_fn(req, res, "ManagementGroup", "Write"))
+            return;
+        if (!mgmt_store) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
 
-                auto id = req.matches[1].str();
-                auto existing = mgmt_store->get_group(id);
-                if (!existing) {
-                    res.status = 404;
-                    res.set_content(error_json("group not found"), "application/json");
-                    return;
-                }
+        auto id = req.matches[1].str();
+        auto existing = mgmt_store->get_group(id);
+        if (!existing) {
+            res.status = 404;
+            res.set_content(error_json("group not found"), "application/json");
+            return;
+        }
 
-                auto body = nlohmann::json::parse(req.body, nullptr, false);
-                if (body.is_discarded()) {
-                    res.status = 400;
-                    res.set_content(error_json("invalid JSON"), "application/json");
-                    return;
-                }
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            res.set_content(error_json("invalid JSON"), "application/json");
+            return;
+        }
 
-                auto updated = *existing;
-                if (body.contains("name"))
-                    updated.name = body["name"].get<std::string>();
-                if (body.contains("description"))
-                    updated.description = body["description"].get<std::string>();
-                if (body.contains("parent_id"))
-                    updated.parent_id = body["parent_id"].get<std::string>();
-                if (body.contains("membership_type"))
-                    updated.membership_type = body["membership_type"].get<std::string>();
-                if (body.contains("scope_expression"))
-                    updated.scope_expression = body["scope_expression"].get<std::string>();
+        auto updated = *existing;
+        if (body.contains("name"))
+            updated.name = body["name"].get<std::string>();
+        if (body.contains("description"))
+            updated.description = body["description"].get<std::string>();
+        if (body.contains("parent_id"))
+            updated.parent_id = body["parent_id"].get<std::string>();
+        if (body.contains("membership_type"))
+            updated.membership_type = body["membership_type"].get<std::string>();
+        if (body.contains("scope_expression"))
+            updated.scope_expression = body["scope_expression"].get<std::string>();
 
-                if (id == ManagementGroupStore::kRootGroupId && !updated.parent_id.empty()) {
-                    res.status = 400;
-                    res.set_content(error_json("cannot re-parent root group"), "application/json");
-                    return;
-                }
+        if (id == ManagementGroupStore::kRootGroupId && !updated.parent_id.empty()) {
+            res.status = 400;
+            res.set_content(error_json("cannot re-parent root group"), "application/json");
+            return;
+        }
 
-                if (!updated.parent_id.empty() && updated.parent_id != existing->parent_id) {
-                    auto descendants = mgmt_store->get_descendant_ids(id);
-                    if (std::find(descendants.begin(), descendants.end(), updated.parent_id) !=
-                        descendants.end()) {
-                        res.status = 400;
-                        res.set_content(error_json("re-parenting would create a cycle"),
-                                        "application/json");
-                        return;
-                    }
-                    auto ancestors = mgmt_store->get_ancestor_ids(updated.parent_id);
-                    if (ancestors.size() >= 4) {
-                        res.status = 400;
-                        res.set_content(error_json("maximum hierarchy depth (5) exceeded"),
-                                        "application/json");
-                        return;
-                    }
-                }
+        if (!updated.parent_id.empty() && updated.parent_id != existing->parent_id) {
+            auto descendants = mgmt_store->get_descendant_ids(id);
+            if (std::find(descendants.begin(), descendants.end(), updated.parent_id) !=
+                descendants.end()) {
+                res.status = 400;
+                res.set_content(error_json("re-parenting would create a cycle"),
+                                "application/json");
+                return;
+            }
+            auto ancestors = mgmt_store->get_ancestor_ids(updated.parent_id);
+            if (ancestors.size() >= 4) {
+                res.status = 400;
+                res.set_content(error_json("maximum hierarchy depth (5) exceeded"),
+                                "application/json");
+                return;
+            }
+        }
 
-                auto result = mgmt_store->update_group(updated);
-                if (!result) {
-                    res.status = 400;
-                    res.set_content(error_json(result.error()), "application/json");
-                    return;
-                }
-                audit_fn(req, "management_group.update", "success", "ManagementGroup", id,
-                         updated.name);
-                res.set_content(ok_json(JObj().add("updated", true).str()), "application/json");
-            });
+        auto result = mgmt_store->update_group(updated);
+        if (!result) {
+            res.status = 400;
+            res.set_content(error_json(result.error()), "application/json");
+            return;
+        }
+        audit_fn(req, "management_group.update", "success", "ManagementGroup", id, updated.name);
+        res.set_content(ok_json(JObj().add("updated", true).str()), "application/json");
+    });
 
     sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+))",
@@ -745,29 +775,29 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
 
     // Members
     sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
-             [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "ManagementGroup", "Write"))
-                     return;
-                 if (!mgmt_store) {
-                     res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
-                     return;
-                 }
+              [perm_fn, audit_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+                  if (!perm_fn(req, res, "ManagementGroup", "Write"))
+                      return;
+                  if (!mgmt_store) {
+                      res.status = 503;
+                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      return;
+                  }
 
-                 auto group_id = req.matches[1].str();
-                 auto body = nlohmann::json::parse(req.body, nullptr, false);
-                 auto agent_id = body.value("agent_id", "");
-                 if (agent_id.empty()) {
-                     res.status = 400;
-                     res.set_content(error_json("agent_id required"), "application/json");
-                     return;
-                 }
-                 mgmt_store->add_member(group_id, agent_id);
-                 audit_fn(req, "management_group.add_member", "success", "ManagementGroup",
-                          group_id, agent_id);
-                 res.status = 201;
-                 res.set_content(ok_json(JObj().add("added", true).str()), "application/json");
-             });
+                  auto group_id = req.matches[1].str();
+                  auto body = nlohmann::json::parse(req.body, nullptr, false);
+                  auto agent_id = body.value("agent_id", "");
+                  if (agent_id.empty()) {
+                      res.status = 400;
+                      res.set_content(error_json("agent_id required"), "application/json");
+                      return;
+                  }
+                  mgmt_store->add_member(group_id, agent_id);
+                  audit_fn(req, "management_group.add_member", "success", "ManagementGroup",
+                           group_id, agent_id);
+                  res.status = 201;
+                  res.set_content(ok_json(JObj().add("added", true).str()), "application/json");
+              });
 
     sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",
@@ -791,108 +821,106 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // ── Management Group Roles (/api/v1/management-groups/:id/roles) ────
 
     sink.Get(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
-            [perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "ManagementGroup", "Read"))
-                    return;
-                if (!mgmt_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+             [perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
+                     return;
+                 if (!mgmt_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
 
-                auto group_id = req.matches[1].str();
-                auto roles = mgmt_store->get_group_roles(group_id);
-                JArr arr;
-                for (const auto& r : roles) {
-                    arr.add(JObj()
-                                .add("group_id", r.group_id)
-                                .add("principal_type", r.principal_type)
-                                .add("principal_id", r.principal_id)
-                                .add("role_name", r.role_name));
-                }
-                res.set_content(ok_json(arr.str()), "application/json");
-            });
+                 auto group_id = req.matches[1].str();
+                 auto roles = mgmt_store->get_group_roles(group_id);
+                 JArr arr;
+                 for (const auto& r : roles) {
+                     arr.add(JObj()
+                                 .add("group_id", r.group_id)
+                                 .add("principal_type", r.principal_type)
+                                 .add("principal_id", r.principal_id)
+                                 .add("role_name", r.role_name));
+                 }
+                 res.set_content(ok_json(arr.str()), "application/json");
+             });
 
-    sink.Post(
-        R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
-        [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
-                                                              httplib::Response& res) {
-            auto session = auth_fn(req, res);
-            if (!session)
-                return;
-            if (!mgmt_store || !rbac_store) {
-                res.status = 503;
-                res.set_content(error_json("service unavailable", 503), "application/json");
-                return;
-            }
+    sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
+              [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
+                                                                   httplib::Response& res) {
+                  auto session = auth_fn(req, res);
+                  if (!session)
+                      return;
+                  if (!mgmt_store || !rbac_store) {
+                      res.status = 503;
+                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      return;
+                  }
 
-            auto group_id = req.matches[1].str();
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded()) {
-                res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
-                return;
-            }
+                  auto group_id = req.matches[1].str();
+                  auto body = nlohmann::json::parse(req.body, nullptr, false);
+                  if (body.is_discarded()) {
+                      res.status = 400;
+                      res.set_content(error_json("invalid JSON"), "application/json");
+                      return;
+                  }
 
-            auto principal_type = body.value("principal_type", "user");
-            auto principal_id = body.value("principal_id", "");
-            auto role_name = body.value("role_name", "");
+                  auto principal_type = body.value("principal_type", "user");
+                  auto principal_id = body.value("principal_id", "");
+                  auto role_name = body.value("role_name", "");
 
-            if (principal_id.empty() || role_name.empty()) {
-                res.status = 400;
-                res.set_content(error_json("principal_id and role_name required"),
-                                "application/json");
-                return;
-            }
+                  if (principal_id.empty() || role_name.empty()) {
+                      res.status = 400;
+                      res.set_content(error_json("principal_id and role_name required"),
+                                      "application/json");
+                      return;
+                  }
 
-            if (role_name != "Operator" && role_name != "Viewer") {
-                res.status = 403;
-                res.set_content(
-                    error_json("only Operator and Viewer roles can be delegated"),
-                    "application/json");
-                return;
-            }
+                  if (role_name != "Operator" && role_name != "Viewer") {
+                      res.status = 403;
+                      res.set_content(error_json("only Operator and Viewer roles can be delegated"),
+                                      "application/json");
+                      return;
+                  }
 
-            bool authorized = rbac_store->check_permission(session->username, "ManagementGroup",
-                                                           "Write");
-            if (!authorized) {
-                auto group_roles = mgmt_store->get_group_roles(group_id);
-                for (const auto& gr : group_roles) {
-                    if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                        gr.role_name == "ITServiceOwner") {
-                        authorized = true;
-                        break;
-                    }
-                }
-            }
-            if (!authorized) {
-                res.status = 403;
-                res.set_content(error_json("forbidden"), "application/json");
-                return;
-            }
+                  bool authorized =
+                      rbac_store->check_permission(session->username, "ManagementGroup", "Write");
+                  if (!authorized) {
+                      auto group_roles = mgmt_store->get_group_roles(group_id);
+                      for (const auto& gr : group_roles) {
+                          if (gr.principal_type == "user" && gr.principal_id == session->username &&
+                              gr.role_name == "ITServiceOwner") {
+                              authorized = true;
+                              break;
+                          }
+                      }
+                  }
+                  if (!authorized) {
+                      res.status = 403;
+                      res.set_content(error_json("forbidden"), "application/json");
+                      return;
+                  }
 
-            GroupRoleAssignment assignment;
-            assignment.group_id = group_id;
-            assignment.principal_type = principal_type;
-            assignment.principal_id = principal_id;
-            assignment.role_name = role_name;
+                  GroupRoleAssignment assignment;
+                  assignment.group_id = group_id;
+                  assignment.principal_type = principal_type;
+                  assignment.principal_id = principal_id;
+                  assignment.role_name = role_name;
 
-            auto result = mgmt_store->assign_role(assignment);
-            if (!result) {
-                res.status = 400;
-                res.set_content(error_json(result.error()), "application/json");
-                return;
-            }
-            audit_fn(req, "management_group.assign_role", "success", "ManagementGroup", group_id,
-                     principal_id + ":" + role_name);
-            res.status = 201;
-            res.set_content(ok_json(JObj().add("assigned", true).str()), "application/json");
-        });
+                  auto result = mgmt_store->assign_role(assignment);
+                  if (!result) {
+                      res.status = 400;
+                      res.set_content(error_json(result.error()), "application/json");
+                      return;
+                  }
+                  audit_fn(req, "management_group.assign_role", "success", "ManagementGroup",
+                           group_id, principal_id + ":" + role_name);
+                  res.status = 201;
+                  res.set_content(ok_json(JObj().add("assigned", true).str()), "application/json");
+              });
 
     sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
         [auth_fn, perm_fn, audit_fn, mgmt_store, rbac_store](const httplib::Request& req,
-                                                              httplib::Response& res) {
+                                                             httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -914,8 +942,8 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             auto principal_id = body.value("principal_id", "");
             auto role_name = body.value("role_name", "");
 
-            bool authorized = rbac_store->check_permission(session->username, "ManagementGroup",
-                                                           "Write");
+            bool authorized =
+                rbac_store->check_permission(session->username, "ManagementGroup", "Write");
             if (!authorized) {
                 auto group_roles = mgmt_store->get_group_roles(group_id);
                 for (const auto& gr : group_roles) {
@@ -941,40 +969,41 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // ── API Tokens (/api/v1/tokens) ──────────────────────────────────────
 
     sink.Get("/api/v1/tokens",
-            [auth_fn, perm_fn, token_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "ApiToken", "Read"))
-                    return;
-                if (!token_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+             [auth_fn, perm_fn, token_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "ApiToken", "Read"))
+                     return;
+                 if (!token_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
 
-                auto session = auth_fn(req, res);
-                if (!session)
-                    return;
+                 auto session = auth_fn(req, res);
+                 if (!session)
+                     return;
 
-                auto tokens = token_store->list_tokens(session->username);
-                JArr arr;
-                for (const auto& t : tokens) {
-                    JObj item;
-                    item.add("token_id", t.token_id)
-                        .add("name", t.name)
-                        .add("principal_id", t.principal_id)
-                        .add("created_at", t.created_at)
-                        .add("expires_at", t.expires_at)
-                        .add("last_used_at", t.last_used_at)
-                        .add("revoked", t.revoked);
-                    if (!t.scope_service.empty())
-                        item.add("scope_service", t.scope_service);
-                    arr.add(item);
-                }
-                res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
-                                "application/json");
-            });
+                 auto tokens = token_store->list_tokens(session->username);
+                 JArr arr;
+                 for (const auto& t : tokens) {
+                     JObj item;
+                     item.add("token_id", t.token_id)
+                         .add("name", t.name)
+                         .add("principal_id", t.principal_id)
+                         .add("created_at", t.created_at)
+                         .add("expires_at", t.expires_at)
+                         .add("last_used_at", t.last_used_at)
+                         .add("revoked", t.revoked);
+                     if (!t.scope_service.empty())
+                         item.add("scope_service", t.scope_service);
+                     arr.add(item);
+                 }
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
+                                 "application/json");
+             });
 
     sink.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, token_store, rbac_store, mgmt_store,
-                                tag_store](const httplib::Request& req, httplib::Response& res) {
+                                 tag_store, metrics_registry](const httplib::Request& req,
+                                                              httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Write"))
             return;
         if (!token_store) {
@@ -992,12 +1021,35 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         auto expires_at = body.value("expires_at", int64_t{0});
         auto scope_service = body.value("scope_service", "");
 
+        // UP-H2 (gov Gate 4, unhappy-path): clamp user-controlled string
+        // length BEFORE any audit emission. An unbounded `name` would be
+        // bound into SQLite per request and (combined with the cheap-to-
+        // trigger CSPRNG-failure path) hand an attacker an audit-DB DoS
+        // during early-boot entropy exhaustion windows. 256 chars is well
+        // above any legitimate token name (cf. settings_routes HTMX name
+        // input cap) and well below the SQLite text-bind buffer cost
+        // worth worrying about. Validation 400s are deliberately not
+        // audited — oversized input is request-level garbage and we
+        // already audit on success; not auditing here closes the audit-
+        // amplification vector outright.
+        if (name.size() > 256) {
+            res.status = 400;
+            res.set_content(error_json("invalid_input_length: name exceeds 256 chars"),
+                            "application/json");
+            return;
+        }
+        if (scope_service.size() > 256) {
+            res.status = 400;
+            res.set_content(error_json("invalid_input_length: scope_service exceeds 256 chars"),
+                            "application/json");
+            return;
+        }
+
         if (!scope_service.empty()) {
             if (!rbac_store || !rbac_store->is_rbac_enabled()) {
                 res.status = 400;
-                res.set_content(
-                    error_json("service-scoped tokens require RBAC to be enabled"),
-                    "application/json");
+                res.set_content(error_json("service-scoped tokens require RBAC to be enabled"),
+                                "application/json");
                 return;
             }
             bool authorized =
@@ -1017,23 +1069,79 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             }
             if (!authorized) {
                 res.status = 403;
-                res.set_content(
-                    error_json("ITServiceOwner authority required for service '" +
-                               scope_service + "'"),
-                    "application/json");
+                res.set_content(error_json("ITServiceOwner authority required for service '" +
+                                           scope_service + "'"),
+                                "application/json");
                 return;
             }
         }
 
-        auto result =
-            token_store->create_token(name, session->username, expires_at, scope_service);
+        auto result = token_store->create_token(name, session->username, expires_at, scope_service);
         if (!result) {
-            res.status = 400;
-            res.set_content(error_json(result.error()), "application/json");
+            // sre-1 (gov Gate 6): Prometheus signal for CSPRNG failure so
+            // on-call has a paging surface short of grepping audit logs.
+            // Increment BEFORE the audit-emission try/catch so the metric
+            // is never lost to an audit-pipeline exception.
+            if (metrics_registry) {
+                metrics_registry
+                    ->counter("yuzu_secure_random_failure_total",
+                              {{"reason", "prng_failure"}, {"site", "api_token"}})
+                    .increment();
+            }
+            // F-002 (gov Gate 2, security-guardian): on CSPRNG entropy
+            // exhaustion the request returns an error but historically emitted
+            // no audit. SOC 2 CC7.2/CC7.3 require security-relevant failure
+            // conditions to be auditable. Emit the failure row BEFORE the
+            // response so a crash mid-response still leaves the audit trail.
+            // The `csprng_unavailable:` marker lets SIEM rules filter this
+            // distinct failure class from generic create failures.
+            //
+            // UP-H1 (gov Gate 4): wrap the audit call in try/catch so an
+            // exception from the audit pipeline does not abort the 503
+            // response, and capture the bool return so a silent persist
+            // failure (audit DB locked / wedged) surfaces as a
+            // `Sec-Audit-Failed: true` header and an `audit_emitted=false`
+            // envelope field. Mirrors the PR #883 HIGH-2 session-revocation
+            // pattern: operator's "deny NOW" intent (returning the 503)
+            // takes precedence over a partial-SOC2-evidence chain — but
+            // we mark the partial-success on the response so clients/SIEM
+            // cannot read a clean 503 as proof the audit row landed.
+            bool audit_emitted = false;
+            try {
+                audit_emitted = audit_fn(req, "api_token.create", "failure", "ApiToken", name,
+                                         "csprng_unavailable: " + result.error());
+            } catch (const std::exception& ex) {
+                spdlog::error("api_token.create audit emission threw: {}", ex.what());
+                audit_emitted = false;
+            } catch (...) {
+                spdlog::error("api_token.create audit emission threw unknown");
+                audit_emitted = false;
+            }
+            // sre-2 (gov Gate 6, sre): CSPRNG failure is a server-side
+            // condition (entropy exhaustion) — clients with retry logic
+            // need a 5xx so they back off and retry, and LB / SRE rules
+            // page on 5xx_rate not 4xx_rate. Retry-After: 5 gives the
+            // entropy pool a window to refill before the next attempt.
+            // Closes follow-up #1046.
+            res.status = 503;
+            res.set_header("Retry-After", "5");
+            if (!audit_emitted)
+                res.set_header("Sec-Audit-Failed", "true");
+            JObj envelope_err;
+            envelope_err.add("code", 503).add("message", "CSPRNG unavailable: " + result.error());
+            JObj envelope;
+            envelope.raw("error", envelope_err.str())
+                .add("audit_emitted", audit_emitted)
+                .raw("meta", R"({"api_version":"v1"})");
+            res.set_content(envelope.str(), "application/json");
             return;
         }
         auto detail = scope_service.empty() ? "" : "scope_service=" + scope_service;
-        audit_fn(req, "api_token.create", "success", "ApiToken", name, detail);
+        // Success-path audit fire-and-forget — bool intentionally discarded
+        // because the response is 201 Created regardless; if the audit row
+        // fails to persist, the AuditStore::emit_failed_ counter still
+        // increments and the operator-visible metric paths catch it.
+        (void)audit_fn(req, "api_token.create", "success", "ApiToken", name, detail);
         res.status = 201;
         JObj resp;
         resp.add("token", *result).add("name", name);
@@ -1043,7 +1151,7 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     });
 
     sink.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, token_store](
-                                             const httplib::Request& req, httplib::Response& res) {
+                                              const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Delete"))
             return;
         if (!token_store) {
@@ -1070,9 +1178,8 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // vs. no event) and the `owner=` detail so forensics can see who
         // tried to revoke whose token.
         auto existing = token_store->get_token(token_id);
-        bool denied =
-            existing && existing->principal_id != session->username &&
-            session->role != auth::Role::admin;
+        bool denied = existing && existing->principal_id != session->username &&
+                      session->role != auth::Role::admin;
         if (!existing || denied) {
             if (denied) {
                 audit_fn(req, "api_token.revoke", "denied", "ApiToken", token_id,
@@ -1096,35 +1203,237 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
     });
 
+    // ── Sessions (/api/v1/sessions) ──────────────────────────────────────
+    //
+    // Two entry points to `AuthManager::invalidate_user_sessions` (the
+    // dual-write primitive that wipes both `auth.db` rows and the
+    // in-memory `sessions_` map):
+    //   - DELETE /api/v1/sessions?username=<name> — admin force-logout
+    //     of another user. Cookie sessions only; API tokens deliberately
+    //     left intact (operator might be revoking a leaked cookie while
+    //     leaving CI/CD automation running).
+    //   - DELETE /api/v1/sessions/me — caller signs out everywhere.
+    //     BOTH cookie sessions AND API tokens are revoked, because the
+    //     operator mental model for "Sign out everywhere" is the
+    //     stolen-laptop scenario where every credential bearing the
+    //     user's identity must die. Closes UP-13.
+    //
+    // Self-target guard differs from the DELETE-user / role-demotion
+    // guards in `settings_routes.cpp`: revoking your own sessions is
+    // *recoverable* (re-auth and you are back), so the admin path
+    // permits self-target but routes through the `session.revoke_all.self`
+    // audit action so SIEM rules can distinguish operator self-service
+    // from a sibling-admin force-logout. Compliance officer's CC6.6
+    // evidence chain depends on that split.
+
+    // DELETE /api/v1/sessions/me — self-revoke. No admin gate; auth
+    // alone is sufficient. Rejected for MCP-tier and service-scoped
+    // tokens — those credential classes have no other write privilege
+    // and accepting them here would create a novel DoS surface against
+    // the human owner (sec-M2 / UP-14).
+    sink.Delete("/api/v1/sessions/me", [auth_fn, audit_fn, session_revoke_fn](
+                                          const httplib::Request& req, httplib::Response& res) {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
+        if (session->username.empty()) {
+            // Defence-in-depth (sec-M1): require_auth shouldn't ever
+            // produce an empty username, but if it does we must NOT fall
+            // through to revoke — comparing two empty strings would
+            // mis-attribute the action.
+            res.status = 500;
+            res.set_content(error_json("session has empty username", 500),
+                            "application/json");
+            return;
+        }
+        // Audit emission helper — wraps audit_fn so we can capture both
+        // silent persistence failures (bool=false) and exceptions, and
+        // surface either via `Sec-Audit-Failed: true` + `audit_emitted`
+        // in the response body. HIGH-2 on PR #883: a 200 OK response
+        // that hides a lost audit row is fictional SOC 2 CC6.6/CC7.2
+        // evidence.
+        auto try_audit = [&audit_fn, &req](const std::string& action, const std::string& result,
+                                           const std::string& target_type,
+                                           const std::string& target_id,
+                                           const std::string& detail) -> RestApiV1::AuditEmission {
+            try {
+                bool ok = audit_fn(req, action, result, target_type, target_id, detail);
+                return RestApiV1::AuditEmission{ok, /*threw=*/false};
+            } catch (const std::exception& e) {
+                spdlog::error("audit_fn threw on session-revoke action={} target={}: {}",
+                              action, target_id, e.what());
+                return RestApiV1::AuditEmission{false, /*threw=*/true};
+            } catch (...) {
+                spdlog::error("audit_fn threw unknown on session-revoke action={} target={}",
+                              action, target_id);
+                return RestApiV1::AuditEmission{false, /*threw=*/true};
+            }
+        };
+
+        if (!session->mcp_tier.empty() || !session->token_scope_service.empty()) {
+            // sec-M2: a leaked readonly MCP token, or a service-scoped
+            // automation token, must not be able to wipe its principal's
+            // interactive cookies. Use the dashboard or a session cookie
+            // for that.
+            const auto audit = try_audit(
+                "session.revoke_all.self", "denied", "User", session->username,
+                "non-interactive credential rejected (mcp_tier='"
+                + session->mcp_tier + "' scope='" + session->token_scope_service + "')");
+            if (!audit.emitted)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = 403;
+            res.set_content(
+                error_json("self-revoke requires an interactive session, not an API token", 403),
+                "application/json");
+            return;
+        }
+        if (!session_revoke_fn) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
+        const auto result = session_revoke_fn(session->username, /*revoke_api_tokens=*/true);
+        const std::string audit_result = result.db_persisted ? "success" : "partial";
+        const std::string detail =
+            "count=" + std::to_string(result.cookie_sessions_revoked)
+            + " api_tokens_revoked=" + std::to_string(result.api_tokens_revoked)
+            + (result.db_persisted ? "" : " db_error=true");
+        const auto audit = try_audit("session.revoke_all.self", audit_result, "User",
+                                     session->username, detail);
+        // CC6.7 disposition: clear the caller's cookie on the response so
+        // the client side completes the revocation. Mirrors POST /logout
+        // attribute set; the `Secure` flag (set on issuance based on
+        // https config) is omitted here to match the logout precedent —
+        // the cookie attributes only need to identify the cookie for
+        // browser deletion, not match the original issuance flags.
+        res.set_header("Set-Cookie",
+                       "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+        if (!audit.emitted)
+            res.set_header("Sec-Audit-Failed", "true");
+        res.set_content(ok_json(JObj()
+                                    .add("revoked",
+                                         static_cast<int64_t>(result.cookie_sessions_revoked))
+                                    .add("api_tokens_revoked",
+                                         static_cast<int64_t>(result.api_tokens_revoked))
+                                    .add("db_persisted", result.db_persisted)
+                                    .add("audit_emitted", audit.emitted)
+                                    .str()),
+                        "application/json");
+    });
+
+    // DELETE /api/v1/sessions?username=<name> — admin-only force-logout.
+    // Gated by `UserManagement:Write` because the action mutates a user's
+    // access state (parity with role change / disable). `username` query
+    // parameter is required AND validated with `is_valid_username` so a
+    // NUL byte in the input cannot truncate the SQL bind in a way that
+    // diverges from the in-memory `==` comparison (sec-H1 / UP-8).
+    sink.Delete("/api/v1/sessions", [auth_fn, perm_fn, audit_fn, session_revoke_fn](
+                                       const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "UserManagement", "Write"))
+            return;
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
+        if (session->username.empty()) {
+            // sec-M1: empty caller username would mis-attribute the
+            // self-vs-cross-user audit action selection below.
+            res.status = 500;
+            res.set_content(error_json("session has empty username", 500),
+                            "application/json");
+            return;
+        }
+        if (!session_revoke_fn) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
+        const auto username = req.get_param_value("username");
+        if (username.empty()) {
+            res.status = 400;
+            res.set_content(error_json("username query parameter required", 400),
+                            "application/json");
+            return;
+        }
+        if (!is_valid_username(username)) {
+            // sec-H1: reject NUL bytes, control characters, newlines.
+            // Without this the audit `target_id` records the full
+            // attacker-controlled string while the SQL bind silently
+            // truncates at NUL — different rows hit memory vs disk.
+            res.status = 400;
+            res.set_content(error_json("invalid username format", 400),
+                            "application/json");
+            return;
+        }
+        const auto result = session_revoke_fn(username, /*revoke_api_tokens=*/false);
+        // Self-revoke via the admin path — distinguish in audit so
+        // forensics can tell operator self-service apart from a sibling
+        // admin force-logout (CC6.6 evidence).
+        const std::string action =
+            (username == session->username) ? "session.revoke_all.self" : "session.revoke_all";
+        const std::string audit_result = result.db_persisted ? "success" : "partial";
+        const std::string detail =
+            "count=" + std::to_string(result.cookie_sessions_revoked)
+            + (result.db_persisted ? "" : " db_error=true");
+        // HIGH-2 on PR #883 — wrap in try/catch and capture the audit_fn
+        // bool return so a silent persist failure (audit DB locked /
+        // disk full) or an exception path doesn't masquerade as 200 OK
+        // SOC 2 evidence. The `Sec-Audit-Failed` response header gives
+        // SRE/SIEM scrapers an out-of-band signal; the `audit_emitted`
+        // body field gives the API client the same signal.
+        bool audit_emitted = true;
+        try {
+            audit_emitted =
+                audit_fn(req, action, audit_result, "User", username, detail);
+        } catch (const std::exception& e) {
+            spdlog::error("audit_fn threw on session-revoke action={} target={}: {}",
+                          action, username, e.what());
+            audit_emitted = false;
+        } catch (...) {
+            spdlog::error("audit_fn threw unknown on session-revoke action={} target={}",
+                          action, username);
+            audit_emitted = false;
+        }
+        if (!audit_emitted)
+            res.set_header("Sec-Audit-Failed", "true");
+        res.set_content(ok_json(JObj()
+                                    .add("username", username)
+                                    .add("revoked",
+                                         static_cast<int64_t>(result.cookie_sessions_revoked))
+                                    .add("db_persisted", result.db_persisted)
+                                    .add("audit_emitted", audit_emitted)
+                                    .str()),
+                        "application/json");
+    });
+
     // ── Quarantine (/api/v1/quarantine) ──────────────────────────────────
 
     sink.Get("/api/v1/quarantine",
-            [perm_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Security", "Read"))
-                    return;
-                if (!quarantine_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+             [perm_fn, quarantine_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Security", "Read"))
+                     return;
+                 if (!quarantine_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
 
-                auto records = quarantine_store->list_quarantined();
-                JArr arr;
-                for (const auto& r : records) {
-                    arr.add(JObj()
-                                .add("agent_id", r.agent_id)
-                                .add("status", r.status)
-                                .add("quarantined_by", r.quarantined_by)
-                                .add("quarantined_at", r.quarantined_at)
-                                .add("whitelist", r.whitelist)
-                                .add("reason", r.reason));
-                }
-                res.set_content(list_json(arr.str(), static_cast<int64_t>(records.size())),
-                                "application/json");
-            });
+                 auto records = quarantine_store->list_quarantined();
+                 JArr arr;
+                 for (const auto& r : records) {
+                     arr.add(JObj()
+                                 .add("agent_id", r.agent_id)
+                                 .add("status", r.status)
+                                 .add("quarantined_by", r.quarantined_by)
+                                 .add("quarantined_at", r.quarantined_at)
+                                 .add("whitelist", r.whitelist)
+                                 .add("reason", r.reason));
+                 }
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(records.size())),
+                                 "application/json");
+             });
 
     sink.Post("/api/v1/quarantine", [auth_fn, perm_fn, audit_fn, quarantine_store](
-                                       const httplib::Request& req, httplib::Response& res) {
+                                        const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "Security", "Execute"))
             return;
         if (!quarantine_store) {
@@ -1177,52 +1486,52 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // ── RBAC (/api/v1/rbac) ──────────────────────────────────────────────
 
     sink.Get("/api/v1/rbac/roles",
-            [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "UserManagement", "Read"))
-                    return;
-                if (!rbac_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "UserManagement", "Read"))
+                     return;
+                 if (!rbac_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
 
-                auto roles = rbac_store->list_roles();
-                JArr arr;
-                for (const auto& r : roles) {
-                    arr.add(JObj()
-                                .add("name", r.name)
-                                .add("description", r.description)
-                                .add("is_system", r.is_system)
-                                .add("created_at", r.created_at));
-                }
-                res.set_content(list_json(arr.str(), static_cast<int64_t>(roles.size())),
-                                "application/json");
-            });
+                 auto roles = rbac_store->list_roles();
+                 JArr arr;
+                 for (const auto& r : roles) {
+                     arr.add(JObj()
+                                 .add("name", r.name)
+                                 .add("description", r.description)
+                                 .add("is_system", r.is_system)
+                                 .add("created_at", r.created_at));
+                 }
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(roles.size())),
+                                 "application/json");
+             });
 
     sink.Get(R"(/api/v1/rbac/roles/(.+)/permissions)",
-            [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "UserManagement", "Read"))
-                    return;
-                if (!rbac_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+             [perm_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "UserManagement", "Read"))
+                     return;
+                 if (!rbac_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
 
-                auto role_name = req.matches[1].str();
-                auto perms = rbac_store->get_role_permissions(role_name);
-                JArr arr;
-                for (const auto& p : perms) {
-                    arr.add(JObj()
-                                .add("securable_type", p.securable_type)
-                                .add("operation", p.operation)
-                                .add("effect", p.effect));
-                }
-                res.set_content(ok_json(arr.str()), "application/json");
-            });
+                 auto role_name = req.matches[1].str();
+                 auto perms = rbac_store->get_role_permissions(role_name);
+                 JArr arr;
+                 for (const auto& p : perms) {
+                     arr.add(JObj()
+                                 .add("securable_type", p.securable_type)
+                                 .add("operation", p.operation)
+                                 .add("effect", p.effect));
+                 }
+                 res.set_content(ok_json(arr.str()), "application/json");
+             });
 
     sink.Post("/api/v1/rbac/check", [auth_fn, rbac_store](const httplib::Request& req,
-                                                         httplib::Response& res) {
+                                                          httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session)
             return;
@@ -1242,120 +1551,122 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // ── Tag Categories (/api/v1/tag-categories) ────────────────────────
 
     sink.Get("/api/v1/tag-categories",
-            [perm_fn](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Tag", "Read"))
-                    return;
+             [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Tag", "Read"))
+                     return;
 
-                const auto& categories = get_tag_categories();
-                JArr arr;
-                for (const auto& cat : categories) {
-                    JArr vals;
-                    for (auto v : cat.allowed_values)
-                        vals.add(v);
-                    arr.add(JObj()
-                                .add("key", cat.key)
-                                .add("display_name", cat.display_name)
-                                .raw("allowed_values", vals.str()));
-                }
-                res.set_content(ok_json(arr.str()), "application/json");
-            });
+                 const auto& categories = get_tag_categories();
+                 JArr arr;
+                 for (const auto& cat : categories) {
+                     JArr vals;
+                     for (auto v : cat.allowed_values)
+                         vals.add(v);
+                     arr.add(JObj()
+                                 .add("key", cat.key)
+                                 .add("display_name", cat.display_name)
+                                 .raw("allowed_values", vals.str()));
+                 }
+                 res.set_content(ok_json(arr.str()), "application/json");
+             });
 
     // ── Tag Compliance (/api/v1/tag-compliance) ──────────────────────────
 
     sink.Get("/api/v1/tag-compliance",
-            [perm_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Tag", "Read"))
-                    return;
-                if (!tag_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+             [perm_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Tag", "Read"))
+                     return;
+                 if (!tag_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
 
-                auto gaps = tag_store->get_compliance_gaps();
-                JArr arr;
-                for (const auto& [agent_id, missing] : gaps) {
-                    JArr m;
-                    for (const auto& k : missing)
-                        m.add(k);
-                    arr.add(JObj().add("agent_id", agent_id).raw("missing_tags", m.str()));
-                }
-                res.set_content(ok_json(arr.str()), "application/json");
-            });
+                 auto gaps = tag_store->get_compliance_gaps();
+                 JArr arr;
+                 for (const auto& [agent_id, missing] : gaps) {
+                     JArr m;
+                     for (const auto& k : missing)
+                         m.add(k);
+                     arr.add(JObj().add("agent_id", agent_id).raw("missing_tags", m.str()));
+                 }
+                 res.set_content(ok_json(arr.str()), "application/json");
+             });
 
     // ── Tags (/api/v1/tags) ──────────────────────────────────────────────
 
     sink.Get("/api/v1/tags",
-            [perm_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Tag", "Read"))
-                    return;
-                if (!tag_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+             [perm_fn, tag_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Tag", "Read"))
+                     return;
+                 if (!tag_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
 
-                auto agent_id = req.get_param_value("agent_id");
-                if (agent_id.empty()) {
-                    res.status = 400;
-                    res.set_content(error_json("agent_id parameter required"), "application/json");
-                    return;
-                }
-                auto tags = tag_store->get_all_tags(agent_id);
-                JObj obj;
-                for (size_t i = 0; i < tags.size(); ++i)
-                    obj.add(tags[i].key, tags[i].value);
-                res.set_content(ok_json(obj.str()), "application/json");
-            });
+                 auto agent_id = req.get_param_value("agent_id");
+                 if (agent_id.empty()) {
+                     res.status = 400;
+                     res.set_content(error_json("agent_id parameter required"), "application/json");
+                     return;
+                 }
+                 auto tags = tag_store->get_all_tags(agent_id);
+                 JObj obj;
+                 for (size_t i = 0; i < tags.size(); ++i)
+                     obj.add(tags[i].key, tags[i].value);
+                 res.set_content(ok_json(obj.str()), "application/json");
+             });
 
-    sink.Put("/api/v1/tags",
-            [perm_fn, audit_fn, tag_store, service_group_fn,
-             tag_push_fn](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Tag", "Write"))
-                    return;
-                if (!tag_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+    sink.Put("/api/v1/tags", [perm_fn, audit_fn, tag_store, service_group_fn,
+                              tag_push_fn](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "Tag", "Write"))
+            return;
+        if (!tag_store) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
 
-                auto body = nlohmann::json::parse(req.body, nullptr, false);
-                if (body.is_discarded()) {
-                    res.status = 400;
-                    res.set_content(error_json("invalid JSON"), "application/json");
-                    return;
-                }
-                auto agent_id = body.value("agent_id", "");
-                auto key = body.value("key", "");
-                auto value = body.value("value", "");
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            res.set_content(error_json("invalid JSON"), "application/json");
+            return;
+        }
+        auto agent_id = body.value("agent_id", "");
+        auto key = body.value("key", "");
+        auto value = body.value("value", "");
 
-                // Normalize category keys to lowercase for consistent lookups
-                std::string lower_key = key;
-                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
-                    [](unsigned char c) { return std::tolower(c); });
-                for (auto cat : {"role", "environment", "location", "service"}) {
-                    if (lower_key == cat) { key = lower_key; break; }
-                }
+        // Normalize category keys to lowercase for consistent lookups
+        std::string lower_key = key;
+        std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        for (auto cat : {"role", "environment", "location", "service"}) {
+            if (lower_key == cat) {
+                key = lower_key;
+                break;
+            }
+        }
 
-                if (agent_id.empty() || key.empty()) {
-                    res.status = 400;
-                    res.set_content(error_json("agent_id and key required"), "application/json");
-                    return;
-                }
+        if (agent_id.empty() || key.empty()) {
+            res.status = 400;
+            res.set_content(error_json("agent_id and key required"), "application/json");
+            return;
+        }
 
-                auto result = tag_store->set_tag_checked(agent_id, key, value, "api");
-                if (!result) {
-                    res.status = 400;
-                    res.set_content(error_json(result.error()), "application/json");
-                    return;
-                }
-                if (key == "service" && service_group_fn)
-                    service_group_fn(value);
-                if (tag_push_fn)
-                    tag_push_fn(agent_id, key);
-                audit_fn(req, "tag.set", "success", "Tag", agent_id + ":" + key, value);
-                res.set_content(ok_json(JObj().add("set", true).str()), "application/json");
-            });
+        auto result = tag_store->set_tag_checked(agent_id, key, value, "api");
+        if (!result) {
+            res.status = 400;
+            res.set_content(error_json(result.error()), "application/json");
+            return;
+        }
+        if (key == "service" && service_group_fn)
+            service_group_fn(value);
+        if (tag_push_fn)
+            tag_push_fn(agent_id, key);
+        audit_fn(req, "tag.set", "success", "Tag", agent_id + ":" + key, value);
+        res.set_content(ok_json(JObj().add("set", true).str()), "application/json");
+    });
 
     sink.Delete(
         R"(/api/v1/tags/([^/]+)/([^/]+))",
@@ -1383,31 +1694,31 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // ── Instructions (/api/v1/definitions) ───────────────────────────────
 
     sink.Get("/api/v1/definitions",
-            [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "InstructionDefinition", "Read"))
-                    return;
-                if (!instruction_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+             [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                     return;
+                 if (!instruction_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
 
-                auto defs = instruction_store->query_definitions();
-                JArr arr;
-                for (size_t i = 0; i < defs.size(); ++i) {
-                    const auto& d = defs[i];
-                    arr.add(JObj()
-                                .add("id", d.id)
-                                .add("name", d.name)
-                                .add("description", d.description)
-                                .add("plugin", d.plugin)
-                                .add("action", d.action)
-                                .add("version", d.version)
-                                .add("created_at", d.created_at));
-                }
-                res.set_content(list_json(arr.str(), static_cast<int64_t>(defs.size())),
-                                "application/json");
-            });
+                 auto defs = instruction_store->query_definitions();
+                 JArr arr;
+                 for (size_t i = 0; i < defs.size(); ++i) {
+                     const auto& d = defs[i];
+                     arr.add(JObj()
+                                 .add("id", d.id)
+                                 .add("name", d.name)
+                                 .add("description", d.description)
+                                 .add("plugin", d.plugin)
+                                 .add("action", d.action)
+                                 .add("version", d.version)
+                                 .add("created_at", d.created_at));
+                 }
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(defs.size())),
+                                 "application/json");
+             });
 
     // ── Response Templates (issue #254, capability 20.6) ─────────────────
     //
@@ -1445,467 +1756,432 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // Helper: persist a mutated template list back to the definition.
     // Returns std::nullopt on success, an error message on failure.
     auto persist_templates =
-        [instruction_store](const std::string& definition_id,
-                             const std::vector<ResponseTemplate>& templates)
-            -> std::optional<std::string> {
-            auto def = instruction_store->get_definition(definition_id);
-            if (!def) return std::string("definition not found");
-            ResponseTemplatesEngine engine;
-            def->response_templates_spec = engine.serialise(templates);
-            auto upd = instruction_store->update_definition(*def);
-            if (!upd) return upd.error();
-            return std::nullopt;
-        };
+        [instruction_store](
+            const std::string& definition_id,
+            const std::vector<ResponseTemplate>& templates) -> std::optional<std::string> {
+        auto def = instruction_store->get_definition(definition_id);
+        if (!def)
+            return std::string("definition not found");
+        ResponseTemplatesEngine engine;
+        def->response_templates_spec = engine.serialise(templates);
+        auto upd = instruction_store->update_definition(*def);
+        if (!upd)
+            return upd.error();
+        return std::nullopt;
+    };
 
     // GET /api/v1/definitions/{id}/response-templates ─ list
     sink.Get(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates)",
-            [perm_fn, instruction_store]
-            (const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "InstructionDefinition", "Read")) return;
-                if (!instruction_store || !instruction_store->is_open()) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503),
-                                    "application/json");
-                    return;
-                }
-                auto def_id = req.matches[1].str();
-                if (!std::regex_match(def_id, kRtDefIdRegex)) {
-                    res.status = 400;
-                    res.set_content(error_json("definition id must match [A-Za-z0-9._-]{1,128}"),
-                                    "application/json");
-                    return;
-                }
-                auto def = instruction_store->get_definition(def_id);
-                if (!def) {
-                    res.status = 404;
-                    res.set_content(error_json("definition not found"),
-                                    "application/json");
-                    return;
-                }
-                ResponseTemplatesEngine engine;
-                auto parsed = engine.parse(def->response_templates_spec);
-                std::vector<ResponseTemplate> templates;
-                if (parsed) templates = std::move(*parsed);
-                // Always prepend the synthesised default unless the
-                // operator has authored their own default-marked one.
-                bool operator_has_default = false;
-                for (const auto& t : templates) if (t.is_default) {
-                    operator_has_default = true; break;
-                }
-                JArr arr;
-                if (!operator_has_default) {
-                    auto synth = engine.synthesise_default(def->result_schema, def->plugin);
-                    arr.add_raw(engine.to_json(synth).dump());
-                }
-                for (const auto& t : templates) {
-                    arr.add_raw(engine.to_json(t).dump());
-                }
-                int64_t total = static_cast<int64_t>(templates.size())
-                                + (operator_has_default ? 0 : 1);
-                res.set_content(list_json(arr.str(), total), "application/json");
-            });
+             [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                     return;
+                 if (!instruction_store || !instruction_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 auto def_id = req.matches[1].str();
+                 if (!std::regex_match(def_id, kRtDefIdRegex)) {
+                     res.status = 400;
+                     res.set_content(error_json("definition id must match [A-Za-z0-9._-]{1,128}"),
+                                     "application/json");
+                     return;
+                 }
+                 auto def = instruction_store->get_definition(def_id);
+                 if (!def) {
+                     res.status = 404;
+                     res.set_content(error_json("definition not found"), "application/json");
+                     return;
+                 }
+                 ResponseTemplatesEngine engine;
+                 auto parsed = engine.parse(def->response_templates_spec);
+                 std::vector<ResponseTemplate> templates;
+                 if (parsed)
+                     templates = std::move(*parsed);
+                 // Always prepend the synthesised default unless the
+                 // operator has authored their own default-marked one.
+                 bool operator_has_default = false;
+                 for (const auto& t : templates)
+                     if (t.is_default) {
+                         operator_has_default = true;
+                         break;
+                     }
+                 JArr arr;
+                 if (!operator_has_default) {
+                     auto synth = engine.synthesise_default(def->result_schema, def->plugin);
+                     arr.add_raw(engine.to_json(synth).dump());
+                 }
+                 for (const auto& t : templates) {
+                     arr.add_raw(engine.to_json(t).dump());
+                 }
+                 int64_t total =
+                     static_cast<int64_t>(templates.size()) + (operator_has_default ? 0 : 1);
+                 res.set_content(list_json(arr.str(), total), "application/json");
+             });
 
     // GET /api/v1/definitions/{id}/response-templates/{tid} ─ get one
     sink.Get(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
-            [perm_fn, instruction_store]
-            (const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "InstructionDefinition", "Read")) return;
-                if (!instruction_store || !instruction_store->is_open()) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503),
-                                    "application/json");
-                    return;
-                }
-                auto def_id = req.matches[1].str();
-                auto tid = req.matches[2].str();
-                if (!std::regex_match(def_id, kRtDefIdRegex) ||
-                    !std::regex_match(tid, kRtTemplateIdRegex)) {
-                    res.status = 400;
-                    res.set_content(error_json("malformed id"), "application/json");
-                    return;
-                }
-                auto def = instruction_store->get_definition(def_id);
-                if (!def) {
-                    res.status = 404;
-                    res.set_content(error_json("definition not found"),
-                                    "application/json");
-                    return;
-                }
-                ResponseTemplatesEngine engine;
-                auto parsed = engine.parse(def->response_templates_spec);
-                std::vector<ResponseTemplate> templates;
-                if (parsed) templates = std::move(*parsed);
+             [perm_fn, instruction_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                     return;
+                 if (!instruction_store || !instruction_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 auto def_id = req.matches[1].str();
+                 auto tid = req.matches[2].str();
+                 if (!std::regex_match(def_id, kRtDefIdRegex) ||
+                     !std::regex_match(tid, kRtTemplateIdRegex)) {
+                     res.status = 400;
+                     res.set_content(error_json("malformed id"), "application/json");
+                     return;
+                 }
+                 auto def = instruction_store->get_definition(def_id);
+                 if (!def) {
+                     res.status = 404;
+                     res.set_content(error_json("definition not found"), "application/json");
+                     return;
+                 }
+                 ResponseTemplatesEngine engine;
+                 auto parsed = engine.parse(def->response_templates_spec);
+                 std::vector<ResponseTemplate> templates;
+                 if (parsed)
+                     templates = std::move(*parsed);
 
-                if (tid == ResponseTemplatesEngine::kDefaultId) {
-                    // Always return the synthesised default for the
-                    // sentinel id, even when an operator has authored
-                    // their own default — the synth view is "what the
-                    // dashboard shows when nothing is configured", and
-                    // operators introspecting it shouldn't have to know
-                    // which path they're on.
-                    auto synth = engine.synthesise_default(def->result_schema, def->plugin);
-                    res.set_content(ok_json(engine.to_json(synth).dump()),
-                                    "application/json");
-                    return;
-                }
-                for (const auto& t : templates) {
-                    if (t.id == tid) {
-                        res.set_content(ok_json(engine.to_json(t).dump()),
-                                        "application/json");
-                        return;
-                    }
-                }
-                res.status = 404;
-                res.set_content(error_json("template not found"), "application/json");
-            });
+                 if (tid == ResponseTemplatesEngine::kDefaultId) {
+                     // Always return the synthesised default for the
+                     // sentinel id, even when an operator has authored
+                     // their own default — the synth view is "what the
+                     // dashboard shows when nothing is configured", and
+                     // operators introspecting it shouldn't have to know
+                     // which path they're on.
+                     auto synth = engine.synthesise_default(def->result_schema, def->plugin);
+                     res.set_content(ok_json(engine.to_json(synth).dump()), "application/json");
+                     return;
+                 }
+                 for (const auto& t : templates) {
+                     if (t.id == tid) {
+                         res.set_content(ok_json(engine.to_json(t).dump()), "application/json");
+                         return;
+                     }
+                 }
+                 res.status = 404;
+                 res.set_content(error_json("template not found"), "application/json");
+             });
 
     // POST /api/v1/definitions/{id}/response-templates ─ create
     sink.Post(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates)",
-            [perm_fn, audit_fn, instruction_store, persist_templates]
-            (const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "InstructionDefinition", "Write")) return;
-                if (!instruction_store || !instruction_store->is_open()) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503),
-                                    "application/json");
-                    return;
-                }
-                auto def_id = req.matches[1].str();
-                if (!std::regex_match(def_id, kRtDefIdRegex)) {
-                    res.status = 400;
-                    res.set_content(error_json("definition id must match [A-Za-z0-9._-]{1,128}"),
-                                    "application/json");
-                    audit_fn(req, "response_template.create", "denied",
-                             "InstructionDefinition", def_id, "reason=malformed_definition_id");
-                    return;
-                }
-                if (req.body.size() > kRtMaxBodyBytes) {
-                    res.status = 413;
-                    res.set_content(error_json("request body exceeds 64 KiB cap", 413),
-                                    "application/json");
-                    audit_fn(req, "response_template.create", "denied",
-                             "InstructionDefinition", def_id, "reason=body_too_large");
-                    return;
-                }
-                auto body = nlohmann::json::parse(req.body, nullptr, false);
-                if (body.is_discarded()) {
-                    res.status = 400;
-                    res.set_content(error_json("invalid JSON"), "application/json");
-                    audit_fn(req, "response_template.create", "denied",
-                             "InstructionDefinition", def_id, "reason=invalid_json");
-                    return;
-                }
-                auto def = instruction_store->get_definition(def_id);
-                if (!def) {
-                    res.status = 404;
-                    res.set_content(error_json("definition not found"),
-                                    "application/json");
-                    audit_fn(req, "response_template.create", "denied",
-                             "InstructionDefinition", def_id, "reason=definition_not_found");
-                    return;
-                }
-                ResponseTemplatesEngine engine;
-                auto parsed = engine.parse(def->response_templates_spec);
-                std::vector<ResponseTemplate> templates;
-                if (parsed) templates = std::move(*parsed);
-                auto validated = engine.validate_payload(body, templates,
-                                                         /*expected_id=*/"",
-                                                         /*assign_id=*/true);
-                if (!validated) {
-                    res.status = 400;
-                    res.set_content(error_json(validated.error()),
-                                    "application/json");
-                    audit_fn(req, "response_template.create", "denied",
-                             "InstructionDefinition", def_id,
-                             "reason=validation_failed");
-                    return;
-                }
-                templates.push_back(*validated);
-                if (auto err = persist_templates(def_id, templates); err) {
-                    spdlog::error("response_template.create persist failed: def={} err={}",
-                                  def_id, *err);
-                    res.status = 500;
-                    res.set_content(error_json("persist failure"), "application/json");
-                    audit_fn(req, "response_template.create", "failure",
-                             "InstructionDefinition", def_id, "reason=persist_failure");
-                    return;
-                }
-                audit_fn(req, "response_template.create", "success",
-                         "InstructionDefinition", def_id, validated->id);
-                res.status = 201;
-                res.set_content(ok_json(engine.to_json(*validated).dump()),
-                                "application/json");
-            });
+              [perm_fn, audit_fn, instruction_store, persist_templates](const httplib::Request& req,
+                                                                        httplib::Response& res) {
+                  if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                      return;
+                  if (!instruction_store || !instruction_store->is_open()) {
+                      res.status = 503;
+                      res.set_content(error_json("service unavailable", 503), "application/json");
+                      return;
+                  }
+                  auto def_id = req.matches[1].str();
+                  if (!std::regex_match(def_id, kRtDefIdRegex)) {
+                      res.status = 400;
+                      res.set_content(error_json("definition id must match [A-Za-z0-9._-]{1,128}"),
+                                      "application/json");
+                      audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
+                               def_id, "reason=malformed_definition_id");
+                      return;
+                  }
+                  if (req.body.size() > kRtMaxBodyBytes) {
+                      res.status = 413;
+                      res.set_content(error_json("request body exceeds 64 KiB cap", 413),
+                                      "application/json");
+                      audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
+                               def_id, "reason=body_too_large");
+                      return;
+                  }
+                  auto body = nlohmann::json::parse(req.body, nullptr, false);
+                  if (body.is_discarded()) {
+                      res.status = 400;
+                      res.set_content(error_json("invalid JSON"), "application/json");
+                      audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
+                               def_id, "reason=invalid_json");
+                      return;
+                  }
+                  auto def = instruction_store->get_definition(def_id);
+                  if (!def) {
+                      res.status = 404;
+                      res.set_content(error_json("definition not found"), "application/json");
+                      audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
+                               def_id, "reason=definition_not_found");
+                      return;
+                  }
+                  ResponseTemplatesEngine engine;
+                  auto parsed = engine.parse(def->response_templates_spec);
+                  std::vector<ResponseTemplate> templates;
+                  if (parsed)
+                      templates = std::move(*parsed);
+                  auto validated = engine.validate_payload(body, templates,
+                                                           /*expected_id=*/"",
+                                                           /*assign_id=*/true);
+                  if (!validated) {
+                      res.status = 400;
+                      res.set_content(error_json(validated.error()), "application/json");
+                      audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
+                               def_id, "reason=validation_failed");
+                      return;
+                  }
+                  templates.push_back(*validated);
+                  if (auto err = persist_templates(def_id, templates); err) {
+                      spdlog::error("response_template.create persist failed: def={} err={}",
+                                    def_id, *err);
+                      res.status = 500;
+                      res.set_content(error_json("persist failure"), "application/json");
+                      audit_fn(req, "response_template.create", "failure", "InstructionDefinition",
+                               def_id, "reason=persist_failure");
+                      return;
+                  }
+                  audit_fn(req, "response_template.create", "success", "InstructionDefinition",
+                           def_id, validated->id);
+                  res.status = 201;
+                  res.set_content(ok_json(engine.to_json(*validated).dump()), "application/json");
+              });
 
     // PUT /api/v1/definitions/{id}/response-templates/{tid} ─ replace
     sink.Put(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
-            [perm_fn, audit_fn, instruction_store, persist_templates]
-            (const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "InstructionDefinition", "Write")) return;
-                if (!instruction_store || !instruction_store->is_open()) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503),
-                                    "application/json");
-                    return;
-                }
-                auto def_id = req.matches[1].str();
-                auto tid = req.matches[2].str();
-                if (!std::regex_match(def_id, kRtDefIdRegex) ||
-                    !std::regex_match(tid, kRtTemplateIdRegex)) {
-                    res.status = 400;
-                    res.set_content(error_json("malformed id"), "application/json");
-                    audit_fn(req, "response_template.update", "denied",
-                             "InstructionDefinition", def_id, "reason=malformed_id");
-                    return;
-                }
-                if (tid == ResponseTemplatesEngine::kDefaultId) {
-                    res.status = 400;
-                    res.set_content(error_json("'__default__' is reserved for the synthesised "
-                                               "default; create a new template instead"),
-                                    "application/json");
-                    audit_fn(req, "response_template.update", "denied",
-                             "InstructionDefinition", def_id, "reason=reserved_id");
-                    return;
-                }
-                if (req.body.size() > kRtMaxBodyBytes) {
-                    res.status = 413;
-                    res.set_content(error_json("request body exceeds 64 KiB cap", 413),
-                                    "application/json");
-                    audit_fn(req, "response_template.update", "denied",
-                             "InstructionDefinition", def_id, "reason=body_too_large");
-                    return;
-                }
-                auto body = nlohmann::json::parse(req.body, nullptr, false);
-                if (body.is_discarded()) {
-                    res.status = 400;
-                    res.set_content(error_json("invalid JSON"), "application/json");
-                    audit_fn(req, "response_template.update", "denied",
-                             "InstructionDefinition", def_id, "reason=invalid_json");
-                    return;
-                }
-                auto def = instruction_store->get_definition(def_id);
-                if (!def) {
-                    res.status = 404;
-                    res.set_content(error_json("definition not found"),
-                                    "application/json");
-                    audit_fn(req, "response_template.update", "denied",
-                             "InstructionDefinition", def_id, "reason=definition_not_found");
-                    return;
-                }
-                ResponseTemplatesEngine engine;
-                auto parsed = engine.parse(def->response_templates_spec);
-                std::vector<ResponseTemplate> templates;
-                if (parsed) templates = std::move(*parsed);
-                bool found = false;
-                for (const auto& t : templates) if (t.id == tid) { found = true; break; }
-                if (!found) {
-                    res.status = 404;
-                    res.set_content(error_json("template not found"),
-                                    "application/json");
-                    audit_fn(req, "response_template.update", "denied",
-                             "InstructionDefinition", def_id, "reason=template_not_found");
-                    return;
-                }
-                auto validated = engine.validate_payload(body, templates,
-                                                         /*expected_id=*/tid,
-                                                         /*assign_id=*/false);
-                if (!validated) {
-                    res.status = 400;
-                    res.set_content(error_json(validated.error()),
-                                    "application/json");
-                    audit_fn(req, "response_template.update", "denied",
-                             "InstructionDefinition", def_id, "reason=validation_failed");
-                    return;
-                }
-                for (auto& t : templates) {
-                    if (t.id == tid) { t = *validated; break; }
-                }
-                if (auto err = persist_templates(def_id, templates); err) {
-                    spdlog::error("response_template.update persist failed: def={} tid={} err={}",
-                                  def_id, tid, *err);
-                    res.status = 500;
-                    res.set_content(error_json("persist failure"), "application/json");
-                    audit_fn(req, "response_template.update", "failure",
-                             "InstructionDefinition", def_id, "reason=persist_failure");
-                    return;
-                }
-                audit_fn(req, "response_template.update", "success",
-                         "InstructionDefinition", def_id, tid);
-                res.set_content(ok_json(engine.to_json(*validated).dump()),
-                                "application/json");
-            });
+             [perm_fn, audit_fn, instruction_store, persist_templates](const httplib::Request& req,
+                                                                       httplib::Response& res) {
+                 if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                     return;
+                 if (!instruction_store || !instruction_store->is_open()) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 auto def_id = req.matches[1].str();
+                 auto tid = req.matches[2].str();
+                 if (!std::regex_match(def_id, kRtDefIdRegex) ||
+                     !std::regex_match(tid, kRtTemplateIdRegex)) {
+                     res.status = 400;
+                     res.set_content(error_json("malformed id"), "application/json");
+                     audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
+                              def_id, "reason=malformed_id");
+                     return;
+                 }
+                 if (tid == ResponseTemplatesEngine::kDefaultId) {
+                     res.status = 400;
+                     res.set_content(error_json("'__default__' is reserved for the synthesised "
+                                                "default; create a new template instead"),
+                                     "application/json");
+                     audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
+                              def_id, "reason=reserved_id");
+                     return;
+                 }
+                 if (req.body.size() > kRtMaxBodyBytes) {
+                     res.status = 413;
+                     res.set_content(error_json("request body exceeds 64 KiB cap", 413),
+                                     "application/json");
+                     audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
+                              def_id, "reason=body_too_large");
+                     return;
+                 }
+                 auto body = nlohmann::json::parse(req.body, nullptr, false);
+                 if (body.is_discarded()) {
+                     res.status = 400;
+                     res.set_content(error_json("invalid JSON"), "application/json");
+                     audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
+                              def_id, "reason=invalid_json");
+                     return;
+                 }
+                 auto def = instruction_store->get_definition(def_id);
+                 if (!def) {
+                     res.status = 404;
+                     res.set_content(error_json("definition not found"), "application/json");
+                     audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
+                              def_id, "reason=definition_not_found");
+                     return;
+                 }
+                 ResponseTemplatesEngine engine;
+                 auto parsed = engine.parse(def->response_templates_spec);
+                 std::vector<ResponseTemplate> templates;
+                 if (parsed)
+                     templates = std::move(*parsed);
+                 bool found = false;
+                 for (const auto& t : templates)
+                     if (t.id == tid) {
+                         found = true;
+                         break;
+                     }
+                 if (!found) {
+                     res.status = 404;
+                     res.set_content(error_json("template not found"), "application/json");
+                     audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
+                              def_id, "reason=template_not_found");
+                     return;
+                 }
+                 auto validated = engine.validate_payload(body, templates,
+                                                          /*expected_id=*/tid,
+                                                          /*assign_id=*/false);
+                 if (!validated) {
+                     res.status = 400;
+                     res.set_content(error_json(validated.error()), "application/json");
+                     audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
+                              def_id, "reason=validation_failed");
+                     return;
+                 }
+                 for (auto& t : templates) {
+                     if (t.id == tid) {
+                         t = *validated;
+                         break;
+                     }
+                 }
+                 if (auto err = persist_templates(def_id, templates); err) {
+                     spdlog::error("response_template.update persist failed: def={} tid={} err={}",
+                                   def_id, tid, *err);
+                     res.status = 500;
+                     res.set_content(error_json("persist failure"), "application/json");
+                     audit_fn(req, "response_template.update", "failure", "InstructionDefinition",
+                              def_id, "reason=persist_failure");
+                     return;
+                 }
+                 audit_fn(req, "response_template.update", "success", "InstructionDefinition",
+                          def_id, tid);
+                 res.set_content(ok_json(engine.to_json(*validated).dump()), "application/json");
+             });
 
     // DELETE /api/v1/definitions/{id}/response-templates/{tid}
-    sink.Delete(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
-            [perm_fn, audit_fn, instruction_store, persist_templates]
-            (const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "InstructionDefinition", "Write")) return;
-                if (!instruction_store || !instruction_store->is_open()) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503),
-                                    "application/json");
-                    return;
-                }
-                auto def_id = req.matches[1].str();
-                auto tid = req.matches[2].str();
-                if (!std::regex_match(def_id, kRtDefIdRegex) ||
-                    !std::regex_match(tid, kRtTemplateIdRegex)) {
-                    res.status = 400;
-                    res.set_content(error_json("malformed id"), "application/json");
-                    audit_fn(req, "response_template.delete", "denied",
-                             "InstructionDefinition", def_id, "reason=malformed_id");
-                    return;
-                }
-                if (tid == ResponseTemplatesEngine::kDefaultId) {
-                    res.status = 400;
-                    res.set_content(error_json("the synthesised default template "
-                                               "cannot be deleted"),
-                                    "application/json");
-                    audit_fn(req, "response_template.delete", "denied",
-                             "InstructionDefinition", def_id, "reason=reserved_id");
-                    return;
-                }
-                auto def = instruction_store->get_definition(def_id);
-                if (!def) {
-                    res.status = 404;
-                    res.set_content(error_json("definition not found"),
-                                    "application/json");
-                    audit_fn(req, "response_template.delete", "denied",
-                             "InstructionDefinition", def_id, "reason=definition_not_found");
-                    return;
-                }
-                ResponseTemplatesEngine engine;
-                auto parsed = engine.parse(def->response_templates_spec);
-                std::vector<ResponseTemplate> templates;
-                if (parsed) templates = std::move(*parsed);
-                auto before = templates.size();
-                templates.erase(
-                    std::remove_if(templates.begin(), templates.end(),
-                                   [&](const ResponseTemplate& t) { return t.id == tid; }),
-                    templates.end());
-                if (templates.size() == before) {
-                    res.status = 404;
-                    res.set_content(error_json("template not found"),
-                                    "application/json");
-                    audit_fn(req, "response_template.delete", "denied",
-                             "InstructionDefinition", def_id, "reason=template_not_found");
-                    return;
-                }
-                if (auto err = persist_templates(def_id, templates); err) {
-                    spdlog::error("response_template.delete persist failed: def={} tid={} err={}",
-                                  def_id, tid, *err);
-                    res.status = 500;
-                    res.set_content(error_json("persist failure"), "application/json");
-                    audit_fn(req, "response_template.delete", "failure",
-                             "InstructionDefinition", def_id, "reason=persist_failure");
-                    return;
-                }
-                audit_fn(req, "response_template.delete", "success",
-                         "InstructionDefinition", def_id, tid);
-                res.set_content(ok_json(JObj().add("deleted", true).str()),
+    sink.Delete(
+        R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
+        [perm_fn, audit_fn, instruction_store, persist_templates](const httplib::Request& req,
+                                                                  httplib::Response& res) {
+            if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                return;
+            if (!instruction_store || !instruction_store->is_open()) {
+                res.status = 503;
+                res.set_content(error_json("service unavailable", 503), "application/json");
+                return;
+            }
+            auto def_id = req.matches[1].str();
+            auto tid = req.matches[2].str();
+            if (!std::regex_match(def_id, kRtDefIdRegex) ||
+                !std::regex_match(tid, kRtTemplateIdRegex)) {
+                res.status = 400;
+                res.set_content(error_json("malformed id"), "application/json");
+                audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
+                         "reason=malformed_id");
+                return;
+            }
+            if (tid == ResponseTemplatesEngine::kDefaultId) {
+                res.status = 400;
+                res.set_content(error_json("the synthesised default template "
+                                           "cannot be deleted"),
                                 "application/json");
-            });
+                audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
+                         "reason=reserved_id");
+                return;
+            }
+            auto def = instruction_store->get_definition(def_id);
+            if (!def) {
+                res.status = 404;
+                res.set_content(error_json("definition not found"), "application/json");
+                audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
+                         "reason=definition_not_found");
+                return;
+            }
+            ResponseTemplatesEngine engine;
+            auto parsed = engine.parse(def->response_templates_spec);
+            std::vector<ResponseTemplate> templates;
+            if (parsed)
+                templates = std::move(*parsed);
+            auto before = templates.size();
+            templates.erase(std::remove_if(templates.begin(), templates.end(),
+                                           [&](const ResponseTemplate& t) { return t.id == tid; }),
+                            templates.end());
+            if (templates.size() == before) {
+                res.status = 404;
+                res.set_content(error_json("template not found"), "application/json");
+                audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
+                         "reason=template_not_found");
+                return;
+            }
+            if (auto err = persist_templates(def_id, templates); err) {
+                spdlog::error("response_template.delete persist failed: def={} tid={} err={}",
+                              def_id, tid, *err);
+                res.status = 500;
+                res.set_content(error_json("persist failure"), "application/json");
+                audit_fn(req, "response_template.delete", "failure", "InstructionDefinition",
+                         def_id, "reason=persist_failure");
+                return;
+            }
+            audit_fn(req, "response_template.delete", "success", "InstructionDefinition", def_id,
+                     tid);
+            res.set_content(ok_json(JObj().add("deleted", true).str()), "application/json");
+        });
 
     // ── Audit (/api/v1/audit) ────────────────────────────────────────────
 
     sink.Get("/api/v1/audit",
-            [perm_fn, audit_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "AuditLog", "Read"))
-                    return;
-                if (!audit_store) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503), "application/json");
-                    return;
-                }
+             [perm_fn, audit_store](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "AuditLog", "Read"))
+                     return;
+                 if (!audit_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
 
-                AuditQuery q;
-                auto limit_str = req.get_param_value("limit");
-                if (!limit_str.empty()) {
-                    try {
-                        q.limit = std::stoi(limit_str);
-                    } catch (...) {}
-                }
-                if (q.limit > 1000)
-                    q.limit = 1000;
-                q.principal = req.get_param_value("principal");
-                q.action = req.get_param_value("action");
+                 AuditQuery q;
+                 auto limit_str = req.get_param_value("limit");
+                 if (!limit_str.empty()) {
+                     try {
+                         q.limit = std::stoi(limit_str);
+                     } catch (...) {}
+                 }
+                 if (q.limit > 1000)
+                     q.limit = 1000;
+                 q.principal = req.get_param_value("principal");
+                 q.action = req.get_param_value("action");
 
-                auto events = audit_store->query(q);
-                JArr arr;
-                for (size_t i = 0; i < events.size(); ++i) {
-                    const auto& e = events[i];
-                    arr.add(JObj()
-                                .add("timestamp", e.timestamp)
-                                .add("principal", e.principal)
-                                .add("action", e.action)
-                                .add("result", e.result)
-                                .add("target_type", e.target_type)
-                                .add("target_id", e.target_id)
-                                .add("detail", e.detail));
-                }
-                res.set_content(list_json(arr.str(), static_cast<int64_t>(events.size())),
-                                "application/json");
-            });
+                 auto events = audit_store->query(q);
+                 JArr arr;
+                 for (size_t i = 0; i < events.size(); ++i) {
+                     const auto& e = events[i];
+                     arr.add(JObj()
+                                 .add("timestamp", e.timestamp)
+                                 .add("principal", e.principal)
+                                 .add("action", e.action)
+                                 .add("result", e.result)
+                                 .add("target_type", e.target_type)
+                                 .add("target_id", e.target_id)
+                                 .add("detail", e.detail));
+                 }
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events.size())),
+                                 "application/json");
+             });
 
     // ── Inventory (/api/v1/inventory) ──────────────────────────────────
 
-    sink.Get("/api/v1/inventory/tables",
-            [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Inventory", "Read"))
-                    return;
-                if (!inventory_store || !inventory_store->is_open()) {
-                    res.status = 503;
-                    res.set_content(error_json("inventory store not available"), "application/json");
-                    return;
-                }
+    sink.Get("/api/v1/inventory/tables", [perm_fn, inventory_store](const httplib::Request& req,
+                                                                    httplib::Response& res) {
+        if (!perm_fn(req, res, "Inventory", "Read"))
+            return;
+        if (!inventory_store || !inventory_store->is_open()) {
+            res.status = 503;
+            res.set_content(error_json("inventory store not available"), "application/json");
+            return;
+        }
 
-                auto tables = inventory_store->list_tables();
-                JArr arr;
-                for (const auto& t : tables) {
-                    arr.add(JObj()
-                                .add("plugin", t.plugin)
-                                .add("agent_count", t.agent_count)
-                                .add("last_collected", t.last_collected));
-                }
-                res.set_content(list_json(arr.str(), static_cast<int64_t>(tables.size())),
-                                "application/json");
-            });
+        auto tables = inventory_store->list_tables();
+        JArr arr;
+        for (const auto& t : tables) {
+            arr.add(JObj()
+                        .add("plugin", t.plugin)
+                        .add("agent_count", t.agent_count)
+                        .add("last_collected", t.last_collected));
+        }
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(tables.size())),
+                        "application/json");
+    });
 
     sink.Get(R"(/api/v1/inventory/([^/]+)/([^/]+))",
-            [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Inventory", "Read"))
-                    return;
-                if (!inventory_store || !inventory_store->is_open()) {
-                    res.status = 503;
-                    res.set_content(error_json("inventory store not available"), "application/json");
-                    return;
-                }
-
-                auto agent_id = req.matches[1].str();
-                auto plugin = req.matches[2].str();
-
-                auto record = inventory_store->get(agent_id, plugin);
-                if (!record) {
-                    res.status = 404;
-                    res.set_content(error_json("no inventory data found"), "application/json");
-                    return;
-                }
-
-                // Embed data_json as raw JSON if valid, otherwise as a quoted string
-                auto parsed = nlohmann::json::parse(record->data_json, nullptr, false);
-                JObj data;
-                data.add("agent_id", record->agent_id)
-                    .add("plugin", record->plugin);
-                if (!parsed.is_discarded()) {
-                    data.raw("data", record->data_json);
-                } else {
-                    data.add("data", record->data_json);
-                }
-                data.add("collected_at", record->collected_at);
-                res.set_content(ok_json(data.str()), "application/json");
-            });
-
-    sink.Post("/api/v1/inventory/query",
              [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "Inventory", "Read"))
                      return;
@@ -1916,101 +2192,153 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                      return;
                  }
 
-                 auto body = nlohmann::json::parse(req.body, nullptr, false);
-                 if (body.is_discarded()) {
-                     res.status = 400;
-                     res.set_content(error_json("invalid JSON"), "application/json");
+                 auto agent_id = req.matches[1].str();
+                 auto plugin = req.matches[2].str();
+
+                 auto record = inventory_store->get(agent_id, plugin);
+                 if (!record) {
+                     res.status = 404;
+                     res.set_content(error_json("no inventory data found"), "application/json");
                      return;
                  }
 
-                 InventoryQuery q;
-                 q.agent_id = body.value("agent_id", "");
-                 q.plugin = body.value("plugin", "");
-                 q.since = body.value("since", int64_t{0});
-                 q.until = body.value("until", int64_t{0});
-                 q.limit = body.value("limit", 100);
-                 if (q.limit > 1000)
-                     q.limit = 1000;
-
-                 auto records = inventory_store->query(q);
-                 JArr arr;
-                 for (const auto& r : records) {
-                     auto parsed = nlohmann::json::parse(r.data_json, nullptr, false);
-                     JObj item;
-                     item.add("agent_id", r.agent_id).add("plugin", r.plugin);
-                     if (!parsed.is_discarded()) {
-                         item.raw("data", r.data_json);
-                     } else {
-                         item.add("data", r.data_json);
-                     }
-                     item.add("collected_at", r.collected_at);
-                     arr.add(item);
+                 // Embed data_json as raw JSON if valid, otherwise as a quoted string
+                 auto parsed = nlohmann::json::parse(record->data_json, nullptr, false);
+                 JObj data;
+                 data.add("agent_id", record->agent_id).add("plugin", record->plugin);
+                 if (!parsed.is_discarded()) {
+                     data.raw("data", record->data_json);
+                 } else {
+                     data.add("data", record->data_json);
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(records.size())),
-                                 "application/json");
+                 data.add("collected_at", record->collected_at);
+                 res.set_content(ok_json(data.str()), "application/json");
              });
+
+    sink.Post("/api/v1/inventory/query", [perm_fn, inventory_store](const httplib::Request& req,
+                                                                    httplib::Response& res) {
+        if (!perm_fn(req, res, "Inventory", "Read"))
+            return;
+        if (!inventory_store || !inventory_store->is_open()) {
+            res.status = 503;
+            res.set_content(error_json("inventory store not available"), "application/json");
+            return;
+        }
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            res.set_content(error_json("invalid JSON"), "application/json");
+            return;
+        }
+
+        InventoryQuery q;
+        q.agent_id = body.value("agent_id", "");
+        q.plugin = body.value("plugin", "");
+        q.since = body.value("since", int64_t{0});
+        q.until = body.value("until", int64_t{0});
+        q.limit = body.value("limit", 100);
+        if (q.limit > 1000)
+            q.limit = 1000;
+
+        auto records = inventory_store->query(q);
+        JArr arr;
+        for (const auto& r : records) {
+            auto parsed = nlohmann::json::parse(r.data_json, nullptr, false);
+            JObj item;
+            item.add("agent_id", r.agent_id).add("plugin", r.plugin);
+            if (!parsed.is_discarded()) {
+                item.raw("data", r.data_json);
+            } else {
+                item.add("data", r.data_json);
+            }
+            item.add("collected_at", r.collected_at);
+            arr.add(item);
+        }
+        res.set_content(list_json(arr.str(), static_cast<int64_t>(records.size())),
+                        "application/json");
+    });
 
     // ── Execution Statistics (capability 1.9) ────────────────────────────
 
     sink.Get("/api/v1/execution-statistics",
-            [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Execution", "Read")) return;
-                auto summary = execution_tracker->get_fleet_summary();
-                auto data = JObj()
-                    .add("total_executions", summary.total_executions)
-                    .add("executions_today", summary.executions_today)
-                    .add("active_agents", summary.active_agents)
-                    .add("overall_success_rate", summary.overall_success_rate)
-                    .add("avg_duration_seconds", summary.avg_duration_seconds)
-                    .str();
-                res.set_content(ok_json(data), "application/json");
-            });
+             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Execution", "Read"))
+                     return;
+                 auto summary = execution_tracker->get_fleet_summary();
+                 auto data = JObj()
+                                 .add("total_executions", summary.total_executions)
+                                 .add("executions_today", summary.executions_today)
+                                 .add("active_agents", summary.active_agents)
+                                 .add("overall_success_rate", summary.overall_success_rate)
+                                 .add("avg_duration_seconds", summary.avg_duration_seconds)
+                                 .str();
+                 res.set_content(ok_json(data), "application/json");
+             });
 
     sink.Get("/api/v1/execution-statistics/agents",
-            [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Execution", "Read")) return;
-                ExecutionStatsQuery q;
-                if (req.has_param("agent_id")) q.agent_id = req.get_param_value("agent_id");
-                if (req.has_param("since")) try { q.since = std::stoll(req.get_param_value("since")); } catch (...) {}
-                if (req.has_param("limit")) try { q.limit = std::stoi(req.get_param_value("limit")); } catch (...) {}
-                if (q.limit > 1000) q.limit = 1000;
-                auto stats = execution_tracker->get_agent_statistics(q);
-                JArr arr;
-                for (const auto& s : stats) {
-                    arr.add(JObj()
-                        .add("agent_id", s.agent_id)
-                        .add("total_executions", s.total_executions)
-                        .add("success_count", s.success_count)
-                        .add("failure_count", s.failure_count)
-                        .add("success_rate", s.success_rate)
-                        .add("avg_duration_seconds", s.avg_duration_seconds)
-                        .add("last_execution_at", s.last_execution_at));
-                }
-                res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
-                                "application/json");
-            });
+             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Execution", "Read"))
+                     return;
+                 ExecutionStatsQuery q;
+                 if (req.has_param("agent_id"))
+                     q.agent_id = req.get_param_value("agent_id");
+                 if (req.has_param("since"))
+                     try {
+                         q.since = std::stoll(req.get_param_value("since"));
+                     } catch (...) {}
+                 if (req.has_param("limit"))
+                     try {
+                         q.limit = std::stoi(req.get_param_value("limit"));
+                     } catch (...) {}
+                 if (q.limit > 1000)
+                     q.limit = 1000;
+                 auto stats = execution_tracker->get_agent_statistics(q);
+                 JArr arr;
+                 for (const auto& s : stats) {
+                     arr.add(JObj()
+                                 .add("agent_id", s.agent_id)
+                                 .add("total_executions", s.total_executions)
+                                 .add("success_count", s.success_count)
+                                 .add("failure_count", s.failure_count)
+                                 .add("success_rate", s.success_rate)
+                                 .add("avg_duration_seconds", s.avg_duration_seconds)
+                                 .add("last_execution_at", s.last_execution_at));
+                 }
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
+                                 "application/json");
+             });
 
     sink.Get("/api/v1/execution-statistics/definitions",
-            [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Execution", "Read")) return;
-                ExecutionStatsQuery q;
-                if (req.has_param("definition_id")) q.definition_id = req.get_param_value("definition_id");
-                if (req.has_param("since")) try { q.since = std::stoll(req.get_param_value("since")); } catch (...) {}
-                if (req.has_param("limit")) try { q.limit = std::stoi(req.get_param_value("limit")); } catch (...) {}
-                if (q.limit > 1000) q.limit = 1000;
-                auto stats = execution_tracker->get_definition_statistics(q);
-                JArr arr;
-                for (const auto& s : stats) {
-                    arr.add(JObj()
-                        .add("definition_id", s.definition_id)
-                        .add("total_executions", s.total_executions)
-                        .add("total_agents", s.total_agents)
-                        .add("success_rate", s.success_rate)
-                        .add("avg_duration_seconds", s.avg_duration_seconds));
-                }
-                res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
-                                "application/json");
-            });
+             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Execution", "Read"))
+                     return;
+                 ExecutionStatsQuery q;
+                 if (req.has_param("definition_id"))
+                     q.definition_id = req.get_param_value("definition_id");
+                 if (req.has_param("since"))
+                     try {
+                         q.since = std::stoll(req.get_param_value("since"));
+                     } catch (...) {}
+                 if (req.has_param("limit"))
+                     try {
+                         q.limit = std::stoi(req.get_param_value("limit"));
+                     } catch (...) {}
+                 if (q.limit > 1000)
+                     q.limit = 1000;
+                 auto stats = execution_tracker->get_definition_statistics(q);
+                 JArr arr;
+                 for (const auto& s : stats) {
+                     arr.add(JObj()
+                                 .add("definition_id", s.definition_id)
+                                 .add("total_executions", s.total_executions)
+                                 .add("total_agents", s.total_agents)
+                                 .add("success_rate", s.success_rate)
+                                 .add("avg_duration_seconds", s.avg_duration_seconds));
+                 }
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
+                                 "application/json");
+             });
 
     // ── Response Visualization (issue #253, capability 20.6) ─────────────
     //
@@ -2025,208 +2353,213 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // Securable: Response:Read — sibling parity with /fragments/results,
     // /api/responses/{id}/aggregate, and /api/responses/{id}/export which
     // all read response_store on the same gate. Governance gate C-1.
-    sink.Get(R"(/api/v1/executions/([A-Za-z0-9._-]+)/visualization)",
-            [auth_fn, perm_fn, audit_fn, response_store, instruction_store]
-            (const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Response", "Read")) return;
-                auto session = auth_fn(req, res);
-                if (!session) return;
-                if (!response_store || !instruction_store ||
-                    !response_store->is_open() ||
-                    !instruction_store->is_open()) {
-                    res.status = 503;
-                    res.set_content(error_json("service unavailable", 503),
-                                    "application/json");
-                    return;
-                }
+    sink.Get(
+        R"(/api/v1/executions/([A-Za-z0-9._-]+)/visualization)",
+        [auth_fn, perm_fn, audit_fn, response_store, instruction_store](const httplib::Request& req,
+                                                                        httplib::Response& res) {
+            if (!perm_fn(req, res, "Response", "Read"))
+                return;
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!response_store || !instruction_store || !response_store->is_open() ||
+                !instruction_store->is_open()) {
+                res.status = 503;
+                res.set_content(error_json("service unavailable", 503), "application/json");
+                return;
+            }
 
-                auto execution_id = req.matches[1].str();
-                if (!req.has_param("definition_id")) {
+            auto execution_id = req.matches[1].str();
+            if (!req.has_param("definition_id")) {
+                res.status = 400;
+                res.set_content(error_json("definition_id query parameter is required"),
+                                "application/json");
+                audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
+                         "reason=missing_definition_id");
+                return;
+            }
+            auto definition_id = req.get_param_value("definition_id");
+
+            // Closes governance sec-F3 / C-15: regex-bound definition_id
+            // on the REST endpoint to match the dashboard fragment.
+            // Without this, an unbounded value flows through audit_fn,
+            // spdlog, and SQL bind parameters.
+            static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
+            if (!std::regex_match(definition_id, kIdRegex)) {
+                res.status = 400;
+                res.set_content(error_json("definition_id must match [A-Za-z0-9._-]{1,128}"),
+                                "application/json");
+                audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
+                         "reason=malformed_definition_id");
+                return;
+            }
+
+            // Issue #587: optional `?index=N` selects which chart to
+            // render when a definition declares multiple. Default 0.
+            int chart_index = 0;
+            if (req.has_param("index")) {
+                try {
+                    chart_index = std::stoi(req.get_param_value("index"));
+                } catch (...) {
                     res.status = 400;
-                    res.set_content(error_json("definition_id query parameter is required"),
+                    res.set_content(error_json("index must be a non-negative integer"),
                                     "application/json");
-                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
-                             execution_id, "reason=missing_definition_id");
                     return;
                 }
-                auto definition_id = req.get_param_value("definition_id");
-
-                // Closes governance sec-F3 / C-15: regex-bound definition_id
-                // on the REST endpoint to match the dashboard fragment.
-                // Without this, an unbounded value flows through audit_fn,
-                // spdlog, and SQL bind parameters.
-                static const std::regex kIdRegex{"^[A-Za-z0-9._-]{1,128}$"};
-                if (!std::regex_match(definition_id, kIdRegex)) {
+                if (chart_index < 0) {
                     res.status = 400;
-                    res.set_content(error_json("definition_id must match [A-Za-z0-9._-]{1,128}"),
+                    res.set_content(error_json("index must be a non-negative integer"),
                                     "application/json");
-                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
-                             execution_id, "reason=malformed_definition_id");
                     return;
                 }
+            }
 
-                // Issue #587: optional `?index=N` selects which chart to
-                // render when a definition declares multiple. Default 0.
-                int chart_index = 0;
-                if (req.has_param("index")) {
-                    try {
-                        chart_index = std::stoi(req.get_param_value("index"));
-                    } catch (...) {
-                        res.status = 400;
-                        res.set_content(error_json("index must be a non-negative integer"),
-                                        "application/json");
-                        return;
-                    }
-                    if (chart_index < 0) {
-                        res.status = 400;
-                        res.set_content(error_json("index must be a non-negative integer"),
-                                        "application/json");
-                        return;
-                    }
-                }
+            auto def = instruction_store->get_definition(definition_id);
+            if (!def) {
+                res.status = 404;
+                res.set_content(error_json("instruction definition not found"), "application/json");
+                audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
+                         definition_id + " reason=definition_not_found");
+                return;
+            }
+            int chart_count = VisualizationEngine::count(def->visualization_spec);
+            if (chart_count == 0) {
+                res.status = 404;
+                res.set_content(error_json("no visualization configured for this definition"),
+                                "application/json");
+                audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
+                         definition_id + " reason=no_visualization");
+                return;
+            }
+            if (chart_index >= chart_count) {
+                res.status = 404;
+                res.set_content(error_json("visualization index out of range (have " +
+                                           std::to_string(chart_count) + " chart(s))"),
+                                "application/json");
+                audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
+                         definition_id + " reason=index_oor index=" + std::to_string(chart_index));
+                return;
+            }
 
-                auto def = instruction_store->get_definition(definition_id);
-                if (!def) {
-                    res.status = 404;
-                    res.set_content(error_json("instruction definition not found"),
-                                    "application/json");
-                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
-                             execution_id,
-                             definition_id + " reason=definition_not_found");
-                    return;
-                }
-                int chart_count = VisualizationEngine::count(def->visualization_spec);
-                if (chart_count == 0) {
-                    res.status = 404;
-                    res.set_content(error_json("no visualization configured for this definition"),
-                                    "application/json");
-                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
-                             execution_id, definition_id + " reason=no_visualization");
-                    return;
-                }
-                if (chart_index >= chart_count) {
-                    res.status = 404;
-                    res.set_content(
-                        error_json("visualization index out of range (have " +
-                                   std::to_string(chart_count) + " chart(s))"),
-                        "application/json");
-                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
-                             execution_id,
-                             definition_id + " reason=index_oor index=" +
-                                 std::to_string(chart_index));
-                    return;
-                }
+            ResponseQuery q;
+            // Sibling parity: dashboard_routes.cpp's /fragments/results
+            // and the response aggregate/export paths use 10000. Closes
+            // governance C-2 row-cap drift.
+            static constexpr int kRowCap = 10000;
+            q.limit = kRowCap;
+            auto responses = response_store->query(execution_id, q);
+            bool rows_capped = static_cast<int>(responses.size()) >= kRowCap;
+            if (rows_capped) {
+                spdlog::warn("visualization row cap hit ({} rows): execution={} definition={}",
+                             kRowCap, execution_id, definition_id);
+            }
 
-                ResponseQuery q;
-                // Sibling parity: dashboard_routes.cpp's /fragments/results
-                // and the response aggregate/export paths use 10000. Closes
-                // governance C-2 row-cap drift.
-                static constexpr int kRowCap = 10000;
-                q.limit = kRowCap;
-                auto responses = response_store->query(execution_id, q);
-                bool rows_capped = static_cast<int>(responses.size()) >= kRowCap;
+            VisualizationEngine engine;
+            auto result =
+                engine.transform_at(def->visualization_spec, chart_index, def->plugin, responses);
+            if (!result.ok) {
+                res.status = 500;
+                auto parsed = nlohmann::json::parse(result.json, nullptr, false);
+                auto msg = parsed.is_discarded() ? std::string("invalid spec")
+                                                 : parsed.value("error", "invalid spec");
+                res.set_content(error_json(msg), "application/json");
+                audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
+                         definition_id + " err=" + msg);
+                return;
+            }
+            // Stamp truncation status + chart index/total onto the
+            // payload so the dashboard can show a "1/2" indicator and
+            // a "showing first 10000 rows" banner. Closes UP-3 / ER-P1.
+            std::string final_json = result.json;
+            if (!final_json.empty() && final_json.back() == '}') {
+                final_json.pop_back();
+                final_json += ",\"chart_index\":" + std::to_string(chart_index);
+                final_json += ",\"chart_count\":" + std::to_string(chart_count);
                 if (rows_capped) {
-                    spdlog::warn("visualization row cap hit ({} rows): execution={} definition={}",
-                                 kRowCap, execution_id, definition_id);
+                    final_json += ",\"rows_capped\":true,\"rows_cap\":";
+                    final_json += std::to_string(kRowCap);
                 }
-
-                VisualizationEngine engine;
-                auto result = engine.transform_at(def->visualization_spec, chart_index,
-                                                   def->plugin, responses);
-                if (!result.ok) {
-                    res.status = 500;
-                    auto parsed = nlohmann::json::parse(result.json, nullptr, false);
-                    auto msg = parsed.is_discarded() ? std::string("invalid spec")
-                                                     : parsed.value("error", "invalid spec");
-                    res.set_content(error_json(msg), "application/json");
-                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
-                             execution_id, definition_id + " err=" + msg);
-                    return;
-                }
-                // Stamp truncation status + chart index/total onto the
-                // payload so the dashboard can show a "1/2" indicator and
-                // a "showing first 10000 rows" banner. Closes UP-3 / ER-P1.
-                std::string final_json = result.json;
-                if (!final_json.empty() && final_json.back() == '}') {
-                    final_json.pop_back();
-                    final_json += ",\"chart_index\":" + std::to_string(chart_index);
-                    final_json += ",\"chart_count\":" + std::to_string(chart_count);
-                    if (rows_capped) {
-                        final_json += ",\"rows_capped\":true,\"rows_cap\":";
-                        final_json += std::to_string(kRowCap);
-                    }
-                    final_json += "}";
-                }
-                res.set_content(ok_json(final_json), "application/json");
-                audit_fn(req, "execution.visualization.fetch", "success", "execution",
-                         execution_id,
-                         definition_id + " index=" + std::to_string(chart_index));
-            });
+                final_json += "}";
+            }
+            res.set_content(ok_json(final_json), "application/json");
+            audit_fn(req, "execution.visualization.fetch", "success", "execution", execution_id,
+                     definition_id + " index=" + std::to_string(chart_index));
+        });
 
     // ── Inventory Evaluation (capability 15.4) ────────────────────────────
 
     if (inventory_store) {
         sink.Post("/api/v1/inventory/evaluate",
-                 [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
-                     if (!perm_fn(req, res, "Inventory", "Read")) return;
-                     auto body = nlohmann::json::parse(req.body, nullptr, false);
-                     if (body.is_discarded()) {
-                         res.status = 400;
-                         res.set_content(error_json("invalid JSON"), "application/json");
-                         return;
-                     }
+                  [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
+                      if (!perm_fn(req, res, "Inventory", "Read"))
+                          return;
+                      auto body = nlohmann::json::parse(req.body, nullptr, false);
+                      if (body.is_discarded()) {
+                          res.status = 400;
+                          res.set_content(error_json("invalid JSON"), "application/json");
+                          return;
+                      }
 
-                     InventoryEvalRequest eval_req;
-                     if (body.contains("agent_id")) eval_req.agent_id = body["agent_id"].get<std::string>();
-                     if (body.contains("combine")) eval_req.combine = body["combine"].get<std::string>();
-                     if (body.contains("conditions") && body["conditions"].is_array()) {
-                         for (const auto& c : body["conditions"]) {
-                             InventoryCondition cond;
-                             if (c.contains("plugin")) cond.plugin = c["plugin"].get<std::string>();
-                             if (c.contains("field")) cond.field = c["field"].get<std::string>();
-                             if (c.contains("op")) cond.op = c["op"].get<std::string>();
-                             if (c.contains("value")) cond.value = c["value"].get<std::string>();
-                             eval_req.conditions.push_back(std::move(cond));
-                         }
-                     }
+                      InventoryEvalRequest eval_req;
+                      if (body.contains("agent_id"))
+                          eval_req.agent_id = body["agent_id"].get<std::string>();
+                      if (body.contains("combine"))
+                          eval_req.combine = body["combine"].get<std::string>();
+                      if (body.contains("conditions") && body["conditions"].is_array()) {
+                          for (const auto& c : body["conditions"]) {
+                              InventoryCondition cond;
+                              if (c.contains("plugin"))
+                                  cond.plugin = c["plugin"].get<std::string>();
+                              if (c.contains("field"))
+                                  cond.field = c["field"].get<std::string>();
+                              if (c.contains("op"))
+                                  cond.op = c["op"].get<std::string>();
+                              if (c.contains("value"))
+                                  cond.value = c["value"].get<std::string>();
+                              eval_req.conditions.push_back(std::move(cond));
+                          }
+                      }
 
-                     // Fetch inventory records
-                     InventoryQuery iq;
-                     if (!eval_req.agent_id.empty()) iq.agent_id = eval_req.agent_id;
-                     iq.limit = 5000;
-                     auto records_raw = inventory_store->query(iq);
-                     std::vector<std::pair<std::string, std::string>> records;
-                     for (const auto& r : records_raw) {
-                         records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
-                     }
+                      // Fetch inventory records
+                      InventoryQuery iq;
+                      if (!eval_req.agent_id.empty())
+                          iq.agent_id = eval_req.agent_id;
+                      iq.limit = 5000;
+                      auto records_raw = inventory_store->query(iq);
+                      std::vector<std::pair<std::string, std::string>> records;
+                      for (const auto& r : records_raw) {
+                          records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
+                      }
 
-                     auto results = evaluate_inventory(eval_req, records);
-                     JArr arr;
-                     for (const auto& r : results) {
-                         arr.add(JObj()
-                             .add("agent_id", r.agent_id)
-                             .add("match", r.match)
-                             .add("matched_value", r.matched_value)
-                             .add("plugin", r.plugin)
-                             .add("collected_at", r.collected_at));
-                     }
-                     res.set_content(list_json(arr.str(), static_cast<int64_t>(results.size())),
-                                     "application/json");
-                 });
+                      auto results = evaluate_inventory(eval_req, records);
+                      JArr arr;
+                      for (const auto& r : results) {
+                          arr.add(JObj()
+                                      .add("agent_id", r.agent_id)
+                                      .add("match", r.match)
+                                      .add("matched_value", r.matched_value)
+                                      .add("plugin", r.plugin)
+                                      .add("collected_at", r.collected_at));
+                      }
+                      res.set_content(list_json(arr.str(), static_cast<int64_t>(results.size())),
+                                      "application/json");
+                  });
     }
 
     // ── Device Authorization Tokens (capability 18.8) ─────────────────────
 
     if (device_token_store) {
-        sink.Get("/api/v1/device-tokens",
-                [auth_fn, perm_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
-                    if (!perm_fn(req, res, "DeviceToken", "Read")) return;
-                    auto session = auth_fn(req, res);
-                    if (!session) return;
-                    auto tokens = device_token_store->list_tokens();
-                    JArr arr;
-                    for (const auto& t : tokens) {
-                        arr.add(JObj()
+        sink.Get("/api/v1/device-tokens", [auth_fn, perm_fn, device_token_store](
+                                              const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "DeviceToken", "Read"))
+                return;
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            auto tokens = device_token_store->list_tokens();
+            JArr arr;
+            for (const auto& t : tokens) {
+                arr.add(JObj()
                             .add("token_id", t.token_id)
                             .add("name", t.name)
                             .add("principal_id", t.principal_id)
@@ -2236,362 +2569,487 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             .add("expires_at", t.expires_at)
                             .add("last_used_at", t.last_used_at)
                             .add("revoked", t.revoked));
-                    }
-                    res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
-                                    "application/json");
-                });
+            }
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens.size())),
+                            "application/json");
+        });
 
-        sink.Post("/api/v1/device-tokens",
-                 [auth_fn, perm_fn, audit_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
-                     auto session = auth_fn(req, res);
-                     if (!session) return;
-                     if (!perm_fn(req, res, "DeviceToken", "Write")) return;
-                     auto body = nlohmann::json::parse(req.body, nullptr, false);
-                     if (body.is_discarded()) {
-                         res.status = 400;
-                         res.set_content(error_json("invalid JSON"), "application/json");
-                         return;
-                     }
-                     auto name = body.value("name", "");
-                     auto device_id = body.value("device_id", "");
-                     auto definition_id = body.value("definition_id", "");
-                     int64_t expires_at = body.value("expires_at", int64_t{0});
+        sink.Post("/api/v1/device-tokens", [auth_fn, perm_fn, audit_fn, device_token_store,
+                                            metrics_registry](const httplib::Request& req,
+                                                              httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!perm_fn(req, res, "DeviceToken", "Write"))
+                return;
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(error_json("invalid JSON"), "application/json");
+                return;
+            }
+            auto name = body.value("name", "");
+            auto device_id = body.value("device_id", "");
+            auto definition_id = body.value("definition_id", "");
+            int64_t expires_at = body.value("expires_at", int64_t{0});
 
-                     auto result = device_token_store->create_token(name, session->username,
-                                                                     device_id, definition_id, expires_at);
-                     if (!result) {
-                         res.status = 400;
-                         res.set_content(error_json(result.error()), "application/json");
-                         return;
-                     }
-                     audit_fn(req, "device_token.create", "success", "DeviceToken", "", name);
-                     res.status = 201;
-                     res.set_content(ok_json(JObj().add("raw_token", *result).str()), "application/json");
-                 });
+            // UP-H2 (gov Gate 4, unhappy-path): clamp user-controlled
+            // string length on `name`, `device_id`, and `definition_id`
+            // BEFORE any audit emission. Same DoS-via-oversized-payload
+            // class as the /api/v1/tokens site — see comment there for
+            // the full rationale. device_id is bound into the audit row
+            // as target_id, so it's the highest-priority field to clamp,
+            // but name and definition_id ride the same SQLite bind path.
+            if (name.size() > 256) {
+                res.status = 400;
+                res.set_content(error_json("invalid_input_length: name exceeds 256 chars"),
+                                "application/json");
+                return;
+            }
+            if (device_id.size() > 256) {
+                res.status = 400;
+                res.set_content(error_json("invalid_input_length: device_id exceeds 256 chars"),
+                                "application/json");
+                return;
+            }
+            if (definition_id.size() > 256) {
+                res.status = 400;
+                res.set_content(error_json("invalid_input_length: definition_id exceeds 256 chars"),
+                                "application/json");
+                return;
+            }
 
-        sink.Delete(R"(/api/v1/device-tokens/([a-f0-9]+))",
-                   [auth_fn, perm_fn, audit_fn, device_token_store](const httplib::Request& req, httplib::Response& res) {
-                       auto session = auth_fn(req, res);
-                       if (!session) return;
-                       if (!perm_fn(req, res, "DeviceToken", "Delete")) return;
-                       auto token_id = req.matches[1].str();
-                       if (device_token_store->revoke_token(token_id)) {
-                           audit_fn(req, "device_token.revoke", "success", "DeviceToken", token_id, "");
-                           res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
-                       } else {
-                           res.status = 404;
-                           res.set_content(error_json("token not found"), "application/json");
-                       }
-                   });
+            auto result = device_token_store->create_token(name, session->username, device_id,
+                                                           definition_id, expires_at);
+            if (!result) {
+                // sre-1: Prometheus signal for CSPRNG failure (see
+                // /api/v1/tokens comment for full rationale).
+                if (metrics_registry) {
+                    metrics_registry
+                        ->counter("yuzu_secure_random_failure_total",
+                                  {{"reason", "prng_failure"}, {"site", "device_token"}})
+                        .increment();
+                }
+                // F-002 (gov Gate 2, security-guardian): same audit
+                // gap as POST /api/v1/tokens — CSPRNG failure on
+                // device-token issuance silently dropped the audit
+                // row. SOC 2 CC7.2/CC7.3 require this surface to
+                // be auditable. `device_id` is the natural target_id
+                // for a device-scoped token (matches the eventual
+                // success-path subject) and `csprng_unavailable:`
+                // is the SIEM marker.
+                //
+                // UP-H1 (gov Gate 4): wrap audit in try/catch and
+                // capture bool return so a wedged AuditStore surfaces
+                // as Sec-Audit-Failed: true header + audit_emitted=false
+                // envelope field. See /api/v1/tokens for the full
+                // rationale.
+                bool audit_emitted = false;
+                try {
+                    audit_emitted = audit_fn(req, "device_token.create", "failure", "DeviceToken",
+                                             device_id, "csprng_unavailable: " + result.error());
+                } catch (const std::exception& ex) {
+                    spdlog::error("device_token.create audit emission threw: {}", ex.what());
+                    audit_emitted = false;
+                } catch (...) {
+                    spdlog::error("device_token.create audit emission threw unknown");
+                    audit_emitted = false;
+                }
+                // sre-2: 503 + Retry-After: 5 (entropy is server-side,
+                // not client error). Closes #1046.
+                res.status = 503;
+                res.set_header("Retry-After", "5");
+                if (!audit_emitted)
+                    res.set_header("Sec-Audit-Failed", "true");
+                JObj envelope_err;
+                envelope_err.add("code", 503)
+                    .add("message", "CSPRNG unavailable: " + result.error());
+                JObj envelope;
+                envelope.raw("error", envelope_err.str())
+                    .add("audit_emitted", audit_emitted)
+                    .raw("meta", R"({"api_version":"v1"})");
+                res.set_content(envelope.str(), "application/json");
+                return;
+            }
+            (void)audit_fn(req, "device_token.create", "success", "DeviceToken", "", name);
+            res.status = 201;
+            res.set_content(ok_json(JObj().add("raw_token", *result).str()), "application/json");
+        });
+
+        sink.Delete(
+            R"(/api/v1/device-tokens/([a-f0-9]+))",
+            [auth_fn, perm_fn, audit_fn, device_token_store](const httplib::Request& req,
+                                                             httplib::Response& res) {
+                auto session = auth_fn(req, res);
+                if (!session)
+                    return;
+                if (!perm_fn(req, res, "DeviceToken", "Delete"))
+                    return;
+                auto token_id = req.matches[1].str();
+                if (device_token_store->revoke_token(token_id)) {
+                    audit_fn(req, "device_token.revoke", "success", "DeviceToken", token_id, "");
+                    res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
+                } else {
+                    res.status = 404;
+                    res.set_content(error_json("token not found"), "application/json");
+                }
+            });
     }
 
     // ── Software Deployment (capability 7.6) ──────────────────────────────
 
     if (sw_deploy_store) {
         sink.Get("/api/v1/software-packages",
-                [perm_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
-                    if (!perm_fn(req, res, "SoftwareDeployment", "Read")) return;
-                    auto pkgs = sw_deploy_store->list_packages();
-                    JArr arr;
-                    for (const auto& p : pkgs) {
-                        arr.add(JObj()
-                            .add("id", p.id).add("name", p.name).add("version", p.version)
-                            .add("platform", p.platform).add("installer_type", p.installer_type)
-                            .add("content_hash", p.content_hash).add("size_bytes", p.size_bytes)
-                            .add("created_at", p.created_at).add("created_by", p.created_by));
-                    }
-                    res.set_content(list_json(arr.str(), static_cast<int64_t>(pkgs.size())),
-                                    "application/json");
-                });
-
-        sink.Post("/api/v1/software-packages",
-                 [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
-                     auto session = auth_fn(req, res);
-                     if (!session) return;
-                     if (!perm_fn(req, res, "SoftwareDeployment", "Write")) return;
-                     auto body = nlohmann::json::parse(req.body, nullptr, false);
-                     if (body.is_discarded()) {
-                         res.status = 400;
-                         res.set_content(error_json("invalid JSON"), "application/json");
+                 [perm_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
+                     if (!perm_fn(req, res, "SoftwareDeployment", "Read"))
                          return;
+                     auto pkgs = sw_deploy_store->list_packages();
+                     JArr arr;
+                     for (const auto& p : pkgs) {
+                         arr.add(JObj()
+                                     .add("id", p.id)
+                                     .add("name", p.name)
+                                     .add("version", p.version)
+                                     .add("platform", p.platform)
+                                     .add("installer_type", p.installer_type)
+                                     .add("content_hash", p.content_hash)
+                                     .add("size_bytes", p.size_bytes)
+                                     .add("created_at", p.created_at)
+                                     .add("created_by", p.created_by));
                      }
-                     auto pkg_name = body.value("name", "");
-                     auto pkg_version = body.value("version", "");
-                     if (pkg_name.empty() || pkg_version.empty()) {
-                         res.status = 400;
-                         res.set_content(error_json("name and version are required"), "application/json");
-                         return;
-                     }
-                     SoftwarePackage pkg;
-                     pkg.name = pkg_name;
-                     pkg.version = pkg_version;
-                     pkg.platform = body.value("platform", "windows");
-                     pkg.installer_type = body.value("installer_type", "msi");
-                     pkg.content_hash = body.value("content_hash", "");
-                     pkg.content_url = body.value("content_url", "");
-                     pkg.silent_args = body.value("silent_args", "");
-                     pkg.verify_command = body.value("verify_command", "");
-                     pkg.rollback_command = body.value("rollback_command", "");
-                     pkg.size_bytes = body.value("size_bytes", int64_t{0});
-                     pkg.created_by = session->username;
-
-                     auto result = sw_deploy_store->create_package(pkg);
-                     if (!result) {
-                         res.status = 400;
-                         res.set_content(error_json(result.error()), "application/json");
-                         return;
-                     }
-                     audit_fn(req, "software_package.create", "success", "SoftwarePackage", *result, pkg.name);
-                     res.status = 201;
-                     res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
+                     res.set_content(list_json(arr.str(), static_cast<int64_t>(pkgs.size())),
+                                     "application/json");
                  });
 
-        sink.Get("/api/v1/software-deployments",
-                [perm_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
-                    if (!perm_fn(req, res, "SoftwareDeployment", "Read")) return;
-                    auto status = req.has_param("status") ? req.get_param_value("status") : std::string{};
-                    auto deps = sw_deploy_store->list_deployments(status);
-                    JArr arr;
-                    for (const auto& d : deps) {
-                        arr.add(JObj()
-                            .add("id", d.id).add("package_id", d.package_id)
-                            .add("status", d.status).add("created_by", d.created_by)
-                            .add("created_at", d.created_at).add("started_at", d.started_at)
+        sink.Post("/api/v1/software-packages", [auth_fn, perm_fn, audit_fn,
+                                                sw_deploy_store](const httplib::Request& req,
+                                                                 httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!perm_fn(req, res, "SoftwareDeployment", "Write"))
+                return;
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(error_json("invalid JSON"), "application/json");
+                return;
+            }
+            auto pkg_name = body.value("name", "");
+            auto pkg_version = body.value("version", "");
+            if (pkg_name.empty() || pkg_version.empty()) {
+                res.status = 400;
+                res.set_content(error_json("name and version are required"), "application/json");
+                return;
+            }
+            SoftwarePackage pkg;
+            pkg.name = pkg_name;
+            pkg.version = pkg_version;
+            pkg.platform = body.value("platform", "windows");
+            pkg.installer_type = body.value("installer_type", "msi");
+            pkg.content_hash = body.value("content_hash", "");
+            pkg.content_url = body.value("content_url", "");
+            pkg.silent_args = body.value("silent_args", "");
+            pkg.verify_command = body.value("verify_command", "");
+            pkg.rollback_command = body.value("rollback_command", "");
+            pkg.size_bytes = body.value("size_bytes", int64_t{0});
+            pkg.created_by = session->username;
+
+            auto result = sw_deploy_store->create_package(pkg);
+            if (!result) {
+                res.status = 400;
+                res.set_content(error_json(result.error()), "application/json");
+                return;
+            }
+            audit_fn(req, "software_package.create", "success", "SoftwarePackage", *result,
+                     pkg.name);
+            res.status = 201;
+            res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
+        });
+
+        sink.Get("/api/v1/software-deployments", [perm_fn,
+                                                  sw_deploy_store](const httplib::Request& req,
+                                                                   httplib::Response& res) {
+            if (!perm_fn(req, res, "SoftwareDeployment", "Read"))
+                return;
+            auto status = req.has_param("status") ? req.get_param_value("status") : std::string{};
+            auto deps = sw_deploy_store->list_deployments(status);
+            JArr arr;
+            for (const auto& d : deps) {
+                arr.add(JObj()
+                            .add("id", d.id)
+                            .add("package_id", d.package_id)
+                            .add("status", d.status)
+                            .add("created_by", d.created_by)
+                            .add("created_at", d.created_at)
+                            .add("started_at", d.started_at)
                             .add("completed_at", d.completed_at)
                             .add("agents_targeted", static_cast<int64_t>(d.agents_targeted))
                             .add("agents_success", static_cast<int64_t>(d.agents_success))
                             .add("agents_failure", static_cast<int64_t>(d.agents_failure)));
-                    }
-                    res.set_content(list_json(arr.str(), static_cast<int64_t>(deps.size())),
-                                    "application/json");
-                });
+            }
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(deps.size())),
+                            "application/json");
+        });
 
         sink.Post("/api/v1/software-deployments",
-                 [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
-                     auto session = auth_fn(req, res);
-                     if (!session) return;
-                     if (!perm_fn(req, res, "SoftwareDeployment", "Execute")) return;
-                     auto body = nlohmann::json::parse(req.body, nullptr, false);
-                     if (body.is_discarded()) {
-                         res.status = 400;
-                         res.set_content(error_json("invalid JSON"), "application/json");
-                         return;
-                     }
-                     SoftwareDeployment dep;
-                     dep.package_id = body.value("package_id", "");
-                     dep.scope_expression = body.value("scope_expression", "");
-                     dep.created_by = session->username;
-                     auto result = sw_deploy_store->create_deployment(dep);
-                     if (!result) {
-                         res.status = 400;
-                         res.set_content(error_json(result.error()), "application/json");
-                         return;
-                     }
-                     audit_fn(req, "software_deployment.create", "success", "SoftwareDeployment", *result, "");
-                     res.status = 201;
-                     res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
-                 });
+                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req,
+                                                                httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
+                          return;
+                      auto body = nlohmann::json::parse(req.body, nullptr, false);
+                      if (body.is_discarded()) {
+                          res.status = 400;
+                          res.set_content(error_json("invalid JSON"), "application/json");
+                          return;
+                      }
+                      SoftwareDeployment dep;
+                      dep.package_id = body.value("package_id", "");
+                      dep.scope_expression = body.value("scope_expression", "");
+                      dep.created_by = session->username;
+                      auto result = sw_deploy_store->create_deployment(dep);
+                      if (!result) {
+                          res.status = 400;
+                          res.set_content(error_json(result.error()), "application/json");
+                          return;
+                      }
+                      audit_fn(req, "software_deployment.create", "success", "SoftwareDeployment",
+                               *result, "");
+                      res.status = 201;
+                      res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
+                  });
 
-        sink.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/start)",
-                 [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
-                     auto session = auth_fn(req, res);
-                     if (!session) return;
-                     if (!perm_fn(req, res, "SoftwareDeployment", "Execute")) return;
-                     auto id = req.matches[1].str();
-                     if (sw_deploy_store->start_deployment(id)) {
-                         audit_fn(req, "software_deployment.start", "success", "SoftwareDeployment", id, "");
-                         res.set_content(ok_json(JObj().add("started", true).str()), "application/json");
-                     } else {
-                         res.status = 400;
-                         res.set_content(error_json("cannot start deployment"), "application/json");
-                     }
-                 });
+        sink.Post(
+            R"(/api/v1/software-deployments/([a-f0-9]+)/start)",
+            [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req,
+                                                          httplib::Response& res) {
+                auto session = auth_fn(req, res);
+                if (!session)
+                    return;
+                if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
+                    return;
+                auto id = req.matches[1].str();
+                if (sw_deploy_store->start_deployment(id)) {
+                    audit_fn(req, "software_deployment.start", "success", "SoftwareDeployment", id,
+                             "");
+                    res.set_content(ok_json(JObj().add("started", true).str()), "application/json");
+                } else {
+                    res.status = 400;
+                    res.set_content(error_json("cannot start deployment"), "application/json");
+                }
+            });
 
         sink.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/rollback)",
-                 [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
-                     auto session = auth_fn(req, res);
-                     if (!session) return;
-                     if (!perm_fn(req, res, "SoftwareDeployment", "Execute")) return;
-                     auto id = req.matches[1].str();
-                     if (sw_deploy_store->rollback_deployment(id)) {
-                         audit_fn(req, "software_deployment.rollback", "success", "SoftwareDeployment", id, "");
-                         res.set_content(ok_json(JObj().add("rolled_back", true).str()), "application/json");
-                     } else {
-                         res.status = 400;
-                         res.set_content(error_json("cannot rollback deployment"), "application/json");
-                     }
-                 });
+                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req,
+                                                                httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
+                          return;
+                      auto id = req.matches[1].str();
+                      if (sw_deploy_store->rollback_deployment(id)) {
+                          audit_fn(req, "software_deployment.rollback", "success",
+                                   "SoftwareDeployment", id, "");
+                          res.set_content(ok_json(JObj().add("rolled_back", true).str()),
+                                          "application/json");
+                      } else {
+                          res.status = 400;
+                          res.set_content(error_json("cannot rollback deployment"),
+                                          "application/json");
+                      }
+                  });
 
         sink.Post(R"(/api/v1/software-deployments/([a-f0-9]+)/cancel)",
-                 [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req, httplib::Response& res) {
-                     auto session = auth_fn(req, res);
-                     if (!session) return;
-                     if (!perm_fn(req, res, "SoftwareDeployment", "Execute")) return;
-                     auto id = req.matches[1].str();
-                     if (sw_deploy_store->cancel_deployment(id)) {
-                         audit_fn(req, "software_deployment.cancel", "success", "SoftwareDeployment", id, "");
-                         res.set_content(ok_json(JObj().add("cancelled", true).str()), "application/json");
-                     } else {
-                         res.status = 400;
-                         res.set_content(error_json("cannot cancel deployment"), "application/json");
-                     }
-                 });
+                  [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req,
+                                                                httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
+                          return;
+                      auto id = req.matches[1].str();
+                      if (sw_deploy_store->cancel_deployment(id)) {
+                          audit_fn(req, "software_deployment.cancel", "success",
+                                   "SoftwareDeployment", id, "");
+                          res.set_content(ok_json(JObj().add("cancelled", true).str()),
+                                          "application/json");
+                      } else {
+                          res.status = 400;
+                          res.set_content(error_json("cannot cancel deployment"),
+                                          "application/json");
+                      }
+                  });
     }
 
     // ── License Management (capability 22.3) ──────────────────────────────
 
     if (license_store) {
-        sink.Get("/api/v1/license",
-                [perm_fn, license_store](const httplib::Request& req, httplib::Response& res) {
-                    if (!perm_fn(req, res, "License", "Read")) return;
-                    auto lic = license_store->get_active_license();
-                    if (!lic) {
-                        res.set_content(ok_json(JObj().add("status", "none").str()), "application/json");
-                        return;
-                    }
-                    auto data = JObj()
-                        .add("id", lic->id)
-                        .add("organization", lic->organization)
-                        .add("seat_count", lic->seat_count)
-                        .add("seats_used", lic->seats_used)
-                        .add("issued_at", lic->issued_at)
-                        .add("expires_at", lic->expires_at)
-                        .add("edition", lic->edition)
-                        .add("status", lic->status)
-                        .add("days_remaining", license_store->days_remaining())
-                        .str();
-                    res.set_content(ok_json(data), "application/json");
-                });
+        sink.Get("/api/v1/license", [perm_fn, license_store](const httplib::Request& req,
+                                                             httplib::Response& res) {
+            if (!perm_fn(req, res, "License", "Read"))
+                return;
+            auto lic = license_store->get_active_license();
+            if (!lic) {
+                res.set_content(ok_json(JObj().add("status", "none").str()), "application/json");
+                return;
+            }
+            auto data = JObj()
+                            .add("id", lic->id)
+                            .add("organization", lic->organization)
+                            .add("seat_count", lic->seat_count)
+                            .add("seats_used", lic->seats_used)
+                            .add("issued_at", lic->issued_at)
+                            .add("expires_at", lic->expires_at)
+                            .add("edition", lic->edition)
+                            .add("status", lic->status)
+                            .add("days_remaining", license_store->days_remaining())
+                            .str();
+            res.set_content(ok_json(data), "application/json");
+        });
 
-        sink.Post("/api/v1/license",
-                 [auth_fn, perm_fn, audit_fn, license_store](const httplib::Request& req, httplib::Response& res) {
-                     auto session = auth_fn(req, res);
-                     if (!session) return;
-                     if (!perm_fn(req, res, "License", "Write")) return;
-                     auto body = nlohmann::json::parse(req.body, nullptr, false);
-                     if (body.is_discarded()) {
-                         res.status = 400;
-                         res.set_content(error_json("invalid JSON"), "application/json");
-                         return;
-                     }
-                     License lic;
-                     lic.organization = body.value("organization", "");
-                     lic.seat_count = body.value("seat_count", int64_t{0});
-                     lic.edition = body.value("edition", "community");
-                     lic.expires_at = body.value("expires_at", int64_t{0});
-                     lic.features_json = body.value("features_json", "[]");
-                     auto key = body.value("license_key", "");
+        sink.Post("/api/v1/license", [auth_fn, perm_fn, audit_fn, license_store](
+                                         const httplib::Request& req, httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!perm_fn(req, res, "License", "Write"))
+                return;
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(error_json("invalid JSON"), "application/json");
+                return;
+            }
+            License lic;
+            lic.organization = body.value("organization", "");
+            lic.seat_count = body.value("seat_count", int64_t{0});
+            lic.edition = body.value("edition", "community");
+            lic.expires_at = body.value("expires_at", int64_t{0});
+            lic.features_json = body.value("features_json", "[]");
+            auto key = body.value("license_key", "");
 
-                     auto result = license_store->activate_license(lic, key);
-                     if (!result) {
-                         res.status = 400;
-                         res.set_content(error_json(result.error()), "application/json");
-                         return;
-                     }
-                     audit_fn(req, "license.activate", "success", "License", *result, lic.organization);
-                     res.status = 201;
-                     res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
-                 });
+            auto result = license_store->activate_license(lic, key);
+            if (!result) {
+                res.status = 400;
+                res.set_content(error_json(result.error()), "application/json");
+                return;
+            }
+            audit_fn(req, "license.activate", "success", "License", *result, lic.organization);
+            res.status = 201;
+            res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
+        });
 
-        sink.Delete(R"(/api/v1/license/([a-f0-9]+))",
-                   [auth_fn, perm_fn, audit_fn, license_store](const httplib::Request& req, httplib::Response& res) {
-                       auto session = auth_fn(req, res);
-                       if (!session) return;
-                       if (!perm_fn(req, res, "License", "Write")) return;
-                       auto id = req.matches[1].str();
-                       if (license_store->remove_license(id)) {
-                           audit_fn(req, "license.remove", "success", "License", id, "");
-                           res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");
-                       } else {
-                           res.status = 404;
-                           res.set_content(error_json("license not found"), "application/json");
-                       }
-                   });
+        sink.Delete(R"(/api/v1/license/([a-f0-9]+))", [auth_fn, perm_fn, audit_fn,
+                                                       license_store](const httplib::Request& req,
+                                                                      httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!perm_fn(req, res, "License", "Write"))
+                return;
+            auto id = req.matches[1].str();
+            if (license_store->remove_license(id)) {
+                audit_fn(req, "license.remove", "success", "License", id, "");
+                res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");
+            } else {
+                res.status = 404;
+                res.set_content(error_json("license not found"), "application/json");
+            }
+        });
 
         sink.Get("/api/v1/license/alerts",
-                [perm_fn, license_store](const httplib::Request& req, httplib::Response& res) {
-                    if (!perm_fn(req, res, "License", "Read")) return;
-                    bool unack = req.has_param("unacknowledged");
-                    auto alerts = license_store->list_alerts(unack);
-                    JArr arr;
-                    for (const auto& a : alerts) {
-                        arr.add(JObj()
-                            .add("id", a.id)
-                            .add("alert_type", a.alert_type)
-                            .add("message", a.message)
-                            .add("triggered_at", a.triggered_at)
-                            .add("acknowledged", a.acknowledged));
-                    }
-                    res.set_content(list_json(arr.str(), static_cast<int64_t>(alerts.size())),
-                                    "application/json");
-                });
+                 [perm_fn, license_store](const httplib::Request& req, httplib::Response& res) {
+                     if (!perm_fn(req, res, "License", "Read"))
+                         return;
+                     bool unack = req.has_param("unacknowledged");
+                     auto alerts = license_store->list_alerts(unack);
+                     JArr arr;
+                     for (const auto& a : alerts) {
+                         arr.add(JObj()
+                                     .add("id", a.id)
+                                     .add("alert_type", a.alert_type)
+                                     .add("message", a.message)
+                                     .add("triggered_at", a.triggered_at)
+                                     .add("acknowledged", a.acknowledged));
+                     }
+                     res.set_content(list_json(arr.str(), static_cast<int64_t>(alerts.size())),
+                                     "application/json");
+                 });
     }
 
     // ── Topology (capability 22.2) ─ REST endpoint ────────────────────────
 
-    sink.Get("/api/v1/topology",
-            [perm_fn](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Infrastructure", "Read")) return;
-                // Topology data is assembled from in-memory agent registry in server.cpp
-                // fragment routes. The REST endpoint returns a placeholder for external callers.
-                auto data = JObj()
-                    .add("message", "Use /frag/topology-data for HTMX or query individual stores")
-                    .str();
-                res.set_content(ok_json(data), "application/json");
-            });
+    sink.Get("/api/v1/topology", [perm_fn](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "Infrastructure", "Read"))
+            return;
+        // Topology data is assembled from in-memory agent registry in server.cpp
+        // fragment routes. The REST endpoint returns a placeholder for external callers.
+        auto data =
+            JObj()
+                .add("message", "Use /frag/topology-data for HTMX or query individual stores")
+                .str();
+        res.set_content(ok_json(data), "application/json");
+    });
 
     // ── Statistics (capability 22.6) ─ REST endpoint ──────────────────────
 
     sink.Get("/api/v1/statistics",
-            [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "Infrastructure", "Read")) return;
-                auto fleet = execution_tracker->get_fleet_summary();
-                auto data = JObj()
-                    .raw("executions", JObj()
-                        .add("total", fleet.total_executions)
-                        .add("today", fleet.executions_today)
-                        .add("success_rate", fleet.overall_success_rate)
-                        .add("avg_duration_seconds", fleet.avg_duration_seconds)
-                        .str())
-                    .add("active_agents", fleet.active_agents)
-                    .str();
-                res.set_content(ok_json(data), "application/json");
-            });
+             [perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "Infrastructure", "Read"))
+                     return;
+                 auto fleet = execution_tracker->get_fleet_summary();
+                 auto data = JObj()
+                                 .raw("executions",
+                                      JObj()
+                                          .add("total", fleet.total_executions)
+                                          .add("today", fleet.executions_today)
+                                          .add("success_rate", fleet.overall_success_rate)
+                                          .add("avg_duration_seconds", fleet.avg_duration_seconds)
+                                          .str())
+                                 .add("active_agents", fleet.active_agents)
+                                 .str();
+                 res.set_content(ok_json(data), "application/json");
+             });
 
     // ── File Retrieval (capability 10.13) ────────────────────────────────
     // Receives files uploaded by the content_dist plugin's upload_file action.
     sink.Post("/api/v1/file-retrieval",
-            [auth_fn, perm_fn, audit_fn](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn(req, res, "FileRetrieval", "Write")) return;
+              [auth_fn, perm_fn, audit_fn](const httplib::Request& req, httplib::Response& res) {
+                  if (!perm_fn(req, res, "FileRetrieval", "Write"))
+                      return;
 
-                // Extract form fields from the request body (JSON)
-                auto body = nlohmann::json::parse(req.body, nullptr, false);
-                if (body.is_discarded() || !body.contains("agent_id")) {
-                    res.status = 400;
-                    res.set_content(error_json("invalid request body"), "application/json");
-                    return;
-                }
-                auto agent_id = body.value("agent_id", "");
-                auto original_path = body.value("original_path", "");
-                auto sha256 = body.value("sha256", "");
-                auto file_size = body.value("size", int64_t{0});
+                  // Extract form fields from the request body (JSON)
+                  auto body = nlohmann::json::parse(req.body, nullptr, false);
+                  if (body.is_discarded() || !body.contains("agent_id")) {
+                      res.status = 400;
+                      res.set_content(error_json("invalid request body"), "application/json");
+                      return;
+                  }
+                  auto agent_id = body.value("agent_id", "");
+                  auto original_path = body.value("original_path", "");
+                  auto sha256 = body.value("sha256", "");
+                  auto file_size = body.value("size", int64_t{0});
 
-                // Store the uploaded file (implementation: write to a configurable
-                // retrieval directory, keyed by agent_id and timestamp)
-                spdlog::info("FileRetrieval: received {} bytes from agent={}, path={}",
-                             file_size, agent_id, original_path);
+                  // Store the uploaded file (implementation: write to a configurable
+                  // retrieval directory, keyed by agent_id and timestamp)
+                  spdlog::info("FileRetrieval: received {} bytes from agent={}, path={}", file_size,
+                               agent_id, original_path);
 
-                audit_fn(req, "file_retrieval.upload", "success", "FileRetrieval", agent_id,
-                          "path=" + original_path + ", size=" + std::to_string(file_size));
+                  audit_fn(req, "file_retrieval.upload", "success", "FileRetrieval", agent_id,
+                           "path=" + original_path + ", size=" + std::to_string(file_size));
 
-                auto data = JObj()
-                    .add("status", "received")
-                    .add("bytes", file_size)
-                    .add("agent_id", agent_id)
-                    .add("sha256", sha256)
-                    .str();
-                res.set_content(ok_json(data), "application/json");
-            });
+                  auto data = JObj()
+                                  .add("status", "received")
+                                  .add("bytes", file_size)
+                                  .add("agent_id", agent_id)
+                                  .add("sha256", sha256)
+                                  .str();
+                  res.set_content(ok_json(data), "application/json");
+              });
 
     // ── Guardian / Guaranteed State (/api/v1/guaranteed-state) ────────────
     // PR 2 of the Guardian Windows-first rollout. Endpoints follow design
@@ -2636,339 +3094,343 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     };
 
     sink.Get("/api/v1/guaranteed-state/rules",
-        [perm_fn, guaranteed_state_store, rule_to_jobj](const httplib::Request& req,
-                                                         httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
-            if (!guaranteed_state_store) {
-                res.status = 503;
-                res.set_content(error_json("service unavailable", 503),
-                                "application/json");
-                return;
-            }
-            auto rows = guaranteed_state_store->list_rules();
-            JArr arr;
-            for (const auto& r : rows) arr.add(rule_to_jobj(r));
-            res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size())),
-                            "application/json");
-        });
+             [perm_fn, guaranteed_state_store, rule_to_jobj](const httplib::Request& req,
+                                                             httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!guaranteed_state_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 auto rows = guaranteed_state_store->list_rules();
+                 JArr arr;
+                 for (const auto& r : rows)
+                     arr.add(rule_to_jobj(r));
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size())),
+                                 "application/json");
+             });
 
-    sink.Post("/api/v1/guaranteed-state/rules",
-        [auth_fn, perm_fn, audit_fn, guaranteed_state_store, iso_now](
-            const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Write")) return;
-            if (!guaranteed_state_store) {
-                res.status = 503;
-                res.set_content(error_json("service unavailable", 503),
-                                "application/json");
-                return;
-            }
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded() || !body.is_object()) {
-                res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
-                return;
-            }
-            GuaranteedStateRuleRow row;
-            row.rule_id          = body.value("rule_id", "");
-            row.name             = body.value("name", "");
-            row.yaml_source      = body.value("yaml_source", "");
-            row.version          = body.value("version", int64_t{1});
-            row.enabled          = body.value("enabled", true);
-            row.enforcement_mode = body.value("enforcement_mode", std::string{"enforce"});
-            row.severity         = body.value("severity", std::string{"medium"});
-            row.os_target        = body.value("os_target", std::string{""});
-            row.scope_expr       = body.value("scope_expr", std::string{""});
-            if (row.rule_id.empty() || row.name.empty() || row.yaml_source.empty()) {
-                res.status = 400;
-                res.set_content(error_json("rule_id, name, and yaml_source are required"),
-                                "application/json");
-                return;
-            }
-            auto session = auth_fn(req, res);
-            if (session) {
-                row.created_by = session->username;
-                row.updated_by = session->username;
-            }
-            row.created_at = iso_now();
-            row.updated_at = row.created_at;
-
-            auto result = guaranteed_state_store->create_rule(row);
-            if (!result) {
-                if (is_conflict_error(result.error())) {
-                    res.status = 409;
-                    res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
-                                    "application/json");
-                } else {
-                    res.status = 400;
-                    res.set_content(error_json(result.error()), "application/json");
-                }
-                audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState",
-                         row.rule_id, result.error());
-                return;
-            }
-            audit_fn(req, "guaranteed_state.rule.create", "success", "GuaranteedState",
-                     row.rule_id, row.name);
-            res.status = 201;
-            res.set_content(ok_json(JObj().add("rule_id", row.rule_id).str()),
+    sink.Post("/api/v1/guaranteed-state/rules", [auth_fn, perm_fn, audit_fn, guaranteed_state_store,
+                                                 iso_now](const httplib::Request& req,
+                                                          httplib::Response& res) {
+        if (!perm_fn(req, res, "GuaranteedState", "Write"))
+            return;
+        if (!guaranteed_state_store) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object()) {
+            res.status = 400;
+            res.set_content(error_json("invalid JSON"), "application/json");
+            return;
+        }
+        GuaranteedStateRuleRow row;
+        row.rule_id = body.value("rule_id", "");
+        row.name = body.value("name", "");
+        row.yaml_source = body.value("yaml_source", "");
+        row.version = body.value("version", int64_t{1});
+        row.enabled = body.value("enabled", true);
+        row.enforcement_mode = body.value("enforcement_mode", std::string{"enforce"});
+        row.severity = body.value("severity", std::string{"medium"});
+        row.os_target = body.value("os_target", std::string{""});
+        row.scope_expr = body.value("scope_expr", std::string{""});
+        if (row.rule_id.empty() || row.name.empty() || row.yaml_source.empty()) {
+            res.status = 400;
+            res.set_content(error_json("rule_id, name, and yaml_source are required"),
                             "application/json");
-        });
+            return;
+        }
+        auto session = auth_fn(req, res);
+        if (session) {
+            row.created_by = session->username;
+            row.updated_by = session->username;
+        }
+        row.created_at = iso_now();
+        row.updated_at = row.created_at;
+
+        auto result = guaranteed_state_store->create_rule(row);
+        if (!result) {
+            if (is_conflict_error(result.error())) {
+                res.status = 409;
+                res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                                "application/json");
+            } else {
+                res.status = 400;
+                res.set_content(error_json(result.error()), "application/json");
+            }
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+                     result.error());
+            return;
+        }
+        audit_fn(req, "guaranteed_state.rule.create", "success", "GuaranteedState", row.rule_id,
+                 row.name);
+        res.status = 201;
+        res.set_content(ok_json(JObj().add("rule_id", row.rule_id).str()), "application/json");
+    });
 
     sink.Get(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
-        [perm_fn, guaranteed_state_store, rule_to_jobj](const httplib::Request& req,
-                                                         httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
-            if (!guaranteed_state_store) {
-                res.status = 503;
-                res.set_content(error_json("service unavailable", 503),
-                                "application/json");
-                return;
-            }
-            auto id = req.matches[1].str();
-            auto row = guaranteed_state_store->get_rule(id);
-            if (!row) {
-                res.status = 404;
-                res.set_content(error_json("rule not found"), "application/json");
-                return;
-            }
-            res.set_content(ok_json(rule_to_jobj(*row).str()), "application/json");
-        });
+             [perm_fn, guaranteed_state_store, rule_to_jobj](const httplib::Request& req,
+                                                             httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 if (!guaranteed_state_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 auto id = req.matches[1].str();
+                 auto row = guaranteed_state_store->get_rule(id);
+                 if (!row) {
+                     res.status = 404;
+                     res.set_content(error_json("rule not found"), "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(rule_to_jobj(*row).str()), "application/json");
+             });
 
     sink.Put(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
-        [auth_fn, perm_fn, audit_fn, guaranteed_state_store, iso_now](
-            const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Write")) return;
-            if (!guaranteed_state_store) {
-                res.status = 503;
-                res.set_content(error_json("service unavailable", 503),
-                                "application/json");
-                return;
-            }
-            auto id = req.matches[1].str();
-            auto existing = guaranteed_state_store->get_rule(id);
-            if (!existing) {
-                res.status = 404;
-                res.set_content(error_json("rule not found"), "application/json");
-                return;
-            }
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded() || !body.is_object()) {
-                res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
-                // Mirror the /push handler's invalid-body audit (BL-6): a
-                // mutating REST path that rejects a malformed body should
-                // leave a denied audit trail so SIEM sees the probe/fuzz
-                // attempt. Asymmetric audit coverage across sibling branches
-                // was flagged as UP-R1 in the Guardian PR 2 governance re-run.
-                audit_fn(req, "guaranteed_state.rule.update", "denied",
-                         "GuaranteedState", id, "invalid JSON body");
-                return;
-            }
-            auto updated = *existing;
-            // Use body.value<T>(k, default) rather than body["k"].get<T>()
-            // so a type-mismatched JSON field (e.g. {"enabled": "yes"})
-            // falls back to the existing value rather than throwing
-            // nlohmann::json::type_error. nlohmann throws from get<T>() on
-            // mismatch; without a server-wide set_exception_handler on
-            // web_server_ (none installed), httplib's default path returns
-            // HTTP 500 with an empty body. That converts a client-error
-            // request-shape mistake into a server-error alertable event.
-            // Mirrors the POST handler's body.value(...) pattern.
-            updated.name             = body.value("name", updated.name);
-            updated.yaml_source      = body.value("yaml_source", updated.yaml_source);
-            updated.enabled          = body.value("enabled", updated.enabled);
-            updated.enforcement_mode = body.value("enforcement_mode", updated.enforcement_mode);
-            updated.severity         = body.value("severity", updated.severity);
-            updated.os_target        = body.value("os_target", updated.os_target);
-            updated.scope_expr       = body.value("scope_expr", updated.scope_expr);
-            updated.version = existing->version + 1;
-            updated.updated_at = iso_now();
-            auto session = auth_fn(req, res);
-            if (session) updated.updated_by = session->username;
+             [auth_fn, perm_fn, audit_fn, guaranteed_state_store,
+              iso_now](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Write"))
+                     return;
+                 if (!guaranteed_state_store) {
+                     res.status = 503;
+                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     return;
+                 }
+                 auto id = req.matches[1].str();
+                 auto existing = guaranteed_state_store->get_rule(id);
+                 if (!existing) {
+                     res.status = 404;
+                     res.set_content(error_json("rule not found"), "application/json");
+                     return;
+                 }
+                 auto body = nlohmann::json::parse(req.body, nullptr, false);
+                 if (body.is_discarded() || !body.is_object()) {
+                     res.status = 400;
+                     res.set_content(error_json("invalid JSON"), "application/json");
+                     // Mirror the /push handler's invalid-body audit (BL-6): a
+                     // mutating REST path that rejects a malformed body should
+                     // leave a denied audit trail so SIEM sees the probe/fuzz
+                     // attempt. Asymmetric audit coverage across sibling branches
+                     // was flagged as UP-R1 in the Guardian PR 2 governance re-run.
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              "invalid JSON body");
+                     return;
+                 }
+                 auto updated = *existing;
+                 // Use body.value<T>(k, default) rather than body["k"].get<T>()
+                 // so a type-mismatched JSON field (e.g. {"enabled": "yes"})
+                 // falls back to the existing value rather than throwing
+                 // nlohmann::json::type_error. nlohmann throws from get<T>() on
+                 // mismatch; without a server-wide set_exception_handler on
+                 // web_server_ (none installed), httplib's default path returns
+                 // HTTP 500 with an empty body. That converts a client-error
+                 // request-shape mistake into a server-error alertable event.
+                 // Mirrors the POST handler's body.value(...) pattern.
+                 updated.name = body.value("name", updated.name);
+                 updated.yaml_source = body.value("yaml_source", updated.yaml_source);
+                 updated.enabled = body.value("enabled", updated.enabled);
+                 updated.enforcement_mode =
+                     body.value("enforcement_mode", updated.enforcement_mode);
+                 updated.severity = body.value("severity", updated.severity);
+                 updated.os_target = body.value("os_target", updated.os_target);
+                 updated.scope_expr = body.value("scope_expr", updated.scope_expr);
+                 updated.version = existing->version + 1;
+                 updated.updated_at = iso_now();
+                 auto session = auth_fn(req, res);
+                 if (session)
+                     updated.updated_by = session->username;
 
-            auto result = guaranteed_state_store->update_rule(updated);
-            if (!result) {
-                if (is_conflict_error(result.error())) {
-                    res.status = 409;
-                    res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
-                                    "application/json");
-                } else {
-                    res.status = 400;
-                    res.set_content(error_json(result.error()), "application/json");
-                }
-                audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState",
-                         id, result.error());
-                return;
-            }
-            audit_fn(req, "guaranteed_state.rule.update", "success", "GuaranteedState",
-                     id, updated.name);
-            res.set_content(ok_json(JObj().add("updated", true)
-                                          .add("version", static_cast<int64_t>(updated.version)).str()),
-                            "application/json");
-        });
+                 auto result = guaranteed_state_store->update_rule(updated);
+                 if (!result) {
+                     if (is_conflict_error(result.error())) {
+                         res.status = 409;
+                         res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                                         "application/json");
+                     } else {
+                         res.status = 400;
+                         res.set_content(error_json(result.error()), "application/json");
+                     }
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              result.error());
+                     return;
+                 }
+                 audit_fn(req, "guaranteed_state.rule.update", "success", "GuaranteedState", id,
+                          updated.name);
+                 res.set_content(ok_json(JObj()
+                                             .add("updated", true)
+                                             .add("version", static_cast<int64_t>(updated.version))
+                                             .str()),
+                                 "application/json");
+             });
 
     sink.Delete(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
-        [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
-                                                     httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Delete")) return;
-            if (!guaranteed_state_store) {
-                res.status = 503;
-                res.set_content(error_json("service unavailable", 503),
-                                "application/json");
-                return;
-            }
-            auto id = req.matches[1].str();
-            auto result = guaranteed_state_store->delete_rule(id);
-            if (!result) {
-                res.status = 404;
-                res.set_content(error_json(result.error()), "application/json");
-                audit_fn(req, "guaranteed_state.rule.delete", "denied", "GuaranteedState",
-                         id, result.error());
-                return;
-            }
-            audit_fn(req, "guaranteed_state.rule.delete", "success", "GuaranteedState",
-                     id, "");
-            res.set_content(ok_json(JObj().add("deleted", true).str()),
-                            "application/json");
-        });
+                [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+                                                            httplib::Response& res) {
+                    if (!perm_fn(req, res, "GuaranteedState", "Delete"))
+                        return;
+                    if (!guaranteed_state_store) {
+                        res.status = 503;
+                        res.set_content(error_json("service unavailable", 503), "application/json");
+                        return;
+                    }
+                    auto id = req.matches[1].str();
+                    auto result = guaranteed_state_store->delete_rule(id);
+                    if (!result) {
+                        res.status = 404;
+                        res.set_content(error_json(result.error()), "application/json");
+                        audit_fn(req, "guaranteed_state.rule.delete", "denied", "GuaranteedState",
+                                 id, result.error());
+                        return;
+                    }
+                    audit_fn(req, "guaranteed_state.rule.delete", "success", "GuaranteedState", id,
+                             "");
+                    res.set_content(ok_json(JObj().add("deleted", true).str()), "application/json");
+                });
 
     // POST /push — fan-out is wired in PR 3 (agent-side dispatch + scope
     // expansion). PR 2 acks the request and audits the operator action so
     // dashboards and audit-trail tooling can be exercised end-to-end now.
-    sink.Post("/api/v1/guaranteed-state/push",
-        [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
-                                                     httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Push")) return;
-            if (!guaranteed_state_store) {
-                res.status = 503;
-                res.set_content(error_json("service unavailable", 503),
-                                "application/json");
-                return;
-            }
-            auto body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded() || (!body.is_null() && !body.is_object())) {
-                res.status = 400;
-                res.set_content(error_json("invalid JSON"), "application/json");
-                audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
-                         "invalid JSON body");
-                return;
-            }
-            if (body.is_null()) body = nlohmann::json::object();
-            std::string scope = body.value("scope", std::string{""});
-            bool full_sync = body.value("full_sync", false);
-            const auto rule_count = guaranteed_state_store->rule_count();
-            // Sanitize scope before embedding in the audit detail: operators
-            // with GuaranteedState:Push can otherwise post a scope containing
-            // raw quotes, CR/LF, NULs, or pipes, which appear verbatim in the
-            // detail string and corrupt SIEM parsers that tokenise on quoted
-            // strings or split on newlines (log-injection, SOC 2 audit-trail
-            // integrity). Dropping control bytes and backslash-escaping `"`
-            // and `\` preserves every printable scope DSL expression while
-            // neutering the injection vector. audit_store stores the string
-            // as an opaque column, so the sanitization is defensive at the
-            // SIEM layer only — but that is the layer SOC 2 Workstream F
-            // evidence is reconstructed from.
-            auto sanitize_audit_string = [](const std::string& s) {
-                std::string out;
-                out.reserve(s.size());
-                for (char c : s) {
-                    if (c == '"' || c == '\\') {
-                        out += '\\';
-                        out += c;
-                    } else if (static_cast<unsigned char>(c) < 0x20 ||
-                               static_cast<unsigned char>(c) == 0x7F) {
-                        // Drop control bytes (CR/LF/NUL/TAB and all C0/DEL).
-                        // Keeping them as escapes would still let an attacker
-                        // embed "\\n\\n" to visually split a SIEM view; better
-                        // to erase. Non-ASCII UTF-8 (>= 0x80) is preserved.
-                    } else {
-                        out += c;
-                    }
+    sink.Post("/api/v1/guaranteed-state/push", [perm_fn, audit_fn,
+                                                guaranteed_state_store](const httplib::Request& req,
+                                                                        httplib::Response& res) {
+        if (!perm_fn(req, res, "GuaranteedState", "Push"))
+            return;
+        if (!guaranteed_state_store) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || (!body.is_null() && !body.is_object())) {
+            res.status = 400;
+            res.set_content(error_json("invalid JSON"), "application/json");
+            audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
+                     "invalid JSON body");
+            return;
+        }
+        if (body.is_null())
+            body = nlohmann::json::object();
+        std::string scope = body.value("scope", std::string{""});
+        bool full_sync = body.value("full_sync", false);
+        const auto rule_count = guaranteed_state_store->rule_count();
+        // Sanitize scope before embedding in the audit detail: operators
+        // with GuaranteedState:Push can otherwise post a scope containing
+        // raw quotes, CR/LF, NULs, or pipes, which appear verbatim in the
+        // detail string and corrupt SIEM parsers that tokenise on quoted
+        // strings or split on newlines (log-injection, SOC 2 audit-trail
+        // integrity). Dropping control bytes and backslash-escaping `"`
+        // and `\` preserves every printable scope DSL expression while
+        // neutering the injection vector. audit_store stores the string
+        // as an opaque column, so the sanitization is defensive at the
+        // SIEM layer only — but that is the layer SOC 2 Workstream F
+        // evidence is reconstructed from.
+        auto sanitize_audit_string = [](const std::string& s) {
+            std::string out;
+            out.reserve(s.size());
+            for (char c : s) {
+                if (c == '"' || c == '\\') {
+                    out += '\\';
+                    out += c;
+                } else if (static_cast<unsigned char>(c) < 0x20 ||
+                           static_cast<unsigned char>(c) == 0x7F) {
+                    // Drop control bytes (CR/LF/NUL/TAB and all C0/DEL).
+                    // Keeping them as escapes would still let an attacker
+                    // embed "\\n\\n" to visually split a SIEM view; better
+                    // to erase. Non-ASCII UTF-8 (>= 0x80) is preserved.
+                } else {
+                    out += c;
                 }
-                return out;
-            };
-            // target_id is reserved for a concrete entity id across every other
-            // audit emission in this file (rule_id, agent_id, group_id, token_id).
-            // The push scope expression is a fleet-level selector, not an entity
-            // id, so emit it in `detail` and leave target_id empty to preserve
-            // the SIEM join semantics. Result vocabulary stays "success" (202 is
-            // still a success); the PR-2 fan-out-deferral is surfaced in detail.
-            audit_fn(req, "guaranteed_state.push", "success", "GuaranteedState", "",
-                     "rules=" + std::to_string(rule_count) +
-                     " full_sync=" + (full_sync ? "true" : "false") +
-                     " scope=\"" + sanitize_audit_string(scope) + "\"" +
-                     " fan_out_deferred_pr3=true");
-            res.status = 202;
-            res.set_content(ok_json(JObj()
-                                        .add("queued", true)
-                                        .add("rules", static_cast<int64_t>(rule_count))
-                                        .add("scope", scope)
-                                        .add("note", "push accepted; agent delivery is asynchronous").str()),
-                            "application/json");
-        });
+            }
+            return out;
+        };
+        // target_id is reserved for a concrete entity id across every other
+        // audit emission in this file (rule_id, agent_id, group_id, token_id).
+        // The push scope expression is a fleet-level selector, not an entity
+        // id, so emit it in `detail` and leave target_id empty to preserve
+        // the SIEM join semantics. Result vocabulary stays "success" (202 is
+        // still a success); the PR-2 fan-out-deferral is surfaced in detail.
+        audit_fn(req, "guaranteed_state.push", "success", "GuaranteedState", "",
+                 "rules=" + std::to_string(rule_count) +
+                     " full_sync=" + (full_sync ? "true" : "false") + " scope=\"" +
+                     sanitize_audit_string(scope) + "\"" + " fan_out_deferred_pr3=true");
+        res.status = 202;
+        res.set_content(ok_json(JObj()
+                                    .add("queued", true)
+                                    .add("rules", static_cast<int64_t>(rule_count))
+                                    .add("scope", scope)
+                                    .add("note", "push accepted; agent delivery is asynchronous")
+                                    .str()),
+                        "application/json");
+    });
 
     // GET /events — query events with optional filters. Mirrors
     // `audit_store` query semantics. Caps `limit` at 1000 at the REST
     // boundary; the store enforces a hard upper bound at kMaxEventsLimit.
-    sink.Get("/api/v1/guaranteed-state/events",
-        [perm_fn, guaranteed_state_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
-            if (!guaranteed_state_store) {
-                res.status = 503;
-                res.set_content(error_json("service unavailable", 503),
-                                "application/json");
+    sink.Get("/api/v1/guaranteed-state/events", [perm_fn, guaranteed_state_store](
+                                                    const httplib::Request& req,
+                                                    httplib::Response& res) {
+        if (!perm_fn(req, res, "GuaranteedState", "Read"))
+            return;
+        if (!guaranteed_state_store) {
+            res.status = 503;
+            res.set_content(error_json("service unavailable", 503), "application/json");
+            return;
+        }
+        GuaranteedStateEventQuery q;
+        q.rule_id = req.has_param("rule_id") ? req.get_param_value("rule_id") : "";
+        q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+        q.severity = req.has_param("severity") ? req.get_param_value("severity") : "";
+        if (req.has_param("limit")) {
+            int v = 0;
+            auto s = req.get_param_value("limit");
+            [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+            if (ec != std::errc{} || v < 0) {
+                res.status = 400;
+                res.set_content(error_json("invalid limit"), "application/json");
                 return;
             }
-            GuaranteedStateEventQuery q;
-            q.rule_id  = req.has_param("rule_id")  ? req.get_param_value("rule_id")  : "";
-            q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
-            q.severity = req.has_param("severity") ? req.get_param_value("severity") : "";
-            if (req.has_param("limit")) {
-                int v = 0;
-                auto s = req.get_param_value("limit");
-                [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-                if (ec != std::errc{} || v < 0) {
-                    res.status = 400;
-                    res.set_content(error_json("invalid limit"), "application/json");
-                    return;
-                }
-                q.limit = std::min(v, 1000);
+            q.limit = std::min(v, 1000);
+        }
+        if (req.has_param("offset")) {
+            int v = 0;
+            auto s = req.get_param_value("offset");
+            [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+            if (ec != std::errc{} || v < 0) {
+                res.status = 400;
+                res.set_content(error_json("invalid offset"), "application/json");
+                return;
             }
-            if (req.has_param("offset")) {
-                int v = 0;
-                auto s = req.get_param_value("offset");
-                [[maybe_unused]] auto [_, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-                if (ec != std::errc{} || v < 0) {
-                    res.status = 400;
-                    res.set_content(error_json("invalid offset"), "application/json");
-                    return;
-                }
-                q.offset = v;
-            }
-            auto rows = guaranteed_state_store->query_events(q);
-            JArr arr;
-            for (const auto& e : rows) {
-                arr.add(JObj()
-                            .add("event_id", e.event_id)
-                            .add("rule_id", e.rule_id)
-                            .add("agent_id", e.agent_id)
-                            .add("event_type", e.event_type)
-                            .add("severity", e.severity)
-                            .add("guard_type", e.guard_type)
-                            .add("guard_category", e.guard_category)
-                            .add("detected_value", e.detected_value)
-                            .add("expected_value", e.expected_value)
-                            .add("remediation_action", e.remediation_action)
-                            .add("remediation_success", e.remediation_success)
-                            .add("detection_latency_us",
-                                 static_cast<int64_t>(e.detection_latency_us))
-                            .add("remediation_latency_us",
-                                 static_cast<int64_t>(e.remediation_latency_us))
-                            .add("timestamp", e.timestamp));
-            }
-            res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()),
-                                      static_cast<int64_t>(q.offset)),
-                            "application/json");
-        });
+            q.offset = v;
+        }
+        auto rows = guaranteed_state_store->query_events(q);
+        JArr arr;
+        for (const auto& e : rows) {
+            arr.add(
+                JObj()
+                    .add("event_id", e.event_id)
+                    .add("rule_id", e.rule_id)
+                    .add("agent_id", e.agent_id)
+                    .add("event_type", e.event_type)
+                    .add("severity", e.severity)
+                    .add("guard_type", e.guard_type)
+                    .add("guard_category", e.guard_category)
+                    .add("detected_value", e.detected_value)
+                    .add("expected_value", e.expected_value)
+                    .add("remediation_action", e.remediation_action)
+                    .add("remediation_success", e.remediation_success)
+                    .add("detection_latency_us", static_cast<int64_t>(e.detection_latency_us))
+                    .add("remediation_latency_us", static_cast<int64_t>(e.remediation_latency_us))
+                    .add("timestamp", e.timestamp));
+        }
+        res.set_content(
+            list_json(arr.str(), static_cast<int64_t>(rows.size()), static_cast<int64_t>(q.offset)),
+            "application/json");
+    });
 
     // GET /status, /status/:agent_id, /alerts — placeholders that respond
     // with empty rollups for PR 2. Real fleet aggregation arrives in PR 4
@@ -2977,9 +3439,11 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // Field names match the agent-side proto `GuaranteedStateStatus`
     // (compliant_rules / drifted_rules / errored_rules) so REST and proto
     // schemas do not diverge when PR 4 wires real aggregation.
-    sink.Get("/api/v1/guaranteed-state/status",
+    sink.Get(
+        "/api/v1/guaranteed-state/status",
         [perm_fn, guaranteed_state_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
+            if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                return;
             const auto rules = guaranteed_state_store ? guaranteed_state_store->rule_count() : 0;
             res.set_content(ok_json(JObj()
                                         .add("total_rules", static_cast<int64_t>(rules))
@@ -2992,25 +3456,27 @@ void RestApiV1::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         });
 
     sink.Get(R"(/api/v1/guaranteed-state/status/([A-Za-z0-9._\-]+))",
-        [perm_fn](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
-            auto agent_id = req.matches[1].str();
-            res.set_content(ok_json(JObj()
-                                        .add("agent_id", agent_id)
-                                        .add("total_rules", 0)
-                                        .add("compliant_rules", 0)
-                                        .add("drifted_rules", 0)
-                                        .add("errored_rules", 0)
-                                        .add("note", "per-agent status lands in Guardian PR 4")
-                                        .str()),
-                            "application/json");
-        });
+             [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 auto agent_id = req.matches[1].str();
+                 res.set_content(ok_json(JObj()
+                                             .add("agent_id", agent_id)
+                                             .add("total_rules", 0)
+                                             .add("compliant_rules", 0)
+                                             .add("drifted_rules", 0)
+                                             .add("errored_rules", 0)
+                                             .add("note", "per-agent status lands in Guardian PR 4")
+                                             .str()),
+                                 "application/json");
+             });
 
     sink.Get("/api/v1/guaranteed-state/alerts",
-        [perm_fn](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Read")) return;
-            res.set_content(list_json("[]", 0), "application/json");
-        });
+             [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 res.set_content(list_json("[]", 0), "application/json");
+             });
 
     spdlog::info("REST API v1: registered all routes at /api/v1/*");
 }

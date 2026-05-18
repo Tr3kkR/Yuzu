@@ -1612,11 +1612,31 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto result = product_pack_store->install(yaml_bundle, install_fn);
         if (!result) {
+            // gov W7.4 R1 UP-1 / compliance CC6.7 / sre B2: SOC 2 CC6.7
+            // requires "all access decisions logged". The pack-install
+            // rejection IS an access decision — without this audit row, an
+            // attacker probing enforcement state via repeated unsigned-pack
+            // POSTs leaves zero rows in the audit store. This becomes a
+            // primary code path once #802's default-true flip ships, so the
+            // audit gap goes from "MEDIUM, edge case" to "HIGH, every prod
+            // server with unsigned packs in its environment hits this".
+            //
+            // target_id is empty: install failed pre-id-generation, no
+            // pack_id exists yet. The pack-name field is attacker-controlled
+            // YAML so we don't echo it into target_id (would create an
+            // attacker-influenced audit key); the pack name is recoverable
+            // from the request body if forensics need it.
+            audit_fn(req, "product_pack.install", "denied", "ProductPack", "", result.error());
             res.status = 400;
             res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
             return;
         }
-        audit_fn(req, "product_pack.install", "success", "product_pack", *result, "");
+        // gov W7.4 R2 sec-MEDIUM: target_type "ProductPack" matches the
+        // denied sibling above, the RBAC perm_fn calls in this file
+        // (1484/1533/1647/1692), and the audit-log.md docs entry. Was
+        // "product_pack" pre-W7.4 R2 — SIEM rules filtering on either
+        // string would have missed half the rows for this action.
+        audit_fn(req, "product_pack.install", "success", "ProductPack", *result, "");
         emit_fn("product_pack.installed", req);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Product pack installed","level":"success"}})");
@@ -1707,7 +1727,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
             return;
         }
-        audit_fn(req, "product_pack.uninstall", "success", "product_pack", id, "");
+        // gov W7.4 R2 sec-MEDIUM: target_type "ProductPack" sibling parity
+        // (see install handler above).
+        audit_fn(req, "product_pack.uninstall", "success", "ProductPack", id, "");
         emit_fn("product_pack.uninstalled", req);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Product pack uninstalled","level":"success"}})");

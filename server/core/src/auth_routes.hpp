@@ -34,23 +34,17 @@ struct Config;
 /// SettingsRoutes, and its own remaining route handlers.
 class AuthRoutes {
 public:
-    AuthRoutes(Config& cfg,
-               auth::AuthManager& auth_mgr,
-               RbacStore* rbac_store,
-               ApiTokenStore* api_token_store,
-               AuditStore* audit_store,
-               ManagementGroupStore* mgmt_group_store,
-               TagStore* tag_store,
-               AnalyticsEventStore* analytics_store,
-               std::shared_mutex& oidc_mu,
+    AuthRoutes(Config& cfg, auth::AuthManager& auth_mgr, RbacStore* rbac_store,
+               ApiTokenStore* api_token_store, AuditStore* audit_store,
+               ManagementGroupStore* mgmt_group_store, TagStore* tag_store,
+               AnalyticsEventStore* analytics_store, std::shared_mutex& oidc_mu,
                std::unique_ptr<oidc::OidcProvider>& oidc_provider);
 
     // -- Auth helpers (called by server.cpp to create callbacks for other modules) --
 
     /// Validate session cookie, Bearer token, or X-Yuzu-Token header.
     /// Returns a Session on success, or sets 401 and returns nullopt.
-    std::optional<auth::Session> require_auth(const httplib::Request& req,
-                                              httplib::Response& res);
+    std::optional<auth::Session> require_auth(const httplib::Request& req, httplib::Response& res);
 
     /// Resolve the authenticated session from a request without writing a response.
     /// Tries cookie, then `Authorization: Bearer`, then `X-Yuzu-Token`. Returns
@@ -70,22 +64,30 @@ public:
 
     /// Scoped RBAC-aware permission check for device-specific operations.
     bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,
-                                   const std::string& securable_type,
-                                   const std::string& operation,
+                                   const std::string& securable_type, const std::string& operation,
                                    const std::string& agent_id);
 
     /// Build a synthetic session from a validated API token.
     auth::Session synthesize_token_session(const ApiToken& api_token);
 
-    /// Cookie attribute string: "; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800" + optional "; Secure".
+    /// Cookie attribute string: "; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800" + optional ";
+    /// Secure".
     std::string session_cookie_attrs() const;
 
     /// Construct an AuditEvent from HTTP request context.
     AuditEvent make_audit_event(const httplib::Request& req, const std::string& action,
                                 const std::string& result);
 
-    /// Write an audit event to the audit store.
-    void audit_log(const httplib::Request& req, const std::string& action,
+    /// Write an audit event to the audit store. Returns true iff the row
+    /// was persisted; returns true (no-op success) when no AuditStore is
+    /// configured (operator-chosen audit-off mode). Returns false on a
+    /// silent persist failure (audit DB locked / disk full / corruption).
+    /// SOC 2 CC6.6 evidence-emitting handlers MUST capture the return so
+    /// they can surface partial-success on the response (HIGH-2 on PR #883,
+    /// UP-H1 on PR W1.1). The bool is [[nodiscard]] on the AuditStore
+    /// primitive but not on this wrapper — most call sites legitimately
+    /// fire-and-forget.
+    bool audit_log(const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type = {},
                    const std::string& target_id = {}, const std::string& detail = {});
 

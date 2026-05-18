@@ -1,12 +1,14 @@
 #include "api_token_store.hpp"
 #include "mcp_policy.hpp"
 #include "migration_runner.hpp"
+#include "secure_random.hpp"
 
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <cstdint>
 #include <mutex>
-#include <random>
+#include <span>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -18,7 +20,6 @@
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 #else
-#include <openssl/rand.h>
 #include <openssl/sha.h>
 #endif
 
@@ -105,25 +106,22 @@ void ApiTokenStore::create_tables() {
 
 // ── Token generation and hashing ─────────────────────────────────────────────
 
-std::string ApiTokenStore::generate_raw_token() const {
-    // Use CSPRNG for token generation (G2-SEC-A2-001)
-    unsigned char buf[32]{};
-#ifdef _WIN32
-    BCRYPT_ALG_HANDLE alg = nullptr;
-    BCryptOpenAlgorithmProvider(&alg, BCRYPT_RNG_ALGORITHM, nullptr, 0);
-    if (alg) {
-        BCryptGenRandom(alg, buf, sizeof(buf), 0);
-        BCryptCloseAlgorithmProvider(alg, 0);
-    }
-#else
-    RAND_bytes(buf, sizeof(buf));
-#endif
+std::expected<std::string, std::string> ApiTokenStore::generate_raw_token() const {
+    // Cryptographic PRNG required — pre-#801 this swallowed CSPRNG failures
+    // and produced a token derived from zero-initialised bytes (all 'A'
+    // chars). secure_random surfaces entropy exhaustion as a hard error so
+    // the request becomes a 503 instead of issuing a known-weak token.
+    std::uint8_t buf[32]{};
+    auto rc = fill_random(std::span{buf, sizeof(buf)});
+    if (!rc.has_value())
+        return std::unexpected(std::string{"CSPRNG unavailable (entropy exhausted)"});
+
     static constexpr char chars[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     std::string token = "yuzu_";
     token.reserve(37);
-    for (int i = 0; i < 32; ++i)
-        token += chars[buf[i] % 62];
+    for (std::uint8_t b : buf)
+        token += chars[b % 62];
     return token;
 }
 
@@ -160,11 +158,10 @@ std::string ApiTokenStore::sha256_hex(const std::string& input) const {
 
 // ── CRUD ─────────────────────────────────────────────────────────────────────
 
-std::expected<std::string, std::string> ApiTokenStore::create_token(const std::string& name,
-                                                                    const std::string& principal_id,
-                                                                    int64_t expires_at,
-                                                                    const std::string& scope_service,
-                                                                    const std::string& mcp_tier) {
+std::expected<std::string, std::string>
+ApiTokenStore::create_token(const std::string& name, const std::string& principal_id,
+                            int64_t expires_at, const std::string& scope_service,
+                            const std::string& mcp_tier) {
     if (!db_)
         return std::unexpected("database not open");
     if (name.empty())
@@ -172,7 +169,8 @@ std::expected<std::string, std::string> ApiTokenStore::create_token(const std::s
     if (!scope_service.empty() && expires_at <= 0)
         return std::unexpected("service-scoped tokens must have an expiration time");
     if (!mcp_tier.empty() && !mcp::is_valid_tier(mcp_tier))
-        return std::unexpected("invalid MCP tier — must be 'readonly', 'operator', or 'supervised'");
+        return std::unexpected(
+            "invalid MCP tier — must be 'readonly', 'operator', or 'supervised'");
     if (!mcp_tier.empty() && expires_at <= 0)
         return std::unexpected("MCP tokens must have an expiration time (max 90 days)");
     if (!mcp_tier.empty() && expires_at > 0) {
@@ -182,7 +180,10 @@ std::expected<std::string, std::string> ApiTokenStore::create_token(const std::s
             return std::unexpected("MCP token TTL cannot exceed 90 days");
     }
 
-    auto raw = generate_raw_token();
+    auto raw_result = generate_raw_token();
+    if (!raw_result.has_value())
+        return std::unexpected(raw_result.error());
+    auto raw = std::move(*raw_result);
     auto hash = sha256_hex(raw);
     auto token_id = hash.substr(0, 24); // Display ID — 24 hex chars (96 bits, collision-resistant)
     auto now = now_epoch();
@@ -217,6 +218,11 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
         return std::nullopt;
 
     auto hash = sha256_hex(raw_token);
+
+    // Snapshot the revoke generation BEFORE the cache lookup so that any
+    // revoke that races with our DB read is observable at the cache-write
+    // step below (HIGH-1 defence-in-depth).
+    const auto gen_before = revoke_generation_.load(std::memory_order_acquire);
 
     // Check cache first (avoids SHA256 recomputation is already done, but avoids SQLite query)
     {
@@ -295,9 +301,18 @@ std::optional<ApiToken> ApiTokenStore::validate_token(const std::string& raw_tok
         sqlite3_step(upd);
         sqlite3_finalize(upd);
 
-        // Store in cache
-        std::lock_guard cache_lock(cache_mtx_);
-        token_cache_[hash] = CachedToken{*result, std::chrono::steady_clock::now()};
+        // Store in cache, but skip the write if a revoke raced our SELECT.
+        // The db_mtx_ exclusive serialization already prevents this
+        // interleave, but the explicit generation re-check survives any
+        // future refactor that narrows the db_lock scope (HIGH-1 on PR
+        // #883). load/load with acquire ordering against the
+        // revoke-path's release-store is sufficient — we only need to
+        // observe that *some* revoke ran, not its ordering vs. other
+        // operations.
+        if (revoke_generation_.load(std::memory_order_acquire) == gen_before) {
+            std::lock_guard cache_lock(cache_mtx_);
+            token_cache_[hash] = CachedToken{*result, std::chrono::steady_clock::now()};
+        }
     }
 
     return result;
@@ -389,6 +404,11 @@ bool ApiTokenStore::revoke_token(const std::string& token_id) {
         return false;
 
     std::unique_lock db_lock(db_mtx_);
+    // Bump the revoke generation BEFORE the UPDATE so any concurrent
+    // validate_token whose SELECT outraces this UPDATE will observe the
+    // generation move at its cache-write step and skip the stale write
+    // (HIGH-1).
+    revoke_generation_.fetch_add(1, std::memory_order_release);
     // Look up the token_hash before revoking so we can invalidate the cache
     std::string token_hash;
     {
@@ -416,11 +436,75 @@ bool ApiTokenStore::revoke_token(const std::string& token_id) {
     return changed;
 }
 
+std::size_t ApiTokenStore::revoke_for_principal(const std::string& principal_id) {
+    if (!db_ || principal_id.empty())
+        return 0;
+
+    std::unique_lock db_lock(db_mtx_);
+    // Bump revoke generation BEFORE the UPDATE — same contract as
+    // `revoke_token` (HIGH-1).
+    revoke_generation_.fetch_add(1, std::memory_order_release);
+
+    // Snapshot the hashes of every non-revoked token for the principal so
+    // we can invalidate the in-memory validate_token cache after the
+    // UPDATE. Without this, a freshly-revoked token would still validate
+    // for up to `kTokenCacheTtl` seconds (60 s) — long enough for a
+    // stolen API token to keep working through the entire incident
+    // response window of someone clicking "Sign out everywhere".
+    std::vector<std::string> hashes_to_invalidate;
+    {
+        sqlite3_stmt* q = nullptr;
+        if (sqlite3_prepare_v2(db_,
+                               "SELECT token_hash FROM api_tokens "
+                               "WHERE principal_id = ? AND revoked = 0;",
+                               -1, &q, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(q, 1, principal_id.c_str(), -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(q) == SQLITE_ROW) {
+                hashes_to_invalidate.emplace_back(
+                    safe(reinterpret_cast<const char*>(sqlite3_column_text(q, 0))));
+            }
+            sqlite3_finalize(q);
+        }
+    }
+
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "UPDATE api_tokens SET revoked = 1 "
+                           "WHERE principal_id = ? AND revoked = 0;",
+                           -1, &s, nullptr) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(s, 1, principal_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+
+    // The hashes we snapshotted under db_mtx_ exclusive at lines 453-467
+    // are exactly the rows the UPDATE just transitioned to revoked=1: the
+    // SELECT and UPDATE share the same `WHERE principal_id = ? AND
+    // revoked = 0` predicate, and no other writer can sneak in while we
+    // hold db_mtx_ exclusively. So `hashes_to_invalidate.size()` is the
+    // count — no need for `sqlite3_changes()`.
+    //
+    // Also dodges two distinct foot-guns:
+    //   1. Windows: `std::max(sqlite3_changes(db_), 0)` mangles to garbage
+    //      because `<windows.h>` defines `max` as a macro when NOMINMAX
+    //      is not set, and the macro fight loses to `std::max`.
+    //   2. CLAUDE.md issue #1033: `sqlite3_changes()` after `sqlite3_step()`
+    //      on a FULLMUTEX handle is a documented data race against any
+    //      concurrent step() on the same handle.
+    for (const auto& h : hashes_to_invalidate)
+        invalidate_cache(h);
+    return hashes_to_invalidate.size();
+}
+
 bool ApiTokenStore::delete_token(const std::string& token_id) {
     if (!db_)
         return false;
 
     std::unique_lock db_lock(db_mtx_);
+    // Bump revoke generation BEFORE the DELETE — a delete is a stronger
+    // form of revoke from the cache's perspective, so the same TOCTOU
+    // applies (HIGH-1).
+    revoke_generation_.fetch_add(1, std::memory_order_release);
     // Look up the token_hash before deleting so we can invalidate the cache
     std::string token_hash;
     {

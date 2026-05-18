@@ -74,9 +74,10 @@ struct RestGsHarness {
                                                        /*cleanup_interval_min=*/60);
         REQUIRE(store->is_open());
 
-        auto auth_fn = [this](const httplib::Request&, httplib::Response&)
-            -> std::optional<auth::Session> {
-            if (session_user.empty()) return std::nullopt;
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
+            if (session_user.empty())
+                return std::nullopt;
             auth::Session s;
             s.username = session_user;
             s.role = session_role;
@@ -84,15 +85,17 @@ struct RestGsHarness {
         };
 
         // perm_fn always grants — RBAC is exercised in test_rbac_store.cpp.
-        auto perm_fn = [](const httplib::Request&, httplib::Response&,
-                          const std::string&, const std::string&) -> bool {
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) -> bool {
             return true;
         };
 
+        // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>.
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) {
+                               const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_type, target_id, detail});
+            return true;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -113,8 +116,7 @@ struct RestGsHarness {
                             /*product_pack_store=*/nullptr,
                             /*sw_deploy_store=*/nullptr,
                             /*device_token_store=*/nullptr,
-                            /*license_store=*/nullptr,
-                            store.get());
+                            /*license_store=*/nullptr, store.get());
     }
 
     ~RestGsHarness() {
@@ -125,18 +127,17 @@ struct RestGsHarness {
         fs::remove(db_path.string() + "-shm");
     }
 
-    static std::string make_rule_body(const std::string& rule_id,
-                                       const std::string& name,
-                                       const std::string& yaml = "name: example\n") {
+    static std::string make_rule_body(const std::string& rule_id, const std::string& name,
+                                      const std::string& yaml = "name: example\n") {
         nlohmann::json j;
-        j["rule_id"]          = rule_id;
-        j["name"]             = name;
-        j["yaml_source"]      = yaml;
-        j["enabled"]          = true;
+        j["rule_id"] = rule_id;
+        j["name"] = name;
+        j["yaml_source"] = yaml;
+        j["enabled"] = true;
         j["enforcement_mode"] = "enforce";
-        j["severity"]         = "high";
-        j["os_target"]        = "windows";
-        j["scope_expr"]       = "tag:env=prod";
+        j["severity"] = "high";
+        j["os_target"] = "windows";
+        j["scope_expr"] = "tag:env=prod";
         return j.dump();
     }
 };
@@ -147,7 +148,7 @@ TEST_CASE("REST gs.rules: create returns 201 and echoes rule_id",
           "[rest][guaranteed_state][create]") {
     RestGsHarness h;
     auto res = h.sink.Post("/api/v1/guaranteed-state/rules",
-                            RestGsHarness::make_rule_body("r-001", "block-rdp"));
+                           RestGsHarness::make_rule_body("r-001", "block-rdp"));
     REQUIRE(res);
     CHECK(res->status == 201);
     CHECK(res->body.find("\"rule_id\":\"r-001\"") != std::string::npos);
@@ -182,10 +183,12 @@ TEST_CASE("REST gs.rules: missing required fields → 400",
 TEST_CASE("REST gs.rules: duplicate name → 409 via kConflictPrefix",
           "[rest][guaranteed_state][conflict]") {
     RestGsHarness h;
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-001", "dup-name"))->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-001", "dup-name"))
+                ->status == 201);
     auto res = h.sink.Post("/api/v1/guaranteed-state/rules",
-                            RestGsHarness::make_rule_body("r-002", "dup-name"));
+                           RestGsHarness::make_rule_body("r-002", "dup-name"));
     REQUIRE(res);
     CHECK(res->status == 409);
     // Body must NOT carry the kConflictPrefix marker — that's an internal
@@ -197,13 +200,16 @@ TEST_CASE("REST gs.rules: duplicate name → 409 via kConflictPrefix",
     CHECK(h.audit_log[1].result == "denied");
 }
 
-TEST_CASE("REST gs.rules: list, get, update, delete round-trip",
-          "[rest][guaranteed_state][crud]") {
+TEST_CASE("REST gs.rules: list, get, update, delete round-trip", "[rest][guaranteed_state][crud]") {
     RestGsHarness h;
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-001", "rule-a"))->status == 201);
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-002", "rule-b"))->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-001", "rule-a"))
+                ->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-002", "rule-b"))
+                ->status == 201);
 
     auto list = h.sink.Get("/api/v1/guaranteed-state/rules");
     REQUIRE(list);
@@ -231,7 +237,7 @@ TEST_CASE("REST gs.rules: list, get, update, delete round-trip",
     REQUIRE(refetched.has_value());
     CHECK_FALSE(refetched->enabled);
     CHECK(refetched->severity == "critical");
-    CHECK(refetched->version == 2);  // bumped by handler
+    CHECK(refetched->version == 2); // bumped by handler
 
     auto del = h.sink.Delete("/api/v1/guaranteed-state/rules/r-001");
     REQUIRE(del);
@@ -239,8 +245,7 @@ TEST_CASE("REST gs.rules: list, get, update, delete round-trip",
     CHECK_FALSE(h.store->get_rule("r-001").has_value());
 }
 
-TEST_CASE("REST gs.rules: get unknown id → 404",
-          "[rest][guaranteed_state][not_found]") {
+TEST_CASE("REST gs.rules: get unknown id → 404", "[rest][guaranteed_state][not_found]") {
     RestGsHarness h;
     auto got = h.sink.Get("/api/v1/guaranteed-state/rules/nope");
     REQUIRE(got);
@@ -253,8 +258,10 @@ TEST_CASE("REST gs.rules: PUT with malformed body → 400 + denied audit",
     // denied audit, matching the sibling /push 400 branch. Asymmetric audit
     // coverage across sibling rejection paths was the original finding.
     RestGsHarness h;
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-001", "rule-a"))->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-001", "rule-a"))
+                ->status == 201);
     // Non-object body (top-level array) — body.is_object() is false.
     auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-001", "[1,2,3]");
     REQUIRE(upd);
@@ -283,8 +290,10 @@ TEST_CASE("REST gs.rules: delete unknown id → 404 + denied audit",
 TEST_CASE("REST gs.push: returns 202 + audits the operator action",
           "[rest][guaranteed_state][push]") {
     RestGsHarness h;
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-001", "rule-a"))->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-001", "rule-a"))
+                ->status == 201);
     nlohmann::json push;
     push["scope"] = "tag:env=prod";
     push["full_sync"] = true;
@@ -296,7 +305,7 @@ TEST_CASE("REST gs.push: returns 202 + audits the operator action",
     // roadmap reference (BL-6 / ER-Dep2).
     CHECK(res->body.find("agent delivery is asynchronous") != std::string::npos);
 
-    REQUIRE(h.audit_log.size() == 2);  // create + push
+    REQUIRE(h.audit_log.size() == 2); // create + push
     const auto& push_audit = h.audit_log[1];
     CHECK(push_audit.action == "guaranteed_state.push");
     // Vocabulary matches sibling handlers: "success" (not the prior novel
@@ -363,12 +372,11 @@ TEST_CASE("REST gs.push: sanitizes scope before embedding in audit detail",
     CHECK(d.find("fan_out_deferred_pr3=true") != std::string::npos);
 }
 
-TEST_CASE("REST gs.events: filter + limit pagination",
-          "[rest][guaranteed_state][events]") {
+TEST_CASE("REST gs.events: filter + limit pagination", "[rest][guaranteed_state][events]") {
     RestGsHarness h;
     GuaranteedStateEventRow ev;
     ev.event_id = "e-1";
-    ev.rule_id  = "r-001";
+    ev.rule_id = "r-001";
     ev.agent_id = "agent-A";
     ev.event_type = "drift.detected";
     ev.severity = "high";
@@ -388,19 +396,19 @@ TEST_CASE("REST gs.events: filter + limit pagination",
     CHECK(j["data"][0]["event_id"].get<std::string>() == "e-1");
 }
 
-TEST_CASE("REST gs.events: invalid limit → 400",
-          "[rest][guaranteed_state][events][validation]") {
+TEST_CASE("REST gs.events: invalid limit → 400", "[rest][guaranteed_state][events][validation]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/guaranteed-state/events?limit=-7");
     REQUIRE(res);
     CHECK(res->status == 400);
 }
 
-TEST_CASE("REST gs.status: returns store rule_count rollup",
-          "[rest][guaranteed_state][status]") {
+TEST_CASE("REST gs.status: returns store rule_count rollup", "[rest][guaranteed_state][status]") {
     RestGsHarness h;
-    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules",
-                         RestGsHarness::make_rule_body("r-001", "rule-a"))->status == 201);
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-001", "rule-a"))
+                ->status == 201);
 
     auto res = h.sink.Get("/api/v1/guaranteed-state/status");
     REQUIRE(res);
@@ -418,8 +426,7 @@ TEST_CASE("REST gs.status: returns store rule_count rollup",
     CHECK_FALSE(j["data"].contains("errored"));
 }
 
-TEST_CASE("REST gs.alerts: empty list placeholder",
-          "[rest][guaranteed_state][alerts]") {
+TEST_CASE("REST gs.alerts: empty list placeholder", "[rest][guaranteed_state][alerts]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/guaranteed-state/alerts");
     REQUIRE(res);

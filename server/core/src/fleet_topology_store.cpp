@@ -720,7 +720,9 @@ void FleetTopologyStore::push_snapshot(RawAgentSnapshot raw) {
             ev.target_id = agent_id;
             ev.detail = spoof_detail;
             ev.result = "denied";
-            audit_store_->log(ev);
+            // [[nodiscard]] on AuditStore::log — background audit
+            // emission inside a per-push hot path; bookkeeping only.
+            (void)audit_store_->log(ev);
         }
         return;
     }
@@ -735,7 +737,7 @@ void FleetTopologyStore::push_snapshot(RawAgentSnapshot raw) {
                     " cap=" + std::to_string(pushed_map_cap_) +
                     " by_push_from=" + sanitise_for_audit(agent_id);
         ev.result = "warning";
-        audit_store_->log(ev);
+        (void)audit_store_->log(ev);
     }
     pushed_count_.fetch_add(1, std::memory_order_relaxed);
     if (first_push_for_this_agent && audit_store_) {
@@ -746,7 +748,7 @@ void FleetTopologyStore::push_snapshot(RawAgentSnapshot raw) {
         ev.target_type = "FleetTopology";
         ev.target_id = agent_id;
         ev.result = "success";
-        audit_store_->log(ev);
+        (void)audit_store_->log(ev);
     }
 }
 

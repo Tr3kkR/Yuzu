@@ -52,9 +52,17 @@ private:
     std::filesystem::path exe_path_;
     std::atomic<bool> stop_requested_{false};
 
-    /// Platform-specific binary replacement with rollback on failure.
+#ifndef _WIN32
+    /// POSIX-only binary replacement with rollback on failure.
+    ///
+    /// On Windows the apply is performed inline in check_and_apply via
+    /// SetFileInformationByHandle on the held HANDLE (see W2.3 cross-
+    /// platform-debt closure). A path-based fallback on Windows would
+    /// re-introduce the close-then-rename race window — keep this
+    /// declaration compile-time-absent on Windows.
     [[nodiscard]] std::expected<bool, UpdateError>
     apply_update(const std::filesystem::path& temp_path);
+#endif
 };
 
 /// Get the path to the currently running executable (cross-platform).

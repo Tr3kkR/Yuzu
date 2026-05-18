@@ -108,6 +108,26 @@ def is_healthy(actual: dict[str, Any] | None, expected_labels: list[str]) -> boo
     return set(expected_labels).issubset(set(actual["labels"]))
 
 
+def is_fork_pr() -> bool:
+    """True iff this run is a pull_request from a fork (no secrets available).
+
+    GHA strips repo secrets on fork PRs, so RUNNER_INVENTORY_TOKEN resolves
+    empty and the /actions/runners query 403s on the GITHUB_TOKEN fallback.
+    The fork PR cannot mutate runner state either way, so the inventory
+    check is moot — matrix jobs will surface real runner unavailability via
+    normal queue timeout. See issue #818 for the full root cause.
+
+    Detection requires BOTH GITHUB_REPOSITORY and GITHUB_HEAD_REPOSITORY to
+    be set and differ; if HEAD is empty/missing we fall through to the
+    normal fail-closed code path rather than guessing.
+    """
+    if os.environ.get("GITHUB_EVENT_NAME") != "pull_request":
+        return False
+    base = os.environ.get("GITHUB_REPOSITORY", "")
+    head = os.environ.get("GITHUB_HEAD_REPOSITORY", "")
+    return bool(base and head and base != head)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument(
@@ -123,6 +143,18 @@ def main() -> int:
         inventory = json.load(f)
     expected = {r["name"]: r for r in inventory["expected_runners"]}
     strict = inventory.get("strict_unknown_runners", True)
+
+    # Fork PR short-circuit (preflight only). Sentinel mode never runs on
+    # pull_request, so its fail-closed contract is unaffected.
+    if args.mode == "preflight" and is_fork_pr():
+        print("::notice::Fork PR detected — skipping runner inventory check")
+        print("(fork PRs have no access to RUNNER_INVENTORY_TOKEN; runner state")
+        print(" cannot be changed by a fork PR; matrix jobs will surface real")
+        print(" runner unavailability via normal queue timeout.)")
+        for name in expected:
+            write_output(f"{slug(name)}_healthy", "true")
+        write_output("all_healthy", "true")
+        return 0
 
     payload = query_runners()
     if payload is None:

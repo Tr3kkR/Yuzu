@@ -47,6 +47,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [Current User](#current-user)
   - [Management Groups](#management-groups)
   - [API Tokens](#api-tokens)
+  - [Sessions](#sessions)
   - [Quarantine](#quarantine)
   - [RBAC](#rbac)
   - [Tags](#tags)
@@ -652,6 +653,127 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+### Sessions
+
+Operator and dashboard sessions are the cookie-based sessions issued by `POST /login`. The endpoints below let an admin force-log-out another user from every device, and let any authenticated principal sign out of every browser at once. They are the SOC 2 CC6.3 (revocation) and CC6.8 (termination) evidence path; both endpoints emit auditable actions distinguishable by SIEM correlation.
+
+The DB primitive (`AuthDB::invalidate_all_sessions`) and the in-memory counterpart already fire when a user is removed (`DELETE /api/settings/users/{username}`) or when their role changes; these REST endpoints expose the same primitive standalone for incident response and operator self-service.
+
+#### `DELETE /api/v1/sessions?username=<name>`
+
+Revoke every active cookie session for a named user. The user remains valid (no role change, no account disable); they simply have to authenticate again to obtain a new session cookie. **API tokens belonging to the user are deliberately NOT revoked** — operators force-logging out a leaked cookie session typically want to leave CI/CD and automation tokens running. Use `DELETE /api/v1/tokens/{token_id}` (or the user's own `DELETE /api/v1/sessions/me`) to revoke those.
+
+**Permission:** `UserManagement:Write`
+
+**Self-target behaviour.** An admin invoking this with their own username is permitted (signing yourself out of every device is recoverable — re-authenticate and you are back), but the audit row is recorded as `session.revoke_all.self` instead of `session.revoke_all` so SIEM rules can split operator self-service from a sibling-admin force-logout. This is a deliberately weaker guard than the `#397/#403` self-target guard on `DELETE /api/settings/users/{username}`, which exists to prevent admin-role self-lockout (an unrecoverable state).
+
+**Example:**
+
+```bash
+curl -s -X DELETE \
+  -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/sessions?username=alice"
+```
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "username": "alice",
+    "revoked": 2,
+    "db_persisted": true,
+    "audit_emitted": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`revoked` is the number of in-memory session cookies wiped. `db_persisted` reports whether the AuthDB DELETE for persisted session rows succeeded; when `false`, the audit row is recorded with `result="partial"` and `detail` carries `db_error=true`. A `false` value indicates the operator should retry or restart the server — server restart will otherwise resurrect any persisted rows that were not deleted.
+
+`audit_emitted` reports whether the SOC 2 CC6.6 audit row landed in the audit store. When `false` the response also sets the `Sec-Audit-Failed: true` header — SREs scraping for evidence-integrity gaps should alert on either signal. The revoke side-effect still completes when `audit_emitted=false` (operator's "stop NOW" intent is honoured); only the SOC 2 evidence chain is degraded for that request. This split was introduced in PR #883 (HIGH-2) to close a silent-failure window where a locked audit DB or disk-full condition produced a 200 OK that masqueraded as full evidence.
+
+**Audit:** successful cross-user invocations emit `session.revoke_all` with `target_type=User`, `target_id=<username>`, and `detail=count=<N>` (or `count=<N> db_error=true` on partial failure). When the caller's own username is supplied, the action is `session.revoke_all.self` instead.
+
+The admin route emits two distinct 400 bodies — operators scripting the endpoint should distinguish them.
+
+**Error (400) -- missing `username` query parameter:**
+
+```json
+{
+  "error": { "code": 400, "message": "username query parameter required" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Error (400) -- malformed `username` value:**
+
+```json
+{
+  "error": { "code": 400, "message": "invalid username format" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The `username` parameter is validated with the same character set used at user creation (`is_valid_username`). NUL bytes, control characters, and newlines are rejected — passing them through to the SQL bind would silently truncate at the NUL while the audit log records the full string, producing a target/effect mismatch (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
+
+**Error (403) -- caller lacks `UserManagement:Write`:**
+
+```json
+{
+  "error": { "code": 403, "message": "forbidden" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `DELETE /api/v1/sessions/me`
+
+Self-revoke "Sign out everywhere". Wipes every cookie session belonging to the authenticated caller AND revokes every API token they own. This is intended as the lost-device recovery flow: every credential bearing the caller's identity is killed in one call.
+
+**Permission:** Any interactive authenticated session (cookie). MCP-tier tokens and service-scoped automation tokens are explicitly rejected with 403 — those credential classes have no other write privilege and accepting them here would create a novel DoS surface against the human owner. Use the dashboard or a fresh password-authenticated session.
+
+**Example:**
+
+```bash
+curl -s -X DELETE \
+  -H "Cookie: yuzu_session=$COOKIE" \
+  "https://yuzu.example.com/api/v1/sessions/me"
+```
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "revoked": 3,
+    "api_tokens_revoked": 2,
+    "db_persisted": true,
+    "audit_emitted": true
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The response sets `Set-Cookie: yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0` so the client side completes the revocation by deleting the cookie from the browser jar. `audit_emitted` and the `Sec-Audit-Failed: true` header have the same semantics as on the admin route above — `false` means the revoke completed but the audit row was lost (locked DB / disk full / pipeline exception), and the SOC 2 CC6.6 evidence chain is degraded for that request.
+
+**Error (403) -- non-interactive credential:**
+
+The caller authenticated with an MCP-tier token (`X-Yuzu-Token` carrying a non-empty `mcp_tier`) or a service-scoped token. The denial is audited as `session.revoke_all.self` with `result=denied`.
+
+```json
+{
+  "error": {
+    "code": 403,
+    "message": "self-revoke requires an interactive session, not an API token"
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Audit:** every successful invocation emits `session.revoke_all.self` with `target_type=User`, `target_id=<caller>`, `detail=count=<N> api_tokens_revoked=<M>` (with `db_error=true` appended on partial failure). The dashboard's "Sign out everywhere" button on the operator's own row in Settings → Users uses this endpoint and follows up with a redirect to `/login`.
 
 ---
 
@@ -3820,6 +3942,58 @@ Dispatch a single-device `tar.configure` with `<source>_enabled=true`. Per-sourc
 - 404 with body `Agent not reachable.` for both out-of-scope `device_id` and not-connected agent. Audit detail records the real reason (`scope_violation` vs `agent_not_connected`) server-side.
 
 **Audit:** Emits `tar.source.reenable` with `result=success` and `detail` carrying `device=<id> source=<src>` on success, or `result=failure` with the real rejection reason on rejected attempts.
+
+---
+
+## Product Packs
+
+Product packs are bundles of `InstructionDefinition`, `PolicyFragment`, `Policy`, and other content shipped as a single signed multi-document YAML file. Pack signature enforcement is **on by default** (#802 / W7.4) — unsigned packs are rejected at install. See [server-admin.md](server-admin.md) for the `--allow-unsigned-packs` escape hatch and [upgrading.md](upgrading.md) for the pack-signing migration recipe.
+
+#### `POST /api/product-packs`
+
+Install a product pack from a multi-document YAML bundle.
+
+**Permission:** `ProductPack:Write`.
+
+**Request body (form-encoded or multipart):**
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `yaml_bundle` | string | Yes | Multi-document YAML; each `---`-separated document is parsed for its `kind:` and delegated to the matching store (`InstructionDefinition` → instructions, `PolicyFragment` → policies, etc.). A `ProductPack` document carries the pack metadata (`name`, `version`, `description`, optional `signature` + `publicKey`). |
+
+**Response:**
+- `201 Created` `{"id": "<pack-id>", "status": "installed"}` on success.
+- `400 Bad Request` `{"error": "<message>"}` on rejection. Distinct error strings:
+  - `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` — the install was refused because the pack carried no `signature:` field and the server is enforcing signatures (default since #802). Either sign the pack or set the escape-hatch flag.
+  - `signature verification failed for pack '<name>' — content may have been tampered with` — the signature was present but did not verify against the supplied public key.
+  - `pack '<name>' has signature but no publicKey — cannot verify` — the bundle carried a `signature:` field but no `publicKey:`.
+- Other 4xx for malformed YAML, missing required fields, or item-install delegation failures.
+
+**Audit:** Emits `product_pack.install` with `result=success` and `target_id=<pack-id>` on accepted install, or `result=denied` with `target_type=ProductPack`, empty `target_id`, and the rejection message in `detail` on any 400 rejection (closes the SOC 2 CC6.7 logging gap from W7.4 governance).
+
+#### `GET /api/product-packs`
+
+List installed packs.
+
+**Permission:** `ProductPack:Read`.
+
+**Response:** JSON array of `{id, name, version, description, installed_at, verified}` objects.
+
+#### `GET /api/product-packs/:id`
+
+Get a single pack with its items.
+
+**Permission:** `ProductPack:Read`.
+
+**Response:** Single pack JSON object including the `items[]` array (each `{kind, item_id, name}`).
+
+#### `DELETE /api/product-packs/:id`
+
+Uninstall a pack, removing all delegated items.
+
+**Permission:** `ProductPack:Delete`.
+
+**Audit:** Emits `product_pack.uninstall`.
 
 ---
 

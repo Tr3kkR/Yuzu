@@ -1,10 +1,10 @@
 #include "device_token_store.hpp"
 #include "migration_runner.hpp"
+#include "secure_random.hpp"
 
 #include <spdlog/spdlog.h>
 
 #include <chrono>
-#include <random>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -136,26 +136,20 @@ std::string DeviceTokenStore::hash_token(const std::string& raw) const {
     return result;
 }
 
-static std::string generate_raw_device_token() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    static constexpr char hex_chars[] = "0123456789abcdef";
-    std::string token = "ydt_"; // yuzu device token prefix
-    token.reserve(68);          // 4 prefix + 64 hex chars (32 bytes)
-    std::uniform_int_distribution<int> dist(0, 15);
-    for (int i = 0; i < 64; ++i)
-        token += hex_chars[dist(rng)];
-    return token;
+// Cryptographic PRNG required — mt19937 is predictable from its outputs (#801).
+// random_hex routes through OpenSSL RAND_bytes (POSIX) / BCryptGenRandom (Win).
+static std::expected<std::string, std::string> generate_raw_device_token() {
+    auto bytes = random_hex(32); // 32 bytes -> 64 hex chars
+    if (!bytes.has_value())
+        return std::unexpected(std::string{"CSPRNG unavailable (entropy exhausted)"});
+    return std::string{"ydt_"} + *bytes; // yuzu device token prefix
 }
 
-static std::string generate_token_id() {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    static constexpr char hex_chars[] = "0123456789abcdef";
-    std::string id;
-    id.reserve(32); // 16 bytes = 32 hex chars
-    std::uniform_int_distribution<int> dist(0, 15);
-    for (int i = 0; i < 32; ++i)
-        id += hex_chars[dist(rng)];
-    return id;
+static std::expected<std::string, std::string> generate_token_id() {
+    auto bytes = random_hex(16); // 16 bytes -> 32 hex chars
+    if (!bytes.has_value())
+        return std::unexpected(std::string{"CSPRNG unavailable (entropy exhausted)"});
+    return std::move(*bytes);
 }
 
 // -- CRUD ---------------------------------------------------------------------
@@ -169,11 +163,18 @@ DeviceTokenStore::create_token(const std::string& name, const std::string& princ
     if (principal_id.empty())
         return std::unexpected("principal_id cannot be empty");
 
+    auto raw_result = generate_raw_device_token();
+    if (!raw_result.has_value())
+        return std::unexpected(raw_result.error());
+    auto token_id_result = generate_token_id();
+    if (!token_id_result.has_value())
+        return std::unexpected(token_id_result.error());
+
     std::unique_lock lock(mtx_);
 
-    auto raw = generate_raw_device_token();
+    auto raw = std::move(*raw_result);
     auto hashed = hash_token(raw);
-    auto token_id = generate_token_id();
+    auto token_id = std::move(*token_id_result);
     auto now = now_epoch();
 
     sqlite3_stmt* s = nullptr;
@@ -204,10 +205,16 @@ DeviceTokenStore::create_token(const std::string& name, const std::string& princ
     return raw; // Return raw token (shown once to user)
 }
 
-std::optional<DeviceAuthToken>
-DeviceTokenStore::validate_token(const std::string& raw_token) const {
+std::expected<DeviceAuthToken, RejectedToken>
+DeviceTokenStore::validate_token(const std::string& raw_token,
+                                 const std::string& presenting_agent_id) const {
+    auto reject_input = []() {
+        RejectedToken r;
+        r.error = DeviceTokenValidateError::invalid_input;
+        return r;
+    };
     if (!db_ || raw_token.empty())
-        return std::nullopt;
+        return std::unexpected(reject_input());
 
     auto hashed = hash_token(raw_token);
 
@@ -217,18 +224,21 @@ DeviceTokenStore::validate_token(const std::string& raw_token) const {
     std::unique_lock lock(mtx_);
 
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(
-            db_,
-            "SELECT token_id, name, principal_id, device_id, definition_id, "
-            "created_at, expires_at, last_used_at, revoked "
-            "FROM device_auth_tokens WHERE token_hash = ?;",
-            -1, &s, nullptr) != SQLITE_OK)
-        return std::nullopt;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT token_id, name, principal_id, device_id, definition_id, "
+                           "created_at, expires_at, last_used_at, revoked "
+                           "FROM device_auth_tokens WHERE token_hash = ?;",
+                           -1, &s, nullptr) != SQLITE_OK) {
+        RejectedToken r;
+        r.error = DeviceTokenValidateError::not_found;
+        return std::unexpected(std::move(r));
+    }
     sqlite3_bind_text(s, 1, hashed.c_str(), -1, SQLITE_TRANSIENT);
 
-    std::optional<DeviceAuthToken> result;
+    DeviceAuthToken t;
+    bool row_found = false;
     if (sqlite3_step(s) == SQLITE_ROW) {
-        DeviceAuthToken t;
+        row_found = true;
         t.token_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
         t.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
         t.principal_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
@@ -238,53 +248,84 @@ DeviceTokenStore::validate_token(const std::string& raw_token) const {
         t.expires_at = sqlite3_column_int64(s, 6);
         t.last_used_at = sqlite3_column_int64(s, 7);
         t.revoked = sqlite3_column_int(s, 8) != 0;
-
-        // Check revocation
-        if (t.revoked) {
-            sqlite3_finalize(s);
-            return std::nullopt;
-        }
-
-        // Check expiration (expires_at == 0 means no expiry)
-        auto now = now_epoch();
-        if (t.expires_at > 0 && now > t.expires_at) {
-            sqlite3_finalize(s);
-            return std::nullopt;
-        }
-
-        result = std::move(t);
     }
     sqlite3_finalize(s);
 
-    // Update last_used_at (already holding unique_lock)
-    if (result) {
-        sqlite3_stmt* upd = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "UPDATE device_auth_tokens SET last_used_at = ? "
-                               "WHERE token_hash = ?;",
-                               -1, &upd, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(upd, 1, now_epoch());
-            sqlite3_bind_text(upd, 2, hashed.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(upd);
-            sqlite3_finalize(upd);
-        }
+    // #1053: every rejection from this point on has row context that the
+    // W1.3 handler needs to emit a complete audit row WITHOUT a second
+    // SELECT. The helper populates the common (token_id, principal_id)
+    // fields and lets the caller decide whether `bound_device_id` is
+    // meaningful per-variant (unbound_legacy explicitly leaves it empty).
+    auto reject_with_context = [&t](DeviceTokenValidateError err, bool include_bound_device) {
+        RejectedToken r;
+        r.error = err;
+        r.token_id = t.token_id;
+        r.bound_principal_id = t.principal_id;
+        if (include_bound_device)
+            r.bound_device_id = t.device_id;
+        return r;
+    };
+
+    if (!row_found) {
+        RejectedToken r;
+        r.error = DeviceTokenValidateError::not_found;
+        return std::unexpected(std::move(r));
     }
 
-    return result;
+    if (t.revoked)
+        return std::unexpected(
+            reject_with_context(DeviceTokenValidateError::revoked, /*include_bound_device=*/true));
+
+    // expires_at == 0 means no expiry
+    auto now = now_epoch();
+    if (t.expires_at > 0 && now > t.expires_at)
+        return std::unexpected(
+            reject_with_context(DeviceTokenValidateError::expired, /*include_bound_device=*/true));
+
+    // HIGH-1/HIGH-2 (PR #824 round 2): tokens stored with empty device_id are
+    // a back-door — any presenter would pass the empty-comparison short-circuit.
+    // Refuse to validate them; the operator must re-issue with explicit binding.
+    // bound_device_id is left empty because the row literally has no binding;
+    // propagating "" would mislead the audit reader.
+    if (t.device_id.empty())
+        return std::unexpected(reject_with_context(DeviceTokenValidateError::unbound_legacy,
+                                                   /*include_bound_device=*/false));
+
+    // Binding enforcement: prevents stolen-token impersonation (#824). The
+    // token row stores `device_id` = the agent authorized to present it. If
+    // `presenting_agent_id` does not match, reject. An empty
+    // `presenting_agent_id` is also a mismatch (the stored device_id is
+    // guaranteed non-empty by the unbound_legacy check above), so a caller
+    // that forgets to pass the agent id cannot silently bypass the check.
+    if (presenting_agent_id != t.device_id)
+        return std::unexpected(reject_with_context(DeviceTokenValidateError::binding_mismatch,
+                                                   /*include_bound_device=*/true));
+
+    // Update last_used_at (already holding unique_lock)
+    sqlite3_stmt* upd = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "UPDATE device_auth_tokens SET last_used_at = ? "
+                           "WHERE token_hash = ?;",
+                           -1, &upd, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int64(upd, 1, now_epoch());
+        sqlite3_bind_text(upd, 2, hashed.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(upd);
+        sqlite3_finalize(upd);
+    }
+
+    return t;
 }
 
-std::vector<DeviceAuthToken>
-DeviceTokenStore::list_tokens(const std::string& principal_id) const {
+std::vector<DeviceAuthToken> DeviceTokenStore::list_tokens(const std::string& principal_id) const {
     std::vector<DeviceAuthToken> result;
     if (!db_)
         return result;
 
     std::shared_lock lock(mtx_);
 
-    std::string sql =
-        "SELECT token_id, name, principal_id, device_id, definition_id, "
-        "created_at, expires_at, last_used_at, revoked "
-        "FROM device_auth_tokens";
+    std::string sql = "SELECT token_id, name, principal_id, device_id, definition_id, "
+                      "created_at, expires_at, last_used_at, revoked "
+                      "FROM device_auth_tokens";
     if (!principal_id.empty())
         sql += " WHERE principal_id = ?";
     sql += " ORDER BY created_at DESC;";
@@ -319,14 +360,44 @@ bool DeviceTokenStore::revoke_token(const std::string& token_id) {
     std::unique_lock lock(mtx_);
 
     sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "UPDATE device_auth_tokens SET revoked = 1 WHERE token_id = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    if (sqlite3_prepare_v2(db_, "UPDATE device_auth_tokens SET revoked = 1 WHERE token_id = ?;", -1,
+                           &s, nullptr) != SQLITE_OK)
         return false;
     sqlite3_bind_text(s, 1, token_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(s);
     sqlite3_finalize(s);
     return sqlite3_changes(db_) > 0;
+}
+
+int64_t DeviceTokenStore::revoke_by_principal(const std::string& principal_id) {
+    // Empty principal_id is a no-op: a buggy caller passing the empty default
+    // must not be able to revoke the entire table or match historical rows
+    // that lack a principal binding. See header doc.
+    if (!db_ || principal_id.empty())
+        return 0;
+
+    std::unique_lock lock(mtx_);
+
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_,
+                           "UPDATE device_auth_tokens SET revoked = 1 "
+                           "WHERE principal_id = ? AND revoked = 0 "
+                           "RETURNING token_id;",
+                           -1, &s, nullptr) != SQLITE_OK)
+        return 0;
+    sqlite3_bind_text(s, 1, principal_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    // RETURNING avoids the FULLMUTEX sqlite3_changes() race (#1033). Each
+    // SQLITE_ROW step yields one revoked token_id; we count and log.
+    int64_t revoked = 0;
+    while (sqlite3_step(s) == SQLITE_ROW)
+        ++revoked;
+    sqlite3_finalize(s);
+
+    if (revoked > 0)
+        spdlog::info("DeviceTokenStore: revoked {} device token(s) for principal '{}'", revoked,
+                     principal_id);
+    return revoked;
 }
 
 } // namespace yuzu::server

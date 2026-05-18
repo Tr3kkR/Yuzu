@@ -76,10 +76,17 @@ void AuditStore::create_tables() {
     }
 }
 
-void AuditStore::log(const AuditEvent& event) {
+bool AuditStore::log(const AuditEvent& event) {
     std::unique_lock lock(mtx_);
-    if (!db_)
-        return;
+    if (!db_) {
+        // Audit DB not open — surface as a failure so callers can flag the
+        // gap on the response (HIGH-2 from PR #883). Operators running
+        // audit-off (no AuditStore wired at all) never reach this code
+        // path because AuthRoutes::audit_log short-circuits on a null
+        // store and returns true.
+        emit_failed_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
 
     const char* sql = R"(
         INSERT INTO audit_events (timestamp, principal, principal_role, action,
@@ -87,8 +94,11 @@ void AuditStore::log(const AuditEvent& event) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
     sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        emit_failed_.fetch_add(1, std::memory_order_relaxed);
+        spdlog::error("AuditStore: sqlite3_prepare_v2 failed: {}", sqlite3_errmsg(db_));
+        return false;
+    }
 
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
@@ -119,9 +129,9 @@ void AuditStore::log(const AuditEvent& event) {
     // ratio remains observable separately from the emit-failed signal.
     if (step_rc != SQLITE_DONE) {
         emit_failed_.fetch_add(1, std::memory_order_relaxed);
-        spdlog::error("AuditStore: sqlite3_step rc={} ({}); event lost",
-                      step_rc, sqlite3_errmsg(db_));
-        return;
+        spdlog::error("AuditStore: sqlite3_step rc={} ({}); event lost", step_rc,
+                      sqlite3_errmsg(db_));
+        return false;
     }
 
     // Bucket the write into a Prometheus-friendly counter so the audit subsystem
@@ -136,13 +146,18 @@ void AuditStore::log(const AuditEvent& event) {
         events_denied_.fetch_add(1, std::memory_order_relaxed);
     else
         events_other_.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 uint64_t AuditStore::events_written(const std::string& result) const noexcept {
-    if (result == "success") return events_success_.load(std::memory_order_relaxed);
-    if (result == "failure") return events_failure_.load(std::memory_order_relaxed);
-    if (result == "denied")  return events_denied_.load(std::memory_order_relaxed);
-    if (result == "other")   return events_other_.load(std::memory_order_relaxed);
+    if (result == "success")
+        return events_success_.load(std::memory_order_relaxed);
+    if (result == "failure")
+        return events_failure_.load(std::memory_order_relaxed);
+    if (result == "denied")
+        return events_denied_.load(std::memory_order_relaxed);
+    if (result == "other")
+        return events_other_.load(std::memory_order_relaxed);
     return 0;
 }
 

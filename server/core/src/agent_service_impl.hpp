@@ -29,6 +29,7 @@ namespace yuzu::server {
 class ResponseStore;
 class TagStore;
 class AnalyticsEventStore;
+class AuditStore;
 class ManagementGroupStore;
 class NotificationStore;
 class WebhookStore;
@@ -59,6 +60,16 @@ public:
     void set_response_store(ResponseStore* store) { response_store_ = store; }
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
+    /// W1.4 / #827: AuditStore wired for enrollment-token consume rows.
+    /// SOC 2 CC7.2/CC7.3 require attributable credential-rejection logs;
+    /// the Register handler emits one audit row per successful consume AND
+    /// one per lost-race rejection (with `already_consumed_by=<agent_id>`
+    /// detail naming the race winner). nullptr disables emission — used
+    /// by the existing test harness that doesn't construct an AuditStore.
+    /// W1.1 audit_log → bool: the handler observes the return so a
+    /// dropped audit row surfaces as a counter increment plus an
+    /// analytics-event severity escalation, never a silent loss.
+    void set_audit_store(AuditStore* store) { audit_store_ = store; }
     void set_health_store(AgentHealthStore* store) { health_store_ = store; }
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_notification_store(NotificationStore* store) { notification_store_ = store; }
@@ -139,6 +150,18 @@ public:
                                   const std::string& line,
                                   const std::vector<std::string>& col_names);
 
+    /// #826: extract the bare IP from a gRPC peer string. gRPC encodes
+    /// peer as `ipv4:1.2.3.4:5678` (and `ipv6:[::1]:5678`, `unix:/tmp/s`,
+    /// etc.). Subscribe's peer-mismatch check operates on IPs because the
+    /// port differs across the Register and Subscribe RPCs from the same
+    /// agent — the meaningful security check is "same network endpoint",
+    /// not "same TCP four-tuple". Returns an empty string for unparseable
+    /// inputs; the caller MUST treat empty as a mismatch (never as a wild
+    /// match) to avoid recreating the #826 skip.
+    ///
+    /// Public for unit testability — exercised in test_agent_service_impl.cpp.
+    static std::string extract_peer_ip(std::string_view peer);
+
     void publish_output_rows(const std::string& agent_id, const std::string& plugin,
                              const std::string& raw_output);
 
@@ -212,6 +235,7 @@ private:
     ResponseStore* response_store_{nullptr};
     TagStore* tag_store_{nullptr};
     AnalyticsEventStore* analytics_store_{nullptr};
+    AuditStore* audit_store_{nullptr};
     AgentHealthStore* health_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
     NotificationStore* notification_store_{nullptr};
@@ -232,6 +256,7 @@ private:
                                              std::string_view key);
     static bool has_identity_overlap(const std::vector<std::string>& lhs,
                                      const std::vector<std::string>& rhs);
+
     void prune_expired_pending_locked();
     static std::string extract_plugin(const std::string& command_id);
 

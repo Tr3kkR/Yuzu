@@ -22,7 +22,7 @@
 #else
 #include <openssl/evp.h>
 #include <openssl/rand.h>
-#include <sys/stat.h>  // umask()
+#include <sys/stat.h> // umask()
 #endif
 
 namespace yuzu::server::auth {
@@ -173,7 +173,8 @@ bool AuthManager::load_config(const std::filesystem::path& cfg_path) {
                 try {
                     int ver = std::stoi(line.substr(11));
                     if (ver != 1) {
-                        spdlog::error("Unsupported config file version {} in {}", ver, cfg_path.string());
+                        spdlog::error("Unsupported config file version {} in {}", ver,
+                                      cfg_path.string());
                         return false;
                     }
                 } catch (const std::exception& e) {
@@ -262,8 +263,8 @@ bool AuthManager::save_config() const {
 #ifndef _WIN32
     // Belt-and-suspenders: ensure 0600 even if the file pre-existed with looser perms.
     std::error_code perm_ec;
-    std::filesystem::permissions(cfg_path_,
-        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+    std::filesystem::permissions(
+        cfg_path_, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
         std::filesystem::perm_options::replace, perm_ec);
     if (perm_ec) {
         spdlog::warn("Failed to set permissions on {}: {}", cfg_path_.string(), perm_ec.message());
@@ -409,10 +410,11 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     if (it == users_.end()) {
         spdlog::warn("Auth failed: unknown user '{}'", username);
         if (metrics_) {
-            const auto elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_start).count();
-            metrics_->histogram("yuzu_auth_login_duration_seconds",
-                                {{"method", "password"}, {"result", "unknown_user"}})
+            const auto elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+            metrics_
+                ->histogram("yuzu_auth_login_duration_seconds",
+                            {{"method", "password"}, {"result", "unknown_user"}})
                 .observe(elapsed);
         }
         return std::nullopt;
@@ -424,10 +426,11 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     if (!constant_time_compare(hash, it->second.hash_hex)) {
         spdlog::warn("Auth failed: bad password for '{}'", username);
         if (metrics_) {
-            const auto elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_start).count();
-            metrics_->histogram("yuzu_auth_login_duration_seconds",
-                                {{"method", "password"}, {"result", "bad_password"}})
+            const auto elapsed =
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+            metrics_
+                ->histogram("yuzu_auth_login_duration_seconds",
+                            {{"method", "password"}, {"result", "bad_password"}})
                 .observe(elapsed);
         }
         return std::nullopt;
@@ -452,10 +455,11 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
 
     spdlog::info("User '{}' authenticated (role={})", username, role_to_string(it->second.role));
     if (metrics_) {
-        const auto elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t_start).count();
-        metrics_->histogram("yuzu_auth_login_duration_seconds",
-                            {{"method", "password"}, {"result", "success"}})
+        const auto elapsed =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+        metrics_
+            ->histogram("yuzu_auth_login_duration_seconds",
+                        {{"method", "password"}, {"result", "success"}})
             .observe(elapsed);
     }
     return token;
@@ -495,6 +499,38 @@ std::optional<Session> AuthManager::validate_session(const std::string& token) c
 void AuthManager::invalidate_session(const std::string& token) {
     std::unique_lock lock(mu_);
     sessions_.erase(token);
+}
+
+AuthManager::RevokeResult
+AuthManager::invalidate_user_sessions(const std::string& username) {
+    // Lock-ordering: AuthDB call OUTSIDE mu_, then take mu_ for the
+    // in-memory erase. Same pattern as remove_user and update_role.
+    //
+    // Failure tolerance INTENTIONALLY DIFFERS from remove_user/update_role.
+    // Those abort on DB write failure because removing a user is a
+    // strictly-ordered durability operation: if the DB doesn't accept
+    // the change, the in-memory cache must not diverge or the server's
+    // first restart silently resurrects the deleted user. Revocation is
+    // different — the operator's mental model is "kill this session NOW",
+    // and the in-memory wipe IS the operationally-critical step (the
+    // active cookie validating against `sessions_` stops working
+    // immediately). We therefore wipe in-memory even on DB failure but
+    // surface `db_persisted=false` so the caller can audit the partial
+    // outcome and the operator knows to retry or restart.
+    bool db_persisted = true;
+    if (auth_db_) {
+        auto result = auth_db_->invalidate_all_sessions(username);
+        if (!result) {
+            spdlog::error("AuthDB invalidate_all_sessions failed for '{}'", username);
+            db_persisted = false;
+        }
+    }
+    std::unique_lock lock(mu_);
+    const auto before = sessions_.size();
+    std::erase_if(sessions_, [&](const auto& pair) {
+        return pair.second.username == username;
+    });
+    return RevokeResult{before - sessions_.size(), db_persisted};
 }
 
 // ── User management ─────────────────────────────────────────────────────────
@@ -564,9 +600,8 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     if (role_changed) {
         // Invalidate sessions so the user picks up the new role on next login
         // Prevents stale session role from granting old privileges (G4-CON-AUTH-001)
-        std::erase_if(sessions_, [&](const auto& pair) {
-            return pair.second.username == username;
-        });
+        std::erase_if(sessions_,
+                      [&](const auto& pair) { return pair.second.username == username; });
     }
 
     // Only save config file if NOT using DB (backwards compat)
@@ -593,9 +628,8 @@ bool AuthManager::remove_user(const std::string& username) {
     if (erased) {
         // Invalidate all active sessions belonging to this user
         // to prevent deleted users from retaining access (CHAOS-T1-001)
-        std::erase_if(sessions_, [&](const auto& pair) {
-            return pair.second.username == username;
-        });
+        std::erase_if(sessions_,
+                      [&](const auto& pair) { return pair.second.username == username; });
     }
 
     if (!auth_db_) {
@@ -632,9 +666,7 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
 
     // Invalidate sessions so the user picks up the new role on next login
     // Prevents stale session role from granting old privileges
-    std::erase_if(sessions_, [&](const auto& pair) {
-        return pair.second.username == username;
-    });
+    std::erase_if(sessions_, [&](const auto& pair) { return pair.second.username == username; });
 
     if (!auth_db_) {
         lock.unlock();
@@ -784,38 +816,170 @@ AuthManager::create_enrollment_tokens_batch(const std::string& label_prefix, int
 }
 
 bool AuthManager::validate_enrollment_token(const std::string& raw_token) {
+    // W1.4 R2 / UP-H2: read-only observability check. The W1.4 PR1 pass
+    // of this wrapper silently delegated to consume_enrollment_token,
+    // which burned a use on every call — a semantic break with the
+    // function name and the doc comment ("validate, not consume"). A
+    // caller checking "is this token still usable?" would unintentionally
+    // exhaust a max_uses=1 token. The behaviour was acceptable in PR1
+    // because the only callers were tests asserting the exhaustion
+    // behaviour, but a future caller would not know to expect the
+    // mutation. Restored to true read-only.
+    //
+    // Length-bound applied here as well (defence-in-depth) so a caller
+    // of validate can't bypass the consume-path length check.
+    if (raw_token.empty() || raw_token.size() > kMaxEnrollmentTokenLength) {
+        return false;
+    }
     auto hash = sha256_hex(raw_token);
     auto now = std::chrono::system_clock::now();
-
-    std::unique_lock lock(mu_);
-
-    for (auto& [id, et] : enrollment_tokens_) {
+    std::shared_lock lock(mu_);
+    for (const auto& [_, et] : enrollment_tokens_) {
         if (!constant_time_compare(et.token_hash, hash))
             continue;
-
-        if (et.revoked) {
-            spdlog::warn("Enrollment token {} is revoked", id);
+        if (et.revoked)
             return false;
-        }
-        if (now > et.expires_at) {
-            spdlog::warn("Enrollment token {} has expired", id);
+        if (now > et.expires_at)
             return false;
-        }
-        if (et.max_uses > 0 && et.use_count >= et.max_uses) {
-            spdlog::warn("Enrollment token {} exhausted ({}/{})", id, et.use_count, et.max_uses);
+        if (et.max_uses > 0 && et.use_count >= et.max_uses)
             return false;
-        }
-
-        ++et.use_count;
-        spdlog::info("Enrollment token {} used ({}/{})", id, et.use_count,
-                     et.max_uses == 0 ? -1 : et.max_uses);
-        // Save updated use count (don't hold lock during file I/O — already locked)
-        // We'll save after releasing; use a flag.
         return true;
     }
-
-    spdlog::warn("Enrollment token not found (hash prefix={})", hash.substr(0, 8));
     return false;
+}
+
+std::expected<EnrollmentClaim, EnrollmentTokenError>
+AuthManager::consume_enrollment_token(std::string_view raw_token,
+                                      std::string_view consuming_agent_id) {
+    // W1.1 UP-H2: length-bound at the API entry. The same kMaxEnrollment
+    // TokenLength constant guards the handlers (where it converts to a 400/
+    // gRPC INVALID_ARGUMENT) AND this consume function (defence-in-depth,
+    // so an in-process caller can't bypass the handler check and force the
+    // store to SHA-256 a 1 MiB blob). Empty token is also rejected here —
+    // the handler should never call us with an empty token, but it makes
+    // the consume contract self-describing.
+    if (raw_token.empty() || raw_token.size() > kMaxEnrollmentTokenLength) {
+        return std::unexpected(EnrollmentTokenError::invalid_input);
+    }
+
+    auto hash = sha256_hex(std::string{raw_token});
+    auto now = std::chrono::system_clock::now();
+
+    EnrollmentClaim claim;
+    bool consumed = false;
+
+    {
+        // The atomic-claim critical section. Everything from validity check
+        // through ++use_count and last_consumed_by_agent_id write happens
+        // under one unique_lock so no second consumer can interleave between
+        // "this token is valid" and "this token's use_count is now N+1".
+        // Loosening this lock is the bug #827 closes; do not split into a
+        // shared_lock for the SELECT + unique_lock for the UPDATE without
+        // re-reading the issue's race scenario.
+        std::unique_lock lock(mu_);
+
+        for (auto& [id, et] : enrollment_tokens_) {
+            if (!constant_time_compare(et.token_hash, hash))
+                continue;
+
+            if (et.revoked) {
+                spdlog::warn("Enrollment token {} is revoked", id);
+                return std::unexpected(EnrollmentTokenError::revoked);
+            }
+            if (now > et.expires_at) {
+                spdlog::warn("Enrollment token {} has expired", id);
+                return std::unexpected(EnrollmentTokenError::expired);
+            }
+            if (et.max_uses > 0 && et.use_count >= et.max_uses) {
+                // The race-lost case is structurally indistinguishable from a
+                // "stale exhausted" case at this point — both look like
+                // use_count >= max_uses. The handler discriminates via the
+                // `last_consumed_by_agent_id` value (already set by the prior
+                // winner) and emits an audit row naming the winner so the
+                // operator can see the contention. We just classify as
+                // already_consumed and let the handler do the attribution.
+                spdlog::warn("Enrollment token {} exhausted ({}/{}) — race lost or stale", id,
+                             et.use_count, et.max_uses);
+                return std::unexpected(EnrollmentTokenError::already_consumed);
+            }
+
+            // The atomic claim. ++use_count and the agent_id stamp happen
+            // before we drop the lock. The use_count value we return to the
+            // caller is the POST-increment value, so a successful single-use
+            // consume returns use_count_after == 1.
+            ++et.use_count;
+            if (!consuming_agent_id.empty()) {
+                et.last_consumed_by_agent_id.assign(consuming_agent_id.data(),
+                                                    consuming_agent_id.size());
+            }
+
+            claim.token_id = id;
+            claim.max_uses = et.max_uses;
+            claim.use_count_after = et.use_count;
+            claim.single_use = (et.max_uses == 1);
+            consumed = true;
+
+            spdlog::info("Enrollment token {} consumed by '{}' ({}/{})", id,
+                         consuming_agent_id.empty() ? std::string_view{"<unknown>"}
+                                                    : consuming_agent_id,
+                         et.use_count, et.max_uses == 0 ? -1 : et.max_uses);
+            break;
+        }
+    }
+
+    if (!consumed) {
+        spdlog::warn("Enrollment token not found (hash prefix={})", hash.substr(0, 8));
+        return std::unexpected(EnrollmentTokenError::not_found);
+    }
+
+    // W1.4 R2 / UP-C1: persist immediately after the in-memory claim.
+    // The PR1 implementation left persistence to whatever next mutation
+    // (revoke, create, manager destruction) happened to call save_tokens(),
+    // which left a crash-replay window: a server SIGKILL between the
+    // in-memory ++use_count and any disk write meant the next boot's
+    // load_tokens() read use_count=0 and the consumed token would
+    // re-enroll. Now save_tokens() lands before we return, closing the
+    // window to "crash inside save_tokens() itself" (atomic file write
+    // via ofstream::trunc + close, so the on-disk file is either the
+    // pre-consume or post-consume snapshot, never a torn intermediate).
+    //
+    // Lock-release first because save_tokens() acquires shared_lock(mu_)
+    // itself — holding unique_lock across the call would deadlock. Once
+    // the in-memory claim has landed, releasing the unique_lock is safe:
+    // parallel consumers see exhausted, parallel saves serialise via
+    // their own shared_lock so the on-disk snapshot only ever advances.
+    //
+    // Failure handling: do NOT roll back the in-memory consume on save
+    // failure. The agent will be told their token is consumed (success
+    // response in flight) and rolling back would create a different
+    // bug (token reuse under disk-failure injection). Log loudly so SRE
+    // sees it; the prior best-effort behaviour for non-consume paths
+    // (revoke, create) is preserved by the existing save_tokens callers.
+    //
+    // Note on AuthDB: AuthManager has an `auth_db_` member, but
+    // create_enrollment_token never inserts into the AuthDB enrollment
+    // _tokens table — that table is dead. Wiring AuthDB as the source
+    // of truth would require reconciling the AuthDB schema (single-use
+    // only) against the in-memory schema (max_uses, label, revoked)
+    // and porting create_enrollment_token. Out of scope for R2; the
+    // in-memory + file-snapshot path is the production-correct one.
+    if (!save_tokens()) {
+        spdlog::error("Enrollment token {} consume succeeded in-memory but save_tokens "
+                      "failed — on a crash before the next save, the consumed state will "
+                      "be lost and the token may replay",
+                      claim.token_id);
+    }
+    return claim;
+}
+
+std::string AuthManager::last_consumer_for_token_hash(std::string_view token_hash) const {
+    std::shared_lock lock(mu_);
+    for (const auto& [_, et] : enrollment_tokens_) {
+        if (constant_time_compare(et.token_hash, std::string{token_hash})) {
+            return et.last_consumed_by_agent_id;
+        }
+    }
+    return {};
 }
 
 std::vector<EnrollmentToken> AuthManager::list_enrollment_tokens() const {
@@ -884,8 +1048,8 @@ bool AuthManager::save_tokens() const {
 #ifndef _WIN32
     // Restrict token file to owner-only (0600) — contains token hashes.
     std::error_code perm_ec;
-    std::filesystem::permissions(path,
-        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+    std::filesystem::permissions(
+        path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
         std::filesystem::perm_options::replace, perm_ec);
     if (perm_ec) {
         spdlog::warn("Failed to set permissions on {}: {}", path.string(), perm_ec.message());
@@ -1125,8 +1289,8 @@ bool AuthManager::save_pending() const {
 #ifndef _WIN32
     // Restrict pending-agents file to owner-only (0600).
     std::error_code perm_ec;
-    std::filesystem::permissions(path,
-        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+    std::filesystem::permissions(
+        path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
         std::filesystem::perm_options::replace, perm_ec);
     if (perm_ec) {
         spdlog::warn("Failed to set permissions on {}: {}", path.string(), perm_ec.message());

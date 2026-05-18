@@ -2,7 +2,11 @@
 
 #include <grpc/grpc_security_constants.h>
 
+#include <chrono>
+
 #include "analytics_event_store.hpp"
+#include "audit_store.hpp"
+#include "enrollment_token_rejection.hpp"
 #include "execution_tracker.hpp"
 #include "fleet_topology_store.hpp"
 #include "heartbeat_ingestion.hpp"
@@ -10,6 +14,7 @@
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
+#include "peer_ip.hpp"
 #include "response_store.hpp"
 #include "result_parsing.hpp"
 #include "tag_store.hpp"
@@ -45,6 +50,27 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         .increment();
     const auto& info = request->info();
 
+    // -- W1.4 R2 / UP-H1 agent_id length bound -------------------------------
+    // Cap agent_id BEFORE any audit emission, mTLS check, or auth-mgr
+    // lookup so a presenter with a 1 MiB agent_id can't inflate audit
+    // rows, exhaust SQLite row budgets, or force SHA-256 work on a giant
+    // string. The protobuf has no length constraint on agent_id and W1.4
+    // PR1 audits the value verbatim — this is the gate. Empty agent_id
+    // is also rejected: every downstream code path assumes a non-empty
+    // string (registry keys, audit principal, pending_agents lookup).
+    // INVALID_ARGUMENT chosen (not UNAUTHENTICATED) because the request
+    // is structurally malformed, not credential-rejected. Counter has
+    // a distinct metric name from token rejections so SRE alerts on
+    // input-shape attacks don't bucket into credential-failure noise.
+    if (info.agent_id().empty() || info.agent_id().size() > auth::kMaxAgentIdLength) {
+        spdlog::warn("Register rejected: agent_id length {} (max {}, empty disallowed)",
+                     info.agent_id().size(), auth::kMaxAgentIdLength);
+        metrics_.counter("yuzu_register_invalid_agent_id_total", {{"reason", "length"}})
+            .increment();
+        return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                            "agent_id length exceeds 256 chars or empty");
+    }
+
     if (require_client_identity_) {
         if (!context || !peer_identity_matches_agent_id(*context, info.agent_id())) {
             spdlog::warn("mTLS identity mismatch: claimed agent_id={}", info.agent_id());
@@ -71,12 +97,21 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         const auto& enrollment_token = request->enrollment_token();
 
         if (!enrollment_token.empty()) {
-            // Tier 2: Validate the pre-shared token
-            if (!auth_mgr_.validate_enrollment_token(enrollment_token)) {
-                spdlog::warn("Agent {} presented invalid enrollment token", info.agent_id());
-                response->set_accepted(false);
-                response->set_reject_reason("invalid, expired, or exhausted enrollment token");
-                response->set_enrollment_status("denied");
+            // -- W1.1 UP-H2 length bound (mirrored on the gateway path) --------
+            // Reject oversize input before any SHA-256 / map walk work. The
+            // bound matches kMaxEnrollmentTokenLength (256 chars — well
+            // above the legitimate 64-hex-char token format). Length-based
+            // rejections get their own variant in the typed error so SIEM
+            // filters can distinguish "input garbage" from "valid token
+            // shape, wrong/expired/race-lost".
+            if (enrollment_token.size() > auth::kMaxEnrollmentTokenLength) {
+                spdlog::warn("Agent {} presented oversize enrollment token ({} chars > {})",
+                             info.agent_id(), enrollment_token.size(),
+                             auth::kMaxEnrollmentTokenLength);
+                metrics_
+                    .counter("yuzu_enrollment_token_rejected_total",
+                             {{"variant", "invalid_input_length"}})
+                    .increment();
                 if (analytics_store_) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
@@ -85,12 +120,151 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     ae.os = info.platform().os();
                     ae.arch = info.platform().arch();
                     ae.severity = Severity::kWarn;
-                    ae.attributes = {{"reason", "invalid_token"}};
+                    ae.attributes = {{"reason", "invalid_input_length"},
+                                     {"token_length", enrollment_token.size()}};
                     analytics_store_->emit(std::move(ae));
                 }
+                response->set_accepted(false);
+                response->set_reject_reason(
+                    std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
+                response->set_enrollment_status("denied");
                 return grpc::Status::OK;
             }
-            spdlog::info("Agent {} auto-enrolled via enrollment token", info.agent_id());
+
+            // -- W1.4 / #827 atomic consume ------------------------------------
+            // The prior validate_enrollment_token returned a bare bool with a
+            // race window between "valid?" and "++use_count". Replaced with
+            // consume_enrollment_token which performs the check-and-increment
+            // under one unique_lock and reports the typed outcome so we can
+            // audit the lost-race case with attribution.
+            auto claim_result =
+                auth_mgr_.consume_enrollment_token(enrollment_token, info.agent_id());
+            if (!claim_result.has_value()) {
+                auto err = claim_result.error();
+                auto variant = yuzu::server::enrollment_rejection_variant_name(err);
+                auto metric_name = yuzu::server::enrollment_rejection_metric_name(err);
+                spdlog::warn("Agent {} enrollment-token consume rejected: variant={}",
+                             info.agent_id(), variant);
+                // High-signal counter for race-lost; low-signal bucket for
+                // everything else. enrollment_rejection_metric_name does
+                // the variant→metric mapping in one place.
+                if (err == auth::EnrollmentTokenError::already_consumed) {
+                    metrics_.counter(std::string(metric_name), {}).increment();
+                } else {
+                    metrics_.counter(std::string(metric_name), {{"variant", std::string(variant)}})
+                        .increment();
+                }
+
+                // For race-loss the audit detail names the winner so an
+                // operator can reconstruct "agent X tried to enroll with a
+                // token already consumed by agent Y". We look the winner
+                // up via the token-hash (constant-time scan); empty result
+                // means the token row was concurrently revoked/expired
+                // between consume and the lookup — rare but possible.
+                std::string already_consumed_by;
+                if (err == auth::EnrollmentTokenError::already_consumed) {
+                    auto hash = auth::AuthManager::sha256_hex(enrollment_token);
+                    already_consumed_by = auth_mgr_.last_consumer_for_token_hash(hash);
+                }
+
+                // Audit row — W1.1 audit_log → bool pattern. The handler
+                // observes the return so a dropped audit row surfaces via
+                // the analytics-event Severity::kError escalation rather
+                // than silently disappearing. SOC 2 CC7.2 evidence chain.
+                bool audit_ok = true;
+                if (audit_store_ && audit_store_->is_open()) {
+                    AuditEvent ev;
+                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                    ev.principal = "agent:" + info.agent_id();
+                    ev.principal_role = "agent";
+                    ev.action = std::string(yuzu::server::enrollment_event_action());
+                    ev.target_type = "enrollment_token";
+                    // No raw token in audit detail (it would let an
+                    // attacker who later compromises audit storage replay
+                    // the token). The hash prefix (8 hex chars = 32 bits
+                    // identifying entropy) is enough to correlate with
+                    // the create-token audit row.
+                    auto hash_for_audit = auth::AuthManager::sha256_hex(enrollment_token);
+                    ev.target_id = hash_for_audit.substr(0, 8);
+                    std::string detail = std::string("variant=")
+                                             .append(variant)
+                                             .append(" presenter=")
+                                             .append(info.agent_id());
+                    if (!already_consumed_by.empty()) {
+                        detail.append(" already_consumed_by=").append(already_consumed_by);
+                    }
+                    ev.detail = std::move(detail);
+                    if (context)
+                        ev.source_ip = extract_peer_ip(context->peer());
+                    ev.result = "failure";
+                    audit_ok = audit_store_->log(ev);
+                }
+
+                if (analytics_store_) {
+                    AnalyticsEvent ae;
+                    ae.event_type = "agent.enrollment_denied";
+                    ae.agent_id = info.agent_id();
+                    ae.hostname = info.hostname();
+                    ae.os = info.platform().os();
+                    ae.arch = info.platform().arch();
+                    // Race-loss is a credential-leak signal — escalate
+                    // severity above the generic invalid-token noise so
+                    // SIEM rules can fire on it independently. Dropped
+                    // audit row is an evidence-chain degradation — also
+                    // escalate to Error per W1.1 UP-H1.
+                    if (err == auth::EnrollmentTokenError::already_consumed || !audit_ok) {
+                        ae.severity = Severity::kError;
+                    } else {
+                        ae.severity = Severity::kWarn;
+                    }
+                    nlohmann::json attrs = {{"reason", std::string(variant)},
+                                            {"audit_emitted", audit_ok}};
+                    if (!already_consumed_by.empty()) {
+                        attrs["already_consumed_by"] = already_consumed_by;
+                    }
+                    ae.attributes = std::move(attrs);
+                    analytics_store_->emit(std::move(ae));
+                }
+
+                response->set_accepted(false);
+                response->set_reject_reason(
+                    std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
+                response->set_enrollment_status("denied");
+                return grpc::Status::OK;
+            }
+
+            // Success path. The token has been atomically claimed (use_count
+            // already incremented under the lock).
+            const auto& claim = claim_result.value();
+            spdlog::info("Agent {} auto-enrolled via enrollment token id={} ({}/{})",
+                         info.agent_id(), claim.token_id, claim.use_count_after,
+                         claim.max_uses == 0 ? -1 : claim.max_uses);
+
+            // Success audit row — same action/target as the failure path so
+            // SIEM filters can pivot on result=success vs failure.
+            if (audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "agent:" + info.agent_id();
+                ev.principal_role = "agent";
+                ev.action = std::string(yuzu::server::enrollment_event_action());
+                ev.target_type = "enrollment_token";
+                ev.target_id = claim.token_id;
+                ev.detail = std::string("variant=success use_count=")
+                                .append(std::to_string(claim.use_count_after))
+                                .append("/")
+                                .append(claim.max_uses == 0 ? std::string{"unlimited"}
+                                                            : std::to_string(claim.max_uses));
+                if (context)
+                    ev.source_ip = extract_peer_ip(context->peer());
+                ev.result = "success";
+                (void)audit_store_->log(ev);
+            }
+
             // Persist enrollment so reconnections don't need a valid token.
             // Returns false if the agent was explicitly denied by an admin.
             if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(), info.platform().os(),
@@ -378,8 +552,45 @@ grpc::Status AgentServiceImpl::Subscribe(
                                 "invalid or expired session");
         }
 
-        if (!gateway_mode_ && it->second.register_peer != context->peer()) {
-            spdlog::warn("Subscribe rejected: peer mismatch for session {}", session_id);
+        // #826 — peer-mismatch enforcement. The old code skipped this
+        // check ENTIRELY when `gateway_mode_` was set, on the theory
+        // that gateway-proxied agents present the gateway's IP rather
+        // than their own. That justified relaxing the per-IP check but
+        // NOT skipping all peer validation: an attacker on the gateway
+        // network segment could intercept a Register response, read
+        // the session_id (plaintext in non-mTLS deployments), then
+        // open Subscribe from an arbitrary IP with the stolen session
+        // and the server would accept it.
+        //
+        // The correct rule is:
+        //   (a) Always allow Subscribe peer IP == Register peer IP
+        //       (same agent, possibly different ephemeral port).
+        //   (b) IF gateway-mode, also allow Subscribe peer IP to be a
+        //       previously-recorded trusted gateway IP. Trusted gateway
+        //       IPs are noted at GatewayUpstreamServiceImpl::ProxyRegister
+        //       time — the gateway's own peer becomes known-good for
+        //       the lifetime of the process.
+        //   (c) Reject anything else.
+        //
+        // Per-port matching is too tight (gRPC opens separate
+        // connections for Register vs Subscribe in some clients) and
+        // unconditional skip is too loose (#826). Per-IP with a
+        // trusted-gateway whitelist is the middle ground.
+        const auto subscribe_peer_ip = extract_peer_ip(context->peer());
+        const auto register_peer_ip = extract_peer_ip(it->second.register_peer);
+        bool peer_ok = !subscribe_peer_ip.empty() && subscribe_peer_ip == register_peer_ip;
+        if (!peer_ok && gateway_mode_) {
+            peer_ok = registry_.is_trusted_gateway_peer(subscribe_peer_ip);
+        }
+        if (!peer_ok) {
+            metrics_
+                .counter("yuzu_grpc_subscribe_peer_mismatch_total",
+                         {{"gateway_mode", gateway_mode_ ? "true" : "false"}})
+                .increment();
+            spdlog::warn("Subscribe rejected: peer mismatch for session {} (register_ip={}, "
+                         "subscribe_ip={}, gateway_mode={})",
+                         session_id, register_peer_ip, subscribe_peer_ip,
+                         gateway_mode_ ? "true" : "false");
             return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "peer mismatch");
         }
 
@@ -1209,6 +1420,16 @@ std::string AgentServiceImpl::client_metadata_value(const grpc::ServerContext& c
     if (it == md.end())
         return {};
     return std::string(it->second.data(), it->second.length());
+}
+
+std::string AgentServiceImpl::extract_peer_ip(std::string_view peer) {
+    // W1.3 R2 / consistency MEDIUM-1: thin shim to the shared parser in
+    // peer_ip.hpp. Kept as a static member for ABI continuity — the unit
+    // tests address it as `AgentServiceImpl::extract_peer_ip(...)` and
+    // production call sites in this TU use the unqualified `extract_peer_ip`
+    // pulled in by the header include. Keeping the static delegate avoids a
+    // mass-rename in the test surface without forking the parser.
+    return ::yuzu::server::detail::extract_peer_ip(peer);
 }
 
 bool AgentServiceImpl::has_identity_overlap(const std::vector<std::string>& lhs,

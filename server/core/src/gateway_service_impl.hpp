@@ -26,6 +26,8 @@ class ManagementGroupStore;
 class InventoryStore;
 class FleetTopologyStore;
 class HeartbeatIngestion;
+class AnalyticsEventStore;
+class AuditStore;
 } // namespace yuzu::server
 
 namespace yuzu::server::detail {
@@ -52,6 +54,18 @@ public:
 
     /// #1000 / arch-S2: shared HeartbeatIngestion (see AgentServiceImpl).
     void set_heartbeat_ingestion(HeartbeatIngestion* hi) { heartbeat_ingestion_ = hi; }
+
+    /// W1.4 / #827: AnalyticsEventStore for the gateway enrollment path's
+    /// `agent.enrollment_*` events (mirrors AgentServiceImpl's direct
+    /// path). Without this set, the proxied-enrollment surface had no
+    /// audit/analytics emission at all — a gap relative to direct
+    /// connections that #827 closes alongside the race fix.
+    void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
+
+    /// W1.4 / #827: AuditStore wired for enrollment-token consume rows
+    /// on the gateway-proxied path. See AgentServiceImpl::set_audit_store
+    /// for the SOC 2 / wire-collapse rationale — same contract here.
+    void set_audit_store(AuditStore* store) { audit_store_ = store; }
 
     grpc::Status ProxyRegister(grpc::ServerContext* context, const pb::RegisterRequest* request,
                                pb::RegisterResponse* response) override;
@@ -81,6 +95,8 @@ private:
     InventoryStore* inventory_store_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
+    AnalyticsEventStore* analytics_store_{nullptr};
+    AuditStore* audit_store_{nullptr};
 
     // Map of gateway session_id -> agent_id for validation.
     mutable std::mutex sessions_mu_;

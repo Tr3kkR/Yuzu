@@ -4,6 +4,7 @@
 #include <cctype>
 
 #include "custom_properties_store.hpp"
+#include "device_token_store.hpp"
 #include "tag_store.hpp"
 #include "web_utils.hpp"
 
@@ -16,6 +17,14 @@ using yuzu::server::html_escape;
 
 AgentRegistry::AgentRegistry(EventBus& bus, yuzu::MetricsRegistry& metrics)
     : bus_(bus), metrics_(metrics) {}
+
+void AgentRegistry::set_device_token_store(DeviceTokenStore* store) {
+    // Take mu_ so a concurrent register_agent cannot observe a half-written
+    // pointer. In practice this setter is called once during startup wiring,
+    // but the lock costs nothing under that pattern and removes a footgun.
+    std::lock_guard lock(mu_);
+    device_token_store_ = store;
+}
 
 void AgentRegistry::register_agent(const pb::AgentInfo& info) {
     auto session = std::make_shared<AgentSession>();
@@ -43,8 +52,20 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
         std::lock_guard lock(mu_);
         // Clean up stale session_to_agent_ entry from a prior connection
         auto old = agents_.find(info.agent_id());
-        if (old != agents_.end() && !old->second->session_id.empty()) {
-            session_to_agent_.erase(old->second->session_id);
+        if (old != agents_.end()) {
+            // W1.5 / #823: re-registration revokes any device tokens still
+            // bound to this agent_id BEFORE the new session is installed. An
+            // attacker who briefly held this identity (mTLS-disabled flow,
+            // #779) could otherwise replay tokens previously issued to it
+            // indefinitely. Done under `mu_` so the install and the revoke
+            // are observed atomically by any concurrent reader. First-time
+            // registrations skip the revoke (agents_ has no entry), which
+            // preserves the operator workflow of pre-issuing a token for an
+            // agent_id that has not registered yet.
+            if (device_token_store_)
+                device_token_store_->revoke_by_principal(info.agent_id());
+            if (!old->second->session_id.empty())
+                session_to_agent_.erase(old->second->session_id);
         }
         agents_[info.agent_id()] = session;
     }
@@ -194,6 +215,95 @@ void AgentRegistry::set_gateway_node(const std::string& agent_id, const std::str
     if (it != agents_.end()) {
         it->second->gateway_node = node;
     }
+}
+
+void AgentRegistry::sweep_and_publish_trusted_gateway_locked() {
+    // Caller MUST hold trusted_gateway_mu_.
+    const auto now = std::chrono::steady_clock::now();
+
+    // Pass 1: drop anything past the TTL window.
+    for (auto it = trusted_gateway_peer_ips_.begin(); it != trusted_gateway_peer_ips_.end();) {
+        if (now - it->second > kTrustedGatewayTtl) {
+            it = trusted_gateway_peer_ips_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Pass 2: if at cap, evict the single oldest entry to make room.
+    // We're called from `note_trusted_gateway_peer` BEFORE the insert,
+    // so being AT the cap means the imminent insert would push over —
+    // drop one now. Linear scan is fine: the map is bounded at
+    // kTrustedGatewayCap, and this only runs on the (rare) insert path.
+    if (trusted_gateway_peer_ips_.size() >= kTrustedGatewayCap) {
+        auto oldest = trusted_gateway_peer_ips_.begin();
+        for (auto it = std::next(oldest); it != trusted_gateway_peer_ips_.end(); ++it) {
+            if (it->second < oldest->second) {
+                oldest = it;
+            }
+        }
+        if (oldest != trusted_gateway_peer_ips_.end()) {
+            trusted_gateway_peer_ips_.erase(oldest);
+        }
+    }
+
+    metrics_.gauge("yuzu_trusted_gateway_peer_set_size")
+        .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
+}
+
+void AgentRegistry::note_trusted_gateway_peer(std::string_view peer_ip) {
+    // #826: defence-in-depth — never record an empty string. An empty
+    // peer IP would later satisfy `is_trusted_gateway_peer("")` and
+    // re-create the bypass we're trying to close.
+    if (peer_ip.empty())
+        return;
+    std::lock_guard lock(trusted_gateway_mu_);
+
+    // W1.3 R2 / UP-2: opportunistic sweep + cap enforcement BEFORE the
+    // insert so a fresh entry never causes the map to exceed
+    // kTrustedGatewayCap. Sweep also refreshes the published gauge,
+    // which is important so an operator sees the set shrinking as TTL
+    // expirations land — without the sweep, a quiet system would show
+    // a stale max-size gauge until the next insert hit cap.
+    sweep_and_publish_trusted_gateway_locked();
+
+    // Insert OR refresh — repeat ProxyRegisters from the same gateway
+    // update last_seen so an active gateway stays trusted indefinitely.
+    trusted_gateway_peer_ips_[std::string(peer_ip)] = std::chrono::steady_clock::now();
+
+    metrics_.gauge("yuzu_trusted_gateway_peer_set_size")
+        .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
+}
+
+bool AgentRegistry::is_trusted_gateway_peer(std::string_view peer_ip) const {
+    // #826: empty is NEVER trusted. Without this guard a caller that
+    // failed to extract the peer IP from the gRPC context would pass
+    // an empty string and the check would pass spuriously.
+    if (peer_ip.empty())
+        return false;
+    std::lock_guard lock(trusted_gateway_mu_);
+    auto it = trusted_gateway_peer_ips_.find(std::string(peer_ip));
+    if (it == trusted_gateway_peer_ips_.end())
+        return false;
+    // W1.3 R2 / UP-3: stale entries do not satisfy the trusted check.
+    // We do not erase here (const method, would require shared→unique
+    // upgrade); the next `note_trusted_gateway_peer` sweep evicts it.
+    const auto age = std::chrono::steady_clock::now() - it->second;
+    return age <= kTrustedGatewayTtl;
+}
+
+std::size_t AgentRegistry::trusted_gateway_peer_count() const {
+    std::lock_guard lock(trusted_gateway_mu_);
+    return trusted_gateway_peer_ips_.size();
+}
+
+void AgentRegistry::expire_trusted_gateway_for_test(std::chrono::seconds offset) {
+    std::lock_guard lock(trusted_gateway_mu_);
+    for (auto& [ip, last_seen] : trusted_gateway_peer_ips_) {
+        last_seen -= offset;
+    }
+    metrics_.gauge("yuzu_trusted_gateway_peer_set_size")
+        .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
 }
 
 bool AgentRegistry::send_to(const std::string& agent_id, const pb::CommandRequest& cmd) {

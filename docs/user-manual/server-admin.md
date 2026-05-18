@@ -63,6 +63,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 | `--viz-disable` | off | Disable the fleet visualization feature. When set, the REST endpoints (`GET /api/v1/viz/fleet/topology`, `GET /fragments/viz/fleet/topology`, and the per-host drill-down routes) **and** the page shells (`GET /viz/fleet`, `GET /viz/host/<id>`) all return `503`. Tier-before-permission ordering: the kill switch takes effect even for callers who would otherwise fail RBAC. Two pieces of durable evidence that the switch took effect: the startup log line `[VIZ] viz endpoint disabled by configuration`, and a `server.viz_disabled` audit event (`target_type = FleetTopology`) written to the audit store at boot — so an auditor can confirm the disabled state from the audit trail even on a deployment with no viz traffic. Env: `YUZU_VIZ_DISABLE`. |
+| `--allow-unsigned-packs` | off | **Dangerous.** Accept product packs at install without an Ed25519 signature. Default is to reject unsigned packs with `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` (security-by-default since #802 / W7.4). Setting this flag restores the pre-W7.4 behaviour where any operator with pack-upload permission, or a MITM on pack delivery, could install a pack containing arbitrary `InstructionDefinition` or plugin payloads that would execute fleet-wide. Two pieces of durable evidence that the flag is active: a startup log line `[SECURITY] product pack signature enforcement DISABLED by configuration`, and a `server.unsigned_packs_allowed` audit event (`target_type = ProductPack`) written to the audit store at boot. Use only as a temporary migration aid; sign your packs and remove the flag as soon as feasible. Env: `YUZU_ALLOW_UNSIGNED_PACKS`. |
 | `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
 
 ### Example
@@ -516,6 +517,60 @@ The server emits an audit event on every branch:
 > until the process is restarted against its on-disk config. To remove
 > the account you are signed in as, first create a second admin, log
 > out, log in as the second admin, and delete the original.
+
+---
+
+### Force-logging out a user (incident response)
+
+Use this when an account credential is suspected of compromise but the
+account itself should remain functional (the user reports a stolen
+laptop but still needs to keep working from a clean device, or a
+short-lived contractor's badge is being rotated).
+
+1. Navigate to **Settings > User Management**.
+2. Click **Revoke sessions** next to the target user.
+3. Confirm the blast-radius warning. The user's active dashboard
+   sessions end immediately; their account remains intact and they
+   can re-authenticate normally.
+
+The audit log records `session.revoke_all` with `target_id=<username>`,
+`target_type=User`, and `detail=count=<N>` where N is the number of
+in-memory cookie sessions wiped. The action is also surfaced on the
+`yuzu_auth_sessions_revoked_total{caller="admin",scope="cookies"}`
+Prometheus counter — a sustained spike there is the operator's
+automated alert for either a real incident response in progress or
+a misbehaving automation script.
+
+> **API tokens are not revoked by this flow.** Use it for a leaked
+> session cookie. If the user's API tokens are also implicated, either
+> revoke them individually via Settings → API Tokens or instruct the
+> user to click **Sign out everywhere** themselves (see below), which
+> revokes both cookies and tokens.
+
+> **Verify persistence after a partial failure.** If the response body
+> reports `db_persisted: false` (or the audit row shows `result=partial`
+> with `db_error=true`), the in-memory wipe succeeded but the
+> persisted `auth.db` rows survive. A server restart will resurrect
+> those sessions. Either retry the revoke after the DB lock clears, or
+> see `docs/ops-runbooks/auth-db-recovery.md` for emergency manual
+> revocation via the SQLite CLI.
+
+### Self-service "Sign out everywhere"
+
+Any user — not just admins — can wipe every credential bearing their
+identity by clicking the **Sign out everywhere** button on their own
+row in Settings → Users. Unlike the admin **Revoke sessions** button,
+this revokes BOTH cookie sessions AND every API token the user owns
+(the lost-laptop scenario must kill every credential, not just
+browser cookies). After the request the page redirects to `/login`
+and the response clears the session cookie via `Set-Cookie: Max-Age=0`.
+
+> **MCP-tier and service-scoped tokens cannot self-revoke.** Those
+> credential classes have no other write privilege; accepting a
+> self-revoke from one would create a novel DoS surface against the
+> human owner. The endpoint returns 403 and the audit row records
+> `session.revoke_all.self` with `result=denied`. Use the dashboard
+> from a password-authenticated session.
 
 ---
 

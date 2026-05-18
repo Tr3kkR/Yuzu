@@ -182,6 +182,15 @@ int main(int argc, char* argv[]) {
                  "/fragments/viz/fleet/topology); both return 503")
         ->envname("YUZU_VIZ_DISABLE");
 
+    // Product pack signature enforcement (#802 / W7.4)
+    app.add_flag("--allow-unsigned-packs", cfg.allow_unsigned_packs,
+                 "Accept product packs without an Ed25519 signature at install time. "
+                 "DANGEROUS — exposes the fleet to arbitrary instruction/plugin execution "
+                 "from any pack upload. Default off; set only for legacy environments that "
+                 "have not yet adopted signing. Emits a `server.unsigned_packs_allowed` "
+                 "audit event + startup warning when enabled.")
+        ->envname("YUZU_ALLOW_UNSIGNED_PACKS");
+
     // Batch token generation mode (runs and exits, no server startup)
     int generate_tokens = 0;
     std::string gen_label;

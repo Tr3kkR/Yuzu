@@ -136,7 +136,7 @@ Server and gateway defaults do not conflict — all three components can run on 
 The gateway's primary function is **command fanout** — relaying commands from the server to potentially millions of agents and aggregating responses. This requires three server flags:
 
 1. **`--gateway-upstream 0.0.0.0:50055`** — Enables the `GatewayUpstream` gRPC service so the gateway can proxy agent registrations and batch heartbeats to the server.
-2. **`--gateway-mode`** — Relaxes Subscribe stream peer-mismatch validation so gateway-proxied agents can receive commands (their Register and Subscribe peers are both the gateway's address, not the agent's).
+2. **`--gateway-mode`** — Subscribe stream peer-mismatch validation accepts the agent's Register peer IP (default rule) **OR** an IP previously recorded in the trusted-gateway peer set via `GatewayUpstreamServiceImpl::ProxyRegister` (W1.3 / #826). Entries are noted only on a successful enrollment branch and expire after 1h (LRU-capped at 1024 entries). Without `--gateway-mode` the trusted-set lookup is skipped — direct-connect agents only ever match their Register peer. Layered defence note: this rule scopes Subscribe to known gateway IPs but does NOT defend against a sniffed `session_id` presented from inside the gateway's IP space; the agent_id↔session binding from W1.4 (#827) is the layer that closes that.
 3. **`--gateway-command-addr localhost:50063`** — Points the server at the gateway's `ManagementService` for command forwarding. Without this, commands to gateway-connected agents are queued in `gw_pending_` but never forwarded. The server calls `SendCommand` (server-streaming RPC) on this address; the gateway fans out to agents and streams responses back.
 
 The dispatch flow in `agent_registry.cpp` `send_to()`:
@@ -366,6 +366,8 @@ gateway-safe wire payloads): same doc §24; PR ladder:
 ## Test conventions — shared helpers
 
 Use `yuzu::test::unique_temp_path(prefix)` / `yuzu::test::TempDbFile` from `tests/unit/test_helpers.hpp` for any test temp file or SQLite DB. **Never** salt uniqueness with `std::hash<std::thread::id>` or `std::chrono::steady_clock` — silent collisions under Defender-induced I/O serialisation on `yuzu-local-windows` (flake #473). Rationale and residual adoption: header comment + #482.
+
+For server tests that need a live `ExecutionTracker` wired into `AgentServiceImpl`, use the `TrackerScope` RAII helper in `tests/unit/server/test_agent_service_impl.cpp` — it opens a `:memory:` SQLite DB, constructs the tracker, calls `set_execution_tracker`, and nulls the borrowed pointer before the tracker destructs (matches the production shutdown contract at `agent_service_impl.hpp:113`). Pattern: `GatewayResponseHarness h; TrackerScope ts{h.svc}; auto exec_id = ts.make_exec();`. The `:memory:` choice deliberately sidesteps the `unique_temp_path` race for shutdown-ordered tests; promote to `test_helpers.hpp` once a second test file needs the pattern (tracked via the H-9 follow-up issue from PR #1068 governance).
 
 ## Agent skills
 
