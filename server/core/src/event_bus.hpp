@@ -65,13 +65,49 @@ private:
 
 // -- SSE sink state (per-connection, shared with content provider) -------------
 
+/// Default per-connection queue cap, used by routes that opt into slow-
+/// consumer protection. A slow / blackholed TCP consumer can otherwise
+/// grow `SseSinkState::queue` without bound (publisher runs synchronously
+/// under the bus channel mutex, listener enqueues, content provider may
+/// not drain for 3 s+ during `wait_for` waits). With ~hundreds of
+/// agentic clients per server, an unbounded queue is the primary memory
+/// growth risk on this path. 500 events is roughly half of
+/// `ExecutionEventBus::kBufferCap` — large enough to absorb a normal
+/// burst, small enough that a stalled consumer is dropped before any
+/// realistic OOM. governance round unhappy-R3 / sre-OBS-MED.
+inline constexpr std::size_t kPerConnectionQueueCapDefault = 500;
+
 struct SseSinkState {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<SseEvent> queue;
     std::atomic<bool> closed = false;
     std::size_t sub_id = 0;
+    /// Total events dropped from the per-connection queue (drop-oldest
+    /// on cap overflow). Routes that enforce a cap use this counter to
+    /// emit a synthetic `events-dropped` envelope on the next provider
+    /// invocation so the client knows a gap exists. Routes that do NOT
+    /// enforce a cap leave this at 0. Atomic so the listener
+    /// (publisher thread) and provider (httplib worker thread) can both
+    /// touch it without taking `mu`.
+    std::atomic<std::uint64_t> dropped_total{0};
 };
+
+/// Enqueue with drop-oldest cap. Routes that opt into slow-consumer
+/// protection call this from their bus listener instead of a raw
+/// `queue.push_back`. Lives next to `SseSinkState` so it's directly
+/// unit-testable; the `/api/v1/events` handler calls it via a capturing
+/// lambda. Holds the per-connection mutex, no condition_variable notify
+/// (the caller controls that — replay shouldn't wake the provider).
+inline void enqueue_capped(const std::shared_ptr<SseSinkState>& state, SseEvent ev,
+                           std::size_t cap = kPerConnectionQueueCapDefault) {
+    std::lock_guard<std::mutex> lk(state->mu);
+    while (state->queue.size() >= cap) {
+        state->queue.pop_front();
+        state->dropped_total.fetch_add(1, std::memory_order_relaxed);
+    }
+    state->queue.push_back(std::move(ev));
+}
 
 // -- SSE helpers --------------------------------------------------------------
 
@@ -94,7 +130,8 @@ inline std::string format_sse(const SseEvent& ev) {
             out += "data: ";
             out.append(d.substr(pos, (nl == std::string_view::npos ? d.size() : nl) - pos));
             out += '\n';
-            if (nl == std::string_view::npos) break;
+            if (nl == std::string_view::npos)
+                break;
             pos = nl + 1;
         }
     }
@@ -130,7 +167,8 @@ inline bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, siz
         constexpr size_t kMaxSlice = 8192;
         while (rem > 0) {
             auto n = std::min(rem, kMaxSlice);
-            if (!sink.write(p, n)) return false;
+            if (!sink.write(p, n))
+                return false;
             p += n;
             rem -= n;
         }

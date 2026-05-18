@@ -176,3 +176,31 @@ The A3 envelope shape and the A4 error envelope live in
 `server/core/src/rest_a4_envelope.hpp` as testable contracts — future
 discovery / MCP surfaces consuming the same bus reuse the helpers there
 rather than re-implementing the envelope.
+
+**Hardening invariants (sprint W5.1 R1):** the agentic handler exposes
+ring-buffer loss and per-connection backpressure to the client rather
+than letting them go silent.
+
+- **Replay-gap signal.** If the bus's ring buffer has already evicted
+  events with id ≤ `since_id`, the handler emits a synthetic
+  `replay-gap` envelope as the first frame
+  (`{execution_id, type:"replay-gap", missing_from, missing_to}`) so the
+  worker knows state may be inconsistent rather than silently observing
+  an `event_id` jump. Counted in
+  `yuzu_server_sse_api_replay_gap_total`. The dashboard sibling does
+  NOT emit this — adding it there is a follow-up.
+- **Per-connection queue cap.** `SseSinkState::queue` is bounded at
+  `kPerConnectionQueueCapDefault=500` (event_bus.hpp) with drop-oldest
+  semantics. Drops accumulate in `SseSinkState::dropped_total` and the
+  content provider emits one `events-dropped` envelope per batch on the
+  next wake, then resets the counter. The dashboard sibling does NOT
+  enforce a cap currently — same follow-up.
+- **Restart loss.** The bus is in-process and in-memory. On server
+  restart the buffer is empty; clients that reconnect with
+  `Last-Event-ID` after a restart will not receive events that occurred
+  before the restart regardless of the `since` value. Agentic workers
+  should fall back to `GET /api/v1/executions/<id>` for terminal state
+  recovery. This is the same characteristic the dashboard drawer
+  already lives with; it is documented here for agentic-client authors
+  who write reconnect logic against the executions ladder rather than
+  the dashboard's bootstrap path.

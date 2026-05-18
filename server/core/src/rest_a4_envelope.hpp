@@ -31,11 +31,16 @@ std::string make_correlation_id();
 /// A4-compliant error envelope. Per `docs/agentic-first-principle.md` §A4,
 /// every failure response includes `code`, `message`, `correlation_id`, an
 /// optional `remediation` hint, and the standard `meta.api_version`.
-/// `retry_after_ms` is reserved for backoff signalling — omitted here
-/// because W5.1's error sites have no rate-limit context to share; future
-/// callers add it via a new overload rather than passing a sentinel.
+/// `retry_after_ms` is the second overload — pass a non-zero value to
+/// advise the worker how long to back off before retrying (governance
+/// round consistency-MED-2). The two overloads coexist rather than a
+/// single sentinel-based signature so 0-as-sentinel ambiguity stays out
+/// of the contract.
 std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
                           std::string_view remediation = {});
+
+std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
+                          std::int64_t retry_after_ms, std::string_view remediation);
 
 /// JSON envelope emitted as the SSE `data:` payload on `/api/v1/events`.
 /// Per A3, every event carries `execution_id` and a deterministic step

@@ -24,6 +24,18 @@
 // W5.1 — `/api/v1/events` JSON SSE consumes the per-execution event bus.
 // Forward-declared to avoid pulling the bus header into every TU that
 // already includes rest_api_v1.hpp (test fixtures, server.cpp).
+//
+// **Lifetime contract:** the bus pointer threaded into `register_routes`
+// is BORROWED. The caller MUST keep the bus alive until every SSE
+// response has fully unwound. This is non-obvious because httplib runs
+// the resource-release closure on a worker thread AFTER the handler
+// returns — `bus->unsubscribe(...)` in that closure dereferences the
+// borrowed pointer. In production this holds because `ServerImpl`
+// declares `execution_event_bus_` BEFORE httplib::Server and the
+// shutdown path stops the server before resetting the bus
+// (`server.cpp:1712`). Any refactor that swaps that order, or any test
+// fixture that drops the bus before draining httplib, breaks the
+// contract. governance round security-guardian-LOW-3 / cpp-expert-M-1.
 namespace yuzu::server {
 class ExecutionEventBus;
 }

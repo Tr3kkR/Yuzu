@@ -87,7 +87,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [Responses](#responses)
   - [Tags (Legacy)](#tags-legacy)
   - [Analytics and NVD](#analytics-and-nvd)
-  - [SSE Event Stream](#sse-event-stream)
+  - [SSE Event Stream](#sse-event-stream) — includes `GET /events`, `GET /sse/executions/{id}`, and the agentic `GET /api/v1/events`
   - [Dashboard TAR](#dashboard-tar)
 - [MCP (Model Context Protocol)](#mcp-model-context-protocol)
 - [Authentication Endpoints](#authentication-endpoints)
@@ -1359,6 +1359,7 @@ Query audit events.
 | `user.delete` | Local account deleted. `result` ∈ {`success`, `denied`}. Denied detail values: `self_delete_blocked` (403), `invalid_username` (400), `user_not_found` (404). |
 | `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
 | `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result=success`. Emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
+| `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `quarantine.enable` | Device quarantined |
@@ -3883,6 +3884,144 @@ event: execution-completed
 id: 6
 data: {"status":"succeeded"}
 ```
+
+#### `GET /api/v1/events`
+
+Agentic-first JSON SSE channel introduced in sprint W5.1 (2026-05-18). This is the sibling of `/sse/executions/{id}` aimed at **external LLM-driven workers** (Claude, GPT, in-house) rather than a browser EventSource. Both routes subscribe to the same per-execution `ExecutionEventBus` and emit the same event taxonomy; the differences are:
+
+- **`/api/v1/events`** wraps every event in a structured JSON envelope so the worker can discriminate events without out-of-band context.
+- **A4 error envelope** on every 4xx/5xx — `correlation_id`, optional `retry_after_ms`, optional `remediation`.
+- **No fragment rendering** — pure machine-consumable JSON.
+
+The browser-oriented `/sse/executions/{id}` route is preserved for the dashboard drawer and is unchanged.
+
+**Permission:** `Execution:Read`.
+**Auth:** Bearer token, `X-Yuzu-Token` header, or session cookie. Same auth surface as every other `/api/v1/*` endpoint.
+
+**Required query parameter:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `execution_id` | string `[A-Za-z0-9_-]{1,128}` | Execution to subscribe to. Multi-execution / `?filter=execution_id:X\|agent_id:Y` syntax is sprint W5.2. |
+
+**Optional replay parameters:**
+
+| Parameter | Type | Description |
+|---|---|---|
+| `since` (query) | integer ≥ 0 | Replay events with `id > since`. Overrides `Last-Event-ID`. Non-integer values silently degrade to 0 (no replay) — mirrors the dashboard sibling. |
+| `Last-Event-ID` (header) | string | Browser EventSource auto-reconnect header. Used only when `?since` is absent. |
+
+**Event envelope (every `data:` line):**
+
+```json
+{
+  "execution_id": "exec-abc",
+  "event_id": 12,
+  "timestamp_ms": 1716000000000,
+  "type": "agent-transition",
+  "payload": {"agent_id": "a-1", "status": "success", "exit_code": 0}
+}
+```
+
+The `type` field is the canonical taxonomy: `agent-transition`, `execution-progress`, `execution-completed` (real bus events) plus three synthetic types the worker should handle:
+
+| Synthetic type | When emitted | Meaning |
+|---|---|---|
+| `heartbeat` | Every ≤3s of provider idle | Liveness check; `data:` is empty. Workers should ignore. |
+| `replay-gap` | First frame on reconnect if the ring buffer has evicted events with `id ≤ since` | Worker missed events `[missing_from..missing_to]` — state may be inconsistent. Payload: `{execution_id, type:"replay-gap", missing_from, missing_to}`. |
+| `events-dropped` | Per-connection queue cap (500) was exceeded | A burst of events was dropped from THIS connection (not the bus). Payload: `{execution_id, type:"events-dropped", dropped_count, reason}`. Reconnect with `?since=<last_id>` to re-read what was dropped (subject to the bus ring-buffer window). |
+
+**Status-code map and error envelope:**
+
+| HTTP | Body | Condition |
+|---|---|---|
+| 200 | SSE stream begins | Stream attached, events follow |
+| 400 | A4 envelope | Missing or malformed `execution_id` |
+| 401 | (auth layer) | No session / token |
+| 403 | (perm layer) | RBAC `Execution:Read` denied |
+| 404 | A4 envelope | Execution does not exist |
+| 410 | A4 envelope | Execution already terminal |
+| 503 | A4 envelope with `retry_after_ms:5000` | Tracker or event bus not initialised (server warmup window) |
+
+A4 envelope shape:
+
+```json
+{
+  "error": {
+    "code": 503,
+    "message": "event bus unavailable",
+    "correlation_id": "req-184c8a9012-7",
+    "retry_after_ms": 5000,
+    "remediation": "retry after server warmup; live events are unavailable until the bus is initialised"
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+**Response headers (always set on 200 and on most error responses):**
+
+| Header | Value | Purpose |
+|---|---|---|
+| `X-Correlation-Id` | `req-<hex-ms>-<hex-seq>` | Grep token tying the response to the audit row and server-side spdlog rows. Echoed inside the A4 envelope on errors. |
+| `Cache-Control` | `no-cache` | Prevents proxy / browser cache buffering. |
+| `X-Accel-Buffering` | `no` | Tells nginx and similar proxies not to buffer the SSE stream. |
+| `X-Content-Type-Options` | `nosniff` | Belt-and-braces against MIME sniffing. |
+| `Sec-Audit-Failed` | `true` (only when audit persist failed) | SOC 2 CC6.6 evidence contract: subscription proceeded even though the audit row failed to persist (matches the PR #883 / W1.1 partial-failure pattern). |
+
+**Audit:** every successful subscribe emits one `api.v1.events.subscribe` audit event (separate verb from the dashboard sibling's `execution.live_subscribe` so SIEM filters can distinguish browser vs agentic consumers). Per-session-per-execution dedup is **not** currently implemented (Deferred-5 / #700); a worker reconnecting frequently generates one row per reconnect.
+
+**Restart behaviour:** the bus is in-process and in-memory. On server restart, every `Last-Event-ID` is invalidated — replays against an event id assigned by a previous process instance return nothing even if the execution is still active. Workers should fall back to `GET /api/v1/executions/<id>` to recover terminal state after a 503 or a long disconnect.
+
+**Example (curl):**
+
+```bash
+curl -N \
+  -H "Authorization: Bearer $YUZU_TOKEN" \
+  -H "Accept: text/event-stream" \
+  "https://yuzu.example.com/api/v1/events?execution_id=exec-abc123"
+```
+
+**Example output (running execution, A3 envelopes):**
+
+```
+id: 1
+event: agent-transition
+data: {"execution_id":"exec-abc123","event_id":1,"timestamp_ms":1716000000000,"type":"agent-transition","payload":{"agent_id":"a-1","status":"running"}}
+
+id: 2
+event: agent-transition
+data: {"execution_id":"exec-abc123","event_id":2,"timestamp_ms":1716000002034,"type":"agent-transition","payload":{"agent_id":"a-1","status":"success","exit_code":0,"duration_ms":4218}}
+
+event: heartbeat
+data:
+
+id: 3
+event: execution-progress
+data: {"execution_id":"exec-abc123","event_id":3,"timestamp_ms":1716000005112,"type":"execution-progress","payload":{"total":2,"succeeded":1,"failed":0,"running":1,"pending":0}}
+
+id: 4
+event: execution-completed
+data: {"execution_id":"exec-abc123","event_id":4,"timestamp_ms":1716000010301,"type":"execution-completed","payload":{"status":"succeeded"}}
+```
+
+**Example output (late reconnect — replay-gap envelope):**
+
+```
+id: 41
+event: replay-gap
+data: {"execution_id":"exec-abc123","type":"replay-gap","missing_from":41,"missing_to":118}
+
+id: 119
+event: agent-transition
+data: {"execution_id":"exec-abc123","event_id":119,"timestamp_ms":...,"type":"agent-transition","payload":{...}}
+```
+
+**Known limitations (sprint W5.1 skeleton; tracked as follow-ups):**
+
+- No multi-execution / wildcard subscription — open one connection per execution, or wait for W5.2.
+- No per-principal connection cap — operators expecting >10 concurrent agentic subscriptions should size the httplib worker pool accordingly.
+- Replay/subscribe race window: a publish that arrives between the `replay_since` and `subscribe` calls is silently lost. A bus-side `subscribe_with_replay` is filed as a follow-up against both this route and the dashboard sibling.
+- The MCP `execute_instruction` tool currently returns `command_id`, not `execution_id`; an agentic flow that dispatches via MCP and observes via this endpoint needs to bridge the two (filed as a follow-up to add `execution_id` to the dispatch response).
 
 ---
 

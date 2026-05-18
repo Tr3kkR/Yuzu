@@ -18,13 +18,13 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdio>
-#include <ctime>
 #include <cstring>
+#include <ctime>
+#include <format>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -358,6 +358,37 @@ const std::string& openapi_spec() {
           "remediation_latency_us": {"type": "integer"},
           "timestamp": {"type": "string", "format": "date-time"}
         }
+      },
+      "ExecutionSseEvent": {
+        "type": "object",
+        "description": "JSON envelope emitted on every /api/v1/events SSE frame (sprint W5.1). Per agentic-first invariant A3, every event carries execution_id and a deterministic step name from the published taxonomy. The payload field raw-embeds the original publisher data; for malformed publisher payloads the helper substitutes null so the envelope stays a valid JSON object. Synthetic taxonomy members (`replay-gap`, `events-dropped`) flag client-relevant gaps without being real bus events.",
+        "required": ["execution_id", "event_id", "timestamp_ms", "type", "payload"],
+        "properties": {
+          "execution_id": {"type": "string"},
+          "event_id": {"type": "integer", "format": "int64", "description": "Monotonic per-execution; use on reconnect via Last-Event-ID header or ?since= query."},
+          "timestamp_ms": {"type": "integer", "format": "int64", "description": "Wall-clock epoch milliseconds."},
+          "type": {"type": "string", "enum": ["agent-transition", "execution-progress", "execution-completed", "replay-gap", "events-dropped", "heartbeat"]},
+          "payload": {"description": "Event-type-specific structured payload, or null for synthetic frames.", "nullable": true}
+        }
+      },
+      "A4ErrorEnvelope": {
+        "type": "object",
+        "description": "Agentic-first error envelope (sprint W5.1; A4 invariant in docs/agentic-first-principle.md). Used by /api/v1/events on every 4xx/5xx response and reserved for future A4-backfill of other /api/v1/* endpoints.",
+        "required": ["error", "meta"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message", "correlation_id"],
+            "properties": {
+              "code": {"type": "integer", "description": "HTTP status code echoed into the body for self-describing error frames."},
+              "message": {"type": "string", "description": "One-sentence human-readable summary."},
+              "correlation_id": {"type": "string", "description": "Server-issued grep token of form `req-<hex-ms>-<hex-seq>`. Also echoed in the X-Correlation-Id response header and (when audit emits) the audit row detail field."},
+              "retry_after_ms": {"type": "integer", "format": "int64", "description": "Optional. Advises the worker to back off this many milliseconds before retrying. Currently emitted on 503 (warmup) only."},
+              "remediation": {"type": "string", "description": "Optional natural-language hint for self-recovery."}
+            }
+          },
+          "meta": {"type": "object", "properties": {"api_version": {"type": "string"}}}
+        }
       }
     }
   },
@@ -496,7 +527,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
     },
     "/events": {
-      "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Requires Execution:Read. Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus `heartbeat`), and a JSON `data:` envelope of shape `{execution_id, event_id, timestamp_ms, type, payload}`. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). Errors use the A4 envelope: `{error:{code,message,correlation_id,remediation?},meta:{api_version:\"v1\"}}`.", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream.", "content": {"text/event-stream": {}}}, "400": {"description": "Missing or malformed execution_id"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found"}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available"}, "503": {"description": "Tracker or event bus not initialised"}}}
+      "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Requires Execution:Read. Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus the synthetic `replay-gap` / `events-dropped` / `heartbeat`), and a JSON `data:` payload conforming to ExecutionSseEvent. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). Non-integer `?since` values silently degrade to 0 (no replay). On reconnect after the per-execution ring buffer has evicted older events (FIFO, ~1000 events / ~30s window), a synthetic `replay-gap` frame is emitted as the first event so the worker knows state may be inconsistent. A slow consumer that lets the per-connection queue fill receives a synthetic `events-dropped` envelope summarising the drop count rather than silent OOM growth. Errors use the A4 envelope (ErrorEnvelope schema). Response headers always include X-Correlation-Id; Sec-Audit-Failed: true is set when audit persistence fails (CC6.6 contract).", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header. Non-integer values silently degrade to 0."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream. Each `data:` line is an ExecutionSseEvent.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when audit row persistence failed; subscription still proceeds (CC6.6 evidence chain)."}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/ExecutionSseEvent"}}}}, "400": {"description": "Missing or malformed execution_id", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Tracker or event bus not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     }
   }
 })json";
@@ -595,10 +626,10 @@ std::string make_correlation_id() {
     auto t = std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::system_clock::now().time_since_epoch())
                  .count();
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "req-%llx-%llx", static_cast<unsigned long long>(t),
-                  static_cast<unsigned long long>(n));
-    return std::string(buf);
+    // std::format keeps the buffer-size reasoning out of the call site;
+    // the surrounding file already uses std::format for the JObj double
+    // path. governance round cpp-expert L-1.
+    return std::format("req-{:x}-{:x}", static_cast<std::uint64_t>(t), n);
 }
 
 std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
@@ -611,14 +642,40 @@ std::string error_json_a4(int code, std::string_view message, std::string_view c
     return JObj().raw("error", err.str()).raw("meta", R"({"api_version":"v1"})").str();
 }
 
+std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
+                          std::int64_t retry_after_ms, std::string_view remediation) {
+    auto err = JObj()
+                   .add("code", code)
+                   .add("message", message)
+                   .add("correlation_id", correlation_id)
+                   .add("retry_after_ms", retry_after_ms);
+    if (!remediation.empty()) {
+        err.add("remediation", remediation);
+    }
+    return JObj().raw("error", err.str()).raw("meta", R"({"api_version":"v1"})").str();
+}
+
 std::string make_event_envelope(std::string_view execution_id,
                                 const yuzu::server::ExecutionEvent& ev) {
+    // Defensive validation — the contract is that publishers (the
+    // ExecutionTracker mutators per ladder doc §"Publisher invariant")
+    // emit well-formed JSON in `ev.data`. If a future publisher ever
+    // shoves a non-JSON payload (e.g. a partial chunk after a kill-9),
+    // raw-embedding it would silently produce a malformed envelope.
+    // `nlohmann::json::accept` is a parse-only validator (microseconds-
+    // cheap, no value-construction). On failure, substitute `null` so
+    // the envelope stays a valid JSON object and the agentic worker
+    // sees a non-fatal event with payload=null rather than a
+    // protocol-level crash. governance round cpp-expert M-2.
+    const std::string_view payload = ev.data.empty() || !nlohmann::json::accept(ev.data)
+                                         ? std::string_view("null")
+                                         : std::string_view(ev.data);
     return JObj()
         .add("execution_id", execution_id)
         .add("event_id", static_cast<int64_t>(ev.id))
         .add("timestamp_ms", ev.timestamp_ms)
         .add("type", ev.event_type)
-        .raw("payload", ev.data.empty() ? std::string_view("null") : std::string_view(ev.data))
+        .raw("payload", payload)
         .str();
 }
 
@@ -3682,14 +3739,45 @@ void RestApiV1::register_routes(
     //     `?filter=...` syntax is W5.2.
     //   * Reuses `ExecutionEventBus` (per ladder doc — no new bus).
     //   * Replays via `Last-Event-ID` header OR `?since=<id>` query
-    //     param (query wins). Replay BEFORE subscribe, both under the
-    //     channel mutex to keep ordering consistent with concurrent
-    //     publishers.
+    //     param (query wins). Bad input degrades to 0 (no replay)
+    //     rather than 400, matching the dashboard sibling.
+    //   * Per-connection queue cap (`kPerConnectionQueueCapDefault`)
+    //     with drop-oldest — a slow / blackholed consumer cannot grow
+    //     the queue without bound. Drops are surfaced to the client
+    //     via a synthetic `events-dropped` envelope on the next
+    //     provider invocation, and counted in
+    //     `yuzu_server_sse_api_queue_overflow_total{route="events"}`.
+    //   * Replay-gap detection: if the bus's ring buffer has already
+    //     evicted events with id ≤ since_id, emit a synthetic
+    //     `replay-gap` envelope as the first frame so the agentic
+    //     worker knows state may be inconsistent rather than silently
+    //     receiving a partial history.
     //   * A4 envelope on all 4xx/5xx: `{error:{code,message,
-    //     correlation_id,[remediation]},meta:{api_version:"v1"}}`.
+    //     correlation_id,[retry_after_ms],[remediation]},
+    //     meta:{api_version:"v1"}}`. 503 sites carry retry_after_ms.
     //   * Audit `api.v1.events.subscribe` on each successful connect
     //     (no per-session dedup — same Deferred-5 / #700 deferral as
     //     the dashboard's `/sse/executions/{id}`).
+    //   * Post-auth denial branches (404/410/503) emit a
+    //     `spdlog::warn` row with the correlation id and the
+    //     authenticated principal so operators can reconstruct what
+    //     happened without the client surfacing the cid (compliance
+    //     F-2 / `docs/observability-conventions.md`).
+    //   * Endpoint-scoped Prometheus metrics:
+    //     `yuzu_server_sse_api_subscriptions_total` (counter),
+    //     `yuzu_server_sse_api_active` (gauge),
+    //     `yuzu_server_sse_api_queue_overflow_total` (counter),
+    //     `yuzu_server_sse_api_replay_gap_total` (counter).
+    //
+    // **Known race window (governance unhappy-R10 + tracked as a
+    // follow-up issue against `ExecutionEventBus`):** `replay_since`
+    // and `subscribe` run under separate locks. A publish that fires
+    // between the two is neither replayed (it post-dates the buffer
+    // snapshot) nor delivered live (the listener is not yet
+    // installed). The fix is bus-side — an atomic
+    // `subscribe_with_replay` API that holds the channel mutex across
+    // both — and benefits the dashboard sibling identically, so it is
+    // filed as a single follow-up rather than fixed inline.
     //
     // Parity with the dashboard sibling at `workflow_routes.cpp` —
     // both consume the same per-execution channel from
@@ -3701,8 +3789,9 @@ void RestApiV1::register_routes(
     // agentic worker subscribed to one channel can still discriminate
     // events; the dashboard sibling emits raw `ev.data` because the
     // browser already knows the channel from the URL path.
-    sink.Get("/api/v1/events", [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus](
-                                   const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/api/v1/events", [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus,
+                                metrics_registry](const httplib::Request& req,
+                                                  httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session) {
             // auth_fn already set 401 + body. Nothing to do.
@@ -3713,9 +3802,9 @@ void RestApiV1::register_routes(
             return;
         }
 
-        // A4 correlation id binds every error/audit row on this
-        // request to a single grep token. Generated once up-front
-        // so 4xx branches and the (future) audit row share it.
+        // A4 correlation id binds every error / audit row / spdlog
+        // line on this request to a single grep token. Generated
+        // once up-front so 4xx branches and the audit row share it.
         const auto cid = detail::make_correlation_id();
 
         // execution_id is mandatory for the W5.1 skeleton — see
@@ -3745,20 +3834,36 @@ void RestApiV1::register_routes(
         }
 
         if (!execution_tracker) {
+            spdlog::warn("api.v1.events.subscribe denied: tracker unavailable cid={} principal={}",
+                         cid, session->username);
             res.status = 503;
-            res.set_content(detail::error_json_a4(503, "execution tracker unavailable", cid),
-                            "application/json");
+            res.set_content(
+                detail::error_json_a4(503, "execution tracker unavailable", cid,
+                                      /*retry_after_ms=*/5000,
+                                      "retry after server warmup; tracker initialises during "
+                                      "startup or after a config reload"),
+                "application/json");
             return;
         }
         if (!execution_event_bus) {
+            spdlog::warn(
+                "api.v1.events.subscribe denied: event_bus unavailable cid={} principal={}", cid,
+                session->username);
             res.status = 503;
-            res.set_content(detail::error_json_a4(503, "event bus unavailable", cid),
-                            "application/json");
+            res.set_content(
+                detail::error_json_a4(503, "event bus unavailable", cid,
+                                      /*retry_after_ms=*/5000,
+                                      "retry after server warmup; live events are unavailable "
+                                      "until the bus is initialised"),
+                "application/json");
             return;
         }
 
         auto exec_opt = execution_tracker->get_execution(exec_id);
         if (!exec_opt) {
+            spdlog::warn("api.v1.events.subscribe denied: unknown execution cid={} "
+                         "principal={} exec_id={}",
+                         cid, session->username, exec_id);
             res.status = 404;
             res.set_content(detail::error_json_a4(404, "execution not found", cid),
                             "application/json");
@@ -3770,6 +3875,9 @@ void RestApiV1::register_routes(
         // envelope here, plaintext there).
         const auto& exec = *exec_opt;
         if (exec.status != "running" && exec.status != "pending") {
+            spdlog::warn("api.v1.events.subscribe denied: execution terminal cid={} "
+                         "principal={} exec_id={} status={}",
+                         cid, session->username, exec_id, exec.status);
             res.status = 410;
             res.set_content(detail::error_json_a4(
                                 410, "execution complete; subscribe-time replay unavailable", cid,
@@ -3795,6 +3903,11 @@ void RestApiV1::register_routes(
         res.set_header("X-Correlation-Id", cid);
         res.set_header("Cache-Control", "no-cache");
         res.set_header("X-Accel-Buffering", "no");
+        // Belt-and-braces against MIME sniffing on intermediary
+        // proxies / browsers that strip the explicit
+        // text/event-stream content type. governance round
+        // security-guardian LOW-2.
+        res.set_header("X-Content-Type-Options", "nosniff");
 
         // Replay window. `since` query param overrides
         // `Last-Event-ID` header — explicit operator intent beats
@@ -3815,25 +3928,81 @@ void RestApiV1::register_routes(
             }
         }
 
+        // Endpoint-scoped metric: subscription count.
+        // Incremented BEFORE subscribe to avoid a race where a
+        // listener fires and modifies the gauge before this line
+        // runs.
+        if (metrics_registry) {
+            metrics_registry
+                ->counter("yuzu_server_sse_api_subscriptions_total", {{"route", "events"}})
+                .increment();
+            metrics_registry->gauge("yuzu_server_sse_api_active", {{"route", "events"}})
+                .increment();
+        }
+
         auto sink_state = std::make_shared<detail::SseSinkState>();
-        // Replay before subscribe — both push onto the same queue
-        // under the connection's mutex, so live events emitted
-        // during the replay walk arrive after the replayed events
-        // (per the bus's channel mutex) and ahead of the first
-        // wait_for in the content provider.
+        // Replay-gap detection: peek the ring buffer's lowest id.
+        // If the buffer's oldest id is greater than `since_id + 1`,
+        // events have been evicted (FIFO drop at
+        // `kBufferCap=1000`) and the client's replay will be
+        // incomplete. Emit a synthetic `replay-gap` envelope as the
+        // first frame so the worker knows state may be inconsistent
+        // rather than silently observing an `event_id` jump it
+        // cannot distinguish from "not yet emitted". governance
+        // round unhappy-R1 / R2.
+        //
+        // The snapshot is taken BEFORE replay_since walks the
+        // buffer — `snapshot()` already serialises on the channel
+        // mutex, so the lowest id we observe is a valid lower
+        // bound. A concurrent publish can widen the buffer at the
+        // top but cannot reduce the bottom (FIFO eviction only
+        // runs when buffer.size() > kBufferCap).
+        if (since_id > 0) {
+            auto snap = execution_event_bus->snapshot(exec_id);
+            if (!snap.empty() && snap.front().id > since_id + 1) {
+                detail::SseEvent gap_sse;
+                gap_sse.event_type = "replay-gap";
+                auto gap_payload = JObj()
+                                       .add("execution_id", exec_id)
+                                       .add("type", "replay-gap")
+                                       .add("missing_from", static_cast<int64_t>(since_id + 1))
+                                       .add("missing_to", static_cast<int64_t>(snap.front().id - 1))
+                                       .str();
+                // Use a synthetic id of `since_id + 1` so the
+                // client's Last-Event-ID after reconnect doesn't
+                // confuse the gap event with a real bus event.
+                gap_sse.data = std::to_string(since_id + 1) + "\n" + gap_payload;
+                sink_state->queue.push_back(std::move(gap_sse));
+                if (metrics_registry) {
+                    metrics_registry
+                        ->counter("yuzu_server_sse_api_replay_gap_total", {{"route", "events"}})
+                        .increment();
+                }
+            }
+        }
+
+        // Replay then subscribe. Note: a `publish` arriving
+        // between the two calls is NOT delivered to this
+        // connection — it post-dates the replay walk but
+        // pre-dates the listener attach. See the per-route
+        // header block above; bus-level fix is tracked as a
+        // follow-up.
         std::string exec_id_for_capture = exec_id;
+        // Cap enforcement lives in `detail::enqueue_capped`
+        // (event_bus.hpp) so it's unit-testable without driving
+        // the handler. Both the replay walker and the live
+        // subscriber go through it.
         execution_event_bus->replay_since(
             exec_id, since_id, [sink_state, exec_id_for_capture](const ExecutionEvent& ev) {
                 detail::SseEvent sse;
                 sse.event_type = ev.event_type;
                 // Frame the per-bus event into <id>\n<JSON
-                // envelope> so the content provider can split
-                // and emit `id:` + `event:` + `data:` lines
-                // without re-touching the bus.
+                // envelope> so the content provider can split and
+                // emit `id:` + `event:` + `data:` lines without
+                // re-touching the bus.
                 sse.data = std::to_string(ev.id) + "\n" +
                            detail::make_event_envelope(exec_id_for_capture, ev);
-                std::lock_guard<std::mutex> lk(sink_state->mu);
-                sink_state->queue.push_back(std::move(sse));
+                detail::enqueue_capped(sink_state, std::move(sse));
             });
 
         auto* bus = execution_event_bus;
@@ -3843,22 +4012,49 @@ void RestApiV1::register_routes(
                 sse.event_type = ev.event_type;
                 sse.data = std::to_string(ev.id) + "\n" +
                            detail::make_event_envelope(exec_id_for_capture, ev);
-                {
-                    std::lock_guard<std::mutex> lk(sink_state->mu);
-                    sink_state->queue.push_back(std::move(sse));
-                }
+                detail::enqueue_capped(sink_state, std::move(sse));
                 sink_state->cv.notify_one();
             });
 
         res.set_chunked_content_provider(
             "text/event-stream",
-            [sink_state](size_t /*offset*/, httplib::DataSink& s) -> bool {
+            [sink_state, exec_id_for_capture, metrics_registry](size_t /*offset*/,
+                                                                httplib::DataSink& s) -> bool {
                 std::unique_lock<std::mutex> lk(sink_state->mu);
                 sink_state->cv.wait_for(lk, std::chrono::seconds(3), [&] {
                     return !sink_state->queue.empty() || sink_state->closed.load();
                 });
                 if (sink_state->closed.load())
                     return false;
+
+                // Dropped-events synthetic envelope. Read the
+                // current dropped total under the queue mutex so
+                // the report is consistent with the queue state
+                // the provider is about to drain. Emit ONCE per
+                // batch of drops (we snapshot, then zero the
+                // counter atomically with the report) so a worker
+                // that disconnects mid-burst doesn't see the
+                // same drop reported on the next reconnect.
+                auto dropped_now = sink_state->dropped_total.exchange(0);
+                if (dropped_now > 0) {
+                    if (metrics_registry) {
+                        metrics_registry
+                            ->counter("yuzu_server_sse_api_queue_overflow_total",
+                                      {{"route", "events"}})
+                            .increment(static_cast<double>(dropped_now));
+                    }
+                    auto dropped_payload =
+                        JObj()
+                            .add("execution_id", exec_id_for_capture)
+                            .add("type", "events-dropped")
+                            .add("dropped_count", static_cast<int64_t>(dropped_now))
+                            .add("reason", "per-connection queue cap exceeded")
+                            .str();
+                    std::string out = "event: events-dropped\ndata: " + dropped_payload + "\n\n";
+                    if (!s.write(out.data(), out.size()))
+                        return false;
+                }
+
                 while (!sink_state->queue.empty()) {
                     auto ev = std::move(sink_state->queue.front());
                     sink_state->queue.pop_front();
@@ -3892,16 +4088,24 @@ void RestApiV1::register_routes(
                 // Heartbeat keeps the connection above httplib's
                 // 5s Keep-Alive timeout and confirms liveness to
                 // intermediary proxies. Same cadence as the
-                // dashboard sibling.
+                // dashboard sibling. Note: emitted on every
+                // provider invocation, not strictly every 3s —
+                // a burst of events flushes them then immediately
+                // writes the heartbeat. Agentic workers must
+                // tolerate sub-3s heartbeats.
                 static const char* keepalive = "event: heartbeat\ndata: \n\n";
                 if (!s.write(keepalive, std::strlen(keepalive)))
                     return false;
                 return true;
             },
-            [sink_state, bus, exec_id_for_capture](bool /*success*/) {
+            [sink_state, bus, exec_id_for_capture, metrics_registry](bool /*success*/) {
                 sink_state->closed.store(true);
                 sink_state->cv.notify_all();
                 bus->unsubscribe(exec_id_for_capture, sink_state->sub_id);
+                if (metrics_registry) {
+                    metrics_registry->gauge("yuzu_server_sse_api_active", {{"route", "events"}})
+                        .decrement();
+                }
             });
     });
 
