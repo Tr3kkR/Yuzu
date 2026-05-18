@@ -30,12 +30,19 @@
 // response has fully unwound. This is non-obvious because httplib runs
 // the resource-release closure on a worker thread AFTER the handler
 // returns — `bus->unsubscribe(...)` in that closure dereferences the
-// borrowed pointer. In production this holds because `ServerImpl`
-// declares `execution_event_bus_` BEFORE httplib::Server and the
-// shutdown path stops the server before resetting the bus
-// (`server.cpp:1712`). Any refactor that swaps that order, or any test
-// fixture that drops the bus before draining httplib, breaks the
-// contract. governance round security-guardian-LOW-3 / cpp-expert-M-1.
+// borrowed pointer. In production this holds because `ServerImpl::stop()`
+// joins the httplib worker pool (`web_server_->stop()` +
+// `web_thread_.join()` at `server.cpp:1664-1668`) BEFORE resetting the
+// bus (`execution_event_bus_.reset()` at `server.cpp:1712`). Note that
+// member-declaration order does NOT enforce this — `web_server_` is
+// declared before `execution_event_bus_` (`server.cpp:6206` vs `:6247`),
+// so destructor-only ordering would tear down the bus FIRST. The
+// explicit shutdown sequence is the load-bearing invariant. Any test
+// fixture that drops the bus before draining httplib breaks the
+// contract, as would removing the explicit `stop()` call. governance
+// round R1 security-LOW-3 / cpp-expert-M-1; R2 cpp-expert noted the
+// declaration-order inaccuracy and the doc was corrected to cite the
+// explicit shutdown sequence.
 namespace yuzu::server {
 class ExecutionEventBus;
 }

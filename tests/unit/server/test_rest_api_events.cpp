@@ -594,24 +594,46 @@ TEST_CASE("GET /api/v1/events: Last-Event-ID header drives replay when ?since ab
     auto exec_id = h.make_exec("running");
     h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"a1"})", false);
     h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"a2"})", false);
-    // TestRouteSink::dispatch lets us inject arbitrary request headers
-    // via a synthesized httplib::Request. The Last-Event-ID semantic
-    // mirrors the dashboard sibling — a browser EventSource sends this
-    // header on auto-reconnect.
-    httplib::Request req;
-    req.method = "GET";
-    req.path = "/api/v1/events";
-    req.params.emplace("execution_id", exec_id);
-    req.set_header("Last-Event-ID", "1");
-    auto res = h.sink.dispatch("GET", "/api/v1/events?execution_id=" + exec_id);
-    // Re-issue with header — TestRouteSink::Get convenience overload
-    // does not let us set headers, so use dispatch via a second call.
+    h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"a3"})", false);
+
+    // The Last-Event-ID semantic mirrors the dashboard sibling — a
+    // browser EventSource sends this header on auto-reconnect. R2
+    // governance fix for happy-path G1: the prior test built a local
+    // httplib::Request, set the header, then discarded it via the
+    // headerless dispatch() — handler never saw the header. The
+    // TestRouteSink::Get headers overload (also added in R2) injects
+    // the header into the synthesized request the handler actually
+    // sees.
+    auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id, {{"Last-Event-ID", "2"}});
     REQUIRE(res);
     REQUIRE(res->status == 200);
     REQUIRE(h.event_bus->subscriber_count(exec_id) == 1);
-    // Bus still has the two published events (replay is read-only).
+    // Bus still has all three published events (replay is read-only).
     auto snap = h.event_bus->snapshot(exec_id);
-    REQUIRE(snap.size() == 2);
+    REQUIRE(snap.size() == 3);
+}
+
+TEST_CASE("GET /api/v1/events: ?since query takes precedence over Last-Event-ID header (with "
+          "header injected)",
+          "[events][replay]") {
+    // Paired with the existing `?since` precedence test — that one
+    // proves `?since` alone works; this one proves `?since` WINS when
+    // a conflicting Last-Event-ID is present in the request. G1
+    // remediation: with the headers-overload now wired through to the
+    // handler, we can finally exercise the precedence contract end-
+    // to-end. The handler short-circuits on `req.has_param("since")`
+    // and never reads the header. The bus snapshot + subscriber
+    // count after dispatch confirm the handler reached the success
+    // path with both signals present.
+    RestEventsHarness h;
+    auto exec_id = h.make_exec("running");
+    h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"a1"})", false);
+    h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"a2"})", false);
+    auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id + "&since=0",
+                          {{"Last-Event-ID", "99"}});
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(h.event_bus->subscriber_count(exec_id) == 1);
 }
 
 TEST_CASE("GET /api/v1/events: ?since query takes precedence over Last-Event-ID header",
@@ -631,6 +653,72 @@ TEST_CASE("GET /api/v1/events: ?since query takes precedence over Last-Event-ID 
 }
 
 // ── Per-connection queue cap (drop-oldest) ──────────────────────────────────
+
+TEST_CASE("detail::SseSinkState: pre_emit survives queue cap overflow",
+          "[events][cap][replay][gap]") {
+    // Regression test for unhappy-NEW-1 HIGH: when R1 hardening
+    // queued the synthetic replay-gap envelope onto the bounded
+    // `queue`, a publisher burst that triggered drop-oldest would
+    // silently evict the gap envelope — restoring the gap-blindness
+    // the synthetic was meant to fix. R2 hardening moved the
+    // synthetic to a dedicated `pre_emit` slot that lives outside the
+    // bounded queue. This test proves the pre_emit slot is not
+    // affected by `enqueue_capped` activity.
+    auto state = std::make_shared<detail::SseSinkState>();
+    detail::SseEvent gap;
+    gap.event_type = "replay-gap";
+    gap.data = "1\n{\"type\":\"replay-gap\",\"missing_from\":1,\"missing_to\":5}";
+    {
+        std::lock_guard<std::mutex> lk(state->mu);
+        state->pre_emit = std::move(gap);
+    }
+    // Pound the queue past its cap to mimic a publisher burst that
+    // forces drop-oldest. Each push goes through enqueue_capped,
+    // which drops the oldest queue entry when full — but NEVER
+    // touches `pre_emit`.
+    constexpr std::size_t kBurst = 800; // > default cap of 500
+    for (std::size_t i = 0; i < kBurst; ++i) {
+        detail::SseEvent ev;
+        ev.event_type = "agent-transition";
+        ev.data = std::to_string(i);
+        detail::enqueue_capped(state, std::move(ev));
+    }
+    // Queue is at cap, drops occurred; pre_emit is intact.
+    REQUIRE(state->queue.size() == detail::kPerConnectionQueueCapDefault);
+    REQUIRE(state->dropped_total.load() == kBurst - detail::kPerConnectionQueueCapDefault);
+    REQUIRE(state->pre_emit.has_value());
+
+    // Provider-side: take_pre_emit() atomically empties the slot.
+    auto taken = state->take_pre_emit();
+    REQUIRE(taken.has_value());
+    REQUIRE(taken->event_type == "replay-gap");
+    REQUIRE_FALSE(state->pre_emit.has_value());
+
+    // Second call returns nullopt (sticky-once contract).
+    auto taken_again = state->take_pre_emit();
+    REQUIRE_FALSE(taken_again.has_value());
+}
+
+TEST_CASE("make_event_envelope: payload over kEventPayloadSizeCap becomes JSON null",
+          "[events][envelope][a3][cap]") {
+    // R2 governance fix for unhappy-NEW-6: agent-sourced fields like
+    // AgentExecStatus::error_detail can in principle be megabytes,
+    // and make_event_envelope runs nlohmann::json::accept on every
+    // fanout × N subscribers. Cap at 64KiB and substitute null on
+    // oversize so the envelope shape stays valid and the per-event
+    // cost stays bounded.
+    yuzu::server::ExecutionEvent ev;
+    ev.id = 99;
+    ev.timestamp_ms = 0;
+    ev.event_type = "agent-transition";
+    // Build a valid JSON object that exceeds the cap.
+    std::string huge_value(70 * 1024, 'x');
+    ev.data = std::string("{\"v\":\"") + huge_value + std::string("\"}");
+    REQUIRE(ev.data.size() > 64 * 1024);
+    auto env = detail::make_event_envelope("exec-OVER", ev);
+    REQUIRE(env.find(R"("payload":null)") != std::string::npos);
+    REQUIRE(env.find(huge_value) == std::string::npos);
+}
 
 TEST_CASE("detail::enqueue_capped: drops oldest on cap overflow + bumps dropped_total",
           "[events][cap]") {

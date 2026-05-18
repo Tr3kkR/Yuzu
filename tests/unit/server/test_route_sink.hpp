@@ -19,6 +19,7 @@
 #include <memory>
 #include <regex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -26,11 +27,11 @@ namespace yuzu::server::test {
 
 class TestRouteSink : public yuzu::server::HttpRouteSink {
 public:
-    void Get(const std::string& p, Handler h) override     { add("GET",     p, std::move(h)); }
-    void Post(const std::string& p, Handler h) override    { add("POST",    p, std::move(h)); }
-    void Put(const std::string& p, Handler h) override     { add("PUT",     p, std::move(h)); }
-    void Delete(const std::string& p, Handler h) override  { add("DELETE",  p, std::move(h)); }
-    void Patch(const std::string& p, Handler h) override   { add("PATCH",   p, std::move(h)); }
+    void Get(const std::string& p, Handler h) override { add("GET", p, std::move(h)); }
+    void Post(const std::string& p, Handler h) override { add("POST", p, std::move(h)); }
+    void Put(const std::string& p, Handler h) override { add("PUT", p, std::move(h)); }
+    void Delete(const std::string& p, Handler h) override { add("DELETE", p, std::move(h)); }
+    void Patch(const std::string& p, Handler h) override { add("PATCH", p, std::move(h)); }
     void Options(const std::string& p, Handler h) override { add("OPTIONS", p, std::move(h)); }
 
     /// Dispatch a synthesized request. Returns nullptr when no route matches
@@ -40,10 +41,17 @@ public:
     /// Pre-sets res->status = 200 so handlers that don't touch status look
     /// the same as production (httplib::Server defaults completed handlers
     /// to 200). Handlers that explicitly set 401/204/403/etc. still win.
-    std::unique_ptr<httplib::Response> dispatch(const std::string& method,
-                                                 const std::string& path,
-                                                 const std::string& body = {},
-                                                 const std::string& content_type = "application/json") {
+    ///
+    /// `extra_headers` injects request headers (e.g. `Last-Event-ID`,
+    /// `Authorization`) so tests can exercise header-driven code paths.
+    /// W5.1 R2 governance fix — happy-path G1 caught that the prior
+    /// signature accepted no headers map, so a test setting
+    /// `Last-Event-ID` on a local Request and then calling dispatch
+    /// silently dropped the header and the handler never saw it.
+    std::unique_ptr<httplib::Response>
+    dispatch(const std::string& method, const std::string& path, const std::string& body = {},
+             const std::string& content_type = "application/json",
+             const std::unordered_map<std::string, std::string>& extra_headers = {}) {
         // httplib::Server splits the request URI into path + query string
         // before routing, so handlers see `req.path` without the `?...` tail
         // and `req.params` populated from the query. Mirror that here so
@@ -56,9 +64,11 @@ public:
         }
 
         for (auto& route : routes_) {
-            if (route.method != method) continue;
+            if (route.method != method)
+                continue;
             std::smatch m;
-            if (!std::regex_match(match_path, m, route.regex)) continue;
+            if (!std::regex_match(match_path, m, route.regex))
+                continue;
 
             httplib::Request req;
             req.method = method;
@@ -68,6 +78,12 @@ public:
                 httplib::detail::parse_query_text(query_text, req.params);
             if (!content_type.empty())
                 req.set_header("Content-Type", content_type);
+            // Inject test-supplied headers. Done AFTER Content-Type so a
+            // test that explicitly overrides Content-Type via the map
+            // wins (rare, but a valid scenario).
+            for (const auto& [name, value] : extra_headers) {
+                req.set_header(name, value);
+            }
             // httplib populates `matches` with the regex capture groups so
             // handlers can extract :path-params via req.matches[1] etc.
             // httplib::Match is a typedef for std::match_results — assign
@@ -83,16 +99,19 @@ public:
     }
 
     /// Convenience wrappers for common verbs.
-    auto Get(const std::string& path)
-        { return dispatch("GET", path); }
+    auto Get(const std::string& path) { return dispatch("GET", path); }
+    auto Get(const std::string& path, const std::unordered_map<std::string, std::string>& headers) {
+        return dispatch("GET", path, {}, "application/json", headers);
+    }
     auto Post(const std::string& path, const std::string& body,
-              const std::string& ct = "application/json")
-        { return dispatch("POST", path, body, ct); }
+              const std::string& ct = "application/json") {
+        return dispatch("POST", path, body, ct);
+    }
     auto Put(const std::string& path, const std::string& body,
-             const std::string& ct = "application/json")
-        { return dispatch("PUT", path, body, ct); }
-    auto Delete(const std::string& path)
-        { return dispatch("DELETE", path); }
+             const std::string& ct = "application/json") {
+        return dispatch("PUT", path, body, ct);
+    }
+    auto Delete(const std::string& path) { return dispatch("DELETE", path); }
 
     /// Number of registered routes — handy for assertions in fixture setup.
     std::size_t route_count() const { return routes_.size(); }

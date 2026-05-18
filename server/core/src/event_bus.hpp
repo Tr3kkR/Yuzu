@@ -9,6 +9,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -91,6 +92,31 @@ struct SseSinkState {
     /// (publisher thread) and provider (httplib worker thread) can both
     /// touch it without taking `mu`.
     std::atomic<std::uint64_t> dropped_total{0};
+    /// Sticky pre-emit slot for a synthetic envelope that MUST reach the
+    /// client even under per-connection-queue overflow. Routes set this
+    /// during handler setup; the content provider drains it on first
+    /// invocation BEFORE the bounded `queue` drain so the synthetic is
+    /// never subject to `enqueue_capped`'s drop-oldest eviction. Set
+    /// once per connection (or never); `take_pre_emit()` empties the
+    /// slot atomically and returns it. governance R2 fix for unhappy
+    /// R1-regression — the W5.1 R1 hardening originally pushed the
+    /// replay-gap envelope onto `queue`, where a fast publisher could
+    /// trigger drop-oldest before the provider emitted the gap warning,
+    /// silently restoring the very gap-blindness the synthetic was
+    /// meant to fix.
+    std::optional<SseEvent> pre_emit;
+
+    /// Take and clear `pre_emit` atomically under the queue mutex.
+    /// Returns std::nullopt if no pre-emit was set. Caller writes the
+    /// returned event directly to the sink before the queue drain.
+    std::optional<SseEvent> take_pre_emit() {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!pre_emit.has_value())
+            return std::nullopt;
+        SseEvent ev = std::move(*pre_emit);
+        pre_emit.reset();
+        return ev;
+    }
 };
 
 /// Enqueue with drop-oldest cap. Routes that opt into slow-consumer
