@@ -557,6 +557,23 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
         return result;
     }
 
+    // W2.2 / #807 follow-up — glibc dlopen path cache.
+    //
+    // The /proc/self/fd/N path that the Linux branch passes to dlopen is
+    // CACHED by glibc keyed on the path string. If we close the fd at
+    // end-of-iteration and the next iteration's open() recycles the
+    // number (almost always true — fd allocation is lowest-available),
+    // every subsequent dlopen of /proc/self/fd/<reused-number> returns
+    // the FIRST plugin's cached handle. Symptom: every plugin's
+    // descriptor reports the name of the FIRST plugin loaded.
+    //
+    // Fix: stash each per-plugin fd into a vector with scope of the
+    // whole scan(), so fd numbers don't recycle across iterations and
+    // each /proc/self/fd/N stays unique while glibc resolves the path.
+    // Closed automatically at the end of scan() via vector destruction;
+    // the dlopen()-mapped .so stays loaded independently.
+    std::vector<int> linux_fd_keepalive; // POSIX-only; empty on macOS, no fd flow there
+
     const bool enforce_allowlist = !allowlist.empty();
     const bool enforce_signing = signing.enabled();
     if (enforce_allowlist) {
@@ -739,9 +756,17 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
         // Linux: load via /proc/self/fd/N — the kernel resolves this to the
         // open file description we hold, so the same inode the hash covered
         // is the one dlopen maps. Full TOCTOU close.
+        //
+        // After dlopen, transfer fd ownership to the scan-scoped keepalive
+        // vector so the fd number does NOT recycle into the next iteration
+        // (see the keepalive declaration above for the glibc-path-cache
+        // rationale). guard.fd is set to -1 to disarm the per-iteration
+        // ScopedFd destructor.
         std::filesystem::path fd_path{"/proc/self/fd/"};
         fd_path += std::to_string(guard.fd);
         auto loaded = PluginHandle::load(fd_path);
+        linux_fd_keepalive.push_back(guard.fd);
+        guard.fd = -1;
 #else
         // macOS: no /proc/self/fd. Fall back to path-based dlopen. The
         // residual race window is from the moment of the held-fd hash
@@ -781,6 +806,18 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
             result.errors.push_back(std::move(loaded.error()));
         }
     }
+
+#ifdef __linux__
+    // Plugins are all dlopen'd and the dynamic linker has its own
+    // mapping for each .so — safe to release the keepalive fds now.
+    // The path-cache collision risk is gone the moment we move past
+    // the scan loop, since no further dlopen of /proc/self/fd/N will
+    // be issued.
+    for (int fd : linux_fd_keepalive) {
+        if (fd >= 0)
+            ::close(fd);
+    }
+#endif
 
     return result;
 }

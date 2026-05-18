@@ -329,6 +329,9 @@ TEST_CASE("InstructionStore: export and import round-trip", "[instruction_store]
 
     // Import into a fresh store (avoids name+version uniqueness collision)
     InstructionStore store2(":memory:");
+    // #1073: opt out of signature enforcement — this test exercises
+    // import-round-trip, not the signature gate.
+    store2.set_require_signed_definitions(false);
     auto import_result = store2.import_definition_json(json);
     REQUIRE(import_result.has_value());
 
@@ -535,6 +538,10 @@ TEST_CASE("InstructionStore: kConflictPrefix has the documented literal value",
 TEST_CASE("InstructionStore: import_definition_json duplicate uses kConflictPrefix",
           "[instruction_store][duplicate][import]") {
     InstructionStore store(":memory:");
+    // #1073: this test pins the duplicate-import error contract for the
+    // boot-time auto-import flow; opt out of signature enforcement so the
+    // unsigned envelope below isn't pre-emptively rejected.
+    store.set_require_signed_definitions(false);
 
     const std::string envelope = R"({
         "id":"test.import.dup",
@@ -551,8 +558,8 @@ TEST_CASE("InstructionStore: import_definition_json duplicate uses kConflictPref
 
     auto second = store.import_definition_json(envelope);
     REQUIRE_FALSE(second.has_value());
-    INFO("actual error: " << second.error());  // Catch2 prints only on failure
-    CHECK(is_conflict_error(second.error()));  // contract for boot-time auto-import
+    INFO("actual error: " << second.error()); // Catch2 prints only on failure
+    CHECK(is_conflict_error(second.error())); // contract for boot-time auto-import
     CHECK(second.error().find(kConflictPrefix) == 0);
 }
 
@@ -575,7 +582,7 @@ TEST_CASE("InstructionStore: create_set duplicate uses kConflictPrefix",
     // — the boot-time auto-import substring-matched "already exists" and
     // miscounted every reboot's bundled sets as `errored`. Pin the
     // kConflictPrefix contract so a future refactor cannot regress it.
-    INFO("actual error: " << second.error());  // Catch2 prints only on failure
+    INFO("actual error: " << second.error()); // Catch2 prints only on failure
     CHECK(is_conflict_error(second.error()));
     CHECK(second.error().find(kConflictPrefix) == 0);
 }

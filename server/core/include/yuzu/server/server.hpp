@@ -133,6 +133,20 @@ struct Config {
     /// audit event + a startup spdlog::warn so the relaxed posture is
     /// loud in both audit log and operator-visible logs.
     bool allow_unsigned_packs{false};
+
+    // Instruction-definition signature enforcement (#1073 / W7.4 sibling-gap)
+    /// When true, `InstructionStore::import_definition_json` accepts
+    /// definitions WITHOUT a `signature` field (legacy unsigned imports).
+    /// Default false — the secure posture rejects unsigned imports to close
+    /// the equivalent fleet-wide arbitrary-code-execution surface that #802
+    /// closed for ProductPack: an operator with `InstructionDefinition:Write`
+    /// can otherwise publish an arbitrary definition (carrying a plugin
+    /// invocation) that executes on every targeted agent. Wired via
+    /// --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1.
+    /// Setting true at startup emits the `server.unsigned_definitions_allowed`
+    /// audit event + a startup spdlog::warn — exact parity with
+    /// `--allow-unsigned-packs`.
+    bool allow_unsigned_definitions{false};
 };
 
 /**

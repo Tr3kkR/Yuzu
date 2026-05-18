@@ -87,6 +87,21 @@ jobs:
           gcc-13 --version | head -1
           ccache --version | head -1
 
+      # Install Erlang/OTP and rebar3. The self-hosted yuzu-wsl2-linux
+      # runner has kerl installed for the `dornbrn` user but workflows
+      # run as `github-runner`, so kerl is not on PATH and our
+      # ensure-erlang.sh helper finds nothing. Use the same setup-beam
+      # pattern as ci.yml / nightly.yml / release.yml — version pin
+      # must move with them on any OTP bump. ImageOS env is required
+      # because setup-beam can't auto-detect self-hosted OS.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
+
       # sre-5: fail fast if the runner is out of disk before we sink
       # time into a 15-min compile that's going to die with ENOSPC.
       # Full sanitizer build + vcpkg + checkout + ccache ≈ 30 GB.
@@ -203,6 +218,15 @@ jobs:
           meson --version
           gcc-13 --version | head -1
           ccache --version | head -1
+
+      # Install Erlang/OTP and rebar3 (see ASan job for full rationale).
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
 
       - name: Assert runner disk (≥30 GB free)
         run: |

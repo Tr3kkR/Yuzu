@@ -3523,7 +3523,30 @@ Export an instruction definition in a portable format.
 
 #### `POST /api/instructions/import`
 
-Import instruction definitions from a YAML file.
+Import an InstructionDefinition (JSON envelope). Requires `InstructionDefinition:Write`.
+
+**Signature enforcement** (since #1073 / W7.4 sibling-gap closure): the server rejects unsigned imports by default. Mirrors the [`POST /api/product-packs`](#post-apiproduct-packs) `--allow-unsigned-packs` model — closes the equivalent fleet-RCE surface where an operator with import permission can otherwise publish a definition carrying an arbitrary plugin invocation that dispatches on every targeted agent.
+
+**Signed request body (recommended):**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id`, `name`, `type`, `plugin`, `action`, etc. | various | yes | Standard `InstructionDefinition` fields. |
+| `yaml_source` | string | yes (when signed) | The verbatim YAML source — this is the signed-content carrier. Every persisted column is derived from it on the canonical path; signing `yaml_source` transitively covers the dispatch. |
+| `signature` | string | optional | Hex-encoded Ed25519 signature over `yaml_source`'s bytes. |
+| `publicKey` | string | optional | Hex-encoded Ed25519 public key (64 hex chars). |
+
+**Signing rules:**
+
+- `signature` + `publicKey` both present + valid → accepted.
+- `signature` + `publicKey` both present + invalid → `400 signature verification failed for instruction — yaml_source may have been tampered with`.
+- Exactly one of `signature` / `publicKey` present → `400 instruction-import has incomplete signing metadata — both signature and publicKey must be present together (or both absent)`.
+- Neither present, signature enforcement on (default) → `400 instruction-import is unsigned and signature enforcement is enabled (set --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1 to bypass)`.
+- Neither present, signature enforcement off → accepted as **unverified** (operator opt-out via [`--allow-unsigned-definitions`](server-admin.md), emits `server.unsigned_definitions_allowed` audit row at startup).
+
+A failed signature ALWAYS rejects, even when enforcement is off — `--allow-unsigned-definitions` only widens the unsigned-path policy, it does not skip crypto on present signatures.
+
+**Audit:** every import attempt emits `instruction.import` with `result=success` on success, `result=denied` on rejection. The `target_id` is the definition's `id` on success; empty on rejection.
 
 #### `POST /api/instructions/yaml`
 

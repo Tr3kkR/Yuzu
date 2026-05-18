@@ -1,5 +1,6 @@
 #include "instruction_store.hpp"
 #include "migration_runner.hpp"
+#include "product_pack_store.hpp" // ProductPackStore::verify_signature (#1073)
 #include "response_templates_engine.hpp"
 #include "store_errors.hpp"
 
@@ -42,7 +43,8 @@ std::string normalize_to_array_helper(const nlohmann::json& v) {
         // does strict validation on the chart objects themselves.
         nlohmann::json out = nlohmann::json::array();
         for (const auto& el : v) {
-            if (el.is_object()) out.push_back(el);
+            if (el.is_object())
+                out.push_back(el);
         }
         return out.dump();
     }
@@ -210,7 +212,8 @@ InstructionStore::InstructionStore(const std::filesystem::path& db_path) {
     // staring at /readyz="ok" while every definition call returned 503.
     bool stamp_failed = false;
     auto probe_and_stamp = [&](const char* column_name, int target_version) {
-        if (stamp_failed) return; // earlier stamp failed; skip remaining
+        if (stamp_failed)
+            return; // earlier stamp failed; skip remaining
         sqlite3_stmt* probe = nullptr;
         bool col_exists = false;
         int rc = sqlite3_prepare_v2(db_,
@@ -218,18 +221,16 @@ InstructionStore::InstructionStore(const std::filesystem::path& db_path) {
                                     "WHERE name=? LIMIT 1",
                                     -1, &probe, nullptr);
         if (rc != SQLITE_OK) {
-            spdlog::error(
-                "InstructionStore: probe prepare failed for {} (rc={}): {}",
-                column_name, rc, sqlite3_errmsg(db_));
+            spdlog::error("InstructionStore: probe prepare failed for {} (rc={}): {}", column_name,
+                          rc, sqlite3_errmsg(db_));
             stamp_failed = true;
             return;
         }
         sqlite3_bind_text(probe, 1, column_name, -1, SQLITE_TRANSIENT);
         int probe_rc = sqlite3_step(probe);
         if (probe_rc != SQLITE_ROW && probe_rc != SQLITE_DONE) {
-            spdlog::error(
-                "InstructionStore: probe step failed for {} (rc={}): {}",
-                column_name, probe_rc, sqlite3_errmsg(db_));
+            spdlog::error("InstructionStore: probe step failed for {} (rc={}): {}", column_name,
+                          probe_rc, sqlite3_errmsg(db_));
             sqlite3_finalize(probe);
             stamp_failed = true;
             return;
@@ -240,15 +241,13 @@ InstructionStore::InstructionStore(const std::filesystem::path& db_path) {
         int current_v = MigrationRunner::current_version(db_, "instruction_store");
         if (col_exists && current_v < target_version) {
             sqlite3_stmt* stamp = nullptr;
-            int prep_rc = sqlite3_prepare_v2(
-                db_,
-                "INSERT OR REPLACE INTO schema_meta "
-                "(store, version, upgraded_at) VALUES (?, ?, ?)",
-                -1, &stamp, nullptr);
+            int prep_rc = sqlite3_prepare_v2(db_,
+                                             "INSERT OR REPLACE INTO schema_meta "
+                                             "(store, version, upgraded_at) VALUES (?, ?, ?)",
+                                             -1, &stamp, nullptr);
             if (prep_rc != SQLITE_OK) {
-                spdlog::error(
-                    "InstructionStore: stamp prepare failed for v{} ({}): {}",
-                    target_version, column_name, sqlite3_errmsg(db_));
+                spdlog::error("InstructionStore: stamp prepare failed for v{} ({}): {}",
+                              target_version, column_name, sqlite3_errmsg(db_));
                 stamp_failed = true;
                 return;
             }
@@ -261,17 +260,15 @@ InstructionStore::InstructionStore(const std::filesystem::path& db_path) {
             int step_rc = sqlite3_step(stamp);
             sqlite3_finalize(stamp);
             if (step_rc != SQLITE_DONE) {
-                spdlog::error(
-                    "InstructionStore: stamp step failed for v{} ({}, rc={}): {}; "
-                    "refusing to run migration ledger to avoid duplicate-column ALTER",
-                    target_version, column_name, step_rc, sqlite3_errmsg(db_));
+                spdlog::error("InstructionStore: stamp step failed for v{} ({}, rc={}): {}; "
+                              "refusing to run migration ledger to avoid duplicate-column ALTER",
+                              target_version, column_name, step_rc, sqlite3_errmsg(db_));
                 stamp_failed = true;
                 return;
             }
-            spdlog::info(
-                "InstructionStore: {} column already present, stamping schema_meta to v{} "
-                "(arch-B2)",
-                column_name, target_version);
+            spdlog::info("InstructionStore: {} column already present, stamping schema_meta to v{} "
+                         "(arch-B2)",
+                         column_name, target_version);
         }
     };
     probe_and_stamp("visualization_spec", 2);
@@ -358,7 +355,8 @@ std::optional<InstructionDefinition> InstructionStore::get_definition(const std:
     return get_definition_impl(id);
 }
 
-std::optional<InstructionDefinition> InstructionStore::get_definition_impl(const std::string& id) const {
+std::optional<InstructionDefinition>
+InstructionStore::get_definition_impl(const std::string& id) const {
     if (!db_)
         return std::nullopt;
 
@@ -410,8 +408,8 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
     // anyway and hope SQLite's PK rejects it".
     if (!def.id.empty()) {
         sqlite3_stmt* exists_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM instruction_definitions WHERE id=? LIMIT 1",
-                               -1, &exists_stmt, nullptr) != SQLITE_OK) {
+        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM instruction_definitions WHERE id=? LIMIT 1", -1,
+                               &exists_stmt, nullptr) != SQLITE_OK) {
             spdlog::error("InstructionStore: prepare failed in duplicate-id check: {}",
                           sqlite3_errmsg(db_));
             return std::unexpected("internal: duplicate-id check failed");
@@ -420,8 +418,8 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
         bool exists = sqlite3_step(exists_stmt) == SQLITE_ROW;
         sqlite3_finalize(exists_stmt);
         if (exists)
-            return std::unexpected(std::string(kConflictPrefix) +
-                                   " instruction definition '" + id + "' already exists");
+            return std::unexpected(std::string(kConflictPrefix) + " instruction definition '" + id +
+                                   "' already exists");
     }
 
     const char* sql = R"(
@@ -603,9 +601,125 @@ std::string InstructionStore::export_definition_json(const std::string& id) cons
 
 std::expected<std::string, std::string>
 InstructionStore::import_definition_json(const std::string& json_str) {
+    return import_definition_json_impl(json_str, /*check_signature=*/true);
+}
+
+std::expected<std::string, std::string>
+InstructionStore::import_definition_json_trusted(const std::string& json_str) {
+    return import_definition_json_impl(json_str, /*check_signature=*/false);
+}
+
+std::expected<std::string, std::string>
+InstructionStore::import_definition_json_impl(const std::string& json_str, bool check_signature) {
     auto parsed = nlohmann::json::parse(json_str, nullptr, false);
     if (parsed.is_discarded())
         return std::unexpected("invalid JSON");
+
+    // ── Ed25519 signature verification (#1073 / W7.4 sibling-gap closure) ──
+    // Wire format mirrors ProductPack: optional top-level `signature` +
+    // `publicKey` fields, hex-encoded. The signed content is the
+    // `yaml_source` field's bytes verbatim — yaml_source is the
+    // authoritative source-of-truth representation of the definition.
+    //
+    // This gates the IMPORT surface. Authoring surfaces (POST /api/instructions,
+    // POST /api/instructions/yaml, PUT /api/instructions/{id}) trust the
+    // InstructionDefinition:Write RBAC permission as the author trust
+    // boundary — see SECURITY SCOPE comment on the public method in the .hpp.
+    //
+    // The trusted boot-content path (`import_definition_json_trusted`)
+    // skips this gate by passing check_signature=false — bundled content
+    // authenticity comes from build-time binary linkage, not runtime
+    // signature.
+    if (check_signature) {
+        // Round 1 governance unhappy-path R5: distinguish "field absent"
+        // from "field present but wrong JSON type". Returning empty-string
+        // silently for both made attacker-corrupted payloads
+        // ({"signature": 42}) reject with the misleading "unsigned" error.
+        // Use a tri-state so we can emit a precise rejection reason.
+        enum class FieldState { Absent, WrongType, Present };
+        auto extract_str = [&](const char* key, std::string& out) -> FieldState {
+            if (!parsed.contains(key))
+                return FieldState::Absent;
+            const auto& v = parsed[key];
+            if (v.is_null())
+                return FieldState::Absent; // null treated as absent
+            if (!v.is_string())
+                return FieldState::WrongType;
+            out = v.get<std::string>();
+            return out.empty() ? FieldState::Absent : FieldState::Present;
+        };
+        std::string sig_hex, pub_hex, yaml_source;
+        const auto sig_state = extract_str("signature", sig_hex);
+        const auto pub_state = extract_str("publicKey", pub_hex);
+        const auto yaml_state = extract_str("yaml_source", yaml_source);
+
+        if (sig_state == FieldState::WrongType || pub_state == FieldState::WrongType ||
+            yaml_state == FieldState::WrongType) {
+            return std::unexpected(
+                "instruction-import has signing field of wrong JSON type — "
+                "signature, publicKey, and yaml_source must be strings when present");
+        }
+
+        // R6 (unhappy-path): length-validate hex strings BEFORE handing to
+        // ProductPackStore::verify_signature so an attacker can't post a
+        // multi-MB sig_hex and trigger a server-side allocation peak.
+        // Ed25519: signature = 64 bytes (128 hex chars), public key = 32
+        // bytes (64 hex chars). Reject any other length.
+        constexpr std::size_t kEd25519SigHexLen = 128;
+        constexpr std::size_t kEd25519PubHexLen = 64;
+        if (sig_state == FieldState::Present && sig_hex.size() != kEd25519SigHexLen) {
+            return std::unexpected("signature length invalid — Ed25519 signature must be "
+                                   "exactly 128 hex chars (64 bytes)");
+        }
+        if (pub_state == FieldState::Present && pub_hex.size() != kEd25519PubHexLen) {
+            return std::unexpected("publicKey length invalid — Ed25519 public key must be "
+                                   "exactly 64 hex chars (32 bytes)");
+        }
+
+        if (sig_state == FieldState::Present && pub_state == FieldState::Present) {
+            // Both fields present → verify. Failure rejects unconditionally
+            // regardless of `require_signed_definitions_` (a failed signature
+            // is evidence of tampering, not a policy question).
+            if (yaml_state != FieldState::Present) {
+                return std::unexpected(
+                    "instruction-import has signature + publicKey but no yaml_source — "
+                    "yaml_source is the signed content carrier; cannot verify");
+            }
+            if (!ProductPackStore::verify_signature(yaml_source, sig_hex, pub_hex)) {
+                spdlog::error("InstructionStore::import_definition_json: signature verification "
+                              "FAILED — rejecting definition (content may be tampered)");
+                // R2 / Gate 4 consistency CONS-BLOCKING-2: wording aligned
+                // with ProductPackStore's parallel error
+                // ("signature verification failed for pack '<name>' — content
+                // may have been tampered with"). Both surfaces now use
+                // "content" as the noun and "may have been tampered with"
+                // as the suffix; SIEM full-string parsers see one shape.
+                return std::unexpected(
+                    "signature verification failed for instruction — content may "
+                    "have been tampered with");
+            }
+            spdlog::info("InstructionStore::import_definition_json: signature verified");
+        } else if (sig_state == FieldState::Present || pub_state == FieldState::Present) {
+            // Exactly one field present — incomplete signing metadata, reject.
+            return std::unexpected(
+                "instruction-import has incomplete signing metadata — both "
+                "signature and publicKey must be present together (or both absent)");
+        } else {
+            // No signature → unsigned import; gated by require_signed_definitions_.
+            if (require_signed_definitions_.load(std::memory_order_relaxed)) {
+                spdlog::error("InstructionStore::import_definition_json: definition is unsigned "
+                              "but signature enforcement is enabled — rejecting");
+                // gov W7.4 R1 CONS-BLOCKING-2 pattern: error names the operator-
+                // facing CLI flag so the rejection is actionable.
+                return std::unexpected(
+                    "instruction-import is unsigned and signature enforcement is enabled "
+                    "(set --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1 "
+                    "to bypass)");
+            }
+            spdlog::info("InstructionStore::import_definition_json: definition has no signature "
+                         "— importing as unverified");
+        }
+    }
 
     std::unique_lock lock(mtx_);
 
@@ -667,7 +781,8 @@ InstructionStore::import_definition_json(const std::string& json_str) {
     auto normalize_to_array = [](const nlohmann::json& v) -> std::string {
         if (v.is_string()) {
             auto inner = nlohmann::json::parse(v.get<std::string>(), nullptr, false);
-            if (inner.is_discarded()) return v.get<std::string>(); // pass through
+            if (inner.is_discarded())
+                return v.get<std::string>(); // pass through
             return normalize_to_array_helper(inner);
         }
         return normalize_to_array_helper(v);
@@ -690,7 +805,8 @@ InstructionStore::import_definition_json(const std::string& json_str) {
     // name `response_templates_spec`, and the explicit pre-serialised
     // string form. Always normalises to a JSON array string at rest.
     auto pick_templates_field = [&]() -> std::optional<nlohmann::json> {
-        if (parsed.contains("response_templates_spec") && !parsed["response_templates_spec"].is_null())
+        if (parsed.contains("response_templates_spec") &&
+            !parsed["response_templates_spec"].is_null())
             return parsed["response_templates_spec"];
         if (parsed.contains("responseTemplates") && !parsed["responseTemplates"].is_null())
             return parsed["responseTemplates"];
@@ -709,7 +825,8 @@ InstructionStore::import_definition_json(const std::string& json_str) {
     // surfaces in logs instead of silently wedging the templates view.
     static constexpr size_t kMaxImportTemplateStringBytes = 256 * 1024; // 256 KiB
     auto strip_reserved_id = [](const nlohmann::json& el) -> bool {
-        if (!el.is_object()) return true; // drop non-objects entirely
+        if (!el.is_object())
+            return true; // drop non-objects entirely
         if (el.contains("id") && el["id"].is_string() &&
             el["id"].get<std::string>() ==
                 std::string(::yuzu::server::ResponseTemplatesEngine::kDefaultId)) {
@@ -721,11 +838,13 @@ InstructionStore::import_definition_json(const std::string& json_str) {
         nlohmann::json out = nlohmann::json::array();
         if (src.is_array()) {
             for (const auto& el : src) {
-                if (strip_reserved_id(el)) continue;
+                if (strip_reserved_id(el))
+                    continue;
                 out.push_back(el);
             }
         } else if (src.is_object()) {
-            if (!strip_reserved_id(src)) out.push_back(src);
+            if (!strip_reserved_id(src))
+                out.push_back(src);
         }
         return out;
     };
@@ -803,16 +922,15 @@ std::expected<std::string, std::string> InstructionStore::create_set(const Instr
     // handler at /api/v1/instruction-sets both rely on (Gate 4 C-B1).
     if (!s.id.empty()) {
         sqlite3_stmt* exists_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT 1 FROM instruction_sets WHERE id=? LIMIT 1",
-                               -1, &exists_stmt, nullptr) != SQLITE_OK)
+        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM instruction_sets WHERE id=? LIMIT 1", -1,
+                               &exists_stmt, nullptr) != SQLITE_OK)
             return std::unexpected("internal: duplicate-id check failed");
         sqlite3_bind_text(exists_stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
         bool exists = sqlite3_step(exists_stmt) == SQLITE_ROW;
         sqlite3_finalize(exists_stmt);
         if (exists)
-            return std::unexpected(std::string(kConflictPrefix) +
-                                   " instruction set '" + id + "' already exists");
+            return std::unexpected(std::string(kConflictPrefix) + " instruction set '" + id +
+                                   "' already exists");
     }
 
     sqlite3_stmt* stmt = nullptr;

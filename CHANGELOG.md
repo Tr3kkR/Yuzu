@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **HIGH (#1073 / W7.4 sibling-gap): InstructionDefinition import
+  signature enforcement is now on-by-default.** `InstructionStore`
+  previously accepted unsigned YAML imports via
+  `POST /api/instructions/import` without verification, leaving an
+  equivalent fleet-RCE surface to the #802 product-pack gap: an
+  operator with `InstructionDefinition:Write` could import a
+  definition carrying an arbitrary plugin invocation that dispatched
+  fleet-wide. The default is now `require_signed_definitions = true`;
+  unsigned imports are rejected with `instruction-import is unsigned
+  and signature enforcement is enabled (set
+  --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1
+  to bypass)`. Operators with legacy unsigned import workflows must
+  explicitly opt out via the new `--allow-unsigned-definitions` flag /
+  `YUZU_ALLOW_UNSIGNED_DEFINITIONS=1` env var, which emits a startup
+  `spdlog::warn` and a `server.unsigned_definitions_allowed` audit row.
+  Wire format mirrors ProductPack: optional top-level `signature` +
+  `publicKey` (hex) fields, signed content is the `yaml_source` field's
+  bytes verbatim. The bundled-content boot seed bypasses the gate via
+  the internal `import_definition_json_trusted` variant
+  (authenticated by build-time binary linkage, not runtime signature).
+  R1 hardening additionally adds: (a) hex-length validation BEFORE
+  crypto allocation (Ed25519 signature = 128 hex chars, publicKey =
+  64 hex chars — oversized fields rejected before `verify_signature`,
+  closing a DoS amplification path); (b) wrong-JSON-type detection
+  (`{"signature": 42}` now returns a typed 400 rather than silently
+  falling into the "unsigned" branch); (c) audit coverage on EVERY
+  rejection branch with `Sec-Audit-Failed: true` header + the
+  `audit_emitted=false` JSON envelope field on audit-write failure
+  (PR #883 SOC 2 CC7.2 evidence-chain pattern); (d) audit-row
+  `target_type` normalised to PascalCase `InstructionDefinition`
+  matching ProductPack's W7.4 R2 convention; (e) error-string wording
+  unified with ProductPack ("content may have been tampered with").
+  **This is a breaking change** — see `### Upgrade notes` below.
+  Closes #1073.
+
 - **CRITICAL (#802 / W7.4): product pack signature enforcement is now
   on-by-default.** `ProductPackStore` previously defaulted
   `require_signed_packs_` to `false`, AND the setter that would have

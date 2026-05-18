@@ -64,6 +64,11 @@ struct VizHarness {
         fs::remove(resp_db);
         instruction_store = std::make_unique<InstructionStore>(inst_db);
         REQUIRE(instruction_store->is_open());
+        // #1073: InstructionStore defaults to require_signed_definitions=true.
+        // These tests exercise the import path + visualization-spec
+        // normalisation, not the signature gate — opt out so unsigned
+        // fixtures still pass.
+        instruction_store->set_require_signed_definitions(false);
         response_store = std::make_unique<ResponseStore>(resp_db, /*retention=*/0,
                                                          /*cleanup_interval=*/60);
         REQUIRE(response_store->is_open());
@@ -457,6 +462,9 @@ TEST_CASE("InstructionStore: import_definition_json accepts visualization_spec a
     {
         InstructionStore store(db_path);
         REQUIRE(store.is_open());
+        // #1073: opt out of signature enforcement — this test pins
+        // visualization_spec normalisation, not the signature gate.
+        store.set_require_signed_definitions(false);
 
         // Object form (CLI converts YAML→JSON in one shot)
         nlohmann::json j;

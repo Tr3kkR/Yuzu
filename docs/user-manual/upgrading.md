@@ -230,6 +230,92 @@ If a migration fails:
 
 ## Upgrade notes by release
 
+### InstructionDefinition import signature enforcement now on-by-default (#1073 / W7.4 sibling-gap) — **BREAKING**
+
+`InstructionStore::import_definition_json` (the storage path behind
+`POST /api/instructions/import`) previously accepted unsigned JSON
+envelopes without verification. After upgrade, unsigned imports are
+rejected with:
+
+```
+instruction-import is unsigned and signature enforcement is enabled (set --allow-unsigned-definitions / YUZU_ALLOW_UNSIGNED_DEFINITIONS=1 to bypass)
+```
+
+This is intentional and closes the sibling-gap to #802. Without the
+gate, any operator with `InstructionDefinition:Write` permission can
+import a definition that dispatches an arbitrary plugin invocation on
+every targeted agent — same fleet-RCE blast radius the pack-signing
+default closed.
+
+**Two migration paths, in order of preference:**
+
+1. **Sign your imports.** Generate an Ed25519 keypair, sign the
+   `yaml_source` field's bytes with the private key, and wrap the
+   envelope with `signature: <hex>` + `publicKey: <hex>` top-level
+   fields. The wire format mirrors ProductPack: signature is hex-
+   encoded over the verbatim `yaml_source` bytes; `publicKey` is the
+   hex-encoded raw Ed25519 public key (32 bytes / 64 hex chars).
+   Until the dedicated helper script lands (tracked as a follow-up
+   issue covering both pack-signing and definition-signing tooling),
+   use the raw `openssl` recipe directly:
+
+   ```bash
+   # One-time: generate a keypair (rotate periodically per your policy).
+   openssl genpkey -algorithm Ed25519 -out yuzu-signing.pem
+   openssl pkey -in yuzu-signing.pem -pubout -outform DER \
+       | tail -c 32 | xxd -p -c 64    # → 64-hex publicKey
+
+   # Per definition: sign yaml_source bytes, hex-encode the output.
+   echo -n "$YAML_SOURCE" \
+       | openssl pkeyutl -sign -inkey yuzu-signing.pem -rawin \
+       | xxd -p -c 128                # → 128-hex signature
+   ```
+
+   Inject `signature` and `publicKey` as top-level string fields in
+   the JSON envelope POSTed to `/api/instructions/import`. See the
+   REST API reference (`docs/user-manual/rest-api.md` →
+   `POST /api/instructions/import`) for the full signing-rules table
+   and per-rejection error strings.
+
+2. **Opt out temporarily** (legacy environments only). Pass
+   `--allow-unsigned-definitions` to `yuzu-server` or set
+   `YUZU_ALLOW_UNSIGNED_DEFINITIONS=1` in the service environment. The
+   server emits an `InstructionStore: signature enforcement DISABLED
+   by configuration` warning on every start AND a
+   `server.unsigned_definitions_allowed` audit row at boot, so the
+   relaxed posture is recoverable from both operator logs and the
+   audit store. **Remove the flag** as soon as the signing migration
+   completes.
+
+**Pre-existing imported definitions are unaffected.** The gate fires
+only on the public import path. The bundled-content boot seed (the
+`kBundledDefinitions` baked into `yuzu-server` at build time) routes
+through an internal `import_definition_json_trusted` variant that
+bypasses the gate; its authenticity comes from binary linkage, not
+runtime signature.
+
+**Authoring surfaces are NOT gated.** `POST /api/instructions`,
+`POST /api/instructions/yaml`, and `PUT /api/instructions/{id}` — the
+dashboard and CLI surfaces where operators author definitions in-
+session — continue to trust `InstructionDefinition:Write` as the
+author trust boundary (the operator IS the source; there is no
+supply chain to authenticate). The `--allow-unsigned-definitions`
+flag does NOT affect those surfaces; they have always accepted
+unsigned author-time input and continue to. The architectural
+question of whether authoring surfaces should ALSO require signed
+envelopes is tracked as a follow-up issue with operator-decision-
+required framing (UX trade-off: gating authoring would break in-
+browser definition authoring).
+
+**Audit-trail evidence chain.** Every rejection emits an
+`instruction.import / denied` audit row with the store error string
+in `detail` (stable SIEM-keyable tokens listed in the
+`audit-log.md` reference). If the audit-store write itself fails
+(locked DB, disk full), the response carries `Sec-Audit-Failed: true`
+header AND `audit_emitted: false` in the JSON body, surfacing the
+SOC 2 CC7.2 evidence gap to the operator immediately rather than
+silently dropping the event.
+
 ### Product pack signature enforcement now on-by-default (#802 / W7.4) — **BREAKING**
 
 The `ProductPackStore` previously shipped with signature enforcement
