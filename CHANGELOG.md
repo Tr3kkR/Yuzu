@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **W5.1 — `GET /api/v1/events` agentic-first JSON SSE channel.** First
+  REST surface that satisfies the A3 (observability) and A4 (error
+  envelope) invariants from `docs/agentic-first-principle.md`.
+  Authenticated agentic workers (`Execution:Read`) can subscribe to
+  per-execution live events as structured JSON envelopes
+  `{execution_id, event_id, timestamp_ms, type, payload}` without
+  scraping HTMX fragments or maintaining a dashboard session. Reuses
+  the same `ExecutionEventBus` as the dashboard
+  `/sse/executions/{id}` route — single taxonomy
+  (`agent-transition`, `execution-progress`, `execution-completed`)
+  plus synthetic `heartbeat`, `replay-gap`, and `events-dropped`
+  envelopes that surface bus-side ring-buffer eviction and
+  per-connection queue overflow rather than silently losing events.
+  Replay via `Last-Event-ID` header OR `?since=<id>` query (query
+  wins, bad input degrades to 0). Every 4xx/5xx response returns the
+  new A4 envelope shape `{error:{code, message, correlation_id,
+  retry_after_ms?, remediation?}, meta:{api_version:"v1"}}` plus an
+  `X-Correlation-Id` header. The contract is testable in isolation
+  via `server/core/src/rest_a4_envelope.hpp` so future MCP / discovery
+  surfaces can reuse the same envelope helpers. Audit verb
+  `api.v1.events.subscribe` is separate from
+  `execution.live_subscribe` so SIEM filters can distinguish
+  browser-tier vs agentic-worker consumers; the `Sec-Audit-Failed:
+  true` response header surfaces audit-persistence failure per the
+  PR #883 CC6.6 contract. Endpoint-scoped Prometheus metrics:
+  `yuzu_server_sse_api_subscriptions_total{route="events"}`,
+  `yuzu_server_sse_api_active{route="events"}`,
+  `yuzu_server_sse_api_queue_overflow_total{route="events"}`,
+  `yuzu_server_sse_api_replay_gap_total{route="events"}`. New OpenAPI
+  schemas `ExecutionSseEvent` + `A4ErrorEnvelope` and a discovery
+  row at `/api/v1/openapi.json`. Sprint W5.2 follows with multi-
+  execution filter syntax and `Accept: application/json` content
+  negotiation on `/fragments/executions`. **Multi-execution
+  subscription, per-principal connection caps, the bus-level replay-
+  before-subscribe race fix, and the MCP `execute_instruction`
+  `execution_id` response field are tracked as follow-up issues.**
+
 ### Security
 
 - **HIGH (#1073 / W7.4 sibling-gap): InstructionDefinition import

@@ -388,6 +388,33 @@ public:
                           "Cumulative SSE channels reaped after retention "
                           "window + zero subscribers",
                           "counter");
+        // W5.1 — endpoint-scoped agentic SSE metrics. Distinct from the
+        // bus-level yuzu_server_sse_* family above: those measure the
+        // ExecutionEventBus regardless of consumer, these measure the
+        // /api/v1/events handler specifically (label `route="events"`).
+        // governance R2 fix for consistency-MED (missing describe()
+        // calls left /metrics output without # HELP / # TYPE).
+        metrics_.describe("yuzu_server_sse_api_subscriptions_total",
+                          "Cumulative successful subscribes on /api/v1/events "
+                          "(labelled by route)",
+                          "counter");
+        metrics_.describe("yuzu_server_sse_api_active",
+                          "Live /api/v1/events subscriptions currently held by "
+                          "httplib worker threads (labelled by route). Alert on "
+                          "saturation of the configured worker pool size.",
+                          "gauge");
+        metrics_.describe("yuzu_server_sse_api_queue_overflow_total",
+                          "Cumulative events dropped from per-connection /api/v1/events "
+                          "queues (kPerConnectionQueueCapDefault overflow; slow-consumer "
+                          "backpressure on the route-side queue, distinct from the "
+                          "bus-level yuzu_server_sse_events_dropped_total).",
+                          "counter");
+        metrics_.describe("yuzu_server_sse_api_replay_gap_total",
+                          "Cumulative /api/v1/events connections that received a "
+                          "synthetic replay-gap envelope because the bus ring buffer "
+                          "had already evicted events the client requested via ?since "
+                          "or Last-Event-ID.",
+                          "counter");
         // Fleet visualization observability (PR 3 + PR 6 of feat/viz-engine).
         // gov R6 SRE OBS-1: every metric has a describe() so /metrics
         // includes # HELP and # TYPE lines for Prometheus / Grafana scrapers.
@@ -5945,7 +5972,13 @@ private:
                     tokens,
                     revoke.db_persisted,
                 };
-            });
+            },
+            // W5.1 — pass the per-execution event bus into the REST
+            // layer so `GET /api/v1/events` can subscribe agentic
+            // workers to live execution transitions. Same bus the
+            // dashboard SSE handler uses; nullptr leaves the new
+            // route registered but returning 503.
+            execution_event_bus_.get());
 
         // -- Register MCP server routes ----------------------------------------
 

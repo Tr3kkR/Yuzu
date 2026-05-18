@@ -148,3 +148,59 @@ PR 2.5 (#670) replaced the 16-arg `WorkflowRoutes::register_routes` with a
 `WorkflowRoutes::Deps` struct. **Do not regress that signature** — adding
 new dependencies to the workflow routes goes through the struct, not new
 positional arguments.
+
+### Second consumer (sprint W5.1, 2026-05-18)
+
+`GET /api/v1/events?execution_id=<id>` is the agentic-first sibling of
+`GET /sse/executions/{id}` — both subscribe to the same per-execution
+channel from the same `ExecutionEventBus`. The dashboard route emits raw
+`ev.data` (the browser already knows the channel from the URL path); the
+agentic route wraps every event in
+`{execution_id, event_id, timestamp_ms, type, payload}` so a worker
+subscribed to one channel can still discriminate events without out-of-
+band context.
+
+**Two consumers, one bus, one set of publisher invariants** — the
+publisher list above (`update_agent_status` / `refresh_counts` /
+`mark_cancelled` → `agent-transition` / `execution-progress` /
+`execution-completed`) is the single taxonomy both routes emit. A new
+event type must be added on the bus side first; both routes pick it up
+transparently. **Do not add a route-specific event type to either
+sibling** — that would split the taxonomy and break the A3 invariant
+that a single deterministic step name appears on every channel.
+
+The agentic route's audit verb is `api.v1.events.subscribe` (separate
+from `execution.live_subscribe` so SIEM filters can distinguish browser
+vs agentic consumers). Same no-dedup deferral applies (#700 Deferred-5).
+The A3 envelope shape and the A4 error envelope live in
+`server/core/src/rest_a4_envelope.hpp` as testable contracts — future
+discovery / MCP surfaces consuming the same bus reuse the helpers there
+rather than re-implementing the envelope.
+
+**Hardening invariants (sprint W5.1 R1):** the agentic handler exposes
+ring-buffer loss and per-connection backpressure to the client rather
+than letting them go silent.
+
+- **Replay-gap signal.** If the bus's ring buffer has already evicted
+  events with id ≤ `since_id`, the handler emits a synthetic
+  `replay-gap` envelope as the first frame
+  (`{execution_id, type:"replay-gap", missing_from, missing_to}`) so the
+  worker knows state may be inconsistent rather than silently observing
+  an `event_id` jump. Counted in
+  `yuzu_server_sse_api_replay_gap_total`. The dashboard sibling does
+  NOT emit this — adding it there is a follow-up.
+- **Per-connection queue cap.** `SseSinkState::queue` is bounded at
+  `kPerConnectionQueueCapDefault=500` (event_bus.hpp) with drop-oldest
+  semantics. Drops accumulate in `SseSinkState::dropped_total` and the
+  content provider emits one `events-dropped` envelope per batch on the
+  next wake, then resets the counter. The dashboard sibling does NOT
+  enforce a cap currently — same follow-up.
+- **Restart loss.** The bus is in-process and in-memory. On server
+  restart the buffer is empty; clients that reconnect with
+  `Last-Event-ID` after a restart will not receive events that occurred
+  before the restart regardless of the `since` value. Agentic workers
+  should fall back to `GET /api/v1/executions/<id>` for terminal state
+  recovery. This is the same characteristic the dashboard drawer
+  already lives with; it is documented here for agentic-client authors
+  who write reconnect logic against the executions ladder rather than
+  the dashboard's bootstrap path.
