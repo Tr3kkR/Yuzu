@@ -4514,14 +4514,20 @@ private:
                 // now the RBAC-securable PascalCase "InstructionDefinition"
                 // matching ProductPack's W7.4 R2 normalisation, NOT the
                 // legacy lowercase "instruction" string.
-                if (!audit_log(req, "instruction.import", "denied", "InstructionDefinition", "",
-                               detail)) {
+                const bool audit_ok = audit_log(req, "instruction.import", "denied",
+                                                "InstructionDefinition", "", detail);
+                if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
-                }
                 auto body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
                                             : result.error();
+                // R3 governance security MEDIUM-1: body field mirrors the
+                // captured bool, NOT a hardcoded `false`. On the rare
+                // happy-rejection path (request denied AND audit row
+                // persisted successfully) the operator sees
+                // `audit_emitted: true`. Symmetric with the success branch
+                // below.
                 res.set_content(
-                    nlohmann::json({{"error", body_msg}, {"audit_emitted", false}}).dump(),
+                    nlohmann::json({{"error", body_msg}, {"audit_emitted", audit_ok}}).dump(),
                     "application/json");
                 return;
             }

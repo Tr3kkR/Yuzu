@@ -255,13 +255,27 @@ default closed.
    fields. The wire format mirrors ProductPack: signature is hex-
    encoded over the verbatim `yaml_source` bytes; `publicKey` is the
    hex-encoded raw Ed25519 public key (32 bytes / 64 hex chars).
-   Operator tooling for definition signing tracks parity with
-   `scripts/sign-pack.sh` — until the dedicated `sign-definition.sh`
-   helper lands (deferred follow-up), use the same `openssl pkeyutl
-   -sign -inkey <key.pem>` recipe over the yaml_source bytes and
-   hex-encode the output. See the REST API reference
-   (`docs/user-manual/rest-api.md` → `POST /api/instructions/import`)
-   for the full signing-rules table and per-rejection error strings.
+   Until the dedicated helper script lands (tracked as a follow-up
+   issue covering both pack-signing and definition-signing tooling),
+   use the raw `openssl` recipe directly:
+
+   ```bash
+   # One-time: generate a keypair (rotate periodically per your policy).
+   openssl genpkey -algorithm Ed25519 -out yuzu-signing.pem
+   openssl pkey -in yuzu-signing.pem -pubout -outform DER \
+       | tail -c 32 | xxd -p -c 64    # → 64-hex publicKey
+
+   # Per definition: sign yaml_source bytes, hex-encode the output.
+   echo -n "$YAML_SOURCE" \
+       | openssl pkeyutl -sign -inkey yuzu-signing.pem -rawin \
+       | xxd -p -c 128                # → 128-hex signature
+   ```
+
+   Inject `signature` and `publicKey` as top-level string fields in
+   the JSON envelope POSTed to `/api/instructions/import`. See the
+   REST API reference (`docs/user-manual/rest-api.md` →
+   `POST /api/instructions/import`) for the full signing-rules table
+   and per-rejection error strings.
 
 2. **Opt out temporarily** (legacy environments only). Pass
    `--allow-unsigned-definitions` to `yuzu-server` or set
