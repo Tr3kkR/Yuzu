@@ -2153,9 +2153,18 @@ private:
         return auth_routes_->make_audit_event(req, action, result);
     }
 
-    bool audit_log(const httplib::Request& req, const std::string& action,
-                   const std::string& result, const std::string& target_type = {},
-                   const std::string& target_id = {}, const std::string& detail = {}) {
+    // `[[nodiscard]]` per #1073 R2 governance / PR #883 SOC 2 CC7.2 pattern:
+    // callers on security-relevant paths MUST inspect the return and signal
+    // audit-write failure to the operator (e.g. `Sec-Audit-Failed: true`
+    // header). Silently discarding the return on a denied/success path
+    // re-opens the evidence-chain gap whose closure was the whole point of
+    // PR #883 and which Gate 4 unhappy-path UP-1/UP-11 re-flagged on the
+    // import handler. Non-security audits (config.update, custom_property.*,
+    // tag.*, etc.) may still discard with explicit `(void)` cast.
+    [[nodiscard]] bool audit_log(const httplib::Request& req, const std::string& action,
+                                 const std::string& result, const std::string& target_type = {},
+                                 const std::string& target_id = {},
+                                 const std::string& detail = {}) {
         return auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
     }
 
@@ -2847,7 +2856,8 @@ private:
             }
             // log_level is applied inside RuntimeConfigStore::set()
 
-            audit_log(req, "config.update", "success", "RuntimeConfig", key, "value=" + value);
+            (void)audit_log(req, "config.update", "success", "RuntimeConfig", key,
+                            "value=" + value);
 
             res.set_content(
                 nlohmann::json({{"key", key}, {"value", value}, {"applied", true}}).dump(),
@@ -2935,7 +2945,8 @@ private:
                 return;
             }
 
-            audit_log(req, "custom_property.set", "success", "Agent", agent_id, key + "=" + value);
+            (void)audit_log(req, "custom_property.set", "success", "Agent", agent_id,
+                            key + "=" + value);
 
             res.set_content(
                 nlohmann::json(
@@ -2974,7 +2985,8 @@ private:
                 return;
             }
 
-            audit_log(req, "custom_property.delete", "success", "Agent", agent_id, "key=" + key);
+            (void)audit_log(req, "custom_property.delete", "success", "Agent", agent_id,
+                            "key=" + key);
 
             res.set_content(nlohmann::json({{"deleted", true}, {"key", key}}).dump(),
                             "application/json");
@@ -3050,7 +3062,7 @@ private:
                 return;
             }
 
-            audit_log(req, "property_schema.create", "success", "PropertySchema", schema.key);
+            (void)audit_log(req, "property_schema.create", "success", "PropertySchema", schema.key);
 
             res.status = 201;
             res.set_content(nlohmann::json({{"key", schema.key},
@@ -3224,7 +3236,7 @@ private:
             [this](const httplib::Request& req, const std::string& action,
                    const std::string& result, const std::string& target_type,
                    const std::string& target_id, const std::string& detail) {
-                audit_log(req, action, result, target_type, target_id, detail);
+                (void)audit_log(req, action, result, target_type, target_id, detail);
             },
             cfg_, auth_mgr_, auto_approve_, api_token_store_.get(), mgmt_group_store_.get(),
             tag_store_.get(), update_registry_.get(), runtime_config_store_.get(),
@@ -3533,8 +3545,8 @@ private:
             event_bus_.publish("command-status", "<span id=\"status-badge\" class=\"badge-running\""
                                                  " hx-swap-oob=\"outerHTML\">RUNNING</span>");
             spdlog::info("Command dispatched: {}:{} → {} agent(s)", plugin, action, sent);
-            audit_log(req, "command.dispatch", "success", "command", command_id,
-                      plugin + ":" + action + " → " + std::to_string(sent) + " agent(s)");
+            (void)audit_log(req, "command.dispatch", "success", "command", command_id,
+                            plugin + ":" + action + " → " + std::to_string(sent) + " agent(s)");
             emit_event("command.dispatched", req, {{"target_count", sent}},
                        {{"plugin", plugin},
                         {"action", action},
@@ -3943,7 +3955,7 @@ private:
                     }
                 }
             }
-            audit_log(req, "tag.set", "success", "tag", agent_id + ":" + key, value);
+            (void)audit_log(req, "tag.set", "success", "tag", agent_id + ":" + key, value);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Tag updated","level":"success"}})");
             res.set_content(R"({"status":"ok"})", "application/json");
@@ -3973,8 +3985,8 @@ private:
             }
 
             bool deleted = tag_store_->delete_tag(agent_id, key);
-            audit_log(req, "tag.delete", deleted ? "success" : "not_found", "tag",
-                      agent_id + ":" + key);
+            (void)audit_log(req, "tag.delete", deleted ? "success" : "not_found", "tag",
+                            agent_id + ":" + key);
             if (deleted) {
                 res.set_header("HX-Trigger",
                                R"({"showToast":{"message":"Tag deleted","level":"success"}})");
@@ -4269,8 +4281,8 @@ private:
                     bool is_conflict = is_conflict_error(result.error());
                     res.status = is_conflict ? 409 : 400;
                     if (is_conflict) {
-                        audit_log(req, "instruction.create", "denied", "instruction", def.id,
-                                  "duplicate_id");
+                        (void)audit_log(req, "instruction.create", "denied",
+                                        "InstructionDefinition", def.id, "duplicate_id");
                     }
                     auto body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
                                                 : result.error();
@@ -4278,7 +4290,8 @@ private:
                                     "application/json");
                     return;
                 }
-                audit_log(req, "instruction.create", "success", "instruction", *result, def.name);
+                (void)audit_log(req, "instruction.create", "success", "InstructionDefinition",
+                                *result, def.name);
                 emit_event("instruction.created", req,
                            {{"name", def.name},
                             {"plugin", def.plugin},
@@ -4404,7 +4417,7 @@ private:
                                     "application/json");
                     return;
                 }
-                audit_log(req, "instruction.update", "success", "instruction", id);
+                (void)audit_log(req, "instruction.update", "success", "InstructionDefinition", id);
                 emit_event("instruction.updated", req, {}, {{"instruction_id", id}});
                 res.set_header(
                     "HX-Trigger",
@@ -4431,7 +4444,7 @@ private:
             auto id = req.matches[1].str();
             bool deleted = instruction_store_->delete_definition(id);
             if (deleted) {
-                audit_log(req, "instruction.delete", "success", "instruction", id);
+                (void)audit_log(req, "instruction.delete", "success", "InstructionDefinition", id);
                 emit_event("instruction.deleted", req, {}, {{"instruction_id", id}});
                 res.set_header(
                     "HX-Trigger",
@@ -4491,16 +4504,39 @@ private:
                 // "signature verification failed" / "instruction-import
                 // is unsigned" / etc. that SIEM rules can key on).
                 std::string detail = is_conflict ? "duplicate_id" : result.error();
-                audit_log(req, "instruction.import", "denied", "instruction", "", detail);
+                // R2 / Gate 4 unhappy UP-1 + compliance CO-1: capture the
+                // audit_log return and surface failure to the operator via
+                // Sec-Audit-Failed header (PR #883 / SOC 2 CC7.2 pattern at
+                // rest_api_v1.cpp:1129). Silently discarding the bool on a
+                // security-decision audit row re-opens the evidence-chain
+                // gap whose closure was the whole point of R4's hoist.
+                // R2 / Gate 4 consistency CONS-BLOCKING-1: target_type is
+                // now the RBAC-securable PascalCase "InstructionDefinition"
+                // matching ProductPack's W7.4 R2 normalisation, NOT the
+                // legacy lowercase "instruction" string.
+                if (!audit_log(req, "instruction.import", "denied", "InstructionDefinition", "",
+                               detail)) {
+                    res.set_header("Sec-Audit-Failed", "true");
+                }
                 auto body_msg = is_conflict ? std::string(strip_conflict_prefix(result.error()))
                                             : result.error();
-                res.set_content(nlohmann::json({{"error", body_msg}}).dump(), "application/json");
+                res.set_content(
+                    nlohmann::json({{"error", body_msg}, {"audit_emitted", false}}).dump(),
+                    "application/json");
                 return;
             }
-            audit_log(req, "instruction.import", "success", "instruction", *result);
+            // R2 success-branch: same Sec-Audit-Failed treatment so a wedged
+            // audit-store on a successful import surfaces to the operator —
+            // SOC 2 CC7.2 requires the evidence row, and silently landing a
+            // definition in the DB without the row is a half-broken chain.
+            const bool audit_ok =
+                audit_log(req, "instruction.import", "success", "InstructionDefinition", *result);
+            if (!audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Definitions imported","level":"success"}})");
-            res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
+            res.set_content(nlohmann::json({{"id", *result}, {"audit_emitted", audit_ok}}).dump(),
+                            "application/json");
         });
 
         // -- Instruction Sets API ---------------------------------------------
@@ -4740,7 +4776,8 @@ private:
                                 "application/json");
                 return;
             }
-            audit_log(req, "execution.rerun", "success", "execution", *result, "rerun of " + id);
+            (void)audit_log(req, "execution.rerun", "success", "execution", *result,
+                            "rerun of " + id);
             emit_event("execution.created", req, {},
                        {{"execution_id", *result}, {"parent_id", id}, {"trigger", "rerun"}});
             res.set_header(
@@ -4766,7 +4803,7 @@ private:
             auto user = session ? session->username : "unknown";
 
             execution_tracker_->mark_cancelled(id, user);
-            audit_log(req, "execution.cancel", "success", "execution", id);
+            (void)audit_log(req, "execution.cancel", "success", "execution", id);
             emit_event("execution.completed", req, {{"status", "cancelled"}},
                        {{"execution_id", id}});
             res.set_header("HX-Trigger",
@@ -4866,7 +4903,7 @@ private:
                                     "application/json");
                     return;
                 }
-                audit_log(req, "schedule.create", "success", "schedule", *result, sched.name);
+                (void)audit_log(req, "schedule.create", "success", "schedule", *result, sched.name);
                 res.set_header("HX-Trigger",
                                R"({"showToast":{"message":"Schedule created","level":"success"}})");
                 res.set_content(nlohmann::json({{"id", *result}}).dump(), "application/json");
@@ -4891,7 +4928,7 @@ private:
             auto id = req.matches[1].str();
             bool deleted = schedule_engine_->delete_schedule(id);
             if (deleted) {
-                audit_log(req, "schedule.delete", "success", "schedule", id);
+                (void)audit_log(req, "schedule.delete", "success", "schedule", id);
                 res.set_header("HX-Trigger",
                                R"({"showToast":{"message":"Schedule deleted","level":"success"}})");
             }
@@ -4989,7 +5026,7 @@ private:
                                 "application/json");
                 return;
             }
-            audit_log(req, "approval.approve", "success", "approval", id);
+            (void)audit_log(req, "approval.approve", "success", "approval", id);
             emit_event("approval.approved", req, {{"reviewer", reviewer}}, {{"approval_id", id}});
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Approved","level":"success"}})");
@@ -5020,7 +5057,7 @@ private:
                                 "application/json");
                 return;
             }
-            audit_log(req, "approval.reject", "success", "approval", id);
+            (void)audit_log(req, "approval.reject", "success", "approval", id);
             emit_event("approval.rejected", req, {{"reviewer", reviewer}, {"comment", comment}},
                        {{"approval_id", id}});
             res.set_header("HX-Trigger",
@@ -5927,7 +5964,7 @@ private:
                 [this](const httplib::Request& req, const std::string& action,
                        const std::string& result, const std::string& target_type,
                        const std::string& target_id, const std::string& detail) {
-                    audit_log(req, action, result, target_type, target_id, detail);
+                    (void)audit_log(req, action, result, target_type, target_id, detail);
                 },
                 [this]() { return registry_.to_json_obj(); }, rbac_store_.get(),
                 instruction_store_.get(), execution_tracker_.get(), response_store_.get(),

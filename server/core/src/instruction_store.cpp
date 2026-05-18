@@ -687,9 +687,15 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
             }
             if (!ProductPackStore::verify_signature(yaml_source, sig_hex, pub_hex)) {
                 spdlog::error("InstructionStore::import_definition_json: signature verification "
-                              "FAILED — rejecting definition (yaml_source may be tampered)");
+                              "FAILED — rejecting definition (content may be tampered)");
+                // R2 / Gate 4 consistency CONS-BLOCKING-2: wording aligned
+                // with ProductPackStore's parallel error
+                // ("signature verification failed for pack '<name>' — content
+                // may have been tampered with"). Both surfaces now use
+                // "content" as the noun and "may have been tampered with"
+                // as the suffix; SIEM full-string parsers see one shape.
                 return std::unexpected(
-                    "signature verification failed for instruction — yaml_source may "
+                    "signature verification failed for instruction — content may "
                     "have been tampered with");
             }
             spdlog::info("InstructionStore::import_definition_json: signature verified");
