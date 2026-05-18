@@ -21,6 +21,13 @@
 #include "software_deployment_store.hpp"
 #include "tag_store.hpp"
 
+// W5.1 — `/api/v1/events` JSON SSE consumes the per-execution event bus.
+// Forward-declared to avoid pulling the bus header into every TU that
+// already includes rest_api_v1.hpp (test fixtures, server.cpp).
+namespace yuzu::server {
+class ExecutionEventBus;
+}
+
 #include <httplib.h>
 
 #include <functional>
@@ -90,8 +97,8 @@ public:
     /// `revoke_api_tokens=true`, the user's API tokens (closes UP-13:
     /// "Sign out everywhere" must mean everywhere, not just browser
     /// cookies). Empty/missing callback = endpoint returns 503.
-    using SessionRevokeFn = std::function<SessionRevokeResult(
-        const std::string& username, bool revoke_api_tokens)>;
+    using SessionRevokeFn =
+        std::function<SessionRevokeResult(const std::string& username, bool revoke_api_tokens)>;
 
     /// Production overload — constructs an HttplibRouteSink and delegates
     /// to the sink-based overload below.
@@ -100,40 +107,36 @@ public:
     /// create handlers increment `yuzu_secure_random_failure_total{site=...}`
     /// on CSPRNG entropy-exhaustion failures so SRE on-call has a paging
     /// signal short of grepping audit logs (sre-1 on PR W1.1).
-    void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                         RbacStore* rbac_store, ManagementGroupStore* mgmt_store,
-                         ApiTokenStore* token_store, QuarantineStore* quarantine_store,
-                         ResponseStore* response_store, InstructionStore* instruction_store,
-                         ExecutionTracker* execution_tracker, ScheduleEngine* schedule_engine,
-                         ApprovalManager* approval_manager, TagStore* tag_store,
-                         AuditStore* audit_store, ServiceGroupFn service_group_fn = {},
-                         TagPushFn tag_push_fn = {}, InventoryStore* inventory_store = nullptr,
-                         ProductPackStore* product_pack_store = nullptr,
-                         SoftwareDeploymentStore* sw_deploy_store = nullptr,
-                         DeviceTokenStore* device_token_store = nullptr,
-                         LicenseStore* license_store = nullptr,
-                         GuaranteedStateStore* guaranteed_state_store = nullptr,
-                         yuzu::MetricsRegistry* metrics_registry = nullptr,
-                         SessionRevokeFn session_revoke_fn = {});
+    void register_routes(
+        httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
+        RbacStore* rbac_store, ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
+        QuarantineStore* quarantine_store, ResponseStore* response_store,
+        InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
+        ScheduleEngine* schedule_engine, ApprovalManager* approval_manager, TagStore* tag_store,
+        AuditStore* audit_store, ServiceGroupFn service_group_fn = {}, TagPushFn tag_push_fn = {},
+        InventoryStore* inventory_store = nullptr, ProductPackStore* product_pack_store = nullptr,
+        SoftwareDeploymentStore* sw_deploy_store = nullptr,
+        DeviceTokenStore* device_token_store = nullptr, LicenseStore* license_store = nullptr,
+        GuaranteedStateStore* guaranteed_state_store = nullptr,
+        yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
+        ExecutionEventBus* execution_event_bus = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
     /// TSan-hostile acceptor thread (#438).
-    void register_routes(class HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
-                         AuditFn audit_fn, RbacStore* rbac_store, ManagementGroupStore* mgmt_store,
-                         ApiTokenStore* token_store, QuarantineStore* quarantine_store,
-                         ResponseStore* response_store, InstructionStore* instruction_store,
-                         ExecutionTracker* execution_tracker, ScheduleEngine* schedule_engine,
-                         ApprovalManager* approval_manager, TagStore* tag_store,
-                         AuditStore* audit_store, ServiceGroupFn service_group_fn = {},
-                         TagPushFn tag_push_fn = {}, InventoryStore* inventory_store = nullptr,
-                         ProductPackStore* product_pack_store = nullptr,
-                         SoftwareDeploymentStore* sw_deploy_store = nullptr,
-                         DeviceTokenStore* device_token_store = nullptr,
-                         LicenseStore* license_store = nullptr,
-                         GuaranteedStateStore* guaranteed_state_store = nullptr,
-                         yuzu::MetricsRegistry* metrics_registry = nullptr,
-                         SessionRevokeFn session_revoke_fn = {});
+    void register_routes(
+        class HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
+        RbacStore* rbac_store, ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
+        QuarantineStore* quarantine_store, ResponseStore* response_store,
+        InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
+        ScheduleEngine* schedule_engine, ApprovalManager* approval_manager, TagStore* tag_store,
+        AuditStore* audit_store, ServiceGroupFn service_group_fn = {}, TagPushFn tag_push_fn = {},
+        InventoryStore* inventory_store = nullptr, ProductPackStore* product_pack_store = nullptr,
+        SoftwareDeploymentStore* sw_deploy_store = nullptr,
+        DeviceTokenStore* device_token_store = nullptr, LicenseStore* license_store = nullptr,
+        GuaranteedStateStore* guaranteed_state_store = nullptr,
+        yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
+        ExecutionEventBus* execution_event_bus = nullptr);
 };
 
 } // namespace yuzu::server

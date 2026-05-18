@@ -5945,7 +5945,13 @@ private:
                     tokens,
                     revoke.db_persisted,
                 };
-            });
+            },
+            // W5.1 — pass the per-execution event bus into the REST
+            // layer so `GET /api/v1/events` can subscribe agentic
+            // workers to live execution transitions. Same bus the
+            // dashboard SSE handler uses; nullptr leaves the new
+            // route registered but returning 503.
+            execution_event_bus_.get());
 
         // -- Register MCP server routes ----------------------------------------
 

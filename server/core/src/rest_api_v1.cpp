@@ -1,6 +1,9 @@
 #include "rest_api_v1.hpp"
+#include "event_bus.hpp"
+#include "execution_event_bus.hpp"
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
+#include "rest_a4_envelope.hpp"
 #include "response_templates_engine.hpp"
 #include "store_errors.hpp"
 #include "visualization_engine.hpp"
@@ -15,10 +18,13 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
+#include <cstring>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -178,6 +184,10 @@ std::string list_json(std::string_view data_json, int64_t total, int64_t start =
         .raw("meta", R"({"api_version":"v1"})")
         .str();
 }
+
+// A4 / event-envelope helpers move to `yuzu::server::detail` below —
+// declared in `rest_a4_envelope.hpp` so unit tests can assert the shape
+// directly without driving the httplib chunked content provider.
 
 // ── OpenAPI 3.0 spec ────────────────────────────────────────────────────
 // Returned as a static raw string — zero template instantiation at compile
@@ -484,6 +494,9 @@ const std::string& openapi_spec() {
     },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
+    },
+    "/events": {
+      "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Requires Execution:Read. Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus `heartbeat`), and a JSON `data:` envelope of shape `{execution_id, event_id, timestamp_ms, type, payload}`. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). Errors use the A4 envelope: `{error:{code,message,correlation_id,remediation?},meta:{api_version:\"v1\"}}`.", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream.", "content": {"text/event-stream": {}}}, "400": {"description": "Missing or malformed execution_id"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found"}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available"}, "503": {"description": "Tracker or event bus not initialised"}}}
     }
   }
 })json";
@@ -568,6 +581,49 @@ bool is_safe_install_command(std::string_view s) {
 
 } // anonymous namespace
 
+namespace detail {
+
+// W5.1 — definitions for the agentic JSON SSE shape contract. Declared
+// in `rest_a4_envelope.hpp`; defined here so they retain access to the
+// anonymous-namespace JObj/JArr builders (any move into a separate TU
+// would either duplicate the builders or promote them to a public
+// header — both bigger diffs than this PR warrants).
+
+std::string make_correlation_id() {
+    static std::atomic<std::uint64_t> seq{0};
+    auto n = seq.fetch_add(1, std::memory_order_relaxed);
+    auto t = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::system_clock::now().time_since_epoch())
+                 .count();
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "req-%llx-%llx", static_cast<unsigned long long>(t),
+                  static_cast<unsigned long long>(n));
+    return std::string(buf);
+}
+
+std::string error_json_a4(int code, std::string_view message, std::string_view correlation_id,
+                          std::string_view remediation) {
+    auto err =
+        JObj().add("code", code).add("message", message).add("correlation_id", correlation_id);
+    if (!remediation.empty()) {
+        err.add("remediation", remediation);
+    }
+    return JObj().raw("error", err.str()).raw("meta", R"({"api_version":"v1"})").str();
+}
+
+std::string make_event_envelope(std::string_view execution_id,
+                                const yuzu::server::ExecutionEvent& ev) {
+    return JObj()
+        .add("execution_id", execution_id)
+        .add("event_id", static_cast<int64_t>(ev.id))
+        .add("timestamp_ms", ev.timestamp_ms)
+        .add("type", ev.event_type)
+        .raw("payload", ev.data.empty() ? std::string_view("null") : std::string_view(ev.data))
+        .str();
+}
+
+} // namespace detail
+
 // ── Route registration ───────────────────────────────────────────────────────
 
 // Production overload — wraps httplib::Server in an HttplibRouteSink and
@@ -583,14 +639,15 @@ void RestApiV1::register_routes(
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
-    SessionRevokeFn session_revoke_fn) {
+    SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
                     execution_tracker, schedule_engine, approval_manager, tag_store, audit_store,
                     std::move(service_group_fn), std::move(tag_push_fn), inventory_store,
                     product_pack_store, sw_deploy_store, device_token_store, license_store,
-                    guaranteed_state_store, metrics_registry, std::move(session_revoke_fn));
+                    guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
+                    execution_event_bus);
 }
 
 void RestApiV1::register_routes(
@@ -603,7 +660,7 @@ void RestApiV1::register_routes(
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
-    SessionRevokeFn session_revoke_fn) {
+    SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -3612,6 +3669,241 @@ void RestApiV1::register_routes(
                      return;
                  res.set_content(list_json("[]", 0), "application/json");
              });
+
+    // ── W5.1 — GET /api/v1/events (agentic JSON SSE) ─────────────────────
+    //
+    // First surface that satisfies agentic-first invariant A3
+    // (`docs/agentic-first-principle.md`): every long-running operation
+    // emits Server-Sent Events on a documented, authenticated,
+    // agent-accessible channel with JSON envelopes.
+    //
+    // Skeleton scope (sprint W5.1):
+    //   * Required `?execution_id=<id>` filter — multi-execution /
+    //     `?filter=...` syntax is W5.2.
+    //   * Reuses `ExecutionEventBus` (per ladder doc — no new bus).
+    //   * Replays via `Last-Event-ID` header OR `?since=<id>` query
+    //     param (query wins). Replay BEFORE subscribe, both under the
+    //     channel mutex to keep ordering consistent with concurrent
+    //     publishers.
+    //   * A4 envelope on all 4xx/5xx: `{error:{code,message,
+    //     correlation_id,[remediation]},meta:{api_version:"v1"}}`.
+    //   * Audit `api.v1.events.subscribe` on each successful connect
+    //     (no per-session dedup — same Deferred-5 / #700 deferral as
+    //     the dashboard's `/sse/executions/{id}`).
+    //
+    // Parity with the dashboard sibling at `workflow_routes.cpp` —
+    // both consume the same per-execution channel from
+    // `ExecutionEventBus` and apply identical preflight ordering
+    // (auth → perm → tracker → bus → execution → terminal → audit →
+    // headers → replay → subscribe → chunked provider). The wire
+    // shapes differ on purpose: this surface emits the A3-mandated
+    // JSON envelope with `execution_id` baked into every event so an
+    // agentic worker subscribed to one channel can still discriminate
+    // events; the dashboard sibling emits raw `ev.data` because the
+    // browser already knows the channel from the URL path.
+    sink.Get("/api/v1/events", [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus](
+                                   const httplib::Request& req, httplib::Response& res) {
+        auto session = auth_fn(req, res);
+        if (!session) {
+            // auth_fn already set 401 + body. Nothing to do.
+            return;
+        }
+        if (!perm_fn(req, res, "Execution", "Read")) {
+            // perm_fn already set 403 + body.
+            return;
+        }
+
+        // A4 correlation id binds every error/audit row on this
+        // request to a single grep token. Generated once up-front
+        // so 4xx branches and the (future) audit row share it.
+        const auto cid = detail::make_correlation_id();
+
+        // execution_id is mandatory for the W5.1 skeleton — see
+        // sprint plan §2 R-4. Unfiltered subscription expands the
+        // attack surface (any authenticated reader fan-out across
+        // every tenant's executions) and needs a separate threat
+        // model before it ships.
+        if (!req.has_param("execution_id")) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(
+                                400, "execution_id query parameter is required", cid,
+                                "pass ?execution_id=<id> to subscribe to a specific execution"),
+                            "application/json");
+            return;
+        }
+        auto exec_id = req.get_param_value("execution_id");
+        // Same character class as the dashboard sibling — reject
+        // any path-traversal / SSRF-ish payload before the store
+        // sees it. Keeps the audit-row target_id field clean too.
+        static const std::regex kExecIdRe(R"(^[A-Za-z0-9_-]{1,128}$)");
+        if (!std::regex_match(exec_id, kExecIdRe)) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "execution_id format invalid", cid,
+                                                  "execution_id must match [A-Za-z0-9_-]{1,128}"),
+                            "application/json");
+            return;
+        }
+
+        if (!execution_tracker) {
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "execution tracker unavailable", cid),
+                            "application/json");
+            return;
+        }
+        if (!execution_event_bus) {
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "event bus unavailable", cid),
+                            "application/json");
+            return;
+        }
+
+        auto exec_opt = execution_tracker->get_execution(exec_id);
+        if (!exec_opt) {
+            res.status = 404;
+            res.set_content(detail::error_json_a4(404, "execution not found", cid),
+                            "application/json");
+            return;
+        }
+        // Terminal executions get 410 so the client's auto-
+        // reconnect loop terminates. The dashboard sibling does
+        // the same — the difference is the body shape (A4
+        // envelope here, plaintext there).
+        const auto& exec = *exec_opt;
+        if (exec.status != "running" && exec.status != "pending") {
+            res.status = 410;
+            res.set_content(detail::error_json_a4(
+                                410, "execution complete; subscribe-time replay unavailable", cid,
+                                "fetch the final state via GET /api/v1/executions/<id> instead"),
+                            "application/json");
+            return;
+        }
+
+        // Audit BEFORE the chunked provider takes over — once
+        // set_chunked_content_provider runs, headers are sealed.
+        // Audit failure surfaces via `Sec-Audit-Failed: true`
+        // header per PR #883 / PR W1.1 contract (CC6.6 evidence).
+        bool audit_ok = true;
+        try {
+            audit_ok = audit_fn(req, "api.v1.events.subscribe", "success", "Execution", exec_id,
+                                "correlation_id=" + cid);
+        } catch (...) {
+            audit_ok = false;
+        }
+        if (!audit_ok) {
+            res.set_header("Sec-Audit-Failed", "true");
+        }
+        res.set_header("X-Correlation-Id", cid);
+        res.set_header("Cache-Control", "no-cache");
+        res.set_header("X-Accel-Buffering", "no");
+
+        // Replay window. `since` query param overrides
+        // `Last-Event-ID` header — explicit operator intent beats
+        // browser auto-reconnect inference. Bad input → 0 (no
+        // replay) rather than 400; matches the dashboard sibling.
+        std::uint64_t since_id = 0;
+        if (req.has_param("since")) {
+            try {
+                since_id = std::stoull(req.get_param_value("since"));
+            } catch (...) {
+                since_id = 0;
+            }
+        } else if (req.has_header("Last-Event-ID")) {
+            try {
+                since_id = std::stoull(req.get_header_value("Last-Event-ID"));
+            } catch (...) {
+                since_id = 0;
+            }
+        }
+
+        auto sink_state = std::make_shared<detail::SseSinkState>();
+        // Replay before subscribe — both push onto the same queue
+        // under the connection's mutex, so live events emitted
+        // during the replay walk arrive after the replayed events
+        // (per the bus's channel mutex) and ahead of the first
+        // wait_for in the content provider.
+        std::string exec_id_for_capture = exec_id;
+        execution_event_bus->replay_since(
+            exec_id, since_id, [sink_state, exec_id_for_capture](const ExecutionEvent& ev) {
+                detail::SseEvent sse;
+                sse.event_type = ev.event_type;
+                // Frame the per-bus event into <id>\n<JSON
+                // envelope> so the content provider can split
+                // and emit `id:` + `event:` + `data:` lines
+                // without re-touching the bus.
+                sse.data = std::to_string(ev.id) + "\n" +
+                           detail::make_event_envelope(exec_id_for_capture, ev);
+                std::lock_guard<std::mutex> lk(sink_state->mu);
+                sink_state->queue.push_back(std::move(sse));
+            });
+
+        auto* bus = execution_event_bus;
+        sink_state->sub_id =
+            bus->subscribe(exec_id, [sink_state, exec_id_for_capture](const ExecutionEvent& ev) {
+                detail::SseEvent sse;
+                sse.event_type = ev.event_type;
+                sse.data = std::to_string(ev.id) + "\n" +
+                           detail::make_event_envelope(exec_id_for_capture, ev);
+                {
+                    std::lock_guard<std::mutex> lk(sink_state->mu);
+                    sink_state->queue.push_back(std::move(sse));
+                }
+                sink_state->cv.notify_one();
+            });
+
+        res.set_chunked_content_provider(
+            "text/event-stream",
+            [sink_state](size_t /*offset*/, httplib::DataSink& s) -> bool {
+                std::unique_lock<std::mutex> lk(sink_state->mu);
+                sink_state->cv.wait_for(lk, std::chrono::seconds(3), [&] {
+                    return !sink_state->queue.empty() || sink_state->closed.load();
+                });
+                if (sink_state->closed.load())
+                    return false;
+                while (!sink_state->queue.empty()) {
+                    auto ev = std::move(sink_state->queue.front());
+                    sink_state->queue.pop_front();
+
+                    // Split <id>\n<envelope_json>. The listener
+                    // queued in that shape; peel back here to
+                    // emit the SSE `id:` line the spec requires
+                    // (browsers and curl --no-buffer rely on it
+                    // to populate Last-Event-ID on reconnect).
+                    std::string id_part;
+                    std::string data_part;
+                    if (auto nl = ev.data.find('\n'); nl != std::string::npos) {
+                        id_part = ev.data.substr(0, nl);
+                        data_part = ev.data.substr(nl + 1);
+                    } else {
+                        data_part = std::move(ev.data);
+                    }
+                    std::string out = "id: " + id_part + "\n" + "event: " + ev.event_type + "\n" +
+                                      "data: " + data_part + "\n\n";
+                    const char* p = out.data();
+                    std::size_t rem = out.size();
+                    constexpr std::size_t kMaxSlice = 8192;
+                    while (rem > 0) {
+                        auto n = std::min(rem, kMaxSlice);
+                        if (!s.write(p, n))
+                            return false;
+                        p += n;
+                        rem -= n;
+                    }
+                }
+                // Heartbeat keeps the connection above httplib's
+                // 5s Keep-Alive timeout and confirms liveness to
+                // intermediary proxies. Same cadence as the
+                // dashboard sibling.
+                static const char* keepalive = "event: heartbeat\ndata: \n\n";
+                if (!s.write(keepalive, std::strlen(keepalive)))
+                    return false;
+                return true;
+            },
+            [sink_state, bus, exec_id_for_capture](bool /*success*/) {
+                sink_state->closed.store(true);
+                sink_state->cv.notify_all();
+                bus->unsubscribe(exec_id_for_capture, sink_state->sub_id);
+            });
+    });
 
     spdlog::info("REST API v1: registered all routes at /api/v1/*");
 }

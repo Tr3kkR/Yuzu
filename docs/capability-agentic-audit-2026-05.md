@@ -122,10 +122,11 @@ Per surface, what an authenticated agentic worker can do today vs cannot.
 | Channel | Auth | Shape | Agent-friendly? |
 |---|---|---|---|
 | `/events` (`server.cpp:2450`) | Yes (cookie or token via `resolve_session`) | HTML fragments | No — content shape mismatch |
-| `/api/v1/guaranteed-state/events` (`rest_api_v1.cpp:2498`) | Yes | JSON | Yes |
-| Workflow / executions SSE (`workflow_routes.cpp:735`) | Yes | text/event-stream — needs verification of JSON-ness | Likely yes |
+| `/api/v1/guaranteed-state/events` (`rest_api_v1.cpp:2498`) | Yes | JSON (polling, not streaming) | Yes |
+| `/api/v1/events` (`rest_api_v1.cpp` — sprint W5.1, 2026-05-18) | Yes (`Execution:Read`) | JSON SSE with A3 envelope | **Yes — first surface that satisfies A3 + A4** |
+| Workflow / executions SSE (`workflow_routes.cpp:735`) | Yes | text/event-stream (raw `ev.data`, dashboard-shaped) | Browser-friendly only |
 
-A3 backfill should pattern after `/api/v1/guaranteed-state/events` rather than introduce a new bus — the existing `event_bus_` and `ExecutionEventBus` (per `docs/executions-history-ladder.md`) carry the events; only the outward shape needs a JSON sibling on a documented `/api/v1/events` channel with filterable subscriptions.
+`/api/v1/events` is the agentic-first SSE channel that A3 backfill kept asking for. It reuses the same `ExecutionEventBus` the dashboard channel rides on (no new bus), wraps each event in `{execution_id, event_id, timestamp_ms, type, payload}` per A3, and emits the A4 error envelope on every 4xx/5xx. W5.1 ships the skeleton (single-execution filter via `?execution_id=`); W5.2 extends with multi-execution / `?filter=` syntax and content negotiation on `/fragments/executions`.
 
 ### 4.5 Auth & identity
 
@@ -192,7 +193,7 @@ These five items become roadmap issues 17.1–17.5 (proposed Phase 17 — Agenti
 
 - **17.1 Introspection endpoints** (A2). `/api/v1/discover/{routes,plugins,scope-kinds,permissions,instructions}` with mirrored MCP tools. Source from existing `openapi_spec()` and the agent-registered `PluginInfo` rather than re-walking handlers.
 - **17.2 Dashboard JSON content negotiation** (A1). Add `Accept: application/json` honoring on `/fragments/*` page routes; admin-surface fragments (user mgmt, enrollment, settings) earmarked for first cut.
-- **17.3 Agent-facing JSON SSE channel** (A3). Pattern after `/api/v1/guaranteed-state/events`; expose `/api/v1/events?since=&filter=execution_id:X|agent_id:Y`. Reuse `event_bus_` and the executions ladder's `ExecutionEventBus`. Decide separately whether to deprecate the HTML-fragment `/events` channel or keep both.
+- **17.3 Agent-facing JSON SSE channel** (A3). Pattern after `/api/v1/guaranteed-state/events`; expose `/api/v1/events?since=&filter=execution_id:X|agent_id:Y`. Reuse `event_bus_` and the executions ladder's `ExecutionEventBus`. Decide separately whether to deprecate the HTML-fragment `/events` channel or keep both. **Sprint W5.1 (2026-05-18) shipped the skeleton** — single-execution filter via `?execution_id=`, A3 envelope, A4 errors, OpenAPI discovery row, Sec-Audit-Failed honouring. W5.2 finishes the multi-execution `?filter=` syntax and the fragment content negotiation.
 - **17.4 Service-account principal type** (A2 + auth). `auth_db` migration to add `principal_type IN ('user','service_account')`. Service accounts can be scoped to mgmt-group / plugin / operation subsets.
 - **17.5 Structured error envelope rev** (A4). `correlation_id`, `retry_after_ms`, `remediation`; on `kPermissionDenied` name the missing `securable_type:operation`; on `kApprovalRequired` return `approval_id` + `status_url`.
 
