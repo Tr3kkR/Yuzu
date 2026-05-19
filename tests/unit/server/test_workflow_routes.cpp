@@ -27,6 +27,7 @@
 #include "workflow_routes.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
 
@@ -81,6 +82,15 @@ struct ExecHarness {
     /// registered BEFORE dispatch). Empty when the dispatch path has no
     /// tracker context.
     std::string last_dispatch_execution_id;
+    /// #1088 — override the (command_id, sent) pair the dispatch stub
+    /// returns. Default keeps the legacy stub behavior (`"", 0`) so the
+    /// route hits its 503 "no agents reached" branch (the PR-2 UP2-4
+    /// regression-net path that does not exercise the response builder).
+    /// Tests that need to reach the 200 response builder — e.g. asserting
+    /// the new `execution_id` field in the response body — set these to
+    /// non-default values.
+    std::string dispatch_cmd_override;
+    int dispatch_sent_override{0};
     /// PR 4 audit-coverage regression net: captures every audit_fn call
     /// the routes layer makes so tests can assert the SSE handler's
     /// audit-on-success / audit-absence-on-denied policy (qe-S4).
@@ -165,7 +175,7 @@ struct ExecHarness {
                                    const std::unordered_map<std::string, std::string>&,
                                    const std::string& execution_id) -> std::pair<std::string, int> {
             last_dispatch_execution_id = execution_id;
-            return {"", 0};
+            return {dispatch_cmd_override, dispatch_sent_override};
         };
 
         // PR 2.5 (#670): deps-struct refactor. WorkflowRoutes::register_routes
@@ -774,6 +784,44 @@ TEST_CASE("PR2 hardening — UP2-4: cmd_dispatch receives non-empty execution_id
     // which is what we're pinning here.
     REQUIRE(res);
     CHECK(!h.last_dispatch_execution_id.empty());
+}
+
+TEST_CASE("#1088 — POST /api/instructions/:id/execute response includes execution_id",
+          "[workflow][executions][execute][issue-1088][agentic]") {
+    // The agentic-first workflow shipped in W5.1 (#1094) is:
+    //   1. dispatch via POST /api/instructions/:id/execute OR MCP execute_instruction
+    //   2. subscribe to live events via GET /api/v1/events?execution_id=<id>
+    // The handoff was broken: dispatch returned only command_id, but the
+    // SSE endpoint requires execution_id with no public bridge. #1088
+    // closes the gap by adding execution_id to the dispatch response.
+    // This test pins the contract: dispatch response body MUST contain a
+    // non-empty execution_id that can be used immediately with the SSE
+    // endpoint.
+    ExecHarness h;
+    h.make_def("def-AGENTIC", "Agentic");
+    // Override the dispatch stub to return sent>0 so the route reaches
+    // the response-build path (default stub returns 0 → 503).
+    h.dispatch_cmd_override = "cmd-agentic-abc";
+    h.dispatch_sent_override = 3;
+
+    auto res = h.sink.Post("/api/instructions/def-AGENTIC/execute",
+                           R"({"params":{},"agent_ids":["a1","a2","a3"]})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("execution_id"));
+    REQUIRE(body["execution_id"].is_string());
+    CHECK(!body["execution_id"].get<std::string>().empty());
+    // The execution_id returned MUST be the same one threaded into the
+    // dispatch closure — proves the response and the agent-side mapping
+    // see the same id.
+    CHECK(body["execution_id"].get<std::string>() == h.last_dispatch_execution_id);
+    // Backwards-compat: command_id, agents_reached, definition_id are
+    // still present.
+    CHECK(body["command_id"] == "cmd-agentic-abc");
+    CHECK(body["agents_reached"] == 3);
+    CHECK(body["definition_id"] == "def-AGENTIC");
 }
 
 TEST_CASE("PR2 hardening — query_by_execution includes the partial-index "

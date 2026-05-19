@@ -5680,6 +5680,14 @@ private:
             mgmt_group_store_.get(), &registry_, tag_store_.get(), &event_bus_,
             [this]() -> std::string { return registry_.to_json(); },
             // DispatchFn — reuses /api/command dispatch logic
+            //
+            // Fed into DashboardRoutes (legacy /api/command UI surface);
+            // signature MUST stay at 5 parameters. The MCP and REST
+            // execute-instruction surfaces have their own 6-parameter
+            // dispatch closures (see server.cpp ~5812 for WorkflowRoutes
+            // and ~6032 for McpServer) with `execution_id` threaded
+            // through for the ExecutionTracker mapping (PR 2 UP2-4
+            // race close + #1088 agentic-first bridging).
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters)
@@ -6010,11 +6018,16 @@ private:
                 audit_store_.get(), tag_store_.get(), inventory_store_.get(), policy_store_.get(),
                 mgmt_group_store_.get(), approval_manager_.get(), schedule_engine_.get(),
                 cfg_.mcp_read_only, cfg_.mcp_disable,
-                // DispatchFn — reuses /api/command dispatch logic for MCP execute_instruction
+                // DispatchFn — reuses /api/command dispatch logic for MCP execute_instruction.
+                // #1088 — execution_id parameter added so the MCP tool's
+                // pre-created execution row is bridged into
+                // AgentServiceImpl's cmd_execution_ids_ map BEFORE any
+                // RPC fires (UP2-4 race close from PR 2). Empty
+                // execution_id is the legacy untracked path.
                 [this](const std::string& plugin, const std::string& action,
                        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-                       const std::unordered_map<std::string, std::string>& parameters)
-                    -> std::pair<std::string, int> {
+                       const std::unordered_map<std::string, std::string>& parameters,
+                       const std::string& execution_id) -> std::pair<std::string, int> {
                     auto command_id =
                         plugin + "-" +
                         auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
@@ -6026,6 +6039,9 @@ private:
                     for (const auto& [k, v] : parameters)
                         (*cmd.mutable_parameters())[k] = v;
                     agent_service_.record_send_time(command_id);
+                    if (!execution_id.empty()) {
+                        agent_service_.record_execution_id(command_id, execution_id);
+                    }
 
                     int sent = 0;
                     if (!scope_expr.empty() && scope_expr != "__all__" &&

@@ -1462,18 +1462,29 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             execution_tracker->set_agents_targeted(execution_id, sent);
         }
 
+        // governance R1 happy-LOW-1 (#1088 round): include execution_id
+        // in audit detail so SOC 2 investigators can join the audit row
+        // to the execution tracker row without a separate lookup.
         audit_fn(req, "instruction.execute", "success", "instruction", def_id,
-                 "command_id=" + command_id + " agents=" + std::to_string(sent));
+                 "command_id=" + command_id + " execution_id=" + execution_id +
+                     " agents=" + std::to_string(sent));
         emit_fn("instruction.executed", req);
 
         auto trigger_msg = std::string("{\"showToast\":{\"message\":\"Instruction dispatched to ") +
                            std::to_string(sent) + " agent(s)\",\"level\":\"success\"}}";
         res.set_header("HX-Trigger", trigger_msg);
-        res.set_content(
-            nlohmann::json(
-                {{"command_id", command_id}, {"agents_reached", sent}, {"definition_id", def_id}})
-                .dump(),
-            "application/json");
+        // #1088 — include execution_id in the response so an agentic
+        // worker can immediately subscribe to /api/v1/events with it
+        // (the agentic-first endpoint requires execution_id, not
+        // command_id). Empty execution_id when execution_tracker is
+        // unavailable is included anyway as an empty string so the
+        // response shape stays stable.
+        res.set_content(nlohmann::json({{"command_id", command_id},
+                                        {"execution_id", execution_id},
+                                        {"agents_reached", sent},
+                                        {"definition_id", def_id}})
+                            .dump(),
+                        "application/json");
     });
 
     // -- Product Pack API (Phase 7) -------------------------------------------
