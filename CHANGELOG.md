@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **#1088 — `McpServer::DispatchFn` signature gained trailing
+  `execution_id` parameter.** Internal ABI on the `McpServer` class
+  (header `server/core/src/mcp_server.hpp`). The typedef now matches
+  `WorkflowRoutes::CommandDispatchFn` (both 6-parameter with
+  `execution_id` last). Only production consumer is `server.cpp`
+  (updated). Out-of-tree consumers embedding `McpServer` directly
+  must update their dispatch lambdas to accept the new parameter
+  (default-empty for callers that don't track executions).
+
 ### Added
 
 - **#1088 — `execution_id` in dispatch responses (closes W5.1 agentic

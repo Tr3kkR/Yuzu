@@ -1462,8 +1462,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             execution_tracker->set_agents_targeted(execution_id, sent);
         }
 
+        // governance R1 happy-LOW-1 (#1088 round): include execution_id
+        // in audit detail so SOC 2 investigators can join the audit row
+        // to the execution tracker row without a separate lookup.
         audit_fn(req, "instruction.execute", "success", "instruction", def_id,
-                 "command_id=" + command_id + " agents=" + std::to_string(sent));
+                 "command_id=" + command_id + " execution_id=" + execution_id +
+                     " agents=" + std::to_string(sent));
         emit_fn("instruction.executed", req);
 
         auto trigger_msg = std::string("{\"showToast\":{\"message\":\"Instruction dispatched to ") +

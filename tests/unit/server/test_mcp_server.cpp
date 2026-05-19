@@ -15,6 +15,7 @@
 
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "response_store.hpp"
 #include "scope_engine.hpp"
@@ -22,11 +23,16 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <sqlite3.h>
+
 #include <chrono>
 #include <filesystem>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
+
+#include "../test_helpers.hpp"
 
 using namespace yuzu::server::mcp;
 using namespace yuzu::server;
@@ -521,6 +527,18 @@ struct McpTestServer {
     std::vector<std::string> last_dispatch_agent_ids;
     std::string last_dispatch_scope;
     std::unordered_map<std::string, std::string> last_dispatch_params;
+    /// governance R1 (QE SHOULD-2 + happy-LOW-2 + consistency SHOULD-1):
+    /// capture the execution_id threaded into the dispatch closure so a
+    /// test can assert round-trip identity with the response — mirrors
+    /// `ExecHarness::last_dispatch_execution_id` in test_workflow_routes.cpp.
+    std::string last_dispatch_execution_id;
+
+    /// governance R1 (QE SHOULD-1 + happy-LOW-2): allow a test to wire a
+    /// real ExecutionTracker so the create_execution / set_agents_targeted
+    /// / mark_cancelled lifecycle is exercised end-to-end on the MCP path.
+    /// Default nullptr preserves backwards-compat with every existing
+    /// MCP test that needs the lifecycle to be a no-op.
+    yuzu::server::ExecutionTracker* execution_tracker_for_test{nullptr};
 
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
@@ -607,7 +625,7 @@ private:
             std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), std::move(agents_fn),
             /*rbac_store=*/nullptr,
             /*instruction_store=*/nullptr,
-            /*execution_tracker=*/nullptr,
+            /*execution_tracker=*/execution_tracker_for_test,
             /*response_store=*/nullptr,
             /*audit_store=*/nullptr,
             /*tag_store=*/nullptr,
@@ -1117,12 +1135,13 @@ TEST_CASE("MCP Integration: execute_instruction happy dispatch", "[mcp][integrat
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
+                        const std::string& execution_id) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_scope = scope_expr;
         ts.last_dispatch_params = params;
+        ts.last_dispatch_execution_id = execution_id;
         return {"cmd-abc", 2};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -1143,12 +1162,104 @@ TEST_CASE("MCP Integration: execute_instruction happy dispatch", "[mcp][integrat
     CHECK(text["agents_reached"] == 2);
     CHECK(text["plugin"] == "os_info");
     CHECK(text["action"] == "version");
-    // #1088 — response carries execution_id (empty string here because
-    // the harness wires execution_tracker=nullptr; presence-of-key is
-    // the stable contract). A separate test below exercises the
-    // non-empty path with a real tracker.
+    // #1088 — response carries execution_id. The harness here wires
+    // execution_tracker=nullptr so the response value is empty string;
+    // presence-of-key + is_string is the stable contract for this
+    // configuration. The non-empty round-trip identity contract is
+    // pinned by `execute_instruction populates execution_id and threads
+    // it through dispatch` below (which wires a real ExecutionTracker).
     REQUIRE(text.contains("execution_id"));
     CHECK(text["execution_id"].is_string());
+    // No tracker → empty execution_id in both the response AND the
+    // value the dispatch closure observed (the handler skips
+    // create_execution and dispatch_fn sees "").
+    CHECK(text["execution_id"].get<std::string>().empty());
+    CHECK(ts.last_dispatch_execution_id.empty());
+}
+
+// ── 23b. execute_instruction with real ExecutionTracker — non-empty path ──
+
+TEST_CASE("MCP Integration: execute_instruction populates execution_id and threads it through "
+          "dispatch (#1088)",
+          "[mcp][integration][execute][issue-1088]") {
+    // governance R1 closure for QE SHOULD-1 + SHOULD-2 / happy-LOW-2 /
+    // consistency SHOULD-1: with a real ExecutionTracker wired in, the
+    // MCP `execute_instruction` lifecycle (create_execution → dispatch
+    // → set_agents_targeted) is exercised end-to-end. This test pins
+    // the contract that the dispatch closure receives the SAME
+    // execution_id the handler reports back in the JSON-RPC result —
+    // mirroring the REST sibling test at
+    // `test_workflow_routes.cpp:#1088 — POST /api/instructions/.../execute`.
+    auto db_path = yuzu::test::unique_temp_path("test-mcp-exec-tracker-");
+    std::filesystem::remove(db_path);
+
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
+    // RAII: close + delete on scope exit so a REQUIRE failure mid-test
+    // doesn't leak the temp DB. Matches the SqliteHandleGuard pattern
+    // from test_workflow_routes.cpp.
+    struct Guard {
+        sqlite3* h;
+        std::filesystem::path p;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+            std::error_code ec;
+            std::filesystem::remove(p, ec);
+            std::filesystem::remove(p.string() + "-wal", ec);
+            std::filesystem::remove(p.string() + "-shm", ec);
+        }
+    } guard{db, db_path};
+
+    yuzu::server::ExecutionTracker tracker(db);
+    tracker.create_tables();
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                        const std::unordered_map<std::string, std::string>& params,
+                        const std::string& execution_id) -> std::pair<std::string, int> {
+        ts.last_dispatch_plugin = plugin;
+        ts.last_dispatch_action = action;
+        ts.last_dispatch_agent_ids = agent_ids;
+        ts.last_dispatch_scope = scope_expr;
+        ts.last_dispatch_params = params;
+        ts.last_dispatch_execution_id = execution_id;
+        return {"cmd-tracker", 3};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":231,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto text = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+
+    // Response carries a non-empty execution_id.
+    REQUIRE(text.contains("execution_id"));
+    REQUIRE(text["execution_id"].is_string());
+    auto exec_id = text["execution_id"].get<std::string>();
+    CHECK(!exec_id.empty());
+
+    // Round-trip identity: the dispatch closure saw THE SAME execution_id
+    // the response returned. This is the contract that lets an agentic
+    // worker dispatch + subscribe in a single round-trip — if these ever
+    // diverged the worker would subscribe to an execution_id the
+    // command_id was never bound to.
+    CHECK(exec_id == ts.last_dispatch_execution_id);
+
+    // The execution row exists in the tracker, in `running` state with
+    // the dispatched principal recorded.
+    auto exec = tracker.get_execution(exec_id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
+    CHECK(exec->dispatched_by == "test-user"); // McpTestServer auth_fn sets username="test-user"
+    CHECK(exec->agents_targeted == 3);         // set_agents_targeted called with sent=3
 }
 
 // ── 24. Null dispatch_fn ──────────────────────────────────────────────────
@@ -1176,7 +1287,7 @@ TEST_CASE("MCP Integration: execute_instruction missing plugin", "[mcp][integrat
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         return {"", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -1199,7 +1310,7 @@ TEST_CASE("MCP Integration: execute_instruction missing action", "[mcp][integrat
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         return {"", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -1223,7 +1334,7 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
     McpTestServer ts;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         return {"cmd-xyz", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -1278,7 +1389,7 @@ TEST_CASE("MCP Integration: execute_instruction explicit agent_ids",
     auto dispatch = [&](const std::string&, const std::string&,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>&,
-                        const std::string&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_scope = scope_expr;
         return {"cmd-agents", 2};
@@ -1353,7 +1464,7 @@ TEST_CASE("MCP Integration: execute_instruction blocked by read_only_mode",
     ts.read_only_mode_ = true;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         return {"cmd-ro", 1};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -1376,7 +1487,7 @@ TEST_CASE("MCP Integration: execute_instruction blocked by readonly tier",
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         return {"cmd-ro", 1};
     };
     ts.start_with_dispatch(dispatch, "readonly");
@@ -1399,7 +1510,7 @@ TEST_CASE("MCP Integration: execute_instruction operator tier proceeds",
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>&, const std::string&,
                         const std::unordered_map<std::string, std::string>&,
-                        const std::string&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         return {"cmd-op", 3};
@@ -1431,7 +1542,7 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier approval-gated",
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         return {"cmd-sup", 1};
     };
     ts.start_with_dispatch(dispatch, "supervised");
@@ -1453,7 +1564,7 @@ TEST_CASE("MCP Integration: execute_instruction audit on success", "[mcp][integr
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         return {"cmd-audit", 2};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -1477,7 +1588,7 @@ TEST_CASE("MCP Integration: execute_instruction audit on no-agents",
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         return {"cmd-empty", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");

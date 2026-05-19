@@ -230,8 +230,9 @@ static const ToolDef kTools[] = {
 
     // Phase 2 write tool
     {"execute_instruction",
-     "Execute a plugin action on one or more agents. Returns a command_id; poll results with "
-     "query_responses. "
+     "Execute a plugin action on one or more agents. Returns command_id, execution_id, "
+     "agents_reached, plugin, and action. Poll results with query_responses or subscribe to "
+     "live JSON events via GET /api/v1/events?execution_id=<id>. "
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents.",
      R"j({"type":"object","properties":{)j"
@@ -1635,31 +1636,86 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (auto created = execution_tracker->create_execution(exec);
                         created.has_value()) {
                         execution_id = *created;
+                    } else {
+                        // governance R1 unhappy-UP-3: create_execution
+                        // returning nullopt is a SQLite write failure
+                        // (disk full, locked DB, schema corruption).
+                        // Silently proceeding with empty execution_id
+                        // hides the tracker outage from operators. Log
+                        // at warn so SREs see the failure; dispatch
+                        // continues so the operator's "stop NOW"
+                        // semantic stays available (the agentic worker
+                        // still sees an empty execution_id and can fall
+                        // back to query_responses).
+                        spdlog::warn("MCP execute_instruction: execution_tracker->create_execution "
+                                     "returned nullopt; dispatching with empty execution_id "
+                                     "principal={} plugin={} action={}",
+                                     session->username, plugin, action);
                     }
                 }
 
-                auto [command_id, agents_reached] =
-                    dispatch_fn(plugin, action, agent_ids, scope, params, execution_id);
+                // governance R1 unhappy-UP-1 BLOCKING: dispatch_fn can
+                // throw (mgmt_group_store->get_members SQLite, scope
+                // parser bug, registry_.send_to_* gRPC stream write,
+                // forward_gateway_pending gateway stub state, std::
+                // bad_alloc, mutex contention). Without protection the
+                // pre-created execution row sits at status=running
+                // forever AND the JSON-RPC client sees a connection
+                // drop instead of a structured error envelope. Mirrors
+                // the REST sibling at workflow_routes.cpp:1427-1444.
+                std::string command_id;
+                int agents_reached = 0;
+                try {
+                    std::tie(command_id, agents_reached) =
+                        dispatch_fn(plugin, action, agent_ids, scope, params, execution_id);
+                } catch (const std::exception& e) {
+                    spdlog::error("MCP execute_instruction: dispatch failed: {}", e.what());
+                    if (execution_tracker && !execution_id.empty()) {
+                        execution_tracker->mark_cancelled(execution_id, session->username);
+                    }
+                    mcp_audit("failure",
+                              std::string("dispatch_exception execution_id=") + execution_id);
+                    res.set_content(error_response(id, kInternalError, "dispatch failed"),
+                                    "application/json");
+                    return;
+                }
 
                 if (agents_reached == 0) {
                     // Mirror the REST sibling — cancel the pre-created
                     // execution row so it doesn't sit at status=running
                     // forever. mark_cancelled records the attempt for
                     // forensic audit instead of orphaning a phantom row.
+                    // governance R1 security/compliance/cpp/sre/consistency
+                    // (4 agents) — identity arg matches REST sibling now
+                    // (`session->username`, not literal `"mcp"`) so any
+                    // future change to ExecutionTracker that persists the
+                    // user field records the authenticated principal.
                     if (execution_tracker && !execution_id.empty()) {
-                        execution_tracker->mark_cancelled(execution_id, "mcp");
+                        execution_tracker->mark_cancelled(execution_id, session->username);
                     }
+                    // governance R1 unhappy-UP-7: structured signal so
+                    // the agentic worker can branch on `status` without
+                    // parsing the free-text message. The text content
+                    // stays for backwards compatibility with workers
+                    // that parse it; the status field is the stable
+                    // programmatic surface.
+                    auto zero_obj = JObj()
+                                        .add("status", "no_agents_reached")
+                                        .add("command_id", command_id)
+                                        .add("execution_id", execution_id)
+                                        .add("agents_reached", 0)
+                                        .add("plugin", plugin)
+                                        .add("action", action)
+                                        .add("message", "No agents reachable for command dispatch");
                     auto result =
                         JObj()
                             .raw("content",
                                  JArr()
-                                     .add(JObj()
-                                              .add("type", "text")
-                                              .add("text",
-                                                   "No agents reachable for command dispatch"))
+                                     .add(JObj().add("type", "text").add("text", zero_obj.str()))
                                      .str())
                             .str();
-                    mcp_audit("failure", "no agents reachable");
+                    mcp_audit("failure",
+                              std::string("no_agents_reached execution_id=") + execution_id);
                     res.set_content(success_response(id, result), "application/json");
                     return;
                 }
@@ -1689,7 +1745,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .add(JObj().add("type", "text").add("text", result_obj.str()))
                                  .str())
                         .str();
-                mcp_audit("success");
+                // governance R1 happy-LOW-1: include command_id and
+                // execution_id in audit detail so SOC 2 investigators
+                // can join the audit row to the execution tracker row
+                // without a separate lookup.
+                mcp_audit("success", std::string("command_id=") + command_id +
+                                         " execution_id=" + execution_id);
                 res.set_content(success_response(id, result), "application/json");
                 return;
             }
