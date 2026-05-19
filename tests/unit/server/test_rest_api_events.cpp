@@ -834,3 +834,70 @@ TEST_CASE("GET /api/v1/events: subscribe increments yuzu_server_sse_api_* metric
     // dashboard sibling has no metric either; this is the first
     // endpoint-scoped active-connection signal.
 }
+
+// ── GET /api/v1/executions/{id} (#1088 R2 — UAT-found contract gap) ─────────
+
+TEST_CASE("GET /api/v1/executions/{id}: returns final state JSON for known execution",
+          "[events][executions][issue-1088]") {
+    // The W5.1 /api/v1/events 410 envelope remediation hint points at
+    // this endpoint. UAT smoke on #1088 caught that the endpoint did
+    // not exist (only /sse/executions/{id} HTML+SSE and the dashboard
+    // fragment). R2 adds the route so the agentic dispatch→observe
+    // loop has a working fallback when the SSE channel has already
+    // gone terminal.
+    RestEventsHarness h;
+    auto exec_id = h.make_exec("running");
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    // Envelope shape: {data:{...}, meta:{api_version:"v1"}}
+    REQUIRE(res->body.find(R"("api_version":"v1")") != std::string::npos);
+    REQUIRE(res->body.find(R"("id":")" + exec_id + R"(")") != std::string::npos);
+    REQUIRE(res->body.find(R"("status":"running")") != std::string::npos);
+    REQUIRE(res->body.find(R"("dispatched_by":"tester")") != std::string::npos);
+    REQUIRE(res->body.find(R"("agents_targeted":3)") != std::string::npos);
+    // Headers: X-Correlation-Id for grep-by-token.
+    REQUIRE(res->get_header_value("X-Correlation-Id").starts_with("req-"));
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: unknown id → 404 A4 envelope",
+          "[events][executions][issue-1088][notfound]") {
+    RestEventsHarness h;
+    auto res = h.sink.Get("/api/v1/executions/exec-does-not-exist");
+    REQUIRE(res);
+    REQUIRE(res->status == 404);
+    REQUIRE(res->body.find(R"("code":404)") != std::string::npos);
+    REQUIRE(res->body.find("execution not found") != std::string::npos);
+    REQUIRE(res->body.find(R"("correlation_id":"req-)") != std::string::npos);
+    // A4 mandates an api_version meta block on every error envelope.
+    REQUIRE(res->body.find(R"("api_version":"v1")") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: tracker unavailable → 503 A4 with retry_after_ms",
+          "[events][executions][issue-1088][noresources]") {
+    RestEventsHarness h(/*with_bus=*/true, /*with_tracker=*/false);
+    auto res = h.sink.Get("/api/v1/executions/exec-anything");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->body.find("execution tracker unavailable") != std::string::npos);
+    // Mirrors the /api/v1/events 503 contract — clients can back off.
+    REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: auth denied → 401 (no body leak)",
+          "[events][executions][issue-1088][auth]") {
+    RestEventsHarness h;
+    h.session_present = false;
+    auto res = h.sink.Get("/api/v1/executions/exec-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 401);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: permission denied → 403",
+          "[events][executions][issue-1088][perm]") {
+    RestEventsHarness h;
+    h.perm_grant = false;
+    auto res = h.sink.Get("/api/v1/executions/exec-1");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+}

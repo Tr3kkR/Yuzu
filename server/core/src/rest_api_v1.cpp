@@ -558,6 +558,9 @@ const std::string& openapi_spec() {
     },
     "/events": {
       "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Requires Execution:Read. Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus the synthetic `replay-gap` / `events-dropped` / `heartbeat`), and a JSON `data:` payload conforming to ExecutionSseEvent. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). Non-integer `?since` values silently degrade to 0 (no replay). On reconnect after the per-execution ring buffer has evicted older events (FIFO, ~1000 events / ~30s window), a synthetic `replay-gap` frame is emitted as the first event so the worker knows state may be inconsistent. A slow consumer that lets the per-connection queue fill receives a synthetic `events-dropped` envelope summarising the drop count rather than silent OOM growth. Errors use the A4 envelope (ErrorEnvelope schema). Response headers always include X-Correlation-Id; Sec-Audit-Failed: true is set when audit persistence fails (CC6.6 contract).", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header. Non-integer values silently degrade to 0."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream. Each `data:` line is an ExecutionSseEvent.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when audit row persistence failed; subscription still proceeds (CC6.6 evidence chain)."}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/ExecutionSseEvent"}}}}, "400": {"description": "Missing or malformed execution_id", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Tracker or event bus not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/executions/{id}": {
+      "get": {"summary": "Fetch the final state of a single execution (#1088)", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Requires Execution:Read.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Final execution state", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     }
   }
 })json";
@@ -2565,6 +2568,76 @@ void RestApiV1::register_routes(
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
                                  "application/json");
              });
+
+    // ── GET /api/v1/executions/{id} — final-state lookup (#1088 UAT-found gap)
+    //
+    // The W5.1 `GET /api/v1/events` 410 envelope's remediation hint
+    // references this endpoint as the fallback for fetching final
+    // execution state after the SSE channel has gone terminal. UAT
+    // smoke on the #1088 PR caught that the endpoint did not exist
+    // (only `/sse/executions/{id}` and `/fragments/executions/{id}/detail`).
+    // This handler closes the W5.1 + #1088 contract: agentic workers
+    // that miss the live SSE window can pull final state in one round-
+    // trip without parsing HTML fragments.
+    //
+    // Auth: Execution:Read (same gate as /api/v1/events and the
+    // dashboard SSE sibling). 404 on unknown id is A4-shaped. 503 on
+    // unwired tracker carries `retry_after_ms` mirroring the
+    // /api/v1/events startup-window behavior.
+    sink.Get(
+        R"(/api/v1/executions/([A-Za-z0-9_-]{1,128}))",
+        [auth_fn, perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!perm_fn(req, res, "Execution", "Read"))
+                return;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!execution_tracker) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "execution tracker unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry after server warmup; tracker initialises during "
+                                          "startup or after a config reload"),
+                    "application/json");
+                return;
+            }
+            auto exec_id = req.matches[1].str();
+            auto exec_opt = execution_tracker->get_execution(exec_id);
+            if (!exec_opt) {
+                res.status = 404;
+                res.set_content(detail::error_json_a4(404, "execution not found", cid),
+                                "application/json");
+                return;
+            }
+            const auto& e = *exec_opt;
+            // Mirrors the Execution struct field-for-field (per
+            // execution_tracker.hpp). `last_error_detail` is PII-
+            // adjacent (agent stderr) — the perm_fn(Execution:Read)
+            // gate above is the same one mcp_server.cpp:get_execution_status
+            // uses to protect this field; if those policies ever diverge,
+            // sibling-handler parity needs revisiting.
+            auto data = JObj()
+                            .add("id", e.id)
+                            .add("definition_id", e.definition_id)
+                            .add("status", e.status)
+                            .add("scope_expression", e.scope_expression)
+                            .add("parameter_values", e.parameter_values)
+                            .add("dispatched_by", e.dispatched_by)
+                            .add("dispatched_at", static_cast<int64_t>(e.dispatched_at))
+                            .add("agents_targeted", e.agents_targeted)
+                            .add("agents_responded", e.agents_responded)
+                            .add("agents_success", e.agents_success)
+                            .add("agents_failure", e.agents_failure)
+                            .add("completed_at", static_cast<int64_t>(e.completed_at))
+                            .add("parent_id", e.parent_id)
+                            .add("rerun_of", e.rerun_of)
+                            .add("last_error_detail", e.last_error_detail)
+                            .str();
+            res.set_content(ok_json(data), "application/json");
+        });
 
     // ── Response Visualization (issue #253, capability 20.6) ─────────────
     //
