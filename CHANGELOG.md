@@ -20,6 +20,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **#1088 R2 — `GET /api/v1/executions/{id}` final-state endpoint.**
+  Companion to `GET /api/v1/events`: when the SSE subscribe returns
+  410 (execution already terminal), the agentic worker calls this
+  endpoint to fetch final state in one JSON round-trip. Required by
+  the W5.1 410 envelope's remediation hint — UAT smoke on the #1088
+  PR caught that the hint pointed at a route that didn't exist.
+  Requires `Execution:Read`. Response mirrors the `Execution` struct
+  field-for-field (id, definition_id, status, scope_expression,
+  parameter_values, dispatched_by, dispatched_at, agents counts,
+  completed_at, parent_id, rerun_of, last_error_detail). 404 on
+  unknown id with A4 envelope; 503 with `retry_after_ms=5000` when
+  tracker is unwired. Includes OpenAPI spec entry, X-Correlation-Id
+  header, and 5 new test cases covering happy / 404 / 503 / 401 /
+  403.
+
 - **#1088 — `execution_id` in dispatch responses (closes W5.1 agentic
   handoff).** The W5.1 agentic-first workflow shipped with a broken
   handoff: dispatch via `POST /api/instructions/{id}/execute` (REST) or
