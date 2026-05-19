@@ -40,10 +40,25 @@ public:
     using AgentsJsonFn = std::function<nlohmann::json()>;
 
     /// Send command callback — dispatches a command and returns (command_id, agents_reached).
+    ///
+    /// `execution_id` is the pre-created `ExecutionTracker` row id, threaded
+    /// through so the dispatch wiring can register the
+    /// `command_id → execution_id` mapping with `AgentServiceImpl` BEFORE
+    /// any RPC is sent (closes the FAST-agent race documented in
+    /// `docs/executions-history-ladder.md` PR 2 / UP2-4 — a sub-millisecond
+    /// loopback agent's response would otherwise win against a
+    /// post-dispatch mapping-registration call). Empty `execution_id` is a
+    /// valid out-of-band dispatch with no tracker row; the wiring skips
+    /// registration. **Caller MUST create the execution row before
+    /// invoking this and pass the assigned id** — same contract as
+    /// `WorkflowRoutes::CommandDispatchFn` (the REST sibling). Added for
+    /// issue #1088 so MCP `execute_instruction` can return `execution_id`
+    /// in its response and let agentic workers bridge to `/api/v1/events`.
     using DispatchFn = std::function<std::pair<std::string, int>(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-        const std::unordered_map<std::string, std::string>& parameters)>;
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id)>;
 
     /// Type of the POST /mcp/v1/ handler — same shape as httplib::Server's Post handler
     /// but exposed independently so tests can dispatch in-process without spinning
@@ -60,39 +75,25 @@ public:
     /// synthesized httplib::Request / httplib::Response — that path avoids the
     /// httplib::Server acceptor thread that crashes under TSan (#438).
     HandlerFn build_handler(AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                            AgentsJsonFn agents_fn,
-                            RbacStore* rbac_store,
+                            AgentsJsonFn agents_fn, RbacStore* rbac_store,
                             InstructionStore* instruction_store,
-                            ExecutionTracker* execution_tracker,
-                            ResponseStore* response_store,
-                            AuditStore* audit_store,
-                            TagStore* tag_store,
-                            InventoryStore* inventory_store,
-                            PolicyStore* policy_store,
-                            ManagementGroupStore* mgmt_store,
-                            ApprovalManager* approval_manager,
-                            ScheduleEngine* schedule_engine,
-                            const bool& read_only_mode,
-                            const bool& mcp_disabled,
-                            DispatchFn dispatch_fn = nullptr);
+                            ExecutionTracker* execution_tracker, ResponseStore* response_store,
+                            AuditStore* audit_store, TagStore* tag_store,
+                            InventoryStore* inventory_store, PolicyStore* policy_store,
+                            ManagementGroupStore* mgmt_store, ApprovalManager* approval_manager,
+                            ScheduleEngine* schedule_engine, const bool& read_only_mode,
+                            const bool& mcp_disabled, DispatchFn dispatch_fn = nullptr);
 
     /// Register the /mcp/v1/ POST route on `svr` and emit the startup log line.
     /// Production callers use this; tests prefer build_handler() above.
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
-                         AgentsJsonFn agents_fn,
-                         RbacStore* rbac_store,
-                         InstructionStore* instruction_store,
-                         ExecutionTracker* execution_tracker,
-                         ResponseStore* response_store,
-                         AuditStore* audit_store,
-                         TagStore* tag_store,
-                         InventoryStore* inventory_store,
-                         PolicyStore* policy_store,
-                         ManagementGroupStore* mgmt_store,
-                         ApprovalManager* approval_manager,
-                         ScheduleEngine* schedule_engine,
-                         const bool& read_only_mode,
-                         const bool& mcp_disabled,
+                         AgentsJsonFn agents_fn, RbacStore* rbac_store,
+                         InstructionStore* instruction_store, ExecutionTracker* execution_tracker,
+                         ResponseStore* response_store, AuditStore* audit_store,
+                         TagStore* tag_store, InventoryStore* inventory_store,
+                         PolicyStore* policy_store, ManagementGroupStore* mgmt_store,
+                         ApprovalManager* approval_manager, ScheduleEngine* schedule_engine,
+                         const bool& read_only_mode, const bool& mcp_disabled,
                          DispatchFn dispatch_fn = nullptr);
 };
 

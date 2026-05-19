@@ -964,10 +964,16 @@ Dispatches the instruction definition to agents. Requires `Execution:Execute` pe
 ```json
 {
   "command_id": "filesystem-a1b2c3",
+  "execution_id": "exec-d4e5f6",
   "agents_reached": 3,
   "definition_id": "filesystem.exists"
 }
 ```
+
+- `command_id` — legacy correlation token; pair with `query_responses` to poll individual agent results.
+- `execution_id` — per-run identifier required by `GET /api/v1/events` (live JSON SSE stream) and `GET /api/v1/executions/{id}` (final state lookup). Agentic workers should subscribe to the events stream with `?execution_id=<execution_id>` immediately after dispatch to watch progress in real time. Added in #1088 to close the dispatch-to-observe handoff for the W5.1 agentic-first surface.
+- `agents_reached` — number of agents the command was actually sent to (may be smaller than the targeted set if some are offline).
+- `definition_id` — echoes the path parameter.
 
 ```bash
 curl -s -b cookies.txt \

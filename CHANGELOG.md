@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **#1088 — `execution_id` in dispatch responses (closes W5.1 agentic
+  handoff).** The W5.1 agentic-first workflow shipped with a broken
+  handoff: dispatch via `POST /api/instructions/{id}/execute` (REST) or
+  `execute_instruction` (MCP) returned only `command_id`, but the new
+  `GET /api/v1/events` SSE endpoint required `execution_id` with no
+  public lookup bridge. Both dispatch responses now include
+  `execution_id` alongside `command_id` so an agentic worker can
+  dispatch and immediately subscribe to live events without any
+  out-of-band ID resolution. The full agentic dispatch-to-observe loop
+  is now functional. `command_id` remains for backwards compatibility
+  (legacy `query_responses` polling). On the MCP side, `execute_instruction`
+  now pre-creates an `ExecutionTracker` row before dispatch — same
+  pattern the REST sibling has used since PR 2.5 — and threads the
+  `execution_id` through dispatch so the `command_id → execution_id`
+  mapping in `AgentServiceImpl` is registered BEFORE any RPC fires
+  (closes the same UP2-4 FAST-agent race the REST path already
+  protects against). The `McpServer::DispatchFn` typedef gained a
+  trailing `const std::string& execution_id` parameter; the
+  `DashboardRoutes::DispatchFn` for the legacy `/api/command` UI is
+  unaffected. Documentation updated in `docs/user-manual/mcp.md`,
+  `docs/user-manual/instructions.md`, and the
+  `docs/user-manual/rest-api.md` known-limitations entry on
+  `GET /api/v1/events`.
+
 - **W5.1 — `GET /api/v1/events` agentic-first JSON SSE channel.** First
   REST surface that satisfies the A3 (observability) and A4 (error
   envelope) invariants from `docs/agentic-first-principle.md`.

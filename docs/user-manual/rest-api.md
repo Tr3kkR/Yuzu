@@ -4021,7 +4021,7 @@ data: {"execution_id":"exec-abc123","event_id":119,"timestamp_ms":...,"type":"ag
 - No multi-execution / wildcard subscription — open one connection per execution, or wait for W5.2.
 - No per-principal connection cap — operators expecting >10 concurrent agentic subscriptions should size the httplib worker pool accordingly.
 - Replay/subscribe race window: a publish that arrives between the `replay_since` and `subscribe` calls is silently lost. A bus-side `subscribe_with_replay` is filed as a follow-up against both this route and the dashboard sibling.
-- The MCP `execute_instruction` tool currently returns `command_id`, not `execution_id`; an agentic flow that dispatches via MCP and observes via this endpoint needs to bridge the two (filed as a follow-up to add `execution_id` to the dispatch response).
+- ~~The MCP `execute_instruction` tool currently returns `command_id`, not `execution_id`~~ — **closed by #1088.** Both the MCP `execute_instruction` tool and REST `POST /api/instructions/{id}/execute` now return `execution_id` alongside `command_id`. The full agentic dispatch-to-observe loop is functional.
 
 ---
 

@@ -267,12 +267,20 @@ for the tool to execute.
 | 20 | `validate_scope` | Validate a scope expression without executing it. | (none -- always allowed) |
 | 21 | `preview_scope_targets` | Show which agents match a scope expression. | `Infrastructure:Read` |
 | 22 | `list_pending_approvals` | List pending approval requests (filterable by status, submitter). | `Approval:Read` |
-| 23 | `execute_instruction` | Execute a plugin action on agents. Returns a `command_id`; poll results with `query_responses`. | `Execution:Execute` |
+| 23 | `execute_instruction` | Execute a plugin action on agents. Returns `{command_id, execution_id, agents_reached, plugin, action}`; poll results with `query_responses` or subscribe to live events via REST `GET /api/v1/events?execution_id=<id>`. | `Execution:Execute` |
 
 > **`execute_instruction` tier behavior:**
 > - `readonly` tier: blocked.
 > - `operator` tier: executes immediately (auto-approved). If neither `scope` nor `agent_ids` is provided, targets **all** connected agents.
 > - `supervised` tier: not yet implemented (returns an error). Use the REST API or dashboard for supervised-tier execution until the approval re-dispatch path is built.
+
+> **`execute_instruction` response — agentic-first bridging (#1088):**
+> The response includes BOTH `command_id` (legacy correlation token for `query_responses`) and `execution_id` (the per-run identifier required by the REST `GET /api/v1/events` SSE endpoint and the `get_execution_status` / `list_executions` MCP tools). An agentic worker that dispatches via `execute_instruction` and wants to observe progress in real time:
+> 1. Call `execute_instruction` → receive `execution_id` in the response.
+> 2. Open `GET /api/v1/events?execution_id=<execution_id>` with `Accept: text/event-stream`.
+> 3. Stream JSON envelopes until the `execution-completed` event arrives.
+>
+> `execution_id` is an empty string if the server was started without an `ExecutionTracker` (test harnesses and stripped-down deployments only — production always has one).
 
 ### Tool parameters
 

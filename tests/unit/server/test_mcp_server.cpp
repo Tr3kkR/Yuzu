@@ -173,7 +173,8 @@ TEST_CASE("MCP Policy: readonly never requires approval", "[mcp][policy]") {
     CHECK(!requires_approval("readonly", "Execution", "Execute"));
 }
 
-TEST_CASE("MCP Policy: operator auto-approves Execute, requires approval for Tag Delete", "[mcp][policy]") {
+TEST_CASE("MCP Policy: operator auto-approves Execute, requires approval for Tag Delete",
+          "[mcp][policy]") {
     CHECK(!requires_approval("operator", "Execution", "Execute")); // auto-approved
     CHECK(requires_approval("operator", "Tag", "Delete"));
     CHECK(!requires_approval("operator", "Tag", "Write"));
@@ -279,7 +280,8 @@ TEST_CASE("MCP Token: list includes mcp_tier", "[mcp][token]") {
 
     int mcp_count = 0;
     for (const auto& t : tokens) {
-        if (!t.mcp_tier.empty()) ++mcp_count;
+        if (!t.mcp_tier.empty())
+            ++mcp_count;
     }
     CHECK(mcp_count == 2);
 }
@@ -523,9 +525,7 @@ struct McpTestServer {
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
 
-    void start(const std::string& tier = "") {
-        install_handler(tier, /*dispatch_fn=*/nullptr);
-    }
+    void start(const std::string& tier = "") { install_handler(tier, /*dispatch_fn=*/nullptr); }
 
     /// Install with a dispatch function (for execute_instruction tests).
     void start_with_dispatch(yuzu::server::mcp::McpServer::DispatchFn dispatch_fn,
@@ -560,9 +560,9 @@ private:
         mock_tier = tier;
 
         // Mock auth: returns a session with the configured tier (or nullopt)
-        auto auth_fn = [this](const httplib::Request& /*req*/,
-                              httplib::Response& res)
-            -> std::optional<yuzu::server::auth::Session> {
+        auto auth_fn =
+            [this](const httplib::Request& /*req*/,
+                   httplib::Response& res) -> std::optional<yuzu::server::auth::Session> {
             if (!mock_auth_enabled) {
                 res.status = 401;
                 res.set_content(R"({"error":"unauthorized"})", "application/json");
@@ -585,19 +585,22 @@ private:
         // Mock audit: record calls
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& /*target_type*/,
-                               const std::string& /*target_id*/,
-                               const std::string& /*detail*/) {
+                               const std::string& /*target_id*/, const std::string& /*detail*/) {
             audit_log.push_back(action + "|" + result);
         };
 
         // Mock agents: return two test agents
         auto agents_fn = []() -> nlohmann::json {
-            return nlohmann::json::array({
-                {{"agent_id", "agent-001"}, {"hostname", "web-01"}, {"os", "linux"},
-                 {"arch", "x64"}, {"agent_version", "0.1.3"}},
-                {{"agent_id", "agent-002"}, {"hostname", "db-01"}, {"os", "windows"},
-                 {"arch", "x64"}, {"agent_version", "0.1.3"}}
-            });
+            return nlohmann::json::array({{{"agent_id", "agent-001"},
+                                           {"hostname", "web-01"},
+                                           {"os", "linux"},
+                                           {"arch", "x64"},
+                                           {"agent_version", "0.1.3"}},
+                                          {{"agent_id", "agent-002"},
+                                           {"hostname", "db-01"},
+                                           {"os", "windows"},
+                                           {"arch", "x64"},
+                                           {"agent_version", "0.1.3"}}});
         };
 
         handler = mcp.build_handler(
@@ -612,10 +615,7 @@ private:
             /*policy_store=*/nullptr,
             /*mgmt_store=*/nullptr,
             /*approval_manager=*/nullptr,
-            /*schedule_engine=*/nullptr,
-            read_only_mode_,
-            mcp_disabled_,
-            std::move(dispatch_fn));
+            /*schedule_engine=*/nullptr, read_only_mode_, mcp_disabled_, std::move(dispatch_fn));
     }
 };
 
@@ -627,7 +627,8 @@ TEST_CASE("MCP Integration: initialize handshake", "[mcp][integration]") {
     McpTestServer ts;
     ts.start();
 
-    auto res = ts.call(R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test"}}})");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"initialize","id":1,"params":{"clientInfo":{"name":"test"}}})");
     REQUIRE(res);
     CHECK(res->status == 200);
 
@@ -678,11 +679,12 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
     REQUIRE(result.contains("tools"));
     auto& tools = result["tools"];
     REQUIRE(tools.is_array());
-    CHECK(tools.size() >= 23);  // At least 23; don't break when new tools are added
+    CHECK(tools.size() >= 23); // At least 23; don't break when new tools are added
 
     // Verify key tools are present
     std::set<std::string> names;
-    for (const auto& t : tools) names.insert(t["name"].get<std::string>());
+    for (const auto& t : tools)
+        names.insert(t["name"].get<std::string>());
     CHECK(names.count("list_agents") == 1);
     CHECK(names.count("execute_instruction") == 1);
     CHECK(names.count("query_responses") == 1);
@@ -698,14 +700,16 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
 
     // Spot-check specific tool names are present
     std::vector<std::string> expected_names = {
-        "list_agents", "get_agent_details", "query_audit_log",
-        "list_definitions", "get_definition", "query_responses",
-        "validate_scope", "preview_scope_targets", "list_pending_approvals"
-    };
+        "list_agents",      "get_agent_details",     "query_audit_log",
+        "list_definitions", "get_definition",        "query_responses",
+        "validate_scope",   "preview_scope_targets", "list_pending_approvals"};
     for (const auto& name : expected_names) {
         bool found = false;
         for (const auto& tool : tools) {
-            if (tool["name"] == name) { found = true; break; }
+            if (tool["name"] == name) {
+                found = true;
+                break;
+            }
         }
         CHECK(found);
     }
@@ -717,7 +721,8 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
     McpTestServer ts;
     ts.start();
 
-    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"list_agents"}})");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"list_agents"}})");
     REQUIRE(res);
     CHECK(res->status == 200);
 
@@ -763,7 +768,8 @@ TEST_CASE("MCP Integration: tools/call unknown tool returns error", "[mcp][integ
     CHECK(body["id"] == 5);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kMethodNotFound);
-    CHECK(body["error"]["message"].get<std::string>().find("nonexistent_tool") != std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find("nonexistent_tool") !=
+          std::string::npos);
     CHECK(!body.contains("result"));
 }
 
@@ -865,7 +871,8 @@ TEST_CASE("MCP Integration: unknown method returns MethodNotFound", "[mcp][integ
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kMethodNotFound);
-    CHECK(body["error"]["message"].get<std::string>().find("completions/list") != std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find("completions/list") !=
+          std::string::npos);
 }
 
 // ── 12. readonly tier allows list_agents (read) ─────────────────────────────
@@ -1088,7 +1095,8 @@ TEST_CASE("MCP Integration: multiple requests on same server", "[mcp][integratio
     CHECK(b3["result"]["tools"].size() >= 23);
 
     // Request 4: tools/call
-    auto r4 = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":103,"params":{"name":"list_agents"}})");
+    auto r4 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":103,"params":{"name":"list_agents"}})");
     REQUIRE(r4);
     CHECK(r4->status == 200);
     auto b4 = nlohmann::json::parse(r4->body);
@@ -1107,10 +1115,9 @@ TEST_CASE("MCP Integration: multiple requests on same server", "[mcp][integratio
 TEST_CASE("MCP Integration: execute_instruction happy dispatch", "[mcp][integration][execute]") {
     McpTestServer ts;
     auto dispatch = [&](const std::string& plugin, const std::string& action,
-                        const std::vector<std::string>& agent_ids,
-                        const std::string& scope_expr,
-                        const std::unordered_map<std::string, std::string>& params)
-        -> std::pair<std::string, int> {
+                        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                        const std::unordered_map<std::string, std::string>& params,
+                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
@@ -1136,6 +1143,12 @@ TEST_CASE("MCP Integration: execute_instruction happy dispatch", "[mcp][integrat
     CHECK(text["agents_reached"] == 2);
     CHECK(text["plugin"] == "os_info");
     CHECK(text["action"] == "version");
+    // #1088 — response carries execution_id (empty string here because
+    // the harness wires execution_tracker=nullptr; presence-of-key is
+    // the stable contract). A separate test below exercises the
+    // non-empty path with a real tracker.
+    REQUIRE(text.contains("execution_id"));
+    CHECK(text["execution_id"].is_string());
 }
 
 // ── 24. Null dispatch_fn ──────────────────────────────────────────────────
@@ -1153,17 +1166,19 @@ TEST_CASE("MCP Integration: execute_instruction null dispatch_fn", "[mcp][integr
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
-    CHECK(body["error"]["message"].get<std::string>().find("Command dispatch unavailable") != std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find("Command dispatch unavailable") !=
+          std::string::npos);
 }
 
 // ── 25. Missing plugin ───────────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: execute_instruction missing plugin", "[mcp][integration][execute]") {
     McpTestServer ts;
-    auto dispatch = [](const std::string&, const std::string&,
-                       const std::vector<std::string>&, const std::string&,
-                       const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> { return {"", 0}; };
+    auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&) -> std::pair<std::string, int> {
+        return {"", 0};
+    };
     ts.start_with_dispatch(dispatch, "operator");
 
     // Only action, no plugin
@@ -1182,10 +1197,11 @@ TEST_CASE("MCP Integration: execute_instruction missing plugin", "[mcp][integrat
 
 TEST_CASE("MCP Integration: execute_instruction missing action", "[mcp][integration][execute]") {
     McpTestServer ts;
-    auto dispatch = [](const std::string&, const std::string&,
-                       const std::vector<std::string>&, const std::string&,
-                       const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> { return {"", 0}; };
+    auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&) -> std::pair<std::string, int> {
+        return {"", 0};
+    };
     ts.start_with_dispatch(dispatch, "operator");
 
     // Only plugin, no action
@@ -1202,12 +1218,14 @@ TEST_CASE("MCP Integration: execute_instruction missing action", "[mcp][integrat
 
 // ── 27. Zero agents reached ──────────────────────────────────────────────
 
-TEST_CASE("MCP Integration: execute_instruction zero agents reached", "[mcp][integration][execute]") {
+TEST_CASE("MCP Integration: execute_instruction zero agents reached",
+          "[mcp][integration][execute]") {
     McpTestServer ts;
-    auto dispatch = [&](const std::string&, const std::string&,
-                        const std::vector<std::string>&, const std::string&,
-                        const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> { return {"cmd-xyz", 0}; };
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&) -> std::pair<std::string, int> {
+        return {"cmd-xyz", 0};
+    };
     ts.start_with_dispatch(dispatch, "operator");
 
     auto res = ts.call(
@@ -1227,13 +1245,13 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached", "[mcp][int
 
 // ── 28. Default scope to __all__ ─────────────────────────────────────────
 
-TEST_CASE("MCP Integration: execute_instruction default scope __all__", "[mcp][integration][execute]") {
+TEST_CASE("MCP Integration: execute_instruction default scope __all__",
+          "[mcp][integration][execute]") {
     McpTestServer ts;
     auto dispatch = [&](const std::string& plugin, const std::string& action,
-                        const std::vector<std::string>& agent_ids,
-                        const std::string& scope_expr,
-                        const std::unordered_map<std::string, std::string>& params)
-        -> std::pair<std::string, int> {
+                        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                        const std::unordered_map<std::string, std::string>& params,
+                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         ts.last_dispatch_scope = scope_expr;
         ts.last_dispatch_agent_ids = agent_ids;
         return {"cmd-default", 1};
@@ -1254,13 +1272,13 @@ TEST_CASE("MCP Integration: execute_instruction default scope __all__", "[mcp][i
 
 // ── 29. Explicit agent_ids ───────────────────────────────────────────────
 
-TEST_CASE("MCP Integration: execute_instruction explicit agent_ids", "[mcp][integration][execute]") {
+TEST_CASE("MCP Integration: execute_instruction explicit agent_ids",
+          "[mcp][integration][execute]") {
     McpTestServer ts;
     auto dispatch = [&](const std::string&, const std::string&,
-                        const std::vector<std::string>& agent_ids,
-                        const std::string& scope_expr,
-                        const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> {
+                        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                        const std::unordered_map<std::string, std::string>&,
+                        const std::string&) -> std::pair<std::string, int> {
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_scope = scope_expr;
         return {"cmd-agents", 2};
@@ -1283,10 +1301,10 @@ TEST_CASE("MCP Integration: execute_instruction explicit agent_ids", "[mcp][inte
 
 TEST_CASE("MCP Integration: execute_instruction params forwarding", "[mcp][integration][execute]") {
     McpTestServer ts;
-    auto dispatch = [&](const std::string&, const std::string&,
-                        const std::vector<std::string>&, const std::string&,
-                        const std::unordered_map<std::string, std::string>& params)
-        -> std::pair<std::string, int> {
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&,
+                        const std::unordered_map<std::string, std::string>& params,
+                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         ts.last_dispatch_params = params;
         return {"cmd-params", 1};
     };
@@ -1307,10 +1325,10 @@ TEST_CASE("MCP Integration: execute_instruction params forwarding", "[mcp][integ
 
 TEST_CASE("MCP Integration: execute_instruction non-string params", "[mcp][integration][execute]") {
     McpTestServer ts;
-    auto dispatch = [&](const std::string&, const std::string&,
-                        const std::vector<std::string>&, const std::string&,
-                        const std::unordered_map<std::string, std::string>& params)
-        -> std::pair<std::string, int> {
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&,
+                        const std::unordered_map<std::string, std::string>& params,
+                        const std::string& /*execution_id*/) -> std::pair<std::string, int> {
         ts.last_dispatch_params = params;
         return {"cmd-nonstr", 1};
     };
@@ -1329,13 +1347,15 @@ TEST_CASE("MCP Integration: execute_instruction non-string params", "[mcp][integ
 
 // ── 32. read_only_mode blocks ────────────────────────────────────────────
 
-TEST_CASE("MCP Integration: execute_instruction blocked by read_only_mode", "[mcp][integration][execute]") {
+TEST_CASE("MCP Integration: execute_instruction blocked by read_only_mode",
+          "[mcp][integration][execute]") {
     McpTestServer ts;
     ts.read_only_mode_ = true;
-    auto dispatch = [](const std::string&, const std::string&,
-                       const std::vector<std::string>&, const std::string&,
-                       const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> { return {"cmd-ro", 1}; };
+    auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&) -> std::pair<std::string, int> {
+        return {"cmd-ro", 1};
+    };
     ts.start_with_dispatch(dispatch, "operator");
 
     auto res = ts.call(
@@ -1351,12 +1371,14 @@ TEST_CASE("MCP Integration: execute_instruction blocked by read_only_mode", "[mc
 
 // ── 33. readonly tier blocked ────────────────────────────────────────────
 
-TEST_CASE("MCP Integration: execute_instruction blocked by readonly tier", "[mcp][integration][execute]") {
+TEST_CASE("MCP Integration: execute_instruction blocked by readonly tier",
+          "[mcp][integration][execute]") {
     McpTestServer ts;
-    auto dispatch = [](const std::string&, const std::string&,
-                       const std::vector<std::string>&, const std::string&,
-                       const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> { return {"cmd-ro", 1}; };
+    auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&) -> std::pair<std::string, int> {
+        return {"cmd-ro", 1};
+    };
     ts.start_with_dispatch(dispatch, "readonly");
 
     auto res = ts.call(
@@ -1371,12 +1393,13 @@ TEST_CASE("MCP Integration: execute_instruction blocked by readonly tier", "[mcp
 
 // ── 34. operator tier allowed ────────────────────────────────────────────
 
-TEST_CASE("MCP Integration: execute_instruction operator tier proceeds", "[mcp][integration][execute]") {
+TEST_CASE("MCP Integration: execute_instruction operator tier proceeds",
+          "[mcp][integration][execute]") {
     McpTestServer ts;
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>&, const std::string&,
-                        const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> {
+                        const std::unordered_map<std::string, std::string>&,
+                        const std::string&) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         return {"cmd-op", 3};
@@ -1403,12 +1426,14 @@ TEST_CASE("MCP Integration: execute_instruction operator tier proceeds", "[mcp][
 
 // ── 35. supervised tier returns not-implemented ──────────────────────────
 
-TEST_CASE("MCP Integration: execute_instruction supervised tier approval-gated", "[mcp][integration][execute]") {
+TEST_CASE("MCP Integration: execute_instruction supervised tier approval-gated",
+          "[mcp][integration][execute]") {
     McpTestServer ts;
-    auto dispatch = [](const std::string&, const std::string&,
-                       const std::vector<std::string>&, const std::string&,
-                       const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> { return {"cmd-sup", 1}; };
+    auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&) -> std::pair<std::string, int> {
+        return {"cmd-sup", 1};
+    };
     ts.start_with_dispatch(dispatch, "supervised");
 
     auto res = ts.call(
@@ -1426,10 +1451,11 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier approval-gated",
 
 TEST_CASE("MCP Integration: execute_instruction audit on success", "[mcp][integration][execute]") {
     McpTestServer ts;
-    auto dispatch = [](const std::string&, const std::string&,
-                       const std::vector<std::string>&, const std::string&,
-                       const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> { return {"cmd-audit", 2}; };
+    auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&) -> std::pair<std::string, int> {
+        return {"cmd-audit", 2};
+    };
     ts.start_with_dispatch(dispatch, "operator");
 
     auto res = ts.call(
@@ -1446,12 +1472,14 @@ TEST_CASE("MCP Integration: execute_instruction audit on success", "[mcp][integr
 
 // ── 37. Audit on no-agents ───────────────────────────────────────────────
 
-TEST_CASE("MCP Integration: execute_instruction audit on no-agents", "[mcp][integration][execute]") {
+TEST_CASE("MCP Integration: execute_instruction audit on no-agents",
+          "[mcp][integration][execute]") {
     McpTestServer ts;
-    auto dispatch = [](const std::string&, const std::string&,
-                       const std::vector<std::string>&, const std::string&,
-                       const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> { return {"cmd-empty", 0}; };
+    auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
+                       const std::string&, const std::unordered_map<std::string, std::string>&,
+                       const std::string&) -> std::pair<std::string, int> {
+        return {"cmd-empty", 0};
+    };
     ts.start_with_dispatch(dispatch, "operator");
 
     auto res = ts.call(
