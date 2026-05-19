@@ -48,7 +48,8 @@ namespace {
 // ── Input validation ────────────────────────────────────────────────────────
 
 bool is_valid_thumbprint(std::string_view s) {
-    if (s.size() != 40) return false;
+    if (s.size() != 40)
+        return false;
     for (char c : s) {
         if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
             return false;
@@ -58,10 +59,11 @@ bool is_valid_thumbprint(std::string_view s) {
 
 bool is_safe_path(std::string_view s) {
     for (char c : s) {
-        // Reject shell metacharacters in filesystem paths
-        if (c == '`' || c == '$' || c == '(' || c == ')' || c == ';' ||
-            c == '|' || c == '&' || c == '\'' || c == '"' || c == '\n' ||
-            c == '\r' || c == '\0')
+        // Reject shell metacharacters in filesystem paths, including
+        // redirection (`<` `>`) and the word-splitting space.
+        if (c == '`' || c == '$' || c == '(' || c == ')' || c == ';' || c == '|' || c == '&' ||
+            c == '\'' || c == '"' || c == '\n' || c == '\r' || c == '\0' || c == '<' || c == '>' ||
+            c == ' ')
             return false;
     }
     return true;
@@ -587,11 +589,17 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
     auto tmp_path = fs::temp_directory_path() / "yuzu_cert_tmp.pem";
     {
         std::ofstream tmp(tmp_path, std::ios::trunc);
-        if (!tmp) { rec.subject = "(temp file error)"; return rec; }
+        if (!tmp) {
+            rec.subject = "(temp file error)";
+            return rec;
+        }
         tmp << pem_block;
     }
     auto base_cmd = std::format("openssl x509 -noout -in \"{}\"", tmp_path.string());
-    auto cleanup = [&]() { std::error_code ec; fs::remove(tmp_path, ec); };
+    auto cleanup = [&]() {
+        std::error_code ec;
+        fs::remove(tmp_path, ec);
+    };
 
     // Subject
     auto subj = run_command(std::format("{} -subject 2>/dev/null", base_cmd).c_str());
