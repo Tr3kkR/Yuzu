@@ -98,6 +98,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Defense-in-depth — plugin shell-interpolation hardening (CodeQL
+  cleanup).** Two belt-and-braces fixes surfaced while triaging the
+  `cpp/yuzu/plugin-command-exec-non-literal` CodeQL alerts (all 21 of
+  which were confirmed false-positives and dismissed). `users` plugin:
+  the Linux `local_users` action interpolated a username read from
+  `/etc/passwd` into `lastlog -u {user}` without validation — now gated
+  by the same `is_safe_identifier()` allowlist the macOS `dscl` paths
+  already use; usernames outside `[A-Za-z0-9._-]` (e.g. AD machine
+  accounts ending in `$`) report `last_logon=unknown` rather than
+  running the shell-out. `certificates` plugin: `is_safe_path()` now
+  also rejects space, `<`, and `>`. Neither path is operator-reachable
+  (inputs come from `/etc/passwd` / `directory_iterator` over
+  `/etc/ssl/certs`), so there is no functional regression on
+  well-formed systems. Also excludes the pure-style
+  `cpp/poorly-documented-function` CodeQL query (no security signal)
+  via `query-filters`.
+
 - **HIGH (#1073 / W7.4 sibling-gap): InstructionDefinition import
   signature enforcement is now on-by-default.** `InstructionStore`
   previously accepted unsigned YAML imports via

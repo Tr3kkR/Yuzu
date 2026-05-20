@@ -186,6 +186,11 @@ Plugins for querying user accounts and active sessions.
 | `primary_user` | Identifies the primary user of the device based on login frequency. Returns username, login count, and detection method. |
 | `session_history` | Historical login/logout session records. Returns username, terminal, source, login time, logout time, and duration. Parameters: `days` (optional, default 30). |
 
+> **Note (Linux):** for `local_users`, the `last_logon` field is reported as
+> `unknown` for usernames outside `[A-Za-z0-9._-]` — most commonly AD/Samba
+> machine accounts that end in `$`. The account is still listed; only the
+> last-login lookup is skipped (it is gated to prevent shell injection).
+
 ---
 
 ## Network
@@ -440,6 +445,12 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 | `list` | List certificates with subject, issuer, thumbprint, and expiry date. |
 | `details` | Full details for a specific certificate by thumbprint. |
 | `delete` | Remove a certificate from the store by thumbprint. |
+
+> **Note (Linux):** PEM files under `/etc/ssl/certs` whose path contains a
+> space, `<`, or `>` are excluded from `list`/`details`/`delete` (the path is
+> validated before the `openssl` shell-out). Standard trust-store filenames
+> are unaffected; rename or symlink an unusually-named cert to a plain path
+> if it must appear in the inventory.
 
 ### ioc
 
