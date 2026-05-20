@@ -82,6 +82,7 @@ jobs:
         if: failure() && steps.check.outputs.drift_count != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRIFT_REPORT: ${{ steps.check.outputs.drift_report }}
         run: |
           set -euo pipefail
           existing=$(gh issue list --label runner-inventory-drift --state open --json number --jq '.[0].number // empty')
@@ -89,7 +90,7 @@ jobs:
           Runner inventory drift detected by \`runner-inventory-sentinel\` workflow run [\`${{ github.run_id }}\`](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
 
           **Drift report:**
-          ${{ steps.check.outputs.drift_report }}
+          $DRIFT_REPORT
 
           **How to resolve:**
           - If a runner is legitimately missing/offline: bring it back online (see \`docs/ci-troubleshooting.md\` for the runner restart runbook).

@@ -128,14 +128,18 @@ jobs:
             /usr/bin/systemctl restart "$SERVICE"
 
       - name: Final summary
+        env:
+          OTP_VER: ${{ inputs.otp_version }}
+          REBAR3_VER: ${{ inputs.rebar3_version }}
+          RESTART_DELAY: ${{ inputs.restart_delay_seconds }}
         run: |
           cat <<EOF
           ═══════════════════════════════════════════════════════════════════════
             Upgrade staged on ${{ inputs.target_runner_label }}
-            OTP:    ${{ inputs.otp_version }}
-            rebar3: ${{ inputs.rebar3_version }}
+            OTP:    $OTP_VER
+            rebar3: $REBAR3_VER
 
-            Runner systemd service will restart in ~${{ inputs.restart_delay_seconds }}s.
+            Runner systemd service will restart in ~${RESTART_DELAY}s.
             New toolchain takes effect on the runner's next workflow.
 
             Verify after restart:
