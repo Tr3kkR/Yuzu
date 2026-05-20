@@ -63,6 +63,8 @@ inline bool is_valid_ipv4(std::string_view s) {
         }
         if (i == start) // no digit consumed
             return false;
+        if (i - start > 1 && s[start] == '0') // leading-zero octet (non-canonical)
+            return false;
         if (val > 255)
             return false;
         ++octets;

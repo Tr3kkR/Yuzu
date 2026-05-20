@@ -286,7 +286,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     ae.os = info.platform().os();
                     ae.arch = info.platform().arch();
                     ae.severity = Severity::kError;
-                    ae.attributes = {{"result", "success"}, {"audit_emitted", false}};
+                    ae.attributes = {
+                        {"result", "success"}, {"audit_emitted", false}, {"source", "direct"}};
                     analytics_store_->emit(std::move(ae));
                 }
             }
@@ -306,21 +307,13 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             approval_ctx.hostname = info.hostname();
             approval_ctx.attestation_provider = request->attestation_provider();
 
-            // Extract peer IP from gRPC context (format: "ipv4:1.2.3.4:port")
-            if (context) {
-                auto peer = context->peer();
-                // Strip scheme prefix and port
-                auto colon1 = peer.find(':');
-                if (colon1 != std::string::npos) {
-                    auto ip_start = colon1 + 1;
-                    auto colon2 = peer.rfind(':');
-                    if (colon2 > ip_start) {
-                        approval_ctx.peer_ip = peer.substr(ip_start, colon2 - ip_start);
-                    } else {
-                        approval_ctx.peer_ip = peer.substr(ip_start);
-                    }
-                }
-            }
+            // gov #1117 (happy-path SHOULD): route through the canonical
+            // extract_peer_ip so the auto-approve peer_ip is the same strict,
+            // validated form as the #826 binding check. The old inline
+            // scheme/port strip mishandled IPv6 (`[::1]` brackets) and could
+            // yield a different string than the binding comparison used.
+            if (context)
+                approval_ctx.peer_ip = extract_peer_ip(context->peer());
 
             auto matched_rule = auto_approve_.evaluate(approval_ctx);
             if (!matched_rule.empty()) {
@@ -569,7 +562,7 @@ grpc::Status AgentServiceImpl::Subscribe(
 
     std::string agent_id;
     {
-        std::lock_guard lock(pending_mu_);
+        std::unique_lock lock(pending_mu_);
         prune_expired_pending_locked();
         auto it = pending_by_session_id_.find(session_id);
         if (it == pending_by_session_id_.end()) {
@@ -618,26 +611,45 @@ grpc::Status AgentServiceImpl::Subscribe(
                          session_id, register_peer_ip, subscribe_peer_ip,
                          gateway_mode_ ? "true" : "false");
             // #1059: a peer-mismatch rejection is a stolen-session signal —
-            // emit an audit row (spdlog is not the audit log). audit_store_ is a
-            // leaf lock, so emitting under pending_mu_ on this rejection path is
-            // safe (no inverse lock order exists) and keeps the registry entry's
-            // agent_id in scope without a re-lookup. SOC 2 CC7.2.
+            // emit an audit row (spdlog is not the audit log). Copy the
+            // registry entry's agent_id, then RELEASE pending_mu_ BEFORE the
+            // audit write: AuditStore::log holds its own mutex and runs a WAL
+            // INSERT (busy_timeout=5s), and pending_mu_ is the global
+            // Register/Subscribe/Heartbeat lock — holding it across the write
+            // under a peer-mismatch flood would serialize the whole plane
+            // (gov #1117 perf / UP-1). `it` is invalidated by the unlock, so
+            // agent_id MUST be copied first (gov UP-2). SOC 2 CC7.2.
+            const std::string mismatch_agent_id = it->second.agent_id;
+            const std::string raw_peer{context->peer()};
+            lock.unlock();
             if (audit_store_ && audit_store_->is_open()) {
                 AuditEvent ev;
                 ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                                    std::chrono::system_clock::now().time_since_epoch())
                                    .count();
-                ev.principal = "agent:" + it->second.agent_id;
+                ev.principal = "agent:" + mismatch_agent_id;
                 ev.principal_role = "agent";
-                ev.action = "subscribe.peer_mismatch";
-                ev.target_type = "session";
-                ev.target_id = it->second.agent_id;
-                ev.detail = std::string("register_ip=")
-                                .append(register_peer_ip)
-                                .append(" subscribe_ip=")
-                                .append(subscribe_peer_ip)
-                                .append(" gateway_mode=")
-                                .append(gateway_mode_ ? "true" : "false");
+                // Action domain + target shape follow the session.* convention
+                // (gov #1117 architect/consistency): the target IS the session,
+                // and target_type is PascalCase to match auth.login's `Session`
+                // so SIEM filters on target_type=="Session" catch this row.
+                ev.action = "session.peer_mismatch";
+                ev.target_type = "Session";
+                ev.target_id = session_id;
+                std::string detail = std::string("agent_id=")
+                                         .append(mismatch_agent_id)
+                                         .append(" register_ip=")
+                                         .append(register_peer_ip)
+                                         .append(" subscribe_ip=")
+                                         .append(subscribe_peer_ip)
+                                         .append(" gateway_mode=")
+                                         .append(gateway_mode_ ? "true" : "false");
+                // UP-4: strict extract_peer_ip returns empty for a malformed
+                // peer — preserve the raw gRPC peer string so the forensic row
+                // isn't blind to the attacker's address.
+                if (subscribe_peer_ip.empty())
+                    detail.append(" raw_peer=").append(raw_peer);
+                ev.detail = std::move(detail);
                 ev.source_ip = subscribe_peer_ip;
                 ev.session_id = session_id;
                 ev.result = "denied";

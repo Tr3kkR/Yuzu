@@ -374,6 +374,9 @@ TEST_CASE("extract_peer_ip strict-mode rejects malformed addresses (#1058)",
     CHECK(extract_peer_ip("ipv4:999.1.1.1:80").empty()); // octet > 255
     CHECK(extract_peer_ip("ipv4:1.2.3.4.:80").empty());  // trailing dot
     CHECK(extract_peer_ip("ipv4::80").empty());          // empty address
+    CHECK(extract_peer_ip("ipv4:01.02.03.04:80").empty()); // leading-zero octets (non-canonical)
+    CHECK(extract_peer_ip("ipv4:1.2.3.04:80").empty());    // single leading-zero octet
+    CHECK(extract_peer_ip("ipv4:0.0.0.0:80") == "0.0.0.0"); // bare-zero octets are canonical
     // ipv6 bodies with non-hex junk in the address → empty
     CHECK(extract_peer_ip("ipv6:[xyz]:80").empty());
     CHECK(extract_peer_ip("ipv6:[g::1]:80").empty()); // 'g' not hex
@@ -394,7 +397,23 @@ TEST_CASE("extract_peer_ip canonicalizes IPv6 to lowercase (#1058)",
     // comparison if that ever changes.)
     CHECK(extract_peer_ip("ipv6:[2001:DB8::1]:443") == "2001:db8::1");
     CHECK(extract_peer_ip("ipv6:[FE80::AbCd]:443") == "fe80::abcd");
+    // IPv4-mapped IPv6 (dual-stack listener accepting an IPv4 client) — '.' is
+    // allowed in the v6 body; uppercase folds to lower.
+    CHECK(extract_peer_ip("ipv6:[::ffff:1.2.3.4]:80") == "::ffff:1.2.3.4");
+    CHECK(extract_peer_ip("ipv6:[::FFFF:1.2.3.4]:80") == "::ffff:1.2.3.4");
     CHECK(extract_peer_ip("ipv4:1.2.3.4:5") == "1.2.3.4"); // ipv4 needs no folding
+}
+
+TEST_CASE("extract_peer_ip register/subscribe comparison is casing-symmetric (#1058)",
+          "[agent_service][peer_mismatch][issue1058]") {
+    using yuzu::server::detail::extract_peer_ip;
+    // The #826 binding check compares extract_peer_ip(register) vs
+    // extract_peer_ip(subscribe). The same IP in different hex casing / port
+    // MUST compare equal after canonicalization, or a legit agent reconnecting
+    // via a differently-cased peer string would be locked out.
+    CHECK(extract_peer_ip("ipv6:[FE80::1]:443") == extract_peer_ip("ipv6:[fe80::1]:9999"));
+    CHECK(extract_peer_ip("ipv6:[2001:DB8::AB]:1") == extract_peer_ip("ipv6:[2001:db8::ab]:2"));
+    CHECK(extract_peer_ip("ipv4:1.2.3.4:443") == extract_peer_ip("ipv4:1.2.3.4:55"));
 }
 
 TEST_CASE("extract_peer_ip never returns junk on arbitrary input (#1058)",
