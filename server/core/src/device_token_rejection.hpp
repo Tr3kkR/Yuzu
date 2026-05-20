@@ -8,8 +8,8 @@
 /// HTTP/gRPC response MUST go through `make_public_rejection()` (HTTP) or
 /// `make_grpc_rejection_status()` (gRPC) and MUST NOT vary the wire shape
 /// by variant. The typed `DeviceTokenValidateError` is visible ONLY in
-/// operator-facing surfaces: audit rows (`rejection_detail()` /
-/// `rejection_event_action()`) and Prometheus counters
+/// operator-facing surfaces: audit rows (`rejection_audit_detail_for_storage()`
+/// / `rejection_event_action()`) and Prometheus counters
 /// (`rejection_metric_name()`).
 ///
 /// **Why collapse?** Without this, an attacker holding a stolen valid
@@ -97,6 +97,8 @@ inline std::string_view rejection_variant_name(DeviceTokenValidateError e) noexc
         return "unbound_legacy";
     case DeviceTokenValidateError::binding_mismatch:
         return "binding_mismatch";
+    case DeviceTokenValidateError::internal_error:
+        return "internal_error";
     }
     return "unknown";
 }
@@ -105,7 +107,17 @@ inline std::string_view rejection_variant_name(DeviceTokenValidateError e) noexc
 /// for `binding_mismatch` (#1053 audit-completeness goal) so an auditor
 /// can reconstruct "agent X tried to use a token bound to agent Y
 /// (issued by principal Z)" without joining additional tables.
-inline std::string rejection_detail(const RejectedToken& r, std::string_view presenting_agent_id) {
+///
+/// **Trust boundary (#1060).** The `_for_storage` suffix is deliberate: the
+/// returned string carries `bound_device_id` / `bound_principal_id`, which
+/// are operator-only. The result MUST be written ONLY to the audit store —
+/// never echoed onto a REST/dashboard "recent rejections" surface, or it
+/// leaks token-binding context to an attacker holding a stolen token. Naming
+/// the boundary at every call site is the compile-time-cheap guard against a
+/// future caller surfacing it on a public response. See the `make_public_*`
+/// helpers for the only sanctioned wire path.
+inline std::string rejection_audit_detail_for_storage(const RejectedToken& r,
+                                                      std::string_view presenting_agent_id) {
     std::string detail{rejection_variant_name(r.error)};
     if (!presenting_agent_id.empty())
         detail.append(": presenter=").append(presenting_agent_id);

@@ -302,7 +302,7 @@ TEST_CASE("REST DELETE /api/v1/tokens: unknown token id returns 404 with no audi
 // `csprng_unavailable` marker. The hooks lean on
 // `yuzu::server::test_hooks::force_next_failure_for_this_thread()` — a
 // thread-local, one-shot override that makes the very next
-// `fill_random` / `random_hex` call return PrngFailure without faking
+// `fill_random` / `random_hex` call return prng_failure without faking
 // an entropy-starved process. SOC 2 CC7.2/CC7.3 rationale: security-
 // relevant failure conditions for token issuance must be auditable.
 // ──────────────────────────────────────────────────────────────────────────
@@ -314,7 +314,7 @@ TEST_CASE("REST POST /api/v1/tokens: CSPRNG failure emits failure audit (F-002)"
     h.session_role = auth::Role::user;
 
     // Force the next fill_random call (inside ApiTokenStore::generate_raw_token)
-    // to return PrngFailure. This is the only path that produces the CSPRNG
+    // to return prng_failure. This is the only path that produces the CSPRNG
     // error without sabotaging the OS RNG, and it auto-clears so any
     // subsequent calls in the harness teardown are unaffected.
     yuzu::server::test_hooks::force_next_failure_for_this_thread();

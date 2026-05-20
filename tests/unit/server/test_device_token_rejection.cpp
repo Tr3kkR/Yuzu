@@ -14,7 +14,7 @@
  *      `binding_mismatch` from `not_found` to confirm token existence.
  *
  *   2. **Audit/metric expansion (#1053).** The operator-visible side —
- *      `rejection_detail()` and `rejection_metric_name()` — MUST
+ *      `rejection_audit_detail_for_storage()` and `rejection_metric_name()` — MUST
  *      discriminate by variant so SRE can alert on a `binding_mismatch`
  *      spike and an auditor can reconstruct attempted impersonations
  *      ("presenter=X bound=Y bound_principal=Z").
@@ -50,6 +50,7 @@ RejectedToken make_rejected(DeviceTokenValidateError v) {
     switch (v) {
     case DeviceTokenValidateError::invalid_input:
     case DeviceTokenValidateError::not_found:
+    case DeviceTokenValidateError::internal_error:
         // no row context — fields stay empty
         break;
     case DeviceTokenValidateError::revoked:
@@ -72,6 +73,7 @@ const std::vector<DeviceTokenValidateError> kAllVariants = {
     DeviceTokenValidateError::invalid_input,  DeviceTokenValidateError::not_found,
     DeviceTokenValidateError::revoked,        DeviceTokenValidateError::expired,
     DeviceTokenValidateError::unbound_legacy, DeviceTokenValidateError::binding_mismatch,
+    DeviceTokenValidateError::internal_error,
 };
 
 } // namespace
@@ -165,7 +167,7 @@ TEST_CASE("device_token_rejection: audit detail discriminates by variant",
     std::set<std::string> detail_set;
     for (auto v : kAllVariants) {
         auto rt = make_rejected(v);
-        auto detail = rejection_detail(rt, "device-B");
+        auto detail = rejection_audit_detail_for_storage(rt, "device-B");
         REQUIRE_FALSE(detail.empty());
         CHECK(detail.find(std::string(rejection_variant_name(v))) != std::string::npos);
         detail_set.insert(detail);
@@ -180,7 +182,7 @@ TEST_CASE("device_token_rejection: binding_mismatch audit detail names presenter
     // The #1053 acceptance case: auditor sees the full impersonation
     // attempt without joining additional tables.
     auto rt = make_rejected(DeviceTokenValidateError::binding_mismatch);
-    auto detail = rejection_detail(rt, "device-B");
+    auto detail = rejection_audit_detail_for_storage(rt, "device-B");
     CHECK(detail.find("binding_mismatch") != std::string::npos);
     CHECK(detail.find("presenter=device-B") != std::string::npos);
     CHECK(detail.find("bound=device-A") != std::string::npos);
@@ -193,7 +195,7 @@ TEST_CASE("device_token_rejection: unbound_legacy audit detail omits bound_devic
     // Per RejectedToken doc — unbound_legacy MUST NOT carry a fabricated
     // bound_device_id. The legacy row has no binding by construction.
     auto rt = make_rejected(DeviceTokenValidateError::unbound_legacy);
-    auto detail = rejection_detail(rt, "device-Z");
+    auto detail = rejection_audit_detail_for_storage(rt, "device-Z");
     CHECK(detail.find("unbound_legacy") != std::string::npos);
     CHECK(detail.find("presenter=device-Z") != std::string::npos);
     CHECK(detail.find("bound_principal=admin") != std::string::npos);
@@ -207,7 +209,7 @@ TEST_CASE("device_token_rejection: not_found audit detail carries no row context
     // not_found is the only rejection without a row — must not fabricate
     // token_id / bound_* fields.
     auto rt = make_rejected(DeviceTokenValidateError::not_found);
-    auto detail = rejection_detail(rt, "device-Z");
+    auto detail = rejection_audit_detail_for_storage(rt, "device-Z");
     CHECK(detail.find("not_found") != std::string::npos);
     CHECK(detail.find("presenter=device-Z") != std::string::npos);
     CHECK(detail.find("token_id=") == std::string::npos);
@@ -232,6 +234,8 @@ TEST_CASE("device_token_rejection: Prometheus metric names are stable + variant-
     CHECK(rejection_metric_name(DeviceTokenValidateError::expired) ==
           "yuzu_device_token_rejected_total");
     CHECK(rejection_metric_name(DeviceTokenValidateError::invalid_input) ==
+          "yuzu_device_token_rejected_total");
+    CHECK(rejection_metric_name(DeviceTokenValidateError::internal_error) ==
           "yuzu_device_token_rejected_total");
 }
 

@@ -266,7 +266,7 @@ public:
                           "Audit events that failed to persist (sqlite3_step != DONE)", "counter");
         // PR W1.1 sre-1 (gov Gate 6, sre): CSPRNG-failure paging signal.
         // Increments in the token-create handlers (api_token, device_token)
-        // when `secure_random::fill_random` returns PrngFailure (entropy
+        // when `secure_random::fill_random` returns prng_failure (entropy
         // exhaustion). Operators wire a Prometheus rule like
         //   rate(yuzu_secure_random_failure_total[5m]) > 0
         // to page on-call short of grepping audit logs.
@@ -298,7 +298,7 @@ public:
                           "Replay attempt against a revoked device token", "counter");
         metrics_.describe("yuzu_device_token_rejected_total",
                           "Low-signal device-token validation rejections (not_found, "
-                          "expired, invalid_input), labelled by variant",
+                          "expired, invalid_input, internal_error), labelled by variant",
                           "counter");
         // W1.4 / #827: enrollment-token race-loss counter. Fires when two
         // agents concurrently presented the same one-time enrollment token
