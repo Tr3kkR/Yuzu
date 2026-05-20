@@ -143,9 +143,11 @@ inline std::string rejection_audit_detail_for_storage(const RejectedToken& r,
 /// * `revoked` — replayed-revoked-token attempt. Investigate the
 ///   originating IP.
 ///
-/// `not_found` / `expired` / `invalid_input` are bucketed together as
-/// low-signal `yuzu_device_token_rejected_total{variant=...}` so SRE
-/// can still see them without flooding the high-signal counters.
+/// `not_found` / `expired` / `invalid_input` / `internal_error` are
+/// bucketed together as low-signal `yuzu_device_token_rejected_total{variant=...}`
+/// so SRE can still see them without flooding the high-signal counters.
+/// (`internal_error` is a store-internal fault, not a client miss — when the
+/// store is wired it should graduate to its own paging counter; see #1054.)
 inline std::string_view rejection_metric_name(DeviceTokenValidateError e) noexcept {
     switch (e) {
     case DeviceTokenValidateError::binding_mismatch:

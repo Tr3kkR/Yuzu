@@ -138,6 +138,7 @@ TEST_CASE("device_token_rejection: gRPC status uniformly UNAUTHENTICATED",
     CHECK(msg.find("expired") == std::string::npos);
     CHECK(msg.find("unbound_legacy") == std::string::npos);
     CHECK(msg.find("binding_mismatch") == std::string::npos);
+    CHECK(msg.find("internal_error") == std::string::npos);
     CHECK(msg.find("device-A") == std::string::npos);
     CHECK(msg.find("admin") == std::string::npos);
 }
@@ -211,6 +212,19 @@ TEST_CASE("device_token_rejection: not_found audit detail carries no row context
     auto rt = make_rejected(DeviceTokenValidateError::not_found);
     auto detail = rejection_audit_detail_for_storage(rt, "device-Z");
     CHECK(detail.find("not_found") != std::string::npos);
+    CHECK(detail.find("presenter=device-Z") != std::string::npos);
+    CHECK(detail.find("token_id=") == std::string::npos);
+    CHECK(detail.find(" bound=") == std::string::npos);
+    CHECK(detail.find("bound_principal=") == std::string::npos);
+}
+
+TEST_CASE("device_token_rejection: internal_error audit detail carries no row context",
+          "[device_token][audit][issue1056]") {
+    // internal_error (a store-internal fault, e.g. sqlite3_prepare_v2 failure)
+    // has no row — like not_found it MUST NOT fabricate token_id / bound_* fields.
+    auto rt = make_rejected(DeviceTokenValidateError::internal_error);
+    auto detail = rejection_audit_detail_for_storage(rt, "device-Z");
+    CHECK(detail.find("internal_error") != std::string::npos);
     CHECK(detail.find("presenter=device-Z") != std::string::npos);
     CHECK(detail.find("token_id=") == std::string::npos);
     CHECK(detail.find(" bound=") == std::string::npos);
