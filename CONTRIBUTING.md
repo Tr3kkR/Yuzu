@@ -36,6 +36,15 @@ maintainer at nathan.dornbrook@gmail.com.
 
 ## Getting Started
 
+> **Meson and Ninja are required — they are the project's only build toolchain.**
+> Everything in this repo assumes both are installed and on your `PATH`:
+> `scripts/setup.sh`, `meson compile` / `meson test`, the per-OS build
+> directories, and the `/test` pre-commit pipeline all drive Meson + Ninja
+> directly. **CMake is not an alternative build system** here — it is pulled in
+> only as a Meson dependency-resolution method, never invoked to build. Without
+> Meson + Ninja you cannot build, test, or run any of the tooling, so install
+> them first (Meson 1.9.2; a recent Ninja) before following the steps below.
+
 1. **Prerequisites**: Meson 1.9.2, Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
 2. **Clone and build**:
    ```bash
