@@ -1173,15 +1173,18 @@ jobs:
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
 
       - name: Image summary
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           {
             echo "## Published \`yuzu-${{ matrix.image }}\` image"
             echo ""
             echo '```'
-            echo "${{ steps.meta.outputs.tags }}"
+            echo "$META_TAGS"
             echo '```'
             echo ""
-            echo "**Digest:** \`${{ steps.build.outputs.digest }}\`"
+            echo "**Digest:** \`$BUILD_DIGEST\`"
             echo ""
             echo "Signed with cosign keyless + SLSA provenance attestation."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -1367,12 +1370,14 @@ jobs:
           fi
 
       - name: Generate release notes
+        env:
+          HAS_CHANGELOG: ${{ steps.changelog.outputs.has_changelog }}
         run: |
           OWNER="${{ github.repository_owner }}"
           TAG="${GITHUB_REF_NAME}"
 
           # Start with changelog content if available
-          if [ "${{ steps.changelog.outputs.has_changelog }}" = "true" ]; then
+          if [ "$HAS_CHANGELOG" = "true" ]; then
             cat changelog_section.md > release-notes.md
             echo "" >> release-notes.md
           else
@@ -1484,9 +1489,10 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IS_PRERELEASE: ${{ steps.prerelease.outputs.is_prerelease }}
         run: |
           PRERELEASE_FLAG=""
-          if [[ "${{ steps.prerelease.outputs.is_prerelease }}" == "true" ]]; then
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
             PRERELEASE_FLAG="--prerelease"
           fi
 
