@@ -9,6 +9,7 @@
 #include "enrollment_token_rejection.hpp"
 #include "execution_tracker.hpp"
 #include "fleet_topology_store.hpp"
+#include "grpc_audit_signal.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
@@ -202,6 +203,12 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     audit_ok = audit_store_->log(ev);
                 }
 
+                // #1063: surface a dropped audit row on the wire (mirror REST
+                // Sec-Audit-Failed) so the operator sees the evidence-chain gap,
+                // not just the analytics-severity escalation below.
+                if (!audit_ok)
+                    signal_grpc_audit_failed(context);
+
                 if (analytics_store_) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
@@ -244,6 +251,7 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
 
             // Success audit row — same action/target as the failure path so
             // SIEM filters can pivot on result=success vs failure.
+            bool enroll_audit_ok = true;
             if (audit_store_ && audit_store_->is_open()) {
                 AuditEvent ev;
                 ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -262,7 +270,25 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 if (context)
                     ev.source_ip = extract_peer_ip(context->peer());
                 ev.result = "success";
-                (void)audit_store_->log(ev);
+                enroll_audit_ok = audit_store_->log(ev);
+            }
+            // #1065 / #1063: a dropped SUCCESS audit row is the same
+            // evidence-chain degradation as a dropped failure row — was
+            // fire-and-forget. Surface it on the wire and escalate analytics,
+            // mirroring the denial path's audit_ok handling. SOC 2 CC7.2.
+            if (!enroll_audit_ok) {
+                signal_grpc_audit_failed(context);
+                if (analytics_store_) {
+                    AnalyticsEvent ae;
+                    ae.event_type = "agent.enrollment_audit_dropped";
+                    ae.agent_id = info.agent_id();
+                    ae.hostname = info.hostname();
+                    ae.os = info.platform().os();
+                    ae.arch = info.platform().arch();
+                    ae.severity = Severity::kError;
+                    ae.attributes = {{"result", "success"}, {"audit_emitted", false}};
+                    analytics_store_->emit(std::move(ae));
+                }
             }
 
             // Persist enrollment so reconnections don't need a valid token.
@@ -591,6 +617,33 @@ grpc::Status AgentServiceImpl::Subscribe(
                          "subscribe_ip={}, gateway_mode={})",
                          session_id, register_peer_ip, subscribe_peer_ip,
                          gateway_mode_ ? "true" : "false");
+            // #1059: a peer-mismatch rejection is a stolen-session signal —
+            // emit an audit row (spdlog is not the audit log). audit_store_ is a
+            // leaf lock, so emitting under pending_mu_ on this rejection path is
+            // safe (no inverse lock order exists) and keeps the registry entry's
+            // agent_id in scope without a re-lookup. SOC 2 CC7.2.
+            if (audit_store_ && audit_store_->is_open()) {
+                AuditEvent ev;
+                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+                ev.principal = "agent:" + it->second.agent_id;
+                ev.principal_role = "agent";
+                ev.action = "subscribe.peer_mismatch";
+                ev.target_type = "session";
+                ev.target_id = it->second.agent_id;
+                ev.detail = std::string("register_ip=")
+                                .append(register_peer_ip)
+                                .append(" subscribe_ip=")
+                                .append(subscribe_peer_ip)
+                                .append(" gateway_mode=")
+                                .append(gateway_mode_ ? "true" : "false");
+                ev.source_ip = subscribe_peer_ip;
+                ev.session_id = session_id;
+                ev.result = "denied";
+                if (!audit_store_->log(ev))
+                    signal_grpc_audit_failed(context);
+            }
             return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "peer mismatch");
         }
 

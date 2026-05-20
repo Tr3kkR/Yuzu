@@ -8,6 +8,7 @@
 #include "audit_store.hpp"
 #include "enrollment_token_rejection.hpp"
 #include "fleet_topology_store.hpp"
+#include "grpc_audit_signal.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
@@ -165,6 +166,11 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     audit_ok = audit_store_->log(ev);
                 }
 
+                // #1063: surface a dropped audit row on the wire (mirror REST
+                // Sec-Audit-Failed) so the operator sees the evidence-chain gap.
+                if (!audit_ok)
+                    signal_grpc_audit_failed(context);
+
                 if (analytics_store_) {
                     AnalyticsEvent ae;
                     ae.event_type = "agent.enrollment_denied";
@@ -198,6 +204,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                          info.agent_id(), claim.token_id, claim.use_count_after,
                          claim.max_uses == 0 ? -1 : claim.max_uses);
 
+            bool enroll_audit_ok = true;
             if (audit_store_ && audit_store_->is_open()) {
                 AuditEvent ev;
                 ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
@@ -216,7 +223,27 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 if (context)
                     ev.source_ip = extract_peer_ip(context->peer());
                 ev.result = "success";
-                (void)audit_store_->log(ev);
+                enroll_audit_ok = audit_store_->log(ev);
+            }
+            // #1065 / #1063: a dropped SUCCESS audit row is the same
+            // evidence-chain degradation as a dropped failure row — was
+            // fire-and-forget. Surface on the wire and escalate analytics,
+            // mirroring the denial path's audit_ok handling. SOC 2 CC7.2.
+            if (!enroll_audit_ok) {
+                signal_grpc_audit_failed(context);
+                if (analytics_store_) {
+                    AnalyticsEvent ae;
+                    ae.event_type = "agent.enrollment_audit_dropped";
+                    ae.agent_id = info.agent_id();
+                    ae.hostname = info.hostname();
+                    ae.os = info.platform().os();
+                    ae.arch = info.platform().arch();
+                    ae.severity = Severity::kError;
+                    ae.attributes = {{"result", "success"},
+                                     {"audit_emitted", false},
+                                     {"source", "gateway_proxy"}};
+                    analytics_store_->emit(std::move(ae));
+                }
             }
 
             if (!auth_mgr_.ensure_enrolled(info.agent_id(), info.hostname(), info.platform().os(),
