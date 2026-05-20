@@ -27,6 +27,13 @@ If you do not wish to sign the CLA, you may not contribute code, documentation,
 or other materials to this repository. File an issue instead — the maintainers
 can implement the idea under their own copyright.
 
+## Code of Conduct
+
+This project adopts the [Contributor Covenant](CODE_OF_CONDUCT.md) (v3.0). By
+participating — as a human or an agentic worker acting on someone's behalf — you
+are expected to uphold it. Report unacceptable behavior privately to the project
+maintainer at nathan.dornbrook@gmail.com.
+
 ## Getting Started
 
 1. **Prerequisites**: Meson 1.9.2, Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
