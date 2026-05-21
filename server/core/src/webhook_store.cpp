@@ -5,6 +5,9 @@
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <chrono>
 #include <iomanip>
 #include <semaphore>
@@ -60,6 +63,192 @@ static bool event_matches(const std::string& event_types, const std::string& eve
         }
     }
     return false;
+}
+
+static std::string lowercase_ascii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+static bool has_suffix(const std::string& value, const std::string& suffix) {
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+static std::string extract_url_host(const std::string& url) {
+    const auto scheme_end = url.find("://");
+    if (scheme_end == std::string::npos)
+        return {};
+
+    auto authority_start = scheme_end + 3;
+    const auto authority_end = url.find_first_of("/?#", authority_start);
+    auto authority = url.substr(authority_start, authority_end - authority_start);
+    if (authority.empty())
+        return {};
+
+    if (const auto at = authority.rfind('@'); at != std::string::npos)
+        authority = authority.substr(at + 1);
+
+    std::string host;
+    if (authority.starts_with('[')) {
+        const auto close = authority.find(']');
+        if (close == std::string::npos)
+            return {};
+        host = authority.substr(1, close - 1);
+    } else {
+        const auto colon = authority.find(':');
+        host = authority.substr(0, colon);
+    }
+
+    host = lowercase_ascii(std::move(host));
+    while (!host.empty() && host.back() == '.')
+        host.pop_back();
+    if (const auto zone = host.find('%'); zone != std::string::npos)
+        host = host.substr(0, zone);
+    return host;
+}
+
+static bool parse_ipv4_literal(const std::string& host, std::array<int, 4>& octets) {
+    std::array<int, 4> parsed{};
+    std::size_t start = 0;
+    for (std::size_t part = 0; part < parsed.size(); ++part) {
+        const auto end = part == parsed.size() - 1 ? std::string::npos : host.find('.', start);
+        if (end == std::string::npos && part != parsed.size() - 1)
+            return false;
+        const auto token = host.substr(start, end - start);
+        if (token.empty() || token.size() > 3)
+            return false;
+        int value = 0;
+        for (char c : token) {
+            if (!std::isdigit(static_cast<unsigned char>(c)))
+                return false;
+            value = value * 10 + (c - '0');
+        }
+        if (value > 255)
+            return false;
+        parsed[part] = value;
+        start = end == std::string::npos ? std::string::npos : end + 1;
+    }
+    if (start != std::string::npos)
+        return false;
+    octets = parsed;
+    return true;
+}
+
+static bool is_ambiguous_ipv4_literal(const std::string& host) {
+    if (host.starts_with("0x") || host.starts_with("0X"))
+        return true;
+
+    bool saw_digit = false;
+    for (char c : host) {
+        if (std::isdigit(static_cast<unsigned char>(c))) {
+            saw_digit = true;
+            continue;
+        }
+        if (c == '.')
+            continue;
+        return false;
+    }
+    return saw_digit;
+}
+
+static bool is_blocked_ipv4_literal(const std::array<int, 4>& ip) {
+    if (ip[0] == 0 || ip[0] == 10 || ip[0] == 127)
+        return true;
+    if (ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127)
+        return true;
+    if (ip[0] == 169 && ip[1] == 254)
+        return true;
+    if (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31)
+        return true;
+    if (ip[0] == 192 && ip[1] == 168)
+        return true;
+    if (ip[0] == 198 && (ip[1] == 18 || ip[1] == 19))
+        return true;
+    if (ip[0] >= 224)
+        return true;
+    return false;
+}
+
+static bool parse_ipv6_hextet(const std::string& value, int& parsed) {
+    if (value.empty() || value.size() > 4)
+        return false;
+
+    int result = 0;
+    for (char c : value) {
+        if (!std::isxdigit(static_cast<unsigned char>(c)))
+            return false;
+        result *= 16;
+        if (std::isdigit(static_cast<unsigned char>(c)))
+            result += c - '0';
+        else
+            result += std::tolower(static_cast<unsigned char>(c)) - 'a' + 10;
+    }
+    parsed = result;
+    return true;
+}
+
+static bool parse_ipv4_mapped_hex_tail(const std::string& host, std::array<int, 4>& ip) {
+    const auto last_colon = host.rfind(':');
+    if (last_colon == std::string::npos || last_colon == 0)
+        return false;
+    const auto prev_colon = host.rfind(':', last_colon - 1);
+    if (prev_colon == std::string::npos)
+        return false;
+
+    const auto prefix = host.substr(0, prev_colon);
+    if (!has_suffix(prefix, ":ffff"))
+        return false;
+
+    int high = 0;
+    int low = 0;
+    if (!parse_ipv6_hextet(host.substr(prev_colon + 1, last_colon - prev_colon - 1), high) ||
+        !parse_ipv6_hextet(host.substr(last_colon + 1), low))
+        return false;
+
+    ip = {high >> 8, high & 0xff, low >> 8, low & 0xff};
+    return true;
+}
+
+static bool is_blocked_ipv6_literal(const std::string& host) {
+    if (host.find(':') == std::string::npos)
+        return false;
+    if (host == "::" || host == "::1" || host == "0:0:0:0:0:0:0:1")
+        return true;
+
+    if (host.starts_with("fc") || host.starts_with("fd"))
+        return true;
+    if (host.starts_with("fe8") || host.starts_with("fe9") || host.starts_with("fea") ||
+        host.starts_with("feb"))
+        return true;
+
+    const auto last_colon = host.rfind(':');
+    if (last_colon != std::string::npos) {
+        std::array<int, 4> mapped{};
+        if (parse_ipv4_literal(host.substr(last_colon + 1), mapped))
+            return is_blocked_ipv4_literal(mapped);
+        if (parse_ipv4_mapped_hex_tail(host, mapped))
+            return is_blocked_ipv4_literal(mapped);
+    }
+    return false;
+}
+
+static bool is_internal_webhook_host(const std::string& host) {
+    if (host.empty())
+        return true;
+    if (host == "localhost" || has_suffix(host, ".localhost") || has_suffix(host, ".local") ||
+        has_suffix(host, ".internal"))
+        return true;
+
+    std::array<int, 4> ipv4{};
+    if (parse_ipv4_literal(host, ipv4))
+        return is_blocked_ipv4_literal(ipv4);
+    if (is_ambiguous_ipv4_literal(host))
+        return true;
+
+    return is_blocked_ipv6_literal(host);
 }
 
 // ── HMAC-SHA256 ─────────────────────────────────────────────────────────────
@@ -167,6 +356,11 @@ int64_t WebhookStore::create_webhook(const std::string& url, const std::string& 
     // Validate URL scheme — only http:// and https:// are allowed
     if (!url.starts_with("http://") && !url.starts_with("https://")) {
         spdlog::warn("WebhookStore: rejected webhook with invalid URL scheme: {}", url);
+        return -1;
+    }
+    auto host = extract_url_host(url);
+    if (is_internal_webhook_host(host)) {
+        spdlog::warn("WebhookStore: rejected webhook with internal URL host: {}", url);
         return -1;
     }
 

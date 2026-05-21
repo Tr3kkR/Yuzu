@@ -94,6 +94,46 @@ TEST_CASE("WebhookStore: rejects invalid URL scheme", "[webhook_store][security]
     CHECK(id5 > 0);
 }
 
+TEST_CASE("WebhookStore: rejects internal webhook hosts", "[webhook_store][security]") {
+    WebhookStore store(":memory:");
+
+    CHECK(store.create_webhook("http://127.0.0.1:8080/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://localhost:50051/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://169.254.169.254/latest/meta-data",
+                               "agent.registered", "secret") == -1);
+    CHECK(store.create_webhook("http://10.0.0.5/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://172.16.0.5/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://192.168.1.5/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://[::1]:50051/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://[fc00::1]/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://[::ffff:7f00:1]/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://[::ffff:a00:1]/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://agent.local/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://api.internal/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://2130706433/hook", "agent.registered",
+                               "secret") == -1);
+    CHECK(store.create_webhook("http://0177.0.0.1/hook", "agent.registered",
+                               "secret") == -1);
+
+    CHECK(store.create_webhook("https://example.com/hook", "agent.registered",
+                               "secret") > 0);
+    CHECK(store.create_webhook("http://93.184.216.34/hook", "agent.registered",
+                               "secret") > 0);
+    CHECK(store.create_webhook("http://[::ffff:5db8:d822]/hook", "agent.registered",
+                               "secret") > 0);
+}
+
 // ── Empty store ────────────────────────────────────────────────────────────
 
 TEST_CASE("WebhookStore: empty store returns empty list", "[webhook_store]") {
