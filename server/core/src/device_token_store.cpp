@@ -229,8 +229,11 @@ DeviceTokenStore::validate_token(const std::string& raw_token,
                            "created_at, expires_at, last_used_at, revoked "
                            "FROM device_auth_tokens WHERE token_hash = ?;",
                            -1, &s, nullptr) != SQLITE_OK) {
+        // #1056: a prepare failure is a store-internal fault, not a clean
+        // miss. Labelling it not_found would pollute the not_found signal and
+        // mislead forensics. It still collapses to the same wire response.
         RejectedToken r;
-        r.error = DeviceTokenValidateError::not_found;
+        r.error = DeviceTokenValidateError::internal_error;
         return std::unexpected(std::move(r));
     }
     sqlite3_bind_text(s, 1, hashed.c_str(), -1, SQLITE_TRANSIENT);

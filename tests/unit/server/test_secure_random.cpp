@@ -79,7 +79,7 @@ TEST_CASE("secure_random: 1000 consecutive 16-byte hex tokens are all unique", "
 // On POSIX, fill_random rejects buffers larger than INT_MAX because
 // RAND_bytes takes int. Windows splits into ULONG-sized chunks instead, so
 // this guard does not apply there.
-TEST_CASE("secure_random: oversized request returns PrngFailure on POSIX", "[csprng][error]") {
+TEST_CASE("secure_random: oversized request returns prng_failure on POSIX", "[csprng][error]") {
     // We cannot actually allocate INT_MAX+1 bytes — synthesise a fake span
     // whose .size() exceeds the cap. The pointer is never dereferenced
     // because fill_random's size check fires first.
@@ -88,6 +88,6 @@ TEST_CASE("secure_random: oversized request returns PrngFailure on POSIX", "[csp
     std::span<std::uint8_t> oversized{&dummy, huge};
     auto rc = fill_random(oversized);
     REQUIRE_FALSE(rc.has_value());
-    CHECK(rc.error() == SecureRandomError::PrngFailure);
+    CHECK(rc.error() == SecureRandomError::prng_failure);
 }
 #endif

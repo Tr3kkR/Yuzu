@@ -57,6 +57,14 @@ enum class DeviceTokenValidateError {
     /// but the agent presenting the token does not match `device_id` (#824
     /// stolen-token impersonation).
     binding_mismatch,
+    /// A store-internal failure prevented validation from reaching a verdict
+    /// (e.g. `sqlite3_prepare_v2` failed). Distinct from `not_found` so an
+    /// internal fault does not pollute the not-found signal or mislead
+    /// forensics into reading a clean miss (#1056). Collapses to the same
+    /// 401/UNAUTHENTICATED wire response as every other variant — an
+    /// internal fault MUST NOT surface as a 500 differential an attacker
+    /// could probe.
+    internal_error,
 };
 
 /// Rich rejection context returned from `validate_token` on failure
@@ -71,6 +79,7 @@ enum class DeviceTokenValidateError {
 /// |--------------------|----------|-----------------|--------------------|
 /// | invalid_input      | empty    | empty           | empty              |
 /// | not_found          | empty    | empty           | empty              |
+/// | internal_error     | empty    | empty           | empty              |
 /// | revoked            | set      | set             | set                |
 /// | expired            | set      | set             | set                |
 /// | unbound_legacy     | set      | empty           | set                |
