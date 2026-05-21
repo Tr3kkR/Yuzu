@@ -44,6 +44,7 @@
 #include <yuzu/server/auto_approve.hpp>
 
 #include <memory>
+#include <random>
 #include <string>
 
 using yuzu::server::ResponseStore;
@@ -359,6 +360,85 @@ TEST_CASE("AgentServiceImpl::extract_peer_ip handles ipv4/ipv6/unix peer encodin
     CHECK(AgentServiceImpl::extract_peer_ip("garbage").empty());
     CHECK(AgentServiceImpl::extract_peer_ip("ipv6:no-brackets:8080").empty());
     CHECK(AgentServiceImpl::extract_peer_ip("ipv6:[unclosed").empty());
+}
+
+TEST_CASE("extract_peer_ip strict-mode rejects malformed addresses (#1058)",
+          "[agent_service][peer_mismatch][issue1058]") {
+    using yuzu::server::detail::extract_peer_ip;
+    // ipv4 bodies that are not a valid dotted-quad → empty. The previous lax
+    // parser returned a half-parsed substring that could slip past the #826
+    // binding comparison.
+    CHECK(extract_peer_ip("ipv4:not.an.ip:80").empty());
+    CHECK(extract_peer_ip("ipv4:1.2.3:80").empty());     // 3 octets
+    CHECK(extract_peer_ip("ipv4:1.2.3.4.5:80").empty()); // 5 octets
+    CHECK(extract_peer_ip("ipv4:999.1.1.1:80").empty()); // octet > 255
+    CHECK(extract_peer_ip("ipv4:1.2.3.4.:80").empty());  // trailing dot
+    CHECK(extract_peer_ip("ipv4::80").empty());          // empty address
+    CHECK(extract_peer_ip("ipv4:01.02.03.04:80").empty()); // leading-zero octets (non-canonical)
+    CHECK(extract_peer_ip("ipv4:1.2.3.04:80").empty());    // single leading-zero octet
+    CHECK(extract_peer_ip("ipv4:0.0.0.0:80") == "0.0.0.0"); // bare-zero octets are canonical
+    // ipv6 bodies with non-hex junk in the address → empty
+    CHECK(extract_peer_ip("ipv6:[xyz]:80").empty());
+    CHECK(extract_peer_ip("ipv6:[g::1]:80").empty()); // 'g' not hex
+    CHECK(extract_peer_ip("ipv6:[]:80").empty());     // empty address
+    CHECK(extract_peer_ip("ipv6:[1234]:80").empty()); // no colon → not v6
+    // valid shapes still pass, including a v6 zone id (interface name is
+    // non-hex but legitimate after '%').
+    CHECK(extract_peer_ip("ipv4:10.0.0.1:443") == "10.0.0.1");
+    CHECK(extract_peer_ip("ipv6:[fe80::1%eth0]:443") == "fe80::1%eth0");
+}
+
+TEST_CASE("extract_peer_ip canonicalizes IPv6 to lowercase (#1058)",
+          "[agent_service][peer_mismatch][issue1058]") {
+    using yuzu::server::detail::extract_peer_ip;
+    // Register-side vs subscribe-side comparison must not depend on hex
+    // casing — both sides route through this function so lowercasing is
+    // symmetric. (gRPC emits canonical lowercase today; this defends the
+    // comparison if that ever changes.)
+    CHECK(extract_peer_ip("ipv6:[2001:DB8::1]:443") == "2001:db8::1");
+    CHECK(extract_peer_ip("ipv6:[FE80::AbCd]:443") == "fe80::abcd");
+    // IPv4-mapped IPv6 (dual-stack listener accepting an IPv4 client) — '.' is
+    // allowed in the v6 body; uppercase folds to lower.
+    CHECK(extract_peer_ip("ipv6:[::ffff:1.2.3.4]:80") == "::ffff:1.2.3.4");
+    CHECK(extract_peer_ip("ipv6:[::FFFF:1.2.3.4]:80") == "::ffff:1.2.3.4");
+    CHECK(extract_peer_ip("ipv4:1.2.3.4:5") == "1.2.3.4"); // ipv4 needs no folding
+}
+
+TEST_CASE("extract_peer_ip register/subscribe comparison is casing-symmetric (#1058)",
+          "[agent_service][peer_mismatch][issue1058]") {
+    using yuzu::server::detail::extract_peer_ip;
+    // The #826 binding check compares extract_peer_ip(register) vs
+    // extract_peer_ip(subscribe). The same IP in different hex casing / port
+    // MUST compare equal after canonicalization, or a legit agent reconnecting
+    // via a differently-cased peer string would be locked out.
+    CHECK(extract_peer_ip("ipv6:[FE80::1]:443") == extract_peer_ip("ipv6:[fe80::1]:9999"));
+    CHECK(extract_peer_ip("ipv6:[2001:DB8::AB]:1") == extract_peer_ip("ipv6:[2001:db8::ab]:2"));
+    CHECK(extract_peer_ip("ipv4:1.2.3.4:443") == extract_peer_ip("ipv4:1.2.3.4:55"));
+}
+
+TEST_CASE("extract_peer_ip never returns junk on arbitrary input (#1058)",
+          "[agent_service][peer_mismatch][issue1058][fuzz]") {
+    using yuzu::server::detail::extract_peer_ip;
+    using yuzu::server::detail::is_plausible_ipv6;
+    using yuzu::server::detail::is_valid_ipv4;
+    // Deterministic fuzz: random bytes from a hostile alphabet (colons,
+    // brackets, percent, whitespace, non-hex letters) must never throw, and any
+    // non-empty result must itself validate as one of the two accepted shapes —
+    // the strict-mode guarantee under adversarial input.
+    std::mt19937 rng(0xC0FFEE);
+    const std::string alphabet = "ipv46:[]%.-_0123456789abcdefABCDEFxyz/ \t";
+    std::uniform_int_distribution<std::size_t> len_dist(0, 40);
+    std::uniform_int_distribution<std::size_t> ch_dist(0, alphabet.size() - 1);
+    for (int iter = 0; iter < 20000; ++iter) {
+        std::string s;
+        const std::size_t n = len_dist(rng);
+        for (std::size_t i = 0; i < n; ++i)
+            s.push_back(alphabet[ch_dist(rng)]);
+        const auto out = extract_peer_ip(s);
+        if (!out.empty()) {
+            CHECK((is_valid_ipv4(out) || is_plausible_ipv6(out)));
+        }
+    }
 }
 
 TEST_CASE("AgentRegistry::note_trusted_gateway_peer round-trips, refuses empty",

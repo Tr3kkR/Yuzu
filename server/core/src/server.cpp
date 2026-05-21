@@ -328,9 +328,11 @@ public:
         // from a new IP" (steady state in gateway deployments) from
         // "stolen session_id in non-gateway deployment" (active attack).
         metrics_.describe("yuzu_grpc_subscribe_peer_mismatch_total",
-                          "Subscribe RPC rejected because the peer IP differs from "
-                          "the Register peer IP and is not a trusted gateway, labelled "
-                          "by gateway_mode (true|false)",
+                          "Subscribe RPC rejected because the peer IP differs from the "
+                          "Register peer IP and is not a trusted gateway (stolen-session "
+                          "signal, #1059). Labelled event=security (SIEM-routing tag — "
+                          "Splunk et al. ingest via their Prometheus receiver and filter "
+                          "on event) and gateway_mode (true|false)",
                           "counter");
         // Login-latency observability (governance PR4 OBS-2). Histogram of
         // PBKDF2 verify duration, labelled by result so alerts can fire on

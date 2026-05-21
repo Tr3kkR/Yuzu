@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **W1.x — gRPC peer-IP strict-mode + audit symmetry (#1058, #1059, #1063,
+  #1065).** `extract_peer_ip` now strict-validates IPv4/IPv6 peer strings and
+  lowercases IPv6 so the Register-vs-Subscribe binding comparison (#826) is
+  canonical and cannot be slipped past with a malformed body. gRPC Subscribe
+  peer-mismatch rejections emit a `session.peer_mismatch` audit row (stolen-
+  session signal, SOC 2 CC7.2). gRPC Register/Subscribe set
+  `x-yuzu-audit-failed: true` trailing metadata when an audit row fails to
+  persist, mirroring REST's `Sec-Audit-Failed`. The success-path enrollment
+  audit is now captured and escalated on drop (symmetric with the denial path)
+  on both the direct-agent and gateway-proxy services.
+
 ### Changed
 
 - **#1056 — `DeviceTokenValidateError::internal_error` distinguishes a
