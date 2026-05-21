@@ -107,6 +107,18 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         // narrow race is closed only by option (b) refund-on-deny, tracked as a
         // follow-up.
         if (prior && *prior == auth::PendingStatus::denied) {
+            // gov #1134 (Tr3kkR): this early short-circuit returns before the
+            // legacy denied-handling code, which used to emit an
+            // `agent.enrollment_denied` analytics signal — leaving only
+            // spdlog. Replace it with the bounded, DoS-safe primitive: a
+            // counter (NOT a per-attempt audit row, which a denied-flood
+            // attacker could turn into a WAL write-amplification lever).
+            // event=security routes it to the SIEM via Prometheus, the same
+            // path as the stolen-session mismatch counters.
+            metrics_
+                .counter("yuzu_register_denied_total",
+                         {{"source", "direct"}, {"event", "security"}})
+                .increment();
             spdlog::warn("Register rejected: agent {} is admin-denied (no token consumed)",
                          info.agent_id());
             response->set_accepted(false);

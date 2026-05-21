@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enrollment paths now reject an admin-**denied** agent *before* consuming its
   enrollment token — previously the consume happened first, so a denied attacker
   could deplete a `max_uses=1` token and lock out the legitimate agent
-  (W1.4 UP-M3). gRPC Subscribe mTLS identity-mismatch rejections now emit a
+  (W1.4 UP-M3). The denied rejection emits a
+  `yuzu_register_denied_total{source,event="security"}` Prometheus signal
+  (replacing the analytics event the early return shadowed). gRPC Subscribe mTLS
+  identity-mismatch rejections now emit a
   `session.identity_mismatch` audit row (the mTLS sibling of
   `session.peer_mismatch`) out-of-lock, with a
   `yuzu_grpc_subscribe_identity_mismatch_total{event="security"}` Prometheus

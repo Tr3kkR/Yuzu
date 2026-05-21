@@ -1029,6 +1029,11 @@ TEST_CASE("Register: admin-denied agent does not consume the enrollment token (#
     REQUIRE(status.ok());
     CHECK_FALSE(resp.accepted());
     CHECK(resp.enrollment_status() == "denied");
+    // gov #1134: the denied rejection emits the bounded SIEM-routed counter.
+    CHECK(h.metrics
+              .counter("yuzu_register_denied_total",
+                       {{"source", "direct"}, {"event", "security"}})
+              .value() == 1.0);
 
     // Core invariant: the denied attempt did NOT consume the token.
     auto tokens = h.auth_mgr.list_enrollment_tokens();
@@ -1104,6 +1109,10 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
     REQUIRE(status.ok());
     CHECK_FALSE(resp.accepted());
     CHECK(resp.enrollment_status() == "denied");
+    CHECK(h.metrics
+              .counter("yuzu_register_denied_total",
+                       {{"source", "gateway_proxy"}, {"event", "security"}})
+              .value() == 1.0);
     auto tokens = h.auth_mgr.list_enrollment_tokens();
     REQUIRE(tokens.size() == 1);
     CHECK(tokens[0].use_count == 0); // token not depleted via the gateway path
