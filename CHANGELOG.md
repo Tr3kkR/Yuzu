@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Governance now requires C++ resource ownership proofs.** Gate 1
+  change summaries include a Resource Ledger for C++ diffs, Gate 2
+  `security-guardian` enforces RAII/scope-guard ownership at raw
+  resource boundaries, and Gate 3 includes a dedicated `cpp-safety`
+  reviewer for lifetime, C ABI, cast, thread, process, and sanitizer
+  coverage.
+
 - **CI — `CHANGELOG order` check no longer wedges meta PRs.** Removed the
   `paths:` filter from `docs-lint.yml` so the **required** "CHANGELOG order"
   status reports on every PR to `main`/`dev`. Previously the filter meant a PR
