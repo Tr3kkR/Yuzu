@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Governance — `CODEOWNERS` added.** `@fjarvis` is the code owner for the
+  auth/identity surface (`auth*`, `rbac_*`, `oidc_*`, `api_token_*`,
+  `device_token_*`, `enrollment_*`, `secure_random.*`, `auth.hpp`,
+  `docs/auth-architecture.md`); GitHub auto-requests his review on matching
+  PRs. Advisory for now — `require_code_owner_review` is off on the dev/main
+  rulesets.
+
 - **#1056 — `DeviceTokenValidateError::internal_error` distinguishes a
   store-internal fault from a clean miss.** A `sqlite3_prepare_v2`
   failure in `DeviceTokenStore::validate_token` was previously
