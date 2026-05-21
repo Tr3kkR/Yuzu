@@ -1066,8 +1066,8 @@ TEST_CASE("Register: successful token enrollment emits a success audit row (#106
     auto rows = h.audit.query({});
     bool found = false;
     for (const auto& ev : rows) {
-        if (ev.result == "success" && ev.principal == "agent:enroll-ok" &&
-            ev.target_type == "enrollment_token") {
+        if (ev.action == "enrollment.token_consumed" && ev.result == "success" &&
+            ev.principal == "agent:enroll-ok" && ev.target_type == "enrollment_token") {
             found = true;
             break;
         }
@@ -1085,6 +1085,7 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
     GatewayResponseHarness h;
     GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
                                            &h.metrics};
+    gateway_svc.set_audit_store(&h.audit);
     auto raw =
         h.auth_mgr.create_enrollment_token("gw-dos-test", /*max_uses=*/1, std::chrono::hours(1));
     h.auth_mgr.add_pending_agent("gw-denied", "evil-host", "linux", "x86_64", "0.0.0-test");
@@ -1106,4 +1107,9 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
     auto tokens = h.auth_mgr.list_enrollment_tokens();
     REQUIRE(tokens.size() == 1);
     CHECK(tokens[0].use_count == 0); // token not depleted via the gateway path
+
+    // The single use is still available — proving non-depletion via the gateway
+    // path too (symmetry with the direct-Register #1067 test).
+    auto gw_claim = h.auth_mgr.consume_enrollment_token(raw, "good-gw-agent");
+    CHECK(gw_claim.has_value());
 }
