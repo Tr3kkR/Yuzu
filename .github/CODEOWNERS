@@ -1,0 +1,15 @@
+# CODEOWNERS — GitHub auto-requests review from the listed owners when a PR
+# touches a matching path. Owners must have write access to the repo, or the
+# entry is silently ignored. The LAST matching pattern wins, so if a broad
+# catch-all is ever added, keep these auth rules below it.
+
+# Auth / identity control plane — owner @fjarvis
+/server/core/src/auth*                       @fjarvis
+/server/core/src/rbac_*                      @fjarvis
+/server/core/src/oidc_*                      @fjarvis
+/server/core/src/api_token_*                 @fjarvis
+/server/core/src/device_token_*              @fjarvis
+/server/core/src/enrollment_*                @fjarvis
+/server/core/src/secure_random.*             @fjarvis
+/server/core/include/yuzu/server/auth.hpp    @fjarvis
+/docs/auth-architecture.md                   @fjarvis
