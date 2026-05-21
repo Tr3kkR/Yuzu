@@ -166,7 +166,7 @@ def log_root() -> Path:
 
 
 def validate_run_id(run_id: str) -> bool:
-    return bool(RUN_ID_RE.fullmatch(run_id))
+    return bool(RUN_ID_RE.fullmatch(run_id)) and run_id not in {".", ".."}
 
 
 @contextlib.contextmanager

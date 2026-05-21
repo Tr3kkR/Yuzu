@@ -462,6 +462,8 @@ scenario_CH_15() {
         ""
         " "
         "../../../tmp/evil"
+        "."
+        ".."
         "foo/bar"
         $'has\nnewline'
         "has space"
@@ -495,31 +497,33 @@ scenario_CH_15() {
 
 scenario_CH_17() {
     echo ""
-    echo "=== CH-17: direct test_db.py rejects control chars in run_id ==="
+    echo "=== CH-17: direct test_db.py rejects unsafe run_id ==="
     init_db || { bad "CH-17" "db init failed"; return; }
 
-    local rid=$'\e[2J'
-    local out rc
-    out=$(python3 "$YUZU_ROOT/scripts/test/test_db.py" gate \
-        --run-id "$rid" \
-        --phase 7 \
-        --gate Probe \
-        --status PASS \
-        --duration 0 2>&1 >/dev/null)
-    rc=$?
-    if (( rc == 0 )); then
-        bad "CH-17" "direct test_db.py accepted a control-char run_id"
-        return
-    fi
+    local bad_ids=($'\e[2J' "." "..")
+    local rid out rc
+    for rid in "${bad_ids[@]}"; do
+        out=$(python3 "$YUZU_ROOT/scripts/test/test_db.py" gate \
+            --run-id "$rid" \
+            --phase 7 \
+            --gate Probe \
+            --status PASS \
+            --duration 0 2>&1 >/dev/null)
+        rc=$?
+        if (( rc == 0 )); then
+            bad "CH-17" "direct test_db.py accepted unsafe run_id '$rid'"
+            return
+        fi
 
-    if [[ "$out" == *$'\e'* ]]; then
-        bad "CH-17" "rejection stderr contained a raw ESC byte"
-        return
-    fi
-    if [[ "$out" != *"invalid --run-id"* ]]; then
-        bad "CH-17" "rejection stderr did not explain invalid run_id: $out"
-        return
-    fi
+        if [[ "$out" == *$'\e'* ]]; then
+            bad "CH-17" "rejection stderr contained a raw ESC byte"
+            return
+        fi
+        if [[ "$out" != *"invalid --run-id"* ]]; then
+            bad "CH-17" "rejection stderr did not explain invalid run_id: $out"
+            return
+        fi
+    done
 
     local stored
     stored=$(python3 - "$YUZU_TEST_DB" <<'PY'
@@ -535,7 +539,7 @@ PY
         return
     fi
 
-    ok "CH-17: direct test_db.py rejects control-char run_id without echoing ESC"
+    ok "CH-17: direct test_db.py rejects unsafe run_ids without echoing ESC"
 }
 
 # ── Scenario dispatch ───────────────────────────────────────────────────

@@ -31,7 +31,8 @@ Gate 3 — domain-triggered agents                   (parallel, decision matrix 
 Gate 4 — happy-path + unhappy-path + consistency   (parallel, mandatory)
 Gate 5 — chaos-injector                            (conditional on Gate 4)
 Gate 6 — compliance + sre + enterprise-readiness   (parallel, mandatory)
-Gate 7 — address BLOCKING findings, iterate until clean
+Gate 7 — address BLOCKING findings
+Gate 8 — re-review affected gates, ledger, final decision
 ```
 
 Per CLAUDE.md: CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed. Iterate until the team gives a clean bill. No commit until governance passes.
@@ -205,7 +206,7 @@ Use the decision matrix below to pick agents. Launch **all picked agents in a si
 |---|---|
 | `proto/`, schema changes, plugin ABI headers | **architect** |
 | `server/core/src/`, cross-module refactor | **architect** |
-| Any C++ file (`*.cpp`, `*.hpp`, `*.h`) | **cpp-safety** |
+| Any C++ file (`*.cpp`, `*.hpp`, `*.h`) | **cpp-expert**, **cpp-safety** |
 | `tests/`, new fixtures, coverage gaps | **quality-engineer** |
 | `meson.build`, `vcpkg.json`, `.github/workflows/`, release tooling | **build-ci** |
 | `agents/plugins/`, plugin YAML defs | **plugin-developer** |
@@ -223,11 +224,11 @@ Use the decision matrix below to pick agents. Launch **all picked agents in a si
 
 **Always include performance** for anything that touches `get_*_ids`, SQLite BFS, or per-authz hot paths.
 
-**Always include cpp-safety** when C++ files change. The role is
-separate from `cpp-expert`: `cpp-expert` reviews language idiom and
-compiler portability; `cpp-safety` reviews ownership, lifetime, C ABI
-borrowed data, syscall/process boundaries, casts, thread teardown, and
-sanitizer coverage.
+**Always include cpp-expert and cpp-safety** when C++ files change.
+The roles are separate: `cpp-expert` reviews language idiom and compiler
+portability; `cpp-safety` reviews ownership, lifetime, C ABI borrowed
+data, syscall/process boundaries, casts, thread teardown, and sanitizer
+coverage.
 
 For C++ safety-sensitive diffs, ask **quality-engineer** to require
 tests for cleanup paths, partial failure, short read/write, EINTR,
@@ -483,15 +484,17 @@ Use the same structural preamble as Gate 4 agents, vary the "Your job" stanza to
 
 ---
 
-## Gate 7 — Iterate
+## Gate 7 — Findings Resolution
 
 **BLOCKING** = CRITICAL / HIGH security, BLOCKING from any Gate 4-6 agent, or any finding that explicitly says "blocks merge".
 
 Strategy:
 1. **Fold compatible fixes into one commit.** If sec flags H1, docs flags B3, QA flags B5, and they all touch related files, fix as a single "hardening round" commit rather than three small ones.
 2. **Re-run Gate 2 security on the hardening round.** Prior runs have caught HIGH regressions introduced by the fix commit itself. Always re-review.
-3. **After re-review passes**, proceed to Gate 4 + Gate 5 + Gate 6 on the final baseline (only re-run the gates whose findings would be affected by the fix — if the fix was docs-only, Gate 4 happy-path doesn't need a re-run).
-4. **Don't commit until governance passes.** Per CLAUDE.md.
+## Gate 8 — Iterate And Ledger
+
+1. **After re-review passes**, proceed to Gate 4 + Gate 5 + Gate 6 on the final baseline (only re-run the gates whose findings would be affected by the fix — if the fix was docs-only, Gate 4 happy-path doesn't need a re-run).
+2. **Don't commit until governance passes.** Per CLAUDE.md.
 
 ## Known patterns from prior runs
 
