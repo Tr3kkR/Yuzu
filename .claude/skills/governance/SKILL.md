@@ -491,6 +491,7 @@ Use the same structural preamble as Gate 4 agents, vary the "Your job" stanza to
 Strategy:
 1. **Fold compatible fixes into one commit.** If sec flags H1, docs flags B3, QA flags B5, and they all touch related files, fix as a single "hardening round" commit rather than three small ones.
 2. **Re-run Gate 2 security on the hardening round.** Prior runs have caught HIGH regressions introduced by the fix commit itself. Always re-review.
+
 ## Gate 8 — Iterate And Ledger
 
 1. **After re-review passes**, proceed to Gate 4 + Gate 5 + Gate 6 on the final baseline (only re-run the gates whose findings would be affected by the fix — if the fix was docs-only, Gate 4 happy-path doesn't need a re-run).
