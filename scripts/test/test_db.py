@@ -36,6 +36,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -439,8 +440,9 @@ def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
         # run with mode='manual' rows. Operator-capture paths
         # (--run-id manual) will see this on first call per DB and
         # never again.
+        run_id_safe = re.sub(r"[^A-Za-z0-9._-]", "?", run_id)
         print(
-            f"test_db: vivified stub test_runs row for run_id={run_id} "
+            f"test_db: vivified stub test_runs row for run_id={run_id_safe} "
             f"(mode='manual') — if this is a /test pipeline run, "
             f"check that run-start succeeded",
             file=sys.stderr,

@@ -15,6 +15,7 @@
 #   CH-8  — coverage __seed sentinel honored → WARN, not silent PASS
 #          (perf half removed 2026-05-03 with the perf gate's regression logic)
 #   CH-15 — empty/whitespace/traversal --run-id rejected
+#   CH-17 — direct test_db.py vivify stderr sanitizes control chars
 #
 # Usage:
 #   bash tests/shell/test_pr2_gates.sh             # run all scenarios
@@ -22,9 +23,9 @@
 #
 # Exit codes: 0 all scenarios passed; 1 one or more failed; 2 harness error.
 #
-# The harness uses isolated fixtures under /tmp/pr2-chaos-$$ and a
-# per-harness YUZU_TEST_DB so it cannot contaminate the operator's real
-# test-runs DB.
+# The harness uses isolated fixtures under /tmp/pr2-chaos-$$, a temporary
+# HOME, and a per-harness YUZU_TEST_DB so it cannot contaminate the
+# operator's real test-runs DB or log root.
 
 set -uo pipefail
 
@@ -32,8 +33,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 YUZU_ROOT="$(cd "$HERE/../.." && pwd)"
 
 CHAOS_ROOT="/tmp/pr2-chaos-$$"
+CHAOS_HOME="$CHAOS_ROOT/home"
 export YUZU_TEST_DB="$CHAOS_ROOT/test-runs.db"
-mkdir -p "$CHAOS_ROOT" "$CHAOS_ROOT/mockbin"
+mkdir -p "$CHAOS_HOME" "$CHAOS_ROOT" "$CHAOS_ROOT/mockbin"
+export HOME="$CHAOS_HOME"
 
 cleanup() {
     rm -rf "$CHAOS_ROOT" 2>/dev/null || true
@@ -484,9 +487,56 @@ scenario_CH_15() {
     fi
 }
 
+# ── CH-17: direct test_db.py vivify stderr sanitizes control chars ──────
+
+scenario_CH_17() {
+    echo ""
+    echo "=== CH-17: direct test_db.py vivify stderr sanitizes control chars ==="
+    init_db || { bad "CH-17" "db init failed"; return; }
+
+    local rid=$'\e[2J'
+    local out rc
+    out=$(python3 "$YUZU_ROOT/scripts/test/test_db.py" gate \
+        --run-id "$rid" \
+        --phase 7 \
+        --gate Probe \
+        --status PASS \
+        --duration 0 2>&1 >/dev/null)
+    rc=$?
+    if (( rc != 0 )); then
+        bad "CH-17" "direct test_db.py gate write failed: $out"
+        return
+    fi
+
+    if [[ "$out" == *$'\e'* ]]; then
+        bad "CH-17" "vivify stderr contained a raw ESC byte"
+        return
+    fi
+    if [[ "$out" != *"run_id=??2J"* ]]; then
+        bad "CH-17" "vivify stderr did not show sanitized run_id: $out"
+        return
+    fi
+
+    local stored
+    stored=$(python3 - "$YUZU_TEST_DB" "$rid" <<'PY'
+import sqlite3, sys
+db, rid = sys.argv[1], sys.argv[2]
+c = sqlite3.connect(db)
+row = c.execute("SELECT run_id FROM test_runs WHERE run_id=?", (rid,)).fetchone()
+print("MATCH" if row and row[0] == rid else "MISSING")
+PY
+)
+    if [[ "$stored" != "MATCH" ]]; then
+        bad "CH-17" "DB row did not preserve the original run_id"
+        return
+    fi
+
+    ok "CH-17: direct vivify stderr sanitizes run_id while DB binding preserves it"
+}
+
 # ── Scenario dispatch ───────────────────────────────────────────────────
 
-SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16)
+SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17)
 
 # CH-1 (clean-log + workflow-failure → FAIL) requires a live gh CLI mock
 # which is more involved — defer to a dedicated PR2.1 harness pass once
@@ -506,6 +556,7 @@ for s in "${SCENARIOS[@]}"; do
         CH-8)  scenario_CH_8 ;;
         CH-15) scenario_CH_15 ;;
         CH-16) scenario_CH_16 ;;
+        CH-17) scenario_CH_17 ;;
         *)     echo "unknown scenario: $s" >&2; exit 2 ;;
     esac
 done
