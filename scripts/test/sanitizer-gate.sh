@@ -85,7 +85,7 @@ fi
 # Reject path-traversal (UP-9), shell metachars, whitespace. Allow only
 # [A-Za-z0-9._-] which matches the PR1 convention "$(date +%s)-$$".
 if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ || "$RUN_ID" == "." || "$RUN_ID" == ".." ]]; then
-    echo "sanitizer-gate: invalid --run-id '$RUN_ID' (allowed: A-Z a-z 0-9 . _ -)" >&2
+    echo "sanitizer-gate: invalid --run-id (allowed: A-Z a-z 0-9 . _ -)" >&2
     exit 2
 fi
 

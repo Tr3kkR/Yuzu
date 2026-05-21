@@ -169,6 +169,20 @@ def validate_run_id(run_id: str) -> bool:
     return bool(RUN_ID_RE.fullmatch(run_id)) and run_id not in {".", ".."}
 
 
+def display_run_id(run_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "?", run_id)
+
+
+def safe_run_log_dir(run_id: str) -> Optional[Path]:
+    if not validate_run_id(run_id):
+        return None
+    root = log_root().resolve()
+    candidate = (root / run_id).resolve()
+    if candidate == root or root not in candidate.parents:
+        return None
+    return candidate
+
+
 @contextlib.contextmanager
 def connect(create_dirs: bool = False):
     p = db_path()
@@ -445,7 +459,7 @@ def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
         # run with mode='manual' rows. Operator-capture paths
         # (--run-id manual) will see this on first call per DB and
         # never again.
-        run_id_safe = re.sub(r"[^A-Za-z0-9._-]", "?", run_id)
+        run_id_safe = display_run_id(run_id)
         print(
             f"test_db: vivified stub test_runs row for run_id={run_id_safe} "
             f"(mode='manual') — if this is a /test pipeline run, "
@@ -956,7 +970,7 @@ def cmd_query(args: argparse.Namespace) -> int:
             if args.dry_run:
                 print(f"--dry-run: would delete {len(to_delete)} runs:")
                 for rid in to_delete:
-                    print(f"  {rid}")
+                    print(f"  {display_run_id(rid)}")
                 return 0
             with conn:
                 placeholders = ",".join(["?"] * len(to_delete))
@@ -968,7 +982,13 @@ def cmd_query(args: argparse.Namespace) -> int:
             # Also reap the per-run log directories.
             removed_dirs = 0
             for rid in to_delete:
-                d = log_root() / rid
+                d = safe_run_log_dir(rid)
+                if d is None:
+                    print(
+                        f"test_db: skipped unsafe log dir for run_id={display_run_id(rid)}",
+                        file=sys.stderr,
+                    )
+                    continue
                 if d.exists():
                     for p in sorted(d.rglob("*"), reverse=True):
                         try:

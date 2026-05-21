@@ -23,7 +23,7 @@
 #
 # Exit codes: 0 all scenarios passed; 1 one or more failed; 2 harness error.
 #
-# The harness uses isolated fixtures under /tmp/yuzu-test-pr2-chaos-$$, a temporary
+# The harness uses isolated fixtures under a mktemp-created /tmp/yuzu-test-pr2-chaos-* dir, a temporary
 # HOME, and a per-harness YUZU_TEST_DB so it cannot contaminate the
 # operator's real test-runs DB or log root.
 
@@ -32,7 +32,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 YUZU_ROOT="$(cd "$HERE/../.." && pwd)"
 
-CHAOS_ROOT="/tmp/yuzu-test-pr2-chaos-$$"
+CHAOS_ROOT="$(mktemp -d /tmp/yuzu-test-pr2-chaos-XXXXXX)"
 CHAOS_HOME="$CHAOS_ROOT/home"
 export YUZU_TEST_DB="$CHAOS_ROOT/test-runs.db"
 mkdir -p "$CHAOS_HOME" "$CHAOS_ROOT" "$CHAOS_ROOT/mockbin"
@@ -491,6 +491,16 @@ scenario_CH_15() {
     if (( all_ok )); then
         ok "CH-15: all invalid run-ids rejected across 3 gates"
     fi
+
+    for gate in coverage-gate.sh perf-gate.sh sanitizer-gate.sh; do
+        local out
+        out=$(bash "$YUZU_ROOT/scripts/test/$gate" --run-id $'\e[2J' 2>&1 || true)
+        if [[ "$out" == *$'\e'* ]]; then
+            bad "CH-15" "$gate echoed raw ESC in invalid --run-id rejection"
+            return
+        fi
+    done
+    ok "CH-15: invalid run-id rejections do not echo raw ESC"
 }
 
 # ── CH-17: direct test_db.py vivify stderr sanitizes control chars ──────
@@ -539,7 +549,35 @@ PY
         return
     fi
 
-    ok "CH-17: direct test_db.py rejects unsafe run_ids without echoing ESC"
+    python3 - "$YUZU_TEST_DB" <<'PY'
+import sqlite3, sys, time
+db = sys.argv[1]
+c = sqlite3.connect(db)
+now = int(time.time())
+c.execute(
+    "INSERT INTO test_runs "
+    "(run_id, started_at, commit_sha, branch, mode, overall_status) "
+    "VALUES (?, ?, 'legacy', 'dev', 'manual', 'MANUAL')",
+    ("safe-keep", now),
+)
+c.execute(
+    "INSERT INTO test_runs "
+    "(run_id, started_at, commit_sha, branch, mode, overall_status) "
+    "VALUES (?, ?, 'legacy', 'dev', 'manual', 'MANUAL')",
+    ("..", now - 1),
+)
+c.commit()
+PY
+
+    local prune_out
+    prune_out=$(python3 "$YUZU_ROOT/scripts/test/test_db.py" query \
+        --include-manual --prune 1 2>&1)
+    if [[ "$prune_out" != *"skipped unsafe log dir for run_id=.."* ]]; then
+        bad "CH-17" "prune did not report unsafe legacy run_id skip: $prune_out"
+        return
+    fi
+
+    ok "CH-17: direct test_db.py rejects unsafe run_ids and prune skips legacy unsafe dirs"
 }
 
 # ── Scenario dispatch ───────────────────────────────────────────────────
