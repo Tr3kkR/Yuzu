@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI — `CHANGELOG order` check no longer wedges meta PRs.** Removed the
+  `paths:` filter from `docs-lint.yml` so the **required** "CHANGELOG order"
+  status reports on every PR to `main`/`dev`. Previously the filter meant a PR
+  that didn't touch `CHANGELOG.md` (CODEOWNERS, CI, pure-code, etc.) never
+  produced the required check and was blocked forever on a status that never
+  arrived. The job is a ~5s file-order lint, so running it unconditionally is
+  cheap.
+
 - **CI / governance — CLA Assistant activated on `Tr3kkR/Yuzu`.** The
   `.github/workflows/cla.yml` gate is live: external contributors must sign
   the Contributor License Agreement before merge (signatures stored in the
