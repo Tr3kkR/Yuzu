@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reviewer for lifetime, C ABI, cast, thread, process, and sanitizer
   coverage.
 
+- **Local release-candidate scratch docs are no longer tracked.**
+  `*.local.md` / `*.local.MD` files are ignored so per-run release notes
+  and review scratchpads stay local.
+
 - **CI — `CHANGELOG order` check no longer wedges meta PRs.** Removed the
   `paths:` filter from `docs-lint.yml` so the **required** "CHANGELOG order"
   status reports on every PR to `main`/`dev`. Previously the filter meant a PR

@@ -148,6 +148,7 @@ VALID_STATUS = {"PASS", "FAIL", "WARN", "SKIP", "RUNNING", "ABORTED"}
 VALID_CI_CONCLUSIONS = {
     "success", "failure", "cancelled", "skipped", "timed_out", "neutral", "action_required",
 }
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 # --- DB plumbing ----------------------------------------------------------
@@ -162,6 +163,10 @@ def db_path() -> Path:
 
 def log_root() -> Path:
     return db_path().parent / "test-runs"
+
+
+def validate_run_id(run_id: str) -> bool:
+    return bool(RUN_ID_RE.fullmatch(run_id))
 
 
 @contextlib.contextmanager
@@ -1126,6 +1131,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_query.set_defaults(func=cmd_query)
 
     args = parser.parse_args(argv)
+    if getattr(args, "cmd", None) in {"run-start", "run-finish", "gate", "timing", "metric"}:
+        if not validate_run_id(args.run_id):
+            print(
+                "test_db: invalid --run-id "
+                "(allowed: A-Z a-z 0-9 . _ -)",
+                file=sys.stderr,
+            )
+            return 2
     return args.func(args)
 
 

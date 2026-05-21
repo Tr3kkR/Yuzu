@@ -21,7 +21,8 @@ Run Yuzu governance as a Codex-native review fanout. This skill may use Codex su
 4. Correctness review: launch `happy-path`, `unhappy-path`, and `consistency-auditor` in parallel.
 5. Chaos analysis: run only if Gate 4 produced unhappy-path or consistency findings.
 6. Operational review: launch `compliance-officer`, `sre`, and `enterprise-readiness` in parallel.
-7. Ledger and blocking decision: consolidate findings, fix blocking items, and re-run affected gates.
+7. Findings resolution: consolidate findings and fix blocking items.
+8. Iteration and ledger: re-run affected gates, record deferrals, and make the blocking decision.
 
 Blocking contract: CRITICAL/HIGH security findings block. Any `BLOCKING` docs finding blocks user-facing changes. `BLOCKING` from Gate 4-6 blocks. MEDIUM/SHOULD findings need either a fix or an explicit deferral with an issue.
 
@@ -45,6 +46,7 @@ Use compact role prompts and include the Gate 1 summary plus prior gate findings
 - `security-guardian`: read every modified file; check authz, ownership, validation, audit, command execution, path handling, crypto, secret handling, sibling handler parity, and new error branches. For C++ diffs, also require an ownership proof for every raw resource boundary: fd, HANDLE, SOCKET, `FILE*`, `sqlite3_stmt*`, `sqlite3*`, OpenSSL/BCrypt object, allocated C string, thread, callback context, subprocess, mapped library, and temp path must have exactly one owner; manual cleanup in new/touched code is blocking unless wrapped in a small RAII/scope guard or justified as impossible; every early return between acquire and release must be checked. Findings use CRITICAL/HIGH/MEDIUM/LOW/INFO with file:line and recommended fix.
 - `docs-writer`: check REST docs, user manual, CHANGELOG, upgrade notes, permission/audit/error tables, and operator workflow docs. Findings use BLOCKING/SHOULD-FIX/NICE-TO-HAVE.
 - `architect`: public contracts, stores, REST boundaries, schema, lifecycle, coupling, and hard-to-reverse design.
+- `cpp-expert`: C++23 correctness, idioms, standard-library use, ABI boundaries, threading primitives, and cross-compiler portability across GCC, Clang, MSVC, and Apple Clang.
 - `cpp-safety`: RAII ownership, lifetime, move/copy semantics, C ABI boundaries, `std::string_view`/`std::span` validity, cast safety, thread lifetime, syscall/process boundaries, shell execution, and sanitizer coverage. BLOCKING for leaks, double-close risk, UAF risk, unjoined/detached thread ambiguity, unsafe shell construction, or borrowed data escaping its owner.
 - `quality-engineer`: test seams, integration coverage, fixture isolation, flaky patterns, temp DB/path hygiene, weak assertions. For C++ safety-sensitive changes, require coverage for cleanup paths, partial failure, short read/write, EINTR, failed `pclose`, failed `CloseHandle`, failed `sqlite3_prepare`, and concurrent teardown where relevant; for new RAII wrappers, require a test or compile-time assertion covering move-only/non-copyable behavior when feasible.
 - `build-ci`: Meson, vcpkg, workflows, release scripts, runner assumptions, cache behavior.
@@ -66,7 +68,7 @@ Use compact role prompts and include the Gate 1 summary plus prior gate findings
 
 Always include `quality-engineer` for feature or bug-fix changes. Always include `architect` for public store contracts or REST API surfaces. Always include `performance` for `get_*_ids`, SQLite BFS/graph traversal, or per-authz hot paths.
 
-Always include `cpp-safety` when C++ files change. Also include it for any diff that introduces or modifies `popen`, `system`, shell strings, `fork`/`exec`, `CreateProcess`, `dlopen`, `LoadLibrary`, `open`, `socket`, `sqlite3_prepare`, `EVP_*_new`, `BCrypt*`, `LocalAlloc`, `yuzu_ctx_*`, `raw()`, `release()`, `reinterpret_cast`, `const_cast`, or a background thread/callback that stores a pointer or reference. Run `rg` over changed C++ files for raw resource APIs and verify each hit appears in the Resource Ledger.
+Always include `cpp-expert` and `cpp-safety` when C++ files change. Also include `cpp-safety` for any diff that introduces or modifies `popen`, `system`, shell strings, `fork`/`exec`, `CreateProcess`, `dlopen`, `LoadLibrary`, `open`, `socket`, `sqlite3_prepare`, `EVP_*_new`, `BCrypt*`, `LocalAlloc`, `yuzu_ctx_*`, `raw()`, `release()`, `reinterpret_cast`, `const_cast`, or a background thread/callback that stores a pointer or reference. Run `rg` over changed C++ files for raw resource APIs and verify owning raw resource boundary hits appear in the Resource Ledger.
 
 Use `$yuzu-proto`, `$yuzu-plugin-abi`, `$yuzu-meson`, `$yuzu-windows-msvc`, and `$yuzu-build` when the changed files touch their domains.
 

@@ -34,7 +34,7 @@ Every C++ change summary must include a Resource Ledger. Verify that it lists ea
 - Acquisition point, release point, transfer behavior, and failure cleanup.
 - Any exception where manual cleanup remains, with justification.
 
-If a resource API appears in the diff but not in the ledger, report a `BLOCKING` governance-process finding.
+If an owning raw resource boundary appears in the diff but not in the ledger, report a `BLOCKING` governance-process finding. Broad mechanical hits such as `new`, `delete`, `malloc`, and `free` still require review, but they only require ledger entries when they create, transfer, or release ownership of a raw resource listed above.
 
 ## Mechanical Triggers
 

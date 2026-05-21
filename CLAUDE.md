@@ -50,7 +50,7 @@ When in doubt in commit messages, PR descriptions, or new docs, use the disambig
 
 Specialized agents live in `.claude/agents/` (each file declares its own role, triggers, and reference docs). The `workflow-orchestrator` agent owns the gate sequence; the `/governance` skill (`.claude/skills/governance/SKILL.md`) is the entry point for running the full pipeline on a commit range.
 
-Pipeline (8 gates, convention-enforced — no git hook): Change Summary with Resource Ledger for C++ resource changes → security-guardian + docs-writer mandatory deep-dive → domain-triggered review (including `cpp-safety` for C++ ownership/lifetime diffs) → happy-path + unhappy-path + consistency-auditor (parallel) → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness (parallel) → findings addressed (CRITICAL/HIGH block merge) → iterate.
+Pipeline (8 gates, convention-enforced — no git hook): Change Summary with Resource Ledger for C++ resource changes → security-guardian + docs-writer mandatory deep-dive → domain-triggered review (including `cpp-expert` and `cpp-safety` for any C++ source change, plus `cpp-safety` for raw resource/process/cast triggers) → happy-path + unhappy-path + consistency-auditor (parallel) → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness (parallel) → findings addressed (CRITICAL/HIGH block merge) → iterate.
 
 **Better process makes better products.** Waves 1–4 shipped without governance and accumulated 4 CRITICAL command-injection vulnerabilities, untested stores, stale docs, and performance bottlenecks — all caught before production but they should have been caught before commit. Use `/governance <range>` rather than hand-running.
 
@@ -384,7 +384,7 @@ Canonical defaults (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-
 
 ### Domain docs
 
-Single-context layout — `CONTEXT.md` at the repo root, ADRs under `docs/adrs/` (note the `s`). See `docs/agents/domain.md`.
+Single-context layout — `CONTEXT.md` at the repo root, ADRs under `docs/adr/`. See `docs/agents/domain.md`.
 
 ## CLAUDE.md updates
 

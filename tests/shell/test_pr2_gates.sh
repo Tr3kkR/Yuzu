@@ -23,7 +23,7 @@
 #
 # Exit codes: 0 all scenarios passed; 1 one or more failed; 2 harness error.
 #
-# The harness uses isolated fixtures under /tmp/pr2-chaos-$$, a temporary
+# The harness uses isolated fixtures under /tmp/yuzu-test-pr2-chaos-$$, a temporary
 # HOME, and a per-harness YUZU_TEST_DB so it cannot contaminate the
 # operator's real test-runs DB or log root.
 
@@ -32,7 +32,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 YUZU_ROOT="$(cd "$HERE/../.." && pwd)"
 
-CHAOS_ROOT="/tmp/pr2-chaos-$$"
+CHAOS_ROOT="/tmp/yuzu-test-pr2-chaos-$$"
 CHAOS_HOME="$CHAOS_ROOT/home"
 export YUZU_TEST_DB="$CHAOS_ROOT/test-runs.db"
 mkdir -p "$CHAOS_HOME" "$CHAOS_ROOT" "$CHAOS_ROOT/mockbin"
@@ -91,7 +91,7 @@ bad() {
 
 init_db() {
     # Fresh DB per scenario so we don't see cross-pollution.
-    rm -f "$YUZU_TEST_DB"
+    rm -f "$YUZU_TEST_DB" "$YUZU_TEST_DB-wal" "$YUZU_TEST_DB-shm"
     bash "$YUZU_ROOT/scripts/test/test-db-init.sh" >/dev/null 2>&1 || return 1
 }
 
@@ -199,9 +199,10 @@ EOF
     chmod +x "$MOCKBIN/meson"
 
     local out
+    local build_dir="$CHAOS_ROOT/build-ch3"
     out=$(bash "$YUZU_ROOT/scripts/test/coverage-gate.sh" \
         --run-id "$run_id" \
-        --build-dir /tmp/build-ch3 \
+        --build-dir "$build_dir" \
         --baseline "$CHAOS_ROOT/ch3-baseline.json" \
         --capture-baselines 2>&1) || true
 
@@ -220,7 +221,7 @@ EOF
         ok "CH-3: gate FAIL, baseline not written, notes: $notes"
     fi
 
-    rm -rf /tmp/build-ch3 2>/dev/null || true
+    rm -rf "$build_dir" 2>/dev/null || true
 }
 
 # ── CH-4: gcovr root-wrapper schema → WARN not silent 0% ────────────────
@@ -251,9 +252,10 @@ case "$1" in setup|compile) mkdir -p "${2:-}"; exit 0 ;; test) exit 0 ;; *) exit
 EOF
     chmod +x "$MOCKBIN/meson"
 
+    local build_dir="$CHAOS_ROOT/build-ch4"
     bash "$YUZU_ROOT/scripts/test/coverage-gate.sh" \
         --run-id "$run_id" \
-        --build-dir /tmp/build-ch4 \
+        --build-dir "$build_dir" \
         --baseline "$CHAOS_ROOT/ch4-baseline.json" \
         --report-only >/dev/null 2>&1 || true
 
@@ -276,7 +278,7 @@ PY
         bad "CH-4" "branch=$branch (expected ~75.0 from root.branches_covered/valid)"
     fi
 
-    rm -rf /tmp/build-ch4 2>/dev/null || true
+    rm -rf "$build_dir" 2>/dev/null || true
 }
 
 # ── CH-6: perf parser drift → FAIL not silent WARN ─────────────────────
@@ -352,9 +354,10 @@ case "$1" in setup|compile) mkdir -p "${2:-}"; exit 0 ;; test) exit 0 ;; *) exit
 EOF
     chmod +x "$MOCKBIN/meson"
 
+    local build_dir="$CHAOS_ROOT/build-ch8"
     bash "$YUZU_ROOT/scripts/test/coverage-gate.sh" \
         --run-id "$run_id" \
-        --build-dir /tmp/build-ch8 \
+        --build-dir "$build_dir" \
         --baseline "$CHAOS_ROOT/ch8-coverage-baseline.json" >/dev/null 2>&1 || true
 
     local status notes
@@ -373,7 +376,7 @@ EOF
     # axis. CH-6 still exercises the parser-drift WARN path which is the
     # only remaining "perf gate doesn't silently green-pass" guarantee.
 
-    rm -rf /tmp/build-ch8 2>/dev/null || true
+    rm -rf "$build_dir" 2>/dev/null || true
 }
 
 # ── CH-16: sec-h-1 regression — malicious --baseline path cannot inject python ──
@@ -425,9 +428,10 @@ EOF
     local sentinel="$CHAOS_ROOT/ch16-should-not-exist"
     rm -f "$sentinel"
 
+    local build_dir="$CHAOS_ROOT/build-ch16"
     bash "$YUZU_ROOT/scripts/test/coverage-gate.sh" \
         --run-id "$run_id" \
-        --build-dir /tmp/build-ch16 \
+        --build-dir "$build_dir" \
         --baseline "$evil_baseline" >/dev/null 2>&1 || true
 
     # The sentinel must not have been created by injected code, AND
@@ -445,7 +449,7 @@ EOF
         bad "CH-16" "expected seed WARN, got status='$status' (gate may have failed to read apostrophed path)"
     fi
 
-    rm -rf /tmp/build-ch16 "$evil_dir" 2>/dev/null || true
+    rm -rf "$build_dir" "$evil_dir" 2>/dev/null || true
 }
 
 # ── CH-15: empty/whitespace/traversal --run-id rejected ────────────────
@@ -491,7 +495,7 @@ scenario_CH_15() {
 
 scenario_CH_17() {
     echo ""
-    echo "=== CH-17: direct test_db.py vivify stderr sanitizes control chars ==="
+    echo "=== CH-17: direct test_db.py rejects control chars in run_id ==="
     init_db || { bad "CH-17" "db init failed"; return; }
 
     local rid=$'\e[2J'
@@ -503,35 +507,35 @@ scenario_CH_17() {
         --status PASS \
         --duration 0 2>&1 >/dev/null)
     rc=$?
-    if (( rc != 0 )); then
-        bad "CH-17" "direct test_db.py gate write failed: $out"
+    if (( rc == 0 )); then
+        bad "CH-17" "direct test_db.py accepted a control-char run_id"
         return
     fi
 
     if [[ "$out" == *$'\e'* ]]; then
-        bad "CH-17" "vivify stderr contained a raw ESC byte"
+        bad "CH-17" "rejection stderr contained a raw ESC byte"
         return
     fi
-    if [[ "$out" != *"run_id=??2J"* ]]; then
-        bad "CH-17" "vivify stderr did not show sanitized run_id: $out"
+    if [[ "$out" != *"invalid --run-id"* ]]; then
+        bad "CH-17" "rejection stderr did not explain invalid run_id: $out"
         return
     fi
 
     local stored
-    stored=$(python3 - "$YUZU_TEST_DB" "$rid" <<'PY'
+    stored=$(python3 - "$YUZU_TEST_DB" <<'PY'
 import sqlite3, sys
-db, rid = sys.argv[1], sys.argv[2]
+db = sys.argv[1]
 c = sqlite3.connect(db)
-row = c.execute("SELECT run_id FROM test_runs WHERE run_id=?", (rid,)).fetchone()
-print("MATCH" if row and row[0] == rid else "MISSING")
+row = c.execute("SELECT COUNT(*) FROM test_runs").fetchone()
+print(row[0])
 PY
 )
-    if [[ "$stored" != "MATCH" ]]; then
-        bad "CH-17" "DB row did not preserve the original run_id"
+    if [[ "$stored" != "0" ]]; then
+        bad "CH-17" "invalid run_id created test_runs rows"
         return
     fi
 
-    ok "CH-17: direct vivify stderr sanitizes run_id while DB binding preserves it"
+    ok "CH-17: direct test_db.py rejects control-char run_id without echoing ESC"
 }
 
 # ── Scenario dispatch ───────────────────────────────────────────────────
