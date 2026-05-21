@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **#1056 — `DeviceTokenValidateError::internal_error` distinguishes a
+  store-internal fault from a clean miss.** A `sqlite3_prepare_v2`
+  failure in `DeviceTokenStore::validate_token` was previously
+  mislabelled `not_found`, polluting the not-found signal and misleading
+  forensics. It now maps to a dedicated `internal_error` variant. The
+  public wire response is unchanged — it still collapses to the same
+  `401`/`UNAUTHENTICATED` as every other variant (no `500` differential
+  to probe); only the operator-facing audit detail and the
+  `yuzu_device_token_rejected_total{variant=...}` label change.
+
+- **#1057 — `SecureRandomError::PrngFailure` renamed to `prng_failure`.**
+  Aligns the enumerator with the snake_case convention used by the
+  sibling auth error enums (`DeviceTokenValidateError` et al.). Internal
+  symbol only; the audit-emitted `"prng_failure"` reason string was
+  already snake_case, so there is no wire or audit-log change.
+
+- **#1060 — `rejection_detail` renamed to
+  `rejection_audit_detail_for_storage`.** Names the trust boundary at
+  every call site: the returned string carries `bound_device_id` /
+  `bound_principal_id` and must be written only to the audit store,
+  never echoed onto a public surface. Internal helper only (no runtime
+  behavior change).
+
 - **#1088 — `McpServer::DispatchFn` signature gained trailing
   `execution_id` parameter.** Internal ABI on the `McpServer` class
   (header `server/core/src/mcp_server.hpp`). The typedef now matches

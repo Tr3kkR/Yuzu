@@ -50,7 +50,7 @@ std::expected<void, SecureRandomError> fill_random(std::span<std::uint8_t> out) 
     // creating a fresh token) is not also forced to fail.
     if (g_force_failure) {
         g_force_failure = false;
-        return std::unexpected(SecureRandomError::PrngFailure);
+        return std::unexpected(SecureRandomError::prng_failure);
     }
 
 #ifdef _WIN32
@@ -66,7 +66,7 @@ std::expected<void, SecureRandomError> fill_random(std::span<std::uint8_t> out) 
         if (rc != 0 /* STATUS_SUCCESS */) {
             spdlog::error("secure_random: BCryptGenRandom failed, NTSTATUS=0x{:08x}",
                           static_cast<unsigned>(rc));
-            return std::unexpected(SecureRandomError::PrngFailure);
+            return std::unexpected(SecureRandomError::prng_failure);
         }
         p += step;
         remaining -= step;
@@ -78,12 +78,12 @@ std::expected<void, SecureRandomError> fill_random(std::span<std::uint8_t> out) 
     // failure — never fall back to weak entropy.
     if (out.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         spdlog::error("secure_random: requested {} bytes exceeds RAND_bytes int limit", out.size());
-        return std::unexpected(SecureRandomError::PrngFailure);
+        return std::unexpected(SecureRandomError::prng_failure);
     }
     const int rc = RAND_bytes(out.data(), static_cast<int>(out.size()));
     if (rc != 1) {
         spdlog::error("secure_random: RAND_bytes returned {} (entropy unavailable)", rc);
-        return std::unexpected(SecureRandomError::PrngFailure);
+        return std::unexpected(SecureRandomError::prng_failure);
     }
     return {};
 #endif

@@ -8,8 +8,11 @@
 /// every gRPC handler that maps an `EnrollmentTokenError` to a wire
 /// response MUST collapse to one opaque message ("invalid, expired, or
 /// exhausted enrollment token"). Operator-facing variance lives ONLY in
-/// audit rows (`rejection_detail`) and Prometheus counters
-/// (`rejection_metric_name`).
+/// audit rows (variant via `enrollment_rejection_variant_name`, assembled at
+/// the call site — there is no `_for_storage` detail helper here because
+/// enrollment rejections carry no bound-device context to guard, unlike the
+/// device-token sibling's `rejection_audit_detail_for_storage`) and
+/// Prometheus counters (`enrollment_rejection_metric_name`).
 ///
 /// **Why collapse the enrollment-token surface.** Same threat model as
 /// device tokens: a presenter who can discriminate `not_found` from

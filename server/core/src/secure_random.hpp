@@ -36,7 +36,7 @@ enum class SecureRandomError {
     /// exhaustion in an early-boot or restricted-FD container. On Windows
     /// it indicates BCrypt's provider returned non-success. Either way the
     /// server has no business issuing a token until the next call succeeds.
-    PrngFailure,
+    prng_failure,
 };
 
 /// Fill `out` with cryptographically-secure random bytes. Empty `out` is a
@@ -53,7 +53,7 @@ fill_random(std::span<std::uint8_t> out) noexcept;
 namespace test_hooks {
 
 /// Force the next `fill_random` / `random_hex` call on the current thread to
-/// return `PrngFailure` without touching the underlying CSPRNG, then auto-clear.
+/// return `prng_failure` without touching the underlying CSPRNG, then auto-clear.
 /// Test-only: lets governance Gate 2 F-002 verify that token-create handlers
 /// emit a `failure` audit row when entropy is unavailable, without faking
 /// an entropy-exhaustion environment. Thread-local so concurrent test cases
