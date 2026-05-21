@@ -1,25 +1,20 @@
 name: Docs Lint
 
-# Lightweight hygiene checks for documentation and the changelog. Runs on
-# markdown-only changes (which ci.yml deliberately skips via paths-ignore).
-# Keep this workflow fast and dependency-light — no build, no vcpkg, no caches.
+# Lightweight hygiene checks for the changelog (and docs). The `changelog-order`
+# job publishes the **required** "CHANGELOG order" status check, so this
+# workflow must run on EVERY pull request to main/dev. A `paths:` filter here
+# was the bug: a PR that didn't touch CHANGELOG.md never reported the required
+# check and got wedged forever on a status that never arrived (the
+# path-filtered-required-check trap). The job is fast and dependency-light — no
+# build, no vcpkg, no caches — so running it unconditionally is cheap.
 on:
-  # push fires only on mainline branches; feature/fix branches with an open
-  # PR run docs lint exactly once via pull_request. Mirrors ci.yml.
+  # No paths filter: the required CHANGELOG-order status must report on every
+  # PR. push fires only on mainline branches so a feature/fix branch with an
+  # open PR runs docs lint exactly once via pull_request.
   push:
     branches: [main, dev]
-    paths:
-      - 'CHANGELOG.md'
-      - 'docs/**'
-      - 'tests/test_changelog_order.py'
-      - '.github/workflows/docs-lint.yml'
   pull_request:
     branches: [main, dev]
-    paths:
-      - 'CHANGELOG.md'
-      - 'docs/**'
-      - 'tests/test_changelog_order.py'
-      - '.github/workflows/docs-lint.yml'
   workflow_dispatch:
 
 permissions:
