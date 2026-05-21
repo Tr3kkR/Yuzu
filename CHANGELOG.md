@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI / governance — CLA Assistant activated on `Tr3kkR/Yuzu`.** The
+  `.github/workflows/cla.yml` gate is live: external contributors must sign
+  the Contributor License Agreement before merge (signatures stored in the
+  private `Tr3kkR/Yuzu-cla-signatures` repo; forks of Yuzu skip the gate).
+  Protects the AGPL + commercial dual-license chain — unsigned external
+  contributions can only ship under AGPL.
+
 - **Governance — `CODEOWNERS` added.** `@fjarvis` is the code owner for the
   auth/identity surface (`auth*`, `rbac_*`, `oidc_*`, `api_token_*`,
   `device_token_*`, `enrollment_*`, `secure_random.*`, `auth.hpp`,
