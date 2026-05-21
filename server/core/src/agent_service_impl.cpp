@@ -602,9 +602,14 @@ grpc::Status AgentServiceImpl::Subscribe(
             peer_ok = registry_.is_trusted_gateway_peer(subscribe_peer_ip);
         }
         if (!peer_ok) {
+            // event=security is the SIEM-routing tag: we don't write to SIEM
+            // directly — we emit via Prometheus and let Splunk et al. (which
+            // have a Prometheus receiver) filter on event="security". Stolen-
+            // session signal (#1059).
             metrics_
                 .counter("yuzu_grpc_subscribe_peer_mismatch_total",
-                         {{"gateway_mode", gateway_mode_ ? "true" : "false"}})
+                         {{"event", "security"},
+                          {"gateway_mode", gateway_mode_ ? "true" : "false"}})
                 .increment();
             spdlog::warn("Subscribe rejected: peer mismatch for session {} (register_ip={}, "
                          "subscribe_ip={}, gateway_mode={})",
