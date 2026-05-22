@@ -72,6 +72,20 @@ case "$1" in
         chown -R yuzu-gw:yuzu-gw /opt/yuzu_gw
         install -d -m 0755 -o yuzu-gw -g yuzu-gw /var/log/yuzu
 
+        # #659: generate a unique Erlang distribution cookie once. The gateway
+        # refuses to boot with the historical default (a publicly known cookie =
+        # unauthenticated inter-node RPC over EPMD). Never clobber on upgrade so
+        # the cookie stays stable. For a multi-node cluster, set the SAME value
+        # on every node (overwrite /etc/yuzu/gateway.env identically).
+        install -d -m 0755 /etc/yuzu
+        if [ ! -f /etc/yuzu/gateway.env ]; then
+            COOKIE=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+            ( umask 027; printf 'YUZU_GW_COOKIE=%s\n' "$COOKIE" > /etc/yuzu/gateway.env )
+            chown root:yuzu-gw /etc/yuzu/gateway.env
+            chmod 0640 /etc/yuzu/gateway.env
+            echo "yuzu-gateway: generated /etc/yuzu/gateway.env with a unique distribution cookie"
+        fi
+
         # Enable systemd service
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload

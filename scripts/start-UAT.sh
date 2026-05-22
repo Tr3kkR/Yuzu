@@ -390,7 +390,10 @@ start_all() {
     echo "[2/3] Starting Erlang gateway..."
     local gw_rel="$GATEWAY_DIR/_build/prod/rel/yuzu_gw"
     if [ -x "$gw_rel/bin/yuzu_gw" ]; then
-        ("$gw_rel/bin/yuzu_gw" foreground \
+        # #659: the release refuses to boot with the default Erlang cookie.
+        # Single-gateway UAT doesn't cluster, so any unique value works.
+        (YUZU_GW_COOKIE="${YUZU_GW_COOKIE:-$(openssl rand -hex 32)}" \
+            "$gw_rel/bin/yuzu_gw" foreground \
             > "$UAT_DIR/gateway.log" 2>&1) &
         local gw_pid=$!
     else

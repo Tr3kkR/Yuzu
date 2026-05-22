@@ -257,6 +257,11 @@ services:
       - "9568:9568"     # Prometheus metrics
     environment:
       - YUZU_GW_TLS_ENABLED=false
+      # #659: the gateway refuses to boot with the default Erlang distribution
+      # cookie (a known cookie = unauthenticated inter-node RPC). Set a strong
+      # unique value before `docker compose up`:
+      #   export YUZU_GW_COOKIE=$(openssl rand -hex 32)
+      - YUZU_GW_COOKIE=${YUZU_GW_COOKIE:?set a strong unique Erlang cookie, e.g. openssl rand -hex 32}
     configs:
       - source: gateway-sys-config
         target: /opt/yuzu_gw/releases/0.2.0/sys.config
