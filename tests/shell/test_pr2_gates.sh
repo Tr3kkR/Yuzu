@@ -33,6 +33,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 YUZU_ROOT="$(cd "$HERE/../.." && pwd)"
 
 CHAOS_ROOT="$(mktemp -d /tmp/yuzu-test-pr2-chaos-XXXXXX)"
+# A failed `mktemp` under `set -uo pipefail` (no -e) leaves CHAOS_ROOT empty,
+# which would root-anchor the paths below ($CHAOS_HOME -> /home, the per-harness
+# YUZU_TEST_DB -> /test-runs.db) and run the suite against the operator's real
+# HOME/DB. Refuse to continue unless we got a real directory (gov UP-1 / chaos CH-20).
+[[ -n "$CHAOS_ROOT" && -d "$CHAOS_ROOT" ]] || { echo "test_pr2_gates: mktemp -d failed" >&2; exit 2; }
 CHAOS_HOME="$CHAOS_ROOT/home"
 export YUZU_TEST_DB="$CHAOS_ROOT/test-runs.db"
 mkdir -p "$CHAOS_HOME" "$CHAOS_ROOT" "$CHAOS_ROOT/mockbin"
@@ -564,7 +569,11 @@ c.execute(
     "INSERT INTO test_runs "
     "(run_id, started_at, commit_sha, branch, mode, overall_status) "
     "VALUES (?, ?, 'legacy', 'dev', 'manual', 'MANUAL')",
-    ("..", now - 1),
+    # One day older than safe-keep so `--prune 1` deterministically keeps
+    # safe-keep and deletes "..". `now - 1` risked a same-second tie where
+    # SQLite's ORDER BY started_at DESC ordering is undefined, which could
+    # keep ".." instead and pass the skip-assertion vacuously (gov QA SHOULD).
+    ("..", now - 86400),
 )
 c.commit()
 PY

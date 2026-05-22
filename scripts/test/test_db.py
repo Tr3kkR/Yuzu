@@ -174,6 +174,14 @@ def display_run_id(run_id: str) -> str:
 
 
 def safe_run_log_dir(run_id: str) -> Optional[Path]:
+    """Return the per-run log dir for run_id, or None if it would escape log_root.
+
+    The returned Path is always fully resolved (``.resolve()``), which is what the
+    containment check below compares against. Callers must not mix the return
+    value with an unresolved ``log_root() / run_id`` string: on macOS the two
+    differ (``/tmp`` vs ``/private/tmp``), though they reference the same dir via
+    the platform symlink.
+    """
     if not validate_run_id(run_id):
         return None
     root = log_root().resolve()
@@ -291,6 +299,19 @@ def _hardware_fingerprint() -> str:
 
 
 def cmd_run_start(args: argparse.Namespace) -> int:
+    # Resolve the per-run log dir up front — before the INSERT — so path
+    # containment is enforced at the construction site (not only by the main()
+    # arg-validation gate), and so a refusal can never leave an orphan test_runs
+    # row with no dir (gov consistency SHOULD-1 / chaos CH-25). run-start is in
+    # main()'s validated set, so for any id reaching here this returns a real
+    # path; the None branch is belt-and-suspenders against a future caller.
+    run_dir = safe_run_log_dir(args.run_id)
+    if run_dir is None:
+        print(
+            f"test_db: refusing unsafe run_id={display_run_id(args.run_id)}",
+            file=sys.stderr,
+        )
+        return 2
     with connect(create_dirs=True) as conn:
         _ensure_schema_initialized(conn)
         conn.execute(
@@ -311,8 +332,8 @@ def cmd_run_start(args: argparse.Namespace) -> int:
                 args.notes or "",
             ),
         )
-        # Create the per-run log directory.
-        (log_root() / args.run_id).mkdir(parents=True, exist_ok=True)
+        # Create the per-run log directory (containment-checked above).
+        run_dir.mkdir(parents=True, exist_ok=True)
     print(f"test_db: started run {args.run_id}")
     return 0
 
