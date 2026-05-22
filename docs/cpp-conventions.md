@@ -1,6 +1,6 @@
 # C++ Coding Conventions — Yuzu
 
-The `cpp-expert` agent loads this document on any C++ source change. CLAUDE.md keeps a one-line pointer.
+The `cpp-expert` and `cpp-safety` agents load this document on any C++ source change. CLAUDE.md keeps a one-line pointer.
 
 ## Language
 
@@ -57,6 +57,22 @@ Both the agent and the server use:
 - `std::unique_lock` / `std::shared_lock` pairing — never bare `lock()/unlock()` calls.
 - SQLite stores use `sqlite3_open_v2(... SQLITE_OPEN_FULLMUTEX ...)` AND application-level mutexes — see `docs/darwin-compat.md` for why the application-level mutex is mandatory, not optional.
 
+## Resource ownership and lifetime
+
+Governance is stricter than style guidance: every C++ diff must prove ownership for each resource boundary it adds or touches. The Gate 1 Resource Ledger names the owner type, acquisition point, release point, transfer behavior, and failure cleanup for every fd, HANDLE, SOCKET, `FILE*`, `sqlite3_stmt*`, `sqlite3*`, OpenSSL object, BCrypt handle, allocated C string, mapped library, temp path, subprocess, callback context, and thread.
+
+New or touched C++ code should use a small RAII owner, `std::unique_ptr` with a deleter, or a local scope guard. Manual cleanup is a governance finding unless the code documents why a wrapper is impossible or would be less safe. Check every early return between acquisition and release.
+
+Resource owner types must be non-copyable when copying would double-release. Prefer move-only wrappers with explicit transfer semantics; any use of `release()` must immediately hand the resource to another named owner.
+
+Borrowed data is allowed only when its source lifetime is obvious at the call site. Do not store `std::string_view`, `std::span`, raw plugin contexts, or callback user data beyond the lifetime of the object they view. If a C ABI trampoline stores or returns a pointer, document who owns the context and who frees output strings.
+
+Shell/process boundaries must prefer argv-style execution. New `system()`, `popen()`, shell strings, `fork`/`exec`, and `CreateProcess` sites require explicit validation and a documented exception when a shell is unavoidable.
+
+Casts at ABI or syscall boundaries need a local aliasing/lifetime proof. `reinterpret_cast` and `const_cast` sites should explain alignment, constness, and ownership assumptions unless they are isolated behind an already-reviewed wrapper.
+
+Safety-sensitive ownership changes need targeted validation. Use ASan/UBSan when memory/resource ownership changes, TSan when thread lifetime, callback ownership, shared state, or store locking changes, and platform-specific tests for Windows HANDLE/service code or POSIX fd/socket/process code.
+
 ## Static-asset translation units
 
 Two patterns coexist for embedding static front-end assets in the server binary; they are not interchangeable.
@@ -91,3 +107,5 @@ Use for vendored assets (Three.js r168, ECharts, Inter typeface, htmx bundles la
 - Raw `new`/`delete` (use RAII).
 - Manual resource cleanup (use RAII / smart pointers).
 - C++ types crossing the C ABI boundary in `plugin.h`.
+- Borrowed `std::string_view`, `std::span`, raw pointer, or callback context escaping its owner.
+- Shell command construction when argv-style execution is feasible.

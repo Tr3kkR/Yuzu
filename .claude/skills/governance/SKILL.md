@@ -31,7 +31,8 @@ Gate 3 — domain-triggered agents                   (parallel, decision matrix 
 Gate 4 — happy-path + unhappy-path + consistency   (parallel, mandatory)
 Gate 5 — chaos-injector                            (conditional on Gate 4)
 Gate 6 — compliance + sre + enterprise-readiness   (parallel, mandatory)
-Gate 7 — address BLOCKING findings, iterate until clean
+Gate 7 — address BLOCKING findings
+Gate 8 — re-review affected gates, ledger, final decision
 ```
 
 Per CLAUDE.md: CRITICAL/HIGH are blocking, MEDIUM should be fixed, LOW addressed. Iterate until the team gives a clean bill. No commit until governance passes.
@@ -66,6 +67,12 @@ You write this yourself, from `git show` and `git diff --stat`. Structure:
 - **Interfaces affected** — public API changes, store contracts, REST behavior, proto, plugin ABI, CI gates
 - **Security surface** — what's closed, what's opened, net-neutral explanation
 - **User-facing impact** — behavior changes, breaking changes, new flags
+- **Resource Ledger** — for C++ changes, list every new or modified fd,
+  HANDLE, SOCKET, `FILE*`, `sqlite3_stmt*`, `sqlite3*`, OpenSSL object,
+  BCrypt handle, allocated C string, mapped library, temp path,
+  subprocess, callback context, and thread. For each, name owner type,
+  acquisition point, release point, transfer behavior, and failure
+  cleanup.
 - **Prior validation performed** — compile, tests, script runs with exit codes
 - **Governance domains triggered** — which Gate 3 agents apply (see matrix below)
 
@@ -92,6 +99,24 @@ You are the mandatory security reviewer for Gate 2. Read every
 modified file top to bottom (CLAUDE.md requires it) and assess:
 
 <finding-specific questions — fill in based on the actual change>
+
+## C++ safety ownership proof
+
+For any C++ diff, verify the Resource Ledger and independently prove
+ownership for every fd, HANDLE, SOCKET, `FILE*`, `sqlite3_stmt*`,
+`sqlite3*`, OpenSSL object, BCrypt handle, allocated C string, thread,
+callback context, subprocess, mapped library, and temp path. Each
+resource must have exactly one owner, one release path, explicit
+transfer behavior, and checked failure cleanup.
+
+Manual cleanup in new or touched C++ code is BLOCKING unless it is
+wrapped in a small RAII owner/scope guard or the exception is documented
+as impossible to express safely. Check every early return between
+acquire and release.
+
+Shell-command surfaces are high risk: new `system()`, `popen()`, shell
+strings, `fork`/`exec`, or `CreateProcess` usage must prefer argv-style
+execution unless a documented exception explains why a shell is required.
 
 ## Sibling-handler check (LOAD-BEARING)
 
@@ -181,6 +206,7 @@ Use the decision matrix below to pick agents. Launch **all picked agents in a si
 |---|---|
 | `proto/`, schema changes, plugin ABI headers | **architect** |
 | `server/core/src/`, cross-module refactor | **architect** |
+| Any C++ file (`*.cpp`, `*.hpp`, `*.h`) | **cpp-expert**, **cpp-safety** |
 | `tests/`, new fixtures, coverage gaps | **quality-engineer** |
 | `meson.build`, `vcpkg.json`, `.github/workflows/`, release tooling | **build-ci** |
 | `agents/plugins/`, plugin YAML defs | **plugin-developer** |
@@ -188,6 +214,8 @@ Use the decision matrix below to pick agents. Launch **all picked agents in a si
 | CEL expressions, scope DSL, trigger templates, YAML DSL spec | **dsl-engineer** |
 | Windows-only / macOS-only code, cross-platform helpers | **cross-platform** |
 | SQLite query paths, BFS/graph, hot authz paths | **performance** |
+| Raw resource/process/cast APIs in C++ (`popen`, `system`, `fork`/`exec`, `CreateProcess`, `dlopen`, `LoadLibrary`, `open`, `socket`, `sqlite3_prepare`, `EVP_*`, `BCrypt*`, `LocalAlloc`, `yuzu_ctx_*`, `raw()`, `release()`, `reinterpret_cast`, `const_cast`) | **cpp-safety** |
+| Background thread or callback storing pointer/reference | **cpp-safety**, **sre** |
 | Packaging, systemd units, Dockerfiles, installer scripts | **release-deploy** |
 
 **Always include architect** when any public store contract or REST API surface changes — the duplicate-validation and error-mapping drift patterns recur.
@@ -195,6 +223,19 @@ Use the decision matrix below to pick agents. Launch **all picked agents in a si
 **Always include quality-engineer** when new features or fixes land — it's the only agent that flags fixture races, bad error-string substring asserts, and REST-handler-untested-through-store-tests, which are the three highest-ROI test gaps.
 
 **Always include performance** for anything that touches `get_*_ids`, SQLite BFS, or per-authz hot paths.
+
+**Always include cpp-expert and cpp-safety** when C++ files change.
+The roles are separate: `cpp-expert` reviews language idiom and compiler
+portability; `cpp-safety` reviews ownership, lifetime, C ABI borrowed
+data, syscall/process boundaries, casts, thread teardown, and sanitizer
+coverage.
+
+For C++ safety-sensitive diffs, ask **quality-engineer** to require
+tests for cleanup paths, partial failure, short read/write, EINTR,
+failed `pclose`, failed `CloseHandle`, failed `sqlite3_prepare`, and
+concurrent teardown where relevant. New RAII wrappers should have a
+test or compile-time assertion covering move-only/non-copyable behavior
+when feasible.
 
 ### Gate 3 agent preamble
 
@@ -443,15 +484,18 @@ Use the same structural preamble as Gate 4 agents, vary the "Your job" stanza to
 
 ---
 
-## Gate 7 — Iterate
+## Gate 7 — Findings Resolution
 
 **BLOCKING** = CRITICAL / HIGH security, BLOCKING from any Gate 4-6 agent, or any finding that explicitly says "blocks merge".
 
 Strategy:
 1. **Fold compatible fixes into one commit.** If sec flags H1, docs flags B3, QA flags B5, and they all touch related files, fix as a single "hardening round" commit rather than three small ones.
 2. **Re-run Gate 2 security on the hardening round.** Prior runs have caught HIGH regressions introduced by the fix commit itself. Always re-review.
-3. **After re-review passes**, proceed to Gate 4 + Gate 5 + Gate 6 on the final baseline (only re-run the gates whose findings would be affected by the fix — if the fix was docs-only, Gate 4 happy-path doesn't need a re-run).
-4. **Don't commit until governance passes.** Per CLAUDE.md.
+
+## Gate 8 — Iterate And Ledger
+
+1. **After re-review passes**, proceed to Gate 4 + Gate 5 + Gate 6 on the final baseline (only re-run the gates whose findings would be affected by the fix — if the fix was docs-only, Gate 4 happy-path doesn't need a re-run).
+2. **Don't commit until governance passes.** Per CLAUDE.md.
 
 ## Known patterns from prior runs
 

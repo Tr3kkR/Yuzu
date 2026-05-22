@@ -118,6 +118,8 @@ bash scripts/test/test-db-write.sh run-start \
 
 Record `RUN_ID` in your scratch space so every subsequent gate call can reference it. The DB row is in `RUNNING` state until Phase 8 finalizes it.
 
+> **`--run-id` format.** Valid run ids match `[A-Za-z0-9._-]+` and must not be the bare `.` or `..`. The generated `"$(date +%s)-$$"` always satisfies this, as does a hand-supplied `--run-id manual` for coverage-baseline capture. An invalid run id (path separator, whitespace, shell/control char, `.`/`..`) is **rejected**: `test_db.py` and all three gate scripts print an error to stderr and exit `2`, and the gate scripts surface that as a gate FAIL. This guards the test-runs DB and its log root against path traversal — see the `[Unreleased]` Security entry in `CHANGELOG.md`.
+
 ## Phase 0 — Preflight
 
 ```bash

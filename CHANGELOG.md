@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Test tooling — `--run-id` path-traversal & terminal-injection hardening.**
+  `scripts/test/test_db.py` and the `coverage`/`perf`/`sanitizer` gate scripts
+  now reject an invalid `--run-id` (exit 2): the allowlist is `[A-Za-z0-9._-]`
+  with the bare `.`/`..` components rejected explicitly (the regex alone matches
+  both), extending the UP-9 path-validation guard. `safe_run_log_dir()` adds a
+  `Path.resolve()` containment check so a malformed or legacy run id cannot make
+  `--prune` escape the test-runs log root, and `display_run_id()` sanitizes
+  control characters so rejection messages cannot echo raw terminal-control
+  bytes. Hardens the SOC 2 change-management evidence store (CC7.2 / CC8.1);
+  CH-15 / CH-17 in `tests/shell/test_pr2_gates.sh` regression-test it.
+
 - **W1.x — enrollment-token DoS fix + mTLS-mismatch audit (#1067, #1118).**
   Both the direct-connect (`Register`) and gateway-proxy (`ProxyRegister`)
   enrollment paths now reject an admin-**denied** agent *before* consuming its
@@ -35,6 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on both the direct-agent and gateway-proxy services.
 
 ### Changed
+
+- **Governance now requires C++ resource ownership proofs.** Gate 1
+  change summaries include a Resource Ledger for C++ diffs, Gate 2
+  `security-guardian` enforces RAII/scope-guard ownership at raw
+  resource boundaries, and Gate 3 includes dedicated `cpp-expert`
+  (language idiom, compiler portability) and `cpp-safety` (lifetime,
+  C ABI, cast, thread, process, sanitizer coverage) reviewers.
+
+- **Local release-candidate scratch docs are no longer tracked.**
+  `*.local.md` / `*.local.MD` files are ignored so per-run release notes
+  and review scratchpads stay local.
 
 - **CI — `CHANGELOG order` check no longer wedges meta PRs.** Removed the
   `paths:` filter from `docs-lint.yml` so the **required** "CHANGELOG order"
