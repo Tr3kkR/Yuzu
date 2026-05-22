@@ -24,6 +24,7 @@ You ensure that every new store, manager, engine, and plugin ships with comprehe
 - **Test isolation** — Flag tests that depend on external state, filesystem artifacts from other tests, or execution order. Each test must create and clean up its own state.
 - **Integration tests** — Audit `scripts/integration-test.sh` for end-to-end scenario coverage.
 - **Regression tests** — When a bug is fixed, verify a regression test was added.
+- **C++ safety regression tests** — For ownership-sensitive changes, require tests for cleanup paths, partial failure, short read/write, EINTR, failed `pclose`, failed `CloseHandle`, failed `sqlite3_prepare`, and concurrent teardown where relevant. For new RAII wrappers, require a test or compile-time assertion covering move-only/non-copyable behavior when feasible.
 
 ## Key Files
 
@@ -58,5 +59,8 @@ When reviewing another agent's Change Summary:
 - [ ] Do tests cover both success and error paths?
 - [ ] Are tests isolated (no shared state, no order dependency)?
 - [ ] If a parser was modified, are there tests for malformed input?
+- [ ] If resource ownership changed, do tests cover cleanup and partial-failure paths?
+- [ ] If a new RAII wrapper was added, is move-only/non-copyable behavior asserted or otherwise covered?
+- [ ] If threads/callbacks changed, is concurrent teardown covered or explicitly deferred with rationale?
 - [ ] Is `tests/meson.build` updated if new test files were added?
 - [ ] Does `docs/test-coverage.md` need updating?

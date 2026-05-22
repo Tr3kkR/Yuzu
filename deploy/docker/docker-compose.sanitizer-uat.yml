@@ -46,6 +46,8 @@ services:
     container_name: yuzu-san-gateway
     environment:
       - YUZU_GW_UPSTREAM_ADDR=server
+      # #659: ephemeral UAT stack — accept the default cookie (single gateway, no clustering).
+      - YUZU_GW_ALLOW_DEFAULT_COOKIE=1
     ports:
       - "50051:50051"
       - "50063:50063"

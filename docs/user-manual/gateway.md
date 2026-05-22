@@ -262,6 +262,33 @@ To enable mTLS between agents and the gateway, add the `tls` key:
 ]}
 ```
 
+### Distribution Cookie (Required in Production)
+
+The gateway enables Erlang distribution (`-name` in `config/vm.args.src`) for
+clustering and remote-shell/`recon` access. The distribution **cookie is the
+sole authentication for inter-node RPC** — any host that can reach EPMD
+(TCP 4369) with the cookie can execute arbitrary code on the gateway node.
+
+Supply it at boot from the `YUZU_GW_COOKIE` environment variable:
+
+```bash
+export YUZU_GW_COOKIE="$(openssl rand -hex 32)"   # strong, unique per cluster
+```
+
+If `YUZU_GW_COOKIE` is unset, `vm.args.src` falls back to the historical
+default and the boot guard (`yuzu_gw_app:check_distribution_cookie/0`)
+**refuses to start** — it fails closed, because a known cookie is
+unauthenticated RCE (#659). For local dev/CI where distribution is not
+exposed, override the guard with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`. All nodes
+in a cluster must share the same cookie.
+
+> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It disables the
+> boot guard and restores the unauthenticated inter-node RPC surface (#659); it
+> exists only for ephemeral dev/CI stacks (where it appears in the UAT compose
+> files). On `.deb`/`.rpm` installs the cookie is auto-generated into
+> `/etc/yuzu/gateway.env`. **Rotate** it by writing a new value there — and to
+> every cluster node identically — then restarting the gateway.
+
 ### Server-Side Setup
 
 The C++ server must be started with the `--gateway-upstream` flag specifying
@@ -438,5 +465,6 @@ scrape_configs:
   detailed process model, message flow diagrams, and design rationale.
 - `proto/yuzu/gateway/v1/gateway.proto` -- GatewayUpstream protobuf definition.
 - `gateway/config/sys.config` -- Default configuration.
-- `gateway/config/vm.args` -- Erlang VM arguments.
+- `gateway/config/vm.args.src` -- Erlang VM arguments (`.src` = env-substituted
+  at boot; supplies the distribution cookie from `YUZU_GW_COOKIE`).
 - `gateway/rebar.config` -- Build configuration and dependencies.

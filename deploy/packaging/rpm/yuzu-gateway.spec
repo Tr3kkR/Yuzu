@@ -31,6 +31,17 @@ getent group yuzu-gw >/dev/null 2>&1 || groupadd -r yuzu-gw
 getent passwd yuzu-gw >/dev/null 2>&1 || useradd -r -g yuzu-gw -d /opt/yuzu_gw -s /sbin/nologin yuzu-gw
 
 %post
+# #659: generate a unique Erlang distribution cookie once, BEFORE the unit can
+# start. The gateway refuses to boot with the historical default (a publicly
+# known cookie = unauthenticated inter-node RPC over EPMD). Never clobber on
+# upgrade. For a multi-node cluster, set the SAME value on every node.
+if [ ! -f /etc/yuzu/gateway.env ]; then
+    install -d -m 0755 /etc/yuzu
+    COOKIE=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    ( umask 027; printf 'YUZU_GW_COOKIE=%s\n' "$COOKIE" > /etc/yuzu/gateway.env )
+    chown root:yuzu-gw /etc/yuzu/gateway.env
+    chmod 0640 /etc/yuzu/gateway.env
+fi
 %systemd_post yuzu-gateway.service
 chown -R yuzu-gw:yuzu-gw /opt/yuzu_gw
 

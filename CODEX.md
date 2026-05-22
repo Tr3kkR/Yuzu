@@ -4,11 +4,24 @@ Use repo-local Codex skills first. Start with the narrowest matching skill and c
 
 ## Route By Task
 
+- `governance`: run `/governance <range>` or full governance review. Produces a change summary, bounded review fanout, a governance ledger, and a blocking decision.
+- `test`: run `/test`, `/test --quick`, `/test --full`, `/test --instructions`, or quarantine-mode validation. Preserves the test-runs DB and UAT lifetime rules.
+- `tdd`: build a feature or fix test-first with Yuzu's public-interface, tracer-bullet red-green-refactor loop.
+- `diagnose`: debug failures, flakes, and performance regressions through reproduce, minimize, hypothesize, instrument, fix, and regression-test.
+- `grill-with-docs`: interrogate plans against Yuzu's domain language, `CONTEXT.md`, code, and ADRs; create ADRs lazily in `docs/adr/` only when warranted.
 - `yuzu-build`: configure, compile, test, choose suites, or recover a broken build directory.
 - `yuzu-meson`: edit any `meson.build`, change source lists, adjust dependencies, or update build graph behavior.
 - `yuzu-proto`: edit `.proto` files, `proto/gen_proto.py`, `proto/meson.build`, `proto/buf.yaml`, or `gateway/priv/proto/**`.
 - `yuzu-plugin-abi`: change `sdk/include/yuzu/plugin.h`, `plugin.hpp`, plugin descriptors, `plugin_loader.cpp`, or plugin action contracts.
 - `yuzu-windows-msvc`: handle Windows MSYS2 + MSVC builds, `setup_msvc_env.sh`, `triplets/x64-windows.cmake`, Windows CI, or the Windows-specific protobuf/grpc wiring in root `meson.build`.
+
+## Operational Workflows
+
+- `/governance` may use Codex subagents because the slash command is an explicit request for delegated review. Keep review agents bounded, read-only, and role-specific. Store role prompts in `.codex/skills/governance/SKILL.md`; do not create `.codex/agents`.
+- C++ governance requires a Resource Ledger in Gate 1 plus `cpp-expert` and `cpp-safety` in Gate 3 for any C++ diff. The ledger names every new or modified raw resource, owner type, acquisition, release, transfer behavior, and failure cleanup. New manual cleanup in touched C++ code is blocking unless wrapped by RAII/scope guard or explicitly justified.
+- `/test` is the high-level validation orchestrator. It may run long-lived scripts and must preserve `~/.local/share/yuzu/test-runs.db` behavior. Do not stop the native UAT stack at the end of default/full test runs unless the user explicitly asks.
+- `/tdd` and `/diagnose` should read `CONTEXT.md` and relevant ADRs before naming domain concepts or selecting a regression seam.
+- `/grill-with-docs` is the ADR-adjacent workflow. ADRs live in `docs/adr/` and are created lazily only for hard-to-reverse, surprising, real trade-off decisions.
 
 ## Repo Invariants
 
@@ -20,6 +33,19 @@ Use repo-local Codex skills first. Start with the narrowest matching skill and c
 - On Windows, use MSYS2 bash plus `source ./setup_msvc_env.sh`. If the build touches the gateway custom target, also `source scripts/ensure-erlang.sh`.
 - Never use `vcvars64.bat`.
 - Never switch Windows protobuf/grpc back to Meson's cmake dependency path without reviewing the Windows-specific rules in root `meson.build` and `docs/windows-build.md`.
+
+## Codex Versus Claude
+
+- Codex setup is repo-local under `.codex` plus `CODEX.md`, `CONTEXT.md`, and `docs/agents/**`.
+- Claude files are source material for parity but remain unchanged by this setup. Do not mutate `.claude/**` or `CLAUDE.md` unless the user asks for a Claude workflow change.
+- Codex uses the runtime sandbox and escalation prompts for command safety. Do not clone `.claude/settings.json` into a Codex allowlist.
+
+## Domain Docs
+
+- This repo uses a single-context layout: `CONTEXT.md` at the root and ADRs in `docs/adr/`.
+- `docs/agents/issue-tracker.md` records GitHub Issues at `github.com/Tr3kkR/Yuzu`.
+- `docs/agents/triage-labels.md` records the canonical triage label mapping.
+- `docs/agents/domain.md` records how engineering skills consume context and ADRs.
 
 ## Validation Defaults
 
