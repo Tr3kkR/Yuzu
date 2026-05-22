@@ -17,7 +17,7 @@
 #   docker build -t yuzu-gateway -f deploy/docker/Dockerfile.gateway .
 
 # ── Stage 1: deps — fetch and compile Erlang dependencies (cached) ────────
-FROM erlang:28-alpine@sha256:f36705c51f7c6d92d102234dfa6d85f8d2828e10f9adcfc98ff1931f87850787 AS deps
+FROM erlang:29-alpine@sha256:4e09fa05d46ac25f8cd3985b051526a35840a8c0561e2f95adb76b50ebdb02c6 AS deps
 
 RUN apk add --no-cache git
 
