@@ -121,6 +121,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **vuln_scan — Alpine (apk) package enumeration.** `get_installed_apps()`
+  enumerates installed packages on Alpine via `apk info -v`, parsing the
+  `name-pkgver-rpkgrel` form. Brings Alpine to parity with the existing
+  dpkg/rpm enumeration (needed for the chiselled Alpine demo/agent images).
+
 - **#1088 R2 — `GET /api/v1/executions/{id}` final-state endpoint.**
   Companion to `GET /api/v1/events`: when the SSE subscribe returns
   410 (execution already terminal), the agentic worker calls this
