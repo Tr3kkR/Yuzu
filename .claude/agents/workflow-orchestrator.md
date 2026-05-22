@@ -30,7 +30,7 @@ You are the conductor of the governance pipeline described in `CLAUDE.md`. You d
 |------|------|--------|-------------|----------------|
 | 1 | Change Summary | Producing agent | — | Never |
 | 2 | Mandatory Deep-Dive | security-guardian, docs-writer | Parallel | Never |
-| 3 | Domain-Triggered Review | architect, quality-engineer, cross-platform, cpp-expert, performance, build-ci, dsl-engineer, gateway-erlang, plugin-developer, release-deploy | Parallel (triggered only) | Agent skipped if domain not touched |
+| 3 | Domain-Triggered Review | architect, quality-engineer, cross-platform, cpp-expert, cpp-safety, performance, build-ci, dsl-engineer, gateway-erlang, plugin-developer, release-deploy | Parallel (triggered only) | Agent skipped if domain not touched |
 | 4 | Correctness & Resilience | happy-path, unhappy-path, consistency-auditor | Parallel | Never during full governance |
 | 5 | Chaos Analysis | chaos-injector | Sequential | Skip if gate 4 produces no findings |
 | 6 | Operational & Compliance | compliance-officer, sre, enterprise-readiness | Parallel | Never during full governance |
@@ -42,7 +42,7 @@ You are the conductor of the governance pipeline described in `CLAUDE.md`. You d
 | File Pattern | Triggered Agent(s) |
 |-------------|---------------------|
 | `proto/` or `*.proto` | architect, gateway-erlang |
-| `sdk/include/yuzu/plugin.h` or `plugin.hpp` | architect, plugin-developer, cpp-expert |
+| `sdk/include/yuzu/plugin.h` or `plugin.hpp` | architect, plugin-developer, cpp-expert, cpp-safety |
 | `meson.build`, `vcpkg.json`, `.github/workflows/` | build-ci |
 | `gateway/` or `*.erl` | gateway-erlang |
 | `agents/plugins/` | plugin-developer |
@@ -51,7 +51,9 @@ You are the conductor of the governance pipeline described in `CLAUDE.md`. You d
 | `*_store.cpp`, `*_store.hpp` | performance (if SQLite query changes) |
 | `#ifdef`, platform-specific APIs | cross-platform |
 | `deploy/`, `scripts/ansible/`, systemd/Docker configs | release-deploy |
-| Any `.cpp` or `.hpp` file | cpp-expert |
+| Any `.cpp`, `.hpp`, or `.h` file | cpp-expert, cpp-safety |
+| Raw resource/process/cast APIs in C++ (`popen`, `system`, `fork`/`exec`, `CreateProcess`, `dlopen`, `LoadLibrary`, `open`, `socket`, `sqlite3_prepare`, `EVP_*`, `BCrypt*`, `LocalAlloc`, `yuzu_ctx_*`, `raw()`, `release()`, `reinterpret_cast`, `const_cast`) | cpp-safety |
+| Background thread or callback storing pointer/reference | cpp-safety, sre |
 | Spans >2 directories | architect |
 | Any test file | quality-engineer |
 

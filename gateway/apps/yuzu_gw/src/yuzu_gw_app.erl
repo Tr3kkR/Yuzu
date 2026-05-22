@@ -12,13 +12,22 @@
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([apply_env_overrides/0]).  %% exported for testing
+-export([apply_env_overrides/0, evaluate_cookie/3]).  %% exported for testing
 
 %%--------------------------------------------------------------------
 %% application callbacks
 %%--------------------------------------------------------------------
 
 start(_StartType, _StartArgs) ->
+    %% #659: refuse to boot with a known-insecure Erlang distribution cookie,
+    %% before any side effects. The cookie is the sole authentication for
+    %% inter-node RPC; a publicly known value is unauthenticated RCE.
+    case check_distribution_cookie() of
+        {error, Reason} -> {error, Reason};
+        ok              -> do_start()
+    end.
+
+do_start() ->
     %% Apply environment variable overrides (container deployment).
     apply_env_overrides(),
 
@@ -45,6 +54,58 @@ start(_StartType, _StartArgs) ->
 
     %% Start the supervision tree.
     yuzu_gw_sup:start_link().
+
+%%--------------------------------------------------------------------
+%% Distribution cookie guard (#659)
+%%--------------------------------------------------------------------
+
+%% @private Refuse to boot if the Erlang distribution cookie is a known-
+%% insecure default. The cookie is the SOLE authentication for inter-node
+%% RPC; a publicly known value (the repo's historical default) means
+%% unauthenticated remote code execution for anyone who can reach EPMD.
+-spec check_distribution_cookie() -> ok | {error, insecure_distribution_cookie}.
+check_distribution_cookie() ->
+    Allow = os:getenv("YUZU_GW_ALLOW_DEFAULT_COOKIE") =:= "1",
+    evaluate_cookie(node(), erlang:get_cookie(), Allow).
+
+%% @doc Pure cookie policy decision — exported for testing.
+%% A non-distributed node ('nonode@nohost') has no inter-node attack surface,
+%% so any cookie is accepted. Otherwise the known-default and empty cookies
+%% are rejected unless explicitly overridden for dev/CI.
+-spec evaluate_cookie(node(), atom(), boolean()) ->
+          ok | {error, insecure_distribution_cookie}.
+evaluate_cookie('nonode@nohost', _Cookie, _Allow) ->
+    ok;
+evaluate_cookie(_Node, Cookie, Allow) ->
+    CookieStr = atom_to_list(Cookie),
+    %% Reject (a) the empty cookie, (b) the historical committed default as a
+    %% SUBSTRING — so the literal `${YUZU_GW_COOKIE:-yuzu_gw_secret_change_me}`
+    %% is caught if relx `.src` env-substitution ever fails (missing awk in a
+    %% broken/minimal image, or a hand-edited vm.args) — and (c) any
+    %% unsubstituted `${...}` env placeholder. Substring (not exact) match is
+    %% the #659 UP-1 hardening: an exact-match list would let the unsubstituted
+    %% literal through and silently re-open the unauthenticated-RPC surface.
+    Insecure = CookieStr =:= ""
+        orelse string:find(CookieStr, "yuzu_gw_secret_change_me") =/= nomatch
+        orelse string:find(CookieStr, "${") =/= nomatch,
+    case {Insecure, Allow} of
+        {true, false} ->
+            logger:critical(
+                "Refusing to start: Erlang distribution cookie is the insecure default. "
+                "The cookie is the sole authentication for inter-node RPC; a known value "
+                "means unauthenticated remote code execution for anyone who can reach EPMD "
+                "(port 4369). Set a strong unique cookie via the YUZU_GW_COOKIE environment "
+                "variable (e.g. `openssl rand -hex 32`). Dev/CI may override with "
+                "YUZU_GW_ALLOW_DEFAULT_COOKIE=1."),
+            {error, insecure_distribution_cookie};
+        {true, true} ->
+            logger:warning(
+                "Erlang distribution cookie is the insecure default, but "
+                "YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set — proceeding (dev/CI only)."),
+            ok;
+        {false, _} ->
+            ok
+    end.
 
 stop(_State) ->
     logger:info("Gateway shutting down — entering drain phase"),

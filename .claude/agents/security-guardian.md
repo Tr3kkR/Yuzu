@@ -32,6 +32,8 @@ You perform a **mandatory deep-dive review of every code change**. You read ever
 - **Audit coverage** — All security-relevant operations (login, permission changes, agent enrollment, command execution) must emit audit events.
 - **Expression safety** — Scope DSL, CEL, and parameter interpolation must have bounded recursion (max depth 10), bounded execution time, and safe regex compilation (no catastrophic backtracking).
 - **Input validation** — All external inputs (REST body, query params, proto fields, YAML content) must be validated before use.
+- **C++ ownership proof** — For C++ diffs, every fd, HANDLE, SOCKET, `FILE*`, `sqlite3_stmt*`, `sqlite3*`, OpenSSL object, BCrypt handle, allocated C string, temp path, subprocess, mapped library, callback context, and thread must have exactly one owner. Manual cleanup in new/touched code is BLOCKING unless wrapped in a small RAII owner/scope guard or documented as impossible. Check every early return between acquire and release.
+- **Process and shell execution** — `system()`, `popen()`, shell strings, `fork`/`exec`, and `CreateProcess` must prefer argv-style execution. Shell use requires a documented exception and strict validation.
 
 ## Key Files
 
@@ -83,3 +85,7 @@ When performing deep-dive review:
 - [ ] No `system()`, `popen()`, or shell execution with user-controlled input
 - [ ] Session tokens have sufficient entropy and secure attributes (HttpOnly, Secure, SameSite)
 - [ ] YAML/JSON deserialization does not allow arbitrary type instantiation
+- [ ] C++ resource boundaries have a Resource Ledger entry naming owner type, acquisition, release, transfer behavior, and failure cleanup
+- [ ] New/touched C++ code does not add manual cleanup paths where RAII/scope guards are feasible
+- [ ] Every early return between resource acquisition and release is safe
+- [ ] Shell/process execution is argv-style or has a documented, validated exception

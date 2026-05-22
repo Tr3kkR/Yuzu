@@ -18,6 +18,10 @@ Group=yuzu-gw
 ExecStart=/opt/yuzu_gw/bin/yuzu_gw foreground
 Restart=on-failure
 RestartSec=5
+# Surface the gateway's own log lines (incl. the #659 cookie boot-guard refusal)
+# under a clean journal tag so the cause isn't buried by OTP crash reports +
+# StartLimitBurst: `journalctl -t yuzu-gateway`.
+SyslogIdentifier=yuzu-gateway
 
 # File-descriptor headroom. The gateway aggregates many agent gRPC
 # streams (one socket per agent under fanout) plus prometheus_httpd
@@ -30,8 +34,20 @@ WorkingDirectory=/opt/yuzu_gw
 # Erlang VM settings
 Environment=ERL_CRASH_DUMP=/var/log/yuzu/gateway-crash.dump
 Environment=RELX_REPLACE_OS_VARS=true
+# #659: the Erlang distribution cookie is supplied via YUZU_GW_COOKIE. The .deb/
+# .rpm postinst generates a unique cookie into /etc/yuzu/gateway.env on install;
+# the gateway refuses to boot with the default. The leading `-` makes the file
+# optional (container/manual deploys may inject YUZU_GW_COOKIE another way). For a
+# multi-node cluster, set the SAME YUZU_GW_COOKIE on every node.
+EnvironmentFile=-/etc/yuzu/gateway.env
 
 # Security hardening
+# UMask 0027: files the BEAM writes must not be world-readable. Critically, relx
+# rewrites the *substituted* vm.args (containing the REAL distribution cookie)
+# into releases/<vsn>/ at boot — default umask 022 would leave it 0644 and let
+# any local user read the cookie (a local re-open of #659). Also covers the
+# ERL_CRASH_DUMP. (#659 Gate 8)
+UMask=0027
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/var/log/yuzu /opt/yuzu_gw

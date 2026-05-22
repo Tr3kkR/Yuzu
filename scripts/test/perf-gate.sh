@@ -110,8 +110,8 @@ if [[ -z "$RUN_ID" ]]; then
 fi
 
 # Validate RUN_ID before it's interpolated into filesystem paths.
-if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
-    echo "perf-gate: invalid --run-id '$RUN_ID' (allowed: A-Z a-z 0-9 . _ -)" >&2
+if [[ ! "$RUN_ID" =~ ^[A-Za-z0-9._-]+$ || "$RUN_ID" == "." || "$RUN_ID" == ".." ]]; then
+    echo "perf-gate: invalid --run-id (allowed: A-Z a-z 0-9 . _ -)" >&2
     exit 2
 fi
 

@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **Gateway requires `YUZU_GW_COOKIE` before upgrade (#659).** The Erlang gateway
+  now refuses to boot with the historical default distribution cookie. `.deb`/
+  `.rpm` installs auto-generate a unique cookie into `/etc/yuzu/gateway.env` (via
+  systemd `EnvironmentFile`); container and manual deployments **must** set
+  `YUZU_GW_COOKIE` (e.g. `openssl rand -hex 32`) before starting, or override for
+  dev/CI with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`. In-place upgrades that provide no
+  cookie fail closed on restart. Recovery + per-node-vs-cluster guidance:
+  `docs/user-manual/upgrading.md`; full reference: `docs/user-manual/gateway.md`.
+
 ### Security
+
+- **Gateway — refuse to boot with the default Erlang distribution cookie (#659).**
+  `gateway/config/vm.args` is now `vm.args.src`, supplying the cookie from the
+  `YUZU_GW_COOKIE` environment variable (e.g. `openssl rand -hex 32`). A boot
+  guard (`yuzu_gw_app:check_distribution_cookie/0`) fails closed when the cookie
+  is the historical default or empty once distribution is up — a known cookie is
+  unauthenticated inter-node RPC / RCE for anyone who can reach EPMD (TCP 4369).
+  Local dev/CI may override with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`; the UAT/CI
+  compose stacks set it. `evaluate_cookie/3` is unit-tested. Hardens SOC 2
+  CC6.1 / CC6.6.
+
+- **Test tooling — `--run-id` path-traversal & terminal-injection hardening.**
+  `scripts/test/test_db.py` and the `coverage`/`perf`/`sanitizer` gate scripts
+  now reject an invalid `--run-id` (exit 2): the allowlist is `[A-Za-z0-9._-]`
+  with the bare `.`/`..` components rejected explicitly (the regex alone matches
+  both), extending the UP-9 path-validation guard. `safe_run_log_dir()` adds a
+  `Path.resolve()` containment check so a malformed or legacy run id cannot make
+  `--prune` escape the test-runs log root, and `display_run_id()` sanitizes
+  control characters so rejection messages cannot echo raw terminal-control
+  bytes. Hardens the SOC 2 change-management evidence store (CC7.2 / CC8.1);
+  CH-15 / CH-17 in `tests/shell/test_pr2_gates.sh` regression-test it.
 
 - **W1.x — gRPC peer-IP strict-mode + audit symmetry (#1058, #1059, #1063,
   #1065).** `extract_peer_ip` now strict-validates IPv4/IPv6 peer strings and
@@ -21,6 +53,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on both the direct-agent and gateway-proxy services.
 
 ### Changed
+
+- **Governance now requires C++ resource ownership proofs.** Gate 1
+  change summaries include a Resource Ledger for C++ diffs, Gate 2
+  `security-guardian` enforces RAII/scope-guard ownership at raw
+  resource boundaries, and Gate 3 includes dedicated `cpp-expert`
+  (language idiom, compiler portability) and `cpp-safety` (lifetime,
+  C ABI, cast, thread, process, sanitizer coverage) reviewers.
+
+- **Local release-candidate scratch docs are no longer tracked.**
+  `*.local.md` / `*.local.MD` files are ignored so per-run release notes
+  and review scratchpads stay local.
 
 - **CI — `CHANGELOG order` check no longer wedges meta PRs.** Removed the
   `paths:` filter from `docs-lint.yml` so the **required** "CHANGELOG order"
@@ -77,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (default-empty for callers that don't track executions).
 
 ### Added
+
+- **vuln_scan — Alpine (apk) package enumeration.** `get_installed_apps()`
+  enumerates installed packages on Alpine via `apk info -v`, parsing the
+  `name-pkgver-rpkgrel` form. Brings Alpine to parity with the existing
+  dpkg/rpm enumeration (needed for the chiselled Alpine demo/agent images).
 
 - **#1088 R2 — `GET /api/v1/executions/{id}` final-state endpoint.**
   Companion to `GET /api/v1/events`: when the SSE subscribe returns
