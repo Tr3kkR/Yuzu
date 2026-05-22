@@ -137,6 +137,11 @@ Start-Service yuzu-server  # or start manually
 
 ### Linux (systemd)
 
+> **Breaking (#659):** the gateway refuses to start without a non-default Erlang
+> distribution cookie. `.deb`/`.rpm` installs auto-generate `/etc/yuzu/gateway.env`;
+> for tarball/manual installs create it once (see "Gateway distribution cookie now
+> required" under *Upgrade notes by release* below) before the restart step.
+
 ```bash
 sudo systemctl stop yuzu-gateway
 # Replace the release directory
@@ -229,6 +234,48 @@ If a migration fails:
 5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
 ## Upgrade notes by release
+
+### Gateway distribution cookie now required (#659) — **BREAKING**
+
+The Erlang gateway shipped a hardcoded default distribution cookie
+(`yuzu_gw_secret_change_me`). The cookie is the sole authentication for
+inter-node RPC, so a publicly-known value is unauthenticated remote code
+execution for anyone who can reach EPMD (TCP 4369). The gateway now **refuses to
+boot** with the default (or an empty/unsubstituted) cookie unless explicitly
+overridden.
+
+**Before upgrading:**
+
+- **`.deb` / `.rpm` installs** auto-generate a unique cookie into
+  `/etc/yuzu/gateway.env` (mode `0640`, `root:yuzu-gw`) on first install and
+  never clobber it on upgrade — no action needed for a single node.
+- **Tarball / manual systemd installs** must create the env file once:
+  ```bash
+  sudo install -d -m 0755 /etc/yuzu
+  printf 'YUZU_GW_COOKIE=%s\n' "$(openssl rand -hex 32)" | sudo tee /etc/yuzu/gateway.env >/dev/null
+  sudo chown root:yuzu-gw /etc/yuzu/gateway.env && sudo chmod 0640 /etc/yuzu/gateway.env
+  ```
+  The systemd unit loads it via `EnvironmentFile=-/etc/yuzu/gateway.env`.
+- **Docker / Compose** deployments must set `YUZU_GW_COOKIE` in the gateway
+  service environment (e.g. `export YUZU_GW_COOKIE=$(openssl rand -hex 32)` then
+  reference it). Dev/CI may instead set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`.
+- **Multi-node clusters:** every node must share the **same** cookie — set an
+  identical `YUZU_GW_COOKIE` (or write the same `/etc/yuzu/gateway.env`) on all
+  nodes; the per-host auto-generated value will NOT match across hosts.
+
+**Recovery — gateway won't start after upgrade:**
+
+| Symptom | Diagnose | Fix |
+|---|---|---|
+| `systemctl status yuzu-gateway` shows `start-limit-hit` / `failed` | `journalctl -t yuzu-gateway \| grep -i cookie` shows "insecure distribution cookie" (for manual/`foreground` or container runs, check stdout / `gateway.log` instead) | Create `/etc/yuzu/gateway.env` with `YUZU_GW_COOKIE=$(openssl rand -hex 32)` (see above), then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. **Do not** use `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production. |
+
+> The generated `/etc/yuzu/gateway.env` is intentionally **preserved across
+> `apt purge` / `rpm -e`** (the `/etc/yuzu` directory may be shared with other
+> Yuzu packages). To remove the cookie after uninstall: `sudo shred -u /etc/yuzu/gateway.env`.
+
+> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production** — it disables the
+> guard and restores the unauthenticated-RPC surface. It exists only for
+> ephemeral dev/CI stacks.
 
 ### InstructionDefinition import signature enforcement now on-by-default (#1073 / W7.4 sibling-gap) — **BREAKING**
 
