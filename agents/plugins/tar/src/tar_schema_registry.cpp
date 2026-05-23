@@ -403,11 +403,12 @@ std::optional<std::string> translate_dollar_name(std::string_view dollar_name) {
 
 bool is_queryable_table(std::string_view real_table_name) {
     // Built once from the registry: every typed warehouse table (the
-    // table_ref_map keys) plus the three base tables. tar_events is included
-    // even though schema v3 retires it — reading a dropped table is a normal
-    // "no such table" query error, not a security concern.
+    // table_ref_map keys) plus the two base config/state tables. tar_events is
+    // deliberately excluded — schema v3 drops it, so allowlisting it would turn
+    // its "no such table" error into a weak existence oracle distinct from the
+    // generic authorizer denial (#760 UP-8).
     static const std::unordered_set<std::string> allowed = [] {
-        std::unordered_set<std::string> s{"tar_state", "tar_config", "tar_events"};
+        std::unordered_set<std::string> s{"tar_state", "tar_config"};
         for (const auto& [real, ref] : table_ref_map())
             s.insert(real);
         return s;

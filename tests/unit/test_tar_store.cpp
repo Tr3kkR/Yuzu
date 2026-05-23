@@ -520,3 +520,40 @@ TEST_CASE("validate_and_translate_sql: non-SELECT, multi-statement, oversize rej
                     .has_value());
     CHECK_FALSE(validate_and_translate_sql(std::string(5000, 'A')).has_value());
 }
+
+// ── #631 divergence — comment + escaped-quote coverage (governance Gate 3) ──
+
+TEST_CASE("validate_and_translate_sql: $name in a line comment is not translated",
+          "[tar][sql][validate][security]") {
+    auto r = validate_and_translate_sql("SELECT 1 -- $Process_Live");
+    REQUIRE(r.has_value());
+    CHECK(r->find("$Process_Live") != std::string::npos);
+    CHECK(r->find("process_live") == std::string::npos);
+}
+
+TEST_CASE("validate_and_translate_sql: $name in a block comment is not translated",
+          "[tar][sql][validate][security]") {
+    auto r = validate_and_translate_sql("SELECT /* $Process_Live */ 1");
+    REQUIRE(r.has_value());
+    CHECK(r->find("$Process_Live") != std::string::npos);
+    CHECK(r->find("process_live") == std::string::npos);
+}
+
+TEST_CASE("validate_and_translate_sql: $name beside an escaped quote is not translated",
+          "[tar][sql][validate][security]") {
+    // '' is an escaped single quote inside the literal; the whole token is a
+    // string, so $Process_Live within it must survive verbatim.
+    auto r = validate_and_translate_sql("SELECT '$Process_Live''s data' AS x");
+    REQUIRE(r.has_value());
+    CHECK(r->find("$Process_Live") != std::string::npos);
+    CHECK(r->find("process_live") == std::string::npos);
+}
+
+TEST_CASE("execute_user_query: pragma_table_info table-valued function is denied",
+          "[tar][store][sandbox][security]") {
+    auto t = make_test_db();
+    // The pragma-as-TVF form reaches the authorizer as SQLITE_READ on a
+    // non-allowlisted table name, so it is denied like any other.
+    CHECK_FALSE(
+        t.db.execute_user_query("SELECT * FROM pragma_table_info('tar_config')").has_value());
+}

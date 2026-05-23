@@ -184,10 +184,11 @@ public:
     // ── Generic SQL execution (for warehouse queries and aggregation) ────────
 
     /**
-     * Execute arbitrary read-only SQL and return results.
-     * Used by tar.sql action. Returns error string on failure.
-     * The caller is responsible for SQL validation (SELECT-only, etc.)
-     * Enforces a maximum row limit to prevent agent DoS.
+     * Execute TRUSTED, internally-constructed read-only SQL on the read-write
+     * connection (NO authorizer). For internal callers ONLY — rollup / stats /
+     * diff queries built from constants and integer-parsed values, never operator
+     * or network input. For any UNTRUSTED operator SQL use execute_user_query
+     * instead (#760). Enforces a maximum row limit to prevent agent DoS.
      */
     std::expected<QueryResult, std::string> execute_query(const std::string& sql,
                                                           int max_rows = 10000);
@@ -201,6 +202,9 @@ public:
      * prepare time. Fails closed (returns an error) if the sandbox connection
      * is unavailable. Callers must still pre-validate via
      * validate_and_translate_sql — this is defence in depth, not a substitute.
+     * Recovery: if the read-only connection cannot be opened at startup it stays
+     * unavailable for the process lifetime (fail closed); restart the agent to
+     * retry.
      */
     std::expected<QueryResult, std::string> execute_user_query(const std::string& sql,
                                                                int max_rows = 10000);

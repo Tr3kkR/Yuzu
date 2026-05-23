@@ -33,7 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one that was validated (#631 — translation previously ran on the un-stripped
   input, diverging from the keyword check). Internal trusted reads are unaffected.
   New unit coverage drives the authorizer, the read-only handle, and the
-  literal-translation fix directly. Hardens SOC 2 CC6.1 / CC8.1.
+  literal-translation fix directly. Operators who used `PRAGMA` or `sqlite_master`
+  for schema discovery should switch to the `$`-prefixed warehouse table names
+  (see `docs/user-manual/tar.md`). Hardens SOC 2 CC6.1 / CC8.1.
 
 - **Gateway — refuse to boot with the default Erlang distribution cookie (#659).**
   `gateway/config/vm.args` is now `vm.args.src`, supplying the cookie from the

@@ -36,21 +36,45 @@ struct StmtDeleter {
 };
 using StmtPtr = std::unique_ptr<sqlite3_stmt, StmtDeleter>;
 
-// SQLite authorizer for the read-only operator-SQL sandbox (#760). Permits
-// only the overall SELECT, reads of registry-known warehouse tables, and
-// scalar/aggregate function calls (the handle is read-only, so no function can
-// mutate, and load_extension is disabled on the connection). Everything else —
-// INSERT/UPDATE/DELETE/DDL, ATTACH/DETACH, PRAGMA, transaction control,
+// Case-insensitive ASCII equality for a short, NUL-terminated SQL identifier
+// (SQLite function/identifier names are case-insensitive).
+bool ascii_iequals(const char* a, const char* b) noexcept {
+    for (; *a && *b; ++a, ++b)
+        if (std::tolower(static_cast<unsigned char>(*a)) !=
+            std::tolower(static_cast<unsigned char>(*b)))
+            return false;
+    return *a == *b;
+}
+
+// SQLite authorizer for the read-only operator-SQL sandbox (#760). Permits only
+// the overall SELECT, reads of registry-known warehouse tables, and scalar/
+// aggregate function calls (the handle is read-only, so no function can mutate;
+// load_extension is denied both by name here and via SQLITE_DBCONFIG). Everything
+// else — INSERT/UPDATE/DELETE/DDL, ATTACH/DETACH, PRAGMA, transaction control,
 // recursive CTEs — is denied at prepare time.
-int tar_query_authorizer(void* /*ctx*/, int action, const char* arg1, const char* /*arg2*/,
-                         const char* /*db_name*/, const char* /*inner_trigger_or_view*/) {
-    switch (action) {
-    case SQLITE_SELECT:
-    case SQLITE_FUNCTION:
-        return SQLITE_OK;
-    case SQLITE_READ:
-        return (arg1 && is_queryable_table(arg1)) ? SQLITE_OK : SQLITE_DENY;
-    default:
+//
+// noexcept + catch-all is load-bearing: SQLite invokes this from C frames during
+// sqlite3_prepare_v2, so a C++ exception (e.g. std::bad_alloc from
+// is_queryable_table's allocation) must never unwind through them — that would be
+// UB. Any exception fails closed (SQLITE_DENY).
+int tar_query_authorizer(void* /*ctx*/, int action, const char* arg1, const char* arg2,
+                         const char* /*db_name*/, const char* /*inner_trigger_or_view*/) noexcept {
+    try {
+        switch (action) {
+        case SQLITE_SELECT:
+            return SQLITE_OK;
+        case SQLITE_FUNCTION:
+            // arg2 is the function name; deny load_extension by name (case-
+            // insensitive, as SQLite names are) atop the SQLITE_DBCONFIG disable.
+            if (arg2 && ascii_iequals(arg2, "load_extension"))
+                return SQLITE_DENY;
+            return SQLITE_OK;
+        case SQLITE_READ:
+            return (arg1 && is_queryable_table(arg1)) ? SQLITE_OK : SQLITE_DENY;
+        default:
+            return SQLITE_DENY;
+        }
+    } catch (...) {
         return SQLITE_DENY;
     }
 }
@@ -252,6 +276,10 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
             sqlite3_busy_timeout(ro, 5000);
             sqlite3_db_config(ro, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, nullptr);
             sqlite3_set_authorizer(ro, &tar_query_authorizer, nullptr);
+            // Force the is_queryable_table allowlist's one-time static init now,
+            // on a normal C++ stack — never lazily inside the authorizer callback
+            // while it runs in SQLite's C prepare frames.
+            (void)is_queryable_table("");
             db.query_db_ = ro;
         } else {
             spdlog::warn("TarDatabase: read-only query connection unavailable ({}); "
@@ -849,7 +877,12 @@ std::expected<QueryResult, std::string> TarDatabase::execute_user_query(const st
 
     sqlite3_stmt* raw_stmt = nullptr;
     const char* tail = nullptr;
-    int rc = sqlite3_prepare_v2(query_db_, sql.c_str(), -1, &raw_stmt, &tail);
+    // Pass the explicit byte length (not -1): with -1 SQLite stops at the first
+    // embedded NUL, which would let the executed query differ from the validated
+    // one (the #631 class). An explicit length makes an embedded NUL a tokenizer
+    // error instead.
+    int rc = sqlite3_prepare_v2(query_db_, sql.c_str(), static_cast<int>(sql.size()), &raw_stmt,
+                                &tail);
     if (rc != SQLITE_OK) {
         // Authorizer denials surface as SQLITE_AUTH; keep the reason generic so
         // a probe can't use the message to enumerate tables or columns.

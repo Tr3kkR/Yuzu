@@ -125,6 +125,9 @@ std::string strip_literals_and_comments(const std::string& sql) {
 /// executed query is the same one the validator checked (#631). Returns an
 /// error if a placeholder is not in the registry whitelist.
 std::expected<std::string, std::string> translate_dollar_names(const std::string& sql) {
+    // This regex must stay anchor-free (no ^, $, \b, lookbehind): it is run per
+    // code span via regex_search over fresh [p, end) ranges, which don't preserve
+    // match_prev_avail across spans, so anchors would misbehave (#631).
     static const std::regex dollar_re(R"(\$([A-Za-z]+_[A-Za-z]+))");
     std::string out;
     out.reserve(sql.size());

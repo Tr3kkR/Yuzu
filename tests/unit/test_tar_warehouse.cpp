@@ -119,7 +119,9 @@ TEST_CASE("TAR warehouse: is_queryable_table allows registry + base tables, deni
     }
     CHECK(is_queryable_table("tar_state"));
     CHECK(is_queryable_table("tar_config"));
-    // Not on the allowlist — schema table, server tables, fabricated names.
+    // Not on the allowlist — schema table, server tables, the v3-dropped
+    // tar_events (excluded to avoid an existence oracle, #760 UP-8), fabricated.
+    CHECK_FALSE(is_queryable_table("tar_events"));
     CHECK_FALSE(is_queryable_table("sqlite_master"));
     CHECK_FALSE(is_queryable_table("users"));
     CHECK_FALSE(is_queryable_table("made_up_table"));
