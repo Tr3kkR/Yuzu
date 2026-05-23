@@ -334,6 +334,18 @@ public:
                           "Splunk et al. ingest via their Prometheus receiver and filter "
                           "on event) and gateway_mode (true|false)",
                           "counter");
+        metrics_.describe("yuzu_grpc_subscribe_identity_mismatch_total",
+                          "Subscribe RPC rejected because the mTLS client identity does not "
+                          "match the identity bound at Register time (stolen-session signal, "
+                          "#1118). Labelled event=security (SIEM-routing tag)",
+                          "counter");
+        metrics_.describe("yuzu_register_denied_total",
+                          "Register/ProxyRegister rejected an admin-denied agent before "
+                          "consuming its enrollment token (#1067). Labelled source "
+                          "(direct|gateway_proxy) and event=security (SIEM-routing tag) — a "
+                          "persistently-denied identity hammering Register is a "
+                          "credential-abuse signal",
+                          "counter");
         // Login-latency observability (governance PR4 OBS-2). Histogram of
         // PBKDF2 verify duration, labelled by result so alerts can fire on
         // success-path regressions independently of brute-force noise on

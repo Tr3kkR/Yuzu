@@ -92,6 +92,40 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             is_reauth = true;
             goto enrolled;
         }
+        // #1067: reject an admin-DENIED agent BEFORE consuming any enrollment
+        // token. Previously the consume happened first and the admin-deny check
+        // (ensure_enrolled) only fired afterward — so a denied attacker burned a
+        // use of the token on every attempt, depleting a max_uses=1 token until
+        // the legitimate agent could no longer enroll (token-depletion DoS,
+        // W1.4 UP-M3). Checking the recorded denial here pre-empts the consume.
+        //
+        // Residual (gov #1134 UP-1/UP-2): `prior` is a snapshot read before the
+        // consume, so an admin denial that races into the snapshot→consume
+        // window still burns one use (the agent is then correctly blocked by the
+        // ensure_enrolled defence-in-depth below). This kills the practical DoS
+        // — a persistently-denied attacker no longer depletes tokens — but the
+        // narrow race is closed only by option (b) refund-on-deny, tracked as a
+        // follow-up.
+        if (prior && *prior == auth::PendingStatus::denied) {
+            // gov #1134 (Tr3kkR): this early short-circuit returns before the
+            // legacy denied-handling code, which used to emit an
+            // `agent.enrollment_denied` analytics signal — leaving only
+            // spdlog. Replace it with the bounded, DoS-safe primitive: a
+            // counter (NOT a per-attempt audit row, which a denied-flood
+            // attacker could turn into a WAL write-amplification lever).
+            // event=security routes it to the SIEM via Prometheus, the same
+            // path as the stolen-session mismatch counters.
+            metrics_
+                .counter("yuzu_register_denied_total",
+                         {{"source", "direct"}, {"event", "security"}})
+                .increment();
+            spdlog::warn("Register rejected: agent {} is admin-denied (no token consumed)",
+                         info.agent_id());
+            response->set_accepted(false);
+            response->set_reject_reason("enrollment denied by administrator");
+            response->set_enrollment_status("denied");
+            return grpc::Status::OK;
+        }
     }
 
     {
@@ -667,8 +701,56 @@ grpc::Status AgentServiceImpl::Subscribe(
         if (require_client_identity_) {
             const auto subscribe_ids = extract_peer_identities(*context);
             if (!has_identity_overlap(it->second.peer_identities, subscribe_ids)) {
+                // event=security is the SIEM-routing tag (see
+                // observability-conventions.md); Splunk et al. filter on it.
+                metrics_
+                    .counter("yuzu_grpc_subscribe_identity_mismatch_total",
+                             {{"event", "security"}})
+                    .increment();
                 spdlog::warn("Subscribe rejected: mTLS identity mismatch for session {}",
                              session_id);
+                // #1118: mTLS identity mismatch is a stolen-session signal — the
+                // session_id was presented with a client cert that doesn't match
+                // the one bound at Register. Audit it, mirroring #1059's
+                // peer-mismatch row. Copy agent_id, release pending_mu_ BEFORE the
+                // audit write (gov #1117 / UP-1 — no lock-held WAL write), emit
+                // out of the lock. SOC 2 CC7.2.
+                const std::string mismatch_agent_id = it->second.agent_id;
+                // Capture cert identities before unlock for the forensic detail
+                // (gov #1134 sre SHOULD): record what was presented at Subscribe
+                // vs what was bound at Register, so an auditor can identify the
+                // cert used in the attempt. `it` is invalidated by the unlock.
+                const auto join_ids = [](const std::vector<std::string>& v) {
+                    std::string s;
+                    for (const auto& id : v) {
+                        if (!s.empty())
+                            s += ",";
+                        s += id;
+                    }
+                    return s;
+                };
+                const std::string presented = join_ids(subscribe_ids);
+                const std::string bound = join_ids(it->second.peer_identities);
+                lock.unlock();
+                if (audit_store_ && audit_store_->is_open()) {
+                    AuditEvent ev;
+                    ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                    ev.principal = "agent:" + mismatch_agent_id;
+                    ev.principal_role = "agent";
+                    ev.action = "session.identity_mismatch";
+                    ev.target_type = "Session";
+                    ev.target_id = session_id;
+                    ev.detail = "agent_id=" + mismatch_agent_id +
+                                " reason=mtls_identity_mismatch presented=[" + presented +
+                                "] bound=[" + bound + "]";
+                    ev.source_ip = extract_peer_ip(context->peer());
+                    ev.session_id = session_id;
+                    ev.result = "denied";
+                    if (!audit_store_->log(ev))
+                        signal_grpc_audit_failed(context);
+                }
                 return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, "peer identity mismatch");
             }
         }

@@ -41,6 +41,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bytes. Hardens the SOC 2 change-management evidence store (CC7.2 / CC8.1);
   CH-15 / CH-17 in `tests/shell/test_pr2_gates.sh` regression-test it.
 
+- **W1.x — enrollment-token DoS fix + mTLS-mismatch audit (#1067, #1118).**
+  Both the direct-connect (`Register`) and gateway-proxy (`ProxyRegister`)
+  enrollment paths now reject an admin-**denied** agent *before* consuming its
+  enrollment token — previously the consume happened first, so a denied attacker
+  could deplete a `max_uses=1` token and lock out the legitimate agent
+  (W1.4 UP-M3). The denied rejection emits a
+  `yuzu_register_denied_total{source,event="security"}` Prometheus signal
+  (replacing the analytics event the early return shadowed). gRPC Subscribe mTLS
+  identity-mismatch rejections now emit a
+  `session.identity_mismatch` audit row (the mTLS sibling of
+  `session.peer_mismatch`) out-of-lock, with a
+  `yuzu_grpc_subscribe_identity_mismatch_total{event="security"}` Prometheus
+  signal for SIEM routing. SOC 2 CC7.2.
+
 - **W1.x — gRPC peer-IP strict-mode + audit symmetry (#1058, #1059, #1063,
   #1065).** `extract_peer_ip` now strict-validates IPv4/IPv6 peer strings and
   lowercases IPv6 so the Register-vs-Subscribe binding comparison (#826) is

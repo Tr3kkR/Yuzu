@@ -122,6 +122,25 @@ The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST 
   for: 10m
   annotations:
     summary: "FleetTopologyStore pushed_ map above 80% of the 100000 hard cap; evictions imminent"
+
+# Stolen-session signals (event="security" — routed to the SIEM via Prometheus;
+# see observability-conventions.md). The audit rows session.peer_mismatch /
+# session.identity_mismatch carry the forensic detail.
+- alert: AgentSubscribePeerMismatch
+  expr: increase(yuzu_grpc_subscribe_peer_mismatch_total{event="security"}[5m]) > 0
+  annotations:
+    summary: "Subscribe peer-IP mismatch (#1059) — possible stolen session_id replayed from a new IP"
+
+- alert: AgentSubscribeIdentityMismatch
+  expr: increase(yuzu_grpc_subscribe_identity_mismatch_total{event="security"}[5m]) > 0
+  annotations:
+    summary: "Subscribe mTLS identity mismatch (#1118) — possible stolen session_id replayed with a non-matching client cert"
+
+- alert: AgentRegisterDeniedFlood
+  expr: rate(yuzu_register_denied_total{event="security"}[5m]) > 1
+  for: 5m
+  annotations:
+    summary: "Admin-denied identity repeatedly attempting Register (#1067) — credential-abuse / denied-flood signal"
 ```
 
 ## Labels
