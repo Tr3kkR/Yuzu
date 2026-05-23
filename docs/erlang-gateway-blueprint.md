@@ -782,7 +782,7 @@ Yuzu/
 │       ├── rebar.lock
 │       ├── config/
 │       │   ├── sys.config
-│       │   └── vm.args
+│       │   └── vm.args.src   # env-substituted at boot (supplies YUZU_GW_COOKIE)
 │       └── apps/
 │           └── yuzu_gw/
 │               └── src/

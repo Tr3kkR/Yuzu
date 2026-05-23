@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **Gateway requires `YUZU_GW_COOKIE` before upgrade (#659).** The Erlang gateway
+  now refuses to boot with the historical default distribution cookie. `.deb`/
+  `.rpm` installs auto-generate a unique cookie into `/etc/yuzu/gateway.env` (via
+  systemd `EnvironmentFile`); container and manual deployments **must** set
+  `YUZU_GW_COOKIE` (e.g. `openssl rand -hex 32`) before starting, or override for
+  dev/CI with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`. In-place upgrades that provide no
+  cookie fail closed on restart. Recovery + per-node-vs-cluster guidance:
+  `docs/user-manual/upgrading.md`; full reference: `docs/user-manual/gateway.md`.
+
 ### Security
+
+- **Gateway — refuse to boot with the default Erlang distribution cookie (#659).**
+  `gateway/config/vm.args` is now `vm.args.src`, supplying the cookie from the
+  `YUZU_GW_COOKIE` environment variable (e.g. `openssl rand -hex 32`). A boot
+  guard (`yuzu_gw_app:check_distribution_cookie/0`) fails closed when the cookie
+  is the historical default or empty once distribution is up — a known cookie is
+  unauthenticated inter-node RPC / RCE for anyone who can reach EPMD (TCP 4369).
+  Local dev/CI may override with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`; the UAT/CI
+  compose stacks set it. `evaluate_cookie/3` is unit-tested. Hardens SOC 2
+  CC6.1 / CC6.6.
 
 - **Test tooling — `--run-id` path-traversal & terminal-injection hardening.**
   `scripts/test/test_db.py` and the `coverage`/`perf`/`sanitizer` gate scripts
@@ -113,6 +134,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (default-empty for callers that don't track executions).
 
 ### Added
+
+- **vuln_scan — Alpine (apk) package enumeration.** `get_installed_apps()`
+  enumerates installed packages on Alpine via `apk info -v`, parsing the
+  `name-pkgver-rpkgrel` form. Brings Alpine to parity with the existing
+  dpkg/rpm enumeration (needed for the chiselled Alpine demo/agent images).
 
 - **#1088 R2 — `GET /api/v1/executions/{id}` final-state endpoint.**
   Companion to `GET /api/v1/events`: when the SSE subscribe returns

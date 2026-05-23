@@ -69,6 +69,8 @@ services:
     container_name: yuzu-uat-gateway
     environment:
       - YUZU_GW_UPSTREAM_ADDR=server
+      # #659: ephemeral UAT stack — accept the default cookie (single gateway, no clustering).
+      - YUZU_GW_ALLOW_DEFAULT_COOKIE=1
     ports:
       - "50051:50051"   # gRPC (agent-facing — agents connect here)
       - "50063:50063"   # gRPC (management/command forwarding)
