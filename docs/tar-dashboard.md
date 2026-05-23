@@ -209,7 +209,7 @@ The reconstruction is O(events_in_window) per device. For a 30-day window on a 2
 | Scan fleet (Phase 15.A) | `Execution:Execute` | Dispatches `tar.status` fleet-wide; same tier as run-instruction/tar-execute |
 | Re-enable | `Execution:Execute` | Per-device RBAC visibility check; out-of-scope collapses to same 404 as not-connected (no enumeration oracle) |
 | Purge | `Infrastructure:Delete` | Per-device check + typed confirmation modal |
-| TAR SQL submit | `Infrastructure:Read` (today) → may tighten later | The current grant is read-only because TAR SQL is bounded to the agent's own DB and is parameter-checked SELECT-only |
+| TAR SQL submit | `Infrastructure:Read` (today) → may tighten later | The current grant is read-only because TAR SQL is bounded to the agent's own DB and runs SELECT-only on a read-only connection behind a SQLite authorizer that allows only registry-known warehouse tables (#760/#631) |
 | Save SQL result as result set | `Infrastructure:Read` + result-set creation quota | Per scope-walking-design §3.3 |
 | Process tree view | `Infrastructure:Read` | With redaction pass |
 | Re-seed process tree | `Infrastructure:Update` | Dispatches `tar.process_tree` to one device |

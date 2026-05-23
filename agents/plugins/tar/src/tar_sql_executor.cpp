@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cctype>
 #include <format>
+#include <optional>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -48,48 +49,110 @@ bool starts_with_ci(std::string_view s, std::string_view prefix) {
     return true;
 }
 
-/// Strip string literals (single-quoted) and SQL comments from input
-/// so keyword matching doesn't produce false positives on data values. (H7)
-std::string strip_literals_and_comments(const std::string& sql) {
-    std::string out;
-    out.reserve(sql.size());
+/// Scan `sql` left to right, invoking `on_code(begin, end)` for each maximal
+/// run of ordinary SQL and `on_skip(begin, end)` for each single-quoted string
+/// literal or comment (block or line). Both the keyword stripper and the $-name
+/// translator are built on this one scanner so they always agree on what is
+/// code vs. data — the root-cause fix for the validate-vs-execute divergence
+/// (#631). [begin, end) are byte offsets into `sql`.
+template <class CodeFn, class SkipFn>
+void scan_sql(const std::string& sql, CodeFn on_code, SkipFn on_skip) {
     size_t i = 0;
+    size_t code_start = 0;
+    auto flush_code = [&](size_t end) {
+        if (end > code_start)
+            on_code(code_start, end);
+    };
     while (i < sql.size()) {
         // Single-quoted string literal
         if (sql[i] == '\'') {
-            out += ' '; // replace literal with space
+            flush_code(i);
+            size_t start = i;
             ++i;
             while (i < sql.size()) {
-                if (sql[i] == '\'' && i + 1 < sql.size() && sql[i + 1] == '\'') {
-                    i += 2; // escaped quote
-                } else if (sql[i] == '\'') {
+                if (sql[i] == '\'' && i + 1 < sql.size() && sql[i + 1] == '\'')
+                    i += 2; // escaped ''
+                else if (sql[i] == '\'') {
                     ++i;
                     break;
-                } else {
+                } else
                     ++i;
-                }
             }
+            on_skip(start, i);
+            code_start = i;
         }
         // Block comment
         else if (sql[i] == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-            out += ' ';
+            flush_code(i);
+            size_t start = i;
             i += 2;
             while (i + 1 < sql.size() && !(sql[i] == '*' && sql[i + 1] == '/'))
                 ++i;
-            if (i + 1 < sql.size()) i += 2;
+            i = (i + 1 < sql.size()) ? i + 2 : sql.size();
+            on_skip(start, i);
+            code_start = i;
         }
         // Line comment
         else if (sql[i] == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-            out += ' ';
+            flush_code(i);
+            size_t start = i;
             i += 2;
             while (i < sql.size() && sql[i] != '\n')
                 ++i;
-        }
-        else {
-            out += sql[i];
+            on_skip(start, i);
+            code_start = i;
+        } else {
             ++i;
         }
     }
+    flush_code(sql.size());
+}
+
+/// Replace string literals and comments with a single space so keyword matching
+/// doesn't produce false positives on data values. (H7)
+std::string strip_literals_and_comments(const std::string& sql) {
+    std::string out;
+    out.reserve(sql.size());
+    scan_sql(
+        sql, [&](size_t b, size_t e) { out.append(sql, b, e - b); },
+        [&](size_t, size_t) { out += ' '; });
+    return out;
+}
+
+/// Translate $Word_Word table placeholders to their real table names, but ONLY
+/// in code regions — never inside a string literal or comment. A $name that is
+/// data (e.g. '$tar_events' as a string value) is left untouched, so the
+/// executed query is the same one the validator checked (#631). Returns an
+/// error if a placeholder is not in the registry whitelist.
+std::expected<std::string, std::string> translate_dollar_names(const std::string& sql) {
+    static const std::regex dollar_re(R"(\$([A-Za-z]+_[A-Za-z]+))");
+    std::string out;
+    out.reserve(sql.size());
+    std::optional<std::string> error;
+    scan_sql(
+        sql,
+        [&](size_t b, size_t e) {
+            if (error)
+                return;
+            const char* p = sql.data() + b;
+            const char* end = sql.data() + e;
+            std::cmatch m;
+            while (std::regex_search(p, end, m, dollar_re)) {
+                out.append(p, p + m.position(0));
+                std::string dollar_name = "$" + m.str(1);
+                auto real = translate_dollar_name(dollar_name);
+                if (!real) {
+                    error = std::format("unknown table: {}", dollar_name);
+                    return;
+                }
+                out += *real;
+                p += m.position(0) + m.length(0);
+            }
+            out.append(p, end);
+        },
+        [&](size_t b, size_t e) { out.append(sql, b, e - b); });
+    if (error)
+        return std::unexpected(*error);
     return out;
 }
 
@@ -102,20 +165,20 @@ bool contains_dangerous_keyword(const std::string& stripped_sql) {
         upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
 
     static const std::string_view dangerous[] = {
-        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE",
-        "ATTACH", "DETACH", "PRAGMA", "REPLACE", "REINDEX", "VACUUM",
+        "INSERT",    "UPDATE",  "DELETE",   "DROP",           "ALTER",   "CREATE",
+        "ATTACH",    "DETACH",  "PRAGMA",   "REPLACE",        "REINDEX", "VACUUM",
         "SAVEPOINT", "RELEASE", "ROLLBACK", "LOAD_EXTENSION",
     };
 
     for (auto kw : dangerous) {
         auto pos = upper.find(kw);
         while (pos != std::string::npos) {
-            bool left_ok = (pos == 0) ||
-                           !std::isalnum(static_cast<unsigned char>(upper[pos - 1])) &&
-                           upper[pos - 1] != '_';
+            bool left_ok =
+                (pos == 0) ||
+                !std::isalnum(static_cast<unsigned char>(upper[pos - 1])) && upper[pos - 1] != '_';
             bool right_ok = (pos + kw.size() >= upper.size()) ||
                             !std::isalnum(static_cast<unsigned char>(upper[pos + kw.size()])) &&
-                            upper[pos + kw.size()] != '_';
+                                upper[pos + kw.size()] != '_';
             if (left_ok && right_ok)
                 return true;
             pos = upper.find(kw, pos + 1);
@@ -156,34 +219,22 @@ std::expected<std::string, std::string> validate_and_translate_sql(const std::st
     if (contains_dangerous_keyword(stripped))
         return std::unexpected("query contains forbidden keyword");
 
-    // Layer 3: Single statement only
-    if (has_multiple_statements(trimmed))
+    // Layer 3: single statement only. Checked on the stripped form so a ';'
+    // inside a string literal or comment doesn't trip it; execute_user_query's
+    // prepare-tail check is the engine-level backstop.
+    if (has_multiple_statements(stripped))
         return std::unexpected("only single-statement queries are allowed");
 
-    // Layer 2: Translate $-prefixed table names
-    // Match $Word_Word patterns
-    static const std::regex dollar_re(R"(\$([A-Za-z]+_[A-Za-z]+))");
-    std::string result;
-    auto begin = std::sregex_iterator(sql_str.begin(), sql_str.end(), dollar_re);
-    auto end = std::sregex_iterator();
-
-    size_t last_pos = 0;
-    for (auto it = begin; it != end; ++it) {
-        auto& match = *it;
-        auto dollar_name = "$" + match[1].str();
-        auto translated = translate_dollar_name(dollar_name);
-        if (!translated)
-            return std::unexpected(std::format("unknown table: {}", dollar_name));
-
-        result += sql_str.substr(last_pos, match.position() - last_pos);
-        result += *translated;
-        last_pos = match.position() + match.length();
-    }
-    result += sql_str.substr(last_pos);
+    // Layer 2: translate $-prefixed table names — only outside string literals
+    // and comments, so the executed query is the one that was validated (#631).
+    auto translated = translate_dollar_names(sql_str);
+    if (!translated)
+        return std::unexpected(translated.error());
+    std::string result = std::move(*translated);
 
     // Strip trailing semicolons
-    while (!result.empty() && (result.back() == ';' ||
-           std::isspace(static_cast<unsigned char>(result.back()))))
+    while (!result.empty() &&
+           (result.back() == ';' || std::isspace(static_cast<unsigned char>(result.back()))))
         result.pop_back();
 
     return result;

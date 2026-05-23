@@ -193,6 +193,19 @@ public:
                                                           int max_rows = 10000);
 
     /**
+     * Execute UNTRUSTED operator SQL (the tar.sql action) in a sandbox: a
+     * dedicated read-only SQLite connection with an authorizer that permits
+     * only SELECT / READ of registry-known warehouse tables. Writes are
+     * structurally impossible (read-only handle); non-SELECT statements,
+     * ATTACH/PRAGMA, unknown tables, and trailing statements are rejected at
+     * prepare time. Fails closed (returns an error) if the sandbox connection
+     * is unavailable. Callers must still pre-validate via
+     * validate_and_translate_sql — this is defence in depth, not a substitute.
+     */
+    std::expected<QueryResult, std::string> execute_user_query(const std::string& sql,
+                                                               int max_rows = 10000);
+
+    /**
      * Execute arbitrary DDL/DML SQL (for rollup inserts, retention deletes).
      * Returns true on success.
      */
@@ -211,7 +224,12 @@ private:
     void set_config_locked(const std::string& key, const std::string& value);
 
     sqlite3* db_{nullptr};
+    // Read-only, authorizer-sandboxed connection used only by execute_user_query
+    // for untrusted operator SQL (#760). Null if it could not be opened, in
+    // which case user queries fail closed.
+    sqlite3* query_db_{nullptr};
     std::mutex mu_;
+    std::mutex query_mu_;
 };
 
 } // namespace yuzu::tar

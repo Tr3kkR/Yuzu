@@ -107,6 +107,24 @@ TEST_CASE("TAR warehouse: unknown dollar name returns nullopt",
     CHECK_FALSE(translate_dollar_name("not a dollar name").has_value());
 }
 
+TEST_CASE("TAR warehouse: is_queryable_table allows registry + base tables, denies others",
+          "[tar][warehouse][security]") {
+    // Every real warehouse table the registry knows about is queryable — this is
+    // the allowlist the read-only SQL sandbox's authorizer enforces (#760).
+    for (const auto& dn : all_dollar_names()) {
+        auto real = translate_dollar_name(dn);
+        REQUIRE(real.has_value());
+        INFO("table: " << *real);
+        CHECK(is_queryable_table(*real));
+    }
+    CHECK(is_queryable_table("tar_state"));
+    CHECK(is_queryable_table("tar_config"));
+    // Not on the allowlist — schema table, server tables, fabricated names.
+    CHECK_FALSE(is_queryable_table("sqlite_master"));
+    CHECK_FALSE(is_queryable_table("users"));
+    CHECK_FALSE(is_queryable_table("made_up_table"));
+}
+
 // ── Rollup SQL coverage ────────────────────────────────────────────────────
 
 TEST_CASE("TAR warehouse rollups: process live -> hourly -> daily -> monthly",

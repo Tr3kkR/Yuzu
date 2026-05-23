@@ -102,6 +102,15 @@ std::string generate_warehouse_ddl();
 std::optional<std::string> translate_dollar_name(std::string_view dollar_name);
 
 /**
+ * Return true if `real_table_name` is a table that untrusted operator SQL
+ * (the tar.sql action) is permitted to read: the typed warehouse tables from
+ * the registry plus the base tar_state / tar_config / tar_events tables. Used
+ * by the read-only SQL sandbox's SQLite authorizer (#760). The set is computed
+ * once from the registry, so it stays in sync as new capture sources land.
+ */
+[[nodiscard]] bool is_queryable_table(std::string_view real_table_name);
+
+/**
  * Get all valid $-prefixed table names.
  * Used for schema browsing and documentation.
  */

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <format>
 #include <sstream>
+#include <unordered_set>
 
 namespace yuzu::tar {
 
@@ -398,6 +399,20 @@ std::optional<std::string> translate_dollar_name(std::string_view dollar_name) {
     if (it != map.end())
         return it->second;
     return std::nullopt;
+}
+
+bool is_queryable_table(std::string_view real_table_name) {
+    // Built once from the registry: every typed warehouse table (the
+    // table_ref_map keys) plus the three base tables. tar_events is included
+    // even though schema v3 retires it — reading a dropped table is a normal
+    // "no such table" query error, not a security concern.
+    static const std::unordered_set<std::string> allowed = [] {
+        std::unordered_set<std::string> s{"tar_state", "tar_config", "tar_events"};
+        for (const auto& [real, ref] : table_ref_map())
+            s.insert(real);
+        return s;
+    }();
+    return allowed.contains(std::string(real_table_name));
 }
 
 std::vector<std::string> all_dollar_names() {
