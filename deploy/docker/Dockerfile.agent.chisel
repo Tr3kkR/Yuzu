@@ -1,0 +1,162 @@
+# syntax=docker/dockerfile:1.7
+# Yuzu Agent — chiselled Ubuntu 26.04 (FROM scratch) image
+#
+# This is the demo-environment variant of Dockerfile.agent. It produces a
+# distroless-style image whose entire userland is a minimal set of Ubuntu
+# 26.04 package "slices" cut with Canonical's `chisel`, assembled FROM
+# scratch. There is no shell, no package manager, no apt — only the files
+# the agent actually needs at runtime, plus a single static busybox for
+# container healthchecks.
+#
+# Build (native arch):
+#   docker build -t yuzu-agent:chisel -f deploy/docker/Dockerfile.agent.chisel .
+#   docker build -t yuzu-agent:chisel --build-arg TRIPLET=arm64-linux \
+#     -f deploy/docker/Dockerfile.agent.chisel .          # arm64 client
+#
+# Three stages:
+#   1. builder  — compiles the agent (debian:trixie-slim, proven + fast with
+#                 the existing vcpkg/ccache cache mounts). The runtime image
+#                 is 100% Ubuntu 26.04; the builder is throwaway scaffolding.
+#   2. chisel   — cuts the Ubuntu 26.04 runtime slices into /rootfs and lays
+#                 the agent binary, core DSO, and plugins on top.
+#   3. final    — FROM scratch + COPY /rootfs. Nothing else.
+
+# ── Stage 1: builder ──────────────────────────────────────────────────────
+# BUILDER_IMAGE defaults to debian:trixie-slim because Canonical's apt mirrors
+# have historically been unreachable from the CI build host (see the comment
+# in Dockerfile.agent). The agent ELF links against the builder's glibc
+# (trixie, 2.41) and runs on the chiselled Ubuntu 26.04 glibc (>= 2.41) —
+# build-old / run-new is the safe direction. Swap to ubuntu:26.04 if you want
+# the compile itself on Ubuntu.
+ARG BUILDER_IMAGE=debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b
+FROM ${BUILDER_IMAGE} AS builder
+
+# TRIPLET may be passed explicitly (--build-arg TRIPLET=arm64-linux, as the
+# launcher does); otherwise it is derived from the buildx-provided TARGETARCH
+# so a single multi-arch `docker buildx build --platform amd64,arm64` works.
+ARG TARGETARCH
+ARG TRIPLET=
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
+    curl zip unzip tar git ca-certificates \
+    python3-pip python3-venv python3-yaml \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
+    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-13 100 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 100 \
+    && pip3 install --break-system-packages meson==1.9.2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/microsoft/vcpkg.git /opt/vcpkg \
+    && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+ENV VCPKG_ROOT=/opt/vcpkg
+
+WORKDIR /src
+COPY vcpkg.json vcpkg-configuration.json ./
+RUN --mount=type=cache,target=/opt/vcpkg/buildtrees \
+    --mount=type=cache,target=/opt/vcpkg/downloads \
+    --mount=type=cache,target=/root/.cache/vcpkg \
+    T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;; *) echo x64-linux;; esac)}"; \
+    /opt/vcpkg/vcpkg install --triplet "$T" --x-manifest-root=.
+
+ENV CC="ccache gcc-13" \
+    CXX="ccache g++-13" \
+    CCACHE_DIR=/root/.cache/ccache
+
+COPY . .
+# LTO is intentionally OFF for the agent — see Dockerfile.agent for the
+# DSO/static-archive binutils rationale.
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;; *) echo x64-linux;; esac)}"; \
+    meson setup builddir \
+        --native-file meson/native/linux-gcc13.ini \
+        --buildtype=release \
+        -Dcmake_prefix_path=/src/vcpkg_installed/$T \
+        -Dbuild_tests=false \
+        -Dbuild_server=false \
+    && meson compile -C builddir \
+    && ccache -s
+
+# Record the runtime shared-library closure of the agent + plugins so build
+# logs document exactly what the chiselled rootfs must satisfy. Non-fatal.
+RUN echo "=== ldd yuzu-agent ===" \
+    && ldd builddir/agents/core/yuzu-agent || true \
+    && echo "=== ldd libyuzu_agent_core.so ===" \
+    && ldd builddir/agents/core/libyuzu_agent_core.so || true
+
+# ── Stage 2: chisel — cut Ubuntu 26.04 rootfs + lay down the agent ────────
+FROM ubuntu:26.04 AS chisel
+
+ARG TARGETARCH
+ARG CHISEL_VERSION=v1.4.1
+ARG CHISEL_RELEASE=ubuntu-26.04
+
+# ca-certificates: chisel fetches the release definitions + .debs over HTTPS.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ADD https://github.com/canonical/chisel/releases/download/${CHISEL_VERSION}/chisel_${CHISEL_VERSION}_linux_${TARGETARCH}.tar.gz /tmp/chisel.tgz
+RUN tar -xzf /tmp/chisel.tgz -C /usr/bin chisel && chisel version
+
+# Cut only the slices the agent needs at runtime.
+#   libc6_libs              glibc + the dlopened NSS modules (libnss_dns /
+#                           libnss_files) — required for getaddrinfo to resolve
+#                           the compose service names (server / gateway).
+#   libssl3t64_libs         OpenSSL 3 (libssl + libcrypto); pulls the legacy
+#                           provider slice automatically.
+#   libsqlite3-0_libs       agent KV / identity store.
+#   busybox-static_bins     single static binary for the compose healthcheck
+#                           (no shell otherwise exists in the image).
+#   base-passwd_data        /etc/passwd + /etc/group base (NSS "files").
+#   netbase_config          /etc/protocols + /etc/services (getaddrinfo).
+# Retry loop: `chisel cut` downloads the Ubuntu archive indices (main +
+# universe) over the network and the large universe index occasionally EOFs
+# mid-fetch. Retrying keeps release rebuilds reliable.
+RUN set -eux; mkdir -p /rootfs; \
+    SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
+      base-files_release-info base-passwd_data netbase_config \
+      ca-certificates_data openssl_config libc6_libs libgcc-s1_libs \
+      libstdc++6_libs libssl3t64_libs libsqlite3-0_libs zlib1g_libs \
+      busybox-static_bins"; \
+    ok=0; for i in 1 2 3 4 5; do \
+      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES}; then ok=1; break; fi; \
+      echo "chisel cut attempt $i failed; retrying in 5s"; sleep 5; \
+    done; \
+    [ "$ok" = 1 ]
+
+# Agent artifacts: binary, the core DSO, and the plugin directory.
+COPY --from=builder /src/builddir/agents/core/yuzu-agent           /rootfs/usr/local/bin/yuzu-agent
+COPY --from=builder /src/builddir/agents/core/libyuzu_agent_core.so /rootfs/usr/local/lib/libyuzu_agent_core.so
+COPY --from=builder /src/builddir/agents/plugins/                  /rootfs/usr/lib/yuzu/plugins/
+
+# Runtime user, data dir, NSS config, and busybox applet symlinks.
+# uid/gid 1000 are numeric so `USER 1000` needs no passwd lookup, but we add
+# the passwd entry too so getpwuid() inside the agent succeeds.
+RUN set -eux; \
+    echo 'yuzu:x:1000:1000:Yuzu Agent:/var/lib/yuzu-agent:/usr/sbin/nologin' >> /rootfs/etc/passwd; \
+    echo 'yuzu:x:1000:' >> /rootfs/etc/group; \
+    printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /rootfs/etc/nsswitch.conf; \
+    install -d -m 0755 -o 1000 -g 1000 /rootfs/var/lib/yuzu-agent; \
+    install -d -m 0755 /rootfs/usr/lib/yuzu/plugins; \
+    BB="$(ls /rootfs/usr/bin/busybox /rootfs/bin/busybox 2>/dev/null | head -1)"; \
+    test -n "$BB"; \
+    for app in sh wget nc; do ln -sf busybox "$(dirname "$BB")/$app"; done; \
+    "$BB" --help >/dev/null 2>&1 || true
+
+# ── Stage 3: final — FROM scratch ─────────────────────────────────────────
+FROM scratch
+
+# libyuzu_agent_core.so lives in /usr/local/lib and the plugins in
+# /usr/lib/yuzu/plugins; neither is on the default linker path and there is no
+# ldconfig at runtime in a scratch image, so make them discoverable explicitly.
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/yuzu/plugins
+
+COPY --from=chisel /rootfs /
+
+USER 1000:1000
+WORKDIR /var/lib/yuzu-agent
+
+# Demo default: connect to the gateway. The demo compose overrides this.
+ENTRYPOINT ["/usr/local/bin/yuzu-agent"]
+CMD ["--server", "gateway:50051", "--no-tls", "--plugin-dir", "/usr/lib/yuzu/plugins", "--data-dir", "/var/lib/yuzu-agent"]
