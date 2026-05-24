@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1.7
+# Yuzu Agent Bundle — chiselled Ubuntu 26.04 (FROM scratch) DELIVERY image
+#
+# This image is a *file-delivery vehicle*, not a runtime. It carries the Yuzu
+# agent for three target triplets — linux-x64, windows-x64, macos-arm64 — all
+# at the same version as the demo server/gateway, so a design partner who can
+# only "docker pull" can still get the right agent onto every endpoint OS.
+#
+# It deliberately does NOT run the agents: a Linux container cannot execute a
+# Windows .exe or a macOS Mach-O, and the Windows (MSVC) / macOS (Apple Clang)
+# binaries cannot be cross-built in a Linux Docker stage at all. They therefore
+# come from the signed/notarized GitHub *release* archives of the pinned version
+# — see scripts/build-agent-bundle.sh, which downloads, verifies, and lays out
+# the /opt/yuzu-agents tree this Dockerfile copies in.
+#
+# Because nothing here is executed, the chiselled rootfs is tiny: no glibc,
+# OpenSSL, or SQLite — just base-files, /etc/passwd, and a single *static*
+# busybox so the partner can `docker run` to self-extract (or use `docker cp`).
+#
+# Build context is the staging dir produced by the helper (it contains the
+# `yuzu-agents/` tree), NOT the repo root:
+#   docker build -f deploy/docker/Dockerfile.agent-bundle.chisel \
+#     -t yuzu-agent-bundle-chisel:<version> <staging-dir>
+# Prefer `bash scripts/build-agent-bundle.sh` — it wires up the context for you.
+
+ARG CHISEL_VERSION=v1.4.1
+ARG CHISEL_RELEASE=ubuntu-26.04
+
+# ── Stage 1: chisel — cut a minimal Ubuntu 26.04 rootfs + lay the bundle ──────
+FROM ubuntu:26.04 AS chisel
+
+ARG TARGETARCH
+ARG CHISEL_VERSION
+ARG CHISEL_RELEASE
+
+# ca-certificates: chisel fetches release definitions + .debs over HTTPS.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ADD https://github.com/canonical/chisel/releases/download/${CHISEL_VERSION}/chisel_${CHISEL_VERSION}_linux_${TARGETARCH}.tar.gz /tmp/chisel.tgz
+RUN tar -xzf /tmp/chisel.tgz -C /usr/bin chisel && chisel version
+
+# Minimal slice set — this image stores files and copies them out; it runs none
+# of the agents, so it needs no glibc/OpenSSL/SQLite. A single static busybox
+# (busybox-static_bins) provides the userland for the self-extract entrypoint.
+#   base-files_*        /, /etc, /var, /tmp, os-release (usrmerge: /bin->/usr/bin)
+#   base-passwd_data    /etc/passwd + /etc/group base
+#   busybox-static_bins one static binary: sh, cp, tar, ls, find, sha256sum, …
+# Retry loop: the Ubuntu archive indices occasionally EOF mid-fetch.
+RUN set -eux; mkdir -p /rootfs; \
+    SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
+      base-files_release-info base-passwd_data busybox-static_bins"; \
+    ok=0; for i in 1 2 3 4 5; do \
+      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES}; then ok=1; break; fi; \
+      echo "chisel cut attempt $i failed; retrying in 5s"; sleep 5; \
+    done; \
+    [ "$ok" = 1 ]
+
+# The pre-staged bundle tree, assembled on the host by build-agent-bundle.sh
+# from the verified release archives. This is the only payload in the image.
+COPY yuzu-agents /rootfs/opt/yuzu-agents
+
+# The self-extract entrypoint (deploy/docker/agent-bundle-extract.sh, staged
+# into the build context alongside yuzu-agents/ by the helper script).
+COPY extract.sh /rootfs/usr/local/bin/extract.sh
+
+# busybox applet symlinks so the entrypoint has a userland. /bin resolves to
+# /usr/bin under Ubuntu usrmerge, so symlinking next to busybox gives /bin/sh.
+RUN set -eux; \
+    BB="$(ls /rootfs/usr/bin/busybox /rootfs/bin/busybox 2>/dev/null | head -1)"; \
+    test -n "$BB"; BBDIR="$(dirname "$BB")"; \
+    for app in sh ls cp tar cat find sha256sum; do ln -sf busybox "$BBDIR/$app"; done; \
+    test -e /rootfs/bin/sh; \
+    chmod 0755 /rootfs/usr/local/bin/extract.sh
+
+# ── Stage 2: final — FROM scratch ─────────────────────────────────────────────
+FROM scratch
+
+ARG BUNDLE_VERSION=unknown
+LABEL org.opencontainers.image.title="yuzu-agent-bundle" \
+      org.opencontainers.image.description="Yuzu agent for linux-x64, windows-x64, macos-arm64 (delivery image; not a runtime)" \
+      org.opencontainers.image.version="${BUNDLE_VERSION}" \
+      org.opencontainers.image.source="https://github.com/Tr3kkR/Yuzu" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"
+
+COPY --from=chisel /rootfs /
+
+WORKDIR /opt/yuzu-agents
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/extract.sh"]

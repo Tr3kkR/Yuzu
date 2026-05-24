@@ -152,6 +152,17 @@ agent UUID (`identity_store`) is unique per container and the fleet shows N
 distinct agents rather than one. tmpfs also makes the agents ephemeral, which
 is what makes a clean restart reproducible.
 
+## Getting agents onto real endpoints
+
+The in-compose agents are Linux containers. To enrol a partner's **Windows,
+Linux, and macOS** machines, ship them the agent via the **agent-bundle**
+delivery image — one chiselled container holding all three triplets
+(`windows-x64`, `linux-x64`, `macos-arm64`) at the same version, with both
+native installers and raw payloads. They `docker pull` it, extract the right
+triplet per endpoint, and point each agent at `<host>:50051` with the demo
+enrollment token. Build/usage: `docs/agent-bundle.md` and
+`scripts/build-agent-bundle.sh`.
+
 ## Publishing (release pipeline)
 
 The `docker-publish-chisel` job in `.github/workflows/release.yml` builds all
