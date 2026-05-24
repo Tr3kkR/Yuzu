@@ -184,13 +184,30 @@ public:
     // ── Generic SQL execution (for warehouse queries and aggregation) ────────
 
     /**
-     * Execute arbitrary read-only SQL and return results.
-     * Used by tar.sql action. Returns error string on failure.
-     * The caller is responsible for SQL validation (SELECT-only, etc.)
-     * Enforces a maximum row limit to prevent agent DoS.
+     * Execute TRUSTED, internally-constructed read-only SQL on the read-write
+     * connection (NO authorizer). For internal callers ONLY — rollup / stats /
+     * diff queries built from constants and integer-parsed values, never operator
+     * or network input. For any UNTRUSTED operator SQL use execute_user_query
+     * instead (#760). Enforces a maximum row limit to prevent agent DoS.
      */
     std::expected<QueryResult, std::string> execute_query(const std::string& sql,
                                                           int max_rows = 10000);
+
+    /**
+     * Execute UNTRUSTED operator SQL (the tar.sql action) in a sandbox: a
+     * dedicated read-only SQLite connection with an authorizer that permits
+     * only SELECT / READ of registry-known warehouse tables. Writes are
+     * structurally impossible (read-only handle); non-SELECT statements,
+     * ATTACH/PRAGMA, unknown tables, and trailing statements are rejected at
+     * prepare time. Fails closed (returns an error) if the sandbox connection
+     * is unavailable. Callers must still pre-validate via
+     * validate_and_translate_sql — this is defence in depth, not a substitute.
+     * Recovery: if the read-only connection cannot be opened at startup it stays
+     * unavailable for the process lifetime (fail closed); restart the agent to
+     * retry.
+     */
+    std::expected<QueryResult, std::string> execute_user_query(const std::string& sql,
+                                                               int max_rows = 10000);
 
     /**
      * Execute arbitrary DDL/DML SQL (for rollup inserts, retention deletes).
@@ -211,7 +228,12 @@ private:
     void set_config_locked(const std::string& key, const std::string& value);
 
     sqlite3* db_{nullptr};
+    // Read-only, authorizer-sandboxed connection used only by execute_user_query
+    // for untrusted operator SQL (#760). Null if it could not be opened, in
+    // which case user queries fail closed.
+    sqlite3* query_db_{nullptr};
     std::mutex mu_;
+    std::mutex query_mu_;
 };
 
 } // namespace yuzu::tar

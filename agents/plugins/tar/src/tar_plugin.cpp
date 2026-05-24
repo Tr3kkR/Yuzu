@@ -1106,7 +1106,7 @@ private:
             return 1;
         }
 
-        auto query_result = db_->execute_query(*validated);
+        auto query_result = db_->execute_user_query(*validated);
         if (!query_result) {
             ctx.write_output(std::format("error|{}", query_result.error()));
             return 1;

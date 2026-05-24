@@ -16,6 +16,7 @@
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 
+#include <cctype>
 #include <chrono>
 #include <format>
 #include <memory>
@@ -34,6 +35,49 @@ struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
 };
 using StmtPtr = std::unique_ptr<sqlite3_stmt, StmtDeleter>;
+
+// Case-insensitive ASCII equality for a short, NUL-terminated SQL identifier
+// (SQLite function/identifier names are case-insensitive).
+bool ascii_iequals(const char* a, const char* b) noexcept {
+    for (; *a && *b; ++a, ++b)
+        if (std::tolower(static_cast<unsigned char>(*a)) !=
+            std::tolower(static_cast<unsigned char>(*b)))
+            return false;
+    return *a == *b;
+}
+
+// SQLite authorizer for the read-only operator-SQL sandbox (#760). Permits only
+// the overall SELECT, reads of registry-known warehouse tables, and scalar/
+// aggregate function calls (the handle is read-only, so no function can mutate;
+// load_extension is denied both by name here and via SQLITE_DBCONFIG). Everything
+// else — INSERT/UPDATE/DELETE/DDL, ATTACH/DETACH, PRAGMA, transaction control,
+// recursive CTEs — is denied at prepare time.
+//
+// noexcept + catch-all is load-bearing: SQLite invokes this from C frames during
+// sqlite3_prepare_v2, so a C++ exception (e.g. std::bad_alloc from
+// is_queryable_table's allocation) must never unwind through them — that would be
+// UB. Any exception fails closed (SQLITE_DENY).
+int tar_query_authorizer(void* /*ctx*/, int action, const char* arg1, const char* arg2,
+                         const char* /*db_name*/, const char* /*inner_trigger_or_view*/) noexcept {
+    try {
+        switch (action) {
+        case SQLITE_SELECT:
+            return SQLITE_OK;
+        case SQLITE_FUNCTION:
+            // arg2 is the function name; deny load_extension by name (case-
+            // insensitive, as SQLite names are) atop the SQLITE_DBCONFIG disable.
+            if (arg2 && ascii_iequals(arg2, "load_extension"))
+                return SQLITE_DENY;
+            return SQLITE_OK;
+        case SQLITE_READ:
+            return (arg1 && is_queryable_table(arg1)) ? SQLITE_OK : SQLITE_DENY;
+        default:
+            return SQLITE_DENY;
+        }
+    } catch (...) {
+        return SQLITE_DENY;
+    }
+}
 
 /// Schema DDL for all TAR tables.
 constexpr const char* kCreateSchema = R"(
@@ -76,18 +120,28 @@ TarDatabase::~TarDatabase() {
         sqlite3_close(db_);
         db_ = nullptr;
     }
+    if (query_db_) {
+        sqlite3_close(query_db_);
+        query_db_ = nullptr;
+    }
 }
 
-TarDatabase::TarDatabase(TarDatabase&& other) noexcept : db_{other.db_} {
+TarDatabase::TarDatabase(TarDatabase&& other) noexcept
+    : db_{other.db_}, query_db_{other.query_db_} {
     other.db_ = nullptr;
+    other.query_db_ = nullptr;
 }
 
 TarDatabase& TarDatabase::operator=(TarDatabase&& other) noexcept {
     if (this != &other) {
         if (db_)
             sqlite3_close(db_);
+        if (query_db_)
+            sqlite3_close(query_db_);
         db_ = other.db_;
+        query_db_ = other.query_db_;
         other.db_ = nullptr;
+        other.query_db_ = nullptr;
     }
     return *this;
 }
@@ -205,6 +259,34 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
             sqlite3_free(emsg);
             sqlite3_exec(raw_db, "ROLLBACK TO v3_migration", nullptr, nullptr, nullptr);
             sqlite3_exec(raw_db, "RELEASE v3_migration", nullptr, nullptr, nullptr);
+        }
+    }
+
+    // Open a dedicated read-only, authorizer-sandboxed connection for untrusted
+    // operator SQL (the tar.sql action). On this handle writes are structurally
+    // impossible and the authorizer restricts reads to registry-known warehouse
+    // tables (#760). Internal trusted reads keep using db_. If this connection
+    // can't be opened we continue without it; execute_user_query then fails
+    // closed.
+    {
+        sqlite3* ro = nullptr;
+        int rrc = sqlite3_open_v2(path.string().c_str(), &ro,
+                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr);
+        if (rrc == SQLITE_OK) {
+            sqlite3_busy_timeout(ro, 5000);
+            sqlite3_db_config(ro, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, nullptr);
+            sqlite3_set_authorizer(ro, &tar_query_authorizer, nullptr);
+            // Force the is_queryable_table allowlist's one-time static init now,
+            // on a normal C++ stack — never lazily inside the authorizer callback
+            // while it runs in SQLite's C prepare frames.
+            (void)is_queryable_table("");
+            db.query_db_ = ro;
+        } else {
+            spdlog::warn("TarDatabase: read-only query connection unavailable ({}); "
+                         "tar.sql queries will be refused",
+                         ro ? sqlite3_errmsg(ro) : "open failed");
+            if (ro)
+                sqlite3_close(ro);
         }
     }
 
@@ -772,6 +854,67 @@ std::expected<QueryResult, std::string> TarDatabase::execute_query(const std::st
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         if (++row_count > max_rows) {
             spdlog::warn("execute_query: row limit ({}) exceeded, truncating", max_rows);
+            break;
+        }
+        QueryRow row;
+        row.reserve(col_count);
+        for (int i = 0; i < col_count; ++i) {
+            auto text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), i));
+            row.emplace_back(text ? text : "");
+        }
+        result.rows.push_back(std::move(row));
+    }
+
+    return result;
+}
+
+std::expected<QueryResult, std::string> TarDatabase::execute_user_query(const std::string& sql,
+                                                                        int max_rows) {
+    std::lock_guard lock(query_mu_);
+    QueryResult result;
+    if (!query_db_)
+        return std::unexpected("query engine unavailable");
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    const char* tail = nullptr;
+    // Pass the explicit byte length (not -1): with -1 SQLite stops at the first
+    // embedded NUL, which would let the executed query differ from the validated
+    // one (the #631 class). An explicit length makes an embedded NUL a tokenizer
+    // error instead.
+    int rc = sqlite3_prepare_v2(query_db_, sql.c_str(), static_cast<int>(sql.size()), &raw_stmt,
+                                &tail);
+    if (rc != SQLITE_OK) {
+        // Authorizer denials surface as SQLITE_AUTH; keep the reason generic so
+        // a probe can't use the message to enumerate tables or columns.
+        if (rc == SQLITE_AUTH)
+            return std::unexpected("query rejected: operation or table not permitted");
+        auto err = std::string(sqlite3_errmsg(query_db_));
+        spdlog::warn("execute_user_query prepare failed: {}", err);
+        return std::unexpected(std::format("query failed: {}", err));
+    }
+    StmtPtr stmt(raw_stmt);
+
+    // Engine-level single-statement enforcement: prepare_v2 compiles only the
+    // first statement and points `tail` at the remainder — reject any trailing
+    // SQL (defence in depth alongside the validator's check).
+    if (tail) {
+        while (*tail && std::isspace(static_cast<unsigned char>(*tail)))
+            ++tail;
+        if (*tail)
+            return std::unexpected("only single-statement queries are allowed");
+    }
+
+    int col_count = sqlite3_column_count(stmt.get());
+    result.columns.reserve(col_count);
+    for (int i = 0; i < col_count; ++i) {
+        auto name = sqlite3_column_name(stmt.get(), i);
+        result.columns.emplace_back(name ? name : "");
+    }
+
+    int row_count = 0;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        if (++row_count > max_rows) {
+            spdlog::warn("execute_user_query: row limit ({}) exceeded, truncating", max_rows);
             break;
         }
         QueryRow row;
