@@ -121,6 +121,28 @@ the linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with
 `cache-prune.yml` runs weekly (Sun 04:00 UTC) on each self-hosted runner.
 Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` >30 days
 old. Does not touch ccache (own LRU at `CCACHE_MAXSIZE=30G`).
+Also sweeps the buildx local cache the chisel images write
+(`/mnt/d/docker-buildcache/*-chisel`, `mode=max` — several GB/arch, no
+built-in eviction); whole-`*-chisel`-dir mtime sweep >30 days, Linux only.
+
+## Chiselled demo images + agent bundle (release-time)
+
+`docker-publish-chisel` (in `release.yml`) builds the server/gateway/agent
+`*.chisel` images multi-arch — linux/amd64 native + linux/arm64 via **QEMU**
+— on the self-hosted Linux runner. The emulated arm64 vcpkg-from-source
+compile can hold that single runner slot up to its 360-min timeout, so the
+job carries a `cancel-in-progress: true` concurrency group (a re-tagged
+release supersedes a stale build instead of queueing behind it). It is
+**not** in the `release` job's `needs:`, so a slow/failed demo-image build
+never blocks the actual release. The sustainable fix for the QEMU cost is a
+native arm64 runner — the open decision tracked in `docs/demo-environment.md`
+("Publishing").
+
+`docker-publish-agent-bundle` runs **after** `release` (it repackages the
+release's own signed agent archives) on a GitHub-hosted runner — no
+compilation, so no self-hosted dependency — and cosign-signs + SBOMs +
+attests the pushed `yuzu-agent-bundle-chisel` image like the other publish
+jobs.
 
 ## vcpkg state corruption — recovery path
 

@@ -116,6 +116,10 @@ bash scripts/start-UAT.sh status   # show running processes
 
 `scripts/start-viz-uat.sh` stands up a three-container Docker stack (server + gateway + agent) for the visualization feature ladder. **Cannot run alongside `start-UAT.sh`** — both bind host ports 8080 *and* 50051. Auto-detects arm64 vs amd64 and sets `--build-arg TRIPLET` accordingly; default `x64-linux` preserves the `release.yml` path. The launcher exports `VIZ_UAT_CONFIG` (absolute path to a generated `yuzu-server.cfg`); do not invoke `docker compose -f docker-compose.viz-uat.yml up` directly. State dir `/tmp/yuzu-viz-uat/`; scale agents with `VIZ_UAT_AGENTS=N`. Set `VIZ_UAT_AGENT_MODE=vm` to skip the in-container agent and print the enrollment token + host-exposed gateway address for running a native `yuzu-agent` on an OrbStack VM / bare-metal host — needed for PR 8+ visuals that depend on real loopback workloads. `VIZ_UAT_AGENT_MODE=none` skips agent startup entirely. **Note:** `scripts/start-UAT.sh` (the native, non-container UAT) force-wipes `/tmp/yuzu-uat/` on each start to work around a stale-DB session-auth bug (#947); do not remove that wipe without first closing the issue. See `bash scripts/start-viz-uat.sh --help` for full usage.
 
+### Cedar & Vale demo environment (release-pinned, sales)
+
+`scripts/start-demo.sh` stands up a three-tier **chiselled** Docker stack (server + gateway + N agent replicas) from release-pinned GHCR images. **Cannot run alongside `start-viz-uat.sh` or `start-UAT.sh`** — all three bind host ports 8080 and 50051 (the launcher pre-checks and refuses to start if they are busy). Clean-start by default (wipes `/tmp/yuzu-demo/` + compose volumes); `--keep` preserves state. Distinct from the viz-UAT rig. The **agent-bundle** delivery image (`docs/agent-bundle.md`, `scripts/build-agent-bundle.sh`) ships the agent for `linux-x64` / `windows-x64` / `macos-arm64` to design partners who can only `docker pull` — published + cosign-signed + SBOM'd by the `docker-publish-agent-bundle` release job. Full runbook: `docs/demo-environment.md`.
+
 ### Port assignments
 
 Server and gateway defaults do not conflict — all three components can run on the same box without overrides:
@@ -312,7 +316,7 @@ Three-tier split (April 2026): Tier 1 PR fast-path (`ci.yml`, one Linux + one Wi
 
 ## Release workflow gates
 
-The `release:` job in `.github/workflows/release.yml` runs `scripts/check-compose-versions.sh` as its **first step**, before any artifact download. The script walks an explicit list of tracked compose files and rejects any `ghcr.io/<owner>/yuzu-{server,gateway,agent}:X.Y.Z` reference that is (a) a bare numeric tag rather than `${YUZU_VERSION:-...}`, or (b) a parameterised default that does not equal the tag being released (`${GITHUB_REF_NAME#v}`). Floating tags (`latest`, `local`, sha-pinned) are ignored.
+The `release:` job in `.github/workflows/release.yml` runs `scripts/check-compose-versions.sh` as its **first step**, before any artifact download. The script walks an explicit list of tracked compose files (including `docker-compose.demo.yml`) and rejects any `ghcr.io/<owner>/yuzu-{server,gateway,agent}(-chisel)?:X.Y.Z` reference that is (a) a bare numeric tag rather than `${YUZU_VERSION:-...}`, or (b) a parameterised default that does not equal the tag being released (`${GITHUB_REF_NAME#v}`). The `-chisel` repo suffix is recognised; floating tags (`latest`, `local`, sha-pinned) are ignored. Passing explicit file paths after the version overrides the tracked list (used by `tests/shell/test_check_compose_versions.sh`).
 
 **Before tagging a release**, bump the `${YUZU_VERSION:-X.Y.Z}` default in every tracked compose file to the new version and verify locally:
 

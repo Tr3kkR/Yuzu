@@ -1,0 +1,138 @@
+# syntax=docker/dockerfile:1.7
+# Yuzu Server — chiselled Ubuntu 26.04 (FROM scratch) image
+#
+# Demo-environment variant of Dockerfile.server. The runtime userland is a
+# minimal set of Ubuntu 26.04 package slices cut with Canonical's `chisel`,
+# assembled FROM scratch — no shell, no apt, just what yuzu-server needs plus
+# a single static busybox for the compose healthcheck.
+#
+# Build:
+#   docker build -t yuzu-server:chisel -f deploy/docker/Dockerfile.server.chisel .
+#   docker build -t yuzu-server:chisel --build-arg TRIPLET=arm64-linux \
+#     -f deploy/docker/Dockerfile.server.chisel .
+#
+# InstructionDefinitions are embedded into yuzu-server at build time
+# (server/core/scripts/embed_content.py); there is no filesystem content copy.
+
+# ── Stage 1: builder ──────────────────────────────────────────────────────
+# debian:trixie-slim builder (proven + fast); chiselled Ubuntu 26.04 runtime.
+# build-old-glibc / run-new-glibc is the safe direction. Swap BUILDER_IMAGE to
+# ubuntu:26.04 to compile on Ubuntu itself.
+ARG BUILDER_IMAGE=debian:trixie-slim@sha256:109e2c65005bf160609e4ba6acf7783752f8502ad218e298253428690b9eaa4b
+FROM ${BUILDER_IMAGE} AS builder
+
+# TRIPLET may be passed explicitly (--build-arg TRIPLET=arm64-linux, as the
+# launcher does); otherwise it is derived from the buildx-provided TARGETARCH
+# so a single multi-arch `docker buildx build --platform amd64,arm64` works.
+ARG TARGETARCH
+ARG TRIPLET=
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake ninja-build gcc-13 g++-13 ccache pkg-config make linux-libc-dev \
+    curl zip unzip tar git ca-certificates \
+    python3-pip python3-venv python3-yaml \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 \
+    && update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 \
+    && update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-13 100 \
+    && update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 100 \
+    && pip3 install --break-system-packages meson==1.9.2 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/microsoft/vcpkg.git /opt/vcpkg \
+    && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+ENV VCPKG_ROOT=/opt/vcpkg
+
+WORKDIR /src
+COPY vcpkg.json vcpkg-configuration.json ./
+RUN --mount=type=cache,target=/opt/vcpkg/buildtrees \
+    --mount=type=cache,target=/opt/vcpkg/downloads \
+    --mount=type=cache,target=/root/.cache/vcpkg \
+    T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;; *) echo x64-linux;; esac)}"; \
+    /opt/vcpkg/vcpkg install --triplet "$T" --x-manifest-root=.
+
+ENV CC="ccache gcc-13" \
+    CXX="ccache g++-13" \
+    CCACHE_DIR=/root/.cache/ccache
+
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/ccache \
+    T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;; *) echo x64-linux;; esac)}"; \
+    meson setup builddir \
+        --native-file meson/native/linux-gcc13.ini \
+        --buildtype=release \
+        -Dcmake_prefix_path=/src/vcpkg_installed/$T \
+        -Dbuild_tests=false \
+        -Dbuild_agent=false \
+    && meson compile -C builddir \
+    && ccache -s
+
+RUN echo "=== ldd yuzu-server ===" && ldd builddir/server/core/yuzu-server || true
+
+# ── Stage 2: chisel — cut Ubuntu 26.04 rootfs + lay down the server ───────
+FROM ubuntu:26.04 AS chisel
+
+ARG TARGETARCH
+ARG CHISEL_VERSION=v1.4.1
+ARG CHISEL_RELEASE=ubuntu-26.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ADD https://github.com/canonical/chisel/releases/download/${CHISEL_VERSION}/chisel_${CHISEL_VERSION}_linux_${TARGETARCH}.tar.gz /tmp/chisel.tgz
+# Verify the chisel tarball against a per-arch sha256 before trusting it. The
+# ADD above is version- but not digest-pinned, and the URL is per-arch so a
+# single `ADD --checksum=` can't cover both arches. Fail closed on mismatch.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) want=a82cbaa4b17af2750d4593312cbdc5afd92573aacefdad08721ccf6a5bdef4f5 ;; \
+      arm64) want=3606a0363ec3ee4f2d5bb5c81ee3892c6b15e8fe776509c012888a33d3953271 ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    echo "${want}  /tmp/chisel.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/chisel.tgz -C /usr/bin chisel; \
+    chisel version
+
+# See Dockerfile.agent.chisel for the per-slice rationale. The server needs no
+# plugin/DSO slices but is otherwise the same closure.
+# Retry loop: `chisel cut` downloads the Ubuntu archive indices (main +
+# universe) over the network and the large universe index occasionally EOFs
+# mid-fetch. Retrying keeps release rebuilds reliable.
+RUN set -eux; mkdir -p /rootfs; \
+    SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
+      base-files_release-info base-passwd_data netbase_config \
+      ca-certificates_data openssl_config libc6_libs libgcc-s1_libs \
+      libstdc++6_libs libssl3t64_libs libsqlite3-0_libs zlib1g_libs \
+      busybox-static_bins"; \
+    ok=0; for i in 1 2 3 4 5; do \
+      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES}; then ok=1; break; fi; \
+      echo "chisel cut attempt $i failed; retrying in 5s"; sleep 5; \
+    done; \
+    [ "$ok" = 1 ]
+
+COPY --from=builder /src/builddir/server/core/yuzu-server /rootfs/usr/local/bin/yuzu-server
+
+# Runtime user + dirs. /var/log/yuzu is 0750 to match the deb postinst and
+# avoid log disclosure to other UIDs (governance Gate 7).
+RUN set -eux; \
+    echo 'yuzu:x:1000:1000:Yuzu Server:/var/lib/yuzu:/usr/sbin/nologin' >> /rootfs/etc/passwd; \
+    echo 'yuzu:x:1000:' >> /rootfs/etc/group; \
+    printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /rootfs/etc/nsswitch.conf; \
+    install -d -m 0755 -o 1000 -g 1000 /rootfs/var/lib/yuzu; \
+    install -d -m 0755 -o 1000 -g 1000 /rootfs/etc/yuzu; \
+    install -d -m 0750 -o 1000 -g 1000 /rootfs/var/log/yuzu; \
+    BB="$(ls /rootfs/usr/bin/busybox /rootfs/bin/busybox 2>/dev/null | head -1)"; \
+    test -n "$BB"; \
+    for app in sh wget nc; do ln -sf busybox "$(dirname "$BB")/$app"; done
+
+# ── Stage 3: final — FROM scratch ─────────────────────────────────────────
+FROM scratch
+
+COPY --from=chisel /rootfs /
+
+USER 1000:1000
+WORKDIR /var/lib/yuzu
+
+EXPOSE 8080 50051 50052 50055
+
+ENTRYPOINT ["/usr/local/bin/yuzu-server"]
+CMD ["--listen", "0.0.0.0:50051", "--no-tls", "--no-https", "--web-address", "0.0.0.0", "--web-port", "8080", "--config", "/var/lib/yuzu/yuzu-server.cfg", "--data-dir", "/var/lib/yuzu"]

@@ -1,0 +1,120 @@
+# syntax=docker/dockerfile:1.7
+# Yuzu Gateway — chiselled Ubuntu 26.04 (FROM scratch) image
+#
+# Demo-environment variant of Dockerfile.gateway. Unlike the C++ components,
+# the gateway is an Erlang/OTP release. `rebar3 as prod release` bundles ERTS
+# (include_erts=true), so the runtime image needs no Erlang install — only the
+# shared libraries ERTS links against, plus a POSIX userland for the release
+# boot script (`bin/yuzu_gw`), which shells out to dirname/sed/grep/awk/uname/…
+# We satisfy that with a single static busybox exposing its full applet set.
+#
+# Two deviations from the alpine production image:
+#   1. Builder is glibc Erlang (erlang:28, debian-based), NOT erlang:28-alpine.
+#      The bundled ERTS + crypto NIF must link the SAME libc family as the
+#      chiselled Ubuntu (glibc) runtime — a musl ERTS cannot run here.
+#   2. Runtime is chiselled Ubuntu 26.04 instead of alpine:3.23.
+#
+# Build:
+#   docker build -t yuzu-gateway:chisel -f deploy/docker/Dockerfile.gateway.chisel .
+
+# ── Stage 1: deps — fetch + compile Erlang dependencies (cached) ──────────
+ARG ERLANG_IMAGE=erlang:28
+FROM ${ERLANG_IMAGE} AS deps
+
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY gateway/rebar.config gateway/rebar.lock ./
+RUN --mount=type=cache,target=/root/.cache/rebar3 \
+    rebar3 compile --deps_only
+
+# ── Stage 2: build — compile app + assemble prod release ──────────────────
+FROM deps AS builder
+COPY gateway/ .
+RUN rebar3 as prod release \
+    && echo "=== release boot script shebang ===" \
+    && head -1 _build/prod/rel/yuzu_gw/bin/yuzu_gw \
+    && echo "=== ldd beam.smp ===" \
+    && ldd _build/prod/rel/yuzu_gw/erts-*/bin/beam.smp || true
+
+# ── Stage 3: chisel — cut Ubuntu 26.04 rootfs + lay down the release ──────
+FROM ubuntu:26.04 AS chisel
+
+ARG TARGETARCH
+ARG CHISEL_VERSION=v1.4.1
+ARG CHISEL_RELEASE=ubuntu-26.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ADD https://github.com/canonical/chisel/releases/download/${CHISEL_VERSION}/chisel_${CHISEL_VERSION}_linux_${TARGETARCH}.tar.gz /tmp/chisel.tgz
+# Verify the chisel tarball against a per-arch sha256 before trusting it. The
+# ADD above is version- but not digest-pinned, and the URL is per-arch so a
+# single `ADD --checksum=` can't cover both arches. Fail closed on mismatch.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) want=a82cbaa4b17af2750d4593312cbdc5afd92573aacefdad08721ccf6a5bdef4f5 ;; \
+      arm64) want=3606a0363ec3ee4f2d5bb5c81ee3892c6b15e8fe776509c012888a33d3953271 ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    echo "${want}  /tmp/chisel.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/chisel.tgz -C /usr/bin chisel; \
+    chisel version
+
+# ERTS runtime closure: glibc (+ NSS for resolving the `server` upstream by
+# name), libstdc++/libgcc, ncurses (the emulator links libtinfo), OpenSSL
+# (crypto NIF dlopens libcrypto.so.3), zlib. busybox provides the shell +
+# coreutils the boot script needs.
+#
+# The cut is wrapped in a retry loop: `chisel cut` fetches the per-component
+# package indices (main + universe) from the Ubuntu archive over the network,
+# and the large universe index occasionally EOFs mid-download. Retrying makes
+# release rebuilds reliable.
+RUN set -eux; mkdir -p /rootfs; \
+    SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
+      base-files_release-info base-passwd_data netbase_config \
+      ca-certificates_data openssl_config libc6_libs libgcc-s1_libs \
+      libstdc++6_libs libncursesw6_libs libtinfo6_libs libssl3t64_libs \
+      zlib1g_libs busybox-static_bins"; \
+    ok=0; for i in 1 2 3 4 5; do \
+      if chisel cut --release "${CHISEL_RELEASE}" --root /rootfs ${SLICES}; then ok=1; break; fi; \
+      echo "chisel cut attempt $i failed; retrying in 5s"; sleep 5; \
+    done; \
+    [ "$ok" = 1 ]
+
+COPY --from=builder /src/_build/prod/rel/yuzu_gw/ /rootfs/opt/yuzu_gw/
+
+# Runtime user, writable release tree, /tmp, NSS config, and the FULL busybox
+# applet set so the OTP boot script's shell-outs resolve.
+RUN set -eux; \
+    echo 'yuzu-gw:x:1000:1000:Yuzu Gateway:/opt/yuzu_gw:/bin/sh' >> /rootfs/etc/passwd; \
+    echo 'yuzu-gw:x:1000:' >> /rootfs/etc/group; \
+    printf 'passwd: files\ngroup: files\nhosts: files dns\n' > /rootfs/etc/nsswitch.conf; \
+    chmod 1777 /rootfs/tmp; \
+    chown -R 1000:1000 /rootfs/opt/yuzu_gw; \
+    BB="$(ls /rootfs/usr/bin/busybox /rootfs/bin/busybox 2>/dev/null | head -1)"; \
+    test -n "$BB"; \
+    BBDIR="$(dirname "$BB")"; \
+    for app in $("$BB" --list); do \
+      [ "$app" = busybox ] && continue; \
+      ln -sf busybox "$BBDIR/$app"; \
+    done; \
+    ln -sf busybox "$BBDIR/bash"; \
+    test -x "$BBDIR/busybox" && test -L "$BBDIR/sh" && test -L "$BBDIR/dirname" && test -L "$BBDIR/sed"
+
+# ── Stage 4: final — FROM scratch ─────────────────────────────────────────
+FROM scratch
+
+COPY --from=chisel /rootfs /
+
+ENV HOME=/opt/yuzu_gw \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/yuzu_gw/bin
+
+USER 1000:1000
+WORKDIR /opt/yuzu_gw
+
+EXPOSE 50051 50063 8081 9568
+
+ENTRYPOINT ["/opt/yuzu_gw/bin/yuzu_gw"]
+CMD ["foreground"]

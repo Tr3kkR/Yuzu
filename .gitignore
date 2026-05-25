@@ -10,6 +10,10 @@ cmake-build-*/
 out/
 .cache/
 
+# Agent-bundle delivery image: build context staged by scripts/build-agent-bundle.sh
+# (downloaded release archives + the laid-out /opt/yuzu-agents tree). Large, derived.
+deploy/docker/.agent-bundle-build/
+
 # Erlang / rebar3
 # `_build/` is the canonical rebar3 base dir. `_build_eunit/` and
 # `_build_ct/` are per-suite base dirs set via REBAR_BASE_DIR in
