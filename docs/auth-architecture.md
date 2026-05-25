@@ -45,6 +45,55 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 - **Enrollment token persistence** — tokens stored in `enrollment-tokens.cfg`, pending agents in `pending-agents.cfg` (same directory as `yuzu-server.cfg`).
 - **Agent `--enrollment-token` CLI flag** — passes token in `RegisterRequest.enrollment_token`.
 
+## Per-session peer binding and NAT-aware relaxation
+
+`Register` and `Subscribe` are separate gRPC connections correlated by a
+`session_id`. To stop a sniffed `session_id` from being replayed from another
+host, Subscribe is bound to the Register connection by **two layers**:
+
+- **Peer-IP binding (#826, hardened #1058/#1059)** — Subscribe's source IP must
+  equal the IP recorded at Register (or, under `--gateway-mode`, a trusted
+  gateway IP). A mismatch increments
+  `yuzu_grpc_subscribe_peer_mismatch_total{event="security"}` and emits a
+  `session.peer_mismatch` audit row (`result="denied"`).
+- **Identity binding (authoritative)** — the `agent_id`↔session binding (#827)
+  and, under mTLS, the client-identity binding (#1118,
+  `yuzu_grpc_subscribe_identity_mismatch_total`). These are *stronger* than
+  source IP.
+
+**NAT-aware relaxation (#1128).** Exact-IP binding false-rejects a legitimate
+agent whose Register and Subscribe egress *different* public IPs (multi-egress
+NAT, proxy pool, CG-NAT, SD-WAN). Strict exact-match is the **default**; two
+**opt-in** accommodations downgrade a mismatch to *advisory* (audit + metric, no
+reject) instead:
+
+1. **mTLS-advisory** — when a verified client identity matches the one bound at
+   Register, the IP is defence-in-depth only (the identity layer is
+   authoritative), so the mismatch is tolerated.
+2. **`--trusted-nat-cidr <cidr>[,…]`** (`Config::trusted_nat_cidrs`) — when the
+   Register *and* Subscribe IPs both fall inside one operator-declared range
+   (analogous to `--gateway-mode`, but for direct-connect NAT).
+
+A mismatch *outside* both accommodations is still a hard reject — the replay
+guard is intact, and an empty/malformed extracted IP is always reject (#826:
+empty is a mismatch, never a wildcard). A tolerated mismatch emits
+`yuzu_grpc_subscribe_peer_advisory_total{event="security",reason=…}` plus a
+`session.peer_mismatch` audit row with `result="ok" outcome=advisory`. The pure
+decision lives in `AgentServiceImpl::evaluate_peer_binding` (unit-tested);
+CIDR containment in `cidr_match.{hpp,cpp}`.
+
+**Gateway origin-IP attribution (#1064).** On the gateway `ProxyRegister` path
+the server's transport peer is the *gateway's* IP, so audit rows would
+mis-attribute the source (SOC 2 IR-2). `RegisterRequest.gateway_observed_peer`
+(an optional, gateway-authoritative, transport-agnostic field — survives the
+planned gRPC→QUIC move) carries the agent's origin IP; the server records
+`source_ip`=agent origin and `gateway_ip`=transport peer, falling back to the
+gateway IP (`origin_observed=false`) when absent. The *direct* Register path
+ignores the field (spoof-safe). **Server-side consumption ships now; the
+gateway-side population is a follow-up** — today's grpcbox transport can only
+source it from `x-forwarded-for` (proxied deployments), and the durable
+direct-mode source arrives with the QUIC transport (#376) that owns its socket.
+
 ## HTTPS and bind defaults (hard invariants)
 
 - **HTTPS by default** — `https_enabled` defaults to `true`. Operators must provide `--https-cert` and `--https-key`, or use `--no-https` for development. The `--https` flag was replaced with `--no-https`.

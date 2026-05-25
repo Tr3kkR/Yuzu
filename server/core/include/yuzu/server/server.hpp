@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace yuzu::server::auth {
 class AuthManager;
@@ -50,6 +51,13 @@ struct Config {
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
     std::string gateway_command_address;  // Gateway ManagementService for command forwarding
     bool gateway_mode{false};             // When true, relax peer-mismatch in Subscribe
+
+    // #1128: operator-declared multi-egress NAT/proxy ranges. When a direct-
+    // connect agent's Register and Subscribe present different source IPs that
+    // BOTH fall inside one of these CIDRs, the per-session peer-IP mismatch is
+    // downgraded to advisory (audit + metric) instead of rejected. Empty = the
+    // strict exact-match binding (default, no relaxation).
+    std::vector<std::string> trusted_nat_cidrs;
 
     // NVD CVE feed
     std::string nvd_api_key; // Optional NVD API key for higher rate limits

@@ -132,6 +132,12 @@ int main(int argc, char* argv[]) {
     app.add_option("--gateway-command-addr", cfg.gateway_command_address,
                    "Gateway ManagementService address for command forwarding (host:port)")
         ->envname("YUZU_GATEWAY_COMMAND_ADDR");
+    app.add_option("--trusted-nat-cidr", cfg.trusted_nat_cidrs,
+                   "Multi-egress NAT/proxy CIDR(s) (e.g. 203.0.113.0/24,2001:db8::/32). A direct "
+                   "agent whose Register and Subscribe source IPs both fall in one range is "
+                   "tolerated instead of rejected (#1128). Repeatable or comma-separated.")
+        ->delimiter(',')
+        ->envname("YUZU_TRUSTED_NAT_CIDR");
     app.add_option("--max-agents", cfg.max_agents, "Maximum concurrent agent connections")
         ->default_val(10000)
         ->envname("YUZU_MAX_AGENTS");

@@ -339,6 +339,16 @@ public:
                           "match the identity bound at Register time (stolen-session signal, "
                           "#1118). Labelled event=security (SIEM-routing tag)",
                           "counter");
+        // #1128: a peer-IP mismatch that was TOLERATED (not rejected) because a
+        // NAT-aware accommodation applied. Paired with _peer_mismatch_total
+        // (rejects): a spike here without a matching reject spike is benign
+        // multi-egress churn; a spike in BOTH is worth investigating. reason
+        // distinguishes the accommodation that fired.
+        metrics_.describe("yuzu_grpc_subscribe_peer_advisory_total",
+                          "Subscribe RPC peer-IP mismatch tolerated under a NAT-aware "
+                          "accommodation instead of rejected (#1128). Labelled event=security "
+                          "(SIEM-routing tag) and reason (mtls_identity_match|trusted_nat_cidr)",
+                          "counter");
         metrics_.describe("yuzu_register_denied_total",
                           "Register/ProxyRegister rejected an admin-denied agent before "
                           "consuming its enrollment token (#1067). Labelled source "
@@ -502,6 +512,10 @@ public:
 
         // Wire health store into agent service
         agent_service_.set_health_store(&health_store_);
+
+        // #1128: NAT-aware Subscribe binding — operator-declared multi-egress
+        // CIDRs. Empty (default) keeps the strict exact-match peer binding.
+        agent_service_.set_trusted_nat_cidrs(cfg_.trusted_nat_cidrs);
 
         // Wire metrics registry into auth manager so authenticate() can
         // observe login latency. Optional in tests/CLI tools that don't

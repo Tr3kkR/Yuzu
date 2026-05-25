@@ -54,6 +54,26 @@ message RegisterRequest {
   bytes  machine_certificate    = 3;   // DER-encoded X.509
   bytes  attestation_signature  = 4;   // Signed challenge
   string attestation_provider   = 5;   // "ad-cs", "aws", "azure", etc.
+
+  // Gateway-observed agent source IP (#1064). When an agent reaches the server
+  // via the Erlang gateway's ProxyRegister, the server's transport peer is the
+  // GATEWAY's IP, not the agent's — so the audit row would mis-attribute the
+  // source (SOC 2 IR-2; SIEM "race-loss IP must equal winner IP" false
+  // negatives). The gateway fills this with the agent's origin IP (bare IPv4 /
+  // IPv6, no scheme/port) so the server can record `source_ip`=agent origin and
+  // `gateway_ip`=transport peer.
+  //
+  // GATEWAY-AUTHORITATIVE / SPOOF-SAFE: the *direct* Register path IGNORES this
+  // field entirely (it trusts the real transport peer), and the gateway
+  // OVERWRITES whatever a client put here. A direct agent therefore cannot use
+  // it to forge a source IP.
+  //
+  // Transport-agnostic by design (#376): the field lives in the message, so it
+  // carries over to a QUIC framing unchanged. Under today's grpcbox transport
+  // the gateway can only source it from `x-forwarded-for` (proxied
+  // deployments); the QUIC transport, owning its socket, will fill it from the
+  // real peer. Empty = not provided → server falls back to the transport peer.
+  string gateway_observed_peer  = 6;
 }
 
 message RegisterResponse {

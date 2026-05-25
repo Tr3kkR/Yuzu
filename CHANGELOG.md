@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **NAT-aware per-session peer-IP binding (#1128).** The W1.3 stolen-session
+  guard (Subscribe source IP must match Register source IP) false-rejected
+  legitimate direct-connect agents behind multi-egress NAT / proxy pools /
+  CG-NAT / SD-WAN. Strict exact-match remains the default; two opt-in
+  accommodations now downgrade a mismatch to *advisory* (audited
+  `result="ok" outcome=advisory`, counted on
+  `yuzu_grpc_subscribe_peer_advisory_total{event="security",reason}`) instead of
+  rejecting: a matching mTLS client identity, or both IPs falling inside an
+  operator-declared `--trusted-nat-cidr` range. Mismatches outside both
+  accommodations still hard-reject. New CLI flag `--trusted-nat-cidr`
+  (`YUZU_TRUSTED_NAT_CIDR`).
+- **Gateway origin-IP attribution (#1064, server side).** Audit rows on the
+  gateway `ProxyRegister` path previously recorded the gateway's IP as the
+  source, not the agent's (SOC 2 IR-2 mis-attribution). A new
+  transport-agnostic `RegisterRequest.gateway_observed_peer` field (survives the
+  planned gRPC→QUIC move) carries the agent origin IP; the server now records
+  `source_ip`=agent origin and `gateway_ip`=transport peer (falling back with
+  `origin_observed=false` when absent). The direct Register path ignores the
+  field (spoof-safe). Gateway-side population is tracked as a follow-up.
+
 ## [0.12.0] - 2026-05-25
 
 ### Breaking Changes
