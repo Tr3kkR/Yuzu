@@ -46,7 +46,9 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
     const std::string observed_origin =
         ::yuzu::server::detail::normalize_bare_ip(request->gateway_observed_peer());
     const std::string agent_source_ip = observed_origin.empty() ? gateway_ip : observed_origin;
-    const auto append_origin_detail = [&](std::string& detail) {
+    // Capture by value (gov Hermes SEC-07): defensive against a future refactor
+    // that stores/returns the lambda — the captured strings then can't dangle.
+    const auto append_origin_detail = [gateway_ip, observed_origin](std::string& detail) {
         detail.append(" gateway_ip=").append(gateway_ip);
         if (observed_origin.empty())
             detail.append(" origin_observed=false");

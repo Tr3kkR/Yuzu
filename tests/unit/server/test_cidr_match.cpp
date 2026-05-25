@@ -27,6 +27,13 @@ TEST_CASE("ip_in_cidr: IPv4 containment", "[cidr][issue1128]") {
     CHECK(ip_in_cidr("203.0.113.0/24", "203.0.113.255"));
     CHECK_FALSE(ip_in_cidr("203.0.113.0/24", "203.0.114.1")); // adjacent /24
 
+    // Boundary-straddling prefix (gov Hermes): /23 spans two /24s, so the mask
+    // crosses a byte boundary (2 full bytes + 7 bits) — exercises prefix_equal's
+    // partial-byte path.
+    CHECK(ip_in_cidr("10.0.0.0/23", "10.0.0.255"));
+    CHECK(ip_in_cidr("10.0.0.0/23", "10.0.1.255")); // still inside /23
+    CHECK_FALSE(ip_in_cidr("10.0.0.0/23", "10.0.2.0")); // first address past /23
+
     // /32 = exact host, and a bare address means an implicit /32.
     CHECK(ip_in_cidr("192.168.1.5/32", "192.168.1.5"));
     CHECK_FALSE(ip_in_cidr("192.168.1.5/32", "192.168.1.6"));
@@ -65,6 +72,7 @@ TEST_CASE("ip_in_cidr: malformed inputs are false, never throw", "[cidr][issue11
     CHECK_FALSE(ip_in_cidr("10.0.0.0/8", "not-an-ip"));
     CHECK_FALSE(ip_in_cidr("10.0.0.0/33", "10.0.0.1"));  // prefix > 32
     CHECK_FALSE(ip_in_cidr("2001:db8::/129", "2001:db8::1")); // prefix > 128
+    CHECK_FALSE(ip_in_cidr("10.0.0.0/-1", "10.0.0.1")); // negative prefix (gov Hermes)
     CHECK_FALSE(ip_in_cidr("10.0.0.0/abc", "10.0.0.1")); // non-numeric prefix
     CHECK_FALSE(ip_in_cidr("10.0.0.0/", "10.0.0.1"));    // empty prefix
     CHECK_FALSE(ip_in_cidr("10.0.0.0/9999", "10.0.0.1")); // overflow-ish prefix
