@@ -6,6 +6,7 @@
  */
 
 #include "tar_db.hpp"
+#include "tar_sql_executor.hpp"
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -418,4 +419,141 @@ TEST_CASE("TarDatabase: multiple collectors have independent state", "[tar][stor
 
     CHECK(t.db.get_state("process") == "process_state");
     CHECK(t.db.get_state("network") == "network_state");
+}
+
+// =============================================================================
+// Untrusted operator SQL sandbox — read-only handle + authorizer (#760), and
+// the validate/execute divergence fix (#631). execute_user_query is called
+// directly here so the engine-level controls are exercised independently of the
+// validate_and_translate_sql text filter.
+// =============================================================================
+
+TEST_CASE("execute_user_query: SELECT on an allowlisted table succeeds",
+          "[tar][store][sandbox][security]") {
+    auto t = make_test_db();
+    ProcessEvent ev;
+    ev.ts = 1000;
+    ev.snapshot_id = 1;
+    ev.action = "started";
+    ev.pid = 7;
+    ev.name = "p";
+    REQUIRE(t.db.insert_process_events({ev}));
+
+    auto r = t.db.execute_user_query("SELECT COUNT(*) FROM process_live");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    CHECK(r->rows[0][0] == "1");
+}
+
+TEST_CASE("execute_user_query: UNION across two allowlisted tables is permitted",
+          "[tar][store][sandbox][security]") {
+    auto t = make_test_db();
+    // Both tar_config and tar_state are base tables on the allowlist; Option A
+    // preserves the existing read scope rather than restricting to one table.
+    auto r =
+        t.db.execute_user_query("SELECT key FROM tar_config UNION SELECT collector FROM tar_state");
+    CHECK(r.has_value());
+}
+
+TEST_CASE("execute_user_query: write statements are denied by the read-only sandbox",
+          "[tar][store][sandbox][security]") {
+    auto t = make_test_db();
+    // These bypass validate_and_translate_sql entirely — the read-only handle and
+    // authorizer are the layer under test.
+    CHECK_FALSE(t.db.execute_user_query("INSERT INTO tar_config VALUES('k','v')").has_value());
+    CHECK_FALSE(t.db.execute_user_query("UPDATE tar_config SET value='x'").has_value());
+    CHECK_FALSE(t.db.execute_user_query("DELETE FROM tar_config").has_value());
+    CHECK_FALSE(t.db.execute_user_query("DROP TABLE tar_config").has_value());
+    // The store is untouched.
+    CHECK(t.db.get_config("retention_days") == "7");
+}
+
+TEST_CASE("execute_user_query: ATTACH / PRAGMA / schema table are denied",
+          "[tar][store][sandbox][security]") {
+    auto t = make_test_db();
+    CHECK_FALSE(t.db.execute_user_query("ATTACH DATABASE 'evil.db' AS e").has_value());
+    CHECK_FALSE(t.db.execute_user_query("PRAGMA table_info(tar_config)").has_value());
+    CHECK_FALSE(t.db.execute_user_query("SELECT name FROM sqlite_master").has_value());
+}
+
+TEST_CASE("execute_user_query: a non-allowlisted table is denied even via UNION",
+          "[tar][store][sandbox][security]") {
+    auto t = make_test_db();
+    CHECK_FALSE(
+        t.db.execute_user_query("SELECT key FROM tar_config UNION SELECT name FROM sqlite_master")
+            .has_value());
+}
+
+TEST_CASE("execute_user_query: trailing statement is rejected at prepare",
+          "[tar][store][sandbox][security]") {
+    auto t = make_test_db();
+    CHECK_FALSE(t.db.execute_user_query("SELECT 1; SELECT 2").has_value());
+}
+
+// ── validate_and_translate_sql — divergence fix (#631) + existing guards ──────
+
+TEST_CASE("validate_and_translate_sql: $name in code is translated", "[tar][sql][validate]") {
+    auto r = validate_and_translate_sql("SELECT * FROM $Process_Live");
+    REQUIRE(r.has_value());
+    CHECK(r->find("process_live") != std::string::npos);
+    CHECK(r->find("$Process_Live") == std::string::npos);
+}
+
+TEST_CASE("validate_and_translate_sql: $name inside a string literal is NOT translated (#631)",
+          "[tar][sql][validate][security]") {
+    // The placeholder is data, not a table reference: it must survive verbatim so
+    // the executed query equals the one that was validated.
+    auto r = validate_and_translate_sql("SELECT '$Process_Live' AS label");
+    REQUIRE(r.has_value());
+    CHECK(r->find("$Process_Live") != std::string::npos);
+    CHECK(r->find("process_live") == std::string::npos);
+}
+
+TEST_CASE("validate_and_translate_sql: unknown $name is rejected", "[tar][sql][validate]") {
+    CHECK_FALSE(validate_and_translate_sql("SELECT * FROM $Made_Up").has_value());
+}
+
+TEST_CASE("validate_and_translate_sql: non-SELECT, multi-statement, oversize rejected",
+          "[tar][sql][validate][security]") {
+    CHECK_FALSE(validate_and_translate_sql("DELETE FROM $Process_Live").has_value());
+    CHECK_FALSE(validate_and_translate_sql("SELECT * FROM $Process_Live; DROP TABLE tar_config")
+                    .has_value());
+    CHECK_FALSE(validate_and_translate_sql(std::string(5000, 'A')).has_value());
+}
+
+// ── #631 divergence — comment + escaped-quote coverage (governance Gate 3) ──
+
+TEST_CASE("validate_and_translate_sql: $name in a line comment is not translated",
+          "[tar][sql][validate][security]") {
+    auto r = validate_and_translate_sql("SELECT 1 -- $Process_Live");
+    REQUIRE(r.has_value());
+    CHECK(r->find("$Process_Live") != std::string::npos);
+    CHECK(r->find("process_live") == std::string::npos);
+}
+
+TEST_CASE("validate_and_translate_sql: $name in a block comment is not translated",
+          "[tar][sql][validate][security]") {
+    auto r = validate_and_translate_sql("SELECT /* $Process_Live */ 1");
+    REQUIRE(r.has_value());
+    CHECK(r->find("$Process_Live") != std::string::npos);
+    CHECK(r->find("process_live") == std::string::npos);
+}
+
+TEST_CASE("validate_and_translate_sql: $name beside an escaped quote is not translated",
+          "[tar][sql][validate][security]") {
+    // '' is an escaped single quote inside the literal; the whole token is a
+    // string, so $Process_Live within it must survive verbatim.
+    auto r = validate_and_translate_sql("SELECT '$Process_Live''s data' AS x");
+    REQUIRE(r.has_value());
+    CHECK(r->find("$Process_Live") != std::string::npos);
+    CHECK(r->find("process_live") == std::string::npos);
+}
+
+TEST_CASE("execute_user_query: pragma_table_info table-valued function is denied",
+          "[tar][store][sandbox][security]") {
+    auto t = make_test_db();
+    // The pragma-as-TVF form reaches the authorizer as SQLITE_READ on a
+    // non-allowlisted table name, so it is denied like any other.
+    CHECK_FALSE(
+        t.db.execute_user_query("SELECT * FROM pragma_table_info('tar_config')").has_value());
 }

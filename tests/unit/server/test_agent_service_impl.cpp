@@ -34,6 +34,7 @@
 #include <sqlite3.h>
 
 #include "agent_registry.hpp"
+#include "audit_store.hpp"
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
 #include "gateway_service_impl.hpp"
@@ -47,6 +48,7 @@
 #include <random>
 #include <string>
 
+using yuzu::server::AuditStore;
 using yuzu::server::ResponseStore;
 using yuzu::server::StoredResponse;
 using yuzu::server::detail::AgentRegistry;
@@ -77,6 +79,7 @@ struct GatewayResponseHarness {
     yuzu::server::auth::AuthManager auth_mgr;
     yuzu::server::auth::AutoApproveEngine auto_approve;
     ResponseStore responses{":memory:"};
+    AuditStore audit{":memory:"};
     AgentServiceImpl svc{registry,
                          bus,
                          /*require_client_identity=*/false,
@@ -87,7 +90,9 @@ struct GatewayResponseHarness {
 
     GatewayResponseHarness() {
         REQUIRE(responses.is_open());
+        REQUIRE(audit.is_open());
         svc.set_response_store(&responses);
+        svc.set_audit_store(&audit);
     }
 
     static apb::CommandResponse make_response(const std::string& command_id,
@@ -991,4 +996,129 @@ TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contra
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
     // Must not crash, must not dereference the destroyed tracker.
     h.svc.process_gateway_response("agent-1", resp);
+}
+
+// ── #1067 — admin-denied agent must NOT consume an enrollment token ─────────
+
+TEST_CASE("Register: admin-denied agent does not consume the enrollment token (#1067)",
+          "[agent_service][register][enrollment][issue1067]") {
+    // W1.4 UP-M3: the consume happened BEFORE the admin-deny check, so a denied
+    // attacker burned a use of the token on every attempt — depleting a
+    // max_uses=1 token until the legitimate agent could no longer enroll. The
+    // early PendingStatus::denied check pre-empts the consume.
+    GatewayResponseHarness h;
+    auto raw =
+        h.auth_mgr.create_enrollment_token("dos-test", /*max_uses=*/1, std::chrono::hours(1));
+
+    // Mark the attacker's agent_id admin-denied.
+    h.auth_mgr.add_pending_agent("denied-agent", "evil-host", "linux", "x86_64", "0.0.0-test");
+    REQUIRE(h.auth_mgr.deny_pending_agent("denied-agent"));
+    REQUIRE(h.auth_mgr.get_pending_status("denied-agent") ==
+            yuzu::server::auth::PendingStatus::denied);
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("denied-agent");
+    req.mutable_info()->set_hostname("evil-host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.set_enrollment_token(raw);
+
+    apb::RegisterResponse resp;
+    auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+
+    REQUIRE(status.ok());
+    CHECK_FALSE(resp.accepted());
+    CHECK(resp.enrollment_status() == "denied");
+    // gov #1134: the denied rejection emits the bounded SIEM-routed counter.
+    CHECK(h.metrics
+              .counter("yuzu_register_denied_total",
+                       {{"source", "direct"}, {"event", "security"}})
+              .value() == 1.0);
+
+    // Core invariant: the denied attempt did NOT consume the token.
+    auto tokens = h.auth_mgr.list_enrollment_tokens();
+    REQUIRE(tokens.size() == 1);
+    CHECK(tokens[0].use_count == 0);
+
+    // And the single use is still available to a legitimate agent — proving the
+    // max_uses=1 token was not depleted by the denied attacker.
+    auto claim = h.auth_mgr.consume_enrollment_token(raw, "good-agent");
+    CHECK(claim.has_value());
+}
+
+// ── #1065 — success-path enrollment audit is emitted (was fire-and-forget) ──
+
+TEST_CASE("Register: successful token enrollment emits a success audit row (#1065)",
+          "[agent_service][register][enrollment][audit][issue1065]") {
+    GatewayResponseHarness h;
+    auto raw =
+        h.auth_mgr.create_enrollment_token("ok-test", /*max_uses=*/1, std::chrono::hours(1));
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("enroll-ok");
+    req.mutable_info()->set_hostname("good-host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.mutable_info()->set_agent_version("0.0.0-test");
+    req.set_enrollment_token(raw);
+
+    apb::RegisterResponse resp;
+    REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &resp).ok());
+    CHECK(resp.accepted());
+
+    // The success-path audit row is now captured + persisted (#1065). Find it
+    // by its stable fields rather than the action constant.
+    auto rows = h.audit.query({});
+    bool found = false;
+    for (const auto& ev : rows) {
+        if (ev.action == "enrollment.token_consumed" && ev.result == "success" &&
+            ev.principal == "agent:enroll-ok" && ev.target_type == "enrollment_token") {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment token (#1067)",
+          "[agent_service][register][enrollment][gateway][issue1067]") {
+    // Sibling of the direct-Register #1067 test. The gateway ProxyRegister path
+    // proxies the agent's RegisterRequest unmodified and had the same
+    // consume-before-deny ordering — so the token-depletion DoS was equally
+    // reachable here until the early PendingStatus::denied check was mirrored.
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    gateway_svc.set_audit_store(&h.audit);
+    auto raw =
+        h.auth_mgr.create_enrollment_token("gw-dos-test", /*max_uses=*/1, std::chrono::hours(1));
+    h.auth_mgr.add_pending_agent("gw-denied", "evil-host", "linux", "x86_64", "0.0.0-test");
+    REQUIRE(h.auth_mgr.deny_pending_agent("gw-denied"));
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("gw-denied");
+    req.mutable_info()->set_hostname("evil-host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.set_enrollment_token(raw);
+
+    apb::RegisterResponse resp;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+
+    REQUIRE(status.ok());
+    CHECK_FALSE(resp.accepted());
+    CHECK(resp.enrollment_status() == "denied");
+    CHECK(h.metrics
+              .counter("yuzu_register_denied_total",
+                       {{"source", "gateway_proxy"}, {"event", "security"}})
+              .value() == 1.0);
+    auto tokens = h.auth_mgr.list_enrollment_tokens();
+    REQUIRE(tokens.size() == 1);
+    CHECK(tokens[0].use_count == 0); // token not depleted via the gateway path
+
+    // The single use is still available — proving non-depletion via the gateway
+    // path too (symmetry with the direct-Register #1067 test).
+    auto gw_claim = h.auth_mgr.consume_enrollment_token(raw, "good-gw-agent");
+    CHECK(gw_claim.has_value());
 }

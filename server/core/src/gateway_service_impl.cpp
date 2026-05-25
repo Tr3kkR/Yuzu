@@ -77,6 +77,28 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             spdlog::info("[gateway] Agent {} re-registering (already enrolled)", info.agent_id());
             goto gw_enrolled;
         }
+        // #1067: reject an admin-DENIED agent BEFORE consuming any enrollment
+        // token — same token-depletion DoS as the direct-connect path (W1.4
+        // UP-M3). The gateway proxies the agent's RegisterRequest unmodified, so
+        // this path is equally reachable; mirror the direct fix here.
+        if (prior && *prior == auth::PendingStatus::denied) {
+            // gov #1134: bounded denied-attempt signal (mirror of the direct
+            // Register path). A counter, not an audit row (DoS-safe under a
+            // denied flood). event=security routes it to the SIEM. metrics_ is
+            // null-guarded (optional on this service).
+            if (metrics_) {
+                metrics_
+                    ->counter("yuzu_register_denied_total",
+                              {{"source", "gateway_proxy"}, {"event", "security"}})
+                    .increment();
+            }
+            spdlog::warn("[gateway] Register rejected: agent {} is admin-denied (no token consumed)",
+                         info.agent_id());
+            response->set_accepted(false);
+            response->set_reject_reason("enrollment denied by administrator");
+            response->set_enrollment_status("denied");
+            return grpc::Status::OK;
+        }
     }
 
     {

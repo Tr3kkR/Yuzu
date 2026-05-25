@@ -20,6 +20,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **TAR warehouse SQL — read-only sandbox + authorizer for operator queries (#760, #631).**
+  The agent's `tar.sql` executor no longer relies solely on a keyword blocklist
+  over a read-write SQLite handle. Untrusted operator SQL now runs on a dedicated
+  **read-only** connection through a new `TarDatabase::execute_user_query`, guarded
+  by a SQLite **authorizer** that permits only `SELECT`/`READ` of registry-known
+  warehouse tables (plus scalar/aggregate functions) and denies writes, `ATTACH`,
+  `PRAGMA`, schema-table reads, and trailing statements at prepare time — so a
+  blocklist gap (e.g. `UNION` was never blocklisted) can no longer reach an
+  unintended table or any write. Separately, `$table_name` translation now runs
+  only **outside** string literals and comments, so the executed query is the same
+  one that was validated (#631 — translation previously ran on the un-stripped
+  input, diverging from the keyword check). Internal trusted reads are unaffected.
+  New unit coverage drives the authorizer, the read-only handle, and the
+  literal-translation fix directly. Operators who used `PRAGMA` or `sqlite_master`
+  for schema discovery should switch to the `$`-prefixed warehouse table names
+  (see `docs/user-manual/tar.md`). Hardens SOC 2 CC6.1 / CC8.1.
+
 - **Gateway — refuse to boot with the default Erlang distribution cookie (#659).**
   `gateway/config/vm.args` is now `vm.args.src`, supplying the cookie from the
   `YUZU_GW_COOKIE` environment variable (e.g. `openssl rand -hex 32`). A boot
@@ -40,6 +57,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control characters so rejection messages cannot echo raw terminal-control
   bytes. Hardens the SOC 2 change-management evidence store (CC7.2 / CC8.1);
   CH-15 / CH-17 in `tests/shell/test_pr2_gates.sh` regression-test it.
+
+- **W1.x — enrollment-token DoS fix + mTLS-mismatch audit (#1067, #1118).**
+  Both the direct-connect (`Register`) and gateway-proxy (`ProxyRegister`)
+  enrollment paths now reject an admin-**denied** agent *before* consuming its
+  enrollment token — previously the consume happened first, so a denied attacker
+  could deplete a `max_uses=1` token and lock out the legitimate agent
+  (W1.4 UP-M3). The denied rejection emits a
+  `yuzu_register_denied_total{source,event="security"}` Prometheus signal
+  (replacing the analytics event the early return shadowed). gRPC Subscribe mTLS
+  identity-mismatch rejections now emit a
+  `session.identity_mismatch` audit row (the mTLS sibling of
+  `session.peer_mismatch`) out-of-lock, with a
+  `yuzu_grpc_subscribe_identity_mismatch_total{event="security"}` Prometheus
+  signal for SIEM routing. SOC 2 CC7.2.
 
 - **W1.x — gRPC peer-IP strict-mode + audit symmetry (#1058, #1059, #1063,
   #1065).** `extract_peer_ip` now strict-validates IPv4/IPv6 peer strings and
