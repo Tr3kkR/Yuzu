@@ -16,10 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accommodations now downgrade a mismatch to *advisory* (audited
   `result="ok" outcome=advisory`, counted on
   `yuzu_grpc_subscribe_peer_advisory_total{event="security",reason}`) instead of
-  rejecting: a matching mTLS client identity, or both IPs falling inside an
-  operator-declared `--trusted-nat-cidr` range. Mismatches outside both
-  accommodations still hard-reject. New CLI flag `--trusted-nat-cidr`
-  (`YUZU_TRUSTED_NAT_CIDR`).
+  rejecting: (1) both IPs falling inside an operator-declared `--trusted-nat-cidr`
+  range (`YUZU_TRUSTED_NAT_CIDR`); or (2) a matching mTLS client identity, which
+  is **opt-in** via `--nat-trust-mtls-identity` (`YUZU_NAT_TRUST_MTLS_IDENTITY`,
+  default off) and SAFE ONLY WITH PER-AGENT CLIENT CERTS — a shared fleet-wide
+  cert would make it a session-replay bypass. Mismatches outside both
+  accommodations still hard-reject; an empty extracted IP always rejects.
+  Malformed `--trusted-nat-cidr` entries are logged and ignored at startup.
 - **Gateway origin-IP attribution (#1064, server side).** Audit rows on the
   gateway `ProxyRegister` path previously recorded the gateway's IP as the
   source, not the agent's (SOC 2 IR-2 mis-attribution). A new
@@ -27,7 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   planned gRPC→QUIC move) carries the agent origin IP; the server now records
   `source_ip`=agent origin and `gateway_ip`=transport peer (falling back with
   `origin_observed=false` when absent). The direct Register path ignores the
-  field (spoof-safe). Gateway-side population is tracked as a follow-up.
+  field (a direct agent cannot forge a source IP; it is not a defence against a
+  compromised gateway). **Note for gateway deployments:** until the gateway-side
+  population follow-up ships, audit rows on the `ProxyRegister` path still record
+  the gateway node's IP as `source_ip` (the field is not yet populated by
+  today's grpcbox transport, which cannot observe the direct agent peer; the
+  durable source arrives with the QUIC transport, #376). Operators relying on
+  `source_ip` for IR-2 attribution on the gateway path should note this.
 
 ## [0.12.0] - 2026-05-25
 

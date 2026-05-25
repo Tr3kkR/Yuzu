@@ -59,6 +59,15 @@ struct Config {
     // strict exact-match binding (default, no relaxation).
     std::vector<std::string> trusted_nat_cidrs;
 
+    // #1128 / gov UP-2: opt-in to the mTLS-identity NAT accommodation. When
+    // true, a peer-IP mismatch is also downgraded to advisory if the Subscribe
+    // mTLS identity matches the one bound at Register. SAFE ONLY WITH PER-AGENT
+    // CLIENT CERTS — a shared/fleet-wide cert makes every identity "match",
+    // which would let an insider replay another agent's session from its own IP
+    // (the IP guard is waived). Default false: identity-match never relaxes the
+    // IP binding unless the operator affirms per-agent certs via this flag.
+    bool nat_trust_mtls_identity{false};
+
     // NVD CVE feed
     std::string nvd_api_key; // Optional NVD API key for higher rate limits
     std::string nvd_proxy;   // HTTP proxy for NVD API (e.g. "http://proxy:8080")

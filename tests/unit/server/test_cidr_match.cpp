@@ -16,6 +16,7 @@
 
 using yuzu::server::detail::ip_in_cidr;
 using yuzu::server::detail::ips_share_trusted_cidr;
+using yuzu::server::detail::is_valid_cidr;
 
 TEST_CASE("ip_in_cidr: IPv4 containment", "[cidr][issue1128]") {
     CHECK(ip_in_cidr("10.0.0.0/8", "10.1.2.3"));
@@ -91,4 +92,24 @@ TEST_CASE("ips_share_trusted_cidr: empty list or empty IP is false",
     const std::vector<std::string> cidrs{"203.0.113.0/24"};
     CHECK_FALSE(ips_share_trusted_cidr(cidrs, "", "203.0.113.8"));
     CHECK_FALSE(ips_share_trusted_cidr(cidrs, "203.0.113.7", ""));
+}
+
+TEST_CASE("is_valid_cidr: accepts well-formed, rejects junk (startup fail-loud, gov UP-9)",
+          "[cidr][issue1128]") {
+    // Well-formed networks + bare addresses.
+    CHECK(is_valid_cidr("10.0.0.0/8"));
+    CHECK(is_valid_cidr("203.0.113.0/24"));
+    CHECK(is_valid_cidr("2001:db8::/32"));
+    CHECK(is_valid_cidr("192.168.1.5"));   // bare v4 = implicit /32
+    CHECK(is_valid_cidr("2001:db8::1"));   // bare v6 = implicit /128
+    CHECK(is_valid_cidr("0.0.0.0/0"));
+
+    // Operator typos that must be flagged at startup rather than silently inert.
+    CHECK_FALSE(is_valid_cidr(""));
+    CHECK_FALSE(is_valid_cidr("not-a-cidr"));
+    CHECK_FALSE(is_valid_cidr("10.0.0.0/33"));   // prefix > 32
+    CHECK_FALSE(is_valid_cidr("2001:db8::/129")); // prefix > 128
+    CHECK_FALSE(is_valid_cidr("10.0.0.0/abc"));  // non-numeric prefix
+    CHECK_FALSE(is_valid_cidr("10.0.0.0/"));     // empty prefix
+    CHECK_FALSE(is_valid_cidr(" 10.0.0.0/8"));   // leading whitespace (inet_pton rejects)
 }

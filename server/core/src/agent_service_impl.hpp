@@ -62,6 +62,9 @@ public:
     void set_trusted_nat_cidrs(std::vector<std::string> cidrs) {
         trusted_nat_cidrs_ = std::move(cidrs);
     }
+    /// #1128 / gov UP-2: opt-in to the mTLS-identity NAT accommodation. Default
+    /// false; only safe with per-agent client certs (see Config doc).
+    void set_nat_trust_mtls_identity(bool enabled) { nat_trust_mtls_identity_ = enabled; }
     void set_response_store(ResponseStore* store) { response_store_ = store; }
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
@@ -254,6 +257,10 @@ private:
     // = strict exact-match peer binding (default). Set once at wiring time via
     // set_trusted_nat_cidrs; read-only on the Subscribe path thereafter.
     std::vector<std::string> trusted_nat_cidrs_;
+    // #1128 / gov UP-2: gate for the mTLS-identity NAT accommodation. Default
+    // false — identity-match relaxes the IP binding ONLY when the operator
+    // affirms per-agent certs. See Config::nat_trust_mtls_identity.
+    bool nat_trust_mtls_identity_{false};
     UpdateRegistry* update_registry_{nullptr};
     ResponseStore* response_store_{nullptr};
     TagStore* tag_store_{nullptr};

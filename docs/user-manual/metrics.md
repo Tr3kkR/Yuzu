@@ -136,6 +136,20 @@ The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST 
   annotations:
     summary: "Subscribe mTLS identity mismatch (#1118) — possible stolen session_id replayed with a non-matching client cert"
 
+# NAT-aware tolerated mismatch (#1128). yuzu_grpc_subscribe_peer_advisory_total
+# {event="security",reason="mtls_identity_match|trusted_nat_cidr"} counts peer-IP
+# mismatches that were DOWNGRADED to advisory (not rejected) under a NAT
+# accommodation. A spike here ALONE is expected churn in multi-egress NAT
+# deployments — do NOT alert on it bare. The actionable signal is the
+# correlated form: advisory AND rejected mismatches rising together can mean a
+# stolen-session replay landing inside a trusted range.
+- alert: AgentSubscribePeerAdvisoryCorrelatedSpike
+  expr: >
+    increase(yuzu_grpc_subscribe_peer_advisory_total{event="security"}[5m]) > 0
+    and increase(yuzu_grpc_subscribe_peer_mismatch_total{event="security"}[5m]) > 0
+  annotations:
+    summary: "Tolerated NAT peer-mismatches (#1128) coincide with rejected mismatches — investigate the reject events for a possible stolen-session replay inside a trusted range"
+
 - alert: AgentRegisterDeniedFlood
   expr: rate(yuzu_register_denied_total{event="security"}[5m]) > 1
   for: 5m

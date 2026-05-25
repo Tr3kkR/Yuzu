@@ -80,6 +80,7 @@
 #include "event_bus.hpp"
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
+#include "cidr_match.hpp"
 #include "gateway_service_impl.hpp"
 
 #include <grpc/grpc_security_constants.h>
@@ -515,7 +516,21 @@ public:
 
         // #1128: NAT-aware Subscribe binding — operator-declared multi-egress
         // CIDRs. Empty (default) keeps the strict exact-match peer binding.
+        // gov UP-9: fail-loud on a mistyped CIDR rather than silently treating
+        // it as a range that matches nothing (operator would believe the
+        // relaxation is active when it isn't).
+        for (const auto& cidr : cfg_.trusted_nat_cidrs) {
+            if (!yuzu::server::detail::is_valid_cidr(cidr))
+                spdlog::warn("--trusted-nat-cidr: ignoring malformed CIDR '{}' (not a valid "
+                             "IPv4/IPv6 network) — agents will NOT be matched against it",
+                             cidr);
+        }
+        if (cfg_.nat_trust_mtls_identity)
+            spdlog::info("--nat-trust-mtls-identity enabled: mTLS-identity match will relax the "
+                         "Subscribe peer-IP binding. Ensure client certs are PER-AGENT (a shared "
+                         "fleet-wide cert makes this a session-replay bypass — gov UP-2).");
         agent_service_.set_trusted_nat_cidrs(cfg_.trusted_nat_cidrs);
+        agent_service_.set_nat_trust_mtls_identity(cfg_.nat_trust_mtls_identity);
 
         // Wire metrics registry into auth manager so authenticate() can
         // observe login latency. Optional in tests/CLI tools that don't

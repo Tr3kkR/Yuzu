@@ -67,12 +67,20 @@ NAT, proxy pool, CG-NAT, SD-WAN). Strict exact-match is the **default**; two
 **opt-in** accommodations downgrade a mismatch to *advisory* (audit + metric, no
 reject) instead:
 
-1. **mTLS-advisory** — when a verified client identity matches the one bound at
-   Register, the IP is defence-in-depth only (the identity layer is
-   authoritative), so the mismatch is tolerated.
+1. **mTLS-advisory — `--nat-trust-mtls-identity`** (`Config::nat_trust_mtls_identity`,
+   **default off**) — when enabled, a verified client identity matching the one
+   bound at Register treats the IP as defence-in-depth only, so the mismatch is
+   tolerated. **Opt-in because it is safe ONLY with per-agent client certs:** a
+   shared/fleet-wide cert makes every identity "match", which would let an
+   insider agent replay another agent's session from its own IP (gov UP-2). Off
+   by default — identity-match never relaxes the IP binding unless the operator
+   affirms per-agent certs via this flag.
 2. **`--trusted-nat-cidr <cidr>[,…]`** (`Config::trusted_nat_cidrs`) — when the
    Register *and* Subscribe IPs both fall inside one operator-declared range
-   (analogous to `--gateway-mode`, but for direct-connect NAT).
+   (analogous to `--gateway-mode`, but for direct-connect NAT). Declaring a
+   range asserts the hosts in it are mutually trusted not to replay each other's
+   sessions — keep ranges narrow (never `0.0.0.0/0`). Malformed entries are
+   logged and ignored at startup.
 
 A mismatch *outside* both accommodations is still a hard reject — the replay
 guard is intact, and an empty/malformed extracted IP is always reject (#826:
@@ -89,7 +97,10 @@ mis-attribute the source (SOC 2 IR-2). `RegisterRequest.gateway_observed_peer`
 planned gRPC→QUIC move) carries the agent's origin IP; the server records
 `source_ip`=agent origin and `gateway_ip`=transport peer, falling back to the
 gateway IP (`origin_observed=false`) when absent. The *direct* Register path
-ignores the field (spoof-safe). **Server-side consumption ships now; the
+ignores the field, so a *direct* agent cannot forge a source IP. It is **not** a
+defence against a compromised gateway (which is inside the trust boundary and
+can set any value) — both `source_ip` and the gateway's `gateway_ip` are
+recorded so an auditor can cross-check. **Server-side consumption ships now; the
 gateway-side population is a follow-up** — today's grpcbox transport can only
 source it from `x-forwarded-for` (proxied deployments), and the durable
 direct-mode source arrives with the QUIC transport (#376) that owns its socket.

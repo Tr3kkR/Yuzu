@@ -63,10 +63,13 @@ message RegisterRequest {
   // IPv6, no scheme/port) so the server can record `source_ip`=agent origin and
   // `gateway_ip`=transport peer.
   //
-  // GATEWAY-AUTHORITATIVE / SPOOF-SAFE: the *direct* Register path IGNORES this
-  // field entirely (it trusts the real transport peer), and the gateway
-  // OVERWRITES whatever a client put here. A direct agent therefore cannot use
-  // it to forge a source IP.
+  // GATEWAY-AUTHORITATIVE: the *direct* Register path IGNORES this field
+  // entirely (it trusts the real transport peer), and the gateway OVERWRITES
+  // whatever a client put here, so a *direct* agent cannot use it to forge a
+  // source IP. It is NOT a defence against a compromised gateway — a malicious
+  // gateway inside the trust boundary can set any value; the server records
+  // both this and the gateway's transport `gateway_ip` so an auditor can
+  // cross-check the two.
   //
   // Transport-agnostic by design (#376): the field lives in the message, so it
   // carries over to a QUIC framing unchanged. Under today's grpcbox transport

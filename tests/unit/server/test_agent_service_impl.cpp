@@ -492,6 +492,12 @@ TEST_CASE("evaluate_peer_binding: default (no accommodation) rejects a mismatch 
     const std::vector<std::string> cidrs{"203.0.113.0/24"};
     CHECK(AgentServiceImpl::evaluate_peer_binding(false, "203.0.113.7", "8.8.8.8", false, cidrs) ==
           O::reject); // only one side in range → still reject
+    // #1128 acceptance bar "cross-range replay rejected" pinned at the decision
+    // layer: each IP sits in a DIFFERENT trusted range, so they share none →
+    // reject (a sniffed session replayed from another trusted subnet loses).
+    const std::vector<std::string> two{"203.0.113.0/24", "198.51.100.0/24"};
+    CHECK(AgentServiceImpl::evaluate_peer_binding(false, "203.0.113.7", "198.51.100.7", false,
+                                                  two) == O::reject);
 }
 
 TEST_CASE("evaluate_peer_binding: empty IP is always reject, accommodation cannot rescue (#1128)",
@@ -1243,8 +1249,12 @@ TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway 
         REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
         CHECK_FALSE(resp.accepted());
         const auto row = failure_row();
-        CHECK(row.source_ip == "203.0.113.7");                       // agent origin
-        CHECK(row.detail.find("gateway_ip=") != std::string::npos);  // gateway recorded too
+        CHECK(row.source_ip == "203.0.113.7"); // agent origin — the core attribution proof
+        // gateway_ip key is always recorded; its VALUE is empty here only
+        // because the test passes context=nullptr (no transport peer). With a
+        // real context it would carry the gateway's IP. source_ip above is the
+        // assertion that proves agent-origin vs gateway attribution.
+        CHECK(row.detail.find("gateway_ip=") != std::string::npos);
         CHECK(row.detail.find("origin_observed=false") == std::string::npos);
     }
 
@@ -1265,5 +1275,22 @@ TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway 
         CHECK(row.source_ip.empty());
         CHECK(row.detail.find("origin_observed=false") != std::string::npos);
         CHECK(row.detail.find("rm -rf") == std::string::npos); // no junk in evidence
+    }
+
+    SECTION("success path also attributes the agent origin (gov QE SHOULD)") {
+        // The success audit site (valid token → accepted) shares append_origin_detail.
+        auto raw = h.auth_mgr.create_enrollment_token("gw-origin-test", /*max_uses=*/1,
+                                                      std::chrono::hours(1));
+        req.set_enrollment_token(raw);
+        req.set_gateway_observed_peer("203.0.113.9");
+        REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+        CHECK(resp.accepted());
+        yuzu::server::AuditEvent success_row;
+        for (const auto& ev : h.audit.query({})) {
+            if (ev.result == "success")
+                success_row = ev;
+        }
+        CHECK(success_row.source_ip == "203.0.113.9"); // agent origin on the success row too
+        CHECK(success_row.detail.find("gateway_ip=") != std::string::npos);
     }
 }

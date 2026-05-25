@@ -138,6 +138,11 @@ int main(int argc, char* argv[]) {
                    "tolerated instead of rejected (#1128). Repeatable or comma-separated.")
         ->delimiter(',')
         ->envname("YUZU_TRUSTED_NAT_CIDR");
+    app.add_flag("--nat-trust-mtls-identity", cfg.nat_trust_mtls_identity,
+                 "Also tolerate a peer-IP mismatch when the Subscribe mTLS identity matches the "
+                 "Register-bound identity (#1128). SAFE ONLY WITH PER-AGENT CLIENT CERTS — a "
+                 "shared fleet-wide cert makes this a session-replay bypass. Default off.")
+        ->envname("YUZU_NAT_TRUST_MTLS_IDENTITY");
     app.add_option("--max-agents", cfg.max_agents, "Maximum concurrent agent connections")
         ->default_val(10000)
         ->envname("YUZU_MAX_AGENTS");

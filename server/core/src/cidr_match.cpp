@@ -3,12 +3,15 @@
 #include <array>
 #include <cstring>
 
+// clang-format off — winsock2.h MUST precede ws2tcpip.h (which pulls windows.h);
+// alphabetizing these would break the Windows build.
 #ifdef _WIN32
-#include <winsock2.h> // must precede windows.h (which ws2tcpip.h pulls in)
+#include <winsock2.h>
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
 #endif
+// clang-format on
 
 namespace yuzu::server::detail {
 namespace {
@@ -76,6 +79,23 @@ bool ip_in_cidr(std::string_view cidr, std::string_view ip) {
     }
 
     return false; // net_str parsed as neither family
+}
+
+bool is_valid_cidr(std::string_view cidr) {
+    if (cidr.empty())
+        return false;
+    const auto slash = cidr.find('/');
+    const std::string net_str(slash == std::string_view::npos ? cidr : cidr.substr(0, slash));
+
+    std::array<unsigned char, 4> v4{};
+    if (inet_pton(AF_INET, net_str.c_str(), v4.data()) == 1)
+        return slash == std::string_view::npos || parse_prefix_len(cidr.substr(slash + 1), 32) >= 0;
+
+    std::array<unsigned char, 16> v6{};
+    if (inet_pton(AF_INET6, net_str.c_str(), v6.data()) == 1)
+        return slash == std::string_view::npos || parse_prefix_len(cidr.substr(slash + 1), 128) >= 0;
+
+    return false;
 }
 
 bool ips_share_trusted_cidr(const std::vector<std::string>& cidrs, std::string_view a,

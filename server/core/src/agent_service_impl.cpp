@@ -6,12 +6,12 @@
 
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
+#include "cidr_match.hpp"
 #include "enrollment_token_rejection.hpp"
 #include "execution_tracker.hpp"
 #include "fleet_topology_store.hpp"
 #include "grpc_audit_signal.hpp"
 #include "heartbeat_ingestion.hpp"
-#include "cidr_match.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
@@ -669,7 +669,12 @@ grpc::Status AgentServiceImpl::Subscribe(
         // relaxes the IP comparison.
         if (!peer_ok) {
             bool identity_matches = false;
-            if (require_client_identity_) {
+            // gov UP-2: the mTLS-identity accommodation is OPT-IN
+            // (nat_trust_mtls_identity_). Default off — a shared/fleet-wide
+            // client cert would otherwise make every identity "match" and turn
+            // this into a session-replay bypass. Only compute the overlap when
+            // the operator has affirmed per-agent certs.
+            if (nat_trust_mtls_identity_ && require_client_identity_) {
                 const auto sub_ids = extract_peer_identities(*context);
                 identity_matches = has_identity_overlap(it->second.peer_identities, sub_ids);
             }

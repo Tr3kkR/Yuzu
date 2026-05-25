@@ -27,6 +27,12 @@ namespace yuzu::server::detail {
 /// Never throws.
 bool ip_in_cidr(std::string_view cidr, std::string_view ip);
 
+/// True iff `cidr` is a well-formed CIDR (or bare address) this module can
+/// match against — i.e. `ip_in_cidr` could ever return true for it. Used at
+/// startup (gov UP-2/UP-9) to fail-loud on a mistyped `--trusted-nat-cidr`
+/// entry instead of silently treating it as a range that matches nothing.
+bool is_valid_cidr(std::string_view cidr);
+
 /// True iff `a` and `b` BOTH fall inside at least one common CIDR in `cidrs`.
 /// The #1128 binding tolerates a Register/Subscribe source-IP pair only when
 /// both endpoints share an operator-declared multi-egress range — a mismatch
