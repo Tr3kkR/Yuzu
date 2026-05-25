@@ -150,6 +150,17 @@ The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST 
   annotations:
     summary: "Tolerated NAT peer-mismatches (#1128) coincide with rejected mismatches — investigate the reject events for a possible stolen-session replay inside a trusted range"
 
+# Operator-visibility guard for --nat-trust-mtls-identity. Sustained
+# mtls_identity_match advisories mean the (opt-in, off-by-default) mTLS-identity
+# NAT accommodation is active — confirm it was enabled intentionally AND that
+# client certs are PER-AGENT (a shared fleet cert makes this a replay bypass,
+# gov UP-2). Long window: this should be rare; a steady stream is worth a look.
+- alert: AgentSubscribeMtlsIdentityAdvisoryActive
+  expr: increase(yuzu_grpc_subscribe_peer_advisory_total{event="security",reason="mtls_identity_match"}[30m]) > 0
+  for: 30m
+  annotations:
+    summary: "--nat-trust-mtls-identity is relaxing peer-IP binding via mTLS-identity match — verify it was enabled deliberately and that client certs are per-agent (shared cert = session-replay bypass)"
+
 - alert: AgentRegisterDeniedFlood
   expr: rate(yuzu_register_denied_total{event="security"}[5m]) > 1
   for: 5m

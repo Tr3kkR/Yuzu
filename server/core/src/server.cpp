@@ -519,11 +519,19 @@ public:
         // gov UP-9: fail-loud on a mistyped CIDR rather than silently treating
         // it as a range that matches nothing (operator would believe the
         // relaxation is active when it isn't).
-        for (const auto& cidr : cfg_.trusted_nat_cidrs) {
-            if (!yuzu::server::detail::is_valid_cidr(cidr))
-                spdlog::warn("--trusted-nat-cidr: ignoring malformed CIDR '{}' (not a valid "
-                             "IPv4/IPv6 network) — agents will NOT be matched against it",
-                             cidr);
+        if (!cfg_.trusted_nat_cidrs.empty()) {
+            std::size_t valid_cidrs = 0;
+            for (const auto& cidr : cfg_.trusted_nat_cidrs) {
+                if (yuzu::server::detail::is_valid_cidr(cidr))
+                    ++valid_cidrs;
+                else
+                    spdlog::warn("--trusted-nat-cidr: ignoring malformed CIDR '{}' (not a valid "
+                                 "IPv4/IPv6 network) — agents will NOT be matched against it",
+                                 cidr);
+            }
+            spdlog::info("--trusted-nat-cidr: {} valid, {} invalid of {} configured range(s)",
+                         valid_cidrs, cfg_.trusted_nat_cidrs.size() - valid_cidrs,
+                         cfg_.trusted_nat_cidrs.size());
         }
         if (cfg_.nat_trust_mtls_identity)
             spdlog::info("--nat-trust-mtls-identity enabled: mTLS-identity match will relax the "
