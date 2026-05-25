@@ -54,6 +54,21 @@ jobs:
           clean: false
           persist-credentials: false
 
+      # Activate Erlang/OTP + rebar3 so the meson `.gateway_built` custom_target
+      # (auto-enabled whenever rebar3 is on PATH — meson.build gates the gateway
+      # purely on `find_program('rebar3')`) can run `escript` at compile time.
+      # The github-runner user has rebar3 in ~/.local/bin but no OTP runtime on
+      # PATH, so without this the Build step fails at `.gateway_built` with
+      # "escript: No such file or directory". Pin matches ci.yml + the
+      # "Build Gateway (Erlang)" job so an OTP bump moves all three together.
+      - name: Install Erlang/OTP and rebar3
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1.24.0
+        env:
+          ImageOS: ubuntu24
+        with:
+          otp-version: '28'
+          rebar3-version: '3.24'
+
       - name: Verify build dependencies
         run: |
           MISSING=""
@@ -690,7 +705,10 @@ jobs:
   # ── macOS ARM64 release build ────────────────────────────────────────
   build-macos:
     name: "Build macOS ARM64"
-    runs-on: macos-14
+    # macos-15 = Apple Silicon, Xcode 16 / Apple Clang 16 (accepts -std=c++23).
+    # macos-14 ships Apple Clang 15, which rejects -std=c++23 ("invalid value
+    # 'c++23'") — that broke the v0.12.0 first cut. Matches ci.yml's macOS job.
+    runs-on: macos-15
     permissions:
       contents: read
       id-token: write       # cosign keyless + actions/attest-build-provenance OIDC
