@@ -80,6 +80,7 @@ dc() {
   DEMO_SERVER_CONFIG="$DEMO_DIR/yuzu-server.cfg" \
   DEMO_GATEWAY_CONFIG="$REPO_ROOT/deploy/docker/demo-gateway-sys.config" \
   YUZU_VERSION="$YUZU_VERSION" \
+  YUZU_REGISTRY="$REGISTRY" \
   DEMO_AGENT_COUNT="$DEMO_AGENT_COUNT" \
   YUZU_ENROLLMENT_TOKEN="${YUZU_ENROLLMENT_TOKEN:-stub}" \
     docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
@@ -116,8 +117,9 @@ ensure_images() {
       else
         info "Pinned images not present locally; pulling..."
         if ! dc pull; then
-          fail "Pull failed. These images may not be published yet."
-          fail "Bootstrap them from source with:  bash scripts/start-demo.sh --build"
+          fail "Pull failed. The images may not be published yet, or the GHCR"
+          fail "packages are private — try 'docker login ghcr.io' (PAT w/ read:packages)."
+          fail "Or bootstrap from source with:  bash scripts/start-demo.sh --build"
           exit 1
         fi
       fi
@@ -149,9 +151,12 @@ wait_for_url() {
   fail "$name did not come up within ${timeout}s"; return 1
 }
 
-agents_registered() {
+agents_connected() {
+  # Poll the live gauge (currently-connected agents), NOT the monotonic
+  # yuzu_agents_registered_total counter — reconnects/restarts inflate the
+  # counter and would make the wait loop report false success.
   curl -fsS "http://localhost:8080/metrics" 2>/dev/null \
-    | awk '/^yuzu_agents_registered_total /{print $2; exit}' || echo 0
+    | awk '/^yuzu_agents_connected /{print $2; exit}' || echo 0
 }
 
 # ── Subcommands ────────────────────────────────────────────────────────────
@@ -167,9 +172,30 @@ cmd_start() {
   if [ "${KEEP:-0}" != "1" ]; then
     info "Clean start: wiping any prior demo state..."
     dc down -v --remove-orphans >/dev/null 2>&1 || true
+    # Drop stale cfg/token/cookies so a clean start is reproducible. Guard the
+    # wipe to temp-ish paths — YUZU_DEMO_DIR is operator-set; never rm -rf a
+    # system dir if it is misconfigured.
+    case "$DEMO_DIR" in
+      /tmp/*|/private/tmp/*|*/yuzu-demo) rm -rf "$DEMO_DIR" ;;
+      *) warn "not auto-wiping non-temp DEMO_DIR=$DEMO_DIR (remove it manually if intended)" ;;
+    esac
+    # Refuse to start on top of another stack already bound to our host ports.
+    for p in 8080 50051; do
+      if command -v nc >/dev/null 2>&1 && nc -z -w1 localhost "$p" >/dev/null 2>&1; then
+        fail "Port $p is already in use — another stack (viz-UAT / start-UAT) is running. Stop it first."
+        exit 1
+      fi
+    done
   fi
 
-  generate_config
+  # Regenerate the admin config on a clean start, or when it is missing. Under
+  # --keep do NOT regenerate: the server seeds admin from the cfg only on first
+  # boot (empty DB), so a fresh random salt would 401 against the retained DB.
+  if [ "${KEEP:-0}" != "1" ] || [ ! -f "$DEMO_DIR/yuzu-server.cfg" ]; then
+    generate_config
+  else
+    ok "Reusing existing server config (--keep)"
+  fi
 
   # Phase 1: server + gateway (stub token).
   info "Starting server + gateway..."
@@ -185,7 +211,10 @@ cmd_start() {
   token_html="$(curl -fsS -b "$DEMO_DIR/cookies.txt" \
     -X POST "http://localhost:8080/api/settings/enrollment-tokens" \
     -d "label=demo&max_uses=100000&ttl_hours=720")"
-  token="$(printf '%s' "$token_html" | grep -oE '[a-f0-9]{64}' | head -1)"
+  # Prefer the token inside its <code> element; fall back to the first 64-hex run
+  # so a stray hex id elsewhere in the HTML can't be mistaken for the token.
+  token="$(printf '%s' "$token_html" | grep -oE '<code[^>]*>[a-f0-9]{64}</code>' | grep -oE '[a-f0-9]{64}' | head -1)"
+  [ -n "$token" ] || token="$(printf '%s' "$token_html" | grep -oE '[a-f0-9]{64}' | head -1)"
   if [ -z "$token" ]; then
     fail "Could not parse enrollment token from response:"; fail "  $token_html"; exit 1
   fi
@@ -200,11 +229,11 @@ cmd_start() {
   info "Waiting for agent registration..."
   local waited=0 reg=0
   while [ "$waited" -lt 120 ]; do
-    reg="$(agents_registered)"; reg="${reg:-0}"
+    reg="$(agents_connected)"; reg="${reg:-0}"
     if awk "BEGIN { exit !(${reg%.*} >= $DEMO_AGENT_COUNT) }"; then break; fi
     sleep 3; waited=$((waited + 3))
   done
-  reg="$(agents_registered)"; reg="${reg:-0}"
+  reg="$(agents_connected)"; reg="${reg:-0}"
   if awk "BEGIN { exit !(${reg%.*} >= $DEMO_AGENT_COUNT) }"; then
     ok "$reg / $DEMO_AGENT_COUNT agents registered"
   else
@@ -224,7 +253,7 @@ cmd_start() {
 }
 
 cmd_stop()    { info "Stopping demo stack..."; if [ "${KEEP:-0}" = "1" ]; then dc down --remove-orphans; else dc down -v --remove-orphans; fi; ok "Stopped"; }
-cmd_status()  { dc ps; echo; printf "agents registered: "; agents_registered; echo; }
+cmd_status()  { dc ps; echo; if curl -fsS http://localhost:8080/readyz >/dev/null 2>&1; then printf "agents connected: "; agents_connected; echo; else warn "server not reachable on http://localhost:8080 — is the stack up?"; fi; }
 cmd_logs()    { dc logs --tail=100 -f ${1:-}; }
 cmd_token()   { cat "$DEMO_DIR/enrollment-token" 2>/dev/null || { fail "no token yet — run start first"; exit 1; }; }
 

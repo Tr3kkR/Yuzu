@@ -49,7 +49,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 
 ADD https://github.com/canonical/chisel/releases/download/${CHISEL_VERSION}/chisel_${CHISEL_VERSION}_linux_${TARGETARCH}.tar.gz /tmp/chisel.tgz
-RUN tar -xzf /tmp/chisel.tgz -C /usr/bin chisel && chisel version
+# Verify the chisel tarball against a per-arch sha256 before trusting it. The
+# ADD above is version- but not digest-pinned, and the URL is per-arch so a
+# single `ADD --checksum=` can't cover both arches. Fail closed on mismatch.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) want=a82cbaa4b17af2750d4593312cbdc5afd92573aacefdad08721ccf6a5bdef4f5 ;; \
+      arm64) want=3606a0363ec3ee4f2d5bb5c81ee3892c6b15e8fe776509c012888a33d3953271 ;; \
+      *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    echo "${want}  /tmp/chisel.tgz" | sha256sum -c -; \
+    tar -xzf /tmp/chisel.tgz -C /usr/bin chisel; \
+    chisel version
 
 # ERTS runtime closure: glibc (+ NSS for resolving the `server` upstream by
 # name), libstdc++/libgcc, ncurses (the emulator links libtinfo), OpenSSL

@@ -121,6 +121,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cedar & Vale demo environment — chiselled server, gateway, and agent images.**
+  A repeatable, release-pinned sales-demo stack: `FROM scratch` chiselled Ubuntu
+  26.04 images for server, gateway, and agent, a `docker-compose.demo.yml`, and
+  `scripts/start-demo.sh` (build-or-pull → start → enroll N agents). Distinct
+  from the viz-UAT rig; cannot run alongside it (both bind host 8080/50051). See
+  `docs/demo-environment.md`.
+
+- **Multi-arch chisel image publishing + agent-bundle delivery image.** Two new
+  release jobs: `docker-publish-chisel` builds `yuzu-{server,gateway,agent}-chisel`
+  multi-arch (linux/amd64 + linux/arm64 via QEMU) and `docker-publish-agent-bundle`
+  publishes `yuzu-agent-bundle-chisel` — a single image carrying the agent for
+  three triplets (`linux-x64`, `windows-x64`, `macos-arm64`) at one pinned
+  version, assembled from the release's own signed/notarized artifacts (verified
+  by SHA-256), not cross-compiled. Design partners `docker pull` it and copy out
+  the right agent per endpoint OS (native installers + raw payload). All images
+  are cosign-keyless-signed with SLSA provenance + CycloneDX/SPDX SBOMs.
+  `scripts/check-compose-versions.sh` now gates `docker-compose.demo.yml` and
+  recognises the `-chisel` repo suffix. Build/usage: `scripts/build-agent-bundle.sh`,
+  `docs/agent-bundle.md`, `docs/demo-environment.md`.
+
 - **vuln_scan — Alpine (apk) package enumeration.** `get_installed_apps()`
   enumerates installed packages on Alpine via `apk info -v`, parsing the
   `name-pkgver-rpkgrel` form. Brings Alpine to parity with the existing

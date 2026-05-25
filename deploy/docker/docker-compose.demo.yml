@@ -30,7 +30,7 @@
 services:
   # ── Tier 1: Yuzu Server (chiselled Ubuntu 26.04) ───────────────────────
   server:
-    image: ghcr.io/tr3kkr/yuzu-server-chisel:${YUZU_VERSION:-0.12.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-server-chisel:${YUZU_VERSION:-0.12.0}
     container_name: yuzu-demo-server
     command:
       - "--listen"
@@ -78,11 +78,17 @@ services:
 
   # ── Tier 2: Erlang Gateway (chiselled Ubuntu 26.04) ────────────────────
   gateway:
-    image: ghcr.io/tr3kkr/yuzu-gateway-chisel:${YUZU_VERSION:-0.12.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-gateway-chisel:${YUZU_VERSION:-0.12.0}
     container_name: yuzu-demo-gateway
     environment:
       NO_PROXY: "*"
       no_proxy: "*"
+      # #659 boot guard: the gateway refuses to boot (fail-closed) when it sees
+      # the default Erlang distribution cookie. This single-node, ephemeral demo
+      # has no clustering, so accept the default — exactly as the viz/full/
+      # sanitizer UAT composes do. Without it the gateway crash-loops and the
+      # whole stack never comes up. Demo-only — never set this in production.
+      YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     ports:
       - "8081:8081"     # Health/readiness
       - "9568:9568"     # Prometheus metrics
@@ -107,7 +113,7 @@ services:
   # container and the fleet shows N distinct agents, not one. tmpfs also makes
   # every agent ephemeral — a restart yields a clean, identical fleet.
   agent:
-    image: ghcr.io/tr3kkr/yuzu-agent-chisel:${YUZU_VERSION:-0.12.0}
+    image: ${YUZU_REGISTRY:-ghcr.io/tr3kkr}/yuzu-agent-chisel:${YUZU_VERSION:-0.12.0}
     command:
       - "--server"
       - "gateway:50051"
@@ -124,7 +130,9 @@ services:
       NO_PROXY: "*"
       no_proxy: "*"
     tmpfs:
-      - /var/lib/yuzu-agent:mode=1777
+      # size-capped so a large --agents N can't exhaust host memory (each replica
+      # gets its own in-kernel tmpfs); 64m is ample for the agent KV/identity DB.
+      - /var/lib/yuzu-agent:mode=1777,size=64m
     depends_on:
       gateway:
         condition: service_healthy

@@ -889,6 +889,7 @@ The default Docker deployment runs the server and agent standalone -- no gateway
 | `deploy/docker/docker-compose.reference.yml` | Copyable deployment template — pulls pinned ghcr.io images, uses a named `server-data` volume, carries inline TLS hardening + backup + rollback commentary. Requires operator hardening (TLS, bind address) before production use. |
 | `deploy/docker/docker-compose.full-uat.yml` | Gateway deployment (server + gateway + monitoring) |
 | `docker-compose.uat.yml` | Self-contained single-file UAT stack pulled from ghcr.io (server + gateway + Prometheus + Grafana + ClickHouse) |
+| `deploy/docker/docker-compose.demo.yml` | Chiselled (FROM scratch) Ubuntu 26.04 sales-demo stack — server + gateway + N agent replicas, release-pinned. Entry point `scripts/start-demo.sh`; see `docs/demo-environment.md`. Not for production (runs `--no-tls` with a baked admin password). |
 
 **Usage:**
 

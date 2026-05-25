@@ -30,19 +30,26 @@ if [[ $# -lt 1 || -z "${1:-}" ]]; then
 fi
 
 EXPECTED="$1"
+shift
 
-# Explicit list of tracked compose files to check. Local-only files
-# (`docker-compose.local.yml`) are gitignored and omitted. If a new compose
-# file is added it must be consciously opted in here.
-FILES=(
-  docker-compose.uat.yml
-  deploy/docker/docker-compose.yml
-  deploy/docker/docker-compose.reference.yml
-  deploy/docker/docker-compose.uat.yml
-  deploy/docker/docker-compose.full-uat.yml
-  deploy/docker/docker-compose.sanitizer-uat.yml
-  deploy/docker/docker-compose.demo.yml
-)
+# Files to check. Explicit args after the version override the default tracked
+# list — used by tests/shell/test_check_compose_versions.sh for hermetic
+# fixtures; the release job passes only the version, so it uses the default.
+# Local-only files (`docker-compose.local.yml`) are gitignored and omitted; a
+# new tracked compose must be opted in here consciously.
+if [ "$#" -gt 0 ]; then
+  FILES=("$@")
+else
+  FILES=(
+    docker-compose.uat.yml
+    deploy/docker/docker-compose.yml
+    deploy/docker/docker-compose.reference.yml
+    deploy/docker/docker-compose.uat.yml
+    deploy/docker/docker-compose.full-uat.yml
+    deploy/docker/docker-compose.sanitizer-uat.yml
+    deploy/docker/docker-compose.demo.yml
+  )
+fi
 
 fail=0
 

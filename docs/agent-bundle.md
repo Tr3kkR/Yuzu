@@ -74,15 +74,23 @@ verifies the SLSA provenance attestation. Registry owner is derived from
 
 ### Version pinning
 
-The default version tracks the latest release line that has published
-Windows/macOS agent artifacts. The demo server/gateway are on the **0.12.0**
-line, but there is no `v0.12.0` *final* release yet — only **`v0.12.0-rc0`**
-carries the three platform archives — so the current default is `0.12.0-rc0`.
-**Bump the `VERSION` default in `scripts/build-agent-bundle.sh` to `0.12.0` once
-the v0.12.0 GA release publishes its artifacts**, so the bundle matches the demo
-stack exactly.
+The default version (`scripts/build-agent-bundle.sh`) tracks the current GA
+release line — currently **`0.12.0`** — and must equal the version of the demo
+server/gateway the agents enroll into. The bundle can only be built for a version
+whose GitHub release has published the Windows/macOS archives, so when the next
+release ships, bump the `VERSION` default **and** the `docker-compose.demo.yml`
+pins together. In CI the `docker-publish-agent-bundle` job passes
+`--version ${GITHUB_REF_NAME#v}`, so a tagged release always builds + signs a
+matching bundle automatically — manual builds are only needed off-cycle.
 
 ## Use it (partner)
+
+> **Prerequisite — image visibility.** GHCR packages are **private by default**.
+> Before hand-off either make the package public (GitHub → your packages → the
+> package → *Package settings* → *Change visibility*) or grant the partner read
+> access; otherwise their `docker pull` returns `unauthorized` / `403`. A partner
+> pulling a still-private image must first authenticate:
+> `echo <PAT-with-read:packages> | docker login ghcr.io -u <github-user> --password-stdin`.
 
 ```bash
 docker pull ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version>
@@ -99,6 +107,11 @@ docker rm "$cid"
 docker run --rm <img> list     # recursive listing
 docker run --rm <img>          # prints the bundle README
 ```
+
+> Extracted files are owned by **root** (the image copies them as root). On a
+> Linux host either `sudo chown -R "$(id -u):$(id -g)" yuzu-agents`, or extract as
+> yourself: `docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/out" <img>`.
+> (On Docker Desktop / macOS the VM boundary makes this transparent.)
 
 Then copy the directory for each endpoint's OS onto that machine and follow its
 `README.txt`. Quick reference (point every agent at the **gateway's** agent port
@@ -125,7 +138,8 @@ DYLD_LIBRARY_PATH="$PWD/bin" ./bin/yuzu-agent \
 ```
 Persistent: `sudo installer -pkg installers/<pkg> -target /`, then add
 `--server`/`--enrollment-token` to `/Library/LaunchDaemons/com.yuzu.agent.plist`
-and `launchctl bootstrap system …`.
+and `launchctl bootstrap system …`. If Gatekeeper quarantines copied files,
+clear it first: `xattr -dr com.apple.quarantine yuzu-agents/macos-arm64`.
 
 **Windows** — foreground (demo, PowerShell):
 ```powershell
@@ -134,8 +148,10 @@ cd yuzu-agents\windows-x64\payload
   --enrollment-token <TOKEN> --plugin-dir .\plugins --data-dir .\data --log-level info
 ```
 Persistent: run `installers\YuzuAgentSetup-<v>.exe` (enter gateway + token on the
-config page), or `… /VERYSILENT /SUPPRESSMSGBOXES /TOKEN=<TOKEN>`. Service name
-`YuzuAgent`.
+config page), or fully unattended —
+`installers\YuzuAgentSetup-<v>.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=<GATEWAY_HOST>:50051 /TOKEN=<TOKEN>`
+(the installer takes the gateway address as `/SERVER=`, not only the GUI page).
+Service name `YuzuAgent`.
 
 ## Verify integrity
 
@@ -151,6 +167,20 @@ The Windows binaries are Authenticode-signed and the macOS binaries are
 notarized; those signatures are embedded in the files and survive the
 copy in/out of the image. If macOS quarantines a copied file, clear it with
 `xattr -dr com.apple.quarantine <dir>`.
+
+The **image itself** (when built by the `docker-publish-agent-bundle` release
+job) is cosign-keyless-signed with SLSA provenance and a CycloneDX/SPDX SBOM, so
+a partner's security team can verify it before trusting the pull:
+
+```bash
+cosign verify ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version> \
+  --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp='^https://github.com/<owner>/Yuzu/\.github/workflows/release\.yml@.*'
+gh attestation verify oci://ghcr.io/<owner>/yuzu-agent-bundle-chisel:<version> --repo <owner>/Yuzu
+```
+
+(Manual off-cycle builds via `scripts/build-agent-bundle.sh` are *not* image-signed
+— only the CI job signs. Prefer the released, CI-published image for partners.)
 
 ## Files
 

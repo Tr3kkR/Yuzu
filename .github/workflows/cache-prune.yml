@@ -53,6 +53,24 @@ jobs:
           after_total=$(find "$base/yuzu-vcpkg-binary-cache-"* -type f 2>/dev/null | wc -l || echo 0)
           echo "before=${before_total} deleted=${deleted} after=${after_total}"
 
+      - name: Prune buildx chisel local cache older than 30 days
+        run: |
+          set -eu
+          # docker-publish-chisel writes a type=local,mode=max buildx cache per
+          # image under /mnt/d/docker-buildcache/<image>-chisel — several GB per
+          # arch with no built-in eviction. buildx rewrites the dir each run, so
+          # an untouched *-chisel dir is genuinely stale. Linux-only (the chisel
+          # C++ builds run on the self-hosted Linux runner).
+          bc="/mnt/d/docker-buildcache"
+          if [[ ! -d "$bc" ]]; then
+            echo "::notice::buildx cache dir $bc not present — skipping"
+            exit 0
+          fi
+          before=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
+          find "$bc" -maxdepth 1 -type d -name '*-chisel' -mtime +30 -exec rm -rf {} + 2>/dev/null || true
+          after=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
+          echo "buildx chisel cache: before=${before} after=${after}"
+
   prune-windows:
     name: "Prune Windows runner cache"
     runs-on: [self-hosted, Windows, X64]

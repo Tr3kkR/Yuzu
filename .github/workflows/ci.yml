@@ -104,6 +104,12 @@ jobs:
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
         run: python3 scripts/ci/runner-health-check.py --mode preflight
 
+      # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
+      # otherwise only runs at release time, so a regex regression would surface
+      # too late (after the full build matrix). No build deps — just bash.
+      - name: Shell gate tests
+        run: bash tests/shell/test_check_compose_versions.sh
+
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
   #   name: "Lint (clang-format)"

@@ -31,8 +31,9 @@ Files:
 ## Quick start
 
 ```bash
-# Bootstrap: build the chiselled images locally and run the stack.
-# (Required until the -chisel images are published to GHCR — see "Publishing".)
+# Bootstrap: build the chiselled images locally and run the stack. --build is
+# needed only until a tagged release publishes the -chisel images (the
+# docker-publish-chisel job does that on every release — see "Publishing").
 bash scripts/start-demo.sh --build
 
 # Steady state, once images are published: pull the pinned release images.
@@ -50,6 +51,11 @@ bash scripts/start-demo.sh logs server
 bash scripts/start-demo.sh token          # reprint the enrollment token
 bash scripts/start-demo.sh stop
 ```
+
+> **Pulling published images?** GHCR packages are private by default — for
+> `--pull` (or the steady-state auto-pull) the `-chisel` packages must be made
+> public, or you must `docker login ghcr.io` with a PAT that has `read:packages`.
+> `--build` needs no registry auth (it builds locally).
 
 When it is up:
 

@@ -18,12 +18,12 @@
 #                                      [--no-test] [--keep-staging]
 #
 # Examples:
-#   bash scripts/build-agent-bundle.sh                       # build 0.12.0-rc0 locally
+#   bash scripts/build-agent-bundle.sh                       # build the default version locally
 #   bash scripts/build-agent-bundle.sh --version 0.11.0 --push
 #   bash scripts/build-agent-bundle.sh --multiarch --push    # linux/amd64+arm64 -> registry
 #
-# Default version is the latest release line that has published Windows/macOS
-# agent artifacts. Bump it (or pass --version) when v0.12.0 GA ships.
+# Default version tracks the current GA release line (must have published
+# Windows/macOS agent artifacts). Override with --version for another release.
 
 set -euo pipefail
 export COPYFILE_DISABLE=1   # macOS: don't emit ._ AppleDouble sidecars (viz-UAT lesson)
@@ -38,7 +38,7 @@ STAGING="deploy/docker/.agent-bundle-build"   # build context (gitignored)
 BUNDLE_ROOT="$STAGING/yuzu-agents"            # becomes /opt/yuzu-agents
 
 # ── Defaults / config ─────────────────────────────────────────────────────
-VERSION="${YUZU_VERSION:-0.12.0-rc0}"
+VERSION="${YUZU_VERSION:-0.12.0}"
 IMAGE_NAME="yuzu-agent-bundle-chisel"
 PUSH=0; MULTIARCH=0; RUN_TEST=1; KEEP_STAGING=0
 
@@ -89,8 +89,12 @@ command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
 command -v unzip  >/dev/null 2>&1 || die "need unzip on PATH (the windows archive is a .zip)"
 command -v gh >/dev/null 2>&1 || die "need the GitHub CLI (gh), authenticated, to download release assets — 'brew install gh && gh auth login'"
 
-DL=""
-cleanup() { [ -n "$DL" ] && rm -rf "$DL" 2>/dev/null || true; }
+DL=""; SMOKE_TMP=""
+cleanup() {
+  [ -n "$DL" ] && rm -rf "$DL" 2>/dev/null || true
+  [ -n "$SMOKE_TMP" ] && rm -rf "$SMOKE_TMP" 2>/dev/null || true
+  [ "${KEEP_STAGING:-0}" = 1 ] || rm -rf "$STAGING" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 echo ""
@@ -162,12 +166,23 @@ extract_payload() {
     tar) tar xzf "$DL/$archive" -C "$ex" ;;
     zip) unzip -q "$DL/$archive" -d "$ex" ;;
   esac
-  local top; top="$(echo "$ex"/*/)"           # single top dir: yuzu-<ver>-<plat>/
-  [ -d "${top}bin" ] || die "unexpected layout in $archive (no bin/ under ${top})"
+  # Find the single top-level dir that actually contains bin/ — robust to a
+  # stray sibling (e.g. __MACOSX/ from a Finder/ditto re-zip) that would
+  # otherwise break a bare `*/` glob.
+  local top="" d
+  for d in "$ex"/*/; do [ -d "${d}bin" ] && { top="$d"; break; }; done
+  [ -n "$top" ] || die "unexpected layout in $archive (no */bin under $ex)"
   cp -R "$top"bin/.     "$dst/payload/bin/"
   cp -R "$top"plugins/. "$dst/payload/plugins/" 2>/dev/null || true
   rm -f "$dst/payload/bin/yuzu-server" "$dst/payload/bin/yuzu-server.exe"
   chmod -R a+rX "$dst/payload"
+  # The unix agent binary must be executable for the partner's foreground run.
+  # tar preserves the bit, but re-assert it and fail closed so a repackaged
+  # archive can't ship a non-runnable agent. (The Windows .exe needs no +x.)
+  if [ "$plat" != "windows-x64" ]; then
+    chmod +x "$dst/payload/bin/yuzu-agent" 2>/dev/null || true
+    [ -x "$dst/payload/bin/yuzu-agent" ] || die "$plat agent binary is not executable"
+  fi
 }
 
 extract_payload linux-x64   yuzu-linux-x64.tar.gz   tar
@@ -286,8 +301,9 @@ PERSISTENT (Windows service via signed installer):
   full silent-install parameter list). The service is named 'YuzuAgent'.
 EOF
 
-# Fresh checksums over the laid-out tree.
-( cd "$BUNDLE_ROOT" && find . -type f ! -name SHA256SUMS | LC_ALL=C sort | xargs $SHACHK > SHA256SUMS )
+# Fresh checksums over the laid-out tree. NUL-delimited so a path with spaces
+# (defensive — the tree has none today) can't mis-split.
+( cd "$BUNDLE_ROOT" && find . -type f ! -name SHA256SUMS -print0 | LC_ALL=C sort -z | xargs -0 $SHACHK > SHA256SUMS )
 
 # Stage the self-extract entrypoint alongside yuzu-agents/ in the build context.
 cp deploy/docker/agent-bundle-extract.sh "$STAGING/extract.sh"
@@ -296,17 +312,38 @@ ok "Bundle tree staged at $BUNDLE_ROOT"
 du -sh "$BUNDLE_ROOT" 2>/dev/null | awk '{print "     payload size: "$1}'
 
 # ── 4. Build the image ─────────────────────────────────────────────────────
+BUILD_ARGS=(--build-arg BUNDLE_VERSION="$VERSION" --build-arg BUNDLE_SOURCE_RELEASE="$TAG")
 if [ "$MULTIARCH" = 1 ]; then
   info "Building multi-arch (linux/amd64,linux/arm64) and pushing $IMAGE_REF..."
   docker buildx build \
     --platform linux/amd64,linux/arm64 \
-    -f "$DOCKERFILE" --build-arg BUNDLE_VERSION="$VERSION" \
+    -f "$DOCKERFILE" "${BUILD_ARGS[@]}" \
     -t "$IMAGE_REF" --push "$STAGING"
   ok "Pushed multi-arch $IMAGE_REF"
+
+  # Verify the pushed index carries BOTH arches — a failed/partial leg must not
+  # silently ship a single-arch "multi-arch" tag — then smoke the host-arch
+  # variant end-to-end (the local-build smoke below is skipped on this path).
+  info "Verifying pushed multi-arch manifest..."
+  plats="$(docker buildx imagetools inspect "$IMAGE_REF" \
+    --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}' 2>/dev/null || true)"
+  case "$plats" in *linux/amd64*) : ;; *) die "pushed manifest missing linux/amd64 (got: $plats)";; esac
+  case "$plats" in *linux/arm64*) : ;; *) die "pushed manifest missing linux/arm64 (got: $plats)";; esac
+  ok "manifest carries both arches"
+  if [ "$RUN_TEST" = 1 ]; then
+    info "Smoke-testing the pushed image (host arch)..."
+    docker pull -q "$IMAGE_REF" >/dev/null
+    SMOKE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/yuzu-bundle-test.XXXXXX")"
+    docker run --rm -v "$SMOKE_TMP:/out" "$IMAGE_REF" >/dev/null
+    [ "$(cat "$SMOKE_TMP/yuzu-agents/VERSION")" = "$VERSION" ] || die "self-extract produced wrong VERSION"
+    ( cd "$SMOKE_TMP/yuzu-agents" && $SHACHK -c SHA256SUMS >/dev/null ) || die "in-image SHA256SUMS failed"
+    rm -rf "$SMOKE_TMP"; SMOKE_TMP=""
+    ok "multi-arch smoke passed (both arches present + host-arch self-extract)"
+  fi
 else
   info "Building $IMAGE_REF (host arch)..."
   DOCKER_BUILDKIT=1 docker build \
-    -f "$DOCKERFILE" --build-arg BUNDLE_VERSION="$VERSION" \
+    -f "$DOCKERFILE" "${BUILD_ARGS[@]}" \
     -t "$IMAGE_REF" "$STAGING"
   ok "Built $IMAGE_REF"
 
