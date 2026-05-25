@@ -1189,6 +1189,177 @@ jobs:
             echo "Signed with cosign keyless + SLSA provenance attestation."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # ── Chiselled demo images — server + gateway + agent, multi-arch ─────
+  # Publishes the FROM-scratch chiselled Ubuntu 26.04 demo images to GHCR
+  # under a distinct `-chisel` repo suffix (see docs/demo-environment.md).
+  # Deliberately NOT in the `release` job's needs: a slow or failed
+  # demo-image build must never block the actual GitHub release. Mirrors
+  # docker-publish (login / metadata / cosign / attestation / lowercase
+  # owner) but differs in three ways:
+  #   1. Multi-arch linux/amd64,linux/arm64 (docker-publish is amd64-only).
+  #   2. NO TRIPLET build-arg — the server/agent chisel Dockerfiles derive
+  #      the vcpkg triplet from buildx's TARGETARCH per-arch; forcing
+  #      x64-linux would bake an x64 binary into the arm64 image.
+  #   3. A distinct local buildcache path (-chisel suffix) so it never
+  #      collides with docker-publish's cache.
+  docker-publish-chisel:
+    name: "Publish ${{ matrix.image }}-chisel image"
+    # Mirror docker-publish's needs (core builds must pass) but stay OUT
+    # of the release job's needs: so this never gates the release.
+    needs: [build-linux, build-gateway]
+    runs-on: [self-hosted, Linux]
+    # Generous timeout: the server/agent chisel images compile all of
+    # vcpkg (gRPC/abseil/protobuf/openssl) from source, and the arm64 leg
+    # does it under QEMU emulation. docs/demo-environment.md flags up to a
+    # ~240 min cold-cache risk for the emulated arm64 build.
+    #
+    # INTERIM STRATEGY: arm64 is built via QEMU on the amd64 self-hosted
+    # runner. This is slow but needs no extra runner. The sustainable path
+    # is a native arm64 runner (self-hosted or GitHub-hosted
+    # ubuntu-24.04-arm) + per-arch manifest merge — a runner-topology
+    # decision tracked as the "Open decision — arm64 build strategy" note
+    # in docs/demo-environment.md ("Publishing"). Revisit before relying on
+    # the QEMU path for every release.
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+      id-token: write        # cosign keyless + Sigstore OIDC
+      attestations: write    # actions/attest-build-provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: server
+            dockerfile: deploy/docker/Dockerfile.server.chisel
+          - image: gateway
+            dockerfile: deploy/docker/Dockerfile.gateway.chisel
+          - image: agent
+            dockerfile: deploy/docker/Dockerfile.agent.chisel
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          clean: false
+          persist-credentials: false
+
+      - name: Lowercase repository owner
+        id: owner
+        run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      # QEMU registers binf_misc handlers so buildx can build the
+      # linux/arm64 leg on this amd64 runner. Required for the multi-arch
+      # build below; see the INTERIM STRATEGY note on timeout-minutes.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          # Distinct `-chisel` suffix — must not collide with the non-chisel
+          # yuzu-${image} images published by docker-publish.
+          images: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel
+          # Tag convention mirrors docker-publish / scripts/docker-release.sh:
+          #   - stable (no -alpha/-beta/-rc suffix): :X.Y.Z + :X.Y + :latest
+          #   - pre-release:                         :X.Y.Z-suffix only
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+          labels: |
+            org.opencontainers.image.title=yuzu-${{ matrix.image }}-chisel
+            org.opencontainers.image.description=Yuzu ${{ matrix.image }} chiselled demo image
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # Multi-arch is the whole point of this job. The arm64 leg runs
+          # under QEMU emulation on the amd64 runner (see timeout note).
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # NOTE: deliberately NO TRIPLET build-arg. The server/agent chisel
+          # Dockerfiles derive the vcpkg triplet from buildx's per-arch
+          # TARGETARCH when TRIPLET is empty
+          # (T="${TRIPLET:-$(case "$TARGETARCH" in arm64) echo arm64-linux;;
+          # *) echo x64-linux;; esac)}"). Pinning TRIPLET=x64-linux here (as
+          # docker-publish does) would bake an x64 binary into the arm64
+          # image. gateway.chisel ignores TRIPLET (rebar3 path).
+          # Distinct local buildcache path so chisel never collides with
+          # the non-chisel docker-publish cache. mode=max caches
+          # intermediate layers too (best hit rate) — important given the
+          # full vcpkg-from-source compile.
+          cache-from: type=local,src=/mnt/d/docker-buildcache/${{ matrix.image }}-chisel
+          cache-to: type=local,dest=/mnt/d/docker-buildcache/${{ matrix.image }}-chisel,mode=max
+          # Disable buildx's own provenance/sbom attestation — we emit
+          # GitHub-native attestations + cosign signatures below so
+          # customers have a single verification path via `gh
+          # attestation verify` and `cosign verify`.
+          provenance: false
+          sbom: false
+
+      # ── SLSA build provenance (by image digest) ─────────────────────
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # ── cosign keyless image signing (Sigstore / Fulcio / Rekor) ────
+      - name: Install cosign
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Sign image (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel
+        run: |
+          # cosign v3.0+ auto-detects the OIDC issuer from the workflow's
+          # id-token; an explicit --oidc-issuer is redundant and a hard
+          # error in v3 (see docker-publish for the #495 history).
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+          echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      - name: Image summary
+        env:
+          META_TAGS: ${{ steps.meta.outputs.tags }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "## Published \`yuzu-${{ matrix.image }}-chisel\` image (multi-arch)"
+            echo ""
+            echo '```'
+            echo "$META_TAGS"
+            echo '```'
+            echo ""
+            echo "**Digest:** \`$BUILD_DIGEST\`"
+            echo ""
+            echo "Platforms: \`linux/amd64,linux/arm64\` (arm64 via QEMU)."
+            echo "Signed with cosign keyless + SLSA provenance attestation."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ── Create GitHub Release ────────────────────────────────────────────
   release:
     name: "Create Release"

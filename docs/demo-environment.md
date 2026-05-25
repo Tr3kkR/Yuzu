@@ -168,9 +168,15 @@ enrollment token. Build/usage: `docs/agent-bundle.md` and
 The `docker-publish-chisel` job in `.github/workflows/release.yml` builds all
 three `*.chisel` Dockerfiles **multi-arch (linux/amd64 + linux/arm64)** and
 pushes them as `ghcr.io/<owner>/yuzu-{server,gateway,agent}-chisel:<version>`,
-signed (cosign keyless) with SLSA provenance. It runs after `docker-publish`
-and is **not** a dependency of the `release` job, so a slow or failed demo-image
-build never blocks the actual release.
+signed (cosign keyless) with SLSA provenance. It is gated on the same core build
+jobs as `docker-publish` (`build-linux`, `build-gateway`) and runs in parallel
+with it, but is **not** a dependency of the `release` job, so a slow or failed
+demo-image build never blocks the actual release.
+
+The three-triplet **agent bundle** (`yuzu-agent-bundle-chisel`) is *not* built by
+this job — it repackages the release's own signed agent binaries for three OS
+triplets and is published separately after the release (see `docs/agent-bundle.md`
+and `scripts/build-agent-bundle.sh`).
 
 > **Open decision — arm64 build strategy.** The job currently builds arm64 via
 > **QEMU emulation** on the amd64 self-hosted runner. The C++ images compile all

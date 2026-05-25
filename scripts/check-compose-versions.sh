@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify docker-compose files reference the expected Yuzu version.
 #
-# Enforces two rules for every `ghcr.io/<owner>/yuzu-{server,gateway,agent}:<tag>`
+# Enforces two rules for every `ghcr.io/<owner>/yuzu-{server,gateway,agent}[-chisel]:<tag>`
 # reference in tracked compose files:
 #
 #   1. The tag must be parameterized as `${YUZU_VERSION:-<default>}` — bare
@@ -41,6 +41,7 @@ FILES=(
   deploy/docker/docker-compose.uat.yml
   deploy/docker/docker-compose.full-uat.yml
   deploy/docker/docker-compose.sanitizer-uat.yml
+  deploy/docker/docker-compose.demo.yml
 )
 
 fail=0
@@ -64,8 +65,8 @@ for f in "${FILES[@]}"; do
   while IFS=: read -r lineno rest; do
     [[ -z "$lineno" ]] && continue
     # Pull just the tag off the matched line.
-    if [[ "$rest" =~ ghcr\.io/[^/]+/yuzu-(server|gateway|agent):([^[:space:]\"\']+) ]]; then
-      tag="${BASH_REMATCH[2]}"
+    if [[ "$rest" =~ ghcr\.io/[^/]+/yuzu-(server|gateway|agent)(-chisel)?:([^[:space:]\"\']+) ]]; then
+      tag="${BASH_REMATCH[3]}"
     else
       continue
     fi
@@ -88,7 +89,7 @@ for f in "${FILES[@]}"; do
     fi
 
     # Anything else (latest, local, sha-*, ...) is intentional and allowed.
-  done < <(grep -nE 'ghcr\.io/[^/]+/yuzu-(server|gateway|agent):' "$f" || true)
+  done < <(grep -nE 'ghcr\.io/[^/]+/yuzu-(server|gateway|agent)(-chisel)?:' "$f" || true)
 done
 
 if [[ $fail -ne 0 ]]; then
