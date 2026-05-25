@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-05-25
+
 ### Breaking Changes
 
 - **Gateway requires `YUZU_GW_COOKIE` before upgrade (#659).** The Erlang gateway
@@ -1943,7 +1945,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and pins the docs link on the `create_fragment` missing-kind branch
   for the same symmetry reason.
 
-## [0.12.0] - 2026-05-03
+## [0.12.0-rc0] - 2026-05-03
 
 ### Breaking
 
