@@ -1074,8 +1074,15 @@ jobs:
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo (e.g.
+          # yuzu-agent-bundle-chisel, originally created via local
+          # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
+          # don't have access to the secret. Username pinned to the
+          # PAT owner ('Tr3kkR') since github.actor varies per actor.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
         id: meta
@@ -1232,10 +1239,16 @@ jobs:
     # workflow-level concurrency is cancel-in-progress:false (a real
     # release must run to completion); this narrower group trades that
     # for runner-slot liveness on the demo-image path specifically — SRE
-    # flagged the starvation risk. Group is keyed on github.ref (not
-    # ref+sha) so a re-push of the same tag is treated as a supersede.
+    # flagged the starvation risk. Group is keyed on github.ref + the
+    # matrix image so a re-push of the same tag is treated as a
+    # supersede PER IMAGE — without `${{ matrix.image }}`, the three
+    # matrix legs (server/gateway/agent) share a single group and
+    # GitHub cancels two of them at scheduling time. Observed on
+    # v0.12.0 release run 26413256206 where server-chisel and
+    # agent-chisel were cancelled at 1s runtime, leaving gateway-chisel
+    # as the only published variant.
     concurrency:
-      group: chisel-publish-${{ github.ref }}
+      group: chisel-publish-${{ github.ref }}-${{ matrix.image }}
       cancel-in-progress: true
     # Generous timeout: the server/agent chisel images compile all of
     # vcpkg (gRPC/abseil/protobuf/openssl) from source, and the arm64 leg
@@ -1297,8 +1310,15 @@ jobs:
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo (e.g.
+          # yuzu-agent-bundle-chisel, originally created via local
+          # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
+          # don't have access to the secret. Username pinned to the
+          # PAT owner ('Tr3kkR') since github.actor varies per actor.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
         id: meta
@@ -1480,8 +1500,15 @@ jobs:
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo (e.g.
+          # yuzu-agent-bundle-chisel, originally created via local
+          # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
+          # don't have access to the secret. Username pinned to the
+          # PAT owner ('Tr3kkR') since github.actor varies per actor.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
@@ -1879,22 +1906,35 @@ jobs:
             WIZARD_ASSET+=(artifacts/yuzu-compose-wizard-*.zip)
           fi
 
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "Yuzu ${GITHUB_REF_NAME}" \
-            --notes-file release-notes.md \
-            ${PRERELEASE_FLAG} \
-            artifacts/yuzu-linux-x64.tar.gz \
-            artifacts/yuzu-gateway-linux-x64.tar.gz \
-            artifacts/yuzu-windows-x64.zip \
-            artifacts/YuzuAgentSetup-*.exe \
-            artifacts/YuzuServerSetup-*.exe \
-            artifacts/YuzuAgent-*.pkg \
-            artifacts/yuzu-macos-arm64.tar.gz \
-            artifacts/*.deb \
-            artifacts/*.rpm \
-            artifacts/*.cdx.json \
-            artifacts/*.spdx.json \
-            artifacts/*.intoto.jsonl \
-            artifacts/SHA256SUMS \
-            artifacts/SHA256SUMS.sigstore \
-            "${WIZARD_ASSET[@]}"
+          # Idempotent on re-tag: if the release already exists (e.g.
+          # operator deleted + recreated the tag to backfill a CI bug
+          # like the chisel-publish concurrency miss in run 26413256206),
+          # skip the create+upload so the dependent docker-publish-*
+          # jobs can still run cleanly without "release already exists"
+          # blowing up Create Release. Asset re-upload would require
+          # --clobber per-file and risks signature drift on already-
+          # published artifacts; the safer behavior is leave the
+          # published release untouched.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "::notice::Release ${GITHUB_REF_NAME} already exists; skipping create+upload (assets already published, signatures preserved)"
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "Yuzu ${GITHUB_REF_NAME}" \
+              --notes-file release-notes.md \
+              ${PRERELEASE_FLAG} \
+              artifacts/yuzu-linux-x64.tar.gz \
+              artifacts/yuzu-gateway-linux-x64.tar.gz \
+              artifacts/yuzu-windows-x64.zip \
+              artifacts/YuzuAgentSetup-*.exe \
+              artifacts/YuzuServerSetup-*.exe \
+              artifacts/YuzuAgent-*.pkg \
+              artifacts/yuzu-macos-arm64.tar.gz \
+              artifacts/*.deb \
+              artifacts/*.rpm \
+              artifacts/*.cdx.json \
+              artifacts/*.spdx.json \
+              artifacts/*.intoto.jsonl \
+              artifacts/SHA256SUMS \
+              artifacts/SHA256SUMS.sigstore \
+              "${WIZARD_ASSET[@]}"
+          fi

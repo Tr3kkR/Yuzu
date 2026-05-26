@@ -124,8 +124,12 @@ jobs:
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo. Falls
+          # back to GITHUB_TOKEN for fork PRs without secret access.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Pull release images
         env:
@@ -598,8 +602,12 @@ jobs:
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo. Falls
+          # back to GITHUB_TOKEN for fork PRs without secret access.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       # Scope: Trivy is used here ONLY for vulnerability scanning of
       # published container images. SBOM generation is NOT done here —
@@ -662,8 +670,12 @@ jobs:
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo. Falls
+          # back to GITHUB_TOKEN for fork PRs without secret access.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Start stack
         env:
@@ -817,8 +829,12 @@ jobs:
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo. Falls
+          # back to GITHUB_TOKEN for fork PRs without secret access.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Start previous release
         env:
