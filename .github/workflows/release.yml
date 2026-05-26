@@ -1232,10 +1232,16 @@ jobs:
     # workflow-level concurrency is cancel-in-progress:false (a real
     # release must run to completion); this narrower group trades that
     # for runner-slot liveness on the demo-image path specifically — SRE
-    # flagged the starvation risk. Group is keyed on github.ref (not
-    # ref+sha) so a re-push of the same tag is treated as a supersede.
+    # flagged the starvation risk. Group is keyed on github.ref + the
+    # matrix image so a re-push of the same tag is treated as a
+    # supersede PER IMAGE — without `${{ matrix.image }}`, the three
+    # matrix legs (server/gateway/agent) share a single group and
+    # GitHub cancels two of them at scheduling time. Observed on
+    # v0.12.0 release run 26413256206 where server-chisel and
+    # agent-chisel were cancelled at 1s runtime, leaving gateway-chisel
+    # as the only published variant.
     concurrency:
-      group: chisel-publish-${{ github.ref }}
+      group: chisel-publish-${{ github.ref }}-${{ matrix.image }}
       cancel-in-progress: true
     # Generous timeout: the server/agent chisel images compile all of
     # vcpkg (gRPC/abseil/protobuf/openssl) from source, and the arm64 leg
