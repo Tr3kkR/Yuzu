@@ -1885,22 +1885,35 @@ jobs:
             WIZARD_ASSET+=(artifacts/yuzu-compose-wizard-*.zip)
           fi
 
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "Yuzu ${GITHUB_REF_NAME}" \
-            --notes-file release-notes.md \
-            ${PRERELEASE_FLAG} \
-            artifacts/yuzu-linux-x64.tar.gz \
-            artifacts/yuzu-gateway-linux-x64.tar.gz \
-            artifacts/yuzu-windows-x64.zip \
-            artifacts/YuzuAgentSetup-*.exe \
-            artifacts/YuzuServerSetup-*.exe \
-            artifacts/YuzuAgent-*.pkg \
-            artifacts/yuzu-macos-arm64.tar.gz \
-            artifacts/*.deb \
-            artifacts/*.rpm \
-            artifacts/*.cdx.json \
-            artifacts/*.spdx.json \
-            artifacts/*.intoto.jsonl \
-            artifacts/SHA256SUMS \
-            artifacts/SHA256SUMS.sigstore \
-            "${WIZARD_ASSET[@]}"
+          # Idempotent on re-tag: if the release already exists (e.g.
+          # operator deleted + recreated the tag to backfill a CI bug
+          # like the chisel-publish concurrency miss in run 26413256206),
+          # skip the create+upload so the dependent docker-publish-*
+          # jobs can still run cleanly without "release already exists"
+          # blowing up Create Release. Asset re-upload would require
+          # --clobber per-file and risks signature drift on already-
+          # published artifacts; the safer behavior is leave the
+          # published release untouched.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "::notice::Release ${GITHUB_REF_NAME} already exists; skipping create+upload (assets already published, signatures preserved)"
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "Yuzu ${GITHUB_REF_NAME}" \
+              --notes-file release-notes.md \
+              ${PRERELEASE_FLAG} \
+              artifacts/yuzu-linux-x64.tar.gz \
+              artifacts/yuzu-gateway-linux-x64.tar.gz \
+              artifacts/yuzu-windows-x64.zip \
+              artifacts/YuzuAgentSetup-*.exe \
+              artifacts/YuzuServerSetup-*.exe \
+              artifacts/YuzuAgent-*.pkg \
+              artifacts/yuzu-macos-arm64.tar.gz \
+              artifacts/*.deb \
+              artifacts/*.rpm \
+              artifacts/*.cdx.json \
+              artifacts/*.spdx.json \
+              artifacts/*.intoto.jsonl \
+              artifacts/SHA256SUMS \
+              artifacts/SHA256SUMS.sigstore \
+              "${WIZARD_ASSET[@]}"
+          fi
