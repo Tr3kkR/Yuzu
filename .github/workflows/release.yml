@@ -1074,8 +1074,15 @@ jobs:
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo (e.g.
+          # yuzu-agent-bundle-chisel, originally created via local
+          # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
+          # don't have access to the secret. Username pinned to the
+          # PAT owner ('Tr3kkR') since github.actor varies per actor.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
         id: meta
@@ -1303,8 +1310,15 @@ jobs:
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo (e.g.
+          # yuzu-agent-bundle-chisel, originally created via local
+          # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
+          # don't have access to the secret. Username pinned to the
+          # PAT owner ('Tr3kkR') since github.actor varies per actor.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Compute image tags and labels
         id: meta
@@ -1486,8 +1500,15 @@ jobs:
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PAT (write:packages-only PAT owned by Tr3kkR) instead
+          # of GITHUB_TOKEN so we can push to GHCR packages whose
+          # Actions-access policy isn't pinned to this repo (e.g.
+          # yuzu-agent-bundle-chisel, originally created via local
+          # PAT push). Falls back to GITHUB_TOKEN for fork PRs that
+          # don't have access to the secret. Username pinned to the
+          # PAT owner ('Tr3kkR') since github.actor varies per actor.
+          username: Tr3kkR
+          password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
