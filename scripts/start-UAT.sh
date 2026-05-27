@@ -85,6 +85,31 @@ fail() { echo -e "  ${RED}✗${NC} $*"; }
 warn() { echo -e "  ${YELLOW}⚠${NC} $*"; }
 info() { echo -e "  ${CYAN}→${NC} $*"; }
 
+# poll_metric_at_least <metrics-url> <metric-name> <min-value> [timeout-s]
+#
+# Poll a Prometheus /metrics endpoint until <metric-name> reaches <min-value>.
+# Handles both bare metrics (`name VALUE`) and labelled metrics
+# (`name{labels} VALUE`) by matching the line on `^name` followed by space,
+# `{`, or end-of-line, and reading the last whitespace-separated field as the
+# value. Uses the awk-no-exit pattern from #988 so the parser plays nicely
+# with `set -o pipefail`. Returns 0 if the threshold is met within timeout, 1
+# otherwise. Mirrored in scripts/integration-test.sh — keep the two copies in
+# sync. (See plan/audit comment in CHANGELOG for the no-shared-lib rationale.)
+poll_metric_at_least() {
+    local url="$1" name="$2" min="$3" timeout="${4:-30}"
+    local i resp value
+    for i in $(seq 1 "$timeout"); do
+        resp=$(curl -sf --max-time 2 "$url" 2>/dev/null || echo "")
+        value=$(echo "$resp" | awk -v n="$name" \
+            '$0 ~ "^"n"([ {]|$)" { val=$NF } END { print val }')
+        if [[ -n "$value" ]] && [[ "${value%.*}" -ge "$min" ]]; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 # ── Kill helpers ────────────────────────────────────────────────────────
 
 kill_stale() {
@@ -479,18 +504,25 @@ start_all() {
     fi
     local agent_pid=$!
 
-    # Wait for registration. PR 10 push-pump agents have a first-delay before
-    # the initial heartbeat, so the worst case is ~10-20s. 30s gives headroom
-    # on a moderately busy dev box. (#1003)
-    local waited=0
-    while ! grep -q "Registered with server" "$UAT_DIR/agent.log" 2>/dev/null; do
-        sleep 1
-        waited=$((waited + 1))
-        if [ "$waited" -ge 30 ]; then
-            fail "Agent did not register within 30s. Check $UAT_DIR/agent.log"
-            exit 1
-        fi
-    done
+    # Wait for registration. Authoritative signal is the server's
+    # yuzu_fleet_agents_healthy gauge — when it crosses 1 the server has
+    # actually counted this agent as healthy. Previously we greped the
+    # agent log for "Registered with server"; the metric is more reliable
+    # because it depends on the SERVER seeing the agent, not on a string
+    # in the AGENT log that downstream tooling may then re-parse and lose.
+    #
+    # Tradeoff (#1003 + recompute window): the fleet-health gauge updates
+    # on the server's 15 s recompute interval, so worst case here is ~15 s
+    # longer than the old log-grep. Keep the 30 s timeout — it still covers
+    # one full recompute + the agent's PR 10 push-pump first-delay with
+    # headroom. The session_id extraction below STILL reads the log; that
+    # is a STRUCTURAL regex on a stable line format (not a generic-English
+    # grep), and there is no metric/REST surface that exposes session_id.
+    if ! poll_metric_at_least "http://localhost:8080/metrics" \
+            yuzu_fleet_agents_healthy 1 30; then
+        fail "Agent did not register within 30s (yuzu_fleet_agents_healthy stayed < 1). Check $UAT_DIR/agent.log"
+        exit 1
+    fi
     local session_id
     session_id=$(grep "Registered with server" "$UAT_DIR/agent.log" | grep -oE 'session=[^ ,)]+' | tail -1)
     ok "Agent up (PID $agent_pid) — $session_id"
@@ -520,10 +552,22 @@ start_all() {
     fi
 
     # Test 2: Gateway health (all subsystem checks)
+    # Parse /readyz JSON properly instead of greping for the literal `"ready"`
+    # substring — the old grep would have false-positived on a response like
+    # `{"status":"degraded","note":"ready_for_disposal"}`. python3 is a hard
+    # build dependency project-wide (CLAUDE.md "PyYAML is a hard build
+    # dependency"), so we can rely on it being on PATH.
     tests_total=$((tests_total + 1))
     local gw_health
     gw_health=$(curl -s http://localhost:8081/readyz 2>/dev/null || echo '{"status":"error"}')
-    if echo "$gw_health" | grep -q '"ready"'; then
+    if echo "$gw_health" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("status") == "ready" else 1)
+' 2>/dev/null; then
         ok "Gateway healthy (all checks pass)"
         tests_passed=$((tests_passed + 1))
     else

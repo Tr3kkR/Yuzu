@@ -173,7 +173,19 @@ else
     T2_START=$(now_ms)
     T2_BODY=$(curl -s --max-time "$TIMEOUT_S" "$GATEWAY_HEALTH_URL/readyz" 2>/dev/null || echo '{"status":"error"}')
     T2_MS=$(elapsed_ms "$T2_START")
-    if echo "$T2_BODY" | grep -q '"ready"'; then
+    # Parse /readyz JSON via python3 rather than greping for the literal
+    # `"ready"` substring — a response like `{"status":"degraded","note":
+    # "ready_for_disposal"}` would false-positive the old grep. python3 is a
+    # hard build dependency project-wide (CLAUDE.md), so it's safe to invoke
+    # here. Mirrors the same change in scripts/start-UAT.sh test 2.
+    if echo "$T2_BODY" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if d.get("status") == "ready" else 1)
+' 2>/dev/null; then
         ok "gateway healthy (${T2_MS}ms)"
         PASSED=$((PASSED + 1))
         record_timing "gateway-readyz" "$T2_MS"
