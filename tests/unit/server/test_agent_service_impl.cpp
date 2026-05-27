@@ -480,6 +480,13 @@ TEST_CASE("evaluate_peer_binding: exact match short-circuits to ok (#1128)",
           O::exact_ok);
     CHECK(AgentServiceImpl::evaluate_peer_binding(true, "10.0.0.1", "10.0.0.9", false, {}) ==
           O::exact_ok); // exact_ok is authoritative regardless of IP equality
+    // gov QA SHOULD-2: a future bug that consulted CIDRs before exact_ok would
+    // still pass the two assertions above (cidrs={} would short-circuit
+    // ips_share_trusted_cidr to false). Pin the short-circuit with a non-empty
+    // wide CIDR so the only way to reach O::exact_ok is the exact_ok=true gate.
+    const std::vector<std::string> wide{"0.0.0.0/0"};
+    CHECK(AgentServiceImpl::evaluate_peer_binding(true, "10.0.0.1", "8.8.8.8", false, wide) ==
+          O::exact_ok);
 }
 
 TEST_CASE("evaluate_peer_binding: default (no accommodation) rejects a mismatch (#1128)",

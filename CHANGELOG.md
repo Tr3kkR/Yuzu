@@ -15,14 +15,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CG-NAT / SD-WAN. Strict exact-match remains the default; two opt-in
   accommodations now downgrade a mismatch to *advisory* (audited
   `result="ok" outcome=advisory`, counted on
-  `yuzu_grpc_subscribe_peer_advisory_total{event="security",reason}`) instead of
-  rejecting: (1) both IPs falling inside an operator-declared `--trusted-nat-cidr`
-  range (`YUZU_TRUSTED_NAT_CIDR`); or (2) a matching mTLS client identity, which
-  is **opt-in** via `--nat-trust-mtls-identity` (`YUZU_NAT_TRUST_MTLS_IDENTITY`,
-  default off) and SAFE ONLY WITH PER-AGENT CLIENT CERTS — a shared fleet-wide
-  cert would make it a session-replay bypass. Mismatches outside both
+  `yuzu_grpc_subscribe_peer_advisory_total{event="security",reason,gateway_mode}`)
+  instead of rejecting: (1) both IPs falling inside an operator-declared
+  `--trusted-nat-cidr` range (`YUZU_TRUSTED_NAT_CIDR`); or (2) a matching mTLS
+  client identity, which is **opt-in** via `--nat-trust-mtls-identity`
+  (`YUZU_NAT_TRUST_MTLS_IDENTITY`, default off) and SAFE ONLY WITH PER-AGENT
+  CLIENT CERTS — a shared fleet-wide cert would make it a session-replay
+  bypass; enabling the flag now emits a `warn`-level startup banner so it is
+  not silently lost in a tail-only boot log. Mismatches outside both
   accommodations still hard-reject; an empty extracted IP always rejects.
   Malformed `--trusted-nat-cidr` entries are logged and ignored at startup.
+  When both accommodations are configured, mTLS-identity match takes
+  precedence (the audit row + metric `reason` label record which fired). The
+  advisory audit row and metric now carry a `gateway_mode` field/label
+  matching the existing reject path, so SIEM rules can correlate advisory and
+  reject volumes by operator-mode dimension.
 - **Gateway origin-IP attribution (#1064, server side).** Audit rows on the
   gateway `ProxyRegister` path previously recorded the gateway's IP as the
   source, not the agent's (SOC 2 IR-2 mis-attribution). A new

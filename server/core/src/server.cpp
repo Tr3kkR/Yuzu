@@ -534,7 +534,12 @@ public:
                          cfg_.trusted_nat_cidrs.size());
         }
         if (cfg_.nat_trust_mtls_identity)
-            spdlog::info("--nat-trust-mtls-identity enabled: mTLS-identity match will relax the "
+            // warn-level (gov chaos CH-3 / UP-2): this flag intentionally
+            // relaxes a security control, so the visibility budget is the same
+            // as --no-tls's ERROR banner — info-level would lose the line in a
+            // multi-thousand-line boot log piped to a file, exactly the path
+            // most production operators use.
+            spdlog::warn("--nat-trust-mtls-identity enabled: mTLS-identity match will relax the "
                          "Subscribe peer-IP binding. Ensure client certs are PER-AGENT (a shared "
                          "fleet-wide cert makes this a session-replay bypass — gov UP-2).");
         agent_service_.set_trusted_nat_cidrs(cfg_.trusted_nat_cidrs);

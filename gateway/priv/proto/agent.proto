@@ -54,6 +54,35 @@ message RegisterRequest {
   bytes  machine_certificate    = 3;   // DER-encoded X.509
   bytes  attestation_signature  = 4;   // Signed challenge
   string attestation_provider   = 5;   // "ad-cs", "aws", "azure", etc.
+
+  // Gateway-observed agent source IP (#1064). When an agent reaches the server
+  // via the Erlang gateway's ProxyRegister, the server's transport peer is the
+  // GATEWAY's IP, not the agent's — so the audit row would mis-attribute the
+  // source (SOC 2 IR-2; SIEM "race-loss IP must equal winner IP" false
+  // negatives). The gateway fills this with the agent's origin IP (bare IPv4 /
+  // IPv6, no scheme/port) so the server can record `source_ip`=agent origin and
+  // `gateway_ip`=transport peer.
+  //
+  // GATEWAY-AUTHORITATIVE: the *direct* Register path IGNORES this field
+  // entirely (it trusts the real transport peer), and the gateway OVERWRITES
+  // whatever a client put here, so a *direct* agent cannot use it to forge a
+  // source IP. It is NOT a defence against a compromised gateway — a malicious
+  // gateway inside the trust boundary can set any value; the server records
+  // both this and the gateway's transport `gateway_ip` so an auditor can
+  // cross-check the two.
+  //
+  // Transport-agnostic by design (#376): the field lives in the message, so it
+  // carries over to a QUIC framing unchanged. Under today's grpcbox transport
+  // the gateway can only source it from `x-forwarded-for` (proxied
+  // deployments); the QUIC transport, owning its socket, will fill it from the
+  // real peer. Empty = not provided → server falls back to the transport peer.
+  //
+  // Gateway-side population is deferred to a follow-up: grpcbox can't observe
+  // the direct transport peer (only mTLS peercert), and the durable direct-mode
+  // source lands with the QUIC transport (#376). Mirror kept in sync with the
+  // canonical proto so gpb regenerates with the field present when the
+  // population work lands.
+  string gateway_observed_peer  = 6;
 }
 
 message RegisterResponse {

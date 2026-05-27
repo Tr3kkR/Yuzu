@@ -696,9 +696,16 @@ grpc::Status AgentServiceImpl::Subscribe(
                 // (matches the reject path — an in-memory counter is not the WAL
                 // write the lock rule targets); the audit row is deferred to
                 // out-of-lock emission after the critical section.
+                //
+                // gateway_mode label mirrors the _peer_mismatch_total reject
+                // counter for SIEM correlation parity — a `reason` label alone
+                // would not let an analyst slice advisory vs reject volume by
+                // the same operator-mode dimension across both counters.
                 metrics_
                     .counter("yuzu_grpc_subscribe_peer_advisory_total",
-                             {{"event", "security"}, {"reason", advisory_reason}})
+                             {{"event", "security"},
+                              {"reason", advisory_reason},
+                              {"gateway_mode", gateway_mode_ ? "true" : "false"}})
                     .increment();
                 spdlog::info("Subscribe peer mismatch tolerated ({}) for session {} "
                              "(register_ip={}, subscribe_ip={})",
@@ -853,9 +860,16 @@ grpc::Status AgentServiceImpl::Subscribe(
         ev.action = "session.peer_mismatch";
         ev.target_type = "Session";
         ev.target_id = session_id;
+        // gateway_mode field mirrors the reject-row detail (line 760) for SIEM
+        // parity. Structurally always false here: gateway-mode connections take
+        // the is_trusted_gateway_peer branch above and set peer_ok=true before
+        // the advisory block is entered, so an advisory row is by construction
+        // a direct-connect event. Keeping the field explicit lets a SIEM rule
+        // join advisory and reject rows on the same operator-mode dimension.
         ev.detail = "agent_id=" + advisory_agent_id + " outcome=advisory reason=" + advisory_reason +
                     " register_ip=" + advisory_register_ip +
-                    " subscribe_ip=" + advisory_subscribe_ip;
+                    " subscribe_ip=" + advisory_subscribe_ip +
+                    " gateway_mode=" + (gateway_mode_ ? "true" : "false");
         ev.source_ip = advisory_subscribe_ip;
         ev.session_id = session_id;
         ev.result = "ok";
