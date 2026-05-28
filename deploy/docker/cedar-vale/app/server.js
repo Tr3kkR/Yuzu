@@ -99,7 +99,7 @@ ${MACHINE_SVG}
   <div class="fallback-message">
     <p>Your browser <b>doesn't support the features required</b> by impress.js, so you're seeing a flat fallback.</p>
   </div>
-  <div id="impress" data-transition-duration="1100" data-width="1920" data-height="1080"
+  <div id="impress" data-transition-duration="1100" data-width="1831" data-height="1030"
        data-max-scale="6" data-min-scale="0.4" data-perspective="1000">
 ${steps}
   </div>
