@@ -57,6 +57,27 @@ function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
+// The hidden machine: murky gold/silver gears far behind the slides. One gear
+// <symbol> reused at several sizes/depths; machine.js spins each in place and
+// nudges the whole field on every transition. aria-hidden — purely decorative.
+const MACHINE_SVG = `
+  <svg class="machine" aria-hidden="true" viewBox="0 0 1600 900" preserveAspectRatio="xMidYMid slice">
+    <defs>
+      <symbol id="cv-gear" viewBox="-50 -50 100 100">
+        <circle r="46" fill="none" stroke="currentColor" stroke-width="16" stroke-dasharray="13 14"/>
+        <circle r="37" fill="currentColor"/>
+        <circle r="16" fill="none" stroke="#070a10" stroke-width="7"/>
+        <circle r="6" fill="#070a10"/>
+      </symbol>
+    </defs>
+    <use href="#cv-gear" class="gear--gold g-far"   x="-60"  y="-80"  width="440" height="440"/>
+    <use href="#cv-gear" class="gear--silver g-far" x="1240" y="-140" width="520" height="520"/>
+    <use href="#cv-gear" class="gear--gold g-mid"   x="1180" y="360"  width="320" height="320"/>
+    <use href="#cv-gear" class="gear--silver g-far" x="-180" y="560"  width="560" height="560"/>
+    <use href="#cv-gear" class="gear--gold g-mid"   x="600"  y="720"  width="260" height="260"/>
+    <use href="#cv-gear" class="gear--silver g-near" x="300" y="430"  width="210" height="210"/>
+  </svg>`;
+
 function renderDeck(rows) {
   const steps = rows.map((r) => `
       <div id="${esc(r.slug)}" class="step slide-${esc(r.slug)}"
@@ -74,6 +95,7 @@ function renderDeck(rows) {
   <link rel="stylesheet" href="/public/deck.css">
 </head>
 <body class="impress-not-supported">
+${MACHINE_SVG}
   <div class="fallback-message">
     <p>Your browser <b>doesn't support the features required</b> by impress.js, so you're seeing a flat fallback.</p>
   </div>
@@ -81,7 +103,9 @@ function renderDeck(rows) {
        data-max-scale="6" data-min-scale="0.4" data-perspective="1000">
 ${steps}
   </div>
+  <img class="crest" src="/public/crest.png" alt="Barony of Alyth" aria-hidden="true">
   <div class="hint">Use &larr; / &rarr; (or Space) to move through the deck. Served live from Postgres.</div>
+  <script src="/public/machine.js"></script>
   <script src="/public/impress.js"></script>
   <script>impress().init();</script>
 </body>

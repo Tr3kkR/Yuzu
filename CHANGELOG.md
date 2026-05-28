@@ -20,12 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multiplier & thinking partner"*; the slide content lives in Postgres
   (`slides` table, seeded via initdb) and is read live on each request, and
   the deck is reachable at `http://localhost:8088`. The deck is styled in the
-  Barony of Alyth livery (French Blue base with Metallic Gold + Silver accents
-  over black) with a slow animated background (drifting nebula + rotating
-  metallic sheen) that idles while the slides fly in dramatically via a
-  big-canvas / z-dolly impress.js journey and a focus-blur snap; `data_scale`
-  is `REAL` so mid-deck zooms can be fractional, and background/entrance motion
-  is `prefers-reduced-motion`-guarded. Tiers stack by their
+  Barony of Alyth livery (French Blue base, polished Metallic Gold + Metallic
+  Silver, black depth): metallic-gold headlines with a travelling specular
+  sheen, over an enigmatic dark background that is itself a *machine* — murky
+  gold/silver gears (far, dark, blurred) idle with a slow creep and spin up on
+  each slide transition, as if a friendly mechanism were moving the deck
+  (`public/machine.js`, driven off impress.js step events), atop a drifting
+  French-blue nebula and edge vignette. The Barony of Alyth coat of arms,
+  recolored to an engraved aged-brass medallion mounted in a riveted cog bezel
+  (the ancient arms set in the machine), is fixed in the lower-left so the deck
+  is seen flying beneath it during transitions. Slides fly in dramatically via
+  a big-canvas / z-dolly impress.js journey and a focus-blur snap; `data_scale`
+  is `REAL` so mid-deck zooms can be fractional, and all background/entrance
+  motion is `prefers-reduced-motion`-guarded. Tiers stack by their
   listener ports (Envoy :8080 → frontend, node :3000 → app, Postgres :5432 →
   db) and the tubes stay lit at idle via Envoy upstream health checks
   (frontend→app) and a pg connection-pool keepalive (app→db). All three tiers
