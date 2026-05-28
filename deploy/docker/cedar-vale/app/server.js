@@ -77,7 +77,7 @@ function renderDeck(rows) {
   <div class="fallback-message">
     <p>Your browser <b>doesn't support the features required</b> by impress.js, so you're seeing a flat fallback.</p>
   </div>
-  <div id="impress" data-transition-duration="900" data-width="1920" data-height="1080"
+  <div id="impress" data-transition-duration="1100" data-width="1920" data-height="1080"
        data-max-scale="6" data-min-scale="0.4" data-perspective="1000">
 ${steps}
   </div>
@@ -103,7 +103,7 @@ app.get('/', async (_req, res) => {
     // auto-refreshes, rather than a hard 500.
     res.status(503).type('text/html').send(
       `<!doctype html><meta http-equiv="refresh" content="2">` +
-      `<body style="font-family:sans-serif;background:#0b1320;color:#cdd9e5;padding:3rem">` +
+      `<body style="font-family:sans-serif;background:#04070c;color:#cdd9e5;padding:3rem">` +
       `<h1>Warming up…</h1><p>Waiting for the database tier (${esc(e.message)}).</p></body>`
     );
   }

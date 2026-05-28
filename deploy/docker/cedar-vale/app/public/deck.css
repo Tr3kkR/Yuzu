@@ -1,21 +1,87 @@
-/* Cedar & Vale demo deck — dark theme (Yuzu is dark-theme only). */
+/* Cedar & Vale demo deck — dark theme (Yuzu is dark-theme only).
+ *
+ * Reskinned to the Barony of Alyth livery for the "world's first Agentic
+ * Colleague IT team": French Blue base, Metallic Gold + Metallic Silver
+ * accents, black for depth. The background carries two slow animated layers
+ * (a drifting French-blue nebula + a rotating metallic sheen) so the deck
+ * breathes while idle; the slides themselves fly in dramatically via impress.js
+ * (big canvas jumps + z-dolly in 01-slides.sql) and a focus-blur snap here.
+ */
 
 :root {
-  --bg: #0b1320;
-  --ink: #e6edf3;
-  --muted: #93a4b8;
-  --accent: #4ea8de;     /* same cool blue as the fleet-viz InternalFleet tube */
-  --accent-2: #7ee787;
-  --rule: #1e2a3a;
+  /* --- Barony of Alyth livery --- */
+  --french-blue:       #0a6cb0;
+  --french-blue-mid:   #064b80;
+  --french-blue-deep:  #032d52;
+  --french-blue-abyss: #02192f;
+  --ink-black:         #04070c;
+
+  --silver:    #c4ccd6;
+  --silver-hi: #f1f4f8;
+  --silver-lo: #8b95a3;
+
+  --gold:    #d4af37;
+  --gold-hi: #f7e9a8;
+  --gold-lo: #a87f1e;
+
+  --ink:    #eaf1f8;
+  --muted:  #9fb2c6;
+  --rule:   rgba(196, 204, 214, 0.18);   /* faint silver hairline */
+  --accent: var(--french-blue);
 }
 
 html, body {
   margin: 0;
   padding: 0;
-  background: var(--bg);
+  min-height: 100%;
+  background: var(--ink-black);
   color: var(--ink);
   font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
+}
+
+/* --- Enigmatic livery background: two animated layers behind the canvas. --- */
+/* Layer 1 — deep French-blue nebula drifting slowly over black. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: -20%;
+  z-index: -2;
+  background:
+    radial-gradient(60% 50% at 30% 28%, rgba(10, 108, 176, 0.55) 0%, rgba(6, 75, 128, 0.22) 38%, rgba(2, 25, 47, 0) 70%),
+    radial-gradient(55% 60% at 78% 72%, rgba(6, 75, 128, 0.42) 0%, rgba(3, 45, 82, 0.18) 40%, rgba(2, 25, 47, 0) 72%),
+    radial-gradient(120% 120% at 50% 50%, rgba(3, 45, 82, 0.35) 0%, var(--ink-black) 68%);
+  animation: nebula-drift 46s ease-in-out infinite alternate;
+  will-change: transform;
+}
+/* Layer 2 — faint rotating metallic sheen (gold + silver glints). */
+body::after {
+  content: "";
+  position: fixed;
+  inset: -40%;
+  z-index: -1;
+  background:
+    conic-gradient(from 0deg at 50% 50%,
+      rgba(247, 233, 168, 0)    0deg,
+      rgba(212, 175, 55, 0.10) 28deg,
+      rgba(247, 233, 168, 0)   72deg,
+      rgba(196, 204, 214, 0.10) 150deg,
+      rgba(241, 244, 248, 0)   200deg,
+      rgba(212, 175, 55, 0.08) 300deg,
+      rgba(247, 233, 168, 0)   360deg);
+  mix-blend-mode: screen;
+  opacity: 0.6;
+  animation: sheen-rotate 120s linear infinite;
+  will-change: transform;
+}
+
+@keyframes nebula-drift {
+  0%   { transform: translate3d(-2%, -1%, 0)  scale(1.05); }
+  50%  { transform: translate3d(1.5%, 1%, 0)  scale(1.12); }
+  100% { transform: translate3d(2%, -1.5%, 0) scale(1.06); }
+}
+@keyframes sheen-rotate {
+  to { transform: rotate(360deg); }
 }
 
 /* Fallback shown only when impress.js can't run (small screens / old browsers). */
@@ -31,59 +97,91 @@ html, body {
 }
 .impress-supported .fallback-message { display: none; }
 
-/* impress.js sets up #impress; each .step is one slide on the canvas. */
+/* impress.js sets up #impress; each .step is one slide on the canvas.
+ * NOTE: do not put `transform` on .step — impress.js owns the inline
+ * transform. We animate opacity + filter only, so the focus-blur snap and
+ * the impress fly-through don't fight each other. */
 .step {
   position: relative;
   box-sizing: border-box;
   width: 1100px;
-  padding: 60px 72px;
-  border-radius: 18px;
-  background: linear-gradient(160deg, #0f1b2d 0%, #0b1320 100%);
+  padding: 64px 76px 72px;
+  border-radius: 20px;
+  background:
+    linear-gradient(165deg, rgba(10, 60, 104, 0.82) 0%, rgba(3, 33, 60, 0.92) 60%, rgba(3, 18, 34, 0.95) 100%);
   border: 1px solid var(--rule);
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
-  opacity: 0.18;
-  transition: opacity 0.6s ease;
+  box-shadow:
+    0 28px 90px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(241, 244, 248, 0.10),   /* silver top highlight */
+    inset 0 0 0 1px rgba(212, 175, 55, 0.06);  /* faint gold inner edge */
+  opacity: 0.14;
+  filter: blur(1.5px);
+  transition: opacity 0.7s ease, filter 0.7s ease;
 }
-.step.active { opacity: 1; }
+.step.active {
+  opacity: 1;
+  filter: none;
+}
+
+/* Dramatic content entrance — animates child elements (impress doesn't touch
+ * their transforms), replayed each time the step re-activates. */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(28px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.step.active h1,
+.step.active h2,
+.step.active p,
+.step.active ul,
+.step.active .callout {
+  animation: rise 0.8s cubic-bezier(.2, .7, .2, 1) both;
+}
+.step.active h2          { animation-delay: 0.05s; }
+.step.active p           { animation-delay: 0.12s; }
+.step.active ul          { animation-delay: 0.16s; }
+.step.active .callout    { animation-delay: 0.24s; }
 
 .step h1 {
   font-size: 76px;
-  line-height: 1.04;
-  margin: 0 0 12px;
+  line-height: 1.18;          /* was 1.04 — too tight, clipped 'g'/'y' descenders */
+  padding-bottom: 0.14em;     /* room so background-clip:text shows the full descender */
+  margin: 0 0 14px;
   letter-spacing: -0.02em;
-  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  background: linear-gradient(95deg, var(--gold-hi) 0%, var(--gold) 38%, var(--silver-hi) 64%, var(--silver) 100%);
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
+  filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.45));
 }
 .step h2 {
   font-size: 40px;
-  line-height: 1.15;
+  line-height: 1.18;
   margin: 0 0 24px;
-  color: var(--ink);
+  color: var(--silver-hi);
   font-weight: 600;
 }
-.step h2 em { color: var(--accent); font-style: normal; }
+.step h2 em { color: var(--gold); font-style: normal; }
 .step p { font-size: 26px; line-height: 1.5; color: var(--ink); margin: 0 0 16px; }
 .step ul { margin: 8px 0 0; padding: 0 0 0 1.1em; }
 .step li { font-size: 25px; line-height: 1.55; margin: 0 0 12px; color: var(--ink); }
-.step li b { color: #fff; }
+.step li::marker { color: var(--gold); }
+.step li b, .step p b { color: var(--silver-hi); }
 
 .eyebrow {
   text-transform: uppercase;
-  letter-spacing: 0.32em;
+  letter-spacing: 0.34em;
   font-size: 18px !important;
-  color: var(--accent) !important;
-  margin: 0 0 8px !important;
+  color: var(--gold) !important;
+  margin: 0 0 10px !important;
 }
 .footnote { font-size: 20px !important; color: var(--muted) !important; margin-top: 22px !important; }
 .callout {
   margin-top: 22px !important;
   padding: 16px 20px;
-  border-left: 3px solid var(--accent);
-  background: rgba(78, 168, 222, 0.08);
+  border-left: 3px solid var(--gold);
+  background: rgba(10, 108, 176, 0.12);
   border-radius: 0 8px 8px 0;
-  color: #cfe6f6 !important;
+  color: var(--silver-hi) !important;
   font-size: 23px !important;
 }
 
@@ -95,4 +193,10 @@ html, body {
   color: var(--muted);
   opacity: 0.7;
   z-index: 10;
+}
+
+/* Respect reduced-motion: kill the ambient drift and entrance animation. */
+@media (prefers-reduced-motion: reduce) {
+  body::before, body::after { animation: none; }
+  .step.active h1, .step.active h2, .step.active p, .step.active ul, .step.active .callout { animation: none; }
 }
