@@ -126,17 +126,27 @@ body::after {
  * transform. We animate opacity + filter only. */
 .step {
   position: relative;
+  isolation: isolate;                /* contain the video / scrim / content z-stack */
+  overflow: hidden;                  /* clip the bg video to the rounded corners */
   box-sizing: border-box;
   width: 1100px;
-  padding: 64px 76px 72px;
-  border-radius: 20px;
-  background:
-    linear-gradient(165deg, rgba(10, 60, 104, 0.82) 0%, rgba(3, 33, 60, 0.92) 60%, rgba(3, 18, 34, 0.95) 100%);
-  border: 1px solid var(--rule);
+  padding: 60px 72px 68px;
+  border-radius: 16px;
+  /* Each slide is a steampunk brass plate. The JPG (--slide-bg, set per slug
+   * below) is the static background AND the <video> poster; when a bg<N>.webm
+   * exists the server adds a <video class="slide-video"> that covers it. A scrim
+   * (::after) sits over whichever is showing, heavy where the text is (top-left)
+   * and thinning to the bottom-right so the machinery shows through. */
+  background-color: #0a0d12;
+  background-image: var(--slide-bg, none);
+  background-size: cover;
+  background-position: center;
+  border: 2px solid rgba(173, 138, 54, 0.55);     /* brass frame */
   box-shadow:
-    0 28px 90px rgba(0, 0, 0, 0.55),
-    inset 0 1px 0 rgba(241, 244, 248, 0.10),   /* silver top highlight */
-    inset 0 0 0 1px rgba(212, 175, 55, 0.06);  /* faint gold inner edge */
+    0 30px 90px rgba(0, 0, 0, 0.60),
+    inset 0 0 0 1px rgba(18, 11, 3, 0.85),         /* dark inner edge under brass */
+    inset 0 2px 0 rgba(247, 233, 168, 0.20),       /* gold top highlight */
+    inset 0 -34px 64px rgba(0, 0, 0, 0.50);        /* bottom shade for depth */
   opacity: 0.06;
   filter: blur(2px);
   transition: opacity 0.7s ease, filter 0.7s ease;
@@ -145,6 +155,41 @@ body::after {
   opacity: 1;
   filter: none;
 }
+
+/* Per-slide moving background (present only when bg<N>.webm exists). Covers the
+ * JPG, sits under the scrim. machine.js plays only the active slide's video. */
+.slide-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 0;
+  pointer-events: none;
+}
+/* Scrim over the background (JPG or video) for text legibility. */
+.step::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: linear-gradient(125deg, rgba(3, 7, 12, 0.90) 0%, rgba(3, 7, 12, 0.76) 44%, rgba(6, 11, 18, 0.52) 100%);
+}
+/* Slide content sits above the scrim. */
+.step > *:not(.slide-video) { position: relative; z-index: 2; }
+
+/* One distinct steampunk background per slide, so the changing backdrop makes
+ * slide-to-slide movement obvious during transitions. Mapped by slug (the
+ * server already emits class="step slide-<slug>"), position order 1..8. */
+.slide-title    { --slide-bg: url(/public/bg1.jpg); }
+.slide-strain   { --slide-bg: url(/public/bg2.jpg); }
+.slide-what     { --slide-bg: url(/public/bg3.jpg); }
+.slide-force    { --slide-bg: url(/public/bg4.jpg); }
+.slide-thinking { --slide-bg: url(/public/bg5.jpg); }
+.slide-how      { --slide-bg: url(/public/bg6.jpg); }
+.slide-trust    { --slide-bg: url(/public/bg7.jpg); }
+.slide-vision   { --slide-bg: url(/public/bg8.jpg); }
 
 /* Dramatic content entrance — animates child elements (impress doesn't touch
  * their transforms), replayed each time the step re-activates. */
@@ -191,7 +236,7 @@ body::after {
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  filter: drop-shadow(0 2px 10px rgba(0, 0, 0, 0.50)) drop-shadow(0 0 1px rgba(255, 240, 190, 0.35));
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.9)) drop-shadow(0 6px 14px rgba(0, 0, 0, 0.55)) drop-shadow(0 0 1px rgba(255, 240, 190, 0.35));
   animation: gold-sheen 7s linear infinite;
 }
 @keyframes gold-sheen {
@@ -211,6 +256,11 @@ body::after {
 .step li { font-size: 25px; line-height: 1.55; margin: 0 0 12px; color: var(--ink); }
 .step li::marker { color: var(--gold); }
 .step li b, .step p b { color: var(--silver-hi); }
+
+/* Legibility over the steampunk texture: a dark halo under all body text. */
+.step h2, .step p, .step li, .eyebrow, .footnote, .callout {
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9), 0 0 2px rgba(0, 0, 0, 0.8);
+}
 
 .eyebrow {
   text-transform: uppercase;

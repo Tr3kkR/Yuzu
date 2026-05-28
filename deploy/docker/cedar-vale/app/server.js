@@ -16,6 +16,7 @@
 
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
 const { Pool } = require('pg');
 
 const PORT = parseInt(process.env.APP_PORT || '3000', 10);
@@ -78,13 +79,26 @@ const MACHINE_SVG = `
     <use href="#cv-gear" class="gear--silver g-near" x="300" y="430"  width="210" height="210"/>
   </svg>`;
 
+const PUBLIC_DIR = path.join(__dirname, 'public');
+
 function renderDeck(rows) {
-  const steps = rows.map((r) => `
+  const steps = rows.map((r) => {
+    // Drop-in video hook: a slide gets a moving steampunk background the moment
+    // a bg<position>.webm exists in public/ — no code change needed. Until then
+    // the JPG (also the <video> poster) is the static background.
+    const hasVideo = fs.existsSync(path.join(PUBLIC_DIR, `bg${r.position}.webm`));
+    const video = hasVideo
+      ? `<video class="slide-video" muted loop playsinline preload="auto" poster="/public/bg${r.position}.jpg">` +
+        `<source src="/public/bg${r.position}.webm" type="video/webm"></video>`
+      : '';
+    return `
       <div id="${esc(r.slug)}" class="step slide-${esc(r.slug)}"
            data-x="${r.data_x}" data-y="${r.data_y}" data-z="${r.data_z}"
            data-rotate="${r.data_rotate}" data-scale="${r.data_scale}">
+        ${video}
         ${r.body_html}
-      </div>`).join('\n');
+      </div>`;
+  }).join('\n');
 
   return `<!doctype html>
 <html lang="en">

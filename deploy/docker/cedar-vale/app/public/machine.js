@@ -15,6 +15,21 @@
   var reduceMotion = window.matchMedia &&
     window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+  // --- Per-slide background video: play only the active slide's <video>, pause
+  // the rest, so at most one clip decodes at a time. Present only on slides that
+  // have a bg<N>.webm (the server emits the element conditionally). Runs even if
+  // there are no gears; under reduced-motion the poster JPG shows (no autoplay).
+  document.addEventListener('impress:stepenter', function (e) {
+    var v = e.target && e.target.querySelector && e.target.querySelector('video.slide-video');
+    if (v && !reduceMotion) {
+      try { v.currentTime = 0; var p = v.play(); if (p && p.catch) p.catch(function () {}); } catch (_) {}
+    }
+  });
+  document.addEventListener('impress:stepleave', function (e) {
+    var v = e.target && e.target.querySelector && e.target.querySelector('video.slide-video');
+    if (v) { try { v.pause(); } catch (_) {} }
+  });
+
   var gears = Array.prototype.slice.call(document.querySelectorAll('.machine use'));
   if (!gears.length) return;
 

@@ -29,10 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   French-blue nebula and edge vignette. The Barony of Alyth coat of arms,
   recolored to an engraved aged-brass medallion mounted in a riveted cog bezel
   (the ancient arms set in the machine), is fixed in the lower-left so the deck
-  is seen flying beneath it during transitions. Slides fly in dramatically via
-  a big-canvas / z-dolly impress.js journey and a focus-blur snap; `data_scale`
-  is `REAL` so mid-deck zooms can be fractional, and all background/entrance
-  motion is `prefers-reduced-motion`-guarded. Tiers stack by their
+  is seen flying beneath it during transitions. Each slide is its own steampunk
+  brass plate: a distinct background texture per slide (8 ornate brass/clockwork
+  panels under a dark scrim, framed in brass with gold/shadow insets) so the
+  changing backdrop makes slide-to-slide movement obvious during transitions;
+  body text carries a dark halo for legibility over the machinery. Each slide
+  also supports an optional **moving** background: drop a `bg<N>.webm` into
+  `app/public/` and the server adds a `<video class="slide-video">` for that
+  slide (the JPG stays as poster + fallback), with only the active slide's clip
+  playing at a time (driven off impress step events in `machine.js`) and no
+  autoplay under reduced-motion — so animated steampunk backdrops can be added
+  one at a time without code changes. Slides fly in dramatically via a
+  big-canvas / z-dolly impress.js journey and a focus-blur snap; `data_scale` is
+  `REAL` so mid-deck zooms can be fractional, and all background/entrance motion
+  is `prefers-reduced-motion`-guarded. Tiers stack by their
   listener ports (Envoy :8080 → frontend, node :3000 → app, Postgres :5432 →
   db) and the tubes stay lit at idle via Envoy upstream health checks
   (frontend→app) and a pg connection-pool keepalive (app→db). All three tiers
