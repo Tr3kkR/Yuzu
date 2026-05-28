@@ -83,6 +83,17 @@ The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST 
 | `yuzu_viz_pushed_cap_evictions_total` | gauge | `pushed_` map entries evicted because the map was at `kPushedMapHardCap` (100000) when a new agent pushed. Non-zero means the fleet outgrew the cap or a cap-flood attack is evicting legitimate agents — cross-check with the `topology.push.evicted_for_cap` audit events. |
 | `yuzu_viz_pushed_map_size` | gauge | Current occupancy of the `pushed_` map. Primary memory-pressure signal — alert before it approaches the 100000 hard cap. |
 
+## Subscribe peer-binding security counters
+
+The per-session peer-IP binding for the agent `Subscribe` RPC (#826/#1058/#1059, NAT-aware relaxation #1128) emits two paired counters. Both carry the `event="security"` SIEM-routing label and should be read together — a spike in one alone vs both together carries very different meaning.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `yuzu_grpc_subscribe_peer_mismatch_total` | counter | `event="security"`, `gateway_mode=true\|false` | A Subscribe attempt was **rejected** because its source IP did not match the IP recorded at `Register` time and no accommodation applied. `gateway_mode` reflects whether the server is running with `--gateway-mode`. The audit row `session.peer_mismatch result=denied` (see [audit-log.md](audit-log.md)) carries the forensic detail. |
+| `yuzu_grpc_subscribe_peer_advisory_total` | counter | `event="security"`, `reason="mtls_identity_match"\|"trusted_nat_cidr"`, `gateway_mode=true\|false` | A Subscribe peer-IP mismatch was **tolerated** (stream established) under a NAT-aware accommodation (#1128). `reason` distinguishes the two opt-in accommodations: `mtls_identity_match` (via `--nat-trust-mtls-identity`), `trusted_nat_cidr` (both IPs in one `--trusted-nat-cidr` range). The audit row is `session.peer_mismatch result=ok outcome=advisory`. |
+
+**Read-together interpretation.** Both counters share the `event` and `gateway_mode` labels so an analyst can join them by operator-mode dimension. A spike in `_peer_advisory_total` alone is expected multi-egress churn in NAT-relaxed deployments and is not actionable. A spike in BOTH simultaneously is the actionable signal: it can indicate a stolen-session replay landing inside a trusted range, where the legitimate agent triggers the reject and the attacker (also in-range) is admitted via advisory. The `AgentSubscribePeerAdvisoryCorrelatedSpike` alert below encodes exactly that pattern.
+
 ### Recommended alerts
 
 ```yaml
@@ -135,6 +146,31 @@ The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST 
   expr: increase(yuzu_grpc_subscribe_identity_mismatch_total{event="security"}[5m]) > 0
   annotations:
     summary: "Subscribe mTLS identity mismatch (#1118) — possible stolen session_id replayed with a non-matching client cert"
+
+# NAT-aware tolerated mismatch (#1128). yuzu_grpc_subscribe_peer_advisory_total
+# {event="security",reason="mtls_identity_match|trusted_nat_cidr"} counts peer-IP
+# mismatches that were DOWNGRADED to advisory (not rejected) under a NAT
+# accommodation. A spike here ALONE is expected churn in multi-egress NAT
+# deployments — do NOT alert on it bare. The actionable signal is the
+# correlated form: advisory AND rejected mismatches rising together can mean a
+# stolen-session replay landing inside a trusted range.
+- alert: AgentSubscribePeerAdvisoryCorrelatedSpike
+  expr: >
+    increase(yuzu_grpc_subscribe_peer_advisory_total{event="security"}[5m]) > 0
+    and increase(yuzu_grpc_subscribe_peer_mismatch_total{event="security"}[5m]) > 0
+  annotations:
+    summary: "Tolerated NAT peer-mismatches (#1128) coincide with rejected mismatches — investigate the reject events for a possible stolen-session replay inside a trusted range"
+
+# Operator-visibility guard for --nat-trust-mtls-identity. Sustained
+# mtls_identity_match advisories mean the (opt-in, off-by-default) mTLS-identity
+# NAT accommodation is active — confirm it was enabled intentionally AND that
+# client certs are PER-AGENT (a shared fleet cert makes this a replay bypass,
+# gov UP-2). Long window: this should be rare; a steady stream is worth a look.
+- alert: AgentSubscribeMtlsIdentityAdvisoryActive
+  expr: increase(yuzu_grpc_subscribe_peer_advisory_total{event="security",reason="mtls_identity_match"}[30m]) > 0
+  for: 30m
+  annotations:
+    summary: "--nat-trust-mtls-identity is relaxing peer-IP binding via mTLS-identity match — verify it was enabled deliberately and that client certs are per-agent (shared cert = session-replay bypass)"
 
 - alert: AgentRegisterDeniedFlood
   expr: rate(yuzu_register_denied_total{event="security"}[5m]) > 1

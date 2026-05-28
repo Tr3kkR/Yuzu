@@ -57,6 +57,14 @@ public:
                      UpdateRegistry* update_registry = nullptr);
 
     void set_update_registry(UpdateRegistry* reg) { update_registry_ = reg; }
+    /// #1128: operator-declared multi-egress NAT/proxy CIDRs for the NAT-aware
+    /// Subscribe binding relaxation. Empty (default) keeps strict exact-match.
+    void set_trusted_nat_cidrs(std::vector<std::string> cidrs) {
+        trusted_nat_cidrs_ = std::move(cidrs);
+    }
+    /// #1128 / gov UP-2: opt-in to the mTLS-identity NAT accommodation. Default
+    /// false; only safe with per-agent client certs (see Config doc).
+    void set_nat_trust_mtls_identity(bool enabled) { nat_trust_mtls_identity_ = enabled; }
     void set_response_store(ResponseStore* store) { response_store_ = store; }
     void set_tag_store(TagStore* store) { tag_store_ = store; }
     void set_analytics_store(AnalyticsEventStore* store) { analytics_store_ = store; }
@@ -162,6 +170,20 @@ public:
     /// Public for unit testability — exercised in test_agent_service_impl.cpp.
     static std::string extract_peer_ip(std::string_view peer);
 
+    /// #1128 — NAT-aware per-session peer-binding decision (pure). `exact_ok` is
+    /// the strict result (Subscribe IP == Register IP, or a trusted-gateway IP
+    /// under gateway-mode). When that fails, a mismatch is DOWNGRADED to advisory
+    /// iff a stronger accommodation applies: a matching mTLS client identity
+    /// (`client_identity_matches`), or both IPs sharing one operator-declared
+    /// trusted NAT CIDR. Anything else is reject. An empty `register_ip` or
+    /// `subscribe_ip` is always reject (#826: empty is a mismatch, never a
+    /// wildcard) regardless of accommodation. Pure + static for unit testability.
+    enum class PeerBindingOutcome { exact_ok, advisory_mtls, advisory_nat_cidr, reject };
+    static PeerBindingOutcome evaluate_peer_binding(bool exact_ok, std::string_view register_ip,
+                                                    std::string_view subscribe_ip,
+                                                    bool client_identity_matches,
+                                                    const std::vector<std::string>& trusted_nat_cidrs);
+
     void publish_output_rows(const std::string& agent_id, const std::string& plugin,
                              const std::string& raw_output);
 
@@ -231,6 +253,14 @@ private:
     std::vector<std::string> tar_dynamic_columns_; // TAR SQL dynamic schema cache
     bool require_client_identity_{false};
     bool gateway_mode_{false};
+    // #1128: operator-declared multi-egress NAT/proxy ranges (see Config). Empty
+    // = strict exact-match peer binding (default). Set once at wiring time via
+    // set_trusted_nat_cidrs; read-only on the Subscribe path thereafter.
+    std::vector<std::string> trusted_nat_cidrs_;
+    // #1128 / gov UP-2: gate for the mTLS-identity NAT accommodation. Default
+    // false — identity-match relaxes the IP binding ONLY when the operator
+    // affirms per-agent certs. See Config::nat_trust_mtls_identity.
+    bool nat_trust_mtls_identity_{false};
     UpdateRegistry* update_registry_{nullptr};
     ResponseStore* response_store_{nullptr};
     TagStore* tag_store_{nullptr};

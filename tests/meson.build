@@ -153,6 +153,7 @@ if build_server
       'unit/server/test_auth.cpp',
       'unit/server/test_auth_routes.cpp',
       'unit/server/test_auto_approve.cpp',
+      'unit/server/test_cidr_match.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_update_registry.cpp',
       'unit/server/test_https_config.cpp',

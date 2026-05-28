@@ -6,6 +6,7 @@
 
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
+#include "cidr_match.hpp"
 #include "enrollment_token_rejection.hpp"
 #include "execution_tracker.hpp"
 #include "fleet_topology_store.hpp"
@@ -595,6 +596,16 @@ grpc::Status AgentServiceImpl::Subscribe(
     }
 
     std::string agent_id;
+    // #1128: when a peer-IP mismatch is DOWNGRADED to advisory (NAT-aware
+    // relaxation below), the forensic audit row must be emitted OUT of the
+    // pending_mu_ critical section (same DoS rule as the reject path — a
+    // lock-held WAL write serializes the plane under flood, gov #1117). Capture
+    // the row's inputs while locked; emit after the lock block closes.
+    bool nat_advisory_emit = false;
+    std::string advisory_reason;
+    std::string advisory_agent_id;
+    std::string advisory_register_ip;
+    std::string advisory_subscribe_ip;
     {
         std::unique_lock lock(pending_mu_);
         prune_expired_pending_locked();
@@ -635,6 +646,78 @@ grpc::Status AgentServiceImpl::Subscribe(
         if (!peer_ok && gateway_mode_) {
             peer_ok = registry_.is_trusted_gateway_peer(subscribe_peer_ip);
         }
+
+        // #1128 — NAT-aware relaxation. The exact-IP binding above false-rejects
+        // a LEGITIMATE direct-connect agent whose Register and Subscribe egress
+        // different public IPs (multi-egress NAT, proxy pool, CG-NAT, SD-WAN).
+        // Strict exact-match stays the DEFAULT — with no relaxation configured
+        // this block is inert and behaviour is unchanged. Two opt-in
+        // accommodations DOWNGRADE a mismatch to advisory (audit + metric, no
+        // reject):
+        //   (a) mTLS-advisory: a verified client identity that matches the one
+        //       bound at Register is a STRONGER identity than source IP — the
+        //       #827 agent_id↔session and #1118 mTLS-identity bindings are the
+        //       authoritative layers, so the IP becomes defence-in-depth only.
+        //   (b) trusted-NAT-CIDR: both IPs fall inside one operator-declared
+        //       multi-egress range (analogous to --gateway-mode, but scoped to
+        //       direct-connect NAT rather than a trusted gateway).
+        // A mismatch OUTSIDE these accommodations is still a hard reject — the
+        // stolen-session replay guard (#826) is intact. The decision itself is a
+        // pure, unit-tested helper (evaluate_peer_binding); this site computes
+        // its inputs, then records the advisory signal. mTLS-advisory does NOT
+        // bypass the independent mTLS identity gate below (#1118) — it only
+        // relaxes the IP comparison.
+        if (!peer_ok) {
+            bool identity_matches = false;
+            // gov UP-2: the mTLS-identity accommodation is OPT-IN
+            // (nat_trust_mtls_identity_). Default off — a shared/fleet-wide
+            // client cert would otherwise make every identity "match" and turn
+            // this into a session-replay bypass. Only compute the overlap when
+            // the operator has affirmed per-agent certs.
+            if (nat_trust_mtls_identity_ && require_client_identity_) {
+                const auto sub_ids = extract_peer_identities(*context);
+                identity_matches = has_identity_overlap(it->second.peer_identities, sub_ids);
+            }
+            switch (evaluate_peer_binding(/*exact_ok=*/false, register_peer_ip, subscribe_peer_ip,
+                                          identity_matches, trusted_nat_cidrs_)) {
+            case PeerBindingOutcome::advisory_mtls:
+                advisory_reason = "mtls_identity_match";
+                break;
+            case PeerBindingOutcome::advisory_nat_cidr:
+                advisory_reason = "trusted_nat_cidr";
+                break;
+            case PeerBindingOutcome::exact_ok:  // unreachable (exact_ok=false above)
+            case PeerBindingOutcome::reject:
+                break; // advisory_reason stays empty → falls through to reject
+            }
+
+            if (!advisory_reason.empty()) {
+                // Tolerated multi-egress. The metric increments under the lock
+                // (matches the reject path — an in-memory counter is not the WAL
+                // write the lock rule targets); the audit row is deferred to
+                // out-of-lock emission after the critical section.
+                //
+                // gateway_mode label mirrors the _peer_mismatch_total reject
+                // counter for SIEM correlation parity — a `reason` label alone
+                // would not let an analyst slice advisory vs reject volume by
+                // the same operator-mode dimension across both counters.
+                metrics_
+                    .counter("yuzu_grpc_subscribe_peer_advisory_total",
+                             {{"event", "security"},
+                              {"reason", advisory_reason},
+                              {"gateway_mode", gateway_mode_ ? "true" : "false"}})
+                    .increment();
+                spdlog::info("Subscribe peer mismatch tolerated ({}) for session {} "
+                             "(register_ip={}, subscribe_ip={})",
+                             advisory_reason, session_id, register_peer_ip, subscribe_peer_ip);
+                nat_advisory_emit = true;
+                advisory_agent_id = it->second.agent_id;
+                advisory_register_ip = register_peer_ip;
+                advisory_subscribe_ip = subscribe_peer_ip;
+                peer_ok = true;
+            }
+        }
+
         if (!peer_ok) {
             // event=security is the SIEM-routing tag: we don't write to SIEM
             // directly — we emit via Prometheus and let Splunk et al. (which
@@ -757,6 +840,41 @@ grpc::Status AgentServiceImpl::Subscribe(
 
         agent_id = it->second.agent_id;
         pending_by_session_id_.erase(it);
+    }
+
+    // #1128: a tolerated (advisory) peer-IP mismatch is still a security-
+    // relevant event — pair the advisory metric (real-time signal) with an
+    // audit row (forensic evidence: which IPs, which accommodation). Emitted
+    // OUT of pending_mu_ (the lock is released above) so the WAL write can't
+    // serialize the plane under a multi-egress reconnect storm. result="ok"
+    // (the stream WAS established) + outcome=advisory distinguishes it from the
+    // result="denied" reject row that shares the session.peer_mismatch action.
+    // SOC 2 CC7.2.
+    if (nat_advisory_emit && audit_store_ && audit_store_->is_open()) {
+        AuditEvent ev;
+        ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+        ev.principal = "agent:" + advisory_agent_id;
+        ev.principal_role = "agent";
+        ev.action = "session.peer_mismatch";
+        ev.target_type = "Session";
+        ev.target_id = session_id;
+        // gateway_mode field mirrors the reject-row detail (line 760) for SIEM
+        // parity. Structurally always false here: gateway-mode connections take
+        // the is_trusted_gateway_peer branch above and set peer_ok=true before
+        // the advisory block is entered, so an advisory row is by construction
+        // a direct-connect event. Keeping the field explicit lets a SIEM rule
+        // join advisory and reject rows on the same operator-mode dimension.
+        ev.detail = "agent_id=" + advisory_agent_id + " outcome=advisory reason=" + advisory_reason +
+                    " register_ip=" + advisory_register_ip +
+                    " subscribe_ip=" + advisory_subscribe_ip +
+                    " gateway_mode=" + (gateway_mode_ ? "true" : "false");
+        ev.source_ip = advisory_subscribe_ip;
+        ev.session_id = session_id;
+        ev.result = "ok";
+        if (!audit_store_->log(ev))
+            signal_grpc_audit_failed(context);
     }
 
     spdlog::info("Agent subscribe stream opened for {}", agent_id);
@@ -1582,6 +1700,23 @@ std::string AgentServiceImpl::extract_peer_ip(std::string_view peer) {
     // pulled in by the header include. Keeping the static delegate avoids a
     // mass-rename in the test surface without forking the parser.
     return ::yuzu::server::detail::extract_peer_ip(peer);
+}
+
+AgentServiceImpl::PeerBindingOutcome AgentServiceImpl::evaluate_peer_binding(
+    bool exact_ok, std::string_view register_ip, std::string_view subscribe_ip,
+    bool client_identity_matches, const std::vector<std::string>& trusted_nat_cidrs) {
+    if (exact_ok)
+        return PeerBindingOutcome::exact_ok;
+    // #826: an empty extracted IP is a mismatch, never a wildcard — no
+    // accommodation can rescue it (a malformed/unix peer must still reject).
+    if (register_ip.empty() || subscribe_ip.empty())
+        return PeerBindingOutcome::reject;
+    // mTLS identity is the stronger layer (#827 + #1118); prefer it over CIDR.
+    if (client_identity_matches)
+        return PeerBindingOutcome::advisory_mtls;
+    if (::yuzu::server::detail::ips_share_trusted_cidr(trusted_nat_cidrs, register_ip, subscribe_ip))
+        return PeerBindingOutcome::advisory_nat_cidr;
+    return PeerBindingOutcome::reject;
 }
 
 bool AgentServiceImpl::has_identity_overlap(const std::vector<std::string>& lhs,

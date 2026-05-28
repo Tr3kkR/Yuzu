@@ -446,6 +446,103 @@ TEST_CASE("extract_peer_ip never returns junk on arbitrary input (#1058)",
     }
 }
 
+// ── #1064 — normalize_bare_ip (gateway_observed_peer parsing) ───────────────
+
+TEST_CASE("normalize_bare_ip accepts canonical bare IPs, rejects junk (#1064)",
+          "[agent_service][peer_mismatch][issue1064]") {
+    using yuzu::server::detail::normalize_bare_ip;
+    // The gateway fills RegisterRequest.gateway_observed_peer with a BARE IP
+    // (no gRPC scheme/port). Valid IPv4 passes through; IPv6 is lowercased so it
+    // compares equal to an extract_peer_ip() value from the same address.
+    CHECK(normalize_bare_ip("203.0.113.7") == "203.0.113.7");
+    CHECK(normalize_bare_ip("10.0.0.1") == "10.0.0.1");
+    CHECK(normalize_bare_ip("2001:DB8::1") == "2001:db8::1");
+    CHECK(normalize_bare_ip("fe80::1%eth0") == "fe80::1%eth0");
+
+    // Anything not a clean literal → empty, so the caller falls back to the
+    // transport (gateway) IP rather than recording attacker-controlled junk.
+    CHECK(normalize_bare_ip("").empty());
+    CHECK(normalize_bare_ip("not-an-ip").empty());
+    CHECK(normalize_bare_ip("999.1.1.1").empty());        // octet > 255
+    CHECK(normalize_bare_ip("01.02.03.04").empty());      // leading-zero (non-canonical)
+    CHECK(normalize_bare_ip("ipv4:1.2.3.4:80").empty());  // gRPC framing is NOT a bare IP
+    CHECK(normalize_bare_ip("1.2.3.4 ; rm -rf").empty()); // no injection round-trips
+}
+
+// ── #1128 — NAT-aware peer-binding decision (evaluate_peer_binding) ─────────
+
+TEST_CASE("evaluate_peer_binding: exact match short-circuits to ok (#1128)",
+          "[agent_service][peer_mismatch][issue1128]") {
+    using O = AgentServiceImpl::PeerBindingOutcome;
+    // exact_ok=true means the strict check (or trusted-gateway) already passed —
+    // no accommodation is consulted.
+    CHECK(AgentServiceImpl::evaluate_peer_binding(true, "10.0.0.1", "10.0.0.1", false, {}) ==
+          O::exact_ok);
+    CHECK(AgentServiceImpl::evaluate_peer_binding(true, "10.0.0.1", "10.0.0.9", false, {}) ==
+          O::exact_ok); // exact_ok is authoritative regardless of IP equality
+    // gov QA SHOULD-2: a future bug that consulted CIDRs before exact_ok would
+    // still pass the two assertions above (cidrs={} would short-circuit
+    // ips_share_trusted_cidr to false). Pin the short-circuit with a non-empty
+    // wide CIDR so the only way to reach O::exact_ok is the exact_ok=true gate.
+    const std::vector<std::string> wide{"0.0.0.0/0"};
+    CHECK(AgentServiceImpl::evaluate_peer_binding(true, "10.0.0.1", "8.8.8.8", false, wide) ==
+          O::exact_ok);
+}
+
+TEST_CASE("evaluate_peer_binding: default (no accommodation) rejects a mismatch (#1128)",
+          "[agent_service][peer_mismatch][issue1128]") {
+    using O = AgentServiceImpl::PeerBindingOutcome;
+    // Strict-by-default: no mTLS match, no trusted CIDR → a mismatch is reject.
+    // This is the unchanged #826 behaviour and the cross-range replay guard.
+    CHECK(AgentServiceImpl::evaluate_peer_binding(false, "10.0.0.1", "8.8.8.8", false, {}) ==
+          O::reject);
+    const std::vector<std::string> cidrs{"203.0.113.0/24"};
+    CHECK(AgentServiceImpl::evaluate_peer_binding(false, "203.0.113.7", "8.8.8.8", false, cidrs) ==
+          O::reject); // only one side in range → still reject
+    // #1128 acceptance bar "cross-range replay rejected" pinned at the decision
+    // layer: each IP sits in a DIFFERENT trusted range, so they share none →
+    // reject (a sniffed session replayed from another trusted subnet loses).
+    const std::vector<std::string> two{"203.0.113.0/24", "198.51.100.0/24"};
+    CHECK(AgentServiceImpl::evaluate_peer_binding(false, "203.0.113.7", "198.51.100.7", false,
+                                                  two) == O::reject);
+}
+
+TEST_CASE("evaluate_peer_binding: empty IP is always reject, accommodation cannot rescue (#1128)",
+          "[agent_service][peer_mismatch][issue1128][issue826]") {
+    using O = AgentServiceImpl::PeerBindingOutcome;
+    const std::vector<std::string> cidrs{"0.0.0.0/0"};
+    // #826: an empty extracted IP is a mismatch, never a wildcard — even with a
+    // matching mTLS identity or an all-encompassing /0 trusted range.
+    CHECK(AgentServiceImpl::evaluate_peer_binding(false, "", "10.0.0.1", true, cidrs) == O::reject);
+    CHECK(AgentServiceImpl::evaluate_peer_binding(false, "10.0.0.1", "", true, cidrs) == O::reject);
+}
+
+TEST_CASE("evaluate_peer_binding: mTLS identity match downgrades to advisory (#1128)",
+          "[agent_service][peer_mismatch][issue1128]") {
+    using O = AgentServiceImpl::PeerBindingOutcome;
+    // A verified, matching client identity is the stronger layer (#827/#1118),
+    // so a multi-egress IP mismatch becomes advisory rather than reject.
+    CHECK(AgentServiceImpl::evaluate_peer_binding(false, "10.0.0.1", "8.8.8.8",
+                                                  /*client_identity_matches=*/true, {}) ==
+          O::advisory_mtls);
+    // mTLS takes precedence over CIDR when both would apply.
+    const std::vector<std::string> cidrs{"0.0.0.0/0"};
+    CHECK(AgentServiceImpl::evaluate_peer_binding(false, "10.0.0.1", "10.0.0.2", true, cidrs) ==
+          O::advisory_mtls);
+}
+
+TEST_CASE("evaluate_peer_binding: shared trusted CIDR downgrades to advisory (#1128)",
+          "[agent_service][peer_mismatch][issue1128]") {
+    using O = AgentServiceImpl::PeerBindingOutcome;
+    const std::vector<std::string> cidrs{"203.0.113.0/24", "2001:db8::/32"};
+    // Legit multi-egress: both Register and Subscribe IPs in one declared range.
+    CHECK(AgentServiceImpl::evaluate_peer_binding(false, "203.0.113.7", "203.0.113.200",
+                                                  /*client_identity_matches=*/false, cidrs) ==
+          O::advisory_nat_cidr);
+    CHECK(AgentServiceImpl::evaluate_peer_binding(false, "2001:db8::1", "2001:db8:dead::beef", false,
+                                                  cidrs) == O::advisory_nat_cidr);
+}
+
 TEST_CASE("AgentRegistry::note_trusted_gateway_peer round-trips, refuses empty",
           "[agent_service][peer_mismatch][issue826]") {
     // The trusted-gateway set is the second leg of the #826 fix —
@@ -1121,4 +1218,86 @@ TEST_CASE("ProxyRegister: admin-denied agent does not consume the enrollment tok
     // path too (symmetry with the direct-Register #1067 test).
     auto gw_claim = h.auth_mgr.consume_enrollment_token(raw, "good-gw-agent");
     CHECK(gw_claim.has_value());
+}
+
+// ── #1064 — ProxyRegister origin-IP attribution ─────────────────────────────
+
+TEST_CASE("ProxyRegister: audit attributes the agent origin IP, not the gateway IP (#1064)",
+          "[agent_service][register][enrollment][gateway][issue1064]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    gateway_svc.set_audit_store(&h.audit);
+
+    // An INVALID enrollment token drives the denied/failure audit site — where
+    // the #1064 attribution records source_ip=agent origin + gateway_ip in
+    // detail. context is nullptr (as in every ProxyRegister test) so the gateway
+    // transport IP is empty; the attribution then comes ENTIRELY from
+    // gateway_observed_peer, making the agent-vs-gateway distinction observable.
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("gw-origin-test");
+    req.mutable_info()->set_hostname("agent-host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.set_enrollment_token("no-such-token-xyz");
+    apb::RegisterResponse resp;
+
+    auto failure_row = [&]() -> yuzu::server::AuditEvent {
+        for (const auto& ev : h.audit.query({})) {
+            if (ev.result == "failure")
+                return ev;
+        }
+        return {};
+    };
+
+    SECTION("origin observed → source_ip is the agent IP, not the gateway") {
+        req.set_gateway_observed_peer("203.0.113.7");
+        REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+        CHECK_FALSE(resp.accepted());
+        const auto row = failure_row();
+        CHECK(row.source_ip == "203.0.113.7"); // agent origin — the core attribution proof
+        // gateway_ip key is always recorded; its VALUE is empty here only
+        // because the test passes context=nullptr (no transport peer). With a
+        // real context it would carry the gateway's IP. source_ip above is the
+        // assertion that proves agent-origin vs gateway attribution.
+        CHECK(row.detail.find("gateway_ip=") != std::string::npos);
+        CHECK(row.detail.find("origin_observed=false") == std::string::npos);
+    }
+
+    SECTION("origin absent → falls back to gateway IP, flagged origin_observed=false") {
+        // No gateway_observed_peer set; null context → gateway IP empty.
+        REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+        const auto row = failure_row();
+        CHECK(row.source_ip.empty()); // gateway-IP fallback (empty under null ctx)
+        CHECK(row.detail.find("origin_observed=false") != std::string::npos);
+    }
+
+    SECTION("malformed origin is rejected by the strict parser → fallback") {
+        // A non-IP value (incl. an injection attempt) must NOT round-trip into
+        // the audit row — normalize_bare_ip returns empty, so we fall back.
+        req.set_gateway_observed_peer("1.2.3.4; rm -rf /");
+        REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+        const auto row = failure_row();
+        CHECK(row.source_ip.empty());
+        CHECK(row.detail.find("origin_observed=false") != std::string::npos);
+        CHECK(row.detail.find("rm -rf") == std::string::npos); // no junk in evidence
+    }
+
+    SECTION("success path also attributes the agent origin (gov QE SHOULD)") {
+        // The success audit site (valid token → accepted) shares append_origin_detail.
+        auto raw = h.auth_mgr.create_enrollment_token("gw-origin-test", /*max_uses=*/1,
+                                                      std::chrono::hours(1));
+        req.set_enrollment_token(raw);
+        req.set_gateway_observed_peer("203.0.113.9");
+        REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+        CHECK(resp.accepted());
+        yuzu::server::AuditEvent success_row;
+        for (const auto& ev : h.audit.query({})) {
+            if (ev.result == "success")
+                success_row = ev;
+        }
+        CHECK(success_row.source_ip == "203.0.113.9"); // agent origin on the success row too
+        CHECK(success_row.detail.find("gateway_ip=") != std::string::npos);
+    }
 }

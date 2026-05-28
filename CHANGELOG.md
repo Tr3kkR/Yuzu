@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests
+
+- **Integration / synthetic-UAT scripts: replace fragile log-grep assertions
+  with Prometheus-metric assertions.** Phase 5 of `/test --full` run
+  `1779859754-13864` surfaced a single Integration FAIL whose root cause was
+  a `cat agent.log | grep -qi "register|session|connect|heartbeat"` assertion
+  that silently swallowed an empty-read race (WSL2 drvfs / spdlog flush
+  timing) and false-failed even though the agent had registered cleanly. An
+  audit found five more sites in the same script — and two siblings in
+  `scripts/start-UAT.sh` and `scripts/test/synthetic-uat-tests.sh` — using
+  the same anti-pattern (generic-English substring match on volatile log
+  content with no retry and no diagnostic for empty reads).
+  - `scripts/integration-test.sh`: agent-registration wait loop (line 609),
+    "Agent registration in logs" test (was the failing one), "Gateway sees
+    agent connections", and "Server gateway-mode operation" now poll
+    `yuzu_fleet_agents_healthy` / `yuzu_gw_agents_current` via a new
+    `poll_metric_at_least` helper. The gateway error-pattern fallback at the
+    one site with no metric substitute is hardened: empty-file → loud FAIL,
+    and the grep pattern is tightened to `\\[error\\]|CRASH REPORT|=ERROR REPORT|
+    badarg|Supervisor: .* terminating` so the bare word "error" inside an
+    info line no longer false-positives. The latent "both branches call
+    `pass`" bug in "Server gateway-mode operation" is fixed at the same
+    time. Test count grew 21 → 22 because the previously-merged "gateway
+    sees agent connections" + "gateway has errors" split into two clean
+    assertions.
+  - `scripts/start-UAT.sh`: the agent-registration wait switched from
+    `grep "Registered with server"` to the same metric poll; the `/readyz`
+    JSON check switched from a `grep '"ready"'` substring to a real
+    `python3 -c 'json.load(...)'` parse (the old grep would have
+    false-positived on responses like `{"status":"degraded",
+    "note":"ready_for_disposal"}`). Session-id extraction at line 495 is
+    intentionally left alone — it uses a structural regex on a stable line
+    format, not generic English, and no metric or REST surface exposes
+    `session_id`.
+  - `scripts/test/synthetic-uat-tests.sh`: same `/readyz` JSON parse fix.
+  - `poll_metric_at_least` is duplicated between `integration-test.sh` and
+    `start-UAT.sh` rather than extracted to a shared lib — `start-UAT.sh`
+    is operator-runnable in isolation and the helper is ~10 lines; coupling
+    the two scripts to a shared file has higher carrying cost than the
+    duplication.
+  - Out of scope for this commit, filed as follow-up F19 (governance
+    Tier-C from the prior round): the MCP / e2e-api / e2e-security
+    `assert_contains` cluster and the `grep -c result-row` HTML row count
+    in `start-UAT.sh` / `synthetic-uat-tests.sh` — different domain
+    (JSON-vs-log), different risk model, separate PR.
+  - Verified: all three scripts pass `bash -n`; `bash
+    scripts/integration-test.sh` against the live UAT stack reports
+    22/22 PASS; the helper passes a four-case behavioural sanity test
+    (live PASS, impossible-threshold FAIL, missing-metric FAIL,
+    labelled-metric PASS).
+
+### Security
+
+- **NAT-aware per-session peer-IP binding (#1128).** The W1.3 stolen-session
+  guard (Subscribe source IP must match Register source IP) false-rejected
+  legitimate direct-connect agents behind multi-egress NAT / proxy pools /
+  CG-NAT / SD-WAN. Strict exact-match remains the default; two opt-in
+  accommodations now downgrade a mismatch to *advisory* (audited
+  `result="ok" outcome=advisory`, counted on
+  `yuzu_grpc_subscribe_peer_advisory_total{event="security",reason,gateway_mode}`)
+  instead of rejecting: (1) both IPs falling inside an operator-declared
+  `--trusted-nat-cidr` range (`YUZU_TRUSTED_NAT_CIDR`); or (2) a matching mTLS
+  client identity, which is **opt-in** via `--nat-trust-mtls-identity`
+  (`YUZU_NAT_TRUST_MTLS_IDENTITY`, default off) and SAFE ONLY WITH PER-AGENT
+  CLIENT CERTS — a shared fleet-wide cert would make it a session-replay
+  bypass; enabling the flag now emits a `warn`-level startup banner so it is
+  not silently lost in a tail-only boot log. Mismatches outside both
+  accommodations still hard-reject; an empty extracted IP always rejects.
+  Malformed `--trusted-nat-cidr` entries are logged and ignored at startup.
+  When both accommodations are configured, mTLS-identity match takes
+  precedence (the audit row + metric `reason` label record which fired). The
+  advisory audit row and metric now carry a `gateway_mode` field/label
+  matching the existing reject path, so SIEM rules can correlate advisory and
+  reject volumes by operator-mode dimension.
+- **Gateway origin-IP attribution (#1064, server side).** Audit rows on the
+  gateway `ProxyRegister` path previously recorded the gateway's IP as the
+  source, not the agent's (SOC 2 IR-2 mis-attribution). A new
+  transport-agnostic `RegisterRequest.gateway_observed_peer` field (survives the
+  planned gRPC→QUIC move) carries the agent origin IP; the server now records
+  `source_ip`=agent origin and `gateway_ip`=transport peer (falling back with
+  `origin_observed=false` when absent). The direct Register path ignores the
+  field (a direct agent cannot forge a source IP; it is not a defence against a
+  compromised gateway). **Note for gateway deployments:** until the gateway-side
+  population follow-up ships, audit rows on the `ProxyRegister` path still record
+  the gateway node's IP as `source_ip` (the field is not yet populated by
+  today's grpcbox transport, which cannot observe the direct agent peer; the
+  durable source arrives with the QUIC transport, #376). Operators relying on
+  `source_ip` for IR-2 attribution on the gateway path should note this.
+
 ## [0.12.0] - 2026-05-25
 
 ### Breaking Changes

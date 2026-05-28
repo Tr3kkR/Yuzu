@@ -236,7 +236,14 @@ salt = os.urandom(16)
 dk = hashlib.pbkdf2_hmac('sha256', '${ADMIN_PASS}'.encode(), salt, 100000, dklen=32)
 print(f'${ADMIN_USER}:admin:{salt.hex()}:{dk.hex()}')
 " > "$VIZ_UAT_DIR/viz-uat/yuzu-server.cfg"
-  chmod 600 "$VIZ_UAT_DIR/viz-uat/yuzu-server.cfg"
+  # 644 (not 600): this file is bind-mounted into yuzu-viz-server, which runs
+  # as uid 999 (`yuzu`) inside the container. The host file is owned by the
+  # operator's uid (typically 1000), so mode 600 made it unreadable from the
+  # container → the server's first-run setup fired, read empty stdin (no TTY),
+  # and the password floor killed the start. The content is a PBKDF2-SHA256
+  # hash (no cleartext password) so 644 is the right mode for a containerized
+  # launcher on a single-operator dev box.
+  chmod 644 "$VIZ_UAT_DIR/viz-uat/yuzu-server.cfg"
   ok "Generated server config (admin / adminpassword1) at $VIZ_UAT_DIR/viz-uat/yuzu-server.cfg"
 }
 

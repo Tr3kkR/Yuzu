@@ -299,6 +299,16 @@ the address and port for the GatewayUpstream service. This port must match
 yuzu-server --gateway-upstream "0.0.0.0:50051"
 ```
 
+> **Known limitation — gateway origin-IP attribution (#1064).** On the gateway
+> `ProxyRegister` path, audit rows currently record the **gateway node's** IP as
+> `source_ip`, not the originating agent's IP. The server already consumes the
+> `RegisterRequest.gateway_observed_peer` field that carries the agent origin
+> (recording `source_ip`=agent origin and `gateway_ip`=transport peer when
+> present), but the gateway does not yet populate it — today's grpcbox transport
+> cannot observe the direct agent peer, and the durable source arrives with the
+> QUIC transport migration (#376). Until then, SIEM/audit consumers correlating
+> `source_ip` with network logs on this path will see the gateway's address.
+
 ---
 
 ## Building and Testing

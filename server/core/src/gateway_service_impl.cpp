@@ -33,6 +33,27 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                                                        pb::RegisterResponse* response) {
     const auto& info = request->info();
 
+    // #1064: on this path the transport peer is the GATEWAY's IP, not the
+    // agent's — so an audit row keyed on `context->peer()` mis-attributes the
+    // source (SOC 2 IR-2; SIEM "race-loss IP must equal winner IP" false
+    // negatives). Prefer the gateway-observed agent origin IP carried in the
+    // RegisterRequest (a bare IP the gateway fills; empty under transports that
+    // can't observe the agent peer — see the proto field comment), validated
+    // through the same strict parser as direct peers. Fall back to the gateway
+    // IP when absent, recording origin_observed=false so an auditor knows the
+    // source_ip is the relay, not the agent. Both IPs go in `detail`.
+    const std::string gateway_ip = context ? extract_peer_ip(context->peer()) : std::string{};
+    const std::string observed_origin =
+        ::yuzu::server::detail::normalize_bare_ip(request->gateway_observed_peer());
+    const std::string agent_source_ip = observed_origin.empty() ? gateway_ip : observed_origin;
+    // Capture by value (gov Hermes SEC-07): defensive against a future refactor
+    // that stores/returns the lambda — the captured strings then can't dangle.
+    const auto append_origin_detail = [gateway_ip, observed_origin](std::string& detail) {
+        detail.append(" gateway_ip=").append(gateway_ip);
+        if (observed_origin.empty())
+            detail.append(" origin_observed=false");
+    };
+
     // -- W1.4 R2 / UP-H1 agent_id length bound (mirror of direct Register) ----
     // Same rationale as the direct-connect path in AgentServiceImpl::Register
     // — cap before any audit emission, auth-mgr lookup, or SHA-256. Source
@@ -181,9 +202,9 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     if (!already_consumed_by.empty()) {
                         detail.append(" already_consumed_by=").append(already_consumed_by);
                     }
+                    append_origin_detail(detail); // #1064: gateway_ip + origin_observed
                     ev.detail = std::move(detail);
-                    if (context)
-                        ev.source_ip = extract_peer_ip(context->peer());
+                    ev.source_ip = agent_source_ip; // #1064: agent origin, not gateway IP
                     ev.result = "failure";
                     audit_ok = audit_store_->log(ev);
                 }
@@ -237,13 +258,15 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 ev.action = std::string(yuzu::server::enrollment_event_action());
                 ev.target_type = "enrollment_token";
                 ev.target_id = claim.token_id;
-                ev.detail = std::string("variant=success source=gateway_proxy use_count=")
-                                .append(std::to_string(claim.use_count_after))
-                                .append("/")
-                                .append(claim.max_uses == 0 ? std::string{"unlimited"}
-                                                            : std::to_string(claim.max_uses));
-                if (context)
-                    ev.source_ip = extract_peer_ip(context->peer());
+                std::string detail =
+                    std::string("variant=success source=gateway_proxy use_count=")
+                        .append(std::to_string(claim.use_count_after))
+                        .append("/")
+                        .append(claim.max_uses == 0 ? std::string{"unlimited"}
+                                                    : std::to_string(claim.max_uses));
+                append_origin_detail(detail); // #1064: gateway_ip + origin_observed
+                ev.detail = std::move(detail);
+                ev.source_ip = agent_source_ip; // #1064: agent origin, not gateway IP
                 ev.result = "success";
                 enroll_audit_ok = audit_store_->log(ev);
             }
