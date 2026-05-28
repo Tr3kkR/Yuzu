@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **viz-UAT `cedar-vale-app` mode: a real three-tier demo app for fleet
+  visualization.** `VIZ_UAT_AGENT_MODE=cedar-vale-app bash
+  scripts/start-viz-uat.sh` stands up the fictional "Cedar & Vale" company as
+  three named tiers — **Envoy** (frontend) → **node.js** (app) → **Postgres**
+  (db) — each co-hosting a `yuzu-agent`, so the stack renders in `/viz/fleet`
+  with the presentation tier on top, app in the middle, and db at the bottom,
+  joined by two persistent blue connection tubes. The node tier serves an
+  8-slide impress.js (Prezi-style) deck on *"Agentic Colleagues: IT's force
+  multiplier & thinking partner"*; the slide content lives in Postgres
+  (`slides` table, seeded via initdb) and is read live on each request, and
+  the deck is reachable at `http://localhost:8088`. Tiers stack by their
+  listener ports (Envoy :8080 → frontend, node :3000 → app, Postgres :5432 →
+  db) and the tubes stay lit at idle via Envoy upstream health checks
+  (frontend→app) and a pg connection-pool keepalive (app→db). All three tiers
+  build on Debian trixie bases so the trixie-built agent's glibc matches.
+  Artifacts under `deploy/docker/cedar-vale/`. Complements the lightweight
+  `cedar-vale-local` (plain named agents) and macOS-only `cedar-vale`
+  (OrbStack VM) modes. DEV/UAT ONLY — `--no-tls`, baked demo credentials.
+- **viz-UAT `cedar-vale-local` mode: three named plain agents.**
+  `VIZ_UAT_AGENT_MODE=cedar-vale-local` runs three `yuzu-agent` containers with
+  hostnames `yuzu-frontend` / `yuzu-app` / `yuzu-db` (no real services), so
+  `/viz/fleet` labels three tiers by name without needing OrbStack VMs — the
+  Linux/WSL2-friendly cousin of the macOS `cedar-vale` mode.
+
+### Fixed
+
+- **viz-UAT: server config bind-mount must be world-readable (0644, not
+  0600).** `start-viz-uat.sh` generated `yuzu-server.cfg` at mode 0600 owned by
+  the operator's uid, then bind-mounted it into the server container which runs
+  as uid 999 (`yuzu`) — unreadable, so the server fell through to interactive
+  first-run setup, read empty stdin, and died on the password floor. The file
+  is a PBKDF2-SHA256 hash (no cleartext), so 0644 is correct for a
+  containerized launcher.
+
 ### Tests
 
 - **Integration / synthetic-UAT scripts: replace fragile log-grep assertions

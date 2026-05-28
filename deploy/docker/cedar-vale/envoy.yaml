@@ -1,0 +1,66 @@
+# Cedar & Vale demo — frontend tier (Envoy).
+#
+# Envoy is the web tier: it listens on :8080 (a "web" port, so fleet-viz
+# classifies this host into the frontend tier, the TOP of the stack) and
+# reverse-proxies everything to the node "app" tier.
+#
+# Crucially, the upstream cluster has an ACTIVE HTTP health check. Envoy reuses
+# a pooled connection for those checks, so an ESTABLISHED TCP socket to the app
+# tier is held open continuously — which is exactly what keeps the frontend->app
+# "blue tube" drawn in fleet-viz even when no browser is open.
+
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: http_listener
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: cedar_vale_ingress
+                codec_type: AUTO
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: cedar_vale
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: node_app }
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: node_app
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      # Hold the upstream connection open between health checks so the
+      # frontend->app socket stays ESTABLISHED (keeps the viz tube lit).
+      health_checks:
+        - timeout: 2s
+          interval: 3s
+          unhealthy_threshold: 3
+          healthy_threshold: 1
+          reuse_connection: true
+          http_health_check:
+            path: "/healthz"
+      load_assignment:
+        cluster_name: node_app
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      # compose service name of the app tier -> its bridge IP,
+                      # so the socket is an InternalFleet edge the topology store
+                      # resolves to the app agent.
+                      address: cv-app
+                      port_value: 3000

@@ -1,0 +1,98 @@
+/* Cedar & Vale demo deck — dark theme (Yuzu is dark-theme only). */
+
+:root {
+  --bg: #0b1320;
+  --ink: #e6edf3;
+  --muted: #93a4b8;
+  --accent: #4ea8de;     /* same cool blue as the fleet-viz InternalFleet tube */
+  --accent-2: #7ee787;
+  --rule: #1e2a3a;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Fallback shown only when impress.js can't run (small screens / old browsers). */
+.fallback-message { display: none; }
+.impress-not-supported .fallback-message {
+  display: block;
+  margin: 2rem auto;
+  max-width: 40rem;
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  color: var(--muted);
+}
+.impress-supported .fallback-message { display: none; }
+
+/* impress.js sets up #impress; each .step is one slide on the canvas. */
+.step {
+  position: relative;
+  box-sizing: border-box;
+  width: 1100px;
+  padding: 60px 72px;
+  border-radius: 18px;
+  background: linear-gradient(160deg, #0f1b2d 0%, #0b1320 100%);
+  border: 1px solid var(--rule);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+  opacity: 0.18;
+  transition: opacity 0.6s ease;
+}
+.step.active { opacity: 1; }
+
+.step h1 {
+  font-size: 76px;
+  line-height: 1.04;
+  margin: 0 0 12px;
+  letter-spacing: -0.02em;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.step h2 {
+  font-size: 40px;
+  line-height: 1.15;
+  margin: 0 0 24px;
+  color: var(--ink);
+  font-weight: 600;
+}
+.step h2 em { color: var(--accent); font-style: normal; }
+.step p { font-size: 26px; line-height: 1.5; color: var(--ink); margin: 0 0 16px; }
+.step ul { margin: 8px 0 0; padding: 0 0 0 1.1em; }
+.step li { font-size: 25px; line-height: 1.55; margin: 0 0 12px; color: var(--ink); }
+.step li b { color: #fff; }
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.32em;
+  font-size: 18px !important;
+  color: var(--accent) !important;
+  margin: 0 0 8px !important;
+}
+.footnote { font-size: 20px !important; color: var(--muted) !important; margin-top: 22px !important; }
+.callout {
+  margin-top: 22px !important;
+  padding: 16px 20px;
+  border-left: 3px solid var(--accent);
+  background: rgba(78, 168, 222, 0.08);
+  border-radius: 0 8px 8px 0;
+  color: #cfe6f6 !important;
+  font-size: 23px !important;
+}
+
+.hint {
+  position: fixed;
+  bottom: 14px;
+  right: 18px;
+  font-size: 13px;
+  color: var(--muted);
+  opacity: 0.7;
+  z-index: 10;
+}
