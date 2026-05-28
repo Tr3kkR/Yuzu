@@ -22,11 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the deck is reachable at `http://localhost:8088`. The deck is styled in the
   Barony of Alyth livery (French Blue base, polished Metallic Gold + Metallic
   Silver, black depth): metallic-gold headlines with a travelling specular
-  sheen, over an enigmatic dark background that is itself a *machine* — murky
-  gold/silver gears (far, dark, blurred) idle with a slow creep and spin up on
-  each slide transition, as if a friendly mechanism were moving the deck
-  (`public/machine.js`, driven off impress.js step events), atop a drifting
-  French-blue nebula and edge vignette. The Barony of Alyth coat of arms,
+  sheen, over an enigmatic dark background that is itself a *machine* — a fixed
+  Victorian analytical-engine backdrop: a deterministic train of ~17
+  interlocking brass/steel gears (constant tooth module so they mesh; centres at
+  the pitch distance; meshing neighbours turn opposite directions with
+  gear-ratio speeds — `omega·N` constant), murky/dark/blurred behind the slides,
+  spread across three clusters to fill the field. Motion is a pure function of a
+  single master drive angle (`public/machine.js` generates the train and drives
+  it), accelerating briefly on each slide transition ("thinking harder"), atop a
+  drifting French-blue nebula and edge vignette. The Barony of Alyth coat of arms,
   recolored to an engraved aged-brass medallion mounted in a riveted cog bezel
   (the ancient arms set in the machine), is fixed in the lower-left so the deck
   is seen flying beneath it during transitions. Each slide is its own steampunk
