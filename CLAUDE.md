@@ -380,6 +380,13 @@ For server tests that need a live `ExecutionTracker` wired into `AgentServiceImp
 
 Per-repo configuration for the Matt Pocock engineering skills (`to-issues`, `triage`, `to-prd`, `qa`, `improve-codebase-architecture`, `diagnose`, `tdd`, `zoom-out`, `grill-with-docs`). Re-run `/setup-matt-pocock-skills` to change.
 
+### Plugin scope — `frontend-design` is marketing-only
+
+The `frontend-design` plugin (`frontend-design@claude-plugins-official`) is scoped to **marketing / sales / demo presentation surfaces only**. Its design ethos — bold, deliberately-varied aesthetics that "vary between light and dark themes" — is right for a standalone pitch surface and wrong for the product, which prizes consistency and is **dark-theme-only**.
+
+- **Use it on:** the Cedar & Vale sales deck at `deploy/docker/cedar-vale/app/` (standalone Node app — `deck.css`, `machine.js`, slide assets) and any future standalone marketing/landing page. These are presentation apps, not the product.
+- **Do NOT use it on:** the operator dashboard or any product UI — `server/core/src/*_ui.cpp`, `server/core/static/*`. This explicitly includes the **in-product fleet visualization** (`viz_page_ui.cpp`, `viz_host_page_ui.cpp`, `server/core/static/yuzu-viz*.js`, governed by `docs/fleet-viz-invariants.md`) — despite the name, it is product, not marketing. Product UI stays HTMX-first, server-rendered, dark-theme-only; follow the existing dashboard conventions, never `frontend-design`.
+
 ### Issue tracker
 
 GitHub issues at `github.com/Tr3kkR/Yuzu` via the `gh` CLI. See `docs/agents/issue-tracker.md`.
