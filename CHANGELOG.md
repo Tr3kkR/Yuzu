@@ -7,6 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Compliance policies now actually evaluate (check → verdict pipeline).**
+  Authored policies + fragments could be created, but nothing evaluated them —
+  `PolicyStore::update_agent_status` had no caller and no trigger fired, so
+  `get_fleet_compliance` / `get_compliance_summary` always read 0%. A new
+  background `PolicyEvaluator` (`server/core/src/policy_evaluator.{hpp,cpp}`)
+  closes the gap: on a cadence it finds enabled policies whose interval has
+  elapsed, resolves scope/management-groups to agents, dispatches the fragment's
+  `check` instruction (via the shared command-dispatch path), then collects each
+  agent's response, evaluates the CEL `check_compliance`, and writes
+  `compliant` / `non_compliant` / `unknown` / `error` per agent. Two new
+  operator-gated endpoints: `POST /api/policies/{id}/evaluate` (force an
+  immediate check) and `POST /api/policies/{id}/remediate` (manual, opt-in
+  remediation — dispatches the fragment's `fix`, then verifies via `postCheck`;
+  only available when the fragment defines a `fix` instruction, surfaced as
+  `remediation_available` on the policy detail). Remediation is never automatic.
+  Audit actions `policy.evaluate` / `policy.remediate`. Hardening from the
+  governance pass: an empty `check_compliance` is scored `error` (never a false
+  `compliant`); a fresh verdict invalidates the 60s fleet-compliance cache so it
+  surfaces promptly; the evaluator's `polchk-*` correlation ids are skipped by
+  the execution-tracker notifier (no phantom executions / SSE — compliance is
+  not in the executions drawer); stranded `fixing` rows are reset to `unknown`
+  on restart; the background dispatch never holds the evaluator lock across the
+  (blocking) command dispatch; the interval is clamped to a ≥60s floor; the
+  evaluation thread is exception-isolated and joined before stores tear down
+  (`~ServerImpl` now calls `stop()`); caller-supplied `remediate` agent lists are
+  intersected with the policy's own scope; new `yuzu_server_policy_verdicts_total`
+  / `yuzu_server_policy_eval_errors_total` metrics.
+
+### Tests
+
+- `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
+  `PolicyEvaluator`: compliant/non_compliant multi-agent fan-out, non-responder
+  → `unknown`, plugin-failure → `error`, missing-field → `non_compliant`, CEL
+  eval-error → `error`, empty-CEL → `error` (no false compliant), interval
+  throttling, remediation fix→verify→compliant, remediation rejected without a
+  `fix`, the 3-attempt remediation cap → `error`, and verify-dispatch-failure →
+  `error`. Real stores on `TempDbFile`, a static management group for targets, a
+  fake dispatch that seeds canned responses, and an injectable clock.
+  visualization.** `VIZ_UAT_AGENT_MODE=cedar-vale-app bash
+  scripts/start-viz-uat.sh` stands up the fictional "Cedar & Vale" company as
+  three named tiers — **Envoy** (frontend) → **node.js** (app) → **Postgres**
+  (db) — each co-hosting a `yuzu-agent`, so the stack renders in `/viz/fleet`
+  with the presentation tier on top, app in the middle, and db at the bottom,
+  joined by two persistent blue connection tubes. The node tier serves an
+  8-slide impress.js (Prezi-style) deck on *"Agentic Colleagues: IT's force
+  multiplier & thinking partner"*; the slide content lives in Postgres
+  (`slides` table, seeded via initdb) and is read live on each request, and
+  the deck is reachable at `http://localhost:8088`. The deck is styled in the
+  Barony of Alyth livery (French Blue base, polished Metallic Gold + Metallic
+  Silver, black depth): metallic-gold headlines with a travelling specular
+  sheen, over an enigmatic dark background that is itself a *machine* — a fixed
+  Victorian analytical-engine backdrop: a deterministic train of ~17
+  interlocking brass/steel gears (constant tooth module so they mesh; centres at
+  the pitch distance; meshing neighbours turn opposite directions with
+  gear-ratio speeds — `omega·N` constant), murky/dark/blurred behind the slides,
+  spread across three clusters to fill the field. Motion is a pure function of a
+  single master drive angle (`public/machine.js` generates the train and drives
+  it), accelerating briefly on each slide transition ("thinking harder"), atop a
+  drifting French-blue nebula and edge vignette. The Barony of Alyth coat of arms,
+  recolored to an engraved aged-brass medallion mounted in a riveted cog bezel
+  (the ancient arms set in the machine), is fixed in the lower-left so the deck
+  is seen flying beneath it during transitions. Each slide is its own steampunk
+  brass plate: a distinct background texture per slide (8 ornate brass/clockwork
+  panels under a dark scrim, framed in brass with gold/shadow insets) so the
+  changing backdrop makes slide-to-slide movement obvious during transitions;
+  body text carries a dark halo for legibility over the machinery. Each slide
+  also supports an optional **moving** background: drop a `bg<N>.webm` into
+  `app/public/` and the server adds a `<video class="slide-video">` for that
+  slide (the JPG stays as poster + fallback), with only the active slide's clip
+  playing at a time (driven off impress step events in `machine.js`) and no
+  autoplay under reduced-motion — so animated steampunk backdrops can be added
+  one at a time without code changes. Slides fly in dramatically via a
+  big-canvas / z-dolly impress.js journey and a focus-blur snap; `data_scale` is
+  `REAL` so mid-deck zooms can be fractional, and all background/entrance motion
+  is `prefers-reduced-motion`-guarded. Tiers stack by their
+  listener ports (Envoy :8080 → frontend, node :3000 → app, Postgres :5432 →
+  db) and the tubes stay lit at idle via Envoy upstream health checks
+  (frontend→app) and a pg connection-pool keepalive (app→db). All three tiers
+  build on Debian trixie bases so the trixie-built agent's glibc matches.
+  Artifacts under `deploy/docker/cedar-vale/`. Complements the lightweight
+  `cedar-vale-local` (plain named agents) and macOS-only `cedar-vale`
+  (OrbStack VM) modes. DEV/UAT ONLY — `--no-tls`, baked demo credentials.
+- **viz-UAT `cedar-vale-local` mode: three named plain agents.**
+  `VIZ_UAT_AGENT_MODE=cedar-vale-local` runs three `yuzu-agent` containers with
+  hostnames `yuzu-frontend` / `yuzu-app` / `yuzu-db` (no real services), so
+  `/viz/fleet` labels three tiers by name without needing OrbStack VMs — the
+  Linux/WSL2-friendly cousin of the macOS `cedar-vale` mode.
+
+### Fixed
+
+- **viz-UAT: server config bind-mount must be world-readable (0644, not
+  0600).** `start-viz-uat.sh` generated `yuzu-server.cfg` at mode 0600 owned by
+  the operator's uid, then bind-mounted it into the server container which runs
+  as uid 999 (`yuzu`) — unreadable, so the server fell through to interactive
+  first-run setup, read empty stdin, and died on the password floor. The file
+  is a PBKDF2-SHA256 hash (no cleartext), so 0644 is correct for a
+  containerized launcher.
+
 ### Tests
 
 - **Integration / synthetic-UAT scripts: replace fragile log-grep assertions

@@ -174,9 +174,47 @@ The policy engine tracks compliance status per agent per policy. Each
 |---|---|
 | `compliant` | Check passed -- the endpoint is in the desired state |
 | `non_compliant` | Check failed -- the endpoint is not in the desired state |
-| `unknown` | Not yet evaluated or status invalidated |
+| `unknown` | Not yet evaluated, status invalidated, or the agent did not respond to a check within the grace window |
 | `fixing` | Fix instruction is currently running |
-| `error` | Check or fix instruction failed to execute |
+| `error` | Check or fix instruction failed to execute, **or the policy is misconfigured** (e.g. an empty compliance expression — a policy that checks nothing is reported as `error`, never `compliant`) |
+
+---
+
+## Automatic Evaluation
+
+Enabled policies are evaluated automatically by a background thread that runs
+every **10 seconds** (the evaluation cadence). On each tick the server:
+
+1. Selects every enabled policy whose evaluation interval has elapsed.
+2. Resolves the policy's management group(s) or scope expression to a target
+   agent list.
+3. Dispatches the bound fragment's `check` instruction to those agents (over
+   the same command path operator-initiated commands use).
+4. After a **15-second grace window**, reads each agent's response, evaluates
+   the CEL `check_compliance` expression, and writes the per-agent verdict.
+
+The evaluation interval is taken from the policy's first `interval` trigger
+(`interval_seconds`, clamped to a 60-second floor). A policy with no interval
+trigger defaults to **3600 seconds** (1 hour). Evaluation timing is in-memory,
+so after a server restart every enabled policy is due on the first tick (a
+freshly authored or just-restarted policy evaluates within ~25 seconds without
+waiting a full interval).
+
+Verdict semantics: a plugin failure / timeout / rejection → `error`; a
+non-responder after the grace window → `unknown`; a successful response that
+fails the CEL → `non_compliant`; one that satisfies it → `compliant`.
+
+> **Remediation is never automatic.** Detection runs on the schedule above;
+> applying a fix is always an explicit, operator-gated action (see
+> `POST /api/policies/{id}/remediate` below). On a server restart, any agent
+> left mid-remediation (`fixing`) is reset to `unknown` and re-evaluated, since
+> the in-flight fix/verify state does not survive the restart.
+
+### Forcing an immediate evaluation
+
+`POST /api/policies/{id}/evaluate` dispatches a check immediately, ignoring the
+interval. It returns `202` with an `execution_id`; verdicts land within roughly
+15–30 seconds (next collection cycle).
 
 ---
 
@@ -294,10 +332,12 @@ Both forms produce a 201 with `{"id": "<fragment-id>", "status": "created"}`.
 |---|---|---|
 | `GET` | `/api/policies` | List all policies. Query params: `name`, `fragment_id`, `enabled_only`, `limit`. |
 | `POST` | `/api/policies` | Create a policy from YAML. Body: same shape as `POST /api/policy-fragments` — full YAML in `yaml_source`, with `kind: Policy`. |
-| `GET` | `/api/policies/{id}` | Get policy detail including compliance summary. |
+| `GET` | `/api/policies/{id}` | Get policy detail including compliance summary and `remediation_available` (true when the bound fragment defines a `fix` instruction). |
 | `DELETE` | `/api/policies/{id}` | Delete a policy and its compliance data. |
 | `POST` | `/api/policies/{id}/enable` | Enable a disabled policy. |
 | `POST` | `/api/policies/{id}/disable` | Disable an active policy. |
+| `POST` | `/api/policies/{id}/evaluate` | Force an immediate compliance check, ignoring the interval. Permission: `Policy:Execute`. Returns `202` with `execution_id`; `409` if the policy has no check instruction or matches no agents. |
+| `POST` | `/api/policies/{id}/remediate` | Manually remediate non-compliant agents. Permission: `Policy:Execute`. Only valid when `remediation_available` is true (else `409`). Optional body `{"agent_ids":[...]}` scopes the fix to a subset (intersected with the policy's own scope); absent ⇒ all currently `non_compliant` agents. Never automatic. |
 | `POST` | `/api/policies/{id}/invalidate` | Invalidate agent-side cache for this policy. |
 | `POST` | `/api/policies/invalidate-all` | Invalidate cache for all policies (fleet-wide). |
 

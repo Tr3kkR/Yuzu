@@ -78,6 +78,8 @@ required.
 | `api_token.revoke` | ApiToken | An API token is revoked |
 | `quarantine.enable` | Security | A device is placed in quarantine |
 | `quarantine.disable` | Security | A device is released from quarantine |
+| `policy.evaluate` | Policy | A forced compliance check was triggered via `POST /api/policies/{id}/evaluate`. `target_id` is the policy id; on `result=success` `detail` is `execution_id=<id>`. The `409` branch (no check instruction / no matching agents) rejects without an audit row. Permission gate: `Policy:Execute`. |
+| `policy.remediate` | Policy | A manual remediation was triggered via `POST /api/policies/{id}/remediate`. `result` is `success` or `denied`. On success: `detail` is `execution_id=<id> agents=<N>`. On denied: `detail` is the rejection reason (no fix instruction / no in-scope agents / no non_compliant agents). Remediation is always operator-initiated, never automatic. Permission gate: `Policy:Execute`. |
 | `cert.reload` | TlsCertificate | Certificate hot-reload attempted; detail contains outcome (success or failure reason) |
 | `guaranteed_state.rule.create` | GuaranteedState | A Guaranteed State rule is created. On 400 (missing required fields), 409 (rule_id/name conflict), or RBAC rejection, emits `result=denied` with the store error in `detail`. |
 | `guaranteed_state.rule.update` | GuaranteedState | A Guaranteed State rule is updated (version is incremented on every successful update). On 404 (rule not found), 400 (invalid JSON body — `detail` is the literal string `"invalid JSON body"`), 409 (name conflict), or RBAC rejection, emits `result=denied`. |

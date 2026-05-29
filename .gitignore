@@ -108,6 +108,9 @@ build_log.txt
 .uat-sanitizer/
 *.local.md
 *.local.MD
+# hookify rule files (.claude/hookify.*.local.md) are intentionally shared with
+# the team despite the *.local.md suffix — negate the ignore so they're tracked.
+!.claude/hookify.*.local.md
 docker-compose.local.yml
 .codex/*
 !.codex/skills/
@@ -166,3 +169,9 @@ __pycache__/
 !/docs/agents/*.md
 .aider*
 .lora/
+
+# Server runtime artifacts written to the working dir on launch.
+# enrollment-tokens.cfg holds live enrollment tokens (secrets); pending-agents.cfg
+# is transient enrollment state. Never track either.
+enrollment-tokens.cfg
+pending-agents.cfg

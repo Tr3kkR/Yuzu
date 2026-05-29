@@ -1416,6 +1416,16 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     if (execution_id.empty())
         return; // out-of-band dispatch, nothing to publish
 
+    // Compliance-check correlation ids ("polchk-…", minted by PolicyEvaluator)
+    // are NOT operator executions: the evaluator tags responses with this id only
+    // so it can read them back via ResponseStore::query_by_execution. There is no
+    // ExecutionTracker row for them, so notifying the tracker here would publish
+    // an `agent-transition` SSE event (execution_tracker.cpp publishes
+    // unconditionally) and create orphan execution_agents rows for a phantom
+    // execution that the executions drawer / /api/v1/events would surface. Skip.
+    if (execution_id.starts_with("polchk-"))
+        return;
+
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();

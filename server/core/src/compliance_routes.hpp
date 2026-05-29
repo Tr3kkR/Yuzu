@@ -18,6 +18,8 @@
 
 namespace yuzu::server {
 
+class PolicyEvaluator;
+
 /// Compliance routes — /compliance, /fragments/compliance/*, /api/policies/*,
 /// /api/policy-fragments/*, /api/compliance/*.
 class ComplianceRoutes {
@@ -45,7 +47,8 @@ public:
                          AuditFn audit_fn,
                          EmitEventFn emit_event_fn,
                          PolicyStore* policy_store,
-                         AgentsJsonFn agents_json_fn);
+                         AgentsJsonFn agents_json_fn,
+                         PolicyEvaluator* policy_evaluator = nullptr);
 
 private:
     // -- Fragment renderers (called by route handlers) -------------------------
@@ -65,6 +68,7 @@ private:
     EmitEventFn emit_event_fn_;
     PolicyStore* policy_store_{};
     AgentsJsonFn agents_json_fn_;
+    PolicyEvaluator* policy_evaluator_{};
 };
 
 } // namespace yuzu::server

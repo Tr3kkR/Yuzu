@@ -49,6 +49,7 @@
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
+#include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
 #include "fleet_topology_store.hpp"
@@ -1410,6 +1411,16 @@ public:
         }
     }
 
+    // Destruction must guarantee every background thread is joined before its
+    // captured members are torn down. stop() does that join and is idempotent
+    // (guarded by the stop_entered_ CAS), so calling it here is safe even when
+    // the normal shutdown path already ran. Without this, a destruction that
+    // skips stop() — run() early-returning on a TLS/bind failure after the
+    // policy-eval / health threads were spawned, or an exception during late
+    // construction — would destroy a still-joinable std::thread and call
+    // std::terminate, or free borrowed stores out from under a live thread.
+    ~ServerImpl() override { stop(); }
+
     void run() override {
         spdlog::info("run(): entering");
         grpc::EnableDefaultHealthCheckService(true);
@@ -1711,6 +1722,12 @@ public:
         // Join the fleet health recomputation thread
         if (health_recompute_thread_.joinable()) {
             health_recompute_thread_.join();
+        }
+
+        // Join the policy evaluation thread (uses policy_evaluator_ + stores,
+        // so it must stop before any of them are torn down)
+        if (policy_eval_thread_.joinable()) {
+            policy_eval_thread_.join();
         }
 
         // Join the insecure-TLS reminder thread (issue #79)
@@ -5711,6 +5728,101 @@ private:
             return audit_log(req, action, result, target_type, target_id, detail);
         };
 
+        // Shared command-dispatch closure — sends a CommandRequest to agents via
+        // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so the
+        // PolicyEvaluator and WorkflowRoutes drive the EXACT same dispatch path.
+        auto command_dispatch_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id) -> std::pair<std::string, int> {
+            // Normalize action to lowercase — agent plugins register actions
+            // in lowercase and match case-sensitively.
+            auto norm_action = action;
+            for (auto& c : norm_action)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            auto command_id =
+                plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+            detail::pb::CommandRequest cmd;
+            cmd.set_command_id(command_id);
+            cmd.set_plugin(plugin);
+            cmd.set_action(norm_action);
+            for (const auto& [k, v] : parameters)
+                (*cmd.mutable_parameters())[k] = v;
+            agent_service_.record_send_time(command_id);
+            // PR 2 / UP2-4: register command_id -> execution_id BEFORE any RPC.
+            if (!execution_id.empty()) {
+                agent_service_.record_execution_id(command_id, execution_id);
+            }
+            int sent = 0;
+            if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
+                auto group_id = scope_expr.substr(6);
+                if (mgmt_group_store_) {
+                    auto members = mgmt_group_store_->get_members(group_id);
+                    for (const auto& m : members)
+                        if (registry_.send_to(m.agent_id, cmd))
+                            ++sent;
+                }
+            } else if (!scope_expr.empty()) {
+                auto parsed = yuzu::scope::parse(scope_expr);
+                if (parsed) {
+                    auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                            custom_properties_store_.get());
+                    for (const auto& aid : matched)
+                        if (registry_.send_to(aid, cmd))
+                            ++sent;
+                }
+            } else if (agent_ids.empty()) {
+                sent = registry_.send_to_all(cmd);
+            } else {
+                for (const auto& aid : agent_ids)
+                    if (registry_.send_to(aid, cmd))
+                        ++sent;
+            }
+            forward_gateway_pending();
+            if (sent > 0)
+                metrics_.counter("yuzu_commands_dispatched_total").increment();
+            return {command_id, sent};
+        };
+
+        // PolicyEvaluator — drives the compliance check -> verdict pipeline.
+        // A background thread ticks it: dispatch due policies' check
+        // instructions, collect responses, evaluate the CEL, write status.
+        policy_evaluator_ = std::make_unique<PolicyEvaluator>(PolicyEvaluator::Deps{
+            .policy_store = policy_store_.get(),
+            .instruction_store = instruction_store_.get(),
+            .response_store = response_store_.get(),
+            .registry = &registry_,
+            .tag_store = tag_store_.get(),
+            .custom_properties_store = custom_properties_store_.get(),
+            .mgmt_group_store = mgmt_group_store_.get(),
+            .metrics = &metrics_,
+            .dispatch_fn = command_dispatch_fn,
+        });
+        policy_eval_thread_ = std::thread([this]() {
+            spdlog::info("Policy evaluation thread started (cadence=10s, grace=15s)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (policy_evaluator_) {
+                    // tick() touches JSON parsing, the CEL evaluator and SQLite —
+                    // any of which can throw on a malformed policy/result. An
+                    // exception escaping a std::thread entry calls std::terminate,
+                    // so a single bad policy must not take the process (or silently
+                    // kill compliance evaluation). Catch, log, and keep ticking.
+                    try {
+                        policy_evaluator_->tick();
+                    } catch (const std::exception& e) {
+                        spdlog::error("policy_eval: tick threw ({}) — thread continuing", e.what());
+                    } catch (...) {
+                        spdlog::error("policy_eval: tick threw unknown exception — thread continuing");
+                    }
+                }
+            }
+        });
+
         // ComplianceRoutes — /compliance, /fragments/compliance/*, /api/policies/*,
         // /api/compliance/*
         compliance_routes_ = std::make_unique<ComplianceRoutes>();
@@ -5720,7 +5832,8 @@ private:
                    const nlohmann::json& attrs, const nlohmann::json& payload_data) {
                 emit_event(event_type, req, attrs, payload_data);
             },
-            policy_store_.get(), [this]() -> std::string { return registry_.to_json(); });
+            policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
+            policy_evaluator_.get());
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
@@ -5873,64 +5986,7 @@ private:
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();
-        wf_deps.command_dispatch_fn =
-            [this](const std::string& plugin, const std::string& action,
-                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters,
-                   const std::string& execution_id) -> std::pair<std::string, int> {
-            // Normalize action to lowercase — agent plugins register actions
-            // in lowercase and match case-sensitively.
-            auto norm_action = action;
-            for (auto& c : norm_action)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            auto command_id =
-                plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
-            detail::pb::CommandRequest cmd;
-            cmd.set_command_id(command_id);
-            cmd.set_plugin(plugin);
-            cmd.set_action(norm_action);
-            for (const auto& [k, v] : parameters)
-                (*cmd.mutable_parameters())[k] = v;
-            agent_service_.record_send_time(command_id);
-            // PR 2 / UP2-4: register the command_id → execution_id
-            // mapping BEFORE any RPC is sent so a sub-millisecond
-            // loopback agent's response cannot win the race against
-            // mapping registration. Empty execution_id (out-of-band
-            // dispatch with no tracker row) skips registration —
-            // record_execution_id is a no-op for empty values.
-            if (!execution_id.empty()) {
-                agent_service_.record_execution_id(command_id, execution_id);
-            }
-            int sent = 0;
-            if (!scope_expr.empty() && scope_expr.starts_with("group:")) {
-                auto group_id = scope_expr.substr(6);
-                if (mgmt_group_store_) {
-                    auto members = mgmt_group_store_->get_members(group_id);
-                    for (const auto& m : members)
-                        if (registry_.send_to(m.agent_id, cmd))
-                            ++sent;
-                }
-            } else if (!scope_expr.empty()) {
-                auto parsed = yuzu::scope::parse(scope_expr);
-                if (parsed) {
-                    auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                            custom_properties_store_.get());
-                    for (const auto& aid : matched)
-                        if (registry_.send_to(aid, cmd))
-                            ++sent;
-                }
-            } else if (agent_ids.empty()) {
-                sent = registry_.send_to_all(cmd);
-            } else {
-                for (const auto& aid : agent_ids)
-                    if (registry_.send_to(aid, cmd))
-                        ++sent;
-            }
-            forward_gateway_pending();
-            if (sent > 0)
-                metrics_.counter("yuzu_commands_dispatched_total").increment();
-            return {command_id, sent};
-        };
+        wf_deps.command_dispatch_fn = command_dispatch_fn;
         wf_deps.approval_manager = approval_manager_.get();
         wf_deps.response_store = response_store_.get();
         // PR 3 — SSE event bus for live execution updates. Server owns
@@ -6365,6 +6421,7 @@ private:
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
     std::unique_ptr<PolicyStore> policy_store_;
+    std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
     std::unique_ptr<AuthRoutes> auth_routes_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
@@ -6417,6 +6474,7 @@ private:
     // Fleet health aggregation
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
+    std::thread policy_eval_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;

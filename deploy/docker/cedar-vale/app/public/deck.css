@@ -1,0 +1,312 @@
+/* Cedar & Vale demo deck — dark theme (Yuzu is dark-theme only).
+ *
+ * Barony of Alyth livery for the "world's first Agentic Colleague IT team":
+ * French Blue base, polished Metallic Gold + Silver, black for depth.
+ *
+ * The background is a hidden machine: murky gold/silver gears, far away and
+ * dark, that idle with a slow creep and spin up on each slide transition — as
+ * if a (friendly, unscary) mechanism is what moves the deck. Gear motion is
+ * driven by public/machine.js off impress.js step events. The headline uses a
+ * banded metallic-gold gradient with a slow travelling specular sheen so it
+ * reads as actual metal catching light.
+ */
+
+:root {
+  /* --- Barony of Alyth livery --- */
+  --french-blue:       #0a6cb0;
+  --french-blue-mid:   #064b80;
+  --french-blue-deep:  #032d52;
+  --french-blue-abyss: #02192f;
+  --ink-black:         #04070c;
+
+  --silver:    #c4ccd6;
+  --silver-hi: #f1f4f8;
+  --silver-lo: #8b95a3;
+
+  --gold:    #d4af37;
+  --gold-hi: #f7e9a8;
+  --gold-lo: #a87f1e;
+
+  --ink:    #eaf1f8;
+  --muted:  #9fb2c6;
+  --rule:   rgba(196, 204, 214, 0.18);   /* faint silver hairline */
+  --accent: var(--french-blue);
+}
+
+/* The opaque backdrop lives on <html> only. <body> must stay transparent:
+ * the background layers (nebula / gears / vignette) sit at negative z-index, and
+ * an opaque body background — body is not a stacking context — would paint over
+ * them and hide the whole machine. Order matters: the body:transparent rule must
+ * not also match html, or it would override html's opaque base (equal
+ * specificity, later wins). */
+html, body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+  color: var(--ink);
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+html { background: var(--ink-black); }
+body { background: transparent; }
+
+/* --- Background depth, back to front: nebula (-3), gears (-2), vignette (-1) --- */
+
+/* Deep French-blue nebula drifting slowly over black. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: -20%;
+  z-index: -3;
+  background:
+    radial-gradient(58% 48% at 28% 26%, rgba(10, 108, 176, 0.20) 0%, rgba(6, 75, 128, 0.08) 36%, rgba(2, 25, 47, 0) 64%),
+    radial-gradient(52% 56% at 80% 74%, rgba(6, 75, 128, 0.15) 0%, rgba(3, 45, 82, 0.06) 38%, rgba(2, 25, 47, 0) 66%),
+    radial-gradient(110% 110% at 50% 48%, rgba(3, 45, 82, 0.12) 0%, var(--ink-black) 50%);
+  animation: nebula-drift 46s ease-in-out infinite alternate;
+  will-change: transform;
+}
+
+/* Vignette sits ABOVE the gears so their edges sink into the dark — "murky,
+ * far away". Static. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(125% 108% at 50% 44%,
+    rgba(4, 7, 12, 0) 30%,
+    rgba(4, 7, 12, 0.45) 72%,
+    rgba(4, 7, 12, 0.86) 100%);
+}
+
+@keyframes nebula-drift {
+  0%   { transform: translate3d(-2%, -1%, 0)  scale(1.05); }
+  50%  { transform: translate3d(1.5%, 1%, 0)  scale(1.12); }
+  100% { transform: translate3d(2%, -1.5%, 0) scale(1.06); }
+}
+
+/* The gear machine: murky, dark, far. JS rotates each <use> in place and gives
+ * the whole field a small parallax nudge per transition. */
+.machine {
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+/* Each gear is an outer <g> (translated to its centre) wrapping an inner <g>
+ * (rotated about the local origin); machine.js generates the meshing train and
+ * drives the rotation. Colour comes from currentColor via the class. */
+.gear--gold   { color: #8f6f1e; }   /* dark murky brass */
+.gear--silver { color: #586a82; }   /* dark murky steel */
+.g-far  { opacity: 0.13; filter: blur(3px); }
+.g-mid  { opacity: 0.20; filter: blur(2px); }
+.g-near { opacity: 0.28; filter: blur(1px); }
+
+/* Fallback shown only when impress.js can't run (small screens / old browsers). */
+.fallback-message { display: none; }
+.impress-not-supported .fallback-message {
+  display: block;
+  margin: 2rem auto;
+  max-width: 40rem;
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  color: var(--muted);
+}
+.impress-supported .fallback-message { display: none; }
+
+/* impress.js sets up #impress; each .step is one slide on the canvas.
+ * NOTE: do not put `transform` on .step — impress.js owns the inline
+ * transform. We animate opacity + filter only. */
+.step {
+  position: relative;
+  isolation: isolate;                /* contain the video / scrim / content z-stack */
+  overflow: hidden;                  /* clip the bg video to the rounded corners */
+  box-sizing: border-box;
+  width: 1100px;
+  padding: 60px 72px 68px;
+  border-radius: 16px;
+  /* Each slide is a steampunk brass plate. The JPG (--slide-bg, set per slug
+   * below) is the static background AND the <video> poster; when a bg<N>.webm
+   * exists the server adds a <video class="slide-video"> that covers it. A scrim
+   * (::after) sits over whichever is showing, heavy where the text is (top-left)
+   * and thinning to the bottom-right so the machinery shows through. */
+  background-color: #0a0d12;
+  background-image: var(--slide-bg, none);
+  background-size: cover;
+  background-position: center;
+  border: 2px solid rgba(173, 138, 54, 0.55);     /* brass frame */
+  box-shadow:
+    0 30px 90px rgba(0, 0, 0, 0.60),
+    inset 0 0 0 1px rgba(18, 11, 3, 0.85),         /* dark inner edge under brass */
+    inset 0 2px 0 rgba(247, 233, 168, 0.20),       /* gold top highlight */
+    inset 0 -34px 64px rgba(0, 0, 0, 0.50);        /* bottom shade for depth */
+  opacity: 0.06;
+  filter: blur(2px);
+  transition: opacity 0.7s ease, filter 0.7s ease;
+}
+.step.active {
+  opacity: 1;
+  filter: none;
+}
+
+/* Per-slide moving background (present only when bg<N>.webm exists). Covers the
+ * JPG, sits under the scrim. machine.js plays only the active slide's video. */
+.slide-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: 0;
+  pointer-events: none;
+}
+/* Scrim over the background (JPG or video) for text legibility. */
+.step::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: linear-gradient(125deg, rgba(3, 7, 12, 0.90) 0%, rgba(3, 7, 12, 0.76) 44%, rgba(6, 11, 18, 0.52) 100%);
+}
+/* Slide content sits above the scrim. */
+.step > *:not(.slide-video) { position: relative; z-index: 2; }
+
+/* One distinct steampunk background per slide, so the changing backdrop makes
+ * slide-to-slide movement obvious during transitions. Mapped by slug (the
+ * server already emits class="step slide-<slug>"), position order 1..8. */
+.slide-title    { --slide-bg: url(/public/bg1.jpg); }
+.slide-strain   { --slide-bg: url(/public/bg2.jpg); }
+.slide-what     { --slide-bg: url(/public/bg3.jpg); }
+.slide-force    { --slide-bg: url(/public/bg4.jpg); }
+.slide-thinking { --slide-bg: url(/public/bg5.jpg); }
+.slide-how      { --slide-bg: url(/public/bg6.jpg); }
+.slide-trust    { --slide-bg: url(/public/bg7.jpg); }
+.slide-vision   { --slide-bg: url(/public/bg8.jpg); }
+
+/* Dramatic content entrance — animates child elements (impress doesn't touch
+ * their transforms), replayed each time the step re-activates. */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(28px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.step.active h1,
+.step.active h2,
+.step.active p,
+.step.active ul,
+.step.active .callout {
+  animation: rise 0.8s cubic-bezier(.2, .7, .2, 1) both;
+}
+.step.active h2          { animation-delay: 0.05s; }
+.step.active p           { animation-delay: 0.12s; }
+.step.active ul          { animation-delay: 0.16s; }
+.step.active .callout    { animation-delay: 0.24s; }
+
+/* Polished metallic gold: banded dark-recess/bright-specular gradient + a slow
+ * travelling sheen so it reads as real metal. */
+.step h1 {
+  font-size: 76px;
+  line-height: 1.18;          /* was 1.04 — too tight, clipped 'g'/'y' descenders */
+  padding-bottom: 0.14em;     /* room so background-clip:text shows the full glyph */
+  margin: 0 0 14px;
+  letter-spacing: -0.02em;
+  background: linear-gradient(100deg,
+    #6e5210 0%,
+    #9c7a1c 7%,
+    #d8b53f 14%,
+    #f6e7a4 20%,
+    #fffdf0 24%,   /* specular */
+    #efd877 29%,
+    #c69f2e 37%,
+    #8a6a14 46%,   /* dark recess */
+    #b8901f 55%,
+    #ecd06a 64%,
+    #fff7d6 70%,   /* specular */
+    #d8b53f 78%,
+    #a07c1a 88%,
+    #6e5210 100%);
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.9)) drop-shadow(0 6px 14px rgba(0, 0, 0, 0.55)) drop-shadow(0 0 1px rgba(255, 240, 190, 0.35));
+  animation: gold-sheen 7s linear infinite;
+}
+@keyframes gold-sheen {
+  to { background-position: -220% 0; }
+}
+
+.step h2 {
+  font-size: 40px;
+  line-height: 1.18;
+  margin: 0 0 24px;
+  color: var(--silver-hi);
+  font-weight: 600;
+}
+.step h2 em { color: var(--gold); font-style: normal; }
+.step p { font-size: 26px; line-height: 1.5; color: var(--ink); margin: 0 0 16px; }
+.step ul { margin: 8px 0 0; padding: 0 0 0 1.1em; }
+.step li { font-size: 25px; line-height: 1.55; margin: 0 0 12px; color: var(--ink); }
+.step li::marker { color: var(--gold); }
+.step li b, .step p b { color: var(--silver-hi); }
+
+/* Legibility over the steampunk texture: a dark halo under all body text. */
+.step h2, .step p, .step li, .eyebrow, .footnote, .callout {
+  text-shadow: 0 2px 6px rgba(0, 0, 0, 0.9), 0 0 2px rgba(0, 0, 0, 0.8);
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.34em;
+  font-size: 18px !important;
+  color: var(--gold) !important;
+  margin: 0 0 10px !important;
+}
+.footnote { font-size: 20px !important; color: var(--muted) !important; margin-top: 22px !important; }
+.callout {
+  margin-top: 22px !important;
+  padding: 16px 20px;
+  border-left: 3px solid var(--gold);
+  background: rgba(10, 108, 176, 0.12);
+  border-radius: 0 8px 8px 0;
+  color: var(--silver-hi) !important;
+  font-size: 23px !important;
+}
+
+.hint {
+  position: fixed;
+  bottom: 14px;
+  right: 18px;
+  font-size: 13px;
+  color: var(--muted);
+  opacity: 0.7;
+  z-index: 10;
+}
+
+/* The steampunk Barony of Alyth crest — a fixed seal in the lower-left, ABOVE
+ * the slides (z-index over the steps) so the deck is seen flying beneath it
+ * during transitions. Subtle and translucent to sit with the livery. */
+.crest {
+  position: fixed;
+  left: 30px;
+  bottom: 26px;
+  width: 138px;
+  height: auto;
+  z-index: 40;
+  opacity: 0.6;
+  pointer-events: none;
+  filter: drop-shadow(0 6px 16px rgba(0, 0, 0, 0.55)) drop-shadow(0 0 1px rgba(247, 233, 168, 0.25));
+}
+
+/* Respect reduced-motion: kill ambient + entrance + headline sheen. Gear motion
+ * is separately disabled in machine.js. */
+@media (prefers-reduced-motion: reduce) {
+  body::before { animation: none; }
+  .machine { transition: none; }
+  .step h1 { animation: none; }
+  .step.active h1, .step.active h2, .step.active p, .step.active ul, .step.active .callout { animation: none; }
+}

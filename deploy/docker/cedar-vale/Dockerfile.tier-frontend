@@ -1,0 +1,38 @@
+# Cedar & Vale demo — frontend tier: Envoy + co-located yuzu-agent.
+#
+# Envoy's official image is Ubuntu 22.04 (glibc 2.35), too old for the
+# trixie-built agent (needs GLIBC_2.38 / GLIBCXX_3.4.32). So we run Envoy's
+# binary on a debian:trixie-slim base instead — an Ubuntu-22.04-built Envoy
+# binary is forward-compatible with trixie's newer glibc (verified: it runs),
+# and trixie matches the agent. One base, both processes happy.
+#
+# Envoy listens on :8080 (a "web" port), which is what makes fleet-viz classify
+# this host into the frontend tier (top of the stack). It reverse-proxies to the
+# node app tier and active-health-checks it to hold the frontend->app tube lit.
+#
+# Build context is the repo root (compose sets context: ../..).
+
+FROM yuzu-agent-viz-uat:latest AS agentsrc
+FROM envoyproxy/envoy:v1.32-latest AS envoysrc
+
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl3 libsqlite3-0 libstdc++6 ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/yuzu-agent /etc/envoy
+
+COPY --from=envoysrc /usr/local/bin/envoy                 /usr/local/bin/envoy
+COPY --from=agentsrc /usr/local/bin/yuzu-agent            /usr/local/bin/yuzu-agent
+COPY --from=agentsrc /usr/local/lib/libyuzu_agent_core.so /usr/local/lib/libyuzu_agent_core.so
+COPY --from=agentsrc /usr/lib/yuzu/plugins/               /usr/lib/yuzu/plugins/
+RUN ldconfig
+
+COPY deploy/docker/cedar-vale/envoy.yaml          /etc/envoy/envoy.yaml
+COPY deploy/docker/cedar-vale/tier-entrypoint.sh  /usr/local/bin/tier-entrypoint.sh
+RUN chmod +x /usr/local/bin/tier-entrypoint.sh
+
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/yuzu/plugins
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/tier-entrypoint.sh"]
+CMD ["envoy", "-c", "/etc/envoy/envoy.yaml", "--base-id", "1"]
