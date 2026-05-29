@@ -644,6 +644,11 @@ public:
             std::string_view reason = "load_failed";
             if (err.reason.starts_with(yuzu::agent::kReservedNameReason)) {
                 reason = "reserved_name";
+            } else if (err.reason.starts_with(yuzu::agent::kInvalidNameReason)) {
+                // #822: a plugin declared a malformed name (empty, over-length,
+                // or outside [A-Za-z0-9_]) — distinct from a reserved-name
+                // attempt so operators can alert on crafted-name loads.
+                reason = "invalid_name";
             } else if (err.reason.starts_with(yuzu::agent::kSignatureMissingReason)) {
                 reason = "signature_missing";
             } else if (err.reason.starts_with(yuzu::agent::kSignatureUntrustedReason)) {

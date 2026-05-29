@@ -23,6 +23,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <string_view>
 #include <system_error>
 
 namespace fs = std::filesystem;
@@ -37,12 +38,13 @@ constexpr const char* kPluginExt = ".dylib";
 constexpr const char* kPluginExt = ".so";
 #endif
 
-// Locate the reserved-name fixture plugin built by tests/meson.build
-// (`reserved_name_fixture_plugin`). Returns empty path if not found —
+// Locate a fixture plugin shared library (`<base_name><ext>`) built by
+// tests/meson.build — e.g. "reserved_name_fixture_plugin" (#453) or
+// "invalid_name_fixture_plugin" (#822). Returns empty path if not found —
 // tests that require the fixture should SKIP rather than FAIL to keep
 // cross-compile / restricted-CI scenarios quiet.
-fs::path find_reserved_fixture_plugin() {
-    const std::string lib_name = std::string{"reserved_name_fixture_plugin"} + kPluginExt;
+fs::path find_fixture_plugin(std::string_view base_name) {
+    const std::string lib_name = std::string{base_name} + kPluginExt;
 
     std::vector<fs::path> candidates;
     if (auto* build_root = std::getenv("MESON_BUILD_ROOT")) {
@@ -305,6 +307,58 @@ TEST_CASE("kReservedPluginNames covers guardian, system, update",
     REQUIRE(yuzu::agent::kReservedPluginNames[2] == "__update__");
 }
 
+// ── #822 plugin-name validation ──────────────────────────────────────────────
+
+TEST_CASE("is_valid_plugin_name accepts well-formed identifiers",
+          "[plugin_loader][name_validation]") {
+    using yuzu::agent::is_valid_plugin_name;
+
+    REQUIRE(is_valid_plugin_name("example"));
+    REQUIRE(is_valid_plugin_name("inventory_scan"));
+    REQUIRE(is_valid_plugin_name("plugin42"));
+    REQUIRE(is_valid_plugin_name("_leading_underscore"));
+    REQUIRE(is_valid_plugin_name("CamelCase"));
+    REQUIRE(is_valid_plugin_name("ALLCAPS"));
+
+    // Reserved names are themselves valid identifiers — the charset check
+    // passes them through; is_reserved_plugin_name is what rejects them.
+    REQUIRE(is_valid_plugin_name("__guard__"));
+    REQUIRE(is_valid_plugin_name("__system__"));
+    REQUIRE(is_valid_plugin_name("__update__"));
+
+    // Exactly at the length bound is allowed.
+    REQUIRE(is_valid_plugin_name(std::string(yuzu::agent::kMaxPluginNameLen, 'a')));
+}
+
+TEST_CASE("is_valid_plugin_name rejects malformed names",
+          "[plugin_loader][name_validation]") {
+    using yuzu::agent::is_valid_plugin_name;
+
+    // Empty / over-length.
+    REQUIRE_FALSE(is_valid_plugin_name(""));
+    REQUIRE_FALSE(is_valid_plugin_name(std::string(yuzu::agent::kMaxPluginNameLen + 1, 'a')));
+
+    // Characters outside [A-Za-z0-9_].
+    REQUIRE_FALSE(is_valid_plugin_name("has space"));
+    REQUIRE_FALSE(is_valid_plugin_name("has-hyphen"));
+    REQUIRE_FALSE(is_valid_plugin_name("has.dot"));
+    REQUIRE_FALSE(is_valid_plugin_name("path/separator"));
+    REQUIRE_FALSE(is_valid_plugin_name("pipe|delimited")); // server splits output on '|'
+    REQUIRE_FALSE(is_valid_plugin_name("bang!"));
+
+    // Control / embedded bytes that would diverge a std::string_view check
+    // from a downstream C-string consumer, or forge a log line (#822). The NUL
+    // case is sized explicitly so the view spans past the embedded NUL.
+    REQUIRE_FALSE(is_valid_plugin_name(std::string_view{"nul\0byte", 8}));
+    REQUIRE_FALSE(is_valid_plugin_name("line\nfeed"));
+    REQUIRE_FALSE(is_valid_plugin_name("tab\tstop"));
+
+    // Non-ASCII high bytes (negative char on signed-char platforms — the
+    // hand-rolled range test must reject these without invoking isalnum UB).
+    REQUIRE_FALSE(is_valid_plugin_name("emoji\xF0\x9F\x98\x80"));
+    REQUIRE_FALSE(is_valid_plugin_name(std::string_view{"\xFF\xFE", 2}));
+}
+
 // ── Code-signing tests (#80) ─────────────────────────────────────────────────
 
 TEST_CASE("verify_plugin_signature accepts a valid CMS signature", "[plugin_loader][signing]") {
@@ -426,7 +480,7 @@ TEST_CASE("PluginLoader::scan with require_signature on rejects unsigned plugin 
 
 TEST_CASE("PluginLoader rejects a plugin declaring a reserved name",
           "[plugin_loader][reserved_name]") {
-    auto fixture = find_reserved_fixture_plugin();
+    auto fixture = find_fixture_plugin("reserved_name_fixture_plugin");
     if (fixture.empty()) {
         WARN("reserved_name_fixture_plugin not found — skipping behavioral scan test");
         SUCCEED();
@@ -462,6 +516,40 @@ TEST_CASE("PluginLoader rejects a plugin declaring a reserved name",
     REQUIRE(err.path == staged.string());
     REQUIRE(err.reason.starts_with(yuzu::agent::kReservedNameReason));
     REQUIRE(err.reason.find("__guard__") != std::string::npos);
+
+    fs::remove_all(tmp);
+}
+
+TEST_CASE("PluginLoader rejects a plugin declaring an invalid name",
+          "[plugin_loader][name_validation]") {
+    auto fixture = find_fixture_plugin("invalid_name_fixture_plugin");
+    if (fixture.empty()) {
+        WARN("invalid_name_fixture_plugin not found — skipping behavioral scan test");
+        SUCCEED();
+        return;
+    }
+
+    // Scan an isolated copy so the result reflects only this fixture (mirrors
+    // the reserved-name behavioral test above).
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_invalid_name_plugin_");
+    fs::create_directories(tmp);
+    auto staged = tmp / fixture.filename();
+    std::error_code ec;
+    fs::copy_file(fixture, staged, fs::copy_options::overwrite_existing, ec);
+    REQUIRE_FALSE(ec);
+
+    auto result = yuzu::agent::PluginLoader::scan(tmp);
+
+    // A malformed name must not yield a loaded plugin...
+    REQUIRE(result.loaded.empty());
+    // ...and must surface as a single error tagged with the stable reason so
+    // the agent metric can categorise it. The reason is exactly kInvalidNameReason
+    // with no suffix — the raw (attacker-controlled) name is deliberately not
+    // echoed (#822).
+    REQUIRE(result.errors.size() == 1);
+    const auto& err = result.errors.front();
+    REQUIRE(err.path == staged.string());
+    REQUIRE(err.reason == yuzu::agent::kInvalidNameReason);
 
     fs::remove_all(tmp);
 }
