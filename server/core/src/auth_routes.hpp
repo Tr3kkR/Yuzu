@@ -14,10 +14,13 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 
 namespace yuzu::server {
 
@@ -91,6 +94,22 @@ public:
                    const std::string& result, const std::string& target_type = {},
                    const std::string& target_id = {}, const std::string& detail = {});
 
+    /// Variant that stamps `principal` + `principal_role` explicitly
+    /// rather than resolving from `resolve_session(req)`. Used at the
+    /// three "mint a fresh session" sites (`POST /login` no-MFA,
+    /// `POST /login/mfa` TOTP/recovery success, OIDC `/auth/callback`)
+    /// where the request itself carries no session cookie yet but the
+    /// authenticating principal IS known to the handler. Without this,
+    /// `make_audit_event` writes an empty `principal` and the SOC 2
+    /// CC6.6 query "every privileged session-creation row names the
+    /// principal" returns false negatives (Gate 4 consistency B3).
+    bool audit_log_for_principal(const httplib::Request& req, const std::string& action,
+                                 const std::string& result, const std::string& principal,
+                                 const std::string& principal_role,
+                                 const std::string& target_type = {},
+                                 const std::string& target_id = {},
+                                 const std::string& detail = {});
+
     /// Emit an analytics event with HTTP request context.
     void emit_event(const std::string& event_type, const httplib::Request& req,
                     const nlohmann::json& attrs = {}, const nlohmann::json& payload_data = {},
@@ -124,6 +143,33 @@ private:
     AnalyticsEventStore* analytics_store_;
     std::shared_mutex& oidc_mu_;
     std::unique_ptr<oidc::OidcProvider>& oidc_provider_;
+
+    /// Pending MFA challenge issued after a successful password verify on
+    /// /login when the user has TOTP enrolled. Keyed by an opaque random
+    /// `mfa_pending_token` returned to the browser; resolved by the
+    /// matching POST /login/mfa request. Expires after
+    /// `cfg.mfa_login_pending_secs`; entries are reaped lazily on every
+    /// access. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
+    ///
+    /// `attempts` caps online TOTP guessing per challenge to
+    /// `kMfaMaxAttemptsPerPending` (default 5). Once exceeded the entry
+    /// is erased and the operator must restart with a fresh password
+    /// submission. Closes Gate 2 H1 + unhappy-path UP-11 (rate-limit
+    /// gap → CPU DoS via PBKDF2 amplification).
+    struct MfaPending {
+        std::string username;
+        auth::Role role{auth::Role::user};
+        std::chrono::steady_clock::time_point expires_at{};
+        int attempts{0};
+    };
+    static constexpr int kMfaMaxAttemptsPerPending = 5;
+    mutable std::mutex mfa_pending_mu_;
+    std::unordered_map<std::string, MfaPending> mfa_pending_;
+
+    /// Drop every pending row whose deadline has passed. Called under
+    /// `mfa_pending_mu_` from each insert/lookup; constant-time on an
+    /// empty map and bounded by the configured rate limit.
+    void reap_mfa_pending_locked();
 };
 
 } // namespace yuzu::server

@@ -3377,6 +3377,49 @@ These endpoints drive the **Settings → Plugin Code Signing** card. The four `/
 
 ---
 
+### Settings — Multi-Factor Authentication (MFA / TOTP)
+
+These endpoints drive the **Settings → Multi-Factor Authentication** card. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than JSON. All five require an admin session and target `#mfa-section` for swap-in. SOC 2 CC6.6 — see `docs/auth-mfa-design.md`.
+
+**`GET /fragments/settings/mfa`** — Render the MFA card for the logged-in admin.
+
+- **Permission:** Admin only.
+- **Response (200):** HTML fragment showing current status (`Not enrolled` / `Enabled` / `Disabled`), recovery codes remaining, and the operative action buttons.
+
+**`POST /api/settings/mfa/init`** — Begin TOTP enrollment.
+
+- **Permission:** Admin only.
+- **Effect:** Generates a fresh 20-byte CSPRNG secret and stores it provisionally (`mfa_enrolled_at` stays NULL). Re-running on an already-provisional row rotates the secret; refused if the user is already enrolled (`MfaAlreadyEnrolled` → 200 with error message in the fragment).
+- **Response (200):** HTML fragment containing the `otpauth://` URI + base32 secret as a one-time reveal, plus the verify-code form. Response carries `Cache-Control: no-store, private`, `Pragma: no-cache`, and `Referrer-Policy: no-referrer` so browsers / proxies / CDNs cannot retain the material.
+- **Audit:** `mfa.enroll.initiated` / `ok` (or `error` on failure).
+
+**`POST /api/settings/mfa/verify`** — Confirm enrollment by submitting the first TOTP code.
+
+- **Permission:** Admin only.
+- **Request body (form-encoded):** `code=<6-digit TOTP from authenticator>`.
+- **Effect on success:** Sets `mfa_enrolled_at = CURRENT_TIMESTAMP`, advances `mfa_last_counter` to the matched counter (replay defence), generates 10 single-use recovery codes (PBKDF2-SHA256 hashed in `mfa_recovery_codes`).
+- **Response (200, success):** HTML fragment with the 10 recovery codes as a one-time reveal (`XXXX-XXXX-XXXX-XXXX`, 80 bits each). Same `Cache-Control: no-store` headers as `init`.
+- **Response (200, failure):** Re-renders the verify form with an instruction to wait for the next 30 s code. Provisional row survives so the operator's authenticator app keeps working; the secret is NOT re-revealed.
+- **Audit:** `mfa.enroll.verified` + `mfa.recovery_codes.generated` on success; `mfa.enroll.failed` on rejection.
+
+**`POST /api/settings/mfa/recovery-codes`** — Regenerate the 10 recovery codes.
+
+- **Permission:** Admin only. Requires existing enrollment.
+- **Effect:** Atomic DELETE + 10×INSERT inside a `BEGIN IMMEDIATE / COMMIT` transaction. All prior codes (consumed and unconsumed) are invalidated.
+- **Response (200):** HTML fragment with the fresh 10 codes as a one-time reveal. Same `Cache-Control: no-store` headers.
+- **Audit:** `mfa.recovery_codes.generated` / `ok` (detail = `10 codes issued (rotation)`).
+
+**`POST /api/settings/mfa/disable`** — Clear MFA state for the logged-in admin.
+
+- **Permission:** Admin only.
+- **Effect:** Atomic UPDATE users (clears `mfa_totp_secret`, `mfa_enrolled_at`; stamps `mfa_disabled_at`) + DELETE `mfa_recovery_codes` inside a `BEGIN IMMEDIATE / COMMIT` transaction.
+- **Response (200):** HTML fragment showing the "Not enrolled" state.
+- **Audit:** `mfa.disabled` / `ok` (or `error` on DB failure).
+
+> **Note — admin force-disable for other users:** the PR 1 endpoints are self-service only. An admin cannot disable another user's MFA via the dashboard or REST in this release; that feature is planned. For emergency lockout recovery use the break-glass procedure in `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable.
+
+---
+
 ### Settings — User Management
 
 These endpoints drive the **Settings → Users** tab. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than the standard JSON envelope. All three require an admin session and the dashboard swaps the response body into `#user-section`.
@@ -4356,7 +4399,9 @@ These endpoints manage user sessions and SSO flows.
 
 #### `POST /login`
 
-Authenticate with username and password. Sets the `yuzu_session` cookie on success.
+Authenticate with username and password.
+
+**Permission:** None (unauthenticated).
 
 **Request body (form-encoded):**
 
@@ -4364,8 +4409,36 @@ Authenticate with username and password. Sets the `yuzu_session` cookie on succe
 username=admin&password=secretpass
 ```
 
-**Success:** Redirect to `/` (dashboard).
-**Failure:** Redirect to `/login?error=1`.
+**Responses:**
+
+| Status | Condition | Body |
+|---|---|---|
+| `200` + `Set-Cookie: yuzu_session=…` | Credentials valid; user has no MFA enrolled | `{"status":"ok"}` |
+| `202` | Credentials valid; user has TOTP MFA enrolled | `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — complete the challenge by posting the pending token + TOTP code (or recovery code) to `POST /login/mfa` |
+| `401` | Invalid credentials | `{"error":{"code":401,"message":"Invalid username or password"}}` |
+
+The `mfa_pending_token` is a 32-byte hex (64-char) opaque random; its lifetime is `cfg.mfa_login_pending_secs` (default 120 s). The pending state lives in process memory and is lost on server restart, and is not shared across HA replicas without sticky sessions.
+
+#### `POST /login/mfa`
+
+Complete a pending MFA login. Called after receiving HTTP 202 from `POST /login`.
+
+**Permission:** None (unauthenticated — the pending token is the bearer).
+
+**Request body (form-encoded):**
+
+```
+mfa_pending_token=<64-hex>&code=<6-digit TOTP or XXXX-XXXX-XXXX-XXXX recovery code>
+```
+
+The endpoint distinguishes TOTP from recovery by code shape — exactly 6 ASCII digits is interpreted as TOTP; anything else routes through recovery-code validation. Each pending token allows at most 5 attempts before being invalidated; once invalidated the operator must start over from `POST /login`.
+
+**Responses:**
+
+| Status | Condition | Body |
+|---|---|---|
+| `200` + `Set-Cookie: yuzu_session=…` | Code accepted | `{"status":"ok"}` |
+| `401` | Invalid or expired pending token, or rejected code | `{"error":{"code":401,"message":"Invalid verification code"}}` — the wire body is identical for all failure modes so an attacker cannot distinguish "this pending token is valid; my code was wrong" from "this pending token is unknown." The distinguishing detail is in the audit `detail` column only. |
 
 #### `POST /logout`
 

@@ -24,6 +24,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -111,6 +112,19 @@ private:
     ///                         (governance Gate 4 finding C1).
     std::string render_api_tokens_fragment(const std::string& new_raw_token = {},
                                            const std::string& filter_principal = {});
+    /// Render the per-user MFA / TOTP self-service panel. Shows current
+    /// status (enrolled / not enrolled / disabled), recovery-codes-remaining,
+    /// and the operative buttons (enroll / disable / regenerate codes).
+    /// Optional `otpauth_uri` / `secret_b32` / `recovery_codes` are populated
+    /// by the POST handlers for the one-time reveal after enroll / verify /
+    /// regenerate. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
+    std::string render_mfa_fragment(const std::string& username,
+                                    const std::string& new_otpauth_uri = {},
+                                    const std::string& new_secret_b32 = {},
+                                    const std::vector<std::string>& new_recovery_codes = {},
+                                    const std::string& enrollment_pending_for_verify = {},
+                                    const std::string& error_msg = {});
+
     std::string render_pending_fragment();
     std::string render_auto_approve_fragment();
     std::string render_tag_compliance_fragment();

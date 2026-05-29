@@ -163,6 +163,8 @@ if build_server
     files(
       'unit/server/test_auth.cpp',
       'unit/server/test_auth_routes.cpp',
+      'unit/server/test_totp.cpp',
+      'unit/server/test_mfa_store.cpp',
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',
       'unit/server/test_nvd.cpp',

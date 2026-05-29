@@ -26,7 +26,7 @@ curl -s -c cookies.txt -X POST http://localhost:8080/login \
   -d "username=admin&password=s3cret"
 ```
 
-On success the response is a `200 OK` with a JSON body `{"status":"ok"}` and a `Set-Cookie` header containing the `yuzu_session` token. The `cookies.txt` file now contains the session cookie. Use it on subsequent requests:
+On success the response is a `200 OK` with a JSON body `{"status":"ok"}` and a `Set-Cookie` header containing the `yuzu_session` token. **For users enrolled in TOTP MFA the response is HTTP 202** with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` and no cookie — the operator must complete the challenge by posting the pending token + a 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `/login/mfa`, which then mints the session cookie. See the [Multi-Factor Authentication (TOTP)](#multi-factor-authentication-totp) section below for the full flow. The `cookies.txt` file now contains the session cookie. Use it on subsequent requests:
 
 ```bash
 curl -s -b cookies.txt http://localhost:8080/api/v1/me
@@ -45,6 +45,75 @@ curl -s -b cookies.txt http://localhost:8080/api/v1/me
 ```
 
 All REST API v1 responses are wrapped in this envelope. The `data` key holds the payload, and `meta` contains the API version. List endpoints also include a `pagination` key.
+
+### Multi-Factor Authentication (TOTP)
+
+Yuzu supports RFC 6238 TOTP (Time-based One-Time Passwords) as a second factor for operator login. Works with every standard authenticator app (Google Authenticator, 1Password, Authy, Microsoft Authenticator). SOC 2 CC6.6 — see `docs/auth-mfa-design.md` for the full design.
+
+#### Enrollment
+
+1. Sign in as an admin. Navigate to **Settings → Multi-Factor Authentication**.
+2. Click **Enable MFA**. The server generates a fresh 20-byte secret and renders an `otpauth://` URI plus the base32 secret as a one-time reveal (`Cache-Control: no-store` is set so the response will not be cached by browsers or proxies).
+3. Scan the QR code (most apps render it from the `otpauth://` URI) or type the base32 secret in manually.
+4. Enter the next 6-digit code shown by your authenticator app and click **Confirm**.
+5. The server confirms enrollment and reveals 10 single-use recovery codes in the format `XXXX-XXXX-XXXX-XXXX` (80 bits of entropy). **Save the codes somewhere safe** — they are shown exactly once.
+6. From now on, every login by this account will prompt for a TOTP code after the password.
+
+#### Login with MFA enrolled
+
+Browser flow: the login page automatically detects the 202 response and swaps to a TOTP code prompt. Programmatic / `curl` flow:
+
+```bash
+# Step 1 — post credentials. Response is 202 + mfa_pending_token if MFA enrolled.
+curl -s -X POST http://localhost:8080/login \
+  -d "username=admin&password=s3cret"
+# {"status":"mfa_required","mfa_pending_token":"abc…64hex","expires_in":120}
+
+# Step 2 — post the pending token + TOTP code (or a recovery code) to /login/mfa.
+curl -s -c cookies.txt -X POST http://localhost:8080/login/mfa \
+  -d "mfa_pending_token=abc…64hex&code=123456"
+# {"status":"ok"}  — cookies.txt now has the session cookie.
+```
+
+Recovery codes work on the same endpoint — paste the `XXXX-XXXX-XXXX-XXXX` form. The server distinguishes by shape: exactly 6 ASCII digits is interpreted as TOTP, anything else routes through recovery-code validation. Each pending token allows at most 5 attempts before being invalidated.
+
+#### Regenerating recovery codes
+
+Settings → Multi-Factor Authentication → **Regenerate recovery codes**. The 10 prior codes (consumed or not) are deleted atomically and 10 fresh codes are revealed.
+
+#### Disabling MFA
+
+Settings → Multi-Factor Authentication → **Disable MFA**. Clears the secret + all recovery codes. After disable, the user falls back to password-only login.
+
+#### Recovery when locked out
+
+If a user loses both their authenticator and all 10 recovery codes, MFA must be cleared via direct database surgery on the server host. See `docs/ops-runbooks/auth-db-recovery.md` "Emergency MFA disable" for the procedure (admin force-disable via REST is planned for a future release).
+
+#### Configuration flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--mfa-enforcement` | `optional` | `optional`: users enroll voluntarily. `admin-only`: admins must enroll. `required`: all users must enroll. **This release ships `optional` semantics only**; non-default values are accepted for forward compatibility but emit a startup warning until the enforcement PR lands. |
+| `--mfa-step-up-window-secs` | `300` | Seconds after a TOTP proof during which high-risk endpoints accept the session as "stepped up" without re-prompting. Used by the step-up flow in a follow-up PR. |
+| `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state lives in process memory and is lost on server restart. |
+
+Each flag also accepts the matching `YUZU_MFA_*` environment variable.
+
+#### Audit verbs
+
+Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` lists the full vocabulary). The verbs are:
+
+- `mfa.enroll.initiated` — secret generated, awaiting verify
+- `mfa.enroll.verified` — first code accepted; enrollment is live
+- `mfa.enroll.failed` — first code rejected
+- `mfa.disabled` — operator or admin cleared the secret
+- `mfa.login.required` — `POST /login` returned a 202 pending challenge
+- `mfa.login.verified` — `POST /login/mfa` TOTP accepted, session minted
+- `mfa.login.failed` — `POST /login/mfa` rejected the code or the pending token
+- `mfa.recovery_codes.generated` — 10 codes issued (enrollment or rotation)
+- `mfa.recovery_code.used` — one code consumed on login
+
+`auth.login` is also emitted on every successful MFA login alongside `mfa.login.verified` / `mfa.recovery_code.used`, so SIEM rules keying on `auth.login` for session-creation parity stay correct across password, OIDC, and MFA flows.
 
 ### Logout
 
