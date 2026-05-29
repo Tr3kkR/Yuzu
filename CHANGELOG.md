@@ -9,7 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **viz-UAT `cedar-vale-app` mode: a real three-tier demo app for fleet
+- **Compliance policies now actually evaluate (check → verdict pipeline).**
+  Authored policies + fragments could be created, but nothing evaluated them —
+  `PolicyStore::update_agent_status` had no caller and no trigger fired, so
+  `get_fleet_compliance` / `get_compliance_summary` always read 0%. A new
+  background `PolicyEvaluator` (`server/core/src/policy_evaluator.{hpp,cpp}`)
+  closes the gap: on a cadence it finds enabled policies whose interval has
+  elapsed, resolves scope/management-groups to agents, dispatches the fragment's
+  `check` instruction (via the shared command-dispatch path), then collects each
+  agent's response, evaluates the CEL `check_compliance`, and writes
+  `compliant` / `non_compliant` / `unknown` / `error` per agent. Two new
+  operator-gated endpoints: `POST /api/policies/{id}/evaluate` (force an
+  immediate check) and `POST /api/policies/{id}/remediate` (manual, opt-in
+  remediation — dispatches the fragment's `fix`, then verifies via `postCheck`;
+  only available when the fragment defines a `fix` instruction, surfaced as
+  `remediation_available` on the policy detail). Remediation is never automatic.
+  Audit actions `policy.evaluate` / `policy.remediate`. Hardening from the
+  governance pass: an empty `check_compliance` is scored `error` (never a false
+  `compliant`); a fresh verdict invalidates the 60s fleet-compliance cache so it
+  surfaces promptly; the evaluator's `polchk-*` correlation ids are skipped by
+  the execution-tracker notifier (no phantom executions / SSE — compliance is
+  not in the executions drawer); stranded `fixing` rows are reset to `unknown`
+  on restart; the background dispatch never holds the evaluator lock across the
+  (blocking) command dispatch; the interval is clamped to a ≥60s floor; the
+  evaluation thread is exception-isolated and joined before stores tear down
+  (`~ServerImpl` now calls `stop()`); caller-supplied `remediate` agent lists are
+  intersected with the policy's own scope; new `yuzu_server_policy_verdicts_total`
+  / `yuzu_server_policy_eval_errors_total` metrics.
+
+### Tests
+
+- `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
+  `PolicyEvaluator`: compliant/non_compliant multi-agent fan-out, non-responder
+  → `unknown`, plugin-failure → `error`, missing-field → `non_compliant`, CEL
+  eval-error → `error`, empty-CEL → `error` (no false compliant), interval
+  throttling, remediation fix→verify→compliant, remediation rejected without a
+  `fix`, the 3-attempt remediation cap → `error`, and verify-dispatch-failure →
+  `error`. Real stores on `TempDbFile`, a static management group for targets, a
+  fake dispatch that seeds canned responses, and an injectable clock.
   visualization.** `VIZ_UAT_AGENT_MODE=cedar-vale-app bash
   scripts/start-viz-uat.sh` stands up the fictional "Cedar & Vale" company as
   three named tiers — **Envoy** (frontend) → **node.js** (app) → **Postgres**

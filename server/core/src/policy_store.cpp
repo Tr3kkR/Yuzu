@@ -1285,6 +1285,12 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
         return std::unexpected("failed to update compliance status");
     }
     sqlite3_finalize(stmt);
+    // Invalidate the fleet-compliance cache (gov happy-path-F2): a freshly
+    // written verdict must surface promptly. Without this, the 60s cache would
+    // keep serving the pre-evaluation value (e.g. 0%) right after a check lands —
+    // the exact window an operator (or a demo) hits after POST /evaluate. Held
+    // under the same unique_lock as the cache reader, so the reset is safe.
+    fleet_compliance_last_computed_ = {};
     return {};
 }
 

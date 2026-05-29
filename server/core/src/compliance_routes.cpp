@@ -5,6 +5,7 @@
 
 #include "compliance_routes.hpp"
 
+#include "policy_evaluator.hpp"
 #include "store_errors.hpp"
 #include "web_utils.hpp"
 
@@ -263,7 +264,8 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                                        AuditFn audit_fn,
                                        EmitEventFn emit_event_fn,
                                        PolicyStore* policy_store,
-                                       AgentsJsonFn agents_json_fn) {
+                                       AgentsJsonFn agents_json_fn,
+                                       PolicyEvaluator* policy_evaluator) {
     // Store dependency pointers
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
@@ -271,6 +273,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
     emit_event_fn_ = std::move(emit_event_fn);
     policy_store_ = policy_store;
     agents_json_fn_ = std::move(agents_json_fn);
+    policy_evaluator_ = policy_evaluator;
 
     // -- Compliance dashboard page ----------------------------------------
     svr.Get("/compliance",
@@ -554,6 +557,12 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
             // Also fetch compliance summary
             auto cs = policy_store_->get_compliance_summary(id);
 
+            // Remediation is only offered where the bound fragment defines a
+            // fix_instruction — the "would you like to remediate?" gate.
+            bool remediation_available = false;
+            if (auto frag = policy_store_->get_fragment(policy->fragment_id))
+                remediation_available = !frag->fix_instruction.empty();
+
             res.set_content(
                 nlohmann::json({{"id", policy->id},
                                 {"name", policy->name},
@@ -562,6 +571,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                                 {"fragment_id", policy->fragment_id},
                                 {"scope_expression", policy->scope_expression},
                                 {"enabled", policy->enabled},
+                                {"remediation_available", remediation_available},
                                 {"inputs", inputs_obj},
                                 {"triggers", triggers_arr},
                                 {"management_groups", policy->management_groups},
@@ -700,6 +710,102 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
             res.set_content(
                 nlohmann::json({{"status", "ok"}, {"total_invalidated", *result}}).dump(),
                 "application/json");
+        });
+
+    // POST /api/policies/:id/evaluate -- force an immediate compliance check
+    // (the background evaluator picks it up on its next collect cycle).
+    svr.Post(R"(/api/policies/([^/]+)/evaluate)",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn_(req, res, "Policy", "Execute"))
+                return;
+            if (!policy_store_ || !policy_store_->is_open() || !policy_evaluator_) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy evaluation not available"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+            auto id = req.matches[1].str();
+            if (!policy_store_->get_policy(id)) {
+                res.status = 404;
+                res.set_content(R"({"error":{"code":404,"message":"policy not found"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+            auto exec_id = policy_evaluator_->evaluate_now(id);
+            if (exec_id.empty()) {
+                res.status = 409;
+                res.set_content(
+                    nlohmann::json({{"error",
+                                     {{"code", 409},
+                                      {"message",
+                                       "policy has no check instruction or matches no agents"}}},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            audit_fn_(req, "policy.evaluate", "success", "policy", id, "execution_id=" + exec_id);
+            emit_event_fn_("policy.evaluated", req, {},
+                           {{"policy_id", id}, {"execution_id", exec_id}});
+            res.status = 202;
+            res.set_content(
+                nlohmann::json({{"status", "dispatched"}, {"execution_id", exec_id}}).dump(),
+                "application/json");
+        });
+
+    // POST /api/policies/:id/remediate -- manual, gated remediation. Requires
+    // the bound fragment to define a fix_instruction. Optional body
+    // {"agent_ids":[...]} scopes the fix; absent => all non_compliant agents.
+    svr.Post(R"(/api/policies/([^/]+)/remediate)",
+        [this](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn_(req, res, "Policy", "Execute"))
+                return;
+            if (!policy_store_ || !policy_store_->is_open() || !policy_evaluator_) {
+                res.status = 503;
+                res.set_content(R"({"error":{"code":503,"message":"policy evaluation not available"},"meta":{"api_version":"v1"}})", "application/json");
+                return;
+            }
+            auto id = req.matches[1].str();
+            std::vector<std::string> agent_ids;
+            if (!req.body.empty()) {
+                auto j = nlohmann::json::parse(req.body, nullptr, false);
+                if (!j.is_discarded() && j.is_object() && j.contains("agent_ids") &&
+                    j["agent_ids"].is_array()) {
+                    for (const auto& a : j["agent_ids"])
+                        if (a.is_string())
+                            agent_ids.push_back(a.get<std::string>());
+                }
+            }
+            auto result = policy_evaluator_->remediate(id, agent_ids);
+            if (!result.ok) {
+                int code = 400;
+                if (result.error.find("not found") != std::string::npos)
+                    code = 404;
+                else if (result.error.find("remediation pathway") != std::string::npos ||
+                         result.error.find("no non_compliant") != std::string::npos ||
+                         result.error.find("no in-scope") != std::string::npos)
+                    code = 409;
+                audit_fn_(req, "policy.remediate", "denied", "policy", id, result.error);
+                res.status = code;
+                // Nested A4 error envelope, matching /evaluate and the other
+                // policy endpoints (gov consistency SHOULD-1).
+                res.set_content(nlohmann::json({{"error", {{"code", code}, {"message", result.error}}},
+                                                {"meta", {{"api_version", "v1"}}}})
+                                    .dump(),
+                                "application/json");
+                return;
+            }
+            audit_fn_(req, "policy.remediate", "success", "policy", id,
+                      "execution_id=" + result.execution_id +
+                          " agents=" + std::to_string(result.agents));
+            emit_event_fn_("policy.remediated", req, {},
+                           {{"policy_id", id},
+                            {"execution_id", result.execution_id},
+                            {"agents", result.agents}});
+            res.status = 202;
+            res.set_content(nlohmann::json({{"status", "remediating"},
+                                            {"execution_id", result.execution_id},
+                                            {"agents", result.agents}})
+                                .dump(),
+                            "application/json");
         });
 
     // GET /api/compliance -- fleet compliance summary
