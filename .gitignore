@@ -108,6 +108,9 @@ build_log.txt
 .uat-sanitizer/
 *.local.md
 *.local.MD
+# hookify rule files (.claude/hookify.*.local.md) are intentionally shared with
+# the team despite the *.local.md suffix — negate the ignore so they're tracked.
+!.claude/hookify.*.local.md
 docker-compose.local.yml
 .codex/*
 !.codex/skills/
