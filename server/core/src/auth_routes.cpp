@@ -1,11 +1,16 @@
 #include "auth_routes.hpp"
 
+#include <yuzu/metrics.hpp>
+#include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <chrono>
 #include <shared_mutex>
 
+#include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
 
 // Login page HTML (defined in login_ui.cpp)
@@ -446,6 +451,11 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
     return event;
 }
 
+void AuthRoutes::reap_mfa_pending_locked() {
+    auto now = std::chrono::steady_clock::now();
+    std::erase_if(mfa_pending_, [&](const auto& p) { return now > p.second.expires_at; });
+}
+
 bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
                            const std::string& result, const std::string& target_type,
                            const std::string& target_id, const std::string& detail) {
@@ -455,7 +465,45 @@ bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& actio
     event.target_type = target_type;
     event.target_id = target_id;
     event.detail = detail;
-    return audit_store_->log(event);
+    auto ok = audit_store_->log(event);
+    if (!ok) {
+        // SOC 2 CC7.2 — surface audit-write failures via spdlog so on-call
+        // has a signal short of the row-count metric. The wrapper still
+        // returns false so the caller can decide whether to abort the
+        // surrounding operation; most call sites legitimately fire-and-
+        // forget the return value (matches the historical contract).
+        spdlog::warn("audit_log: AuditStore::log failed for action='{}' target_type='{}' "
+                     "target_id='{}'",
+                     action, target_type, target_id);
+    }
+    return ok;
+}
+
+bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std::string& action,
+                                         const std::string& result, const std::string& principal,
+                                         const std::string& principal_role,
+                                         const std::string& target_type,
+                                         const std::string& target_id,
+                                         const std::string& detail) {
+    if (!audit_store_)
+        return true;
+    AuditEvent event;
+    event.action = action;
+    event.result = result;
+    event.source_ip = req.remote_addr;
+    event.user_agent = req.get_header_value("User-Agent");
+    event.principal = principal;
+    event.principal_role = principal_role;
+    event.target_type = target_type;
+    event.target_id = target_id;
+    event.detail = detail;
+    auto ok = audit_store_->log(event);
+    if (!ok) {
+        spdlog::warn("audit_log_for_principal: AuditStore::log failed for action='{}' "
+                     "principal='{}' target_id='{}'",
+                     action, principal, target_id);
+    }
+    return ok;
 }
 
 void AuthRoutes::emit_event(const std::string& event_type, const httplib::Request& req,
@@ -482,8 +530,17 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
 // ---------------------------------------------------------------------------
 
 void AuthRoutes::register_routes(httplib::Server& svr) {
+    // Production shim — wrap the real server in an HttplibRouteSink and
+    // delegate to the sink-based overload. Same handlers, same lambdas,
+    // same observable behaviour. Test code calls the sink overload
+    // directly with a TestRouteSink.
+    HttplibRouteSink sink(svr);
+    register_routes(sink);
+}
+
+void AuthRoutes::register_routes(HttpRouteSink& sink) {
     // -- Login page -----------------------------------------------------------
-    svr.Get("/login", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/login", [this](const httplib::Request& req, httplib::Response& res) {
         std::string html(kLoginHtml);
         // Inject OIDC enablement flag into the page
         std::shared_lock oidc_lock(oidc_mu_);
@@ -495,33 +552,248 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
         res.set_content(html, "text/html; charset=utf-8");
     });
 
-    svr.Post("/login", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/login", [this](const httplib::Request& req, httplib::Response& res) {
         auto username = extract_form_value(req.body, "username");
         auto password = extract_form_value(req.body, "password");
 
-        auto token = auth_mgr_.authenticate(username, password);
-        if (!token) {
+        auto role_opt = auth_mgr_.verify_password(username, password);
+        if (!role_opt) {
             res.status = 401;
             res.set_content(
                 R"({"error":{"code":401,"message":"Invalid username or password"},"meta":{"api_version":"v1"}})",
                 "application/json");
-            audit_log(req, "auth.login_failed", "failure", "user", username);
+            audit_log(req, "auth.login_failed", "error", "User", username);
             emit_event("auth.login_failed", req,
                        {{"source_ip", req.remote_addr}, {"username", username}}, {},
                        Severity::kWarn);
             return;
         }
 
-        res.set_header("Set-Cookie", "yuzu_session=" + *token + session_cookie_attrs());
+        // Decide whether this user must complete a TOTP challenge before
+        // we mint a real session. The AuthDB lookup is fail-open relative
+        // to MFA: if AuthDB is not configured (legacy config-file-only
+        // deployments) or the row read fails, we treat the user as
+        // not-enrolled. Enforcement modes (`admin-only`, `required`)
+        // tighten this in a follow-up PR.
+        bool mfa_enrolled = false;
+        if (auto* db = auth_mgr_.auth_db_ptr()) {
+            auto status = db->mfa_status(username);
+            if (status && status->enrolled) {
+                mfa_enrolled = true;
+            }
+        }
+
+        if (!mfa_enrolled) {
+            auto token = auth_mgr_.create_local_session(username, *role_opt, false);
+            res.set_header("Set-Cookie", "yuzu_session=" + token + session_cookie_attrs());
+            res.set_content(R"({"status":"ok"})", "application/json");
+            // Mint-time audit row uses the explicit-principal helper —
+            // request has no session cookie yet so the default
+            // resolve_session-based path would leave `principal` empty
+            // (consistency B3). target_type follows the
+            // observability-conventions.md PascalCase convention; result
+            // uses the spec's "ok"/"error" vocabulary.
+            audit_log_for_principal(req, "auth.login", "ok", username,
+                                    auth::role_to_string(*role_opt), "User", username);
+            emit_event("auth.login", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", username},
+                        {"auth_method", "password"},
+                        {"user_agent", req.get_header_value("User-Agent")}});
+            return;
+        }
+
+        // User has TOTP enrolled — issue an opaque short-lived pending
+        // token and require POST /login/mfa to complete.
+        auto pending_token =
+            auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(32));
+        {
+            std::lock_guard lock(mfa_pending_mu_);
+            reap_mfa_pending_locked();
+            MfaPending entry;
+            entry.username = username;
+            entry.role = *role_opt;
+            entry.expires_at = std::chrono::steady_clock::now() +
+                               std::chrono::seconds(cfg_.mfa_login_pending_secs);
+            mfa_pending_[pending_token] = std::move(entry);
+        }
+        res.status = 202;
+        nlohmann::json body = {{"status", "mfa_required"},
+                               {"mfa_pending_token", pending_token},
+                               {"expires_in", cfg_.mfa_login_pending_secs}};
+        res.set_content(body.dump(), "application/json");
+        audit_log_for_principal(req, "mfa.login.required", "ok", username,
+                                auth::role_to_string(*role_opt), "User", username);
+        emit_event("mfa.login.required", req,
+                   {{"source_ip", req.remote_addr}, {"username", username}});
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_auth_mfa_challenges_issued_total").increment();
+            std::lock_guard lock(mfa_pending_mu_);
+            m->gauge("yuzu_auth_mfa_pending_tokens")
+                .set(static_cast<double>(mfa_pending_.size()));
+        }
+    });
+
+    sink.Post("/login/mfa", [this](const httplib::Request& req, httplib::Response& res) {
+        // Single error message regardless of failure mode (token-invalid
+        // vs code-rejected vs attempts-exhausted) — distinguishing them
+        // on the wire gives an attacker a token-validity oracle. The
+        // discriminator lives in the audit `detail` column only
+        // (Gate 4 consistency N1 + security oracle).
+        static constexpr const char* kFailureBody =
+            R"({"error":{"code":401,"message":"Invalid verification code"},"meta":{"api_version":"v1"}})";
+
+        auto pending = extract_form_value(req.body, "mfa_pending_token");
+        auto code = extract_form_value(req.body, "code");
+
+        // Look up + atomically take ownership of the entry under the
+        // lock — without the move, two concurrent submits with the same
+        // pending token + same valid code would both succeed and mint
+        // two sessions (Gate 4 happy-path B2). We extract the entry
+        // here, work without the lock, and on terminal failure we
+        // re-insert with the attempts counter bumped.
+        MfaPending entry;
+        bool found = false;
+        {
+            std::lock_guard lock(mfa_pending_mu_);
+            reap_mfa_pending_locked();
+            auto it = mfa_pending_.find(pending);
+            if (it != mfa_pending_.end()) {
+                entry = std::move(it->second);
+                mfa_pending_.erase(it);
+                found = true;
+            }
+        }
+        if (!found) {
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log(req, "mfa.login.failed", "error", "User", "",
+                      "pending token invalid or expired");
+            emit_event("mfa.login.failed", req,
+                       {{"source_ip", req.remote_addr}, {"reason", "pending_invalid"}}, {},
+                       Severity::kWarn);
+            return;
+        }
+
+        auto* db = auth_mgr_.auth_db_ptr();
+        if (!db) {
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "auth_db unavailable");
+            return;
+        }
+
+        bool matched = false;
+        bool used_recovery = false;
+        // Strict shape gate (Gate 4 consistency N2 + unhappy UP-14/UP-20):
+        //   - TOTP: exactly 6 ASCII digits
+        //   - Recovery: any other shape goes through normalisation +
+        //     base32 alphabet check at the store layer
+        // Pre-PR1's heuristic admitted 7-digit numeric noise into the
+        // recovery PBKDF2 scan (~10 ms CPU each) which compounded UP-11
+        // into a sustained DoS vector.
+        bool is_totp = code.size() == 6;
+        if (is_totp) {
+            for (char c : code) {
+                if (c < '0' || c > '9') {
+                    is_totp = false;
+                    break;
+                }
+            }
+        }
+        if (is_totp) {
+            auto r = db->mfa_verify_login_code(entry.username, code);
+            if (r && *r) {
+                matched = true;
+            }
+        } else {
+            auto r = db->mfa_consume_recovery_code(entry.username, code);
+            if (r && *r) {
+                matched = true;
+                used_recovery = true;
+            }
+        }
+
+        if (!matched) {
+            // Bump attempts counter and re-insert if still under the cap.
+            // Once exhausted the entry stays erased and the operator must
+            // start over from /login (rate-limit gap closure for H1+UP-11).
+            entry.attempts += 1;
+            bool exhausted = entry.attempts >= kMfaMaxAttemptsPerPending;
+            std::size_t pending_size = 0;
+            if (!exhausted) {
+                std::lock_guard lock(mfa_pending_mu_);
+                mfa_pending_[pending] = std::move(entry);
+                pending_size = mfa_pending_.size();
+            } else {
+                std::lock_guard lock(mfa_pending_mu_);
+                pending_size = mfa_pending_.size();
+            }
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    exhausted ? "attempts exhausted"
+                                              : (is_totp ? "totp code rejected"
+                                                         : "recovery code rejected"));
+            emit_event("mfa.login.failed", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", entry.username},
+                        {"method", is_totp ? "totp" : "recovery"},
+                        {"attempts_exhausted", exhausted}},
+                       {}, Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_mfa_logins_total",
+                           {{"method", is_totp ? "totp" : "recovery"},
+                            {"result", exhausted ? "exhausted" : "failure"}})
+                    .increment();
+                m->gauge("yuzu_auth_mfa_pending_tokens")
+                    .set(static_cast<double>(pending_size));
+            }
+            return;
+        }
+
+        // Terminal success — entry was already erased atomically at
+        // lookup time. Mint the real session marked as MFA-verified.
+        auto token = auth_mgr_.create_local_session(entry.username, entry.role, true);
+        res.set_header("Set-Cookie", "yuzu_session=" + token + session_cookie_attrs());
         res.set_content(R"({"status":"ok"})", "application/json");
-        audit_log(req, "auth.login", "success", "user", username);
-        emit_event(
-            "auth.login", req,
-            {{"source_ip", req.remote_addr}, {"user_agent", req.get_header_value("User-Agent")}});
+        // Audit chain — emit BOTH the method-specific verb AND the
+        // canonical auth.login row so SIEM queries that key on
+        // `auth.login` for session-creation parity across password,
+        // OIDC, and MFA paths stay correct (Gate 4 architect S2 +
+        // happy-path S1 + S2).
+        if (used_recovery) {
+            audit_log_for_principal(req, "mfa.recovery_code.used", "ok", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "method=recovery");
+        } else {
+            audit_log_for_principal(req, "mfa.login.verified", "ok", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username);
+        }
+        audit_log_for_principal(req, "auth.login", "ok", entry.username,
+                                auth::role_to_string(entry.role), "User", entry.username,
+                                used_recovery ? "method=password+recovery"
+                                              : "method=password+totp");
+        emit_event(used_recovery ? "mfa.recovery_code.used" : "mfa.login.verified", req,
+                   {{"source_ip", req.remote_addr},
+                    {"username", entry.username},
+                    {"auth_method", used_recovery ? "password+recovery" : "password+totp"}});
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_auth_mfa_logins_total",
+                       {{"method", used_recovery ? "recovery" : "totp"},
+                        {"result", "success"}})
+                .increment();
+            std::lock_guard lock(mfa_pending_mu_);
+            m->gauge("yuzu_auth_mfa_pending_tokens")
+                .set(static_cast<double>(mfa_pending_.size()));
+        }
     });
 
     // -- Logout ---------------------------------------------------------------
-    svr.Post("/logout", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/logout", [this](const httplib::Request& req, httplib::Response& res) {
         audit_log(req, "auth.logout", "success");
         emit_event("auth.logout", req);
         auto token = extract_session_cookie(req);
@@ -539,7 +811,7 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
     });
 
     // -- OIDC SSO endpoints ---------------------------------------------------
-    svr.Get("/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
         std::shared_lock oidc_lock(oidc_mu_);
         if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
             res.status = 404;
@@ -562,7 +834,7 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
         res.set_redirect(auth_url);
     });
 
-    svr.Get("/auth/callback", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/auth/callback", [this](const httplib::Request& req, httplib::Response& res) {
         std::shared_lock oidc_lock(oidc_mu_);
         if (!oidc_provider_) {
             res.status = 404;
@@ -620,9 +892,25 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
 
         res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
 
-        audit_log(req, "auth.oidc_login", "success", "user", display);
+        // Explicit-principal audit row — request lands at /auth/callback
+        // with no session cookie yet, so the default resolve_session
+        // path would leave principal empty (Gate 4 consistency B3). Use
+        // the validated `display` from the IdP as the canonical
+        // principal name. Role is resolved from the freshly-minted
+        // session — for the audit row we re-validate to capture the
+        // role the user actually holds (group-mapping may have made
+        // them admin).
+        auto effective_role = auth_mgr_.validate_session(session_token)
+                                  .transform([](const auth::Session& s) {
+                                      return auth::role_to_string(s.role);
+                                  })
+                                  .value_or(std::string{"user"});
+        audit_log_for_principal(req, "auth.oidc_login", "ok", display, effective_role, "User",
+                                display);
         emit_event("auth.oidc_login", req,
                    {{"source_ip", req.remote_addr},
+                    {"username", display},
+                    {"auth_method", "oidc"},
                     {"oidc_sub", claims.sub},
                     {"email", email},
                     {"name", claims.name}});

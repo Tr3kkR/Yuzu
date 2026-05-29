@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **`POST /login` now returns HTTP 202 (not 200) for MFA-enrolled users.**
+  Programmatic clients (CI pipelines, automation scripts, health checks)
+  that called `POST /login` and gated on `HTTP 200 + {"status":"ok"}` will
+  fail silently the first time the authenticating user enrolls in TOTP MFA.
+  Handle the 202 branch: read `mfa_pending_token` from the JSON body and
+  POST it along with the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX`
+  recovery code) to `POST /login/mfa` to obtain a session cookie. Clients
+  using API tokens or OIDC are unaffected.
+- **Audit verb taxonomy on every new MFA emission site uses the
+  `target_type="User"` (PascalCase) and `result ∈ {ok, error}` vocabulary
+  from `docs/observability-conventions.md`.** SIEM and Grafana rules that
+  filter on the historical lowercase `target_type="user"` + `success/failure`
+  strings used by `auth.login` / `auth.oidc_login` will not match the new
+  `mfa.*` rows. Existing auth.* sites remain on the historical vocabulary
+  for backwards compatibility (separate tracking issue).
+- **Recovery code format changed from `XXXXX-XXXXX` (50 bits) to
+  `XXXX-XXXX-XXXX-XXXX` (80 bits, four base32 groups).** Codes issued by
+  prior PR1 commits are no longer the canonical shape but remain valid
+  until consumed or regenerated.
+- **`AuthDB::remove_user` now also clears MFA enrollment state.** Soft-
+  deleting a user nulls their `mfa_totp_secret`, clears `mfa_enrolled_at`,
+  and DELETEs every `mfa_recovery_codes` row owned by the user — SOC 2 CC6.8
+  requires credentials be revoked on termination. Any external code or
+  ops tooling that relied on the prior "soft delete leaves MFA intact"
+  behavior must update.
+
 ### Added
 
 - **Compliance policies now actually evaluate (check → verdict pipeline).**
@@ -36,9 +64,96 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`~ServerImpl` now calls `stop()`); caller-supplied `remediate` agent lists are
   intersected with the policy's own scope; new `yuzu_server_policy_verdicts_total`
   / `yuzu_server_policy_eval_errors_total` metrics.
+- **MFA / TOTP — PR 1 of the `/auth-and-authz` skill P0 #1 ladder (SOC 2
+  CC6.6).** First shippable slice of MFA: RFC 6238 TOTP self-service
+  enrollment via Settings → Multi-Factor Authentication, login challenge
+  after password verify, recovery codes. Step-up on high-risk endpoints
+  and OIDC `amr` interop ship in subsequent PRs of the same ladder.
+  - `auth.db` schema v2 migration: `users.mfa_totp_secret` (BLOB, raw 20-byte
+    HMAC-SHA1 key per RFC 4226 §4 R6, at-rest protected by the existing
+    0600 file mode), `users.mfa_enrolled_at`, `users.mfa_disabled_at`,
+    `users.mfa_last_counter` (replay floor), `sessions.mfa_verified_at`,
+    new tables `mfa_recovery_codes` (PBKDF2-SHA256 hashed, single-use)
+    and `auth_kv` (provisioned empty for future encryption-at-rest).
+  - New `server/core/src/totp.{hpp,cpp}` — RFC 6238 TOTP generator/verifier
+    (30 s step, 6 digits, ±1 step skew with replay protection), RFC 4648
+    base32 enc/dec, otpauth URI builder, CSPRNG secret and recovery-code
+    generation. Tested against RFC 6238 Appendix B SHA-1 vectors.
+  - `AuthDB::mfa_init_enrollment` / `mfa_verify_enrollment` /
+    `mfa_verify_login_code` / `mfa_consume_recovery_code` /
+    `mfa_regenerate_recovery_codes` / `mfa_disable` / `mfa_status` /
+    `mfa_mark_session_stepup` — new MFA accessor surface on the existing
+    AuthDB instance.
+  - `AuthManager` additions: `verify_password` (creds-only check, no
+    session), `create_local_session(user, role, mfa_verified)`,
+    `mark_session_mfa_verified(token)`, `auth_db_ptr()` accessor.
+  - `Session::mfa_verified_at` field (step-up window comparison).
+  - `Config::mfa_enforcement` (`optional` | `admin-only` | `required`,
+    default `optional`), `Config::mfa_step_up_window_secs` (default 300),
+    `Config::mfa_login_pending_secs` (default 120). CLI flags
+    `--mfa-enforcement`, `--mfa-step-up-window-secs`,
+    `--mfa-login-pending-secs` (envs `YUZU_MFA_*`). PR1 honours
+    `optional` semantics only; non-default values emit a startup `WARN`.
+  - `POST /login` now returns HTTP 202 + `{"status":"mfa_required",
+    "mfa_pending_token":"…","expires_in":N}` if the user is MFA-enrolled;
+    the login page swaps to a TOTP form and posts to `POST /login/mfa`
+    (TOTP code or recovery code; same endpoint). Each pending token is
+    capped at 5 attempts before invalidation.
+  - Settings page gains a Multi-Factor Authentication section with
+    enroll / verify / regenerate / disable HTMX handlers under
+    `/fragments/settings/mfa` and `/api/settings/mfa/*` (admin-only in
+    PR1; per-user surface is a follow-up). All 4 mutating POSTs carry
+    `Origin`/`Referer` CSRF protection via an `origin_safe` helper
+    (default-port normalised, userinfo rejected, audit detail
+    sanitised + 128 B capped).
+  - New audit verbs: `mfa.enroll.initiated`, `mfa.enroll.verified`,
+    `mfa.enroll.failed`, `mfa.disabled`, `mfa.login.required`,
+    `mfa.login.verified`, `mfa.login.failed`, `mfa.recovery_codes.generated`,
+    `mfa.recovery_code.used`, `csrf.denied`. Step-up verbs (`mfa.step_up.*`)
+    ship in PR 2.
+  - Prometheus metrics: `yuzu_auth_mfa_logins_total{method,result}`,
+    `yuzu_auth_mfa_pending_tokens` gauge,
+    `yuzu_auth_mfa_challenges_issued_total`.
+  - Docs: `docs/auth-mfa-design.md` (architecture), updated
+    `docs/auth-architecture.md`, user-manual updates
+    (`authentication.md`, `rest-api.md`, `server-admin.md`),
+    `docs/ops-runbooks/auth-db-recovery.md` Emergency MFA disable
+    break-glass procedure.
+  - Tests: `tests/unit/server/test_totp.cpp` (RFC 6238 vectors, base32,
+    drift / replay) and `tests/unit/server/test_mfa_store.cpp` (end-to-end
+    AuthDB enroll → verify → login → recovery → disable).
 
 ### Tests
 
+- **Route-level MFA test harness (closes PR1 deferred quality-engineer
+  SHOULD-FIX).** Hermes Agent's red-team round on PR1 caught the
+  CRITICAL `/login/mfa` pre-routing exemption bug within 30 s of live
+  curl probing because the internal governance pipeline reviewed
+  handlers statically without exercising the wire path. This change
+  closes that gap with two new test files that drive every MFA-touching
+  handler through an in-process `TestRouteSink` (TSan-clean per #438).
+  - **`AuthRoutes::register_routes` dual overload**: mirrors the
+    `SettingsRoutes` pattern. Existing `httplib::Server&` overload becomes
+    a 2-line shim that constructs `HttplibRouteSink` and delegates to a
+    new `HttpRouteSink&` overload that owns every lambda. Production
+    behaviour is unchanged; tests get a TSan-safe in-process dispatch
+    seam.
+  - **`tests/unit/server/test_auth_routes_mfa.cpp`** — 10 cases covering
+    `POST /login` (no-MFA fast-path + MFA-enrolled 202 branch + bad
+    password), `POST /login/mfa` (valid TOTP, valid recovery code,
+    invalid pending token, 5-attempts-cap, strict-shape gate routing
+    non-6-digit to recovery, pending-token TTL expiry, atomic erase
+    under concurrent submit with same valid token), and the dual audit
+    emission contract (`mfa.login.verified` + `auth.login`,
+    `mfa.recovery_code.used` + `auth.login`).
+  - **`tests/unit/server/test_settings_routes_mfa.cpp`** — 12 cases
+    covering the 5 `/api/settings/mfa/*` routes (init reveal +
+    Cache-Control: no-store contract, double-init → MfaAlreadyEnrolled
+    message, recovery-codes regenerate, disable atomicity, non-admin
+    403), and the `origin_safe` CSRF gate (same-origin pass,
+    cross-origin 403 with `csrf.denied` audit, default-port :443
+    normalisation, userinfo / RFC-6454 rejection, no-Origin
+    non-browser pass-through, Referer fallback).
 - `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
   `PolicyEvaluator`: compliant/non_compliant multi-agent fan-out, non-responder
   → `unknown`, plugin-failure → `error`, missing-field → `non_compliant`, CEL
@@ -106,6 +221,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first-run setup, read empty stdin, and died on the password floor. The file
   is a PBKDF2-SHA256 hash (no cleartext), so 0644 is correct for a
   containerized launcher.
+- **CRITICAL — `POST /login/mfa` was unreachable behind the pre-routing
+  auth gate** (Hermes Agent red-team review, 2026-05-29). The exemption
+  list at `server.cpp:2393` covered `/login` but not `/login/mfa`, so
+  every unauthenticated POST to the MFA challenge was redirected to
+  `/login` before the route handler ran — the MFA login flow was
+  completely deadlocked in any deployment with the gate enabled. The
+  internal governance review missed this because PR1 deferred route-
+  level integration tests. Added `/login/mfa` to the exemption list
+  with a comment crediting the Hermes finding.
+- **HIGH — `/login/mfa` was bypassing the login-specific rate limiter**
+  (Hermes Agent LOW #6 escalated by the credential-brute compounding
+  effect). `is_login = req.path == "/login"` at `server.cpp:2374` did
+  not match `/login/mfa`, so MFA submissions fell through to the looser
+  `api_rate_limiter_` bucket. Expanded the predicate to cover both
+  paths so per-IP rate-limit defence applies to both legs of credential
+  auth. The per-pending-token 5-attempt cap remains as the second layer.
+- **MEDIUM — CSRF protection on the five `/api/settings/mfa/*` POST
+  routes** (Hermes Agent MEDIUM #2). The mutating MFA settings routes
+  (`init`, `verify`, `recovery-codes`, `disable`) relied on session-
+  cookie auth (`SameSite=Lax`) without `Origin` / `Referer` checks; a
+  stolen cookie could be replayed cross-site to strip a victim's MFA.
+  Added an `origin_safe` helper that requires `Origin` (or `Referer`
+  fallback) host to match the request `Host` header on browser POSTs;
+  non-browser clients (curl, automation) that omit both headers pass
+  through. Mismatched host returns 403 with audit verb `csrf.denied`
+  (`target_type="Endpoint"`) for SIEM correlation. Audit detail strings
+  are sanitised (control + high-bit bytes stripped, each field capped at
+  128 B), default ports `:443`/`:80` are normalised so a TLS-terminating
+  reverse proxy that rewrites `Host` to the port-less form does not
+  false-deny, and userinfo (`@`) plus fragment / query (`?`, `#`) in the
+  Origin URL are rejected per RFC 6454.
+
+  **Deferred scope (Gate 4 SHOULD S2 — known follow-up):** `origin_safe`
+  is wired into the 4 mutating MFA POSTs only. 11 sibling state-changing
+  Settings POSTs remain CSRF-unprotected:
+  `/api/settings/users` (and `/role`), `/api/settings/api-tokens`,
+  `/api/settings/plugin-signing/{upload,clear,require}`,
+  `/api/settings/oidc` (and `/test`), `/api/settings/{cert-upload,
+  cert-paste}`, `/api/settings/enrollment-tokens`, `/api/settings/tls`.
+  These were unprotected before PR1 too — the asymmetry is documented
+  here so it isn't mistaken for a regression. A follow-up PR wraps every
+  admin HTMX mutation with the same helper.
 
 ### Tests
 

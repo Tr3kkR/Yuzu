@@ -2387,8 +2387,15 @@ private:
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
-            // Rate limiting — check before auth to protect against brute force
-            bool is_login = (req.path == "/login" && req.method == "POST");
+            // Rate limiting — check before auth to protect against brute force.
+            // Both /login and /login/mfa share the tighter login-rate bucket;
+            // the MFA challenge is part of the same per-IP credential-brute
+            // surface and must not fall through to the looser api_rate_limiter_
+            // (Hermes Agent red-team finding LOW #6, 2026-05-29). The per-
+            // pending-token 5-attempt cap on /login/mfa is the second layer of
+            // this defence and remains in place at AuthRoutes::POST /login/mfa.
+            bool is_login =
+                (req.path == "/login" || req.path == "/login/mfa") && req.method == "POST";
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
                 res.status = 429;
@@ -2399,7 +2406,7 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
-            // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec.
+            // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
             // /health and /api/health are ALSO covered by the early-return
             // exemption at the top of this lambda (which additionally skips
             // rate limiting). They are kept in this list as defense-in-depth
@@ -2407,9 +2414,18 @@ private:
             // /livez|/readyz alone would silently start requiring auth on
             // /health without this lower entry. Governance Gate 7, security
             // re-review LOW. Do not remove either site without updating both.
-            if (req.path == "/login" || req.path == "/health" || req.path == "/api/health" ||
-                req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
-                req.path == "/api/v1/openapi.json" || req.path.starts_with("/static/")) {
+            //
+            // `/login/mfa` MUST be unauthenticated for the same reason `/login`
+            // is: the MFA challenge completes the login. The pending token is
+            // the only credential the caller has at this point — they have no
+            // session cookie yet. Hermes Agent's red-team review (2026-05-29)
+            // caught the omission; without it, MFA-enrolled users are locked
+            // out because every POST /login/mfa redirects to /login before the
+            // route handler runs.
+            if (req.path == "/login" || req.path == "/login/mfa" || req.path == "/health" ||
+                req.path == "/api/health" || req.path == "/auth/oidc/start" ||
+                req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
+                req.path.starts_with("/static/")) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
