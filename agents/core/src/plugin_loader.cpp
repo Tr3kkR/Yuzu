@@ -778,7 +778,27 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
         auto loaded = PluginHandle::load(entry.path());
 #endif
         if (loaded) {
-            const std::string_view plugin_name{loaded->descriptor()->name};
+            // The descriptor name is plugin-self-declared and crosses the C ABI
+            // as a bare `const char*`. Validate it before constructing a
+            // std::string_view from it — the string_view(const char*) ctor calls
+            // strlen, which is UB on a null pointer that a malformed C plugin
+            // could set — and before any reserved-name / dispatch comparison, so
+            // a crafted name cannot diverge between this security check and a
+            // downstream C-string consumer of descriptor->name (#822).
+            const char* raw_name = loaded->descriptor()->name;
+            if (raw_name == nullptr || !is_valid_plugin_name(raw_name)) {
+                // Do NOT echo raw_name: it may carry NUL/control/newline bytes
+                // that would forge log lines or corrupt the error channel. The
+                // on-disk entry path is operator-controlled and safe to log.
+                spdlog::error("Plugin {} declares an invalid name — rejecting (a "
+                              "plugin name must be a non-empty [A-Za-z0-9_] "
+                              "identifier of at most {} bytes)",
+                              entry.path().string(), kMaxPluginNameLen);
+                result.errors.push_back(
+                    LoadError{entry.path().string(), std::string{kInvalidNameReason}});
+                continue;
+            }
+            const std::string_view plugin_name{raw_name};
             if (is_reserved_plugin_name(plugin_name)) {
                 // #453: prevent a compromised plugin author from shadowing
                 // the Guardian (__guard__) or other reserved dispatch names.

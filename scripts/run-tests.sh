@@ -3,6 +3,7 @@
 #
 # Usage:
 #   ./scripts/run-tests.sh                    # Run all test tiers
+#   ./scripts/run-tests.sh checks             # Static checks only (hookify rules)
 #   ./scripts/run-tests.sh unit               # C++ unit tests only
 #   ./scripts/run-tests.sh erlang-unit        # Erlang EUnit tests only
 #   ./scripts/run-tests.sh erlang-ct          # Erlang Common Test suites only
@@ -39,6 +40,16 @@ fail()   { FAIL=$((FAIL + 1)); echo "  ✗ $1"; }
 skip()   { SKIP=$((SKIP + 1)); echo "  ⊘ $1 (skipped)"; }
 
 # ── Tier 1: C++ Unit Tests ──────────────────────────────────────────
+run_checks() {
+    banner "STATIC CHECKS"
+    echo "  Validating hookify guardrail rules..."
+    if python3 "$PROJECT_ROOT/scripts/check-hookify-rules.py"; then
+        pass "hookify rules valid"
+    else
+        fail "hookify rules invalid"
+    fi
+}
+
 run_cpp_unit() {
     banner "C++ UNIT TESTS (Catch2)"
 
@@ -190,12 +201,14 @@ run_integration() {
 
 # ── Dispatch ────────────────────────────────────────────────────────
 case "$TIER" in
+    checks)        run_checks ;;
     unit)          run_cpp_unit ;;
     erlang-unit)   run_erlang_unit ;;
     erlang-ct)     run_erlang_ct ;;
     erlang-perf)   run_erlang_perf ;;
     integration)   run_integration ;;
     all)
+        run_checks
         run_cpp_unit
         run_erlang_unit
         run_erlang_ct
@@ -207,7 +220,7 @@ case "$TIER" in
         ;;
     *)
         echo "Unknown tier: $TIER"
-        echo "Usage: $0 [unit|erlang-unit|erlang-ct|erlang-perf|integration|all]"
+        echo "Usage: $0 [checks|unit|erlang-unit|erlang-ct|erlang-perf|integration|all]"
         exit 1
         ;;
 esac

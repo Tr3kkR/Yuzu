@@ -50,9 +50,7 @@ When in doubt in commit messages, PR descriptions, or new docs, use the disambig
 
 Specialized agents live in `.claude/agents/` (each file declares its own role, triggers, and reference docs). The `workflow-orchestrator` agent owns the gate sequence; the `/governance` skill (`.claude/skills/governance/SKILL.md`) is the entry point for running the full pipeline on a commit range.
 
-Pipeline (8 gates, convention-enforced — no git hook): Change Summary with Resource Ledger for C++ resource changes → security-guardian + docs-writer mandatory deep-dive → domain-triggered review (including `cpp-expert` and `cpp-safety` for any C++ source change, plus `cpp-safety` for raw resource/process/cast triggers) → happy-path + unhappy-path + consistency-auditor (parallel) → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness (parallel) → findings addressed (CRITICAL/HIGH block merge) → iterate.
-
-**Better process makes better products.** Waves 1–4 shipped without governance and accumulated 4 CRITICAL command-injection vulnerabilities, untested stores, stale docs, and performance bottlenecks — all caught before production but they should have been caught before commit. Use `/governance <range>` rather than hand-running.
+Pipeline (8 gates, convention-enforced — no git hook): Change Summary + Resource Ledger (C++ resource changes) → security-guardian + docs-writer deep-dive → domain-triggered review (`cpp-expert` + `cpp-safety` on any C++ change; `cpp-safety` on raw resource/process/cast) → happy-path + unhappy-path + consistency-auditor (parallel) → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness (parallel) → findings addressed (CRITICAL/HIGH block merge) → iterate. Use `/governance <range>`, not hand-running — waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
 
 ## Darwin Compatibility
 
@@ -60,97 +58,11 @@ This Claude instance is the designated **macOS/Darwin compatibility guardian**. 
 
 ## Erlang Gateway Build & Quality
 
-The gateway (`gateway/`) is a standalone rebar3 project. It compiles independently from the C++ codebase.
-
-### Build & verify commands
-```bash
-cd gateway
-rebar3 compile                               # compile
-rebar3 eunit --dir apps/yuzu_gw/test         # unit tests (148 tests)
-rebar3 dialyzer                              # type analysis — must be warning-free
-rebar3 ct --dir apps/yuzu_gw/test --suite <name>  # Common Test
-```
-
-**Always run `rebar3 dialyzer` after any Erlang change.** Compilation succeeding is not enough — dialyzer catches type violations, dead code, and missing dependencies that the compiler silently accepts. The project uses `warnings_as_errors` for compile but dialyzer warnings are separate.
-
-**`--dir apps/yuzu_gw/test` is mandatory on `rebar3 eunit`**, not optional. Without it, rebar3 3.27 intersects discovered test modules against the `src/`-derived `modules` list in `yuzu_gw.app` and rejects every orphan test module (`*_tests` without a 1:1 src counterpart, every `*_SUITE` file, helpers) with `Module X not found in project` before running a single test. Tracked as **#337**; `scripts/run-tests.sh erlang-unit` already applies the workaround, but if you invoke rebar3 directly you must pass the flag yourself.
-
-**`rebar3 eunit --module X` does NOT give you test isolation.** It runs the full `--dir` phase first, then the module filter, **in the same BEAM VM**. The second run inherits polluted state — meck mocks, registered names, leaked processes, send_after timers — from the first, so a passing filtered run does not prove the test is order-independent, and a failing filtered run may be failing because of pollution rather than the test itself. For real isolation, `rm -rf gateway/_build/test` between runs (forces a fresh BEAM) or drop into `erl -pa _build/test/lib/yuzu_gw/ebin -pa _build/test/lib/*/ebin` and call test functions directly. This gotcha wasted meaningful debugging time on #336.
-
-Use the `gateway-eunit` and `gateway-dialyzer` skills (in `.claude/skills/`) for routine invocations — they bundle the toolchain activation, the `--dir` flag, and result interpretation.
-
-### Toolchain activation (Erlang on PATH)
-
-`rebar3` and the meson custom_target that wraps it both need `erl` on PATH. Forgetting to activate is the usual cause of phantom `.gateway_built` failures while the C++ targets succeed. Source the cross-platform helper before any gateway work and verify:
-
-```bash
-source scripts/ensure-erlang.sh           # default: latest 28.x
-source scripts/ensure-erlang.sh 28.4.2    # exact pin
-command -v erl >/dev/null || { echo "Erlang missing"; exit 1; }
-```
-
-The helper probes kerl → asdf → Homebrew (macOS) → MSYS2 installer (Windows) and **always returns 0** so it can't trip the caller's `set -e`. Callers MUST verify `command -v erl` themselves. Default version tracks `release.yml`'s `erlef/setup-beam` `otp-version` — bump both together. Native `cmd.exe`/PowerShell is out of scope; documented Windows build path is MSYS2 bash.
-
-### Standing Erlang pitfalls
-
-| Area | Issue |
-|---|---|
-| `ctx` dependency | `ctx:background/0` is used for grpcbox RPC calls. `ctx` is a transitive dep of `grpcbox` but must be listed in `yuzu_gw.app.src` `applications` since we call it directly — otherwise dialyzer can't find it in the PLT. **Rule: if you call a function from a transitive dependency, add it to the applications list.** |
-| `-spec` contracts | If a function spec says `-spec f(map()) -> ok`, passing an atom like `f(some_atom)` compiles fine but dialyzer flags it. Always respect `-spec` contracts, even in catch/fallback paths. |
-| Circuit breaker dead code | `on_success/1` and `on_failure/1` only receive states `closed` or `half_open` (never `open`, because `check_circuit/1` rejects before the RPC runs). Don't add catchall clauses for states that are structurally unreachable — dialyzer knows the type is fully covered. |
-| `gpb` plugin warning | `Plugin gpb does not export init/1` is a benign warning from rebar3 — gpb is used via `grpc` config, not as a rebar3 plugin. Ignore it. |
-| Stray `.beam` / crash dumps | `erl_crash.dump` and loose `.beam` files in the gateway root are artifacts. They should be gitignored or deleted, never committed. |
-| Shutdown flush | During `stop/1`, `flush_sync/0` is the correct way to drain the heartbeat buffer. Do not fall back to `queue_heartbeat/1` with sentinel atoms — it violates the `map()` spec and would corrupt the buffer. If `flush_sync` fails, the process is already dead and the buffer is lost. |
+Touching `gateway/` or any `*.erl` file? **Read `docs/erlang-gateway-build.md` first.** It holds the build/verify commands, toolchain activation (`source scripts/ensure-erlang.sh`), the always-run-dialyzer rule, the mandatory-`--dir`/#337 and eunit-isolation/#336 gotchas, and the standing pitfalls table (`ctx` dep, `-spec` contracts, circuit-breaker dead code, benign `gpb` warning, stray `.beam`, shutdown flush). The `gateway-erlang` agent loads it automatically on any `gateway/`/`.erl` change; use the `/gateway-eunit` and `/gateway-dialyzer` skills for routine runs.
 
 ## UAT Environment (Server ↔ Gateway ↔ Agent)
 
-A cross-platform UAT script at `scripts/start-UAT.sh` (Linux + macOS) stands up the full stack, verifies connectivity, and runs command round-trip tests. The historical `scripts/linux-start-UAT.sh` name is kept as a thin shim that execs the canonical script. Usage:
-
-```bash
-bash scripts/start-UAT.sh          # start + verify (6 automated tests)
-bash scripts/start-UAT.sh stop     # kill all
-bash scripts/start-UAT.sh status   # show running processes
-```
-
-### viz-UAT (container-based, feat/viz-engine ladder)
-
-`scripts/start-viz-uat.sh` stands up a three-container Docker stack (server + gateway + agent) for the visualization feature ladder. **Cannot run alongside `start-UAT.sh`** — both bind host ports 8080 *and* 50051. Auto-detects arm64 vs amd64 and sets `--build-arg TRIPLET` accordingly; default `x64-linux` preserves the `release.yml` path. The launcher exports `VIZ_UAT_CONFIG` (absolute path to a generated `yuzu-server.cfg`); do not invoke `docker compose -f docker-compose.viz-uat.yml up` directly. State dir `/tmp/yuzu-viz-uat/`; scale agents with `VIZ_UAT_AGENTS=N`. Set `VIZ_UAT_AGENT_MODE=vm` to skip the in-container agent and print the enrollment token + host-exposed gateway address for running a native `yuzu-agent` on an OrbStack VM / bare-metal host — needed for PR 8+ visuals that depend on real loopback workloads. `VIZ_UAT_AGENT_MODE=none` skips agent startup entirely. **Note:** `scripts/start-UAT.sh` (the native, non-container UAT) force-wipes `/tmp/yuzu-uat/` on each start to work around a stale-DB session-auth bug (#947); do not remove that wipe without first closing the issue. See `bash scripts/start-viz-uat.sh --help` for full usage.
-
-### Cedar & Vale demo environment (release-pinned, sales)
-
-`scripts/start-demo.sh` stands up a three-tier **chiselled** Docker stack (server + gateway + N agent replicas) from release-pinned GHCR images. **Cannot run alongside `start-viz-uat.sh` or `start-UAT.sh`** — all three bind host ports 8080 and 50051 (the launcher pre-checks and refuses to start if they are busy). Clean-start by default (wipes `/tmp/yuzu-demo/` + compose volumes); `--keep` preserves state. Distinct from the viz-UAT rig. The **agent-bundle** delivery image (`docs/agent-bundle.md`, `scripts/build-agent-bundle.sh`) ships the agent for `linux-x64` / `windows-x64` / `macos-arm64` to design partners who can only `docker pull` — published + cosign-signed + SBOM'd by the `docker-publish-agent-bundle` release job. Full runbook: `docs/demo-environment.md`.
-
-### Port assignments
-
-Server and gateway defaults do not conflict — all three components can run on the same box without overrides:
-
-| Port | Component | Purpose |
-|------|-----------|---------|
-| 8080 | Server | Web dashboard + REST API |
-| 50051 | Server | Agent gRPC (direct connections) |
-| 50052 | Server | Management gRPC |
-| 50055 | Server | Gateway upstream (registration, heartbeats) |
-| 50051 | Gateway | Agent-facing gRPC (agents connect here) |
-| 50063 | Gateway | Management/command forwarding (server sends commands here) |
-| 8081 | Gateway | Health/readiness (`/healthz`, `/readyz`) |
-| 9568 | Gateway | Prometheus metrics |
-
-### Gateway command forwarding
-
-The gateway's primary function is **command fanout** — relaying commands from the server to potentially millions of agents and aggregating responses. This requires three server flags:
-
-1. **`--gateway-upstream 0.0.0.0:50055`** — Enables the `GatewayUpstream` gRPC service so the gateway can proxy agent registrations and batch heartbeats to the server.
-2. **`--gateway-mode`** — Subscribe stream peer-mismatch validation accepts the agent's Register peer IP (default rule) **OR** an IP previously recorded in the trusted-gateway peer set via `GatewayUpstreamServiceImpl::ProxyRegister` (W1.3 / #826). Entries are noted only on a successful enrollment branch and expire after 1h (LRU-capped at 1024 entries). Without `--gateway-mode` the trusted-set lookup is skipped — direct-connect agents only ever match their Register peer. Layered defence note: this rule scopes Subscribe to known gateway IPs but does NOT defend against a sniffed `session_id` presented from inside the gateway's IP space; the agent_id↔session binding from W1.4 (#827) is the layer that closes that.
-3. **`--gateway-command-addr localhost:50063`** — Points the server at the gateway's `ManagementService` for command forwarding. Without this, commands to gateway-connected agents are queued in `gw_pending_` but never forwarded. The server calls `SendCommand` (server-streaming RPC) on this address; the gateway fans out to agents and streams responses back.
-
-`--trusted-nat-cidr <cidr>[,…]` (`Config::trusted_nat_cidrs`, #1128) is the direct-connect analogue of `--gateway-mode`'s trusted-IP relaxation: when a direct agent's Register and Subscribe source IPs both fall inside one declared CIDR (multi-egress NAT / proxy pool / CG-NAT / SD-WAN), the per-session peer-IP mismatch is downgraded to *advisory* (audit `result="ok" outcome=advisory` + `yuzu_grpc_subscribe_peer_advisory_total`) instead of rejected. mTLS-identity match does the same downgrade but is **opt-in** via `--nat-trust-mtls-identity` (`Config::nat_trust_mtls_identity`, default off) — it is a session-replay bypass under a shared fleet-wide client cert, so it requires the operator to affirm per-agent certs (gov UP-2). Strict exact-match stays the default; mismatches outside both accommodations still reject; an empty extracted IP always rejects (#826). The pure decision is `AgentServiceImpl::evaluate_peer_binding`; gateway origin-IP attribution rides `RegisterRequest.gateway_observed_peer` (#1064, server-side consumed; gateway population is a follow-up — grpcbox can't see the direct transport peer, QUIC #376 will). See `docs/auth-architecture.md` "Per-session peer binding and NAT-aware relaxation".
-
-The dispatch flow in `agent_registry.cpp` `send_to()`:
-- Agent has a local Subscribe stream → write directly (direct-connect agents)
-- Agent has a `gateway_node` but no local stream → queue to `gw_pending_` for gateway forwarding
-- `forward_gateway_pending()` drains the queue via `gw_mgmt_stub_->SendCommand()`
-
-The gateway uses port range 5006x (vs server's 5005x); `gateway/config/sys.config` and `grpcbox` `listen_opts` are configured independently and must match. UAT credentials: fresh `yuzu-server.cfg` with PBKDF2-SHA256 hashed `admin` / `adminpassword1` per run; state lives under `/tmp/yuzu-uat/` and is wiped on each start.
+Standing up or debugging the stack? **Read `docs/uat-environment.md` first.** It covers the three mutually-exclusive rigs (`scripts/start-UAT.sh` native; `scripts/start-viz-uat.sh` containerised viz; `scripts/start-demo.sh` release-pinned Cedar & Vale sales demo — full runbook in `docs/demo-environment.md`), the port-assignment table, and gateway command forwarding (the `--gateway-upstream` / `--gateway-mode` / `--gateway-command-addr` flags, `--trusted-nat-cidr`, and the `agent_registry.cpp` `send_to()` dispatch flow). All three rigs bind host ports 8080 + 50051, so only one runs at a time. The `release-deploy` agent loads the doc on any compose / UAT-script change.
 
 ## Pre-commit testing with /test
 
@@ -158,28 +70,11 @@ The `/test` skill (`.claude/skills/test/SKILL.md`) is the single-command pre-com
 
 ## Instruction Engine
 
-The content plane. YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack` with typed parameter and result schemas, executed via the `CommandRequest` wire protocol. DSL: `apiVersion: yuzu.io/v1alpha1`, six `kind` values (`InstructionDefinition`, `InstructionSet`, `PolicyFragment`, `Policy`, `TriggerTemplate`, `ProductPack`). Definitions are persisted with verbatim `yaml_source` as the source of truth plus denormalized columns for queries.
+The content plane: YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack`, executed via the `CommandRequest` wire protocol; `yaml_source` is authoritative, denormalized columns are for queries. Architecture: `docs/Instruction-Engine.md`; DSL spec: `docs/yaml-dsl-spec.md`; tutorial: `docs/getting-started.md`.
 
-- Architecture: `docs/Instruction-Engine.md`
-- DSL spec: `docs/yaml-dsl-spec.md`
-- Beginner tutorial: `docs/getting-started.md`
+**Build-time gotcha:** PyYAML is a **hard build dependency** — `meson setup` fails the configure step without it. Shipped content is build-time embedded (`embed_content.py` → `bundled_content.cpp`, seeded into `instructions.db` on first boot); the runtime never reads YAML from disk — there is no `--content-dir` flag. Details + rationale: `docs/Instruction-Engine.md` "Build-time content embedding".
 
-### Shipped content is build-time embedded — there is no filesystem load path
-
-`content/definitions/*.yaml` and `content/packs/*.yaml` are converted to JSON envelopes by `server/core/scripts/embed_content.py` at build time, written into `bundled_content.cpp` as the `kBundledDefinitions` / `kBundledSets` vectors, linked into `yuzu-server`, and seeded into `instructions.db` on first boot via `import_definition_json` (conflict-skip on subsequent boots so operator REST/dashboard edits win). The runtime never reads YAML from disk — there is no `--content-dir` flag and none of the install packages ship the YAMLs separately. This is identical on Linux, macOS, and Windows.
-
-**PyYAML is a hard build dependency.** `meson setup` probes `python -c "import yaml"` and fails the configure step if it's missing; `embed_content.py` itself fails the build (non-zero exit) on missing PyYAML, missing `content/` directory, missing required fields in any `InstructionDefinition`, or zero parsed defs. The historical "warn and emit empty bundle" fallback (which silently produced binaries with empty Instructions tabs) was removed. Provision PyYAML with `pip install pyyaml` (Linux/macOS) or `pacman -S python-yaml` (MSYS2).
-
-### Executions-history ladder
-
-PR 2 (`responses.execution_id` correlation) and PR 3 (SSE live updates) ship
-a stack of invariants every successor PR must check — `cmd_execution_ids_`
-race-free dispatch registration, the `execution_id=''` coverage-gap list,
-multi-agent fan-out non-erase rule, partial-index `WHERE execution_id != ''`
-planner contract, `ExecutionEventBus` lifetime ordering, the data-attribute
-binding contract on drawer markup, and the `WorkflowRoutes::Deps` struct that
-PR 2.5 (#670) made the **hard predecessor** for any new dispatch surface.
-Full reference: `docs/executions-history-ladder.md`.
+The **executions-history ladder** (PR 2/3 `execution_id` correlation + SSE) carries a stack of invariants every successor PR must check — see `docs/executions-history-ladder.md` (also in Routed concerns below).
 
 ## Enterprise Readiness and SOC 2
 
@@ -337,6 +232,7 @@ The release job will otherwise fail after all build matrix jobs have run, wastin
 | Enterprise A&A roadmap — RBAC, OIDC, SAML, SCIM, MFA, AD/Entra, API tokens, session lifecycle, audit | `.claude/skills/auth-and-authz/SKILL.md` | invoke `/auth-and-authz` for any A&A planning, audit, or implementation work |
 | MCP server architecture, tier-before-RBAC ordering, kill switches, audit pattern | `docs/mcp-server.md` | `security-guardian` on `/mcp/v1/`, `mcp_server.{hpp,cpp}`, `mcp_jsonrpc.hpp`, `mcp_policy.hpp` change |
 | Executions-history ladder — `command_id → execution_id` map, partial-index planner contract, SSE event bus, drawer data-attribute binding, two-consumer / one-bus / one-taxonomy invariant (sprint W5.1 second consumer `/api/v1/events`), `api.v1.events.subscribe` audit verb split, MCP `execute_instruction` as a tracked-execution producer (#1088) | `docs/executions-history-ladder.md` | any change to `agent_service_impl.cpp` `cmd_execution_ids_`, `response_store` execution queries, `execution_event_bus.*`, `execution_tracker.*`, `rest_a4_envelope.{hpp,cpp}`, the `/api/v1/events` handler in `rest_api_v1.cpp`, the `execute_instruction` handler in `mcp_server.cpp`, or executions-drawer markup |
+| Compliance evaluation pipeline — `PolicyEvaluator` background thread (10s cadence, 15s grace, interval ≥60s floor, default 3600s) drives the check→verdict→`PolicyStore::update_agent_status` path so authored policies actually evaluate (was dead code). Wired in `server.cpp` (hoisted shared `command_dispatch_fn`, `policy_eval_thread_`, joined before stores in `~ServerImpl`/`stop()`). Mints `polchk-*` correlation ids that `notify_exec_tracker` **skips** (no tracker row, no SSE — compliance is NOT in the executions drawer). Remediation is manual/operator-gated only. | `docs/user-manual/policy-engine.md` | `cpp-safety` + `docs-writer` on any change to `policy_evaluator.{hpp,cpp}`, the `PolicyStore` status writer, or the `polchk-` guard in `agent_service_impl.cpp` |
 | C++23 conventions, naming, headers, plugin ABI boundary | `docs/cpp-conventions.md` | `cpp-expert` on any C++ source change |
 | C++ resource ownership and lifetime — fd/HANDLE/SOCKET/`FILE*`/SQLite/OpenSSL/BCrypt/C-string/thread/callback/temp-path ownership, RAII/scope guards, `string_view`/`span` validity, casts, syscall/process boundaries, sanitizer coverage | `docs/cpp-conventions.md` | `cpp-safety` on any C++ source change; `security-guardian` also enforces the ownership proof during Gate 2 |
 | macOS workflow + Darwin pitfalls table | `docs/darwin-compat.md` | `cross-platform` on any macOS-affecting change |
@@ -357,18 +253,7 @@ The release job will otherwise fail after all build matrix jobs have run, wastin
 
 ## Guardian engine — stores
 
-`guaranteed-state.db` (PR 1) holds `GuaranteedStateStore` with rules + events
-tables; rule `yaml_source` is authoritative, denormalised columns are
-indexes; events are an immutable audit-style log. Proto lives at
-`proto/yuzu/guardian/v1/guaranteed_state.proto` (package `yuzu.guardian.v1` —
-separate from `yuzu.agent.v1` so wire contracts evolve independently).
-Agent-side `guardian_engine.{hpp,cpp}` (PR 2) does two-phase startup
-(`start_local()` pre-network, `sync_with_server()` post-Register), KV
-namespace `__guardian__`, reserved plugin name `__guard__` intercepted in
-`agent.cpp` before the plugin match loop. Schema: `docs/yuzu-guardian-design-v1.1.md`
-§9.1; standing invariants (`Push`-seed scope, `__guard__` defence-in-depth,
-gateway-safe wire payloads): same doc §24; PR ladder:
-`docs/yuzu-guardian-windows-implementation-plan.md`.
+Working on Guardian / Guaranteed State? **Read `docs/yuzu-guardian-design-v1.1.md` first** — §9.1 has the `guaranteed-state.db` / `GuaranteedStateStore` schema and §24 the standing invariants (`Push`-seed scope, `__guard__` defence-in-depth, gateway-safe wire payloads). Key facts: agent-side `guardian_engine.{hpp,cpp}` does two-phase startup (`start_local()` pre-network, `sync_with_server()` post-Register); KV namespace `__guardian__`; reserved plugin name `__guard__` intercepted in `agent.cpp` before the plugin match loop; proto `proto/yuzu/guardian/v1/guaranteed_state.proto` (package `yuzu.guardian.v1`, separate from `yuzu.agent.v1`). PR ladder: `docs/yuzu-guardian-windows-implementation-plan.md`. (Also in Routed concerns below.)
 
 ## Test conventions — shared helpers
 
@@ -379,6 +264,13 @@ For server tests that need a live `ExecutionTracker` wired into `AgentServiceImp
 ## Agent skills
 
 Per-repo configuration for the Matt Pocock engineering skills (`to-issues`, `triage`, `to-prd`, `qa`, `improve-codebase-architecture`, `diagnose`, `tdd`, `zoom-out`, `grill-with-docs`). Re-run `/setup-matt-pocock-skills` to change.
+
+### Plugin scope — `frontend-design` is marketing-only
+
+The `frontend-design` plugin (`frontend-design@claude-plugins-official`) is scoped to **marketing / sales / demo presentation surfaces only**. Its design ethos — bold, deliberately-varied aesthetics that "vary between light and dark themes" — is right for a standalone pitch surface and wrong for the product, which prizes consistency and is **dark-theme-only**.
+
+- **Use it on:** the Cedar & Vale sales deck at `deploy/docker/cedar-vale/app/` (standalone Node app — `deck.css`, `machine.js`, slide assets) and any future standalone marketing/landing page. These are presentation apps, not the product.
+- **Do NOT use it on:** the operator dashboard or any product UI — `server/core/src/*_ui.cpp`, `server/core/static/*`. This explicitly includes the **in-product fleet visualization** (`viz_page_ui.cpp`, `viz_host_page_ui.cpp`, `server/core/static/yuzu-viz*.js`, governed by `docs/fleet-viz-invariants.md`) — despite the name, it is product, not marketing. Product UI stays HTMX-first, server-rendered, dark-theme-only; follow the existing dashboard conventions, never `frontend-design`.
 
 ### Issue tracker
 
@@ -394,4 +286,4 @@ Single-context layout — `CONTEXT.md` at the repo root, ADRs under `docs/adr/`.
 
 ## CLAUDE.md updates
 
-Architectural decisions, new stores, new plugin patterns, churning subsystems, and cross-cutting concerns belong here so future Claude sessions read them before touching code. Stable reference material that an agent already loads belongs in `docs/` with a one-line pointer here. See memory `feedback_claude_md_scope.md` for the heuristic — Build / Release / Erlang stay resident because the work is unstable or foreign; mature areas can be split out.
+Architectural decisions, new stores, new plugin patterns, churning subsystems, and cross-cutting concerns belong here so future Claude sessions read them before touching code. Stable reference material that an agent already loads belongs in `docs/` with a one-line pointer here. See memory `feedback_claude_md_scope.md` for the heuristic — Build / Release stay resident because the work is unstable or local-host-specific; mature areas route to `docs/` with a short "read this first" statement once an agent/skill/hook carries the load (precedent: the Erlang gateway build/quality section moved to `docs/erlang-gateway-build.md`).

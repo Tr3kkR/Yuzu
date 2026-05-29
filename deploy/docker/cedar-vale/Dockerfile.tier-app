@@ -1,0 +1,47 @@
+# Cedar & Vale demo — app tier: node.js (Express + impress.js deck) + agent.
+#
+# Base is node:22-trixie-slim (Debian trixie, glibc 2.41) so the trixie-built
+# agent runs natively. Serves the impress.js deck rendered from slide rows in
+# the db tier (Postgres). impress.js (the renderer library) is fetched at build
+# from a pinned upstream tag; the slide CONTENT lives in Postgres, not here.
+#
+# Build context is the repo root (compose sets context: ../..).
+
+FROM yuzu-agent-viz-uat:latest AS agentsrc
+
+FROM node:22-trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl3 libsqlite3-0 ca-certificates tini curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/yuzu-agent /app
+
+COPY --from=agentsrc /usr/local/bin/yuzu-agent            /usr/local/bin/yuzu-agent
+COPY --from=agentsrc /usr/local/lib/libyuzu_agent_core.so /usr/local/lib/libyuzu_agent_core.so
+COPY --from=agentsrc /usr/lib/yuzu/plugins/               /usr/lib/yuzu/plugins/
+RUN ldconfig
+
+WORKDIR /app
+# package.json first so `npm install` layer caches independently of app code.
+COPY deploy/docker/cedar-vale/app/package.json /app/package.json
+RUN npm install --omit=dev --no-audit --no-fund
+
+# App source (server.js, public/deck.css). node_modules from the install above
+# survives because the host app/ has no node_modules dir to clobber it.
+COPY deploy/docker/cedar-vale/app/ /app/
+
+# impress.js renderer library (pinned). This is the engine, not the content —
+# the slides themselves come from Postgres at request time.
+# impress.js release tag (note the leading "v"; the bare "2.0.0" path 404s).
+ARG IMPRESS_VERSION=v2.0.0
+RUN curl -fsSL "https://raw.githubusercontent.com/impress/impress.js/${IMPRESS_VERSION}/js/impress.js" \
+        -o /app/public/impress.js \
+    && test -s /app/public/impress.js
+
+COPY deploy/docker/cedar-vale/tier-entrypoint.sh /usr/local/bin/tier-entrypoint.sh
+RUN chmod +x /usr/local/bin/tier-entrypoint.sh
+
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/yuzu/plugins
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/tier-entrypoint.sh"]
+CMD ["node", "/app/server.js"]

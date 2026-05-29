@@ -1,0 +1,34 @@
+# Cedar & Vale demo — db tier: Postgres + co-located yuzu-agent.
+#
+# Base is postgres:17 (Debian trixie, glibc 2.41) so the trixie-built agent
+# binary runs natively. The agent is copied from the already-built
+# yuzu-agent-viz-uat image (the launcher builds it first). The official
+# postgres entrypoint still runs /docker-entrypoint-initdb.d/*.sql on first
+# boot, which seeds the slide content (01-slides.sql).
+#
+# Build context is the repo root (compose sets context: ../..).
+
+FROM yuzu-agent-viz-uat:latest AS agentsrc
+
+FROM postgres:17
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libssl3 libsqlite3-0 libstdc++6 ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/yuzu-agent
+
+COPY --from=agentsrc /usr/local/bin/yuzu-agent            /usr/local/bin/yuzu-agent
+COPY --from=agentsrc /usr/local/lib/libyuzu_agent_core.so /usr/local/lib/libyuzu_agent_core.so
+COPY --from=agentsrc /usr/lib/yuzu/plugins/               /usr/lib/yuzu/plugins/
+RUN ldconfig
+
+COPY deploy/docker/cedar-vale/initdb/          /docker-entrypoint-initdb.d/
+COPY deploy/docker/cedar-vale/tier-entrypoint.sh /usr/local/bin/tier-entrypoint.sh
+RUN chmod +x /usr/local/bin/tier-entrypoint.sh
+
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/yuzu/plugins
+
+# tini reaps the backgrounded agent; tier-entrypoint backgrounds the agent then
+# execs the postgres official entrypoint in the foreground.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/tier-entrypoint.sh"]
+CMD ["docker-entrypoint.sh", "postgres"]

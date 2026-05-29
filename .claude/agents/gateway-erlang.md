@@ -98,6 +98,7 @@ For real isolation, either `rm -rf gateway/_build/test` between runs, or drop in
 - `gateway/apps/yuzu_gw/integration_test/` — CT suites that require a real running upstream + enrollment token
 - `gateway/rebar.config` — Build and dependency configuration
 - `docs/erlang-gateway-blueprint.md` — Architecture reference
+- `docs/erlang-gateway-build.md` — **Read first.** Build/verify commands, toolchain activation, `--dir`/#337 + eunit-isolation/#336 gotchas, and the standing pitfalls table (routed out of `CLAUDE.md`)
 
 ## OTP Conventions
 

@@ -53,6 +53,17 @@ reserved_name_fixture_plugin = shared_library(
   install: false,
 )
 
+# ── Test fixture: plugin with a malformed name (#822) ────────────────────────
+# Declares a name outside the [A-Za-z0-9_] identifier set; test_plugin_loader.cpp
+# scans against it to verify the invalid-name rejection path.
+invalid_name_fixture_plugin = shared_library(
+  'invalid_name_fixture_plugin',
+  files('unit/fixtures/invalid_name_plugin.cpp'),
+  name_prefix: '',
+  dependencies: [yuzu_sdk_dep, yuzu_agent_core_dep],
+  install: false,
+)
+
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 #
 # Proto-dep choice is platform-conditional (#572 + Windows MSVC follow-up):
@@ -107,16 +118,16 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
   ],
   dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_dep, agent_test_openssl_dep],
-  # Ensure the fixture plugin is built before the test runs so the lookup
-  # inside test_plugin_loader.cpp finds it under MESON_BUILD_ROOT/tests/.
-  link_depends: reserved_name_fixture_plugin,
+  # Ensure the fixture plugins are built before the test runs so the lookups
+  # inside test_plugin_loader.cpp find them under MESON_BUILD_ROOT/tests/.
+  link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
 test(
   'agent unit tests',
   agent_test_exe,
   suite: 'agent',
   timeout: 240,
-  depends: reserved_name_fixture_plugin,
+  depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin],
 )
 
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
@@ -183,6 +194,7 @@ if build_server
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_policy_store.cpp',
+      'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
       'unit/server/test_compliance_eval.cpp',
       'unit/server/test_cel_eval.cpp',

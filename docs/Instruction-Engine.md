@@ -1452,3 +1452,9 @@ This document is grounded in the following implementation files:
 | `proto/yuzu/common/v1/common.proto` | ScopeExpression, ErrorDetail, Platform, PluginInfo |
 | `docs/capability-map.md` | 184 capabilities, 150 done (82%) |
 | `docs/roadmap.md` | 72 issues across 7 phases (all complete) |
+
+## Build-time content embedding — there is no filesystem load path
+
+`content/definitions/*.yaml` and `content/packs/*.yaml` are converted to JSON envelopes by `server/core/scripts/embed_content.py` at build time, written into `bundled_content.cpp` as the `kBundledDefinitions` / `kBundledSets` vectors, linked into `yuzu-server`, and seeded into `instructions.db` on first boot via `import_definition_json` (conflict-skip on subsequent boots so operator REST/dashboard edits win). The runtime never reads YAML from disk — there is no `--content-dir` flag and none of the install packages ship the YAMLs separately. This is identical on Linux, macOS, and Windows.
+
+**PyYAML is a hard build dependency.** `meson setup` probes `python -c "import yaml"` and fails the configure step if it's missing; `embed_content.py` itself fails the build (non-zero exit) on missing PyYAML, missing `content/` directory, missing required fields in any `InstructionDefinition`, or zero parsed defs. The historical "warn and emit empty bundle" fallback (which silently produced binaries with empty Instructions tabs) was removed. Provision PyYAML with `pip install pyyaml` (Linux/macOS) or `pacman -S python-yaml` (MSYS2).

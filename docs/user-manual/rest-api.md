@@ -1362,6 +1362,8 @@ Query audit events.
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
+| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result=success`. Detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row. |
+| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `tag.set` | Tag created or updated |
@@ -1535,6 +1537,7 @@ Get policy detail including compliance summary.
     "fragment_id": "frag-abc123",
     "scope_expression": "tag:environment = 'production'",
     "enabled": true,
+    "remediation_available": true,
     "management_groups": ["eu-production"],
     "triggers": [{"type": "interval", "config": {"interval_seconds": 300}}],
     "inputs": [{"key": "severity", "value": "high"}],
@@ -1633,6 +1636,76 @@ Invalidate compliance cache for all policies across all agents.
   "total_invalidated": 210
 }
 ```
+
+---
+
+#### `POST /api/policies/{id}/evaluate`
+
+Force an immediate compliance evaluation of a policy, ignoring its interval. The
+server dispatches the bound fragment's `check` instruction to the policy's scope
+and, once responses arrive (within a short grace window), evaluates the CEL
+`check_compliance` per agent and writes `compliant` / `non_compliant` /
+`unknown` / `error` to each agent's status — which is what
+`GET /api/compliance` and `GET /api/policies/{id}` then report. Evaluation is
+asynchronous: this returns immediately with the dispatch `execution_id`; the
+verdicts appear a few seconds later.
+
+**Permission:** `Policy:Execute`
+
+**Response (202):**
+
+```json
+{
+  "status": "dispatched",
+  "execution_id": "polchk-a1b2c3d4e5f60718"
+}
+```
+
+**Response (404):** policy not found. **Response (409):** the policy's fragment
+has no `check` instruction, or the policy matches no agents. **Response (503):**
+policy evaluation not available.
+
+**Audit:** `policy.evaluate`.
+
+---
+
+#### `POST /api/policies/{id}/remediate`
+
+Manually remediate a policy's non-compliant agents. **Only available when the
+bound fragment defines a `fix` instruction** (the `remediation_available` flag
+on the policy detail) — this is the operator-gated "would you like to remediate
+this?" action; remediation is never automatic. The server marks the targets
+`fixing`, dispatches the `fix` instruction, then runs the `postCheck` (falling
+back to `check`) and writes the verified post-fix verdict.
+
+**Permission:** `Policy:Execute`
+
+**Request body (optional):**
+
+```json
+{
+  "agent_ids": ["agent-123", "agent-456"]
+}
+```
+
+If `agent_ids` is omitted, every agent currently `non_compliant` for the policy
+is remediated.
+
+**Response (202):**
+
+```json
+{
+  "status": "remediating",
+  "execution_id": "polchk-9f8e7d6c5b4a3021",
+  "agents": 2
+}
+```
+
+**Response (404):** policy not found. **Response (409):** the fragment defines no
+`fix` instruction, or there are no non-compliant agents to remediate.
+**Response (503):** policy evaluation not available.
+
+**Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`}).
 
 ---
 
