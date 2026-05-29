@@ -50,9 +50,7 @@ When in doubt in commit messages, PR descriptions, or new docs, use the disambig
 
 Specialized agents live in `.claude/agents/` (each file declares its own role, triggers, and reference docs). The `workflow-orchestrator` agent owns the gate sequence; the `/governance` skill (`.claude/skills/governance/SKILL.md`) is the entry point for running the full pipeline on a commit range.
 
-Pipeline (8 gates, convention-enforced — no git hook): Change Summary with Resource Ledger for C++ resource changes → security-guardian + docs-writer mandatory deep-dive → domain-triggered review (including `cpp-expert` and `cpp-safety` for any C++ source change, plus `cpp-safety` for raw resource/process/cast triggers) → happy-path + unhappy-path + consistency-auditor (parallel) → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness (parallel) → findings addressed (CRITICAL/HIGH block merge) → iterate.
-
-**Better process makes better products.** Waves 1–4 shipped without governance and accumulated 4 CRITICAL command-injection vulnerabilities, untested stores, stale docs, and performance bottlenecks — all caught before production but they should have been caught before commit. Use `/governance <range>` rather than hand-running.
+Pipeline (8 gates, convention-enforced — no git hook): Change Summary + Resource Ledger (C++ resource changes) → security-guardian + docs-writer deep-dive → domain-triggered review (`cpp-expert` + `cpp-safety` on any C++ change; `cpp-safety` on raw resource/process/cast) → happy-path + unhappy-path + consistency-auditor (parallel) → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness (parallel) → findings addressed (CRITICAL/HIGH block merge) → iterate. Use `/governance <range>`, not hand-running — waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
 
 ## Darwin Compatibility
 
@@ -72,28 +70,11 @@ The `/test` skill (`.claude/skills/test/SKILL.md`) is the single-command pre-com
 
 ## Instruction Engine
 
-The content plane. YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack` with typed parameter and result schemas, executed via the `CommandRequest` wire protocol. DSL: `apiVersion: yuzu.io/v1alpha1`, six `kind` values (`InstructionDefinition`, `InstructionSet`, `PolicyFragment`, `Policy`, `TriggerTemplate`, `ProductPack`). Definitions are persisted with verbatim `yaml_source` as the source of truth plus denormalized columns for queries.
+The content plane: YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack`, executed via the `CommandRequest` wire protocol; `yaml_source` is authoritative, denormalized columns are for queries. Architecture: `docs/Instruction-Engine.md`; DSL spec: `docs/yaml-dsl-spec.md`; tutorial: `docs/getting-started.md`.
 
-- Architecture: `docs/Instruction-Engine.md`
-- DSL spec: `docs/yaml-dsl-spec.md`
-- Beginner tutorial: `docs/getting-started.md`
+**Build-time gotcha:** PyYAML is a **hard build dependency** — `meson setup` fails the configure step without it. Shipped content is build-time embedded (`embed_content.py` → `bundled_content.cpp`, seeded into `instructions.db` on first boot); the runtime never reads YAML from disk — there is no `--content-dir` flag. Details + rationale: `docs/Instruction-Engine.md` "Build-time content embedding".
 
-### Shipped content is build-time embedded — there is no filesystem load path
-
-`content/definitions/*.yaml` and `content/packs/*.yaml` are converted to JSON envelopes by `server/core/scripts/embed_content.py` at build time, written into `bundled_content.cpp` as the `kBundledDefinitions` / `kBundledSets` vectors, linked into `yuzu-server`, and seeded into `instructions.db` on first boot via `import_definition_json` (conflict-skip on subsequent boots so operator REST/dashboard edits win). The runtime never reads YAML from disk — there is no `--content-dir` flag and none of the install packages ship the YAMLs separately. This is identical on Linux, macOS, and Windows.
-
-**PyYAML is a hard build dependency.** `meson setup` probes `python -c "import yaml"` and fails the configure step if it's missing; `embed_content.py` itself fails the build (non-zero exit) on missing PyYAML, missing `content/` directory, missing required fields in any `InstructionDefinition`, or zero parsed defs. The historical "warn and emit empty bundle" fallback (which silently produced binaries with empty Instructions tabs) was removed. Provision PyYAML with `pip install pyyaml` (Linux/macOS) or `pacman -S python-yaml` (MSYS2).
-
-### Executions-history ladder
-
-PR 2 (`responses.execution_id` correlation) and PR 3 (SSE live updates) ship
-a stack of invariants every successor PR must check — `cmd_execution_ids_`
-race-free dispatch registration, the `execution_id=''` coverage-gap list,
-multi-agent fan-out non-erase rule, partial-index `WHERE execution_id != ''`
-planner contract, `ExecutionEventBus` lifetime ordering, the data-attribute
-binding contract on drawer markup, and the `WorkflowRoutes::Deps` struct that
-PR 2.5 (#670) made the **hard predecessor** for any new dispatch surface.
-Full reference: `docs/executions-history-ladder.md`.
+The **executions-history ladder** (PR 2/3 `execution_id` correlation + SSE) carries a stack of invariants every successor PR must check — see `docs/executions-history-ladder.md` (also in Routed concerns below).
 
 ## Enterprise Readiness and SOC 2
 
@@ -271,18 +252,7 @@ The release job will otherwise fail after all build matrix jobs have run, wastin
 
 ## Guardian engine — stores
 
-`guaranteed-state.db` (PR 1) holds `GuaranteedStateStore` with rules + events
-tables; rule `yaml_source` is authoritative, denormalised columns are
-indexes; events are an immutable audit-style log. Proto lives at
-`proto/yuzu/guardian/v1/guaranteed_state.proto` (package `yuzu.guardian.v1` —
-separate from `yuzu.agent.v1` so wire contracts evolve independently).
-Agent-side `guardian_engine.{hpp,cpp}` (PR 2) does two-phase startup
-(`start_local()` pre-network, `sync_with_server()` post-Register), KV
-namespace `__guardian__`, reserved plugin name `__guard__` intercepted in
-`agent.cpp` before the plugin match loop. Schema: `docs/yuzu-guardian-design-v1.1.md`
-§9.1; standing invariants (`Push`-seed scope, `__guard__` defence-in-depth,
-gateway-safe wire payloads): same doc §24; PR ladder:
-`docs/yuzu-guardian-windows-implementation-plan.md`.
+Working on Guardian / Guaranteed State? **Read `docs/yuzu-guardian-design-v1.1.md` first** — §9.1 has the `guaranteed-state.db` / `GuaranteedStateStore` schema and §24 the standing invariants (`Push`-seed scope, `__guard__` defence-in-depth, gateway-safe wire payloads). Key facts: agent-side `guardian_engine.{hpp,cpp}` does two-phase startup (`start_local()` pre-network, `sync_with_server()` post-Register); KV namespace `__guardian__`; reserved plugin name `__guard__` intercepted in `agent.cpp` before the plugin match loop; proto `proto/yuzu/guardian/v1/guaranteed_state.proto` (package `yuzu.guardian.v1`, separate from `yuzu.agent.v1`). PR ladder: `docs/yuzu-guardian-windows-implementation-plan.md`. (Also in Routed concerns below.)
 
 ## Test conventions — shared helpers
 
