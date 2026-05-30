@@ -37,6 +37,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MFA step-up on 11 high-risk REST + Settings surfaces (PR 2 of the MFA
+  ladder; SOC 2 CC6.6).** Closes the privileged-access control gap by
+  re-prompting for fresh TOTP / recovery proof on session-cookie callers
+  before any high-risk mutation lands. New helper `require_mfa_step_up()`
+  in `server/core/src/mfa_step_up.{hpp,cpp}` evaluates the gate: api/mcp
+  tokens bypass (the bearer credential is itself the step-up moment),
+  non-enrolled users bypass (consistent with PR1's `optional` enforcement
+  model), and stale sessions (now − `mfa_verified_at` > `mfa_step_up_
+  window_secs`, default 300 s) receive a 401 A4 envelope `{"error":
+  {"code":401,"message":"MFA step-up required",...},"meta":{"api_version":
+  "v1","mfa_step_up_required":true,"challenge_url":"/login/mfa/stepup"}}`
+  plus a `mfa.step_up.required` audit row. A new route `POST
+  /login/mfa/stepup` accepts an authenticated session cookie + a TOTP
+  code (6 digits) or recovery code; strict-shape gate (same as PR1's
+  `/login/mfa`) defeats the CPU-DoS shape oracle. Success refreshes
+  `Session::mfa_verified_at` via `AuthManager::mark_session_mfa_verified`
+  and emits `mfa.step_up.passed`; failure emits `mfa.step_up.failed`.
+  The dashboard auto-intercepts the envelope (`htmx:responseError`) and
+  prompts inline so HTMX-driven UI flows complete without operator
+  context-switch. The 11 sites wired in this PR:
+  - `POST /api/v1/tokens` (token mint — high-impact bearer credential)
+  - `DELETE /api/v1/tokens/{id}` (token revoke)
+  - `DELETE /api/v1/sessions` (admin force-logout of another principal)
+  - `POST /api/v1/software-packages` (introduces executable content)
+  - `POST /api/v1/software-deployments/{id}/start` (push to live agents)
+  - `POST /api/v1/guaranteed-state/rules` (Guardian rule create — drives
+    auto-remediation policy)
+  - `PUT /api/v1/guaranteed-state/rules/{id}` (Guardian rule update)
+  - `DELETE /api/v1/guaranteed-state/rules/{id}` (Guardian rule delete —
+    added in Gate 4 consistency-B1 closure; removing a rule is as
+    destructive as updating one)
+  - `POST /api/v1/guaranteed-state/push` (Guardian rule fan-out)
+  - `DELETE /api/settings/users/{username}` (destroys a principal)
+  - `POST /api/settings/users/{username}/role` (promotes / demotes
+    authority)
+  New CLI flag `--mfa-step-up-window-secs` (default 300; 0 disables the
+  gate — emit a startup `WARN`). New Prometheus metric
+  `yuzu_auth_mfa_step_up_total{method,result}` (counter). Tests:
+  `tests/unit/server/test_mfa_step_up.cpp` (9 cases / 108 assertions —
+  every branch of the gate decision tree) + extensions to
+  `tests/unit/server/test_auth_routes_mfa.cpp` (5 new cases for
+  `/login/mfa/stepup`: TOTP / recovery success, no-session, missing
+  code, wrong code). Docs: `docs/auth-mfa-design.md` step-up section
+  marked implemented; `docs/user-manual/{authentication,rest-api}.md`
+  document the new endpoint + the 401 envelope on each gated site.
+  Plan note: the original plan called for 11 sites including `POST
+  /api/v1/file-retrieval`; that endpoint turned out to be the
+  agent-side push-back (authenticated via mTLS / device token, not a
+  session cookie) so step-up does not apply. Guardian rule DELETE was
+  added during governance Gate 4 to keep the destructive-Guardian
+  surface uniform — final scope is 11 sites.
+
+  The helper fails CLOSED on auth_db errors (governance Gate 4 UP-4 /
+  qe Gate 3 BLOCKING fix): a `mfa_status()` failure or a row-not-found
+  on the user emits a 401 with `reason=mfa_status_unavailable
+  (fail-closed)` rather than silently bypassing the gate. Test:
+  `test_mfa_step_up.cpp` "store error fails CLOSED" case.
+
 - **Compliance policies now actually evaluate (check → verdict pipeline).**
   Authored policies + fragments could be created, but nothing evaluated them —
   `PolicyStore::update_agent_status` had no caller and no trigger fired, so
@@ -109,8 +167,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New audit verbs: `mfa.enroll.initiated`, `mfa.enroll.verified`,
     `mfa.enroll.failed`, `mfa.disabled`, `mfa.login.required`,
     `mfa.login.verified`, `mfa.login.failed`, `mfa.recovery_codes.generated`,
-    `mfa.recovery_code.used`, `csrf.denied`. Step-up verbs (`mfa.step_up.*`)
-    ship in PR 2.
+    `mfa.recovery_code.used`, `csrf.denied`. Step-up verbs
+    (`mfa.step_up.required`, `mfa.step_up.passed`, `mfa.step_up.failed`)
+    added in PR 2.
   - Prometheus metrics: `yuzu_auth_mfa_logins_total{method,result}`,
     `yuzu_auth_mfa_pending_tokens` gauge,
     `yuzu_auth_mfa_challenges_issued_total`.

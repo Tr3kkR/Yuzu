@@ -4440,6 +4440,79 @@ The endpoint distinguishes TOTP from recovery by code shape — exactly 6 ASCII 
 | `200` + `Set-Cookie: yuzu_session=…` | Code accepted | `{"status":"ok"}` |
 | `401` | Invalid or expired pending token, or rejected code | `{"error":{"code":401,"message":"Invalid verification code"}}` — the wire body is identical for all failure modes so an attacker cannot distinguish "this pending token is valid; my code was wrong" from "this pending token is unknown." The distinguishing detail is in the audit `detail` column only. |
 
+#### `POST /login/mfa/stepup`
+
+Refresh a session's MFA proof so the next high-risk REST/Settings mutation is accepted within the `mfa_step_up_window_secs` window (PR 2 of the MFA ladder). Called automatically by the dashboard HTMX layer when a request to a step-up-gated endpoint returns `401 mfa_step_up_required`; programmatic clients invoke it directly.
+
+**Permission:** Existing session cookie (local or OIDC `auth_source`). API token / MCP token principals are step-up-exempt — they receive `400` here ("step-up is for session-cookie callers only — re-issue the API token to refresh MFA proof").
+
+**Request body (form-encoded):**
+
+```
+code=<6-digit TOTP or XXXX-XXXX-XXXX-XXXX recovery code>
+```
+
+Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpreted as TOTP, anything else as a recovery code. There is no per-request attempts cap (the session is itself the credential and is rate-limited at the server layer via the shared `is_login` bucket).
+
+**Responses:**
+
+| Status | Condition | Body |
+|---|---|---|
+| `200` | Code accepted; session's `mfa_verified_at` refreshed to now | `{"status":"ok"}` |
+| `400` | Missing `code`, or principal is an API/MCP token | `{"error":{"code":400,"message":"missing code"}}` or `step-up is for session-cookie callers only` |
+| `401` | No session cookie, or rejected code | `{"error":{"code":401,"message":"MFA step-up failed"}}` |
+| `503` | `auth_db` unavailable (transient) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
+
+**Audit verbs:** `mfa.step_up.passed` on success (`detail=method=totp` or `method=recovery`); `mfa.step_up.failed` on each rejection with the rejection reason in `detail`.
+
+**Example:**
+
+```bash
+# After a high-risk request returned 401 + mfa_step_up_required, post your
+# current TOTP code (or a recovery code) to refresh the session's MFA proof:
+curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --cookie "yuzu_session=<session>" \
+  -d "code=123456"
+# 200 {"status":"ok"}
+```
+
+#### Step-up envelope on high-risk endpoints
+
+The following 11 endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs`:
+
+- `POST /api/v1/tokens` (mint API token)
+- `DELETE /api/v1/tokens/{id}` (revoke API token)
+- `DELETE /api/v1/sessions` (admin force-logout another user)
+- `POST /api/v1/software-packages` (upload software package)
+- `POST /api/v1/software-deployments/{id}/start` (start deployment)
+- `POST /api/v1/guaranteed-state/rules` (create Guardian rule)
+- `PUT /api/v1/guaranteed-state/rules/{id}` (update Guardian rule)
+- `DELETE /api/v1/guaranteed-state/rules/{id}` (delete Guardian rule)
+- `POST /api/v1/guaranteed-state/push` (fan out Guardian rules)
+- `DELETE /api/settings/users/{username}` (delete user)
+- `POST /api/settings/users/{username}/role` (change user role)
+
+Envelope shape:
+
+```json
+{
+  "error": {
+    "code": 401,
+    "message": "MFA step-up required",
+    "correlation_id": "req-...",
+    "remediation": "POST /login/mfa/stepup with current TOTP code or a recovery code, then retry"
+  },
+  "meta": {
+    "api_version": "v1",
+    "mfa_step_up_required": true,
+    "challenge_url": "/login/mfa/stepup"
+  }
+}
+```
+
+`meta.mfa_step_up_required` is the boolean discriminator that distinguishes this 401 from an "unauthenticated" 401; `meta.challenge_url` lets a forward-compatible client route to a future operator-configurable step-up path without re-templating. API token / MCP token principals **never see this 401** — the gate skips them entirely (the bearer credential was issued as part of an authenticated session and is itself the step-up).
+
 #### `POST /logout`
 
 Destroy the current session. Clears the `yuzu_session` cookie.

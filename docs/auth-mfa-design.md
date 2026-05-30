@@ -1,9 +1,9 @@
 # MFA (TOTP) — Yuzu design reference
 
-Status: **PR 1 of 3 shipped (v0.12+)** — self-service enrollment, login
-challenge, recovery codes. PR 2 adds step-up on high-risk endpoints; PR 3
-adds OIDC `amr` short-circuit and enforcement modes (`admin-only` /
-`required`).
+Status: **PR 1 + PR 2 of 3 shipped (v0.13+)** — self-service enrollment,
+login challenge, recovery codes (PR 1) and step-up on 10 high-risk
+REST + Settings surfaces (PR 2). PR 3 adds OIDC `amr` short-circuit and
+enforcement modes (`admin-only` / `required`).
 
 This doc is the single design reference for Yuzu's MFA implementation.
 For why MFA matters at all and where it sits in the broader A&A roadmap,

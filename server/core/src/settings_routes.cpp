@@ -2150,13 +2150,14 @@ void SettingsRoutes::register_routes(
     UpdateRegistry* update_registry, RuntimeConfigStore* runtime_config_store,
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
-    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry) {
+    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry,
+    StepUpFn step_up_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(admin_fn), std::move(perm_fn),
                     std::move(audit_fn), cfg, auth_mgr, auto_approve, api_token_store,
                     mgmt_group_store, tag_store, update_registry, runtime_config_store, audit_store,
                     gateway_enabled, std::move(gateway_session_count_fn), std::move(agents_json_fn),
-                    oidc_mu, oidc_provider, metrics_registry);
+                    oidc_mu, oidc_provider, metrics_registry, std::move(step_up_fn));
 }
 
 void SettingsRoutes::register_routes(
@@ -2166,7 +2167,8 @@ void SettingsRoutes::register_routes(
     UpdateRegistry* update_registry, RuntimeConfigStore* runtime_config_store,
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
-    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry) {
+    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry,
+    StepUpFn step_up_fn) {
     // Store dependency pointers
     auth_fn_ = std::move(auth_fn);
     admin_fn_ = std::move(admin_fn);
@@ -2187,6 +2189,7 @@ void SettingsRoutes::register_routes(
     oidc_mu_ = &oidc_mu;
     oidc_provider_ = &oidc_provider;
     metrics_registry_ = metrics_registry;
+    step_up_fn_ = std::move(step_up_fn);
 
     // -- Settings page (admin only) -------------------------------------------
     sink.Get("/settings", [this](const httplib::Request& req, httplib::Response& res) {
@@ -3105,6 +3108,12 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // PR2 — MFA step-up gate. Deleting a user destroys a principal;
+        // require fresh MFA proof. Sits after admin_fn (no point step-
+        // upping a non-admin) but before any state mutation.
+        if (step_up_fn_ &&
+            !step_up_fn_(req, res, *session, "DELETE /api/settings/users/{username}"))
+            return;
         if (session->username.empty()) {
             // Defense-in-depth: an empty session->username would let
             // a hand-crafted DELETE against an empty-username row
@@ -3188,6 +3197,11 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // PR2 — MFA step-up gate. Role changes promote/demote a
+        // principal's authority; require fresh MFA proof.
+        if (step_up_fn_ &&
+            !step_up_fn_(req, res, *session, "POST /api/settings/users/{username}/role"))
+            return;
         if (session->username.empty()) {
             spdlog::error("POST /api/settings/users/:username/role: session has empty username");
             res.status = 500;
