@@ -151,6 +151,13 @@ void GuaranteedStateStore::create_tables() {
                 ON guaranteed_state_events(ttl_expires_at)
                 WHERE ttl_expires_at > 0;
         )"},
+        {2, R"(
+            -- Canonical structured JSON of the Guard (spark/assertion/remediation) —
+            -- the authoritative form the agent enforces from; yaml_source is a
+            -- generated rendering. See docs/guardian-mvp-contract.md decisions 1-2.
+            ALTER TABLE guaranteed_state_rules
+                ADD COLUMN spec_json TEXT NOT NULL DEFAULT '';
+        )"},
     };
     if (!MigrationRunner::run(db_, "guaranteed_state_store", kMigrations)) {
         // Include enough detail in the log for an on-call operator to triage
@@ -187,8 +194,8 @@ GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
         INSERT INTO guaranteed_state_rules
             (rule_id, name, yaml_source, version, enabled, enforcement_mode,
              severity, os_target, scope_expr, signature, created_at, updated_at,
-             created_by, updated_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             created_by, updated_by, spec_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -213,6 +220,7 @@ GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
     sqlite3_bind_text(stmt, 12, row.updated_at.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 13, row.created_by.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 14, row.updated_by.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 15, row.spec_json.c_str(), -1, SQLITE_TRANSIENT);
 
     const int step = sqlite3_step(stmt);
     std::expected<void, std::string> result;
@@ -247,7 +255,8 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
         UPDATE guaranteed_state_rules SET
             name = ?, yaml_source = ?, version = ?, enabled = ?,
             enforcement_mode = ?, severity = ?, os_target = ?,
-            scope_expr = ?, signature = ?, updated_at = ?, updated_by = ?
+            scope_expr = ?, signature = ?, updated_at = ?, updated_by = ?,
+            spec_json = ?
         WHERE rule_id = ?
     )";
     sqlite3_stmt* stmt = nullptr;
@@ -270,7 +279,8 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
     }
     sqlite3_bind_text(stmt, 10, row.updated_at.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 11, row.updated_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 12, row.rule_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 12, row.spec_json.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 13, row.rule_id.c_str(), -1, SQLITE_TRANSIENT);
 
     const int step = sqlite3_step(stmt);
     if (step != SQLITE_DONE) {

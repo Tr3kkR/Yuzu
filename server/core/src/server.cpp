@@ -40,6 +40,7 @@
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
 #include "guaranteed_state_store.hpp"
+#include "guaranteed_state.pb.h"
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
@@ -1299,6 +1300,9 @@ public:
                 guaranteed_state_store_->start_cleanup();
                 spdlog::info("GuaranteedStateStore initialized at {} (retention={}d)",
                              gs_db.string(), cfg_.guardian_event_retention_days);
+                // Step 5: ingest agent `__guard__` events arriving on the Subscribe
+                // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
+                agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
             }
         }
 
@@ -6098,7 +6102,81 @@ private:
             // workers to live execution transitions. Same bus the
             // dashboard SSE handler uses; nullptr leaves the new
             // route registered but returning 503.
-            execution_event_bus_.get());
+            execution_event_bus_.get(),
+            // Step 3 — Guardian push fan-out. Resolve scope → in-scope agents, build the
+            // GuaranteedStatePush from the store's enabled rules (typed
+            // spark/assertion/remediation from spec_json) and deliver as a
+            // `__guard__`/push_rules CommandRequest via the agent dispatch path (reuses
+            // the instruction-dispatch scope→send_to idiom). Returns the agent count, or
+            // -1 on an unparseable scope. See docs/guardian-mvp-contract.md (step 3/G12).
+            [this](const std::string& scope, bool full_sync) -> int {
+                if (!guaranteed_state_store_)
+                    return 0;
+                const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                ::yuzu::guardian::v1::GuaranteedStatePush push;
+                push.set_full_sync(full_sync);
+                push.set_policy_generation(static_cast<std::uint64_t>(now_s));
+                for (const auto& row : guaranteed_state_store_->list_rules()) {
+                    if (!row.enabled)
+                        continue;
+                    auto* r = push.add_rules();
+                    r->set_rule_id(row.rule_id);
+                    r->set_name(row.name);
+                    r->set_version(static_cast<std::uint64_t>(row.version));
+                    r->set_enabled(row.enabled);
+                    r->set_enforcement_mode(row.enforcement_mode);
+                    if (row.spec_json.empty())
+                        continue; // legacy yaml_source-only rule — not agent-enforceable
+                    auto spec = nlohmann::json::parse(row.spec_json, nullptr, false);
+                    if (!spec.is_object())
+                        continue;
+                    auto fill = [](::yuzu::guardian::v1::GuardianSpecBlock* blk,
+                                   const nlohmann::json& j) {
+                        if (!j.is_object())
+                            return;
+                        blk->set_type(j.value("type", std::string{}));
+                        if (j.contains("params") && j["params"].is_object()) {
+                            const auto& params = j["params"];
+                            // Iterator form, not `auto& [k, v]`: MSVC C3493s on
+                            // structured bindings referenced inside a lambda body.
+                            for (auto it = params.begin(); it != params.end(); ++it)
+                                (*blk->mutable_params())[it.key()] =
+                                    it.value().is_string() ? it.value().get<std::string>()
+                                                           : it.value().dump();
+                        }
+                    };
+                    if (spec.contains("spark"))
+                        fill(r->mutable_spark(), spec["spark"]);
+                    if (spec.contains("assertion"))
+                        fill(r->mutable_assertion(), spec["assertion"]);
+                    if (spec.contains("remediation"))
+                        fill(r->mutable_remediation(), spec["remediation"]);
+                }
+                ::yuzu::agent::v1::CommandRequest cmd;
+                cmd.set_command_id("__guard__-push-" + std::to_string(now_s));
+                cmd.set_plugin("__guard__");
+                cmd.set_action("push_rules");
+                (*cmd.mutable_parameters())["push"] = push.SerializeAsString();
+                int sent = 0;
+                if (scope.empty()) {
+                    sent = registry_.send_to_all(cmd);
+                } else if (scope.starts_with("group:") && mgmt_group_store_) {
+                    for (const auto& m : mgmt_group_store_->get_members(scope.substr(6)))
+                        if (registry_.send_to(m.agent_id, cmd))
+                            ++sent;
+                } else {
+                    auto parsed = yuzu::scope::parse(scope);
+                    if (!parsed)
+                        return -1;
+                    for (const auto& aid : registry_.evaluate_scope(
+                             *parsed, tag_store_.get(), custom_properties_store_.get()))
+                        if (registry_.send_to(aid, cmd))
+                            ++sent;
+                }
+                return sent;
+            });
 
         // -- Register MCP server routes ----------------------------------------
 

@@ -23,7 +23,24 @@ message GuaranteedStateRule {
   uint64 version = 4;
   bool enabled = 5;
   string enforcement_mode = 6;  // "enforce" | "audit" | "disabled"
-  bytes signature = 7;          // HMAC-SHA256 over yaml_source (see design §11.2)
+  bytes signature = 7;          // HMAC-SHA256 over the canonical JSON (contract G3, deferred)
+
+  // Structured, typed enforcement content — the agent's source of truth (it never
+  // parses yaml_source). Each block is {type, map<string,string> params}; the param
+  // shape is defined by the server-side JSON-Schema registry, not the proto.
+  // See docs/guardian-mvp-contract.md decisions 1 & 3.
+  GuardianSpecBlock spark       = 8;   // trigger / detection mechanism
+  GuardianSpecBlock assertion   = 9;   // desired-state check
+  GuardianSpecBlock remediation = 10;  // alert|remediate (action + method in params)
+}
+
+// A typed {type, params} block — the unit of a Guard's spark/assertion/remediation.
+// `type` is the discriminator the agent dispatches on; `params` carries typed values
+// by key (e.g. hive/key/value_name/value_type/expected). The param schema lives in the
+// server-side JSON-Schema registry (the agent never sees it). See contract decision 3.
+message GuardianSpecBlock {
+  string type = 1;
+  map<string, string> params = 2;
 }
 
 message GuaranteedStatePush {
@@ -52,6 +69,10 @@ message GuaranteedStateEvent {
   double drift_rate = 16;
   string competing_process = 17;
   string platform = 18;         // "windows" | "linux" | "macos"
+
+  // Agent-generated, stable across retries — the dedup key for the at-least-once
+  // event journal (contract G6/N1). The server dedups inserts by event_id.
+  string event_id = 19;
 }
 
 message GuaranteedStateStatus {

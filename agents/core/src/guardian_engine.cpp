@@ -19,6 +19,7 @@
  */
 
 #include <yuzu/agent/guardian_engine.hpp>
+#include <yuzu/agent/guard_registry.hpp>
 #include <yuzu/agent/kv_store.hpp>
 
 #include "agent.grpc.pb.h"
@@ -83,6 +84,18 @@ std::string hex_decode(std::string_view hex) {
     return out;
 }
 
+nlohmann::json block_to_json(const gpb::GuardianSpecBlock& b) {
+    nlohmann::json j;
+    j["type"] = b.type();
+    nlohmann::json params = nlohmann::json::object();
+    // Iterator form (not `auto& [k,v]`): MSVC C3493s on structured bindings used
+    // inside a lambda/function template context.
+    for (auto it = b.params().begin(); it != b.params().end(); ++it)
+        params[it->first] = it->second;
+    j["params"] = params;
+    return j;
+}
+
 nlohmann::json rule_to_json(const gpb::GuaranteedStateRule& r) {
     nlohmann::json j;
     j["rule_id"]          = r.rule_id();
@@ -91,9 +104,23 @@ nlohmann::json rule_to_json(const gpb::GuaranteedStateRule& r) {
     j["version"]          = static_cast<std::uint64_t>(r.version());
     j["enabled"]          = r.enabled();
     j["enforcement_mode"] = r.enforcement_mode();
+    j["spark"]            = block_to_json(r.spark());
+    j["assertion"]        = block_to_json(r.assertion());
+    j["remediation"]      = block_to_json(r.remediation());
     if (!r.signature().empty())
         j["signature_hex"] = hex_encode(r.signature());
     return j;
+}
+
+void json_to_block(const nlohmann::json& j, gpb::GuardianSpecBlock* b) {
+    if (!j.is_object() || !b) return;
+    b->set_type(j.value("type", std::string{}));
+    if (j.contains("params") && j["params"].is_object()) {
+        const auto& p = j["params"];
+        for (auto it = p.begin(); it != p.end(); ++it)
+            (*b->mutable_params())[it.key()] =
+                it.value().is_string() ? it.value().get<std::string>() : it.value().dump();
+    }
 }
 
 bool json_to_rule(const nlohmann::json& j, gpb::GuaranteedStateRule& out) {
@@ -104,6 +131,9 @@ bool json_to_rule(const nlohmann::json& j, gpb::GuaranteedStateRule& out) {
     out.set_version(j.value("version", std::uint64_t{0}));
     out.set_enabled(j.value("enabled", false));
     out.set_enforcement_mode(j.value("enforcement_mode", std::string{}));
+    if (j.contains("spark")) json_to_block(j["spark"], out.mutable_spark());
+    if (j.contains("assertion")) json_to_block(j["assertion"], out.mutable_assertion());
+    if (j.contains("remediation")) json_to_block(j["remediation"], out.mutable_remediation());
     if (j.contains("signature_hex"))
         out.set_signature(hex_decode(j["signature_hex"].get<std::string>()));
     return !out.rule_id().empty();
@@ -165,6 +195,7 @@ void GuardianEngine::sync_with_server() {
 
 void GuardianEngine::stop() {
     std::lock_guard lock(mtx_);
+    stop_all_guards_locked();
     stopped_ = true;
     started_ = false;
 }
@@ -183,6 +214,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             spdlog::info("Guardian: full_sync cleared {} prior rule(s)", cleared);
         // Re-persist the policy generation marker after clear() wiped everything.
         persist_generation_locked();
+        // Full sync replaces the active set — tear down guards before re-arming.
+        stop_all_guards_locked();
     }
 
     std::size_t applied = 0;
@@ -194,6 +227,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         if (!put_rule_locked(rule)) {
             return std::unexpected("failed to persist rule '" + rule.rule_id() + "'");
         }
+        start_guard_for_rule_locked(rule); // step 4: arm the on-box guard
         ++applied;
     }
 
@@ -333,6 +367,78 @@ void GuardianEngine::refresh_count_locked() {
 void GuardianEngine::persist_generation_locked() {
     if (!kv_) return;
     kv_->set(kKvNamespace, kKeyGen, std::to_string(policy_generation_));
+}
+
+void GuardianEngine::set_event_sink(EventSink sink) {
+    std::lock_guard lock(mtx_);
+    event_sink_ = std::move(sink);
+}
+
+void GuardianEngine::stop_all_guards_locked() {
+    for (auto& kv : guards_)
+        if (kv.second) kv.second->stop();
+    guards_.clear();
+}
+
+void GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule& rule) {
+    // MVP: only the Windows Registry Spark. RegistryGuard::start() no-ops off Windows.
+    if (rule.spark().type() != "registry-change")
+        return;
+    const auto& a = rule.assertion();
+    if (a.type() != "registry-value-equals")
+        return;
+    auto param = [&a](const char* k) -> std::string {
+        auto it = a.params().find(k);
+        return it != a.params().end() ? it->second : std::string{};
+    };
+    RegistryGuard::Config cfg;
+    cfg.rule_id    = rule.rule_id();
+    cfg.rule_name  = rule.name();
+    cfg.hive       = param("hive");
+    cfg.key        = param("key");
+    cfg.value_name = param("value_name");
+    cfg.value_type = param("value_type");
+    cfg.expected   = param("expected");
+
+    // Capture a copy of the current sink so the guard thread never reads
+    // event_sink_ concurrently (set-once-then-read; copied here under mtx_).
+    EventSink sink_copy = event_sink_;
+    auto guard_sink = [this, sink_copy](const RegistryDrift& d) {
+        if (!sink_copy)
+            return;
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+        const auto seq = event_seq_.fetch_add(1, std::memory_order_relaxed);
+        gpb::GuaranteedStateEvent ev;
+        ev.set_event_id(d.rule_id + "-" + std::to_string(now_ms) + "-" + std::to_string(seq));
+        ev.set_rule_id(d.rule_id);
+        ev.set_rule_name(d.rule_name);
+        ev.set_event_type("drift.detected");
+        ev.set_guard_type("registry");
+        ev.set_guard_category("event");
+        ev.set_detected_value(d.detected_value);
+        ev.set_expected_value(d.expected_value);
+        ev.set_detection_latency_us(d.detection_latency_us);
+        ev.mutable_timestamp()->set_seconds(now_ms / 1000);
+        ev.set_platform("windows");
+        sink_copy(ev);
+    };
+
+    if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
+        if (it->second)
+            it->second->stop();
+        guards_.erase(it);
+    }
+    auto guard = std::make_unique<RegistryGuard>(std::move(cfg), std::move(guard_sink));
+    if (guard->start()) {
+        guards_.emplace(rule.rule_id(), std::move(guard));
+        spdlog::info("Guardian: registry guard armed for rule '{}'", rule.rule_id());
+    } else {
+        spdlog::warn("Guardian: registry guard for rule '{}' did not start "
+                     "(non-Windows or invalid hive)",
+                     rule.rule_id());
+    }
 }
 
 // #501: Test-support helper — see guardian_engine.hpp for the full rationale.

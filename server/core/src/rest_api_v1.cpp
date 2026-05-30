@@ -742,7 +742,8 @@ void RestApiV1::register_routes(
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
-    SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus) {
+    SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
+    GuardianPushFn guardian_push_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -750,7 +751,7 @@ void RestApiV1::register_routes(
                     std::move(service_group_fn), std::move(tag_push_fn), inventory_store,
                     product_pack_store, sw_deploy_store, device_token_store, license_store,
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
-                    execution_event_bus);
+                    execution_event_bus, std::move(guardian_push_fn));
 }
 
 void RestApiV1::register_routes(
@@ -763,7 +764,8 @@ void RestApiV1::register_routes(
     ProductPackStore* product_pack_store, SoftwareDeploymentStore* sw_deploy_store,
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
-    SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus) {
+    SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
+    GuardianPushFn guardian_push_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -3445,6 +3447,7 @@ void RestApiV1::register_routes(
         o.add("rule_id", r.rule_id)
             .add("name", r.name)
             .add("yaml_source", r.yaml_source)
+            .add("spec_json", r.spec_json)
             .add("version", static_cast<int64_t>(r.version))
             .add("enabled", r.enabled)
             .add("enforcement_mode", r.enforcement_mode)
@@ -3495,17 +3498,67 @@ void RestApiV1::register_routes(
         GuaranteedStateRuleRow row;
         row.rule_id = body.value("rule_id", "");
         row.name = body.value("name", "");
-        row.yaml_source = body.value("yaml_source", "");
         row.version = body.value("version", int64_t{1});
         row.enabled = body.value("enabled", true);
         row.enforcement_mode = body.value("enforcement_mode", std::string{"enforce"});
         row.severity = body.value("severity", std::string{"medium"});
         row.os_target = body.value("os_target", std::string{""});
-        row.scope_expr = body.value("scope_expr", std::string{""});
-        if (row.rule_id.empty() || row.name.empty() || row.yaml_source.empty()) {
+        row.scope_expr = body.value("scope_expr", body.value("scope", std::string{""}));
+
+        // Guardian Guards are authored STRUCTURED (contract decisions 1-3): typed
+        // spark/assertion/remediation blocks, each {type, map params}. The agent
+        // enforces from these (it never parses yaml_source). The server derives the
+        // authoritative canonical spec_json plus a human-readable yaml_source
+        // rendering. A legacy yaml_source-only body is still accepted (stored, but
+        // not agent-enforceable — spec_json stays empty) so pre-structured callers
+        // and tests keep working during the transition. See guardian-mvp-contract.md.
+        auto json_block = [&](const char* key) -> nlohmann::json {
+            if (body.contains(key) && body[key].is_object())
+                return body[key];
+            return nlohmann::json::object();
+        };
+        nlohmann::json spark = json_block("spark");
+        nlohmann::json assertion = json_block("assertion");
+        nlohmann::json remediation = json_block("remediation");
+        const std::string spark_type = spark.value("type", std::string{});
+        const std::string assertion_type = assertion.value("type", std::string{});
+        const bool structured = !spark_type.empty() && !assertion_type.empty();
+
+        if (structured) {
+            // Detect-and-alert is the MVP default remediation.
+            if (remediation.empty())
+                remediation = {{"type", "alert-only"}, {"params", nlohmann::json::object()}};
+            nlohmann::json spec;
+            spec["name"] = row.name;
+            spec["version"] = row.version;
+            spec["enabled"] = row.enabled;
+            spec["enforcement_mode"] = row.enforcement_mode;
+            spec["spark"] = spark;
+            spec["assertion"] = assertion;
+            spec["remediation"] = remediation;
+            // Authoritative structured form. NOTE: a structured dump, not yet
+            // JCS-canonicalised — full RFC-8785 canonicalisation lands with rule
+            // signing (contract G3, deferred).
+            row.spec_json = spec.dump();
+            // yaml_source is a generated, never-parsed human-readable rendering
+            // (decision 1). JSON is a valid YAML subset, so a header-commented
+            // pretty dump is an honest rendering; block-YAML output is cosmetic.
+            row.yaml_source =
+                "# Guardian Guard (generated rendering — authoritative form is the "
+                "structured spec)\n" +
+                spec.dump(2) + "\n";
+        } else {
+            // Legacy path: yaml_source supplied directly, no structured spec.
+            row.yaml_source = body.value("yaml_source", std::string{});
+        }
+
+        if (row.rule_id.empty() || row.name.empty() ||
+            (!structured && row.yaml_source.empty())) {
             res.status = 400;
-            res.set_content(error_json("rule_id, name, and yaml_source are required"),
-                            "application/json");
+            res.set_content(
+                error_json("rule_id and name are required, plus either a structured "
+                           "spark+assertion or a yaml_source"),
+                "application/json");
             return;
         }
         auto session = auth_fn(req, res);
@@ -3660,9 +3713,9 @@ void RestApiV1::register_routes(
     // POST /push — fan-out is wired in PR 3 (agent-side dispatch + scope
     // expansion). PR 2 acks the request and audits the operator action so
     // dashboards and audit-trail tooling can be exercised end-to-end now.
-    sink.Post("/api/v1/guaranteed-state/push", [perm_fn, audit_fn,
-                                                guaranteed_state_store](const httplib::Request& req,
-                                                                        httplib::Response& res) {
+    sink.Post("/api/v1/guaranteed-state/push", [perm_fn, audit_fn, guaranteed_state_store,
+                                                guardian_push_fn](const httplib::Request& req,
+                                                                  httplib::Response& res) {
         if (!perm_fn(req, res, "GuaranteedState", "Push"))
             return;
         if (!guaranteed_state_store) {
@@ -3713,22 +3766,33 @@ void RestApiV1::register_routes(
             }
             return out;
         };
-        // target_id is reserved for a concrete entity id across every other
-        // audit emission in this file (rule_id, agent_id, group_id, token_id).
-        // The push scope expression is a fleet-level selector, not an entity
-        // id, so emit it in `detail` and leave target_id empty to preserve
-        // the SIEM join semantics. Result vocabulary stays "success" (202 is
-        // still a success); the PR-2 fan-out-deferral is surfaced in detail.
+        // Step 3 fan-out: resolve scope → in-scope agents, build the GuaranteedStatePush
+        // from the store, deliver via the agent dispatch path. The callback is injected
+        // from server.cpp (registry + scope engine live there). A null callback means
+        // dispatch isn't wired (tests) — degrade to ack-only with agents=0. target_id is
+        // left empty: the scope is a fleet-level selector, not an entity id, so it goes
+        // in `detail` to preserve the SIEM join semantics.
+        int pushed = 0;
+        if (guardian_push_fn) {
+            pushed = guardian_push_fn(scope, full_sync);
+            if (pushed < 0) {
+                res.status = 400;
+                res.set_content(error_json("invalid scope expression"), "application/json");
+                audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
+                         "invalid scope=\"" + sanitize_audit_string(scope) + "\"");
+                return;
+            }
+        }
         audit_fn(req, "guaranteed_state.push", "success", "GuaranteedState", "",
-                 "rules=" + std::to_string(rule_count) +
-                     " full_sync=" + (full_sync ? "true" : "false") + " scope=\"" +
-                     sanitize_audit_string(scope) + "\"" + " fan_out_deferred_pr3=true");
+                 "rules=" + std::to_string(rule_count) + " full_sync=" +
+                     (full_sync ? "true" : "false") + " scope=\"" + sanitize_audit_string(scope) +
+                     "\" agents=" + std::to_string(pushed));
         res.status = 202;
         res.set_content(ok_json(JObj()
                                     .add("queued", true)
                                     .add("rules", static_cast<int64_t>(rule_count))
+                                    .add("agents", static_cast<int64_t>(pushed))
                                     .add("scope", scope)
-                                    .add("note", "push accepted; agent delivery is asynchronous")
                                     .str()),
                         "application/json");
     });

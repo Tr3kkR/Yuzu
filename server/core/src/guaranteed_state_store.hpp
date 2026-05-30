@@ -42,7 +42,12 @@ namespace yuzu::server {
 struct GuaranteedStateRuleRow {
     std::string rule_id;           // UUID
     std::string name;              // unique, human-authored
-    std::string yaml_source;       // verbatim YAML, authoritative
+    std::string yaml_source;       // human-readable rendering (generated; see spec_json)
+    // Canonical structured JSON of the Guard (spark/assertion/remediation) — the
+    // AUTHORITATIVE form the agent enforces from and that the push proto is built
+    // from. yaml_source is rendered one-way from this. See
+    // docs/guardian-mvp-contract.md decisions 1-2. Empty for pre-migration rows.
+    std::string spec_json;
     int64_t version{1};
     bool enabled{true};
     std::string enforcement_mode;  // "enforce" | "audit" | "disabled"

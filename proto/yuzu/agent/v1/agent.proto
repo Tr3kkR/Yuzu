@@ -157,6 +157,16 @@ message CommandResponse {
 
   yuzu.common.v1.ErrorDetail error  = 5;
   yuzu.common.v1.Timestamp   sent_at = 6;
+
+  // Side-channel routing for unsolicited agent→server messages (Guardian
+  // events/status over the reserved "__guard__" plugin). When `plugin` is set, the
+  // server's Subscribe read loop routes by `plugin`/`action` at the TOP of the loop
+  // body — before the command_id-correlation path — so these never enter the response
+  // store / executions drawer. `payload` carries a serialized proto (binary-safe,
+  // unlike the `output` UTF-8 string). See docs/guardian-mvp-contract.md G2.
+  string plugin  = 7;
+  string action  = 8;
+  bytes  payload = 9;
 }
 
 // ── Inventory ─────────────────────────────────────────────────────────────────

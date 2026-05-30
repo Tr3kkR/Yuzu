@@ -18,21 +18,27 @@
 
 #include <yuzu/plugin.h>
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::agent {
 class KvStore;
+class RegistryGuard;
 }
 
 namespace yuzu::guardian::v1 {
 class GuaranteedStatePush;
 class GuaranteedStateRule;
 class GuaranteedStateStatus;
+class GuaranteedStateEvent;
 } // namespace yuzu::guardian::v1
 
 namespace yuzu::agent::v1 {
@@ -75,6 +81,14 @@ public:
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.
     void stop();
+
+    /// Sink for outbound Guardian events (drift, etc.). Wired by agent.cpp once
+    /// the Subscribe stream is open and BEFORE any push arrives, so a guard started
+    /// by apply_rules captures a live sink. The sink writes a
+    /// CommandResponse{plugin:"__guard__", action:"event", payload:<event>} on the
+    /// stream. Guards capture a copy at start, so this is set-once-then-read.
+    using EventSink = std::function<void(const yuzu::guardian::v1::GuaranteedStateEvent&)>;
+    void set_event_sink(EventSink sink);
 
     /// Replace (full_sync=true) or merge (full_sync=false) the active
     /// rule set with the contents of `push`. Persists each rule as a
@@ -120,6 +134,17 @@ private:
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();
     void persist_generation_locked();
+
+    /// Step 4: start (or restart) the on-box guard for a rule. Reads the rule's
+    /// spark/assertion to decide the guard. MVP supports only the Windows Registry
+    /// Spark (`spark.type=="registry-change"` + `assertion.type=="registry-value-equals"`);
+    /// no-op otherwise / off-Windows. Called under mtx_.
+    void start_guard_for_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
+    void stop_all_guards_locked();
+
+    EventSink event_sink_;
+    std::atomic<std::uint64_t> event_seq_{0};
+    std::unordered_map<std::string, std::unique_ptr<RegistryGuard>> guards_;
 };
 
 /// Test-support helper: builds a __guard__ `CommandRequest` inside the

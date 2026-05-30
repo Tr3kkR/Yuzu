@@ -28,6 +28,7 @@ __declspec(allocate(".CRT$XCB"))
 
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
+#include "guaranteed_state.pb.h"
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
@@ -64,6 +65,7 @@ namespace yuzu::agent {
 namespace {
 
 namespace pb = ::yuzu::agent::v1;
+namespace gpb = ::yuzu::guardian::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 
 #if defined(_WIN32)
@@ -1158,6 +1160,24 @@ public:
                 }
                 spdlog::info("Subscribe stream opened - waiting for commands");
 
+                // Step 4: wire the Guardian event-sink now the stream is up and
+                // BEFORE any push arrives, so a guard started by a push captures a
+                // live sink. Drift events ship as a self-describing
+                // CommandResponse{plugin:"__guard__", action:"event", payload}. Re-set
+                // on each reconnect; the shared_ptr capture keeps the stream alive for
+                // the sink's lifetime.
+                if (guardian_) {
+                    guardian_->set_event_sink([this, stream](const gpb::GuaranteedStateEvent& ev) {
+                        pb::CommandResponse resp;
+                        resp.set_plugin("__guard__");
+                        resp.set_action("event");
+                        resp.set_status(pb::CommandResponse::SUCCESS);
+                        resp.set_payload(ev.SerializeAsString());
+                        std::lock_guard lock(stream_write_mu_);
+                        stream->Write(resp, grpc::WriteOptions());
+                    });
+                }
+
                 // 4b. Spawn OTA update check thread
                 if (cfg_.auto_update && updater_) {
                     auto* raw_stub = static_cast<void*>(stub.get());
@@ -1342,6 +1362,11 @@ public:
                             resp.set_exit_code(dr.exit_code);
                             resp.set_output(std::move(dr.output));
                         }
+                        // Stamp the response so the server routes it via the Guardian
+                        // ingest branch (plugin=="__guard__") and skips the response
+                        // store / executions drawer. action mirrors the request.
+                        resp.set_plugin("__guard__");
+                        resp.set_action(cmd.action());
                         metrics_
                             .counter("yuzu_agent_commands_executed_total",
                                      {{"plugin", "__guard__"}})
