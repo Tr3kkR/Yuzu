@@ -31,17 +31,25 @@ extern const char* const kDashboardIndexHtml =
     .dashboard-grid {
       display: grid; flex: 1; min-height: 0;
       grid-template-rows: auto 1fr auto;
-      grid-template-columns: 220px 1fr 260px;
+      grid-template-columns: 220px minmax(0, 1fr) 260px;
       grid-template-areas:
         "history instrbar  scope"
         "history results   scope"
         "history footer    scope";
     }
+    /* Grid items default to min-width:auto (= min-content). The instr-bar's
+       nowrap content has a ~920px min-content, which pins the whole grid at
+       ~1400px and pushes the right-hand scope (agent list) column off-screen
+       under body{overflow:hidden} on narrower windows. min-width:0 lets the
+       middle track actually compress so the scope column stays visible.
+       (Responsive breakpoints — hiding the history rail and reflowing to two
+       columns on narrow viewports — live in static/yuzu.css.) */
+    .dashboard-grid > * { min-width: 0; }
 
     /* ── Instruction Bar ─────────────────────────────────────── */
     .instr-bar {
       grid-area: instrbar;
-      display: flex; align-items: center; gap: 0.75rem;
+      display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
       padding: 0.75rem 1rem;
       border-bottom: 1px solid var(--border);
       background: var(--surface);
