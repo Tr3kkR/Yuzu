@@ -1340,7 +1340,12 @@ extern const char* const kDashboardIndexHtml =
       history.replaceState(null, '', '/');
       setTimeout(function() { cmdPalette.open(); }, 100);
     }
-
+)HTM"
+    // Split here: the PR2 MFA step-up intercept block pushed this chunk to
+    // ~18.3 KB, over MSVC's C2026 16380-byte raw-string-literal limit.
+    // Adjacent string literals concatenate at compile time, so the runtime
+    // HTML is byte-identical.
+    R"HTM(
     /* PR2 — MFA step-up intercept. High-risk REST/Settings handlers return
        401 + A4 envelope `{"error":{...},"meta":{"mfa_step_up_required":true,
        "challenge_url":"/login/mfa/stepup"}}` when the session's
