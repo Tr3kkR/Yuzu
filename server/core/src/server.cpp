@@ -50,6 +50,7 @@
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
+#include "guardian_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -5839,6 +5840,21 @@ private:
             policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
             policy_evaluator_.get());
 
+        // GuardianRoutes — /guardian + /fragments/guardian/* (Guaranteed State
+        // dashboard; docs/guardian-mvp-contract.md §8). Fragment renderers are
+        // mock-backed (contract-shaped) until the parallel backend on
+        // feat/guardian-mvp lands; live data is used where it already exists
+        // (rule CRUD + event query on GuaranteedStateStore).
+        guardian_routes_ = std::make_unique<GuardianRoutes>();
+        guardian_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, audit_fn,
+            [this](const std::string& event_type, const httplib::Request& req,
+                   const nlohmann::json& attrs, const nlohmann::json& payload_data) {
+                emit_event(event_type, req, attrs, payload_data);
+            },
+            guaranteed_state_store_.get(),
+            [this]() -> std::string { return registry_.to_json(); });
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
@@ -6506,6 +6522,7 @@ private:
     std::unique_ptr<SettingsRoutes> settings_routes_;
     std::unique_ptr<mcp::McpServer> mcp_server_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
+    std::unique_ptr<GuardianRoutes> guardian_routes_;
     std::unique_ptr<DashboardRoutes> dashboard_routes_;
     std::unique_ptr<WorkflowRoutes> workflow_routes_;
     std::unique_ptr<NotificationRoutes> notification_routes_;
