@@ -6174,7 +6174,10 @@ private:
                 cmd.set_command_id("__guard__-push-" + std::to_string(now_s));
                 cmd.set_plugin("__guard__");
                 cmd.set_action("push_rules");
-                (*cmd.mutable_parameters())["push"] = push.SerializeAsString();
+                // Binary serialized proto rides in the `payload` bytes field, not the
+                // `parameters` string map: proto3 string values must be valid UTF-8, and
+                // raw GuaranteedStatePush bytes are not. See agent.proto CommandRequest.payload.
+                cmd.set_payload(push.SerializeAsString());
                 int sent = 0;
                 if (scope.empty()) {
                     sent = registry_.send_to_all(cmd);

@@ -333,7 +333,7 @@ GuaranteedStateStore::get_rule(const std::string& rule_id) const {
     const char* sql = R"(
         SELECT rule_id, name, yaml_source, version, enabled, enforcement_mode,
                severity, os_target, scope_expr, signature, created_at, updated_at,
-               created_by, updated_by
+               created_by, updated_by, spec_json
         FROM guaranteed_state_rules WHERE rule_id = ?
     )";
     sqlite3_stmt* stmt = nullptr;
@@ -358,6 +358,7 @@ GuaranteedStateStore::get_rule(const std::string& rule_id) const {
         r.updated_at = col_text(stmt, 11);
         r.created_by = col_text(stmt, 12);
         r.updated_by = col_text(stmt, 13);
+        r.spec_json = col_text(stmt, 14);
         out = std::move(r);
     }
     sqlite3_finalize(stmt);
@@ -373,7 +374,7 @@ std::vector<GuaranteedStateRuleRow> GuaranteedStateStore::list_rules() const {
     const char* sql = R"(
         SELECT rule_id, name, yaml_source, version, enabled, enforcement_mode,
                severity, os_target, scope_expr, signature, created_at, updated_at,
-               created_by, updated_by
+               created_by, updated_by, spec_json
         FROM guaranteed_state_rules ORDER BY name
     )";
     sqlite3_stmt* stmt = nullptr;
@@ -396,6 +397,7 @@ std::vector<GuaranteedStateRuleRow> GuaranteedStateStore::list_rules() const {
         r.updated_at = col_text(stmt, 11);
         r.created_by = col_text(stmt, 12);
         r.updated_by = col_text(stmt, 13);
+        r.spec_json = col_text(stmt, 14);
         rows.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);

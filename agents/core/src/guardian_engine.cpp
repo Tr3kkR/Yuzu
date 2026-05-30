@@ -50,8 +50,6 @@ constexpr std::string_view kKeyGen      = "meta:policy_generation";
 constexpr std::string_view kActionPushRules = "push_rules";
 constexpr std::string_view kActionGetStatus = "get_status";
 
-constexpr std::string_view kParamPush = "push";
-
 std::string hex_encode(const std::string& bytes) {
     static constexpr char kHex[] = "0123456789abcdef";
     std::string out;
@@ -293,19 +291,20 @@ GuardianDispatchResult GuardianEngine::dispatch(const apb::CommandRequest& cmd) 
     GuardianDispatchResult res;
 
     if (cmd.action() == kActionPushRules) {
-        const auto& params = cmd.parameters();
-        auto it = params.find(std::string{kParamPush});
-        if (it == params.end()) {
+        // The serialized GuaranteedStatePush rides in the `payload` bytes field, not
+        // the `parameters` string map: proto3 string-map values must be valid UTF-8,
+        // and raw proto bytes are not (the server's UTF-8 validator rejects the whole
+        // CommandRequest before it reaches us). `bytes` is binary-safe across embedded
+        // NUL bytes and gateway-safe. See agent.proto CommandRequest.payload + G12.
+        const std::string& push_bytes = cmd.payload();
+        if (push_bytes.empty()) {
             res.exit_code = 1;
             res.content_type = "text";
-            res.output = "missing 'push' parameter (expected serialized GuaranteedStatePush)";
+            res.output = "missing payload (expected serialized GuaranteedStatePush)";
             return res;
         }
         gpb::GuaranteedStatePush push;
-        // proto map<string,string> stores the value as a std::string with
-        // exact length — binary-safe across embedded NUL bytes, unlike a
-        // C-string round trip.
-        if (!push.ParseFromString(it->second)) {
+        if (!push.ParseFromString(push_bytes)) {
             res.exit_code = 2;
             res.content_type = "text";
             res.output = "failed to parse GuaranteedStatePush proto";
@@ -442,13 +441,12 @@ void GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
 }
 
 // #501: Test-support helper — see guardian_engine.hpp for the full rationale.
-// The CommandRequest construction and `parameters` map population happen
-// INSIDE yuzu_agent_core.dll (where this TU compiles). When the test EXE
-// calls this function, the map is populated and read using the same
-// absl::HashOf seed (the DLL's copy of `MixingHashState::kSeed`), so
-// `engine.dispatch()`'s internal `.find("push")` succeeds. If the test
-// instead populates `cmd.mutable_parameters()` directly, the insert runs
-// against the EXE's hash seed and the DLL's find misses the bucket.
+// The CommandRequest construction happens INSIDE yuzu_agent_core.dll (where
+// this TU compiles). The push payload now rides in the `payload` bytes field
+// (a plain string field, not a Map), so the absl::HashOf-seed split that
+// motivated this helper no longer applies to the payload itself — but the
+// helper still usefully parses the GuaranteedStatePush (whose nested `params`
+// Map IS hashed) inside the DLL during dispatch()→apply_rules(), so keep it.
 GuardianDispatchResult
 guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
                                       std::string_view push_param_bytes) {
@@ -456,13 +454,7 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
     cmd.set_command_id("test-dispatch");
     cmd.set_plugin("__guard__");
     cmd.set_action(std::string{kActionPushRules});
-    // Use operator[] on the mutable Map here rather than insert({k,v}) or
-    // try_emplace — any of them work equivalently because population and
-    // the downstream find() both happen inside this TU (same DLL, same
-    // seed). The distinction only mattered when the mutation crossed
-    // modules; here it doesn't.
-    (*cmd.mutable_parameters())[std::string{kParamPush}] =
-        std::string{push_param_bytes};
+    cmd.set_payload(std::string{push_param_bytes});
     return engine.dispatch(cmd);
 }
 
