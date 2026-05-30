@@ -1332,6 +1332,55 @@ extern const char* const kDashboardIndexHtml =
       history.replaceState(null, '', '/');
       setTimeout(function() { cmdPalette.open(); }, 100);
     }
+
+    /* PR2 — MFA step-up intercept. High-risk REST/Settings handlers return
+       401 + A4 envelope `{"error":{...},"meta":{"mfa_step_up_required":true,
+       "challenge_url":"/login/mfa/stepup"}}` when the session's
+       mfa_verified_at is stale. Listen on htmx:responseError, detect the
+       envelope, prompt the operator for a TOTP / recovery code, POST to
+       /login/mfa/stepup, and on success retry the original request via
+       htmx.ajax() so the dashboard interaction completes seamlessly.
+       Minimal-UX intentional — a richer modal lives in a UX follow-up. */
+    document.body.addEventListener('htmx:responseError', function(evt) {
+      var xhr = evt.detail.xhr;
+      if (!xhr || xhr.status !== 401) return;
+      var env;
+      try { env = JSON.parse(xhr.responseText); } catch (_) { return; }
+      if (!env || !env.meta || !env.meta.mfa_step_up_required) return;
+      /* Suppress any other htmx response-error handlers + the default
+         error toast (governance Gate 4 happy-N3). We own this 401 from
+         here on; the operator gets either a successful retry or an
+         alert, not a duplicate error message. */
+      evt.preventDefault();
+      var challenge = (env.meta.challenge_url) || '/login/mfa/stepup';
+      var code = window.prompt('MFA step-up required for this action.\n\nEnter your 6-digit TOTP code (or a recovery code):');
+      if (!code) return; /* user cancelled */
+      var form = new URLSearchParams();
+      form.set('code', code.trim());
+      fetch(challenge, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: form.toString()
+      }).then(function(resp) {
+        if (!resp.ok) {
+          alert('MFA step-up failed — verify your code and try again.');
+          return;
+        }
+        /* Replay the original request via htmx.ajax. The original
+           triggering element is in evt.detail.elt; pass it as the
+           context so OOB swaps / hx-target are honoured. */
+        var elt = evt.detail.elt;
+        var verb = (evt.detail.requestConfig && evt.detail.requestConfig.verb) ||
+                   evt.detail.xhr.method || 'GET';
+        var path = (evt.detail.requestConfig && evt.detail.requestConfig.path) ||
+                   xhr.responseURL || '';
+        var orig = (evt.detail.requestConfig && evt.detail.requestConfig.parameters) || {};
+        htmx.ajax(verb.toUpperCase(), path, {source: elt, target: elt, values: orig});
+      }).catch(function() {
+        alert('MFA step-up request failed — please try the action again.');
+      });
+    });
   </script>
   <div id="toast-container" class="toast-container"></div>
 </body>

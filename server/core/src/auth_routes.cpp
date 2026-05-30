@@ -12,6 +12,9 @@
 
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
+#include "rest_a4_envelope.hpp"
+
+#include <nlohmann/json.hpp>
 
 // Login page HTML (defined in login_ui.cpp)
 extern const char* const kLoginHtml;
@@ -789,6 +792,154 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             std::lock_guard lock(mfa_pending_mu_);
             m->gauge("yuzu_auth_mfa_pending_tokens")
                 .set(static_cast<double>(mfa_pending_.size()));
+        }
+    });
+
+    // -- MFA step-up (PR2) ----------------------------------------------------
+    //
+    // POST /login/mfa/stepup — re-prove MFA for an existing session so the
+    // session's mfa_verified_at refreshes and the high-risk REST/Settings
+    // gate at `mfa_step_up.hpp` lets the next mutation through. The endpoint
+    // is rate-limited at the server pre-routing layer (`is_login`
+    // predicate widened to include this path) so a malicious operator with
+    // a valid session cannot pound the TOTP space to brute-force the secret.
+    //
+    // Failure-mode taxonomy mirrors POST /login/mfa: uniform 401 body
+    // regardless of whether the session was missing/stale, the code shape
+    // was wrong, or the code mismatched. Discriminator lives in the audit
+    // detail only (token-validity oracle defence). API-token principals
+    // hit this endpoint with auth_source != "local"/"oidc" — they get a
+    // 400 (session step-up is the wrong tool for token rotation).
+    sink.Post("/login/mfa/stepup", [this](const httplib::Request& req, httplib::Response& res) {
+        static constexpr const char* kFailureBody =
+            R"({"error":{"code":401,"message":"MFA step-up failed"},"meta":{"api_version":"v1"}})";
+
+        auto session = require_auth(req, res);
+        if (!session)
+            return;
+
+        // Bearer-credential callers cannot step up a session (they don't
+        // have one). Surface this as 400 with a precise remediation hint
+        // so an agentic worker that hit this endpoint by mistake knows
+        // to re-issue the token instead. Audit emission + per-request
+        // correlation_id keep this branch traceable (governance Gate 2
+        // sec-M4 + happy-N1).
+        if (session->auth_source != "local" && session->auth_source != "oidc") {
+            const auto cid = detail::make_correlation_id();
+            res.status = 400;
+            nlohmann::json envelope = {
+                {"error",
+                 {{"code", 400},
+                  {"message",
+                   "step-up is for session-cookie callers only — re-issue the API "
+                   "token to refresh MFA proof"},
+                  {"correlation_id", cid}}},
+                {"meta", {{"api_version", "v1"}}}};
+            res.set_content(envelope.dump(), "application/json");
+            audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
+                                    auth::role_to_string(session->role), "User",
+                                    session->username,
+                                    "bearer credential cannot step up (auth_source=" +
+                                        session->auth_source + ")");
+            return;
+        }
+
+        auto* db = auth_mgr_.auth_db_ptr();
+        if (!db) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"auth_db unavailable"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+
+        auto code = extract_form_value(req.body, "code");
+        if (code.empty()) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"missing code"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
+                                    auth::role_to_string(session->role), "User",
+                                    session->username, "missing code");
+            return;
+        }
+
+        // Strict shape gate (same as /login/mfa): 6 ASCII digits → TOTP,
+        // anything else → recovery code path. Defeats the CPU-DoS shape
+        // oracle that a 7-digit numeric noise would otherwise trip.
+        bool is_totp = code.size() == 6;
+        if (is_totp) {
+            for (char c : code) {
+                if (c < '0' || c > '9') {
+                    is_totp = false;
+                    break;
+                }
+            }
+        }
+        bool matched = false;
+        bool used_recovery = false;
+        if (is_totp) {
+            auto r = db->mfa_verify_login_code(session->username, code);
+            if (r && *r)
+                matched = true;
+        } else {
+            auto r = db->mfa_consume_recovery_code(session->username, code);
+            if (r && *r) {
+                matched = true;
+                used_recovery = true;
+            }
+        }
+
+        if (!matched) {
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
+                                    auth::role_to_string(session->role), "User",
+                                    session->username,
+                                    is_totp ? "totp code rejected" : "recovery code rejected");
+            emit_event("mfa.step_up.failed", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", session->username},
+                        {"method", is_totp ? "totp" : "recovery"}},
+                       {}, Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_mfa_step_up_total",
+                           {{"method", is_totp ? "totp" : "recovery"}, {"result", "failure"}})
+                    .increment();
+            }
+            return;
+        }
+
+        // Success — stamp `mfa_verified_at = steady_clock::now()` on the
+        // existing session row. The cookie itself does NOT rotate — the
+        // step-up refreshes a session attribute, it does not mint a new
+        // session (which would break in-flight HTMX requests from the
+        // same browser tab).
+        auto token = extract_session_cookie(req);
+        if (!auth_mgr_.mark_session_mfa_verified(token)) {
+            // Defensive — require_auth succeeded so the token resolves to
+            // a session; if mark_session_mfa_verified can't find it, the
+            // session was concurrently invalidated. Fail closed.
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
+                                    auth::role_to_string(session->role), "User",
+                                    session->username, "session vanished during step-up");
+            return;
+        }
+        res.set_content(R"({"status":"ok"})", "application/json");
+        audit_log_for_principal(req, "mfa.step_up.passed", "ok", session->username,
+                                auth::role_to_string(session->role), "User", session->username,
+                                used_recovery ? "method=recovery" : "method=totp");
+        emit_event("mfa.step_up.passed", req,
+                   {{"source_ip", req.remote_addr},
+                    {"username", session->username},
+                    {"method", used_recovery ? "recovery" : "totp"}});
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_auth_mfa_step_up_total",
+                       {{"method", used_recovery ? "recovery" : "totp"}, {"result", "success"}})
+                .increment();
         }
     });
 

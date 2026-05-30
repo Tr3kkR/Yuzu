@@ -435,6 +435,154 @@ TEST_CASE("POST /login/mfa pending token expires after TTL", "[mfa][routes][auth
     CHECK(saw_expired);
 }
 
+// ── /login/mfa/stepup tests (PR2) ─────────────────────────────────────────
+
+namespace {
+
+/// Helper: full PR1 login dance (password → 202 → TOTP → 200) and return
+/// the session cookie value so step-up tests can authenticate. Drives the
+/// real routes end-to-end so any future change that breaks the cookie
+/// shape or the dual-audit trips a test in `[mfa][stepup]` as well as
+/// `[mfa][routes][auth_routes]`.
+std::string login_with_mfa(AuthRoutesHarness& h, const std::string& username,
+                           const std::string& password, const std::string& secret_b32) {
+    auto step1 =
+        h.sink.Post("/login", form({{"username", username}, {"password", password}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1);
+    REQUIRE(step1->status == 202);
+    auto body = step1->body;
+    auto p_start = body.find(R"("mfa_pending_token":")") + 21;
+    auto pending = body.substr(p_start, body.find('"', p_start) - p_start);
+
+    auto code = h.totp_at(secret_b32, 1);
+    auto step2 = h.sink.Post("/login/mfa", form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    REQUIRE(step2->status == 200);
+    auto cookie_hdr = step2->get_header_value("Set-Cookie");
+    auto eq = cookie_hdr.find("yuzu_session=");
+    REQUIRE(eq != std::string::npos);
+    auto sc = cookie_hdr.find(';', eq);
+    return cookie_hdr.substr(eq, sc == std::string::npos ? cookie_hdr.size() - eq : sc - eq);
+}
+
+} // namespace
+
+TEST_CASE(
+    "POST /login/mfa/stepup with valid fresh TOTP succeeds and emits mfa.step_up.passed",
+    "[mfa][stepup][routes]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+
+    // verify_window is ±1 step (PR1) and login_with_mfa consumed counter+1,
+    // so the next code we could verify in this 30 s window is counter+2 —
+    // which is OUT of window. Without sleeping 30 s, the only way to test
+    // a TOTP-path step-up success deterministically is to disable + re-
+    // enroll, which resets `mfa_last_counter` to 0. The session cookie
+    // remains valid because the session row is keyed by token, not by the
+    // user's MFA state.
+    REQUIRE(h.auth_db.mfa_disable("admin").has_value());
+    auto fresh_secret = h.enroll_mfa("admin");
+    auto stepup_code = h.totp_at(fresh_secret, 1);
+
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup",
+                               form({{"code", stepup_code}}),
+                               "application/x-www-form-urlencoded",
+                               {{"Cookie", cookie}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find(R"("status":"ok")") != std::string::npos);
+    CHECK(h.count_audits("mfa.step_up.passed", "admin") >= 1);
+    CHECK(h.count_audits("mfa.step_up.failed") == 0);
+}
+
+TEST_CASE(
+    "POST /login/mfa/stepup with a recovery code succeeds and emits mfa.step_up.passed",
+    "[mfa][stepup][routes]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    auto codes = h.auth_db.mfa_regenerate_recovery_codes("admin");
+    REQUIRE(codes.has_value());
+    REQUIRE_FALSE(codes->empty());
+    auto recovery = codes->front();
+
+    auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup",
+                               form({{"code", recovery}}),
+                               "application/x-www-form-urlencoded",
+                               {{"Cookie", cookie}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.count_audits("mfa.step_up.passed", "admin") >= 1);
+    // Recovery codes are single-use — second attempt must fail.
+    auto res2 = h.sink.dispatch("POST", "/login/mfa/stepup",
+                                form({{"code", recovery}}),
+                                "application/x-www-form-urlencoded",
+                                {{"Cookie", cookie}});
+    REQUIRE(res2);
+    CHECK(res2->status == 401);
+    CHECK(h.count_audits("mfa.step_up.failed", "admin") >= 1);
+}
+
+TEST_CASE("POST /login/mfa/stepup without a session returns 401 (require_auth gate)",
+          "[mfa][stepup][routes]") {
+    AuthRoutesHarness h;
+    h.enroll_mfa("admin");
+    auto res = h.sink.Post("/login/mfa/stepup", form({{"code", "123456"}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    // No session → no principal → no mfa.step_up audit at all.
+    CHECK(h.count_audits("mfa.step_up.passed") == 0);
+    CHECK(h.count_audits("mfa.step_up.failed") == 0);
+}
+
+TEST_CASE("POST /login/mfa/stepup with empty code body returns 400 + audit",
+          "[mfa][stepup][routes]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup", "",
+                               "application/x-www-form-urlencoded",
+                               {{"Cookie", cookie}});
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.count_audits("mfa.step_up.failed", "admin") >= 1);
+}
+
+TEST_CASE("POST /login/mfa/stepup with wrong TOTP returns 401 + mfa.step_up.failed",
+          "[mfa][stepup][routes]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    auto cookie = login_with_mfa(h, "admin", "adminpassword1", secret);
+
+    auto res = h.sink.dispatch("POST", "/login/mfa/stepup",
+                               form({{"code", "000000"}}),
+                               "application/x-www-form-urlencoded",
+                               {{"Cookie", cookie}});
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(res->body.find("MFA step-up failed") != std::string::npos);
+
+    AuditQuery q;
+    q.action = "mfa.step_up.failed";
+    q.principal = "admin";
+    auto rows = h.audit_store->query(q);
+    REQUIRE_FALSE(rows.empty());
+    bool saw_totp_reject = false;
+    for (const auto& r : rows) {
+        if (r.detail.find("totp code rejected") != std::string::npos) {
+            saw_totp_reject = true;
+            break;
+        }
+    }
+    CHECK(saw_totp_reject);
+}
+
 TEST_CASE("POST /login/mfa concurrent submit with same token: exactly one wins",
           "[mfa][routes][auth_routes]") {
     AuthRoutesHarness h;

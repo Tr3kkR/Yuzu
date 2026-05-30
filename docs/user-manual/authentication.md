@@ -94,7 +94,7 @@ If a user loses both their authenticator and all 10 recovery codes, MFA must be 
 | Flag | Default | Description |
 |---|---|---|
 | `--mfa-enforcement` | `optional` | `optional`: users enroll voluntarily. `admin-only`: admins must enroll. `required`: all users must enroll. **This release ships `optional` semantics only**; non-default values are accepted for forward compatibility but emit a startup warning until the enforcement PR lands. |
-| `--mfa-step-up-window-secs` | `300` | Seconds after a TOTP proof during which high-risk endpoints accept the session as "stepped up" without re-prompting. Used by the step-up flow in a follow-up PR. |
+| `--mfa-step-up-window-secs` | `300` | Seconds after a TOTP proof during which high-risk endpoints accept the session as "stepped up" without re-prompting. Set to `0` to disable the step-up gate entirely (escape hatch — emits a startup `WARN`). |
 | `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state lives in process memory and is lost on server restart. |
 
 Each flag also accepts the matching `YUZU_MFA_*` environment variable.
@@ -112,8 +112,39 @@ Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` l
 - `mfa.login.failed` — `POST /login/mfa` rejected the code or the pending token
 - `mfa.recovery_codes.generated` — 10 codes issued (enrollment or rotation)
 - `mfa.recovery_code.used` — one code consumed on login
+- `mfa.step_up.required` — high-risk endpoint returned a 401 because the session's MFA proof was stale (PR 2)
+- `mfa.step_up.passed` — `POST /login/mfa/stepup` accepted, session's MFA proof refreshed (PR 2)
+- `mfa.step_up.failed` — `POST /login/mfa/stepup` rejected the code (PR 2)
 
 `auth.login` is also emitted on every successful MFA login alongside `mfa.login.verified` / `mfa.recovery_code.used`, so SIEM rules keying on `auth.login` for session-creation parity stay correct across password, OIDC, and MFA flows.
+
+#### Step-up on high-risk surfaces (PR 2)
+
+Ten REST + Settings endpoints (token mint/revoke, admin session revoke, software package create / deployment start, Guardian rule create/update/push, user delete, user role change) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
+
+```json
+{
+  "error": {
+    "code": 401,
+    "message": "MFA step-up required",
+    "correlation_id": "req-...",
+    "remediation": "POST /login/mfa/stepup with current TOTP code or a recovery code, then retry"
+  },
+  "meta": {
+    "api_version": "v1",
+    "mfa_step_up_required": true,
+    "challenge_url": "/login/mfa/stepup"
+  }
+}
+```
+
+Dashboard HTMX flows auto-intercept this envelope and prompt the operator inline (no context-switch). Programmatic clients should:
+
+1. Detect the 401 + `meta.mfa_step_up_required == true`.
+2. POST `code=<6-digit TOTP or recovery code>` (form-encoded) to `meta.challenge_url` (`/login/mfa/stepup` by default) on the same session cookie.
+3. On `200 OK`, retry the original request — the session is now "stepped up" for `--mfa-step-up-window-secs` seconds.
+
+API token / MCP token principals **bypass step-up entirely** — the token itself was issued as a long-lived bearer credential through an authenticated session and does not re-prompt. Step-up applies to session-cookie principals only.
 
 ### Logout
 

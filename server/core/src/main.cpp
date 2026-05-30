@@ -372,6 +372,20 @@ int main(int argc, char* argv[]) {
             "silence this warning.",
             cfg.mfa_enforcement);
     }
+    // PR2 governance Gate 2 sec-M6: the step-up gate honours
+    // window_secs <= 0 as an "escape hatch" that lets every request
+    // through without re-prompting. The helper itself doesn't log on
+    // every skip (too noisy), so we surface it once at startup so the
+    // operator sees the disabled state in journald and an auditor
+    // reading the boot log can spot a misconfigured deployment.
+    if (cfg.mfa_step_up_window_secs <= 0) {
+        spdlog::warn(
+            "--mfa-step-up-window-secs={} disables the MFA step-up gate entirely. High-risk "
+            "REST + Settings endpoints will NOT re-prompt for MFA proof. SOC 2 CC6.6 evidence "
+            "rows (`mfa.step_up.required`) will not be emitted. Set to a positive value "
+            "(default 300) to re-enable.",
+            cfg.mfa_step_up_window_secs);
+    }
 
     // ── Validate operator-supplied CSP extras (SOC2-C1, gov UP-1/UP-2) ──
     // Done immediately after CLI parse so operators see a clear startup

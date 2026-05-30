@@ -19,6 +19,7 @@
 #include "response_store.hpp"
 #include "schedule_engine.hpp"
 #include "software_deployment_store.hpp"
+#include "mfa_step_up.hpp"
 #include "tag_store.hpp"
 
 // W5.1 — `/api/v1/events` JSON SSE consumes the per-execution event bus.
@@ -138,11 +139,18 @@ public:
         DeviceTokenStore* device_token_store = nullptr, LicenseStore* license_store = nullptr,
         GuaranteedStateStore* guaranteed_state_store = nullptr,
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
-        ExecutionEventBus* execution_event_bus = nullptr);
+        ExecutionEventBus* execution_event_bus = nullptr, StepUpFn step_up_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
     /// TSan-hostile acceptor thread (#438).
+    ///
+    /// `step_up_fn` (PR2, optional) — when present, the 9 high-risk REST
+    /// handlers (token create/revoke, session revoke, Guardian rule
+    /// create/update/push, software package create, software deploy
+    /// start, file retrieval upload) gate behind it after permissions
+    /// pass. Empty functor disables the gate entirely (default — preserves
+    /// pre-PR2 behaviour for any caller that hasn't wired it).
     void register_routes(
         class HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
         RbacStore* rbac_store, ManagementGroupStore* mgmt_store, ApiTokenStore* token_store,
@@ -155,7 +163,7 @@ public:
         DeviceTokenStore* device_token_store = nullptr, LicenseStore* license_store = nullptr,
         GuaranteedStateStore* guaranteed_state_store = nullptr,
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
-        ExecutionEventBus* execution_event_bus = nullptr);
+        ExecutionEventBus* execution_event_bus = nullptr, StepUpFn step_up_fn = {});
 };
 
 } // namespace yuzu::server

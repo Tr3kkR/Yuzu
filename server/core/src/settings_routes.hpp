@@ -11,6 +11,7 @@
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
 #include "management_group_store.hpp"
+#include "mfa_step_up.hpp"
 #include "oidc_provider.hpp"
 #include "runtime_config_store.hpp"
 #include "tag_store.hpp"
@@ -67,11 +68,16 @@ public:
                          GatewaySessionCountFn gateway_session_count_fn,
                          AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
                          std::unique_ptr<oidc::OidcProvider>& oidc_provider,
-                         yuzu::MetricsRegistry* metrics_registry = nullptr);
+                         yuzu::MetricsRegistry* metrics_registry = nullptr,
+                         StepUpFn step_up_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink and dispatch synthesized requests directly,
     /// avoiding httplib::Server's TSan-hostile acceptor thread (#438).
+    ///
+    /// `step_up_fn` (PR2, optional) — when present, the 2 user-management
+    /// Settings mutations (DELETE user, POST user role) gate behind it
+    /// after admin_fn passes. Empty functor disables the gate entirely.
     void register_routes(class HttpRouteSink& sink, AuthFn auth_fn, AdminFn admin_fn,
                          PermFn perm_fn, AuditFn audit_fn, Config& cfg, auth::AuthManager& auth_mgr,
                          auth::AutoApproveEngine& auto_approve, ApiTokenStore* api_token_store,
@@ -81,7 +87,8 @@ public:
                          GatewaySessionCountFn gateway_session_count_fn,
                          AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
                          std::unique_ptr<oidc::OidcProvider>& oidc_provider,
-                         yuzu::MetricsRegistry* metrics_registry = nullptr);
+                         yuzu::MetricsRegistry* metrics_registry = nullptr,
+                         StepUpFn step_up_fn = {});
 
 private:
     // -- Fragment renderers (called by route handlers) -------------------------
@@ -167,6 +174,7 @@ private:
     std::shared_mutex* oidc_mu_{};
     std::unique_ptr<oidc::OidcProvider>* oidc_provider_{};
     yuzu::MetricsRegistry* metrics_registry_{};
+    StepUpFn step_up_fn_;
 };
 
 } // namespace yuzu::server
