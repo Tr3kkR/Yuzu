@@ -143,8 +143,13 @@ message CommandRequest {
   // text parameters. The Guardian push (`plugin="__guard__"`, action="push_rules")
   // puts a serialized GuaranteedStatePush here: proto3 `string` map values must be
   // valid UTF-8, so binary proto bytes cannot ride in `parameters`. `bytes` is
-  // binary-safe and gateway-safe (gpb passes bytes through verbatim). Symmetric
-  // with CommandResponse.payload. See docs/guardian-mvp-contract.md G2/G12.
+  // binary-safe across embedded NUL bytes. Symmetric with CommandResponse.payload.
+  // GATEWAY CAVEAT: the Erlang gateway re-encodes CommandRequest field-by-field
+  // (gateway/apps/yuzu_gw/src/yuzu_gw_proto.erl encode_command_request/1) and DROPS
+  // any field it doesn't copy. Gateway mode therefore also needs this field added to
+  // the gateway's vendored agent.proto (gateway/priv/proto/.../agent.proto, regen
+  // agent_pb.erl) AND copied in encode_command_request/1. Verified direct-mode only;
+  // gateway path pending. See docs/guardian-mvp-contract.md G2/G12.
   bytes payload = 8;
 }
 

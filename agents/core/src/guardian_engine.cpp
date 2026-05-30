@@ -295,7 +295,9 @@ GuardianDispatchResult GuardianEngine::dispatch(const apb::CommandRequest& cmd) 
         // the `parameters` string map: proto3 string-map values must be valid UTF-8,
         // and raw proto bytes are not (the server's UTF-8 validator rejects the whole
         // CommandRequest before it reaches us). `bytes` is binary-safe across embedded
-        // NUL bytes and gateway-safe. See agent.proto CommandRequest.payload + G12.
+        // NUL bytes. NOTE: the Erlang gateway's field-by-field re-encoder currently
+        // DROPS this field — gateway mode is not yet wired (see agent.proto
+        // CommandRequest.payload gateway caveat + G12).
         const std::string& push_bytes = cmd.payload();
         if (push_bytes.empty()) {
             res.exit_code = 1;
