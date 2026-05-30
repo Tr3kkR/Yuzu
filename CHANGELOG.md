@@ -37,6 +37,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   intersected with the policy's own scope; new `yuzu_server_policy_verdicts_total`
   / `yuzu_server_policy_eval_errors_total` metrics.
 
+### Fixed
+
+- **Dashboard scope panel now visible at narrow viewports (≤1280px).** A global
+  responsive rule in `server/core/static/yuzu.css` was hiding the right-hand
+  agent/device selector panel (`.scope`) on any browser window 1280px wide or
+  narrower — a common laptop resolution — making connected agents invisible
+  until the operator widened the window past ~1400px. The rule was inherited
+  from an unrelated `.main-grid` layout. Now only the optional history rail is
+  hidden at that breakpoint; the scope panel reflows to a two-column layout and
+  stays fully accessible. The 1281–1440px band also received grid hardening
+  (`minmax(0,1fr)` middle track + `min-width:0`) so the instruction bar's
+  minimum content size can no longer push the panel off-screen.
+
 ### Tests
 
 - `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
