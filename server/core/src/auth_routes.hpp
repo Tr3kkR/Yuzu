@@ -117,9 +117,20 @@ public:
 
     // -- Route registration ---------------------------------------------------
 
-    /// Register auth-related routes: GET/POST /login, POST /logout,
-    /// GET /auth/oidc/start, GET /auth/callback.
+    /// Register auth-related routes: GET/POST /login, POST /login/mfa,
+    /// POST /logout, GET /auth/oidc/start, GET /auth/callback.
+    ///
+    /// Production callers use this overload; it constructs an
+    /// `HttplibRouteSink` over `svr` and delegates to the sink-based
+    /// overload below. Same handlers, same lambdas, same behaviour.
     void register_routes(httplib::Server& svr);
+
+    /// Sink-based overload — used by tests to register routes against an
+    /// in-process `TestRouteSink` and dispatch synthesized requests
+    /// directly, avoiding `httplib::Server`'s TSan-hostile acceptor
+    /// thread (#438). Matches the pattern already in use by
+    /// `SettingsRoutes::register_routes`.
+    void register_routes(class HttpRouteSink& sink);
 
     // -- Static utilities (also used by server.cpp pre-routing handler) --------
 

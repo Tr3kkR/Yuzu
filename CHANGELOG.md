@@ -125,6 +125,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
+- **Route-level MFA test harness (closes PR1 deferred quality-engineer
+  SHOULD-FIX).** Hermes Agent's red-team round on PR1 caught the
+  CRITICAL `/login/mfa` pre-routing exemption bug within 30 s of live
+  curl probing because the internal governance pipeline reviewed
+  handlers statically without exercising the wire path. This change
+  closes that gap with two new test files that drive every MFA-touching
+  handler through an in-process `TestRouteSink` (TSan-clean per #438).
+  - **`AuthRoutes::register_routes` dual overload**: mirrors the
+    `SettingsRoutes` pattern. Existing `httplib::Server&` overload becomes
+    a 2-line shim that constructs `HttplibRouteSink` and delegates to a
+    new `HttpRouteSink&` overload that owns every lambda. Production
+    behaviour is unchanged; tests get a TSan-safe in-process dispatch
+    seam.
+  - **`tests/unit/server/test_auth_routes_mfa.cpp`** — 10 cases covering
+    `POST /login` (no-MFA fast-path + MFA-enrolled 202 branch + bad
+    password), `POST /login/mfa` (valid TOTP, valid recovery code,
+    invalid pending token, 5-attempts-cap, strict-shape gate routing
+    non-6-digit to recovery, pending-token TTL expiry, atomic erase
+    under concurrent submit with same valid token), and the dual audit
+    emission contract (`mfa.login.verified` + `auth.login`,
+    `mfa.recovery_code.used` + `auth.login`).
+  - **`tests/unit/server/test_settings_routes_mfa.cpp`** — 12 cases
+    covering the 5 `/api/settings/mfa/*` routes (init reveal +
+    Cache-Control: no-store contract, double-init → MfaAlreadyEnrolled
+    message, recovery-codes regenerate, disable atomicity, non-admin
+    403), and the `origin_safe` CSRF gate (same-origin pass,
+    cross-origin 403 with `csrf.denied` audit, default-port :443
+    normalisation, userinfo / RFC-6454 rejection, no-Origin
+    non-browser pass-through, Referer fallback).
 - `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
   `PolicyEvaluator`: compliant/non_compliant multi-agent fan-out, non-responder
   → `unknown`, plugin-failure → `error`, missing-field → `non_compliant`, CEL

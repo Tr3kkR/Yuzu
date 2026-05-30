@@ -10,6 +10,7 @@
 #include <chrono>
 #include <shared_mutex>
 
+#include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
 
 // Login page HTML (defined in login_ui.cpp)
@@ -529,8 +530,17 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
 // ---------------------------------------------------------------------------
 
 void AuthRoutes::register_routes(httplib::Server& svr) {
+    // Production shim — wrap the real server in an HttplibRouteSink and
+    // delegate to the sink-based overload. Same handlers, same lambdas,
+    // same observable behaviour. Test code calls the sink overload
+    // directly with a TestRouteSink.
+    HttplibRouteSink sink(svr);
+    register_routes(sink);
+}
+
+void AuthRoutes::register_routes(HttpRouteSink& sink) {
     // -- Login page -----------------------------------------------------------
-    svr.Get("/login", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/login", [this](const httplib::Request& req, httplib::Response& res) {
         std::string html(kLoginHtml);
         // Inject OIDC enablement flag into the page
         std::shared_lock oidc_lock(oidc_mu_);
@@ -542,7 +552,7 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
         res.set_content(html, "text/html; charset=utf-8");
     });
 
-    svr.Post("/login", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/login", [this](const httplib::Request& req, httplib::Response& res) {
         auto username = extract_form_value(req.body, "username");
         auto password = extract_form_value(req.body, "password");
 
@@ -624,7 +634,7 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
         }
     });
 
-    svr.Post("/login/mfa", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/login/mfa", [this](const httplib::Request& req, httplib::Response& res) {
         // Single error message regardless of failure mode (token-invalid
         // vs code-rejected vs attempts-exhausted) — distinguishing them
         // on the wire gives an attacker a token-validity oracle. The
@@ -783,7 +793,7 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
     });
 
     // -- Logout ---------------------------------------------------------------
-    svr.Post("/logout", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/logout", [this](const httplib::Request& req, httplib::Response& res) {
         audit_log(req, "auth.logout", "success");
         emit_event("auth.logout", req);
         auto token = extract_session_cookie(req);
@@ -801,7 +811,7 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
     });
 
     // -- OIDC SSO endpoints ---------------------------------------------------
-    svr.Get("/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
         std::shared_lock oidc_lock(oidc_mu_);
         if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
             res.status = 404;
@@ -824,7 +834,7 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
         res.set_redirect(auth_url);
     });
 
-    svr.Get("/auth/callback", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/auth/callback", [this](const httplib::Request& req, httplib::Response& res) {
         std::shared_lock oidc_lock(oidc_mu_);
         if (!oidc_provider_) {
             res.status = 404;

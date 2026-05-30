@@ -160,6 +160,36 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code replay-protected", "[mfa][st
     REQUIRE_FALSE(*replay);
 }
 
+TEST_CASE_METHOD(MfaFixture,
+                 "mfa_verify_login_code stamps last_counter so a successful login cannot be replayed",
+                 "[mfa][store]") {
+    // security Gate 2 LOW follow-up: the route-test `totp_at(offset=1)`
+    // workaround sidesteps the post-enrollment floor. To prove that the
+    // *post-login* floor is also enforced, drive a login that succeeds
+    // at counter+1 and assert the same code at counter+1 fails the
+    // immediate next call. A regression that drops the
+    // `mfa_last_counter` UPDATE inside mfa_verify_login_code would let
+    // an intercepted TOTP be re-used within the same 30 s step.
+    auto init = db->mfa_init_enrollment("alice", "Yuzu");
+    REQUIRE(init.has_value());
+    auto enroll_code = code_for_now(init->secret_base32);
+    REQUIRE(db->mfa_verify_enrollment("alice", enroll_code).has_value());
+
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto future_counter = mfa::current_counter(std::chrono::system_clock::now()) + 1;
+    auto future_code = mfa::generate(raw, future_counter);
+
+    auto first = db->mfa_verify_login_code("alice", future_code);
+    REQUIRE(first.has_value());
+    REQUIRE(*first);
+
+    auto replay = db->mfa_verify_login_code("alice", future_code);
+    REQUIRE(replay.has_value());
+    REQUIRE_FALSE(*replay);
+}
+
 TEST_CASE_METHOD(MfaFixture, "mfa_verify_login_code rejects garbage", "[mfa][store]") {
     auto init = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(init.has_value());
