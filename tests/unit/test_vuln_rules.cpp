@@ -235,3 +235,81 @@ TEST_CASE("CVE matching: unrelated product does not match", "[vuln][match]") {
     }
     CHECK(match_count == 0);
 }
+
+// ── compare_versions_normalized ─────────────────────────────────────────────
+
+TEST_CASE("compare_versions_normalized handles real-world formats", "[vuln][version_normalized]") {
+    // Debian epochs: 2:1.0.0 > 1.99.99
+    REQUIRE(compare_versions_normalized("2:1.0.0", "1.99.99") > 0);
+    REQUIRE(compare_versions_normalized("1:1.0.0", "2:0.9.9") < 0);
+    REQUIRE(compare_versions_normalized("1:1.0.0", "1:1.0.0") == 0);
+    // No epoch == epoch 0
+    REQUIRE(compare_versions_normalized("1.0.1g", "0:1.0.1g") == 0);
+
+    // RPM release suffix: strip everything after the LAST '-' before comparing
+    REQUIRE(compare_versions_normalized("1.0.1g-1.el8", "1.0.1h") < 0);
+    REQUIRE(compare_versions_normalized("1.0.1g-1.el8", "1.0.1g-2.el8") == 0);
+    REQUIRE(compare_versions_normalized("1.9.5p2-1.el8", "1.9.5p1") > 0);
+
+    // Alpine pkgver-rN same stripping rule
+    REQUIRE(compare_versions_normalized("9.7p1-r3", "9.8p1") < 0);
+
+    // semver pre-release: 1.0.0-rc1 < 1.0.0
+    REQUIRE(compare_versions_normalized("3.0.6-rc1", "3.0.6") < 0);
+    REQUIRE(compare_versions_normalized("3.0.6-beta", "3.0.6") < 0);
+    REQUIRE(compare_versions_normalized("3.0.6-alpha3", "3.0.6-beta1") < 0);
+
+    // Existing semantics preserved
+    REQUIRE(compare_versions_normalized("1.0.1f", "1.0.1g") < 0);
+    REQUIRE(compare_versions_normalized("9.8p1", "9.8") > 0);
+}
+
+// ── load_rules_from_json ────────────────────────────────────────────────────
+
+#include "test_helpers.hpp"
+#include <fstream>
+
+TEST_CASE("load_rules_from_json loads valid JSON ruleset", "[vuln][json_rules]") {
+    auto tmp = yuzu::test::unique_temp_path("cve_rules");
+    tmp += ".json";
+    {
+        std::ofstream f(tmp);
+        f << R"({
+  "schema_version": 1,
+  "rules": [
+    {
+      "cve_id": "CVE-TEST-0001",
+      "product": "testpkg",
+      "affected_below": "2.0.0",
+      "fixed_in": "2.0.0",
+      "severity": "HIGH",
+      "description": "Test rule"
+    }
+  ]
+})";
+    }
+
+    std::vector<CveRuleDynamic> rules;
+    auto err = load_rules_from_json(tmp.string(), rules);
+    REQUIRE(err.empty());
+    REQUIRE(rules.size() == 1);
+    CHECK(rules[0].cve_id == "CVE-TEST-0001");
+    CHECK(rules[0].product == "testpkg");
+    CHECK(rules[0].affected_below == "2.0.0");
+    CHECK(rules[0].severity == "HIGH");
+}
+
+TEST_CASE("load_rules_from_json rejects wrong schema_version", "[vuln][json_rules]") {
+    auto tmp = yuzu::test::unique_temp_path("cve_rules_bad");
+    tmp += ".json";
+    { std::ofstream f(tmp); f << R"({"schema_version":99,"rules":[]})"; }
+    std::vector<CveRuleDynamic> rules;
+    auto err = load_rules_from_json(tmp.string(), rules);
+    REQUIRE(!err.empty());
+}
+
+TEST_CASE("load_rules_from_json returns error for missing file", "[vuln][json_rules]") {
+    std::vector<CveRuleDynamic> rules;
+    auto err = load_rules_from_json("/nonexistent/path/cve_rules.json", rules);
+    REQUIRE(!err.empty());
+}
