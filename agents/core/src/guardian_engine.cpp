@@ -148,7 +148,13 @@ std::string make_rule_key(std::string_view rule_id) {
 GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id)
     : kv_{kv}, agent_id_{std::move(agent_id)} {}
 
-GuardianEngine::~GuardianEngine() = default;
+GuardianEngine::~GuardianEngine() {
+    // Explicit (not = default): join the guard worker threads here via stop()
+    // so teardown does not depend on member declaration order. Workers call
+    // emit_guard_event(), which reads event_sink_/sink_mtx_/event_seq_ — those
+    // must outlive the join. stop() is idempotent.
+    stop();
+}
 
 std::string_view GuardianEngine::kv_namespace() {
     return kKvNamespace;
@@ -198,12 +204,17 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         }
         if (!rule.enabled())
             continue;
-        start_guard_for_rule_locked(rule);
-        ++rearmed;
+        if (start_guard_for_rule_locked(rule)) // count only guards that actually armed
+            ++rearmed;
     }
 
     spdlog::info("Guardian engine started (cached_rules={}, re-armed={}, policy_generation={})",
                  rule_count_, rearmed, policy_generation_);
+    if (rearmed > 0)
+        spdlog::warn("Guardian: {} guard(s) re-armed pre-network — drift remediated before the "
+                     "server connection is enforced but NOT reported until reconnect (durable "
+                     "event buffering is A3)",
+                     rearmed);
     return {};
 }
 
@@ -273,11 +284,18 @@ gpb::GuaranteedStateStatus GuardianEngine::get_status() const {
     status.set_policy_generation(policy_generation_);
     status.set_total_rules(static_cast<std::uint32_t>(rule_count_));
 
-    // Per-rule status is derived from the live guard set below: a rule with an
-    // armed guard reports compliant/healthy, one without reports "errored". The
-    // top-level counts are set after the loop. (Real drift-state-per-read — vs.
-    // "is a guard watching this" — is a follow-up; we don't hold the live value
-    // here.)
+    // Fail-closed status. An armed guard does NOT prove the watched value is
+    // currently compliant, nor that the worker is healthy: the thread may have
+    // exited after start() returned, an enforce write may be failing, or the
+    // guard may have silently fallen back to read-only. `guard_healthy` is a
+    // RESERVED wire field whose safe default is "unknown" (false). So until a
+    // real self-test / last-remediation signal exists (deferred — see the richer
+    // status-taxonomy follow-up), every rule is reported conservatively: not
+    // compliant, not healthy. Under-reporting here is fail-closed; the prior
+    // "armed ⇒ compliant/healthy" was the silently-deaf failure class.
+    status.set_compliant_rules(0);
+    status.set_drifted_rules(0);
+    status.set_errored_rules(static_cast<std::uint32_t>(rule_count_));
 
 #if defined(_WIN32)
     status.set_platform("windows");
@@ -287,7 +305,6 @@ gpb::GuaranteedStateStatus GuardianEngine::get_status() const {
     status.set_platform("linux");
 #endif
 
-    std::uint32_t armed = 0;
     if (kv_) {
         for (const auto& key : kv_->list(kKvNamespace, kRulePrefix)) {
             auto raw = kv_->get(kKvNamespace, key);
@@ -300,20 +317,14 @@ gpb::GuaranteedStateStatus GuardianEngine::get_status() const {
             } catch (const nlohmann::json::exception&) {
                 continue;
             }
-            const bool is_armed = guards_.find(rule.rule_id()) != guards_.end();
-            if (is_armed) ++armed;
             auto* row = status.add_rules();
             row->set_rule_id(rule.rule_id());
-            row->set_status(is_armed ? "compliant" : "errored");
+            row->set_status("errored");
             row->set_guard_category("event");
-            row->set_guard_healthy(is_armed);
+            row->set_guard_healthy(false);
             row->set_notifications_total(0);
         }
     }
-    status.set_compliant_rules(armed);
-    status.set_drifted_rules(0);
-    const auto total = static_cast<std::uint32_t>(rule_count_);
-    status.set_errored_rules(total >= armed ? total - armed : 0);
     return status;
 }
 
@@ -435,10 +446,13 @@ void GuardianEngine::emit_guard_event(const RegistryDrift& d) {
         ev.set_remediation_action(d.remediation_action);
         ev.set_remediation_success(d.remediation_success);
         ev.set_remediation_latency_us(d.remediation_latency_us);
-        // "drift.remediated" only when the write-back actually restored the
-        // value; a failed enforce write stays "drift.detected" so the operator
-        // still sees the unresolved drift.
-        ev.set_event_type(d.remediation_success ? "drift.remediated" : "drift.detected");
+        // drift.remediated = write-back restored the value; remediation.failed =
+        // enforce attempted but the write did not succeed (e.g. read-only-fallback
+        // key, denied ACL). Both are in the frozen taxonomy and the dashboard
+        // renderer styles them; remediation.failed keeps a failed enforce visibly
+        // distinct from a passive detection so the operator sees enforcement is
+        // not working, not just that drift exists.
+        ev.set_event_type(d.remediation_success ? "drift.remediated" : "remediation.failed");
     } else {
         ev.set_event_type("drift.detected");
     }
@@ -453,13 +467,14 @@ void GuardianEngine::stop_all_guards_locked() {
     guards_.clear();
 }
 
-void GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule& rule) {
+bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule& rule) {
     // MVP: only the Windows Registry Spark. RegistryGuard::start() no-ops off Windows.
+    // Returns true iff a guard was actually armed (so callers can count accurately).
     if (rule.spark().type() != "registry-change")
-        return;
+        return false;
     const auto& a = rule.assertion();
     if (a.type() != "registry-value-equals")
-        return;
+        return false;
     auto param = [&a](const char* k) -> std::string {
         auto it = a.params().find(k);
         return it != a.params().end() ? it->second : std::string{};
@@ -492,11 +507,12 @@ void GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
         guards_.emplace(rule.rule_id(), std::move(guard));
         spdlog::info("Guardian: registry guard armed for rule '{}' (mode={})", rule.rule_id(),
                      enforce ? "enforce" : "audit");
-    } else {
-        spdlog::warn("Guardian: registry guard for rule '{}' did not start "
-                     "(non-Windows or invalid hive)",
-                     rule.rule_id());
+        return true;
     }
+    spdlog::warn("Guardian: registry guard for rule '{}' did not start "
+                 "(non-Windows or invalid hive)",
+                 rule.rule_id());
+    return false;
 }
 
 // #501: Test-support helper — see guardian_engine.hpp for the full rationale.

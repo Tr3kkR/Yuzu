@@ -140,7 +140,10 @@ private:
     /// spark/assertion to decide the guard. MVP supports only the Windows Registry
     /// Spark (`spark.type=="registry-change"` + `assertion.type=="registry-value-equals"`);
     /// no-op otherwise / off-Windows. Called under mtx_.
-    void start_guard_for_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
+    /// Arm (or re-arm) the on-box guard for a rule. Returns true iff a guard was
+    /// actually started (false for non-registry sparks, off-Windows, or a failed
+    /// start) so callers can count armed guards accurately.
+    bool start_guard_for_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void stop_all_guards_locked();
 
     /// Build a GuaranteedStateEvent from a guard's drift report and ship it to

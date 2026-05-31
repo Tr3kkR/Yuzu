@@ -101,9 +101,12 @@ std::string read_value(HKEY key, const std::string& value_name) {
 // Re-encode `expected` per value_type and write it to value_name — the inverse
 // of read_value(). Used only in enforce mode. Returns true on a successful
 // RegSetValueExW. The write is bounded to the rule's `expected`: a fixed-value
-// restore, never an arbitrary-write primitive — value name, type, and content
-// all come from the (server-authored, signature-carrying) rule, not from any
-// runtime input. Unsupported types are refused rather than written as garbage.
+// restore, never an arbitrary-write-of-arbitrary-data primitive — value name,
+// type, and content all come from the server-authored rule, not from any
+// runtime/endpoint input. NOTE on trust: the rule's `signature` is NOT yet
+// verified by the agent (deferred — contract G3), so the integrity gate on
+// "what gets written where" is Push RBAC + mTLS on the control-plane link, not
+// rule signing. Unsupported types are refused rather than written as garbage.
 bool write_value(HKEY key, const std::string& value_name, const std::string& value_type,
                  const std::string& expected) {
     if (!key)
@@ -207,11 +210,25 @@ void RegistryGuard::run() {
         if (sink_) sink_(d);
     };
 
-    const REGSAM access = KEY_NOTIFY | KEY_READ | (cfg_.enforce ? KEY_SET_VALUE : 0);
-    if (RegOpenKeyExW(root, wkey.c_str(), 0, access, &key) != ERROR_SUCCESS) {
-        // For registry-value-equals, a missing key means the value is absent →
-        // that is itself drift. Report once; we can't arm a watch on a key that
-        // doesn't exist (reconciliation would re-check later — deferred).
+    const REGSAM read_access = KEY_NOTIFY | KEY_READ;
+    const REGSAM enforce_access = read_access | KEY_SET_VALUE;
+    LONG rc = RegOpenKeyExW(root, wkey.c_str(), 0, cfg_.enforce ? enforce_access : read_access, &key);
+    if (rc != ERROR_SUCCESS && cfg_.enforce) {
+        // UP-2: KEY_SET_VALUE can be denied where read+notify would succeed (e.g.
+        // an HKLM key under a non-privileged agent account). Requesting write
+        // access must NOT disarm the guard — fall back to a read-only watch so we
+        // still DETECT drift and surface a failed write-back (remediation.failed)
+        // rather than silently not arming. The enforce write in emit() then fails
+        // on this read-only handle and is reported — the honest signal.
+        spdlog::warn("Guardian RegistryGuard[{}]: write-access open of {}\\{} failed (rc={}) — "
+                     "falling back to read-only watch; enforcement will report failures",
+                     cfg_.rule_id, cfg_.hive, cfg_.key, rc);
+        rc = RegOpenKeyExW(root, wkey.c_str(), 0, read_access, &key);
+    }
+    if (rc != ERROR_SUCCESS) {
+        // For registry-value-equals, a missing/unreadable key means the value is
+        // absent → that is itself drift. Report once; we can't arm a watch on a
+        // key we can't open (reconciliation would re-check later — deferred).
         spdlog::warn("Guardian RegistryGuard[{}]: cannot open {}\\{} — reporting value absent",
                      cfg_.rule_id, cfg_.hive, cfg_.key);
         emit("<absent>", 0);
