@@ -2,7 +2,9 @@
 
 Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rule** is a desired-state assertion about an endpoint — a registry value, a service status, a file presence, a configuration key — plus optional automatic remediation when the endpoint drifts. Unlike the server-side [Policy Engine](policy-engine.md), Guardian runs *inside the agent*, reacts to kernel-backed change notifications in sub-second time, and can repair drift without an operator in the loop.
 
-> **Status — read this first.** Guardian's control plane, the agent guard host, and the **Windows `registry` guard** are live and verified end-to-end. Rules can be authored, stored, retrieved, and pushed through the REST API; a push is **delivered to in-scope agents over both the direct gRPC stream and the Erlang gateway**, the agent arms the rule's guard, and drift is detected and reported sub-second to `/api/v1/guaranteed-state/events` (`agent_id` is server- or gateway-asserted, never self-reported). This release delivers the **detect-and-alert path (Guardian A1)**. Still on the roadmap: automatic remediation depth, non-Windows guard types (Linux inotify/netlink/D-Bus, macOS Endpoint Security), and server-side Prometheus metrics for push/apply/parse. One operational caveat for gateway deployments: drift-event forwarding over the gateway is **best-effort** — events emitted while the gateway's upstream circuit is open or its forward budget is saturated are dropped and not yet replayed (durable buffering is Guardian A3); the gateway exposes `yuzu_gw_guardian_forward_dropped_total` so this loss is observable. Design reference: `docs/yuzu-guardian-design-v1.1.md`. Windows-first rollout plan: `docs/yuzu-guardian-windows-implementation-plan.md`.
+> **Status — read this first.** Guardian's control plane, the agent guard host, and the **Windows `registry` guard** are live and verified end-to-end. Rules are authored/stored/pushed via the REST API; a push is delivered to in-scope agents over both the direct gRPC stream and the Erlang gateway, the agent arms the guard, and drift is detected sub-second (`agent_id` is server/gateway-asserted, never self-reported). The registry guard runs in two modes: **`enforce`** — on drift the agent *writes the expected value back* via a single in-process `RegSetValueExW` syscall (tens of µs; emits `drift.remediated`, or `remediation.failed` if the write is denied) — and **`audit`** — detect and report only, no write-back. A restarted agent re-arms enforce guards from its local cache and enforces **pre-network** (heal-on-restart); drift in that pre-network window is enforced but not reported until reconnect (durable event buffering is Guardian A3).
+>
+> **Boundaries you must know before enabling `enforce`:** (1) `enforce` is **HKCU-demo-grade today** — HKLM writes need the agent service account to hold write access; a non-writable key **degrades to a read-only watch that reports `remediation.failed`, it does not silently disarm**. (2) The rule `signature` is **not yet verified** before a guard arms, so the integrity gate on what gets written where is **Push RBAC + mTLS**, not rule signing (deferred — contract G3). (3) Agent status is **fail-closed**: an armed guard reports `errored`/not-healthy, never a green "compliant", until the self-test lands — do not read the agent status proto as proof of enforcement. (4) `enforcement_mode` defaults to **`enforce`** on rule create — see the upgrade note below. Still on the roadmap: non-Windows guards, server-side Prometheus metrics, fight-loop rate-limiting, rule signing, and durable event buffering (A3). Gateway drift forwarding is best-effort (`yuzu_gw_guardian_forward_dropped_total`). Design: `docs/yuzu-guardian-design-v1.1.md`. Rollout plan: `docs/yuzu-guardian-windows-implementation-plan.md`.
 
 ## Concepts
 
@@ -10,7 +12,7 @@ Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rul
 |---|---|
 | **Rule** | A YAML document describing a desired state, a detection strategy, and an optional remediation. Stored server-side with `yaml_source` as the authoritative form. |
 | **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. The Windows `registry` guard is live; service/ETW and non-Windows guards are on the roadmap. |
-| **Event** | A record of detected drift, attempted remediation, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. |
+| **Event** | A record of detected drift, attempted remediation, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. Live `event_type` values from the registry guard: `drift.detected` (drift observed in **audit** mode — no write-back), `drift.remediated` (enforce write-back restored the expected value), `remediation.failed` (enforce attempted but the write was denied — e.g. a read-only-fallback key). |
 | **Push** | An operator-initiated distribution of the active rule set to a scope of agents. Separates deploy authority (`Push`) from authoring authority (`Write`). |
 | **Enforcement mode** | `enforce` (remediate on drift) or `audit` (log drift, do not remediate). |
 | **Scope expression** | A Scope DSL expression (same engine as Instructions) selecting which agents a rule applies to. |
@@ -126,7 +128,22 @@ curl -H "Authorization: Bearer $YUZU_TOKEN" \
   https://yuzu.example.com/api/v1/guaranteed-state/status
 ```
 
-Both require `GuaranteedState:Read`. `/status` response keys (`total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`) match the agent-side proto `GuaranteedStateStatus`.
+Both require `GuaranteedState:Read`. `/status` response keys (`total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`) match the agent-side proto `GuaranteedStateStatus`. **The agent status is fail-closed:** until the guard self-test lands, an armed guard reports `errored` / `guard_healthy=false`, never `compliant`. Treat the **events stream** (`drift.remediated` / `remediation.failed`), not `/status`, as the source of truth for whether enforcement is working.
+
+### 6. Enable/disable and switch mode from the dashboard
+
+The Guardian dashboard guard list (`/guardian`) exposes per-guard controls:
+
+- **Enable / Disable** — toggles the rule's `enabled` flag. Disabling tears the guard down on agents (the next full-sync push omits it).
+- **Switch to Audit / Switch to Enforce** — toggles `enforcement_mode` between `audit` (detect only) and `enforce` (write-back).
+
+Both require **`GuaranteedState:Write` *and* `GuaranteedState:Push`** (they mutate the rule *and* deploy it). On change the server updates the rule, **auto-deploys a full-sync push to all in-scope agents** (so it takes effect live), audits the mutation under `guaranteed_state.rule.update`, and re-renders the list. These are dashboard HTMX fragments, not REST endpoints — for scripted control use `PUT /api/v1/guaranteed-state/rules/<id>` (`enforcement_mode` must be `enforce` or `audit`) then `POST .../push`.
+
+> **Note:** the auto-deploy is a **full-fleet** `full_sync` push on every per-rule toggle; scoping it to the rule's own scope is a tracked follow-up. Avoid rapid toggling on a large fleet during initial rollout.
+
+## Upgrading from a detect-only build
+
+> **Breaking behaviour change.** `enforcement_mode` defaults to **`enforce`**, and enforce mode now **writes to the endpoint registry** on drift. A rule authored on a pre-enforcement build (when Guardian was detect-only) will begin **remediating** on the next push after the agents are upgraded — with no further opt-in. Before upgrading agents: audit existing rules (`GET /api/v1/guaranteed-state/rules`), set `enforcement_mode: audit` on any rule you want to keep detect-only, and re-push. HKLM-scoped enforce rules require the agent service account to have write access to the key.
 
 ## Retention
 

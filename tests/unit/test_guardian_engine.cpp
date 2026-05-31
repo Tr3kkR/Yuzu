@@ -94,6 +94,25 @@ struct GuardianFixture {
         r.set_enforcement_mode("enforce");
         return r;
     }
+
+    // A rule that actually arms a RegistryGuard on Windows (registry-change spark
+    // + registry-value-equals assertion). The key need not exist — an absent key
+    // makes the guard worker exit immediately, which is the UP-1 "dead thread
+    // still in guards_" case we want get_status to report fail-closed.
+    static gpb::GuaranteedStateRule make_registry_rule(const std::string& id,
+                                                       const std::string& mode) {
+        gpb::GuaranteedStateRule r = make_rule(id, id);
+        r.set_enforcement_mode(mode);
+        r.mutable_spark()->set_type("registry-change");
+        auto* a = r.mutable_assertion();
+        a->set_type("registry-value-equals");
+        (*a->mutable_params())["hive"] = "HKCU";
+        (*a->mutable_params())["key"] = "SOFTWARE\\YuzuTest\\GuardStatusTest";
+        (*a->mutable_params())["value_name"] = "Flag";
+        (*a->mutable_params())["value_type"] = "REG_DWORD";
+        (*a->mutable_params())["expected"] = "1";
+        return r;
+    }
 };
 
 } // namespace
@@ -236,10 +255,34 @@ TEST_CASE("GuardianEngine: dispatch get_status returns serialised proto",
     REQUIRE(status.ParseFromString(dr.output));
     CHECK(status.agent_id() == "agent-test");
     CHECK(status.total_rules() == 2);
-    // PR 2 reports every rule as errored — no real guards yet.
+    // Fail-closed: rules report errored, never compliant, without a real verdict.
     CHECK(status.errored_rules() == 2);
     CHECK(status.compliant_rules() == 0);
     CHECK(status.rules_size() == 2);
+}
+
+TEST_CASE("GuardianEngine: get_status is fail-closed — an armed guard is never healthy/compliant",
+          "[guardian][engine][status][health]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = GuardianFixture::make_registry_rule("reg-1", "enforce");
+    // Serialize-then-dispatch so the params Map is parsed INSIDE the agent DLL
+    // (the #501 cross-image hash-seed reason the helper exists). On Windows this
+    // arms a real RegistryGuard (the absent key makes its worker exit at once —
+    // the UP-1 dead-thread case); off-Windows no guard arms. Either way the
+    // status MUST be fail-closed.
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    auto status = f.engine->get_status();
+    REQUIRE(status.rules_size() == 1);
+    // The B1/UP-1/F4 false-green fix: armed (or dead-but-armed) does NOT prove
+    // compliance or health. guard_healthy is a reserved field, default false.
+    CHECK_FALSE(status.rules(0).guard_healthy());
+    CHECK(status.rules(0).status() == "errored");
+    CHECK(status.compliant_rules() == 0);
+    CHECK(status.errored_rules() == 1);
 }
 
 TEST_CASE("GuardianEngine: dispatch unknown action fails with detail",
