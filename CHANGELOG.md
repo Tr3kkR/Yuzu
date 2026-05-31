@@ -111,6 +111,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attribute predicates (AND), and per-device membership evaluation
   (member+predicate match, non-member drop). All on `TempDbFile` helpers.
 
+- **Scope walking PR-D.** `tests/unit/server/test_result_set_matcher.cpp` — 11 cases
+  for the async membership matcher (pure `(matcher, status, output)` function):
+  non-success never qualifies, empty/blank → SUCCESS default, `any_response`,
+  `tar_rows_ge` thresholds + tar `error|` → 0 rows, `tar_row_count` trailer +
+  line-count fallback, unknown-kind conservative exclude, column ops
+  (`eq`/`in`/`contains`/`exists`) over both the tar pipe shape and the JSON
+  array-of-objects fallback, and the malformed-matcher fallbacks.
+  `tests/unit/server/test_rest_result_sets_async.cpp` — 14 HTTP-level cases (real
+  `ResultSetStore` + `ExecutionTracker`, fake recording dispatch closure):
+  from-tar-query 202/pending shape + create-before-dispatch ordering, `__all__` vs
+  `from_result_set:<parent>` scope, **alias pre-resolution** to canonical id,
+  unknown-alias 404, `include_empty` → `any_response` matcher, missing-sql 400,
+  zero-agents 503 (execution cancelled, no pending row), dispatch-throw 500,
+  unwired-dispatch 503, from-instruction-result plugin/action/matcher persistence +
+  unknown-instruction 404, and re-eval sibling parent / unsupported-kind 400 /
+  not-found 404.
+
 - `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
   `PolicyEvaluator`: compliant/non_compliant multi-agent fan-out, non-responder
   → `unknown`, plugin-failure → `error`, missing-field → `non_compliant`, CEL

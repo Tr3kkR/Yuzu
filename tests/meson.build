@@ -194,6 +194,8 @@ if build_server
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_result_set_store.cpp',
+      'unit/server/test_result_set_matcher.cpp',
+      'unit/server/test_rest_result_sets_async.cpp',
       'unit/server/test_result_sets_ui.cpp',
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
