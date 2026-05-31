@@ -2888,12 +2888,18 @@ void RestApiV1::register_routes(
         // Load a row and enforce the owner check. Returns nullopt and writes a
         // 404 (existence-oracle-safe: non-owner is indistinguishable from
         // missing) when the row is absent or not owned by the session.
-        auto load_owned = [result_set_store, rs_err](const std::string& id,
-                                                     const std::string& owner,
-                                                     httplib::Response& res)
-            -> std::optional<ResultSet> {
+        auto load_owned = [result_set_store, rs_err, audit_fn](
+                              const httplib::Request& req, const std::string& id,
+                              const std::string& owner,
+                              httplib::Response& res) -> std::optional<ResultSet> {
             auto row = result_set_store->get(id);
             if (!row || row->owner_principal != owner) {
+                // Audit the failed access so probing the existence oracle leaves
+                // a trail (review finding G). The 404 stays oracle-safe (a
+                // non-owner is indistinguishable from missing); the audit row is
+                // server-side only.
+                audit_fn(req, "result_set.access", "denied", "ResultSet", id,
+                         "not found or not owned");
                 rs_err(res, 404, "RESULT_SET_NOT_FOUND: result set not found");
                 return std::nullopt;
             }
@@ -2908,7 +2914,8 @@ void RestApiV1::register_routes(
         // scope the alias lookup. Writes a 404 and returns nullopt when the
         // ref doesn't resolve to a row this session owns.
         auto resolve_owned_parent =
-            [result_set_store, load_owned](const std::string& raw, const std::string& owner,
+            [result_set_store, load_owned](const httplib::Request& req, const std::string& raw,
+                                           const std::string& owner,
                                            httplib::Response& res) -> std::optional<std::string> {
             std::string id = raw;
             if (!raw.starts_with("rs_")) {
@@ -2916,7 +2923,7 @@ void RestApiV1::register_routes(
                     id = *canon;
                 // else: id stays = raw; load_owned() below 404s on the miss.
             }
-            auto row = load_owned(id, owner, res);
+            auto row = load_owned(req, id, owner, res);
             if (!row)
                 return std::nullopt;
             return id;
@@ -2950,7 +2957,7 @@ void RestApiV1::register_routes(
             if (body.contains("parent_id") && body["parent_id"].is_string() &&
                 !body["parent_id"].get<std::string>().empty()) {
                 auto canon =
-                    resolve_owned_parent(body["parent_id"].get<std::string>(), owner, res);
+                    resolve_owned_parent(req, body["parent_id"].get<std::string>(), owner, res);
                 if (!canon)
                     return; // resolve_owned_parent wrote 404
                 parent_id = *canon;
@@ -2971,6 +2978,19 @@ void RestApiV1::register_routes(
                 exec_id = *created;
             if (exec_id.empty()) {
                 rs_err(res, 500, "RESULT_SET_INTERNAL: failed to create execution row");
+                return;
+            }
+
+            // Pre-dispatch quota check: never send a (possibly destructive)
+            // command we can't record. create_pending re-checks atomically
+            // below, but rejecting here means the common at-quota case fails
+            // BEFORE any agent executes (review finding B5).
+            if (result_set_store->count_for_owner(owner) >= ResultSetStore::kMaxPerOwner) {
+                if (metrics_registry)
+                    metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
+                execution_tracker->mark_cancelled(exec_id, owner);
+                rs_err(res, 429, std::string(to_string(ResultSetError::QuotaExceeded)) +
+                                     " execution_id=" + exec_id);
                 return;
             }
 
@@ -3006,8 +3026,14 @@ void RestApiV1::register_routes(
             if (!created) {
                 if (metrics_registry && created.error() == ResultSetError::QuotaExceeded)
                     metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
+                // The command already dispatched but there is no row to
+                // materialise into — cancel the execution so it doesn't idle in
+                // 'running', and surface exec_id so the operator can trace what
+                // was sent (review B5; mirrors the throw / no-agents paths).
+                execution_tracker->mark_cancelled(exec_id, owner);
                 int status = created.error() == ResultSetError::QuotaExceeded ? 429 : 400;
-                rs_err(res, status, to_string(created.error()));
+                rs_err(res, status,
+                       std::string(to_string(created.error())) + " execution_id=" + exec_id);
                 return;
             }
             if (metrics_registry)
@@ -3034,7 +3060,9 @@ void RestApiV1::register_routes(
             std::string cursor = req.has_param("cursor") ? req.get_param_value("cursor") : "";
             int limit = 50;
             if (req.has_param("limit")) {
-                int v = std::atoi(req.get_param_value("limit").c_str());
+                const auto lv = req.get_param_value("limit");
+                int v = 0;
+                std::from_chars(lv.data(), lv.data() + lv.size(), v);
                 if (v > 0 && v <= 500)
                     limit = v;
             }
@@ -3051,8 +3079,8 @@ void RestApiV1::register_routes(
         // POST /api/v1/result-sets — direct create from pre-computed device ids
         // (e.g. dashboard "I have a CSV"). Synchronous → lands materialized.
         sink.Post("/api/v1/result-sets",
-                  [auth_fn, audit_fn, result_set_store, metrics_registry, rs_to_json, rs_err](
-                      const httplib::Request& req, httplib::Response& res) {
+                  [auth_fn, audit_fn, result_set_store, metrics_registry, rs_to_json, rs_err,
+                   load_owned](const httplib::Request& req, httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -3068,14 +3096,29 @@ void RestApiV1::register_routes(
             cr.source_payload = body.contains("source_payload") ? body["source_payload"].dump()
                                                                 : std::string("{}");
             if (body.contains("parent_id") && body["parent_id"].is_string() &&
-                !body["parent_id"].get<std::string>().empty())
-                cr.parent_id = body["parent_id"].get<std::string>();
+                !body["parent_id"].get<std::string>().empty()) {
+                auto pid = body["parent_id"].get<std::string>();
+                // Owner-check the parent before persisting the lineage edge,
+                // else an operator can parent onto a victim's id and read its
+                // name/source_kind/device_count back via /lineage (review B2).
+                if (!load_owned(req, pid, session->username, res))
+                    return; // load_owned wrote 404
+                cr.parent_id = pid;
+            }
 
             std::vector<std::string> members;
             if (body.contains("device_ids") && body["device_ids"].is_array()) {
                 for (const auto& d : body["device_ids"])
                     if (d.is_string())
                         members.push_back(d.get<std::string>());
+            }
+            // Reject an oversized array before the store dedups it under its
+            // write lock — bounds the DoS from a giant device_ids body (B4).
+            if (members.size() > static_cast<size_t>(ResultSetStore::kMaxMembersPerSet)) {
+                if (metrics_registry)
+                    metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
+                rs_err(res, 400, to_string(ResultSetError::TooManyMembers));
+                return;
             }
 
             auto created = result_set_store->create_materialized(cr, members);
@@ -3140,16 +3183,24 @@ void RestApiV1::register_routes(
                       if (body.contains("parent_id") && body["parent_id"].is_string() &&
                           !body["parent_id"].get<std::string>().empty()) {
                           auto pid = body["parent_id"].get<std::string>();
-                          auto parent = load_owned(pid, session->username, res);
+                          auto parent = load_owned(req, pid, session->username, res);
                           if (!parent)
                               return; // load_owned already wrote 404
                           cr.parent_id = pid;
                           std::unordered_set<std::string> ms;
                           std::string cur;
-                          do {
-                              auto page = result_set_store->members(pid, cur, 5000, cur);
+                          while (true) {
+                              // Separate in/out cursor: members() clears its
+                              // out-cursor first, so aliasing one variable as
+                              // both rereads page 1 forever once the parent
+                              // exceeds the page size (review finding B3).
+                              std::string next;
+                              auto page = result_set_store->members(pid, cur, 5000, next);
                               ms.insert(page.begin(), page.end());
-                          } while (!cur.empty());
+                              if (next.empty())
+                                  break;
+                              cur = std::move(next);
+                          }
                           parent_members = std::move(ms);
                       }
 
@@ -3300,7 +3351,7 @@ void RestApiV1::register_routes(
                       if (!session)
                           return;
                       auto id = req.matches[1].str();
-                      auto orig = load_owned(id, session->username, res);
+                      auto orig = load_owned(req, id, session->username, res);
                       if (!orig)
                           return;
                       auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
@@ -3310,8 +3361,13 @@ void RestApiV1::register_routes(
                       nlohmann::json synth;
                       if (orig->parent_id && !orig->parent_id->empty())
                           synth["parent_id"] = *orig->parent_id;
+                      // Skip the suffix if it's already there, else repeated
+                      // re-evals of a sibling grow "foo (re-eval) (re-eval) …"
+                      // unboundedly (review finding bug_014).
                       const std::string reeval_name =
-                          orig->name.empty() ? std::string() : (orig->name + " (re-eval)");
+                          orig->name.empty()                  ? std::string()
+                          : orig->name.ends_with(" (re-eval)") ? orig->name
+                                                               : (orig->name + " (re-eval)");
                       if (orig->source_kind == source_kind::kTarQuery) {
                           std::string sql = sp.is_object() ? sp.value("sql", "") : "";
                           if (sql.empty()) {
@@ -3354,7 +3410,7 @@ void RestApiV1::register_routes(
                      auto session = auth_fn(req, res);
                      if (!session)
                          return;
-                     auto row = load_owned(req.matches[1].str(), session->username, res);
+                     auto row = load_owned(req, req.matches[1].str(), session->username, res);
                      if (!row)
                          return;
                      res.set_content(ok_json(rs_to_json(*row)), "application/json");
@@ -3368,14 +3424,16 @@ void RestApiV1::register_routes(
                      if (!session)
                          return;
                      auto id = req.matches[1].str();
-                     auto row = load_owned(id, session->username, res);
+                     auto row = load_owned(req, id, session->username, res);
                      if (!row)
                          return;
                      std::string cursor =
                          req.has_param("cursor") ? req.get_param_value("cursor") : "";
                      int limit = 1000;
                      if (req.has_param("limit")) {
-                         int v = std::atoi(req.get_param_value("limit").c_str());
+                         const auto lv = req.get_param_value("limit");
+                         int v = 0;
+                         std::from_chars(lv.data(), lv.data() + lv.size(), v);
                          if (v > 0 && v <= 10000)
                              limit = v;
                      }
@@ -3397,10 +3455,10 @@ void RestApiV1::register_routes(
                      if (!session)
                          return;
                      auto id = req.matches[1].str();
-                     auto row = load_owned(id, session->username, res);
+                     auto row = load_owned(req, id, session->username, res);
                      if (!row)
                          return;
-                     auto chain = result_set_store->lineage(id);
+                     auto chain = result_set_store->lineage(id, session->username);
                      JArr arr;
                      for (const auto& n : chain)
                          arr.add(JObj()
@@ -3420,7 +3478,7 @@ void RestApiV1::register_routes(
                       if (!session)
                           return;
                       auto id = req.matches[1].str();
-                      auto row = load_owned(id, session->username, res);
+                      auto row = load_owned(req, id, session->username, res);
                       if (!row)
                           return;
                       auto pinned = result_set_store->pin(id);
@@ -3441,7 +3499,7 @@ void RestApiV1::register_routes(
                       if (!session)
                           return;
                       auto id = req.matches[1].str();
-                      auto row = load_owned(id, session->username, res);
+                      auto row = load_owned(req, id, session->username, res);
                       if (!row)
                           return;
                       auto unpinned = result_set_store->unpin(id);
@@ -3461,7 +3519,7 @@ void RestApiV1::register_routes(
                         if (!session)
                             return;
                         auto id = req.matches[1].str();
-                        auto row = load_owned(id, session->username, res);
+                        auto row = load_owned(req, id, session->username, res);
                         if (!row)
                             return;
                         auto del = result_set_store->delete_set(id);

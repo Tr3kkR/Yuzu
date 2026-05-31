@@ -423,6 +423,15 @@ private:
         // AgentRegistry resolver answers per-device membership against the
         // result_set_store. Composes with attribute predicates via AND/OR/NOT.
         if (tok.type == TokenType::Ident && tok.value.starts_with("from_result_set:")) {
+            // Bound the reference length (review finding K): previously any
+            // suffix up to the 4096-char token cap was accepted — a bounded DoS.
+            // Bound length only, NOT charset — the grammar accepts a canonical
+            // rs_<hex> id OR a per-operator alias (design §4.1), and a reference
+            // the resolver doesn't own/recognise simply no-matches downstream.
+            const std::string suffix = tok.value.substr(16);
+            if (suffix.empty() || suffix.size() > 128)
+                return std::unexpected(std::format(
+                    "from_result_set: id or alias must be 1-128 chars at position {}", tok.pos));
             tokenizer_.next(); // consume the atom
             Condition cond;
             cond.attribute = tok.value;

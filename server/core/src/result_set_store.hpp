@@ -8,6 +8,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server {
@@ -85,7 +86,7 @@ struct PendingSet {
 /// Typed failure surface; the REST layer maps these to the error taxonomy
 /// (RESULT_SET_NOT_FOUND, RESULT_SET_NOT_OWNER, RESULT_SET_QUOTA, PIN_LIMIT,
 /// RESULT_SET_EXPIRED) and the corresponding HTTP status.
-enum class ResultSetError { NotFound, NotOwner, QuotaExceeded, PinLimit, Pinned, DbError };
+enum class ResultSetError { NotFound, NotOwner, QuotaExceeded, PinLimit, Pinned, TooManyMembers, DbError };
 
 const char* to_string(ResultSetError e);
 
@@ -105,6 +106,7 @@ public:
     // Lifecycle / sizing knobs (design §3.3, §3.4).
     static constexpr int64_t kDefaultTtlSeconds = 3600;  // 1 hour
     static constexpr int kMaxPerOwner = 10000;           // hard create cap
+    static constexpr int kMaxMembersPerSet = 100000;     // per-set member cap (DoS guard)
     static constexpr int kMaxPinsPerOwner = 50;          // pin-storm guard
     static constexpr int kLineageDepthCap = 10;          // breadcrumb truncation
 
@@ -135,8 +137,16 @@ public:
                                          int limit, std::string& out_next_cursor) const;
     std::vector<std::string> members(const std::string& id, const std::string& cursor, int limit,
                                      std::string& out_next_cursor) const;
-    std::vector<LineageNode> lineage(const std::string& id) const;
+    /// Lineage chain root→leaf, walking parent_id. Owner-filtered: the walk
+    /// stops at the first ancestor not owned by `owner`, so a child parented
+    /// onto another operator's set cannot leak that set's metadata (review B2).
+    std::vector<LineageNode> lineage(const std::string& id, const std::string& owner) const;
     bool contains(const std::string& id, const std::string& device_id) const;
+    /// All members of `id` iff owned by `owner`; empty otherwise. Lets the scope
+    /// resolver preload owner-checked membership once per set instead of an
+    /// under-lock query per agent (review findings B1 + F).
+    std::unordered_set<std::string> member_set_owned(const std::string& id,
+                                                     const std::string& owner) const;
     /// Resolve an owner-scoped alias to a canonical id. Empty if not found.
     std::optional<std::string> resolve_alias(const std::string& owner,
                                              const std::string& name) const;
@@ -181,7 +191,7 @@ private:
     int count_pinned_for_owner_unlocked(const std::string& owner) const;
     std::expected<ResultSet, ResultSetError> insert_row_impl(
         const CreateRequest& req, ResultSetStatus status, const std::string& execution_id,
-        const std::vector<std::string>& members, int64_t member_count);
+        const std::vector<std::string>& members);
 };
 
 } // namespace yuzu::server

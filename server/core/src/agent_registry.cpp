@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "custom_properties_store.hpp"
 #include "result_set_store.hpp"
@@ -1020,20 +1022,62 @@ std::shared_ptr<AgentSession> AgentRegistry::get_session(const std::string& agen
     return it != agents_.end() ? it->second : nullptr;
 }
 
+// Collect every from_result_set:<id> reference in a scope expression so the
+// resolver can preload owner-checked membership once per set. The scope AST is
+// a variant of Condition | Combinator (scope_engine.hpp); walk it recursively.
+static void collect_result_set_ids(const yuzu::scope::Expression& expr,
+                                   std::vector<std::string>& out) {
+    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
+        if (cond->attribute.starts_with("from_result_set:"))
+            out.push_back(cond->attribute.substr(16));
+    } else if (const auto* comb =
+                   std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
+        if (*comb)
+            for (const auto& child : (*comb)->children)
+                collect_result_set_ids(child, out);
+    }
+}
+
 std::vector<std::string>
 AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
-                              const CustomPropertiesStore* props_store,
-                              const ResultSetStore* rs_store) const {
+                              const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
+                              std::string_view principal) const {
+    // Preload owner-checked membership for every from_result_set:<id> the
+    // expression references — once per set, before the agent loop, rather than a
+    // store query per agent while holding mu_ (review finding F). The owner join
+    // in member_set_owned is the authorization gate: a set `principal` does not
+    // own yields an empty membership and therefore never matches, so an operator
+    // cannot target another operator's set by id (review finding B1). Aliases
+    // are not resolved here; callers that accept aliases pre-resolve them.
+    std::unordered_map<std::string, std::unordered_set<std::string>> rs_members;
+    if (rs_store && !principal.empty()) {
+        std::vector<std::string> refs;
+        collect_result_set_ids(expr, refs);
+        const std::string owner(principal);
+        for (const auto& rsid : refs) {
+            if (rs_members.contains(rsid))
+                continue;
+            auto mem = rs_store->member_set_owned(rsid, owner);
+            // Touch only sets we actually own (non-empty owned membership): keeps
+            // a set actively used as scope from being GC'd mid-investigation
+            // (review finding I), and never extends another operator's set TTL.
+            if (!mem.empty())
+                rs_store->touch(rsid);
+            rs_members.emplace(rsid, std::move(mem));
+        }
+    }
+
     std::vector<std::string> matched;
     std::lock_guard lock(mu_);
     for (const auto& [id, session] : agents_) {
         auto resolver = [&](std::string_view attr) -> std::string {
             auto key = std::string(attr);
             // from_result_set:<id> — composable-scope membership (capability
-            // §30). EXISTS-semantics: "true" iff this device is a member.
+            // §30). EXISTS-semantics: "true" iff this device is an owner-checked
+            // member of the preloaded set.
             if (key.starts_with("from_result_set:")) {
-                auto rsid = key.substr(16);
-                return (rs_store && rs_store->contains(rsid, id)) ? "true" : "";
+                auto it = rs_members.find(key.substr(16));
+                return (it != rs_members.end() && it->second.contains(id)) ? "true" : "";
             }
             if (key == "ostype")
                 return session->os;

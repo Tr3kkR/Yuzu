@@ -3628,9 +3628,15 @@ private:
                         "application/json");
                     return;
                 }
+                // Owner principal for from_result_set: resolution (review B1).
+                // This raw path is untracked (no execution row), so read the
+                // session directly; auth already passed require_permission above.
+                std::string principal;
+                if (auto s = require_auth(req, res))
+                    principal = s->username;
                 auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get(),
                                                             custom_properties_store_.get(),
-                                                            result_set_store_.get());
+                                                            result_set_store_.get(), principal);
                 for (const auto& aid : matched_ids) {
                     if (registry_.send_to(aid, cmd)) {
                         ++sent;
@@ -4209,7 +4215,7 @@ private:
                                     "text/html; charset=utf-8");
                     return;
                 }
-                auto chain = result_set_store_->lineage(id);
+                auto chain = result_set_store_->lineage(id, session->username);
                 res.set_content(render_result_set_detail(*row, chain),
                                 "text/html; charset=utf-8");
             });
@@ -4222,7 +4228,7 @@ private:
                 res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
                 return;
             }
-            auto chain = result_set_store_->lineage(id);
+            auto chain = result_set_store_->lineage(id, owner);
             res.set_header("HX-Trigger", "resultSetsChanged");
             res.set_content(render_result_set_detail(*row, chain), "text/html; charset=utf-8");
         };
@@ -4239,7 +4245,24 @@ private:
                     res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
                     return;
                 }
-                result_set_store_->pin(id);
+                auto pinned = result_set_store_->pin(id);
+                if (!pinned) {
+                    // Don't audit a success that didn't happen, and tell the
+                    // operator why (review merged_bug_009). PinLimit is the
+                    // 50-pin cap; otherwise a transient store error.
+                    audit_log(req, "result_set.pin",
+                              pinned.error() == ResultSetError::PinLimit ? "denied" : "failure",
+                              "ResultSet", id, to_string(pinned.error()));
+                    res.set_header(
+                        "HX-Trigger",
+                        nlohmann::json{{"showToast",
+                                        {{"level", "error"}, {"message", to_string(pinned.error())}}}}
+                            .dump());
+                    auto chain = result_set_store_->lineage(id, session->username);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
                 audit_log(req, "result_set.pin", "success", "ResultSet", id, "");
                 rs_detail_after(id, session->username, res);
             });
@@ -4256,7 +4279,20 @@ private:
                     res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
                     return;
                 }
-                result_set_store_->unpin(id);
+                auto unpinned = result_set_store_->unpin(id);
+                if (!unpinned) {
+                    audit_log(req, "result_set.unpin", "failure", "ResultSet", id,
+                              to_string(unpinned.error()));
+                    res.set_header("HX-Trigger",
+                                   nlohmann::json{{"showToast",
+                                                   {{"level", "error"},
+                                                    {"message", to_string(unpinned.error())}}}}
+                                       .dump());
+                    auto chain = result_set_store_->lineage(id, session->username);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
                 audit_log(req, "result_set.unpin", "success", "ResultSet", id, "");
                 rs_detail_after(id, session->username, res);
             });
@@ -4277,7 +4313,7 @@ private:
                 if (!del) {
                     // Pinned sets must be unpinned first — re-render the detail
                     // so the operator sees why nothing was deleted.
-                    auto chain = result_set_store_->lineage(id);
+                    auto chain = result_set_store_->lineage(id, session->username);
                     res.set_content(render_result_set_detail(*row, chain),
                                     "text/html; charset=utf-8");
                     return;
@@ -4321,13 +4357,33 @@ private:
                     flush();
                 }
                 auto created = result_set_store_->create_materialized(cr, members);
-                if (created)
-                    audit_log(req, "result_set.create", "success", "ResultSet", created->id,
-                              cr.source_kind);
+                if (!created) {
+                    // Surface quota / too-many-members / store errors instead of
+                    // silently re-rendering as if the create succeeded (review
+                    // merged_bug_009). The store enforces kMaxMembersPerSet, so an
+                    // oversized pasted CSV lands here as TooManyMembers (B4).
+                    if (created.error() == ResultSetError::QuotaExceeded ||
+                        created.error() == ResultSetError::TooManyMembers)
+                        metrics_.counter("yuzu_result_set_quota_rejected").increment();
+                    audit_log(req, "result_set.create", "denied", "ResultSet", "",
+                              to_string(created.error()));
+                    res.set_header("HX-Trigger",
+                                   nlohmann::json{{"showToast",
+                                                   {{"level", "error"},
+                                                    {"message", to_string(created.error())}}}}
+                                       .dump());
+                    std::string next;
+                    auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                    res.set_content(render_result_sets_sidebar(sets, ""),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.create", "success", "ResultSet", created->id,
+                          cr.source_kind);
                 std::string next;
                 auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
                 res.set_header("HX-Trigger", "resultSetsChanged");
-                res.set_content(render_result_sets_sidebar(sets, created ? created->id : ""),
+                res.set_content(render_result_sets_sidebar(sets, created->id),
                                 "text/html; charset=utf-8");
             });
 
@@ -5952,9 +6008,21 @@ private:
             } else if (!scope_expr.empty()) {
                 auto parsed = yuzu::scope::parse(scope_expr);
                 if (parsed) {
+                    // from_result_set: is owner-scoped; recover the dispatching
+                    // operator from the execution row (run_async / workflow /
+                    // scheduled all create it with dispatched_by before dispatch).
+                    // This is how owner-checked result-set resolution reaches the
+                    // tracked dispatch paths without threading a param through the
+                    // shared CommandDispatchFn (review finding B1).
+                    std::string principal;
+                    if (scope_expr.find("from_result_set:") != std::string::npos &&
+                        !execution_id.empty() && execution_tracker_) {
+                        if (auto ex = execution_tracker_->get_execution(execution_id))
+                            principal = ex->dispatched_by;
+                    }
                     auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
                                                             custom_properties_store_.get(),
-                                                            result_set_store_.get());
+                                                            result_set_store_.get(), principal);
                     for (const auto& aid : matched)
                         if (registry_.send_to(aid, cmd))
                             ++sent;
@@ -6063,11 +6131,22 @@ private:
                                         members.push_back(r.agent_id);
                                 }
                             }
-                            result_set_store_->materialize(p.id, members);
-                            metrics_
-                                .counter("yuzu_result_sets_total",
-                                         {{"source_kind", p.source_kind}, {"result", "materialized"}})
-                                .increment();
+                            if (result_set_store_->materialize(p.id, members)) {
+                                metrics_
+                                    .counter("yuzu_result_sets_total",
+                                             {{"source_kind", p.source_kind},
+                                              {"result", "materialized"}})
+                                    .increment();
+                            } else {
+                                // Don't count a materialization that didn't happen
+                                // (review finding bug_008); surface the failure so
+                                // SRE can alert on a stuck pending row.
+                                metrics_
+                                    .counter("yuzu_result_sets_total",
+                                             {{"source_kind", p.source_kind},
+                                              {"result", "materialize_failed"}})
+                                    .increment();
+                            }
                         }
 
                         // 2) GC sweep on the slow cadence.
@@ -6246,13 +6325,14 @@ private:
             emit_event(event_type, req);
         };
         wf_deps.scope_fn =
-            [this](const std::string& expression) -> std::pair<std::size_t, std::size_t> {
+            [this](const std::string& expression,
+                   const std::string& principal) -> std::pair<std::size_t, std::size_t> {
             auto parsed = yuzu::scope::parse(expression);
             if (!parsed)
                 return {0, registry_.agent_count()};
             auto matched =
                 registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get(),
-                                         result_set_store_.get());
+                                         result_set_store_.get(), principal);
             return {matched.size(), registry_.agent_count()};
         };
         wf_deps.workflow_engine = workflow_engine_.get();
@@ -6450,9 +6530,17 @@ private:
                     } else if (!scope_expr.empty() && scope_expr != "__all__") {
                         auto parsed = yuzu::scope::parse(scope_expr);
                         if (parsed) {
+                            // Owner-scoped from_result_set: recover the principal
+                            // from the MCP-created execution row (review B1).
+                            std::string principal;
+                            if (scope_expr.find("from_result_set:") != std::string::npos &&
+                                !execution_id.empty() && execution_tracker_) {
+                                if (auto ex = execution_tracker_->get_execution(execution_id))
+                                    principal = ex->dispatched_by;
+                            }
                             for (const auto& aid : registry_.evaluate_scope(
                                      *parsed, tag_store_.get(), custom_properties_store_.get(),
-                                     result_set_store_.get()))
+                                     result_set_store_.get(), principal))
                                 if (registry_.send_to(aid, cmd))
                                     ++sent;
                         }

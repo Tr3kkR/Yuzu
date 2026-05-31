@@ -98,6 +98,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`minmax(0,1fr)` middle track + `min-width:0`) so the instruction bar's
   minimum content size can no longer push the panel off-screen.
 
+- **Scope walking — `from_result_set:` is owner-scoped end-to-end (the merge-blocking
+  IDOR, review B1).** `AgentRegistry::evaluate_scope` resolved `from_result_set:<id>`
+  with no owner check, so any operator with `Execution:Execute` could embed another
+  operator's `rs_` id in a scope and dispatch commands to that operator's curated
+  devices. The dispatching principal is now threaded into `evaluate_scope`;
+  referenced sets are preloaded once via the new owner-checked
+  `ResultSetStore::member_set_owned` (a set the caller does not own resolves to an
+  empty membership and never matches), which also removes the per-agent under-lock
+  store query (review F). Tracked dispatch paths (REST async producers, workflows,
+  scheduled, MCP) recover the principal from the execution's `dispatched_by`;
+  `/api/command` reads the session; server-authored policy scopes intentionally do
+  not resolve `from_result_set:`. A used set is `touch`-ed so it does not GC
+  mid-investigation (review I).
+- **Cross-operator result-set metadata leak via `/lineage` closed (review B2).**
+  Direct `POST /api/v1/result-sets` owner-checks `parent_id` before persisting the
+  lineage edge, and `ResultSetStore::lineage` is owner-filtered (the walk stops at
+  the first cross-owner ancestor) — a child can no longer parent onto a victim's id
+  and read its name / source_kind / device_count back.
+- **Result-set DoS vectors bounded (review B3, B4, K).** Fixed an infinite loop in
+  `from-inventory-query` parent pagination (an aliased in/out cursor re-read page one
+  forever once a parent exceeded the 5000 page size); added a `kMaxMembersPerSet` cap
+  (100k) on the JSON-array and CSV-import create paths; bounded the
+  `from_result_set:` scope token to 128 chars in the parser.
+- **Async producers no longer orphan a destructive dispatch (review B5).** `run_async`
+  does a pre-dispatch quota check and, on any post-dispatch `create_pending` failure,
+  calls `mark_cancelled` and surfaces `execution_id` — matching the throw / no-agents
+  paths so the execution cannot idle in `running` after agents already executed.
+- **Dashboard result-set fragments stop faking success (review merged_bug_009).**
+  Pin / unpin / CSV-create honour the store's `std::expected`: they audit the real
+  outcome (no false `success` rows) and surface failures via a `showToast` HX-Trigger
+  instead of silently re-rendering as if the action succeeded.
+- **Failed result-set access is audited (review G) + observability/correctness nits.**
+  Non-owner / not-found 404s emit a `result_set.access` `denied` audit row with the
+  attempted id (existence-oracle trail); the maintenance thread only increments
+  `yuzu_result_sets_total{result="materialized"}` on success (`materialize_failed`
+  otherwise — bug_008); `gc_sweep` returns the real deleted count and logs on failure
+  (D); `device_count` reflects distinct members after `INSERT OR IGNORE` dedup (L);
+  `lineage` has a visited-set cycle guard (J); re-eval no longer appends ` (re-eval)`
+  unboundedly (bug_014); result-set `limit` params parse via `std::from_chars` (M).
+  `rs_` ids stay non-CSPRNG display identifiers per the #801 convention now that B1
+  removes the bearer-reference property (review E, by design).
+
 ### Tests
 
 - **Scope walking.** `tests/unit/server/test_result_set_store.cpp` — 8 cases for
