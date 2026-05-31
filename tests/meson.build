@@ -193,6 +193,8 @@ if build_server
       'unit/server/test_api_token_store.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
+      'unit/server/test_result_set_store.cpp',
+      'unit/server/test_result_sets_ui.cpp',
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',

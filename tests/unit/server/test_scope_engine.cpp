@@ -438,3 +438,42 @@ TEST_CASE("ScopeEngine: eval performance", "[scope][perf]") {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
     REQUIRE(ms < 5000); // 100k evals should take less than 5s
 }
+
+// ── from_result_set: (scope walking, capability §30) ─────────────────────────
+
+TEST_CASE("ScopeEngine: parse from_result_set bare atom", "[scope][parser][result_set]") {
+    auto result = parse("from_result_set:rs_01hxyzdeadbeef");
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("ScopeEngine: from_result_set composes with attribute predicate",
+          "[scope][parser][result_set]") {
+    auto result = parse(R"(from_result_set:rs_01hxyz AND ostype == "Windows")");
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("ScopeEngine: from_result_set evaluates membership via resolver",
+          "[scope][eval][result_set]") {
+    auto expr = parse(R"(from_result_set:rs_abc AND ostype == "Windows")");
+    REQUIRE(expr.has_value());
+
+    // make_resolver captures its argument by reference, so the attr maps must
+    // outlive the evaluate() calls — keep them as named locals (not temporaries).
+    std::unordered_map<std::string, std::string> member_win_attrs = {
+        {"from_result_set:rs_abc", "true"}, {"ostype", "Windows"}};
+    std::unordered_map<std::string, std::string> member_lin_attrs = {
+        {"from_result_set:rs_abc", "true"}, {"ostype", "Linux"}};
+    std::unordered_map<std::string, std::string> non_member_attrs = {{"ostype", "Windows"}};
+
+    // Member + Windows → match.
+    auto member_win = make_resolver(member_win_attrs);
+    CHECK(evaluate(*expr, member_win));
+
+    // Member + Linux → no match (predicate refines the set).
+    auto member_lin = make_resolver(member_lin_attrs);
+    CHECK_FALSE(evaluate(*expr, member_lin));
+
+    // Non-member (resolver returns empty → EXISTS false) → no match.
+    auto non_member = make_resolver(non_member_attrs);
+    CHECK_FALSE(evaluate(*expr, non_member));
+}

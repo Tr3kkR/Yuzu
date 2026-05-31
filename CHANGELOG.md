@@ -75,6 +75,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
+- **Scope walking.** `tests/unit/server/test_result_set_store.cpp` — 8 cases for
+  `ResultSetStore`: synchronous create/get/members, root-first lineage,
+  owner-scoped alias resolution, pin/unpin + pinned-delete rejection, async
+  create → materialize, touch TTL extension, GC sweep, and the per-owner quota
+  counter. `tests/unit/server/test_result_sets_ui.cpp` — 7 render cases for the
+  result-sets dashboard surface including an explicit XSS test (operator-supplied
+  names are HTML-escaped). `tests/unit/server/test_scope_engine.cpp` — 3 added
+  cases for the `from_result_set:` scope kind: bare-atom parse, composition with
+  attribute predicates (AND), and per-device membership evaluation
+  (member+predicate match, non-member drop). All on `TempDbFile` helpers.
+
 - `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
   `PolicyEvaluator`: compliant/non_compliant multi-agent fan-out, non-responder
   → `unknown`, plugin-failure → `error`, missing-field → `non_compliant`, CEL
