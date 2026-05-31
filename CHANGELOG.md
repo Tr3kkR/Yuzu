@@ -170,6 +170,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unknown-instruction 404, and re-eval sibling parent / unsupported-kind 400 /
   not-found 404.
 
+- **Scope walking — review remediation.** `tests/unit/server/test_scope_walking_authz.cpp`
+  — cross-operator `evaluate_scope` authorization: the set owner resolves exactly the
+  set's members, while a non-owner and an empty principal resolve nothing (the B1
+  IDOR is blocked). `tests/unit/server/test_result_set_store.cpp` gains 7 cases: GC
+  actually deletes expired unpinned rows and returns the count (D), per-set member cap
+  (B4), `device_count` distinct-dedup (L), owner-scoped `member_set_owned` (B1),
+  lineage stops at a cross-owner ancestor (B2) and terminates on a `parent_id` cycle
+  (J), and >5000-member pagination terminates (B3); its lineage assertions move to
+  the owner-arg `lineage`. `test_workflow_routes.cpp` updated for the principal-arg
+  scope-estimate callback. (`test_scope_engine.cpp` is unchanged — its existing
+  `from_result_set:` cases pass under the relaxed length-bound token validation.)
+
 - `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
   `PolicyEvaluator`: compliant/non_compliant multi-agent fan-out, non-responder
   → `unknown`, plugin-failure → `error`, missing-field → `non_compliant`, CEL
