@@ -27,6 +27,7 @@
 namespace yuzu::server {
 class TagStore;
 class CustomPropertiesStore;
+class ResultSetStore;
 class DeviceTokenStore;
 } // namespace yuzu::server
 
@@ -230,9 +231,19 @@ public:
     std::shared_ptr<AgentSession> get_session(const std::string& agent_id) const;
 
     // Evaluate a scope expression against all agents, return matching agent IDs.
+    // `rs_store` resolves the `from_result_set:<id>` scope kind (capability §30)
+    // to per-device membership, scoped to `principal`: a referenced set that
+    // `principal` does not own resolves to an empty membership and never matches
+    // (no cross-operator targeting — review finding B1). Pass the dispatching
+    // operator as `principal` on every command path; leave it empty (and/or
+    // rs_store null) only where from_result_set is intentionally unsupported
+    // (e.g. server-authored policy scopes). Aliases must be pre-resolved to
+    // canonical ids by the caller. Stale members (offline / decommissioned
+    // agents not in the live registry) drop silently.
     std::vector<std::string>
     evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
-                   const CustomPropertiesStore* props_store = nullptr) const;
+                   const CustomPropertiesStore* props_store = nullptr,
+                   ResultSetStore* rs_store = nullptr, std::string_view principal = {}) const;
 
 private:
     mutable std::mutex mu_;

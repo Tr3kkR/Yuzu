@@ -17,6 +17,7 @@
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "result_set_store.hpp"
 #include "schedule_engine.hpp"
 #include "software_deployment_store.hpp"
 #include "tag_store.hpp"
@@ -52,6 +53,9 @@ class ExecutionEventBus;
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -119,6 +123,21 @@ public:
     using SessionRevokeFn =
         std::function<SessionRevokeResult(const std::string& username, bool revoke_api_tokens)>;
 
+    /// Command dispatch callback — sends a CommandRequest to agents via gRPC
+    /// and returns (command_id, agents_reached). Identical signature to
+    /// `WorkflowRoutes::CommandDispatchFn`; the server threads the SAME hoisted
+    /// `command_dispatch_fn` closure into both so the result-set async
+    /// producers (`from-tar-query`, `from-instruction-result`, `re-eval`) drive
+    /// the exact dispatch path the workflow + policy engines use. The trailing
+    /// `execution_id` is registered command_id→execution_id BEFORE any RPC so
+    /// FAST loopback agents can't reply before the mapping lands (UP2-4). Empty
+    /// callback leaves the async producer routes returning 503.
+    using CommandDispatchFn = std::function<std::pair<std::string, int>(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id)>;
+
     /// Production overload — constructs an HttplibRouteSink and delegates
     /// to the sink-based overload below.
     ///
@@ -138,7 +157,8 @@ public:
         DeviceTokenStore* device_token_store = nullptr, LicenseStore* license_store = nullptr,
         GuaranteedStateStore* guaranteed_state_store = nullptr,
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
-        ExecutionEventBus* execution_event_bus = nullptr);
+        ExecutionEventBus* execution_event_bus = nullptr,
+        ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -155,7 +175,8 @@ public:
         DeviceTokenStore* device_token_store = nullptr, LicenseStore* license_store = nullptr,
         GuaranteedStateStore* guaranteed_state_store = nullptr,
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
-        ExecutionEventBus* execution_event_bus = nullptr);
+        ExecutionEventBus* execution_event_bus = nullptr,
+        ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {});
 };
 
 } // namespace yuzu::server

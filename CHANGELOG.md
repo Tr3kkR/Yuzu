@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Scope walking — composable scope from previous query results (capability §30).**
+  A new per-operator **result set** primitive: a named, TTL-bounded, lineage-tracked
+  set of device IDs that becomes the input scope for the next query or action.
+  `server/core/src/result_set_store.{hpp,cpp}` (new `result_sets.db`, schema v1 via
+  `MigrationRunner`, time-prefixed lexically-sortable `rs_<ts><rand>` ids,
+  RETURNING-idiom writes per #1033, sync + async `pending → materialized` lifecycle,
+  root-first lineage walk, pin/unpin, per-operator 10k quota + 50-pin caps, 5-minute
+  GC sweep). REST surface under `/api/v1/result-sets` (list, direct create,
+  from-inventory-query, members, lineage, pin/unpin, delete) — owner-scoped authz,
+  A4 error envelope, audit on every state transition. The Scope Engine gains a third
+  short-circuit kind, `from_result_set:<id>` (`scope_engine.cpp`), composable with
+  attribute predicates via AND/OR/NOT and resolved per-device by
+  `AgentRegistry::evaluate_scope` (threaded through all command-dispatch sites); stale
+  (offline) members drop silently. A background maintenance thread materialises async
+  result sets from terminal executions and runs the GC sweep; new
+  `yuzu_result_sets_total` / `yuzu_result_sets_alive` / `yuzu_result_set_gc_total` /
+  `yuzu_result_set_quota_rejected` metrics. New `/result-sets` dashboard page
+  (`result_sets_ui.{hpp,cpp}`): sidebar of active sets, lineage breadcrumb, copyable
+  `from_result_set:` scope token, CSV-import create, pin/unpin/delete — HTMX,
+  server-rendered, dark-theme; nav link added across all dashboard pages. The two async
+  producers (from-tar-query / from-instruction-result), the YAML `fromResultSet:` DSL
+  surface, and re-eval land in follow-up PRs. Design: `docs/scope-walking-design.md`.
+
+- **Scope walking — async result-set producers + TAR SQL frame (PR-D).** The two
+  asynchronous producers now create result sets by dispatching a command and
+  materialising membership once the producing execution reaches a terminal state:
+  `POST /api/v1/result-sets/from-tar-query` (dispatches operator SQL to the tar
+  plugin in the parent set's scope — or `__all__` — and includes every agent that
+  returned ≥1 row, or all responders with `include_empty=true`) and
+  `POST /api/v1/result-sets/from-instruction-result` (runs an InstructionDefinition
+  and filters responders by an operator-supplied `{column,op,value|value_set}`
+  matcher — the Chrome-IR hash-check step). Both follow the
+  create-execution-**before**-dispatch ordering (UP2-4) and return `202` with a
+  `pending` row carrying `source_execution_id`; the server maintenance thread applies
+  the matcher (new `result_set_matcher.{hpp,cpp}` — `tar_rows_ge` / `any_response` /
+  column-op over both the tar pipe shape and JSON array-of-objects) and flips the row
+  to `materialized`. `POST /api/v1/result-sets/{id}/re-eval` re-runs an async set's
+  source query as a **sibling** (shares the original's parent). Parent references
+  accept a per-operator **alias** as well as the canonical `rs_` id (resolved at the
+  dispatch layer where the owner is known). New `yuzu_result_sets_total{result="pending"}`
+  metric path. The TAR dashboard's "Ad-hoc TAR SQL" frame (`tar_page_ui.cpp`) is now
+  live: a reusable **scope chip** (your result sets + `__all__`), a SQL editor, and a
+  one-click "Run & create result set" that dispatches, polls the pending set, and
+  surfaces the materialised device count + copyable `from_result_set:` token — HTMX,
+  server-rendered, dark-theme. The async producer routes require the command-dispatch
+  callback + ExecutionTracker (threaded into `RestApiV1::register_routes`); without
+  them they return `503`. Design: `docs/scope-walking-design.md` §3.1/§3.3/§6/§8.3/§10.
+
 - **Compliance policies now actually evaluate (check → verdict pipeline).**
   Authored policies + fragments could be created, but nothing evaluated them —
   `PolicyStore::update_agent_status` had no caller and no trigger fired, so
@@ -50,7 +98,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`minmax(0,1fr)` middle track + `min-width:0`) so the instruction bar's
   minimum content size can no longer push the panel off-screen.
 
+- **Scope walking — `from_result_set:` is owner-scoped end-to-end (the merge-blocking
+  IDOR, review B1).** `AgentRegistry::evaluate_scope` resolved `from_result_set:<id>`
+  with no owner check, so any operator with `Execution:Execute` could embed another
+  operator's `rs_` id in a scope and dispatch commands to that operator's curated
+  devices. The dispatching principal is now threaded into `evaluate_scope`;
+  referenced sets are preloaded once via the new owner-checked
+  `ResultSetStore::member_set_owned` (a set the caller does not own resolves to an
+  empty membership and never matches), which also removes the per-agent under-lock
+  store query (review F). Tracked dispatch paths (REST async producers, workflows,
+  scheduled, MCP) recover the principal from the execution's `dispatched_by`;
+  `/api/command` reads the session; server-authored policy scopes intentionally do
+  not resolve `from_result_set:`. A used set is `touch`-ed so it does not GC
+  mid-investigation (review I).
+- **Cross-operator result-set metadata leak via `/lineage` closed (review B2).**
+  Direct `POST /api/v1/result-sets` owner-checks `parent_id` before persisting the
+  lineage edge, and `ResultSetStore::lineage` is owner-filtered (the walk stops at
+  the first cross-owner ancestor) — a child can no longer parent onto a victim's id
+  and read its name / source_kind / device_count back.
+- **Result-set DoS vectors bounded (review B3, B4, K).** Fixed an infinite loop in
+  `from-inventory-query` parent pagination (an aliased in/out cursor re-read page one
+  forever once a parent exceeded the 5000 page size); added a `kMaxMembersPerSet` cap
+  (100k) on the JSON-array and CSV-import create paths; bounded the
+  `from_result_set:` scope token to 128 chars in the parser.
+- **Async producers no longer orphan a destructive dispatch (review B5).** `run_async`
+  does a pre-dispatch quota check and, on any post-dispatch `create_pending` failure,
+  calls `mark_cancelled` and surfaces `execution_id` — matching the throw / no-agents
+  paths so the execution cannot idle in `running` after agents already executed.
+- **Dashboard result-set fragments stop faking success (review merged_bug_009).**
+  Pin / unpin / CSV-create honour the store's `std::expected`: they audit the real
+  outcome (no false `success` rows) and surface failures via a `showToast` HX-Trigger
+  instead of silently re-rendering as if the action succeeded.
+- **Failed result-set access is audited (review G) + observability/correctness nits.**
+  Non-owner / not-found 404s emit a `result_set.access` `denied` audit row with the
+  attempted id (existence-oracle trail); the maintenance thread only increments
+  `yuzu_result_sets_total{result="materialized"}` on success (`materialize_failed`
+  otherwise — bug_008); `gc_sweep` returns the real deleted count and logs on failure
+  (D); `device_count` reflects distinct members after `INSERT OR IGNORE` dedup (L);
+  `lineage` has a visited-set cycle guard (J); re-eval no longer appends ` (re-eval)`
+  unboundedly (bug_014); result-set `limit` params parse via `std::from_chars` (M).
+  `rs_` ids stay non-CSPRNG display identifiers per the #801 convention now that B1
+  removes the bearer-reference property (review E, by design).
+
 ### Tests
+
+- **Scope walking.** `tests/unit/server/test_result_set_store.cpp` — 8 cases for
+  `ResultSetStore`: synchronous create/get/members, root-first lineage,
+  owner-scoped alias resolution, pin/unpin + pinned-delete rejection, async
+  create → materialize, touch TTL extension, GC sweep, and the per-owner quota
+  counter. `tests/unit/server/test_result_sets_ui.cpp` — 7 render cases for the
+  result-sets dashboard surface including an explicit XSS test (operator-supplied
+  names are HTML-escaped). `tests/unit/server/test_scope_engine.cpp` — 3 added
+  cases for the `from_result_set:` scope kind: bare-atom parse, composition with
+  attribute predicates (AND), and per-device membership evaluation
+  (member+predicate match, non-member drop). All on `TempDbFile` helpers.
+
+- **Scope walking PR-D.** `tests/unit/server/test_result_set_matcher.cpp` — 11 cases
+  for the async membership matcher (pure `(matcher, status, output)` function):
+  non-success never qualifies, empty/blank → SUCCESS default, `any_response`,
+  `tar_rows_ge` thresholds + tar `error|` → 0 rows, `tar_row_count` trailer +
+  line-count fallback, unknown-kind conservative exclude, column ops
+  (`eq`/`in`/`contains`/`exists`) over both the tar pipe shape and the JSON
+  array-of-objects fallback, and the malformed-matcher fallbacks.
+  `tests/unit/server/test_rest_result_sets_async.cpp` — 14 HTTP-level cases (real
+  `ResultSetStore` + `ExecutionTracker`, fake recording dispatch closure):
+  from-tar-query 202/pending shape + create-before-dispatch ordering, `__all__` vs
+  `from_result_set:<parent>` scope, **alias pre-resolution** to canonical id,
+  unknown-alias 404, `include_empty` → `any_response` matcher, missing-sql 400,
+  zero-agents 503 (execution cancelled, no pending row), dispatch-throw 500,
+  unwired-dispatch 503, from-instruction-result plugin/action/matcher persistence +
+  unknown-instruction 404, and re-eval sibling parent / unsupported-kind 400 /
+  not-found 404.
+
+- **Scope walking — review remediation.** `tests/unit/server/test_scope_walking_authz.cpp`
+  — cross-operator `evaluate_scope` authorization: the set owner resolves exactly the
+  set's members, while a non-owner and an empty principal resolve nothing (the B1
+  IDOR is blocked). `tests/unit/server/test_result_set_store.cpp` gains 7 cases: GC
+  actually deletes expired unpinned rows and returns the count (D), per-set member cap
+  (B4), `device_count` distinct-dedup (L), owner-scoped `member_set_owned` (B1),
+  lineage stops at a cross-owner ancestor (B2) and terminates on a `parent_id` cycle
+  (J), and >5000-member pagination terminates (B3); its lineage assertions move to
+  the owner-arg `lineage`. `test_workflow_routes.cpp` updated for the principal-arg
+  scope-estimate callback. (`test_scope_engine.cpp` is unchanged — its existing
+  `from_result_set:` cases pass under the relaxed length-bound token validation.)
 
 - `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
   `PolicyEvaluator`: compliant/non_compliant multi-agent fan-out, non-responder

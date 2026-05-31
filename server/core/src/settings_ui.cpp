@@ -180,6 +180,7 @@ extern const char* const kSettingsHtml =
     <a href="/compliance" class="nav-link">Compliance</a>
     <a href="/tar" class="nav-link">TAR</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
+    <a href="/result-sets" class="nav-link">Result Sets</a>
     <a href="/settings" class="nav-link active" id="nav-settings-link">Settings</a>
     <span class="nav-spacer"></span>
     <span class="nav-user" id="nav-user"></span>
