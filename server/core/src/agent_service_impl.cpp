@@ -14,6 +14,7 @@
 #include "grpc_audit_signal.hpp"
 #include "guaranteed_state.pb.h"
 #include "guaranteed_state_store.hpp"
+#include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
@@ -35,25 +36,6 @@ namespace yuzu::server::detail {
 // Bring html_escape into scope for the HTML rendering methods.
 using yuzu::server::html_escape;
 
-namespace {
-// google.protobuf.Timestamp seconds → ISO-8601 UTC; falls back to "now" when unset
-// (an agent that didn't stamp the event, or a 0 default). Mirrors iso_now() in
-// rest_api_v1.cpp.
-std::string ts_to_iso8601(std::int64_t epoch_seconds) {
-    std::time_t t = epoch_seconds > 0
-                        ? static_cast<std::time_t>(epoch_seconds)
-                        : std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-    std::tm tm{};
-#if defined(_WIN32)
-    gmtime_s(&tm, &t);
-#else
-    gmtime_r(&t, &tm);
-#endif
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    return std::string(buf);
-}
-} // namespace
 
 // -- Constructor --------------------------------------------------------------
 
@@ -927,43 +909,13 @@ grpc::Status AgentServiceImpl::Subscribe(
         // miss them. agent_id is server-stamped from the cert-bound session, never
         // self-reported. See docs/guardian-mvp-contract.md.
         if (resp.plugin() == "__guard__") {
-            if (resp.action() == "event" && guaranteed_state_store_) {
-                ::yuzu::guardian::v1::GuaranteedStateEvent ev;
-                if (ev.ParseFromString(resp.payload())) {
-                    GuaranteedStateEventRow ev_row;
-                    ev_row.event_id = ev.event_id();
-                    ev_row.rule_id = ev.rule_id();
-                    ev_row.agent_id = agent_id; // server-stamped (cert-bound)
-                    ev_row.event_type = ev.event_type();
-                    ev_row.severity = ev.severity();
-                    ev_row.guard_type = ev.guard_type();
-                    ev_row.guard_category = ev.guard_category();
-                    ev_row.detected_value = ev.detected_value();
-                    ev_row.expected_value = ev.expected_value();
-                    ev_row.remediation_action = ev.remediation_action();
-                    ev_row.remediation_success = ev.remediation_success();
-                    ev_row.detection_latency_us = static_cast<int64_t>(ev.detection_latency_us());
-                    ev_row.remediation_latency_us =
-                        static_cast<int64_t>(ev.remediation_latency_us());
-                    ev_row.timestamp = ts_to_iso8601(ev.timestamp().seconds());
-                    // Enrich severity from the rule store (contract decision 4) — the
-                    // agent isn't pushed severity. Fall back to the event's own value,
-                    // then "unknown" for an already-deleted rule.
-                    if (auto rule = guaranteed_state_store_->get_rule(ev_row.rule_id); rule)
-                        ev_row.severity = rule->severity;
-                    if (ev_row.severity.empty())
-                        ev_row.severity = "unknown";
-                    if (auto r = guaranteed_state_store_->insert_event(ev_row); !r) {
-                        spdlog::warn("Guardian: insert_event failed (agent={}, rule={}): {}",
-                                     agent_id, ev_row.rule_id, r.error());
-                    }
-                } else {
-                    spdlog::warn("Guardian: failed to parse GuaranteedStateEvent from agent {}",
-                                 agent_id);
-                }
-            }
-            // action "status" ingest lands with the status slice; other actions are
-            // ignored. Always skip the response-store / executions path.
+            // Guardian side-channel — route through the shared ingest so the
+            // direct and gateway-proxied (GatewayUpstreamServiceImpl::
+            // ForwardGuardianMessage) paths cannot diverge. agent_id is
+            // cert-bound from this Subscribe session. Always skip the
+            // response-store / executions path.
+            if (guaranteed_state_store_)
+                ingest_guardian_response(*guaranteed_state_store_, agent_id, resp);
             continue;
         }
 

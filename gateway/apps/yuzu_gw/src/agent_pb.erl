@@ -112,7 +112,10 @@
         output                  => unicode:chardata(), % = 3, optional
         exit_code               => integer(),       % = 4, optional, 32 bits
         error                   => 'yuzu.common.v1.ErrorDetail'(), % = 5, optional
-        sent_at                 => 'yuzu.common.v1.Timestamp'() % = 6, optional
+        sent_at                 => 'yuzu.common.v1.Timestamp'(), % = 6, optional
+        plugin                  => unicode:chardata(), % = 7, optional
+        action                  => unicode:chardata(), % = 8, optional
+        payload                 => iodata()         % = 9, optional
        }.
 
 -type 'yuzu.agent.v1.InventoryReport'() ::
@@ -658,15 +661,48 @@ encode_msg(Msg, MsgName, Opts) ->
                  end;
              _ -> B4
          end,
+    B6 = case M of
+             #{sent_at := F6} ->
+                 begin
+                     TrF6 = id(F6, TrUserData),
+                     if TrF6 =:= undefined -> B5;
+                        true -> 'e_mfield_yuzu.agent.v1.CommandResponse_sent_at'(TrF6, <<B5/binary, 50>>, TrUserData)
+                     end
+                 end;
+             _ -> B5
+         end,
+    B7 = case M of
+             #{plugin := F7} ->
+                 begin
+                     TrF7 = id(F7, TrUserData),
+                     case is_empty_string(TrF7) of
+                         true -> B6;
+                         false -> e_type_string(TrF7, <<B6/binary, 58>>, TrUserData)
+                     end
+                 end;
+             _ -> B6
+         end,
+    B8 = case M of
+             #{action := F8} ->
+                 begin
+                     TrF8 = id(F8, TrUserData),
+                     case is_empty_string(TrF8) of
+                         true -> B7;
+                         false -> e_type_string(TrF8, <<B7/binary, 66>>, TrUserData)
+                     end
+                 end;
+             _ -> B7
+         end,
     case M of
-        #{sent_at := F6} ->
+        #{payload := F9} ->
             begin
-                TrF6 = id(F6, TrUserData),
-                if TrF6 =:= undefined -> B5;
-                   true -> 'e_mfield_yuzu.agent.v1.CommandResponse_sent_at'(TrF6, <<B5/binary, 50>>, TrUserData)
+                TrF9 = id(F9, TrUserData),
+                case iolist_size(TrF9) of
+                    0 -> B8;
+                    _ -> e_type_bytes(TrF9, <<B8/binary, 74>>, TrUserData)
                 end
             end;
-        _ -> B5
+        _ -> B8
     end.
 
 'encode_msg_yuzu.agent.v1.InventoryReport'(Msg, TrUserData) -> 'encode_msg_yuzu.agent.v1.InventoryReport'(Msg, <<>>, TrUserData).
@@ -2130,46 +2166,75 @@ decode_msg_2_doit('yuzu.common.v1.ScopeCombinator', Bin, TrUserData) -> id('deco
     'dfp_read_field_def_yuzu.agent.v1.CommandRequest'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, TrUserData).
 
 'decode_msg_yuzu.agent.v1.CommandResponse'(Bin, TrUserData) ->
-    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Bin, 0, 0, 0, id(<<>>, TrUserData), id('RUNNING', TrUserData), id(<<>>, TrUserData), id(0, TrUserData), id('$undef', TrUserData), id('$undef', TrUserData), TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Bin,
+                                                       0,
+                                                       0,
+                                                       0,
+                                                       id(<<>>, TrUserData),
+                                                       id('RUNNING', TrUserData),
+                                                       id(<<>>, TrUserData),
+                                                       id(0, TrUserData),
+                                                       id('$undef', TrUserData),
+                                                       id('$undef', TrUserData),
+                                                       id(<<>>, TrUserData),
+                                                       id(<<>>, TrUserData),
+                                                       id(<<>>, TrUserData),
+                                                       TrUserData).
 
-'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<10, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'd_field_yuzu.agent.v1.CommandResponse_command_id'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<16, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'd_field_yuzu.agent.v1.CommandResponse_status'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<26, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'd_field_yuzu.agent.v1.CommandResponse_output'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'd_field_yuzu.agent.v1.CommandResponse_exit_code'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<42, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'd_field_yuzu.agent.v1.CommandResponse_error'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<50, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'd_field_yuzu.agent.v1.CommandResponse_sent_at'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, _) ->
-    S1 = #{command_id => F@_1, status => F@_2, output => F@_3, exit_code => F@_4},
+'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<10, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'd_field_yuzu.agent.v1.CommandResponse_command_id'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<16, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'd_field_yuzu.agent.v1.CommandResponse_status'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<26, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'd_field_yuzu.agent.v1.CommandResponse_output'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'd_field_yuzu.agent.v1.CommandResponse_exit_code'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<42, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'd_field_yuzu.agent.v1.CommandResponse_error'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<50, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'd_field_yuzu.agent.v1.CommandResponse_sent_at'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<58, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'd_field_yuzu.agent.v1.CommandResponse_plugin'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<66, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'd_field_yuzu.agent.v1.CommandResponse_action'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<74, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'd_field_yuzu.agent.v1.CommandResponse_payload'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, _) ->
+    S1 = #{command_id => F@_1, status => F@_2, output => F@_3, exit_code => F@_4, plugin => F@_7, action => F@_8, payload => F@_9},
     S2 = if F@_5 == '$undef' -> S1;
             true -> S1#{error => F@_5}
          end,
     if F@_6 == '$undef' -> S2;
        true -> S2#{sent_at => F@_6}
     end;
-'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dg_read_field_def_yuzu.agent.v1.CommandResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'dg_read_field_def_yuzu.agent.v1.CommandResponse'(Other, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData).
 
-'dg_read_field_def_yuzu.agent.v1.CommandResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 32 - 7 ->
-    'dg_read_field_def_yuzu.agent.v1.CommandResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'dg_read_field_def_yuzu.agent.v1.CommandResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'dg_read_field_def_yuzu.agent.v1.CommandResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) when N < 32 - 7 ->
+    'dg_read_field_def_yuzu.agent.v1.CommandResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'dg_read_field_def_yuzu.agent.v1.CommandResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
     Key = X bsl N + Acc,
     case Key of
-        10 -> 'd_field_yuzu.agent.v1.CommandResponse_command_id'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        16 -> 'd_field_yuzu.agent.v1.CommandResponse_status'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        26 -> 'd_field_yuzu.agent.v1.CommandResponse_output'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        32 -> 'd_field_yuzu.agent.v1.CommandResponse_exit_code'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        42 -> 'd_field_yuzu.agent.v1.CommandResponse_error'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-        50 -> 'd_field_yuzu.agent.v1.CommandResponse_sent_at'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
+        10 -> 'd_field_yuzu.agent.v1.CommandResponse_command_id'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+        16 -> 'd_field_yuzu.agent.v1.CommandResponse_status'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+        26 -> 'd_field_yuzu.agent.v1.CommandResponse_output'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+        32 -> 'd_field_yuzu.agent.v1.CommandResponse_exit_code'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+        42 -> 'd_field_yuzu.agent.v1.CommandResponse_error'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+        50 -> 'd_field_yuzu.agent.v1.CommandResponse_sent_at'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+        58 -> 'd_field_yuzu.agent.v1.CommandResponse_plugin'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+        66 -> 'd_field_yuzu.agent.v1.CommandResponse_action'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+        74 -> 'd_field_yuzu.agent.v1.CommandResponse_payload'(Rest, 0, 0, 0, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
         _ ->
             case Key band 7 of
-                0 -> 'skip_varint_yuzu.agent.v1.CommandResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                1 -> 'skip_64_yuzu.agent.v1.CommandResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                2 -> 'skip_length_delimited_yuzu.agent.v1.CommandResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                3 -> 'skip_group_yuzu.agent.v1.CommandResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-                5 -> 'skip_32_yuzu.agent.v1.CommandResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData)
+                0 -> 'skip_varint_yuzu.agent.v1.CommandResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+                1 -> 'skip_64_yuzu.agent.v1.CommandResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+                2 -> 'skip_length_delimited_yuzu.agent.v1.CommandResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+                3 -> 'skip_group_yuzu.agent.v1.CommandResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+                5 -> 'skip_32_yuzu.agent.v1.CommandResponse'(Rest, 0, 0, Key bsr 3, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData)
             end
     end;
-'dg_read_field_def_yuzu.agent.v1.CommandResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, _) ->
-    S1 = #{command_id => F@_1, status => F@_2, output => F@_3, exit_code => F@_4},
+'dg_read_field_def_yuzu.agent.v1.CommandResponse'(<<>>, 0, 0, _, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, _) ->
+    S1 = #{command_id => F@_1, status => F@_2, output => F@_3, exit_code => F@_4, plugin => F@_7, action => F@_8, payload => F@_9},
     S2 = if F@_5 == '$undef' -> S1;
             true -> S1#{error => F@_5}
          end,
@@ -2177,33 +2242,33 @@ decode_msg_2_doit('yuzu.common.v1.ScopeCombinator', Bin, TrUserData) -> id('deco
        true -> S2#{sent_at => F@_6}
     end.
 
-'d_field_yuzu.agent.v1.CommandResponse_command_id'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CommandResponse_command_id'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CommandResponse_command_id'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.CommandResponse_command_id'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CommandResponse_command_id'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'d_field_yuzu.agent.v1.CommandResponse_command_id'(<<0:1, X:7, Rest/binary>>, N, Acc, F, _, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF, 0, 0, F, NewFValue, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF, 0, 0, F, NewFValue, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData).
 
-'d_field_yuzu.agent.v1.CommandResponse_status'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CommandResponse_status'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CommandResponse_status'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, _, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.CommandResponse_status'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CommandResponse_status'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'d_field_yuzu.agent.v1.CommandResponse_status'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, _, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
     {NewFValue, RestF} = {id('d_enum_yuzu.agent.v1.CommandResponse.Status'(begin <<Res:32/signed-native>> = <<(X bsl N + Acc):32/unsigned-native>>, id(Res, TrUserData) end), TrUserData), Rest},
-    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF, 0, 0, F, F@_1, NewFValue, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF, 0, 0, F, F@_1, NewFValue, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData).
 
-'d_field_yuzu.agent.v1.CommandResponse_output'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CommandResponse_output'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CommandResponse_output'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, _, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.CommandResponse_output'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CommandResponse_output'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'d_field_yuzu.agent.v1.CommandResponse_output'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, _, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
-    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF, 0, 0, F, F@_1, F@_2, NewFValue, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF, 0, 0, F, F@_1, F@_2, NewFValue, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData).
 
-'d_field_yuzu.agent.v1.CommandResponse_exit_code'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CommandResponse_exit_code'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CommandResponse_exit_code'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, _, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.CommandResponse_exit_code'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CommandResponse_exit_code'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'d_field_yuzu.agent.v1.CommandResponse_exit_code'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, _, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
     {NewFValue, RestF} = {begin <<Res:32/signed-native>> = <<(X bsl N + Acc):32/unsigned-native>>, id(Res, TrUserData) end, Rest},
-    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, NewFValue, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, NewFValue, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData).
 
-'d_field_yuzu.agent.v1.CommandResponse_error'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CommandResponse_error'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CommandResponse_error'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, Prev, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.CommandResponse_error'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CommandResponse_error'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'d_field_yuzu.agent.v1.CommandResponse_error'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, Prev, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bs:Len/binary, Rest2/binary>> = Rest, {id('decode_msg_yuzu.common.v1.ErrorDetail'(Bs, TrUserData), TrUserData), Rest2} end,
     'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF,
                                                        0,
@@ -2217,11 +2282,14 @@ decode_msg_2_doit('yuzu.common.v1.ScopeCombinator', Bin, TrUserData) -> id('deco
                                                           true -> 'merge_msg_yuzu.common.v1.ErrorDetail'(Prev, NewFValue, TrUserData)
                                                        end,
                                                        F@_6,
+                                                       F@_7,
+                                                       F@_8,
+                                                       F@_9,
                                                        TrUserData).
 
-'d_field_yuzu.agent.v1.CommandResponse_sent_at'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'd_field_yuzu.agent.v1.CommandResponse_sent_at'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'d_field_yuzu.agent.v1.CommandResponse_sent_at'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, Prev, TrUserData) ->
+'d_field_yuzu.agent.v1.CommandResponse_sent_at'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CommandResponse_sent_at'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'d_field_yuzu.agent.v1.CommandResponse_sent_at'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, Prev, F@_7, F@_8, F@_9, TrUserData) ->
     {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bs:Len/binary, Rest2/binary>> = Rest, {id('decode_msg_yuzu.common.v1.Timestamp'(Bs, TrUserData), TrUserData), Rest2} end,
     'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF,
                                                        0,
@@ -2235,25 +2303,50 @@ decode_msg_2_doit('yuzu.common.v1.ScopeCombinator', Bin, TrUserData) -> id('deco
                                                        if Prev == '$undef' -> NewFValue;
                                                           true -> 'merge_msg_yuzu.common.v1.Timestamp'(Prev, NewFValue, TrUserData)
                                                        end,
+                                                       F@_7,
+                                                       F@_8,
+                                                       F@_9,
                                                        TrUserData).
 
-'skip_varint_yuzu.agent.v1.CommandResponse'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'skip_varint_yuzu.agent.v1.CommandResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'skip_varint_yuzu.agent.v1.CommandResponse'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'d_field_yuzu.agent.v1.CommandResponse_plugin'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CommandResponse_plugin'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'d_field_yuzu.agent.v1.CommandResponse_plugin'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, _, F@_8, F@_9, TrUserData) ->
+    {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, NewFValue, F@_8, F@_9, TrUserData).
 
-'skip_length_delimited_yuzu.agent.v1.CommandResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) when N < 57 ->
-    'skip_length_delimited_yuzu.agent.v1.CommandResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData);
-'skip_length_delimited_yuzu.agent.v1.CommandResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'d_field_yuzu.agent.v1.CommandResponse_action'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CommandResponse_action'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'d_field_yuzu.agent.v1.CommandResponse_action'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, _, F@_9, TrUserData) ->
+    {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, NewFValue, F@_9, TrUserData).
+
+'d_field_yuzu.agent.v1.CommandResponse_payload'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) when N < 57 ->
+    'd_field_yuzu.agent.v1.CommandResponse_payload'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'d_field_yuzu.agent.v1.CommandResponse_payload'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, _, TrUserData) ->
+    {NewFValue, RestF} = begin Len = X bsl N + Acc, <<Bytes:Len/binary, Rest2/binary>> = Rest, Bytes2 = binary:copy(Bytes), {id(Bytes2, TrUserData), Rest2} end,
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(RestF, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, NewFValue, TrUserData).
+
+'skip_varint_yuzu.agent.v1.CommandResponse'(<<1:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'skip_varint_yuzu.agent.v1.CommandResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'skip_varint_yuzu.agent.v1.CommandResponse'(<<0:1, _:7, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData).
+
+'skip_length_delimited_yuzu.agent.v1.CommandResponse'(<<1:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) when N < 57 ->
+    'skip_length_delimited_yuzu.agent.v1.CommandResponse'(Rest, N + 7, X bsl N + Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData);
+'skip_length_delimited_yuzu.agent.v1.CommandResponse'(<<0:1, X:7, Rest/binary>>, N, Acc, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
     Length = X bsl N + Acc,
     <<_:Length/binary, Rest2/binary>> = Rest,
-    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Rest2, 0, 0, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData).
 
-'skip_group_yuzu.agent.v1.CommandResponse'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) ->
+'skip_group_yuzu.agent.v1.CommandResponse'(Bin, _, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
     {_, Rest} = read_group(Bin, FNum),
-    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Rest, 0, Z2, FNum, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData).
 
-'skip_32_yuzu.agent.v1.CommandResponse'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'skip_32_yuzu.agent.v1.CommandResponse'(<<_:32, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData).
 
-'skip_64_yuzu.agent.v1.CommandResponse'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData) -> 'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, TrUserData).
+'skip_64_yuzu.agent.v1.CommandResponse'(<<_:64, Rest/binary>>, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData) ->
+    'dfp_read_field_def_yuzu.agent.v1.CommandResponse'(Rest, Z1, Z2, F, F@_1, F@_2, F@_3, F@_4, F@_5, F@_6, F@_7, F@_8, F@_9, TrUserData).
 
 'decode_msg_yuzu.agent.v1.InventoryReport'(Bin, TrUserData) ->
     'dfp_read_field_def_yuzu.agent.v1.InventoryReport'(Bin, 0, 0, 0, id(<<>>, TrUserData), id('$undef', TrUserData), 'tr_decode_init_default_yuzu.agent.v1.InventoryReport.plugin_data'([], TrUserData), TrUserData).
@@ -3557,11 +3650,26 @@ merge_msgs(Prev, New, MsgName, Opts) ->
              {#{error := PFerror}, _} -> S5#{error => PFerror};
              {_, _} -> S5
          end,
+    S7 = case {PMsg, NMsg} of
+             {#{sent_at := PFsent_at}, #{sent_at := NFsent_at}} -> S6#{sent_at => 'merge_msg_yuzu.common.v1.Timestamp'(PFsent_at, NFsent_at, TrUserData)};
+             {_, #{sent_at := NFsent_at}} -> S6#{sent_at => NFsent_at};
+             {#{sent_at := PFsent_at}, _} -> S6#{sent_at => PFsent_at};
+             {_, _} -> S6
+         end,
+    S8 = case {PMsg, NMsg} of
+             {_, #{plugin := NFplugin}} -> S7#{plugin => NFplugin};
+             {#{plugin := PFplugin}, _} -> S7#{plugin => PFplugin};
+             _ -> S7
+         end,
+    S9 = case {PMsg, NMsg} of
+             {_, #{action := NFaction}} -> S8#{action => NFaction};
+             {#{action := PFaction}, _} -> S8#{action => PFaction};
+             _ -> S8
+         end,
     case {PMsg, NMsg} of
-        {#{sent_at := PFsent_at}, #{sent_at := NFsent_at}} -> S6#{sent_at => 'merge_msg_yuzu.common.v1.Timestamp'(PFsent_at, NFsent_at, TrUserData)};
-        {_, #{sent_at := NFsent_at}} -> S6#{sent_at => NFsent_at};
-        {#{sent_at := PFsent_at}, _} -> S6#{sent_at => PFsent_at};
-        {_, _} -> S6
+        {_, #{payload := NFpayload}} -> S9#{payload => NFpayload};
+        {#{payload := PFpayload}, _} -> S9#{payload => PFpayload};
+        _ -> S9
     end.
 
 -compile({nowarn_unused_function,'merge_msg_yuzu.agent.v1.InventoryReport'/3}).
@@ -4116,12 +4224,27 @@ verify_msg(Msg, MsgName, Opts) ->
         #{sent_at := F6} -> 'v_submsg_yuzu.common.v1.Timestamp'(F6, [sent_at | Path], TrUserData);
         _ -> ok
     end,
+    case M of
+        #{plugin := F7} -> v_type_string(F7, [plugin | Path], TrUserData);
+        _ -> ok
+    end,
+    case M of
+        #{action := F8} -> v_type_string(F8, [action | Path], TrUserData);
+        _ -> ok
+    end,
+    case M of
+        #{payload := F9} -> v_type_bytes(F9, [payload | Path], TrUserData);
+        _ -> ok
+    end,
     lists:foreach(fun (command_id) -> ok;
                       (status) -> ok;
                       (output) -> ok;
                       (exit_code) -> ok;
                       (error) -> ok;
                       (sent_at) -> ok;
+                      (plugin) -> ok;
+                      (action) -> ok;
+                      (payload) -> ok;
                       (OtherKey) -> mk_type_error({extraneous_key, OtherKey}, M, Path)
                   end,
                   maps:keys(M)),
@@ -4753,7 +4876,10 @@ get_msg_defs() ->
        #{name => output, fnum => 3, rnum => 4, type => string, occurrence => optional, opts => []},
        #{name => exit_code, fnum => 4, rnum => 5, type => int32, occurrence => optional, opts => []},
        #{name => error, fnum => 5, rnum => 6, type => {msg, 'yuzu.common.v1.ErrorDetail'}, occurrence => optional, opts => []},
-       #{name => sent_at, fnum => 6, rnum => 7, type => {msg, 'yuzu.common.v1.Timestamp'}, occurrence => optional, opts => []}]},
+       #{name => sent_at, fnum => 6, rnum => 7, type => {msg, 'yuzu.common.v1.Timestamp'}, occurrence => optional, opts => []},
+       #{name => plugin, fnum => 7, rnum => 8, type => string, occurrence => optional, opts => []},
+       #{name => action, fnum => 8, rnum => 9, type => string, occurrence => optional, opts => []},
+       #{name => payload, fnum => 9, rnum => 10, type => bytes, occurrence => optional, opts => []}]},
      {{msg, 'yuzu.agent.v1.InventoryReport'},
       [#{name => session_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
        #{name => collected_at, fnum => 2, rnum => 3, type => {msg, 'yuzu.common.v1.Timestamp'}, occurrence => optional, opts => []},
@@ -4919,7 +5045,10 @@ find_msg_def('yuzu.agent.v1.CommandResponse') ->
      #{name => output, fnum => 3, rnum => 4, type => string, occurrence => optional, opts => []},
      #{name => exit_code, fnum => 4, rnum => 5, type => int32, occurrence => optional, opts => []},
      #{name => error, fnum => 5, rnum => 6, type => {msg, 'yuzu.common.v1.ErrorDetail'}, occurrence => optional, opts => []},
-     #{name => sent_at, fnum => 6, rnum => 7, type => {msg, 'yuzu.common.v1.Timestamp'}, occurrence => optional, opts => []}];
+     #{name => sent_at, fnum => 6, rnum => 7, type => {msg, 'yuzu.common.v1.Timestamp'}, occurrence => optional, opts => []},
+     #{name => plugin, fnum => 7, rnum => 8, type => string, occurrence => optional, opts => []},
+     #{name => action, fnum => 8, rnum => 9, type => string, occurrence => optional, opts => []},
+     #{name => payload, fnum => 9, rnum => 10, type => bytes, occurrence => optional, opts => []}];
 find_msg_def('yuzu.agent.v1.InventoryReport') ->
     [#{name => session_id, fnum => 1, rnum => 2, type => string, occurrence => optional, opts => []},
      #{name => collected_at, fnum => 2, rnum => 3, type => {msg, 'yuzu.common.v1.Timestamp'}, occurrence => optional, opts => []},

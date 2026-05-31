@@ -1304,6 +1304,12 @@ public:
                 // Step 5: ingest agent `__guard__` events arriving on the Subscribe
                 // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
                 agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
+                // Guardian Half B: gateway-connected agents' drift events arrive
+                // via GatewayUpstream.ForwardGuardianMessage, not the direct
+                // Subscribe loop — wire the same store so they ingest through the
+                // shared path. Gateway service exists only in gateway mode.
+                if (gateway_service_)
+                    gateway_service_->set_guaranteed_state_store(guaranteed_state_store_.get());
             }
         }
 

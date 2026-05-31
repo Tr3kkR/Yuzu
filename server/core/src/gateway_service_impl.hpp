@@ -28,6 +28,7 @@ class FleetTopologyStore;
 class HeartbeatIngestion;
 class AnalyticsEventStore;
 class AuditStore;
+class GuaranteedStateStore;
 } // namespace yuzu::server
 
 namespace yuzu::server::detail {
@@ -67,6 +68,15 @@ public:
     /// for the SOC 2 / wire-collapse rationale — same contract here.
     void set_audit_store(AuditStore* store) { audit_store_ = store; }
 
+    /// Guardian Half B: store for ingesting unsolicited "__guard__" drift
+    /// events forwarded from gateway-connected agents via
+    /// ForwardGuardianMessage. Same store AgentServiceImpl uses on the direct
+    /// Subscribe path; both call the shared ingest_guardian_response so they
+    /// cannot diverge. nullptr disables ingest (tests / store-less configs).
+    void set_guaranteed_state_store(GuaranteedStateStore* store) {
+        guaranteed_state_store_ = store;
+    }
+
     grpc::Status ProxyRegister(grpc::ServerContext* context, const pb::RegisterRequest* request,
                                pb::RegisterResponse* response) override;
 
@@ -80,6 +90,10 @@ public:
     grpc::Status NotifyStreamStatus(grpc::ServerContext* context,
                                     const gw::StreamStatusNotification* request,
                                     gw::StreamStatusAck* response) override;
+
+    grpc::Status ForwardGuardianMessage(grpc::ServerContext* context,
+                                        const gw::ForwardGuardianRequest* request,
+                                        gw::ForwardGuardianAck* response) override;
 
     // Status accessors for dashboard
     std::size_t session_count() const;
@@ -97,6 +111,7 @@ private:
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     AnalyticsEventStore* analytics_store_{nullptr};
     AuditStore* audit_store_{nullptr};
+    GuaranteedStateStore* guaranteed_state_store_{nullptr};
 
     // Map of gateway session_id -> agent_id for validation.
     mutable std::mutex sessions_mu_;
