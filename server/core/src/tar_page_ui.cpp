@@ -334,7 +334,11 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
 
   <div id="toast-container" class="toast-container"></div>
 
-<script>
+)HTM"
+// Split here (not a content boundary): MSVC caps a single string literal at
+// 16380 chars (C2026) and this page exceeds it. Adjacent raw-string literals
+// are concatenated by the compiler, so the rendered HTML is byte-identical.
+R"HTM(<script>
 function showToast(message, level) {
   var c = document.getElementById('toast-container');
   if (!c) return;
