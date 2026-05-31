@@ -53,6 +53,14 @@ public:
     /// AgentRegistry — same trick ComplianceRoutes uses).
     using AgentsJsonFn = std::function<std::string()>;
 
+    /// Guardian push fan-out: resolve `scope` → in-scope agents, deliver the
+    /// store's enabled rules as a `__guard__`/push_rules CommandRequest. Returns
+    /// the agent count, or <0 on failure (unparseable scope / not wired). Same
+    /// callback the REST `/push` endpoint uses; the dashboard toggle calls it to
+    /// auto-deploy a guard change. May be empty (toggle then degrades to
+    /// "saved, not deployed").
+    using PushFn = std::function<int(const std::string& scope, bool full_sync)>;
+
     /// Register all Guardian routes on the given server.
     /// `store` may be null (degrades to fully-mock rendering).
     void register_routes(httplib::Server& svr,
@@ -61,7 +69,8 @@ public:
                          AuditFn audit_fn,
                          EmitEventFn emit_event_fn,
                          GuaranteedStateStore* store,
-                         AgentsJsonFn agents_json_fn);
+                         AgentsJsonFn agents_json_fn,
+                         PushFn push_fn);
 
 private:
     // -- Fragment renderers (called by route handlers) -------------------------
@@ -75,6 +84,13 @@ private:
     std::string render_guard_form_fragment() const;
     std::string render_baseline_form_fragment() const;
 
+    /// Apply a live enable/disable or audit↔enforce change to one authored rule,
+    /// auto-deploy it (full_sync push), and respond with the re-rendered guards
+    /// list. Backs the `/guard/<id>/enabled` and `/guard/<id>/mode` toggles.
+    void apply_guard_change(const httplib::Request& req, httplib::Response& res,
+                            const std::string& rule_id, bool set_enabled, bool enabled,
+                            bool set_mode, const std::string& mode);
+
     // -- Dependency pointers (stored by register_routes) -----------------------
     AuthFn auth_fn_;
     PermFn perm_fn_;
@@ -82,6 +98,7 @@ private:
     EmitEventFn emit_event_fn_;
     GuaranteedStateStore* store_{};
     AgentsJsonFn agents_json_fn_;
+    PushFn push_fn_{};
 };
 
 } // namespace yuzu::server

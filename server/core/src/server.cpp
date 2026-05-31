@@ -5859,7 +5859,14 @@ private:
                 emit_event(event_type, req, attrs, payload_data);
             },
             guaranteed_state_store_.get(),
-            [this]() -> std::string { return registry_.to_json(); });
+            [this]() -> std::string { return registry_.to_json(); },
+            // Dashboard enforcement toggle deploys via the same push fan-out the
+            // REST endpoint uses. guardian_push_fn_ is assigned just below during
+            // REST wiring; this lambda reads it at toggle-time (runtime), never at
+            // registration time, so the ordering is fine.
+            [this](const std::string& scope, bool full_sync) -> int {
+                return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
+            });
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
@@ -6131,7 +6138,10 @@ private:
             // `__guard__`/push_rules CommandRequest via the agent dispatch path (reuses
             // the instruction-dispatch scope→send_to idiom). Returns the agent count, or
             // -1 on an unparseable scope. See docs/guardian-mvp-contract.md (step 3/G12).
-            [this](const std::string& scope, bool full_sync) -> int {
+            // Also stored into guardian_push_fn_ (member) so the dashboard enforcement
+            // toggle deploys via this exact fan-out. The parenthesised assignment yields
+            // the assigned std::function, which is what gets passed here by value.
+            (guardian_push_fn_ = [this](const std::string& scope, bool full_sync) -> int {
                 if (!guaranteed_state_store_)
                     return 0;
                 const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
@@ -6209,7 +6219,7 @@ private:
                 // forward_gateway_pending() and docs/guardian-mvp-contract.md G12.
                 forward_gateway_pending();
                 return sent;
-            });
+            }));
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -6540,6 +6550,11 @@ private:
     std::unique_ptr<mcp::McpServer> mcp_server_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
     std::unique_ptr<GuardianRoutes> guardian_routes_;
+    // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
+    // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
+    // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
+    // which point it is set.
+    std::function<int(const std::string&, bool)> guardian_push_fn_;
     std::unique_ptr<DashboardRoutes> dashboard_routes_;
     std::unique_ptr<WorkflowRoutes> workflow_routes_;
     std::unique_ptr<NotificationRoutes> notification_routes_;

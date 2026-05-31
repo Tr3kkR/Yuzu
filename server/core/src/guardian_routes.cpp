@@ -231,18 +231,47 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
                                        : (r.os_target == "windows" ? "W"
                                           : r.os_target == "linux"  ? "L"
                                           : r.os_target == "macos"  ? "M" : r.os_target);
-                html += "<div class=\"guard-item\" hx-get=\"/fragments/guardian/guard/" +
-                        html_escape(r.rule_id) + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">"
-                        "<div class=\"guard-item-top\">"
+                const bool on = r.enabled;
+                const std::string mode = r.enforcement_mode.empty() ? "enforce" : r.enforcement_mode;
+                const bool enforcing = (mode == "enforce");
+                const char* badge_color = on ? (enforcing ? "var(--green)" : "var(--yellow)")
+                                             : "var(--muted)";
+                const char* badge_text = on ? (enforcing ? "ENFORCING" : "audit-only") : "disabled";
+                const std::string rid = html_escape(r.rule_id);
+                // Detail nav lives on the top row only, so the control buttons
+                // below (siblings, not children) never open the detail panel.
+                html += "<div class=\"guard-item\">"
+                        "<div class=\"guard-item-top\" style=\"cursor:pointer\" "
+                        "hx-get=\"/fragments/guardian/guard/" + rid +
+                        "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">"
                         "<span class=\"guard-name\">" + html_escape(r.name) + "</span>"
                         "<span class=\"guard-os\">" + html_escape(os) + "</span>"
-                        "<span style=\"margin-left:auto\">" + status_badge("compliant") + "</span>"
+                        "<span style=\"margin-left:auto;font-size:0.62rem;font-weight:700;color:" +
+                        std::string(badge_color) + "\">" + badge_text + "</span>"
                         "</div>"
                         "<div class=\"guard-meta\">"
                         "<span>" + html_escape(r.severity.empty() ? "medium" : r.severity) + "</span>"
-                        "<span>mode: " + html_escape(r.enforcement_mode.empty() ? "enforce" : r.enforcement_mode) + "</span>"
-                        "<span class=\"health-ok\">&#9679; healthy</span>"
-                        "</div></div>";
+                        "<span>mode: " + html_escape(on ? mode : "disabled") + "</span>"
+                        "<span class=\"" + std::string(on ? "health-ok" : "health-bad") +
+                        "\">&#9679; " + (on ? "armed" : "off") + "</span>"
+                        "</div>"
+                        // Live controls: enable/disable + audit↔enforce, auto-deployed.
+                        "<div class=\"guard-meta\" style=\"gap:0.4rem;margin-top:0.4rem\">"
+                        "<button class=\"btn btn-secondary\" "
+                        "style=\"padding:0.15rem 0.5rem;font-size:0.7rem\" "
+                        "hx-post=\"/fragments/guardian/guard/" + rid + "/enabled?value=" +
+                        (on ? "0" : "1") +
+                        "\" hx-target=\"#guardian-guards\" hx-swap=\"innerHTML\">" +
+                        (on ? "Disable" : "Enable") + "</button>"
+                        "<button class=\"btn btn-secondary\" " +
+                        std::string(on ? "" : "disabled ") +
+                        "style=\"padding:0.15rem 0.5rem;font-size:0.7rem\" "
+                        "hx-post=\"/fragments/guardian/guard/" + rid + "/mode?value=" +
+                        (enforcing ? "audit" : "enforce") +
+                        "\" hx-target=\"#guardian-guards\" hx-swap=\"innerHTML\">" +
+                        (enforcing ? "Switch to Audit" : "Switch to Enforce") + "</button>"
+                        "</div>"
+                        "</div>";
             }
         }
     }
@@ -272,6 +301,55 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
                 "GuaranteedStateStore; per-guard status wires to "
                 "<code>/api/v1/guaranteed-state/status</code>.</div>";
     return html;
+}
+
+void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Response& res,
+                                        const std::string& rule_id, bool set_enabled, bool enabled,
+                                        bool set_mode, const std::string& mode) {
+    if (!store_ || !store_->is_open()) {
+        res.status = 503;
+        res.set_content("<div class=\"mock-note\">Guardian store unavailable.</div>",
+                        "text/html; charset=utf-8");
+        return;
+    }
+    auto rule = store_->get_rule(rule_id);
+    if (!rule) {
+        res.status = 404;
+        res.set_content("<div class=\"mock-note\">No such guard.</div>",
+                        "text/html; charset=utf-8");
+        return;
+    }
+    std::string detail;
+    if (set_enabled) {
+        rule->enabled = enabled;
+        detail = enabled ? "enabled=true" : "enabled=false";
+    }
+    if (set_mode) {
+        if (mode != "enforce" && mode != "audit") {
+            res.status = 400;
+            res.set_content("<div class=\"mock-note\">Invalid mode (expected enforce|audit).</div>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+        rule->enforcement_mode = mode;
+        detail = "enforcement_mode=" + mode;
+    }
+    if (auto r = store_->update_rule(*rule); !r) {
+        res.status = 500;
+        res.set_content("<div class=\"mock-note\">Update failed: " + html_escape(r.error()) +
+                        "</div>",
+                        "text/html; charset=utf-8");
+        return;
+    }
+    // Auto-deploy so the change reaches agents immediately. full_sync re-pushes
+    // the enabled set and (because the agent clears guards on full_sync) tears
+    // down the guard for a rule that was just disabled.
+    int pushed = -2;
+    if (push_fn_)
+        pushed = push_fn_(/*scope=*/"", /*full_sync=*/true);
+    audit_fn_(req, "guaranteed_state.push", pushed >= 0 ? "success" : "denied", "GuaranteedState",
+              rule_id, detail + " agents=" + std::to_string(pushed));
+    res.set_content(render_guards_fragment(""), "text/html; charset=utf-8");
 }
 
 std::string GuardianRoutes::render_events_fragment(const std::string& type_filter,
@@ -494,13 +572,15 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
                                      AuditFn audit_fn,
                                      EmitEventFn emit_event_fn,
                                      GuaranteedStateStore* store,
-                                     AgentsJsonFn agents_json_fn) {
+                                     AgentsJsonFn agents_json_fn,
+                                     PushFn push_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
     emit_event_fn_ = std::move(emit_event_fn);
     store_ = store;
     agents_json_fn_ = std::move(agents_json_fn);
+    push_fn_ = std::move(push_fn);
 
     // -- Guardian dashboard page ------------------------------------------
     svr.Get("/guardian", [this](const httplib::Request& req, httplib::Response& res) {
@@ -588,6 +668,30 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
                          "</strong>.</div><div class=\"mock-note\">Will POST a structured Guard "
                          "(spark/assertion/remediation) to the create endpoint.</div></div>",
                      "text/html; charset=utf-8");
+             });
+
+    // -- Live guard controls: enable/disable + audit↔enforce, auto-deploy --
+    // These act on a REAL authored rule and re-push so the change takes effect
+    // on the fleet immediately. Both Write (mutates the rule) and Push (deploys
+    // to agents) are required — the toggle does both.
+    svr.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/enabled)",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
+                 if (!perm_fn_(req, res, "GuaranteedState", "Push")) return;
+                 const std::string id = req.matches[1].str();
+                 const bool enable = req.has_param("value") && req.get_param_value("value") == "1";
+                 apply_guard_change(req, res, id, /*set_enabled=*/true, enable,
+                                    /*set_mode=*/false, "");
+             });
+    svr.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/mode)",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
+                 if (!perm_fn_(req, res, "GuaranteedState", "Push")) return;
+                 const std::string id = req.matches[1].str();
+                 const std::string mode =
+                     req.has_param("value") ? req.get_param_value("value") : "audit";
+                 apply_guard_change(req, res, id, /*set_enabled=*/false, false,
+                                    /*set_mode=*/true, mode);
              });
 
     // -- Mock create (Baseline) -------------------------------------------
