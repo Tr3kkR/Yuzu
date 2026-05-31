@@ -32,6 +32,7 @@
 namespace yuzu::agent {
 class KvStore;
 class RegistryGuard;
+struct RegistryDrift;
 }
 
 namespace yuzu::guardian::v1 {
@@ -142,6 +143,17 @@ private:
     void start_guard_for_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void stop_all_guards_locked();
 
+    /// Build a GuaranteedStateEvent from a guard's drift report and ship it to
+    /// the current event sink. Called from guard worker threads, so it takes
+    /// ONLY sink_mtx_ (never mtx_): guards may fire during apply_rules / stop
+    /// which hold mtx_, and taking mtx_ here would deadlock the stop-join.
+    void emit_guard_event(const RegistryDrift& drift);
+
+    // event_sink_ is guarded by its own mutex (not mtx_) so a guard worker can
+    // deliver an event without contending with — or deadlocking against — the
+    // engine's rule-management path. The dedicated lock makes the A2 pre-network
+    // arm (guards started by start_local before the sink is wired) race-free.
+    mutable std::mutex sink_mtx_;
     EventSink event_sink_;
     std::atomic<std::uint64_t> event_seq_{0};
     std::unordered_map<std::string, std::unique_ptr<RegistryGuard>> guards_;

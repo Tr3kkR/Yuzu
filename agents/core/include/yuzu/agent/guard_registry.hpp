@@ -15,6 +15,8 @@
  * tests build everywhere; real enforcement is Windows-only for the MVP.
  */
 
+#include <yuzu/plugin.h>  // YUZU_EXPORT
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -30,13 +32,22 @@ struct RegistryDrift {
     std::string detected_value;   ///< string-encoded live value, or "<absent>"
     std::string expected_value;   ///< string-encoded expected (registry-value-equals)
     std::uint64_t detection_latency_us{0};
+
+    // Remediation (enforce mode only). When the guard is armed with
+    // Config::enforce=true it writes `expected_value` back on drift, before
+    // reporting, and records the outcome here. In audit mode all three stay at
+    // their defaults (attempted=false) and the guard only observes.
+    bool remediation_attempted{false};
+    bool remediation_success{false};
+    std::uint64_t remediation_latency_us{0};
+    std::string remediation_action;   ///< "registry-write" when a write-back was attempted
 };
 
 /// One registry-value watch. start() opens the key, runs an initial compare, and
 /// arms RegNotifyChangeKeyValue on a dedicated thread that re-reads + compares on
 /// every change and re-arms. (The RegNotify re-arm gap is the reconciliation
 /// guard's job — deferred to Slice A.2.)
-class RegistryGuard {
+class YUZU_EXPORT RegistryGuard {
 public:
     struct Config {
         std::string rule_id;
@@ -44,8 +55,9 @@ public:
         std::string hive;        ///< "HKLM" | "HKCU" | "HKCR" | "HKU"
         std::string key;         ///< subkey path, e.g. "SOFTWARE\\YuzuTest"
         std::string value_name;  ///< "" = the key's default value
-        std::string value_type;  ///< "REG_DWORD" | "REG_SZ" | ... (informational)
+        std::string value_type;  ///< "REG_DWORD" | "REG_SZ" | ... (load-bearing in enforce mode: selects the write-back encoding)
         std::string expected;    ///< string-encoded (G4): DWORD=decimal, SZ=literal
+        bool enforce{false};     ///< true = write `expected` back on drift (registry-write remediation); false = observe/audit only
     };
     using Sink = std::function<void(const RegistryDrift&)>;
 

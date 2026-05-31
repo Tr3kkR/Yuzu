@@ -176,8 +176,34 @@ std::expected<void, std::string> GuardianEngine::start_local() {
             policy_generation_ = parsed;
     }
 
-    spdlog::info("Guardian engine started (cached_rules={}, policy_generation={})",
-                 rule_count_, policy_generation_);
+    // A2 (restart re-arm). A restarted agent must keep enforcing without waiting
+    // for the next server push — re-arm a guard for every cached enabled rule
+    // (design §4: enforce cached guards from KV pre-network). Enforcement
+    // (write-back) needs no event sink, so it runs immediately; drift events
+    // detected before set_event_sink() is wired are dropped (durable buffering
+    // is A3). Guards re-armed by a later push replace these. Before this, a
+    // restarted agent reported rules present while enforcing nothing.
+    std::size_t rearmed = 0;
+    for (const auto& key : kv_->list(kKvNamespace, kRulePrefix)) {
+        auto raw = kv_->get(kKvNamespace, key);
+        if (!raw)
+            continue;
+        gpb::GuaranteedStateRule rule;
+        try {
+            auto parsed = nlohmann::json::parse(*raw);
+            if (!json_to_rule(parsed, rule))
+                continue;
+        } catch (const nlohmann::json::exception&) {
+            continue;
+        }
+        if (!rule.enabled())
+            continue;
+        start_guard_for_rule_locked(rule);
+        ++rearmed;
+    }
+
+    spdlog::info("Guardian engine started (cached_rules={}, re-armed={}, policy_generation={})",
+                 rule_count_, rearmed, policy_generation_);
     return {};
 }
 
@@ -247,14 +273,11 @@ gpb::GuaranteedStateStatus GuardianEngine::get_status() const {
     status.set_policy_generation(policy_generation_);
     status.set_total_rules(static_cast<std::uint32_t>(rule_count_));
 
-    // PR 2 has no real evaluator yet — be honest about that. Every rule is
-    // reported with status="errored" because we cannot prove compliance
-    // without a guard running. PR 3 replaces this with real per-guard
-    // health; dashboard presentation of the PR 2 state is also a PR 3
-    // concern.
-    status.set_compliant_rules(0);
-    status.set_drifted_rules(0);
-    status.set_errored_rules(static_cast<std::uint32_t>(rule_count_));
+    // Per-rule status is derived from the live guard set below: a rule with an
+    // armed guard reports compliant/healthy, one without reports "errored". The
+    // top-level counts are set after the loop. (Real drift-state-per-read — vs.
+    // "is a guard watching this" — is a follow-up; we don't hold the live value
+    // here.)
 
 #if defined(_WIN32)
     status.set_platform("windows");
@@ -264,6 +287,7 @@ gpb::GuaranteedStateStatus GuardianEngine::get_status() const {
     status.set_platform("linux");
 #endif
 
+    std::uint32_t armed = 0;
     if (kv_) {
         for (const auto& key : kv_->list(kKvNamespace, kRulePrefix)) {
             auto raw = kv_->get(kKvNamespace, key);
@@ -276,14 +300,20 @@ gpb::GuaranteedStateStatus GuardianEngine::get_status() const {
             } catch (const nlohmann::json::exception&) {
                 continue;
             }
+            const bool is_armed = guards_.find(rule.rule_id()) != guards_.end();
+            if (is_armed) ++armed;
             auto* row = status.add_rules();
             row->set_rule_id(rule.rule_id());
-            row->set_status("errored");
+            row->set_status(is_armed ? "compliant" : "errored");
             row->set_guard_category("event");
-            row->set_guard_healthy(false);
+            row->set_guard_healthy(is_armed);
             row->set_notifications_total(0);
         }
     }
+    status.set_compliant_rules(armed);
+    status.set_drifted_rules(0);
+    const auto total = static_cast<std::uint32_t>(rule_count_);
+    status.set_errored_rules(total >= armed ? total - armed : 0);
     return status;
 }
 
@@ -371,8 +401,50 @@ void GuardianEngine::persist_generation_locked() {
 }
 
 void GuardianEngine::set_event_sink(EventSink sink) {
-    std::lock_guard lock(mtx_);
+    std::lock_guard lock(sink_mtx_);
     event_sink_ = std::move(sink);
+}
+
+void GuardianEngine::emit_guard_event(const RegistryDrift& d) {
+    // Snapshot the sink under sink_mtx_, then release BEFORE the (potentially
+    // blocking) network send — never hold the lock across the sink call, and
+    // never take mtx_ here (a guard worker can fire while apply_rules/stop hold
+    // mtx_ and join this thread).
+    EventSink sink;
+    {
+        std::lock_guard lock(sink_mtx_);
+        sink = event_sink_;
+    }
+    if (!sink)
+        return; // sink not wired yet (pre-network arm) — drop; durable buffering is A3
+
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    const auto seq = event_seq_.fetch_add(1, std::memory_order_relaxed);
+    gpb::GuaranteedStateEvent ev;
+    ev.set_event_id(d.rule_id + "-" + std::to_string(now_ms) + "-" + std::to_string(seq));
+    ev.set_rule_id(d.rule_id);
+    ev.set_rule_name(d.rule_name);
+    ev.set_guard_type("registry");
+    ev.set_guard_category("event");
+    ev.set_detected_value(d.detected_value);
+    ev.set_expected_value(d.expected_value);
+    ev.set_detection_latency_us(d.detection_latency_us);
+    if (d.remediation_attempted) {
+        ev.set_remediation_action(d.remediation_action);
+        ev.set_remediation_success(d.remediation_success);
+        ev.set_remediation_latency_us(d.remediation_latency_us);
+        // "drift.remediated" only when the write-back actually restored the
+        // value; a failed enforce write stays "drift.detected" so the operator
+        // still sees the unresolved drift.
+        ev.set_event_type(d.remediation_success ? "drift.remediated" : "drift.detected");
+    } else {
+        ev.set_event_type("drift.detected");
+    }
+    ev.mutable_timestamp()->set_seconds(now_ms / 1000);
+    ev.set_platform("windows");
+    sink(ev);
 }
 
 void GuardianEngine::stop_all_guards_locked() {
@@ -392,6 +464,7 @@ void GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
         auto it = a.params().find(k);
         return it != a.params().end() ? it->second : std::string{};
     };
+    const bool enforce = (rule.enforcement_mode() == "enforce");
     RegistryGuard::Config cfg;
     cfg.rule_id    = rule.rule_id();
     cfg.rule_name  = rule.name();
@@ -400,31 +473,14 @@ void GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
     cfg.value_name = param("value_name");
     cfg.value_type = param("value_type");
     cfg.expected   = param("expected");
+    // "enforce" → the guard writes `expected` back on drift; any other mode
+    // (audit / observe) only detects and reports.
+    cfg.enforce    = enforce;
 
-    // Capture a copy of the current sink so the guard thread never reads
-    // event_sink_ concurrently (set-once-then-read; copied here under mtx_).
-    EventSink sink_copy = event_sink_;
-    auto guard_sink = [this, sink_copy](const RegistryDrift& d) {
-        if (!sink_copy)
-            return;
-        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count();
-        const auto seq = event_seq_.fetch_add(1, std::memory_order_relaxed);
-        gpb::GuaranteedStateEvent ev;
-        ev.set_event_id(d.rule_id + "-" + std::to_string(now_ms) + "-" + std::to_string(seq));
-        ev.set_rule_id(d.rule_id);
-        ev.set_rule_name(d.rule_name);
-        ev.set_event_type("drift.detected");
-        ev.set_guard_type("registry");
-        ev.set_guard_category("event");
-        ev.set_detected_value(d.detected_value);
-        ev.set_expected_value(d.expected_value);
-        ev.set_detection_latency_us(d.detection_latency_us);
-        ev.mutable_timestamp()->set_seconds(now_ms / 1000);
-        ev.set_platform("windows");
-        sink_copy(ev);
-    };
+    // Route drift through the engine rather than a captured sink copy, so a
+    // guard armed before the sink is wired (A2 start_local pre-network) still
+    // delivers once set_event_sink runs. emit_guard_event takes sink_mtx_ only.
+    auto guard_sink = [this](const RegistryDrift& d) { emit_guard_event(d); };
 
     if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
         if (it->second)
@@ -434,7 +490,8 @@ void GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
     auto guard = std::make_unique<RegistryGuard>(std::move(cfg), std::move(guard_sink));
     if (guard->start()) {
         guards_.emplace(rule.rule_id(), std::move(guard));
-        spdlog::info("Guardian: registry guard armed for rule '{}'", rule.rule_id());
+        spdlog::info("Guardian: registry guard armed for rule '{}' (mode={})", rule.rule_id(),
+                     enforce ? "enforce" : "audit");
     } else {
         spdlog::warn("Guardian: registry guard for rule '{}' did not start "
                      "(non-Windows or invalid hive)",

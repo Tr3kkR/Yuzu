@@ -23,6 +23,7 @@
 #endif
 #include <windows.h>
 
+#include <charconv>
 #include <cstring>
 #include <vector>
 
@@ -97,6 +98,42 @@ std::string read_value(HKEY key, const std::string& value_name) {
     }
 }
 
+// Re-encode `expected` per value_type and write it to value_name — the inverse
+// of read_value(). Used only in enforce mode. Returns true on a successful
+// RegSetValueExW. The write is bounded to the rule's `expected`: a fixed-value
+// restore, never an arbitrary-write primitive — value name, type, and content
+// all come from the (server-authored, signature-carrying) rule, not from any
+// runtime input. Unsupported types are refused rather than written as garbage.
+bool write_value(HKEY key, const std::string& value_name, const std::string& value_type,
+                 const std::string& expected) {
+    if (!key)
+        return false;
+    std::wstring wname = to_wide(value_name);
+    const wchar_t* name = value_name.empty() ? nullptr : wname.c_str();
+    if (value_type == "REG_DWORD") {
+        DWORD v = 0;
+        auto [ptr, ec] = std::from_chars(expected.data(), expected.data() + expected.size(), v);
+        if (ec != std::errc{}) return false;
+        return RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v),
+                              sizeof(v)) == ERROR_SUCCESS;
+    }
+    if (value_type == "REG_QWORD") {
+        unsigned long long v = 0;
+        auto [ptr, ec] = std::from_chars(expected.data(), expected.data() + expected.size(), v);
+        if (ec != std::errc{}) return false;
+        return RegSetValueExW(key, name, 0, REG_QWORD, reinterpret_cast<const BYTE*>(&v),
+                              sizeof(v)) == ERROR_SUCCESS;
+    }
+    if (value_type == "REG_SZ" || value_type == "REG_EXPAND_SZ") {
+        std::wstring w = to_wide(expected);
+        const DWORD bytes = static_cast<DWORD>((w.size() + 1) * sizeof(wchar_t)); // include NUL
+        const DWORD t = (value_type == "REG_EXPAND_SZ") ? REG_EXPAND_SZ : REG_SZ;
+        return RegSetValueExW(key, name, 0, t, reinterpret_cast<const BYTE*>(w.c_str()), bytes) ==
+               ERROR_SUCCESS;
+    }
+    return false; // unsupported type — refuse rather than write garbage
+}
+
 } // namespace
 
 RegistryGuard::RegistryGuard(Config cfg, Sink sink) : cfg_(std::move(cfg)), sink_(std::move(sink)) {}
@@ -141,10 +178,37 @@ void RegistryGuard::run() {
         d.detected_value = detected;
         d.expected_value = cfg_.expected;
         d.detection_latency_us = latency_us;
+        // Enforce mode: restore the expected value BEFORE reporting (so the
+        // self-write's RegNotify wakeup re-reads expected==expected and emit()
+        // short-circuits — no remediation loop). `key` is captured by reference
+        // and valid for every emit() after the open; on the open-failure path
+        // it is nullptr, where write_value() returns false (reported as a failed
+        // attempt). Out of scope for the MVP: creating an absent KEY.
+        if (cfg_.enforce) {
+            d.remediation_attempted = true;
+            d.remediation_action = "registry-write";
+            const auto r0 = std::chrono::steady_clock::now();
+            const bool ok = write_value(key, cfg_.value_name, cfg_.value_type, cfg_.expected);
+            d.remediation_latency_us = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - r0)
+                    .count());
+            d.remediation_success = ok;
+            if (ok)
+                spdlog::info("Guardian RegistryGuard[{}]: enforced {}\\{} [{}] {} -> {} ({}us)",
+                             cfg_.rule_id, cfg_.hive, cfg_.key, cfg_.value_name, detected,
+                             cfg_.expected, d.remediation_latency_us);
+            else
+                spdlog::warn("Guardian RegistryGuard[{}]: enforce write FAILED for {}\\{} [{}] "
+                             "(detected={}, type={})",
+                             cfg_.rule_id, cfg_.hive, cfg_.key, cfg_.value_name, detected,
+                             cfg_.value_type);
+        }
         if (sink_) sink_(d);
     };
 
-    if (RegOpenKeyExW(root, wkey.c_str(), 0, KEY_NOTIFY | KEY_READ, &key) != ERROR_SUCCESS) {
+    const REGSAM access = KEY_NOTIFY | KEY_READ | (cfg_.enforce ? KEY_SET_VALUE : 0);
+    if (RegOpenKeyExW(root, wkey.c_str(), 0, access, &key) != ERROR_SUCCESS) {
         // For registry-value-equals, a missing key means the value is absent →
         // that is itself drift. Report once; we can't arm a watch on a key that
         // doesn't exist (reconciliation would re-check later — deferred).
