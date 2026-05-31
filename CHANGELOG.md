@@ -32,6 +32,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   producers (from-tar-query / from-instruction-result), the YAML `fromResultSet:` DSL
   surface, and re-eval land in follow-up PRs. Design: `docs/scope-walking-design.md`.
 
+- **Scope walking — async result-set producers + TAR SQL frame (PR-D).** The two
+  asynchronous producers now create result sets by dispatching a command and
+  materialising membership once the producing execution reaches a terminal state:
+  `POST /api/v1/result-sets/from-tar-query` (dispatches operator SQL to the tar
+  plugin in the parent set's scope — or `__all__` — and includes every agent that
+  returned ≥1 row, or all responders with `include_empty=true`) and
+  `POST /api/v1/result-sets/from-instruction-result` (runs an InstructionDefinition
+  and filters responders by an operator-supplied `{column,op,value|value_set}`
+  matcher — the Chrome-IR hash-check step). Both follow the
+  create-execution-**before**-dispatch ordering (UP2-4) and return `202` with a
+  `pending` row carrying `source_execution_id`; the server maintenance thread applies
+  the matcher (new `result_set_matcher.{hpp,cpp}` — `tar_rows_ge` / `any_response` /
+  column-op over both the tar pipe shape and JSON array-of-objects) and flips the row
+  to `materialized`. `POST /api/v1/result-sets/{id}/re-eval` re-runs an async set's
+  source query as a **sibling** (shares the original's parent). Parent references
+  accept a per-operator **alias** as well as the canonical `rs_` id (resolved at the
+  dispatch layer where the owner is known). New `yuzu_result_sets_total{result="pending"}`
+  metric path. The TAR dashboard's "Ad-hoc TAR SQL" frame (`tar_page_ui.cpp`) is now
+  live: a reusable **scope chip** (your result sets + `__all__`), a SQL editor, and a
+  one-click "Run & create result set" that dispatches, polls the pending set, and
+  surfaces the materialised device count + copyable `from_result_set:` token — HTMX,
+  server-rendered, dark-theme. The async producer routes require the command-dispatch
+  callback + ExecutionTracker (threaded into `RestApiV1::register_routes`); without
+  them they return `503`. Design: `docs/scope-walking-design.md` §3.1/§3.3/§6/§8.3/§10.
+
 - **Compliance policies now actually evaluate (check → verdict pipeline).**
   Authored policies + fragments could be created, but nothing evaluated them —
   `PolicyStore::update_agent_status` had no caller and no trigger fired, so

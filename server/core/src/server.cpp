@@ -44,6 +44,7 @@
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
 #include "quarantine_store.hpp"
+#include "result_set_matcher.hpp"
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
 #include "rbac_store.hpp"
@@ -6045,15 +6046,18 @@ private:
                             if (!terminal && !timed_out)
                                 continue;
 
-                            // Default membership: agents that returned a SUCCESS
-                            // response. Producer-specific matcher refinement
-                            // (column op value) lands with PR-D.
+                            // Membership: every responder whose (status,
+                            // output) satisfies the pending row's matcher.
+                            // rs_matcher centralises the per-producer rule —
+                            // empty matcher = SUCCESS responders; tar_rows_ge
+                            // = SUCCESS with ≥N rows; column/op/value = a
+                            // matching output row (PR-D, design §3.3).
                             std::vector<std::string> members;
                             std::unordered_set<std::string> seen;
                             if (response_store_) {
                                 for (const auto& r :
                                      response_store_->query_by_execution(p.source_execution_id)) {
-                                    if (r.status != 1) // 1 = SUCCESS (agent.proto)
+                                    if (!rs_matcher::response_matches(p.matcher, r.status, r.output))
                                         continue;
                                     if (seen.insert(r.agent_id).second)
                                         members.push_back(r.agent_id);
@@ -6372,7 +6376,12 @@ private:
             execution_event_bus_.get(),
             // Scope-walking result-set store (capability §30). nullptr leaves
             // the /api/v1/result-sets routes unregistered.
-            result_set_store_.get());
+            result_set_store_.get(),
+            // Same hoisted dispatch closure the workflow + policy engines use,
+            // so the async result-set producers (from-tar-query /
+            // from-instruction-result / re-eval) drive the exact dispatch path
+            // (PR-D). Empty closure would 503 those routes.
+            command_dispatch_fn);
 
         // -- Register MCP server routes ----------------------------------------
 

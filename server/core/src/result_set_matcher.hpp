@@ -1,0 +1,49 @@
+#pragma once
+
+#include <string>
+#include <string_view>
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Result-set membership matcher (scope walking — design §3.2 / §6).
+//
+// Async result-set producers (`from-tar-query`, `from-instruction-result`)
+// dispatch a command and land a `pending` row carrying an opaque `matcher`
+// JSON. Once the producing execution reaches a terminal state, the server's
+// maintenance thread walks every responder and asks this predicate whether
+// that agent qualifies for membership.
+//
+// Keeping the decision here — a pure function of (matcher, status, output) —
+// makes the per-producer membership rule unit-testable in isolation, away
+// from the dispatch + tracker + SQLite plumbing of the maintenance thread.
+//
+// Matcher grammar (all JSON; an empty or unparseable matcher means "default"):
+//
+//   ""  /  {}                       → default: SUCCESS responders only
+//   {"kind":"any_response"}         → every SUCCESS responder (include_empty)
+//   {"kind":"tar_rows_ge","n":N}    → SUCCESS AND the tar result carried ≥ N rows
+//   {"column":C,"op":O,"value":V}        ─┐ SUCCESS AND at least one parsed
+//   {"column":C,"op":O,"value_set":[..]} ─┘ output row's column C satisfies O
+//
+// `op` ∈ {eq, in, contains, exists}. A non-SUCCESS response NEVER qualifies,
+// regardless of matcher — a plugin that errored is not evidence of a hit.
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace yuzu::server::rs_matcher {
+
+/// Agent command-response status that counts as a successful execution.
+/// Mirrors `CommandResponse::SUCCESS` (= 1) in agent.proto; the maintenance
+/// thread used the bare literal `1` before this module was extracted.
+inline constexpr int kStatusSuccess = 1;
+
+/// True iff a responder with the given (status, output) qualifies for
+/// membership in a result set whose pending row carries `matcher_json`.
+bool response_matches(std::string_view matcher_json, int status, std::string_view output);
+
+/// Count the rows in a tar `tar.sql` response `output`. The tar plugin emits
+/// a `__schema__|col|col` header line, one `|`-joined line per row, then a
+/// `__total__|N` trailer (see agents/plugins/tar do_sql). Returns N from the
+/// trailer when present; otherwise counts data lines. An `error|...` output
+/// (the tar failure shape) returns 0. Exposed for direct testing.
+int tar_row_count(std::string_view output);
+
+} // namespace yuzu::server::rs_matcher

@@ -273,6 +273,7 @@ yuzu_server_core_lib = static_library(
     'src/secure_random.cpp',
     'src/quarantine_store.cpp',
     'src/result_set_store.cpp',
+    'src/result_set_matcher.cpp',
     'src/policy_store.cpp',
     'src/policy_evaluator.cpp',
     'src/guaranteed_state_store.cpp',
