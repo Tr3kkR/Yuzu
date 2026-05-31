@@ -253,7 +253,7 @@ TEST_CASE("GuardianEngine: dispatch unknown action fails with detail",
     CHECK(dr.output.find("not_a_real_action") != std::string::npos);
 }
 
-TEST_CASE("GuardianEngine: dispatch push_rules with missing param → exit_code 1",
+TEST_CASE("GuardianEngine: dispatch push_rules with missing payload → exit_code 1",
           "[guardian][engine][dispatch][error]") {
     GuardianFixture f;
     apb::CommandRequest cmd;
@@ -261,7 +261,9 @@ TEST_CASE("GuardianEngine: dispatch push_rules with missing param → exit_code 
     cmd.set_action("push_rules");
     auto dr = f.engine->dispatch(cmd);
     CHECK(dr.exit_code == 1);
-    CHECK(dr.output.find("missing 'push' parameter") != std::string::npos);
+    // The push rides in the `payload` bytes field (not a `parameters` entry)
+    // since the payload-bytes migration; an empty payload reports accordingly.
+    CHECK(dr.output.find("missing payload") != std::string::npos);
 }
 
 TEST_CASE("GuardianEngine: dispatch push_rules with garbage proto → exit_code 2",
