@@ -301,24 +301,29 @@ TEST_CASE("REST gs.push: returns 202 + audits the operator action",
     REQUIRE(res);
     CHECK(res->status == 202);
     CHECK(res->body.find("\"queued\":true") != std::string::npos);
-    // Response body uses a stable operational phrase, not an engineer-facing
-    // roadmap reference (BL-6 / ER-Dep2).
-    CHECK(res->body.find("agent delivery is asynchronous") != std::string::npos);
+    // Real fan-out landed: the body reports the rule count and the number of
+    // in-scope agents the push was dispatched to (direct + gateway transports).
+    // The old "agent delivery is asynchronous / deferred" phrasing is gone —
+    // see docs/user-manual/guaranteed-state.md.
+    CHECK(res->body.find("\"rules\":1") != std::string::npos);
+    CHECK(res->body.find("\"agents\":") != std::string::npos);
 
     REQUIRE(h.audit_log.size() == 2); // create + push
     const auto& push_audit = h.audit_log[1];
     CHECK(push_audit.action == "guaranteed_state.push");
     // Vocabulary matches sibling handlers: "success" (not the prior novel
     // "accepted"), target_id is empty because a push is fleet-level rather
-    // than per-entity, and the scope expression lives in detail alongside
-    // the fan-out-deferred marker so SIEM correlation rules can filter on it.
+    // than per-entity, and the scope expression lives in detail alongside the
+    // agents=<count> fan-out result so SIEM correlation rules can filter on it.
     CHECK(push_audit.result == "success");
     CHECK(push_audit.target_id == "");
     CHECK(push_audit.target_type == "GuaranteedState");
     CHECK(push_audit.detail.find("rules=1") != std::string::npos);
     CHECK(push_audit.detail.find("full_sync=true") != std::string::npos);
     CHECK(push_audit.detail.find("scope=\"tag:env=prod\"") != std::string::npos);
-    CHECK(push_audit.detail.find("fan_out_deferred_pr3=true") != std::string::npos);
+    // Audit detail records the dispatched agent count, not the retired
+    // fan_out_deferred_pr3 marker (push now actually delivers).
+    CHECK(push_audit.detail.find("agents=") != std::string::npos);
 }
 
 TEST_CASE("REST gs.push: sanitizes scope before embedding in audit detail",
@@ -369,7 +374,7 @@ TEST_CASE("REST gs.push: sanitizes scope before embedding in audit detail",
     // The structural frame of the detail is intact.
     CHECK(d.find("rules=0") != std::string::npos);
     CHECK(d.find("full_sync=false") != std::string::npos);
-    CHECK(d.find("fan_out_deferred_pr3=true") != std::string::npos);
+    CHECK(d.find("agents=") != std::string::npos);
 }
 
 TEST_CASE("REST gs.events: filter + limit pagination", "[rest][guaranteed_state][events]") {

@@ -2,14 +2,14 @@
 
 Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rule** is a desired-state assertion about an endpoint — a registry value, a service status, a file presence, a configuration key — plus optional automatic remediation when the endpoint drifts. Unlike the server-side [Policy Engine](policy-engine.md), Guardian runs *inside the agent*, reacts to kernel-backed change notifications in sub-second time, and can repair drift without an operator in the loop.
 
-> **PR 2 status — read this first.** The v0.12 release ships Guardian's **control plane + agent skeleton only**. Rules can be authored, stored, retrieved, and pushed through the REST API. The agent persists the pushed rule set into a reserved KV namespace (`__guardian__`). **No guards run yet** — every rule reports `errored` in `/api/v1/guaranteed-state/status` and dashboards will surface this as "Guardian installed but inert." Server-to-agent fan-out is audited as `result=success` with `fan_out_deferred_pr3=true` in the detail field, but does not actually deliver rules to agents until Guardian PR 3 lands. SIEM correlation rules that infer "rules were delivered to agents" from these events are premature until that marker disappears. Operators pilot-testing Guardian should treat this release as an API-shape preview, not working enforcement. Design reference: `docs/yuzu-guardian-design-v1.1.md`. Windows-first rollout plan: `docs/yuzu-guardian-windows-implementation-plan.md`.
+> **Status — read this first.** Guardian's control plane, the agent guard host, and the **Windows `registry` guard** are live and verified end-to-end. Rules can be authored, stored, retrieved, and pushed through the REST API; a push is **delivered to in-scope agents over both the direct gRPC stream and the Erlang gateway**, the agent arms the rule's guard, and drift is detected and reported sub-second to `/api/v1/guaranteed-state/events` (`agent_id` is server- or gateway-asserted, never self-reported). This release delivers the **detect-and-alert path (Guardian A1)**. Still on the roadmap: automatic remediation depth, non-Windows guard types (Linux inotify/netlink/D-Bus, macOS Endpoint Security), and server-side Prometheus metrics for push/apply/parse. One operational caveat for gateway deployments: drift-event forwarding over the gateway is **best-effort** — events emitted while the gateway's upstream circuit is open or its forward budget is saturated are dropped and not yet replayed (durable buffering is Guardian A3); the gateway exposes `yuzu_gw_guardian_forward_dropped_total` so this loss is observable. Design reference: `docs/yuzu-guardian-design-v1.1.md`. Windows-first rollout plan: `docs/yuzu-guardian-windows-implementation-plan.md`.
 
 ## Concepts
 
 | Term | Meaning |
 |---|---|
 | **Rule** | A YAML document describing a desired state, a detection strategy, and an optional remediation. Stored server-side with `yaml_source` as the authoritative form. |
-| **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. (PR 3+.) |
+| **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. The Windows `registry` guard is live; service/ETW and non-Windows guards are on the roadmap. |
 | **Event** | A record of detected drift, attempted remediation, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. |
 | **Push** | An operator-initiated distribution of the active rule set to a scope of agents. Separates deploy authority (`Push`) from authoring authority (`Write`). |
 | **Enforcement mode** | `enforce` (remediate on drift) or `audit` (log drift, do not remediate). |
@@ -110,9 +110,9 @@ curl -X POST https://yuzu.example.com/api/v1/guaranteed-state/push \
   -d '{"scope": "tag:env=prod", "full_sync": true}'
 ```
 
-Requires `GuaranteedState:Push`. Returns `202 Accepted`. Audits `guaranteed_state.push` with `result=success` and `detail=rules=<N> full_sync=<bool> scope="<expr>" fan_out_deferred_pr3=true`.
+Requires `GuaranteedState:Push`. Returns `202 Accepted`. Audits `guaranteed_state.push` with `result=success` and `detail=rules=<N> full_sync=<bool> scope="<expr>" agents=<count>`, where `agents` is the number of in-scope agents the push was dispatched to (across the direct gRPC and gateway transports).
 
-**While PR 2 is in effect, no agent will actually receive the push** — the REST call is accepted and persisted but agent delivery is wired in Guardian PR 3. SIEM correlation rules should not infer "rules were delivered to agents" from this event until the `fan_out_deferred_pr3=true` flag disappears from the audit detail.
+The push is dispatched to in-scope agents; the `agents=<count>` field records how many were targeted. Delivery is best-effort for gateway-connected agents under an upstream outage (durable buffering is Guardian A3), so a non-zero `agents` count records **dispatch, not a per-agent delivery receipt**. SIEM correlation should treat the count as "push fanned out to N agents," and corroborate actual enforcement against the drift/sync records at `/api/v1/guaranteed-state/events`.
 
 ### 5. Query events and status
 
