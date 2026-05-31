@@ -44,6 +44,8 @@
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
 #include "quarantine_store.hpp"
+#include "result_set_store.hpp"
+#include "result_sets_ui.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "mcp_jsonrpc.hpp"
@@ -1277,6 +1279,13 @@ public:
             auto quar_db = cfg_.db_dir() / "quarantine.db";
             quarantine_store_ = std::make_unique<QuarantineStore>(quar_db);
         }
+        {
+            // Scope-walking result sets (capability §30).
+            auto rs_db = cfg_.db_dir() / "result_sets.db";
+            result_set_store_ = std::make_unique<ResultSetStore>(rs_db);
+            if (result_set_store_ && result_set_store_->is_open())
+                spdlog::info("ResultSetStore initialized at {}", rs_db.string());
+        }
 
         // Phase 5: Policy Engine
         {
@@ -1728,6 +1737,12 @@ public:
         // so it must stop before any of them are torn down)
         if (policy_eval_thread_.joinable()) {
             policy_eval_thread_.join();
+        }
+
+        // Join the result-set maintenance thread (borrows result_set_store_,
+        // execution_tracker_, response_store_ — must stop before teardown)
+        if (result_set_maint_thread_.joinable()) {
+            result_set_maint_thread_.join();
         }
 
         // Join the insecure-TLS reminder thread (issue #79)
@@ -3613,7 +3628,8 @@ private:
                     return;
                 }
                 auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                            custom_properties_store_.get());
+                                                            custom_properties_store_.get(),
+                                                            result_set_store_.get());
                 for (const auto& aid : matched_ids) {
                     if (registry_.send_to(aid, cmd)) {
                         ++sent;
@@ -4144,6 +4160,175 @@ private:
             }
             res.set_content(kTarPageHtml, "text/html; charset=utf-8");
         });
+
+        // ── Result Sets (scope walking — capability §30) ─────────────────
+        // Page shell + HTML fragment routes. Per-operator, owner-scoped: every
+        // fragment authenticates and filters/loads by the session principal.
+        // Rendering lives in result_sets_ui.cpp; store I/O happens here.
+        web_server_->Get("/result-sets",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             auto session = require_auth(req, res);
+                             if (!session) {
+                                 res.set_redirect("/login");
+                                 return;
+                             }
+                             res.set_content(kResultSetsPageHtml, "text/html; charset=utf-8");
+                         });
+
+        // Owner-scoped sidebar list.
+        web_server_->Get(
+            "/fragments/result-sets/sidebar",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session)
+                    return;
+                if (!result_set_store_) {
+                    res.set_content("", "text/html; charset=utf-8");
+                    return;
+                }
+                std::string next;
+                std::string selected =
+                    req.has_param("selected") ? req.get_param_value("selected") : "";
+                auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                res.set_content(render_result_sets_sidebar(sets, selected),
+                                "text/html; charset=utf-8");
+            });
+
+        // Detail pane for one set (owner-checked).
+        web_server_->Get(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/detail)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_ ? result_set_store_->get(id) : std::nullopt;
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                auto chain = result_set_store_->lineage(id);
+                res.set_content(render_result_set_detail(*row, chain),
+                                "text/html; charset=utf-8");
+            });
+
+        // Pin / unpin — return the refreshed detail and trigger a sidebar reload.
+        auto rs_detail_after = [this](const std::string& id, const std::string& owner,
+                                      httplib::Response& res) {
+            auto row = result_set_store_->get(id);
+            if (!row || row->owner_principal != owner) {
+                res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                return;
+            }
+            auto chain = result_set_store_->lineage(id);
+            res.set_header("HX-Trigger", "resultSetsChanged");
+            res.set_content(render_result_set_detail(*row, chain), "text/html; charset=utf-8");
+        };
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",
+            [this, rs_detail_after](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                result_set_store_->pin(id);
+                audit_log(req, "result_set.pin", "success", "ResultSet", id, "");
+                rs_detail_after(id, session->username, res);
+            });
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",
+            [this, rs_detail_after](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                result_set_store_->unpin(id);
+                audit_log(req, "result_set.unpin", "success", "ResultSet", id, "");
+                rs_detail_after(id, session->username, res);
+            });
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/delete)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                auto del = result_set_store_->delete_set(id);
+                if (!del) {
+                    // Pinned sets must be unpinned first — re-render the detail
+                    // so the operator sees why nothing was deleted.
+                    auto chain = result_set_store_->lineage(id);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.delete", "success", "ResultSet", id, "");
+                res.set_header("HX-Trigger", "resultSetsChanged");
+                res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+            });
+
+        // Create from pasted device IDs (CSV import) — returns refreshed sidebar.
+        web_server_->Post(
+            "/fragments/result-sets/create",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                CreateRequest cr;
+                cr.owner_principal = session->username;
+                cr.name = req.has_param("name") ? req.get_param_value("name") : "";
+                cr.source_kind = std::string(source_kind::kManualCurate);
+                cr.source_payload = R"({"note":"dashboard CSV import"})";
+
+                std::vector<std::string> members;
+                if (req.has_param("device_ids")) {
+                    std::string raw = req.get_param_value("device_ids");
+                    std::string cur;
+                    auto flush = [&]() {
+                        // trim whitespace
+                        std::size_t a = cur.find_first_not_of(" \t\r\n");
+                        std::size_t b = cur.find_last_not_of(" \t\r\n");
+                        if (a != std::string::npos)
+                            members.push_back(cur.substr(a, b - a + 1));
+                        cur.clear();
+                    };
+                    for (char c : raw) {
+                        if (c == '\n' || c == ',')
+                            flush();
+                        else
+                            cur += c;
+                    }
+                    flush();
+                }
+                auto created = result_set_store_->create_materialized(cr, members);
+                if (created)
+                    audit_log(req, "result_set.create", "success", "ResultSet", created->id,
+                              cr.source_kind);
+                std::string next;
+                auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                res.set_header("HX-Trigger", "resultSetsChanged");
+                res.set_content(render_result_sets_sidebar(sets, created ? created->id : ""),
+                                "text/html; charset=utf-8");
+            });
 
         // PR 5 of feat/viz-engine: Fleet visualization page. Auth-gated
         // (same posture as /tar) but the per-request RBAC check happens
@@ -5767,7 +5952,8 @@ private:
                 auto parsed = yuzu::scope::parse(scope_expr);
                 if (parsed) {
                     auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                            custom_properties_store_.get());
+                                                            custom_properties_store_.get(),
+                                                            result_set_store_.get());
                     for (const auto& aid : matched)
                         if (registry_.send_to(aid, cmd))
                             ++sent;
@@ -5822,6 +6008,89 @@ private:
                 }
             }
         });
+
+        // Result-set maintenance thread (capability §30) — materialises pending
+        // result sets once their producing execution reaches a terminal state,
+        // runs the GC sweep on a ~5-minute cadence, and refreshes the alive
+        // gauges. Borrows result_set_store_, execution_tracker_, response_store_
+        // and metrics_, so it MUST be joined before any of them are torn down
+        // (join sits next to the policy-eval join in stop()).
+        if (result_set_store_ && result_set_store_->is_open()) {
+            result_set_maint_thread_ = std::thread([this]() {
+                spdlog::info("Result-set maintenance thread started (cadence=2s, GC=5m)");
+                constexpr int kGcEveryNTicks = 150;            // ~5 minutes at 2s/tick
+                constexpr int64_t kPendingTimeoutSeconds = 300; // give up waiting after 5m
+                int tick = 0;
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        std::this_thread::sleep_for(std::chrono::seconds{1});
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    try {
+                        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                .count();
+
+                        // 1) Materialise terminal pending sets.
+                        for (const auto& p : result_set_store_->list_pending()) {
+                            if (p.source_execution_id.empty())
+                                continue;
+                            bool terminal = false;
+                            if (execution_tracker_) {
+                                auto sum = execution_tracker_->get_summary(p.source_execution_id);
+                                terminal = sum.agents_targeted > 0 &&
+                                           sum.agents_responded >= sum.agents_targeted;
+                            }
+                            const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
+                            if (!terminal && !timed_out)
+                                continue;
+
+                            // Default membership: agents that returned a SUCCESS
+                            // response. Producer-specific matcher refinement
+                            // (column op value) lands with PR-D.
+                            std::vector<std::string> members;
+                            std::unordered_set<std::string> seen;
+                            if (response_store_) {
+                                for (const auto& r :
+                                     response_store_->query_by_execution(p.source_execution_id)) {
+                                    if (r.status != 1) // 1 = SUCCESS (agent.proto)
+                                        continue;
+                                    if (seen.insert(r.agent_id).second)
+                                        members.push_back(r.agent_id);
+                                }
+                            }
+                            result_set_store_->materialize(p.id, members);
+                            metrics_
+                                .counter("yuzu_result_sets_total",
+                                         {{"source_kind", p.source_kind}, {"result", "materialized"}})
+                                .increment();
+                        }
+
+                        // 2) GC sweep on the slow cadence.
+                        if (++tick % kGcEveryNTicks == 0) {
+                            int swept = result_set_store_->gc_sweep();
+                            if (swept > 0) {
+                                metrics_.counter("yuzu_result_set_gc_total")
+                                    .increment(static_cast<double>(swept));
+                                spdlog::info("result-set GC swept {} expired set(s)", swept);
+                            }
+                        }
+
+                        // 3) Refresh alive gauges.
+                        auto c = result_set_store_->counts();
+                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "true"}})
+                            .set(static_cast<double>(c.pinned));
+                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "false"}})
+                            .set(static_cast<double>(c.total - c.pinned));
+                    } catch (const std::exception& e) {
+                        spdlog::error("result_set_maint: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("result_set_maint: tick threw unknown — thread continuing");
+                    }
+                }
+            });
+        }
 
         // ComplianceRoutes — /compliance, /fragments/compliance/*, /api/policies/*,
         // /api/compliance/*
@@ -5887,7 +6156,8 @@ private:
                     auto parsed = yuzu::scope::parse(scope_expr);
                     if (parsed) {
                         auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                                custom_properties_store_.get());
+                                                                custom_properties_store_.get(),
+                                                                result_set_store_.get());
                         for (const auto& aid : matched) {
                             if (registry_.send_to(aid, cmd))
                                 ++sent;
@@ -5977,7 +6247,8 @@ private:
             if (!parsed)
                 return {0, registry_.agent_count()};
             auto matched =
-                registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get());
+                registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get(),
+                                         result_set_store_.get());
             return {matched.size(), registry_.agent_count()};
         };
         wf_deps.workflow_engine = workflow_engine_.get();
@@ -6098,7 +6369,10 @@ private:
             // workers to live execution transitions. Same bus the
             // dashboard SSE handler uses; nullptr leaves the new
             // route registered but returning 503.
-            execution_event_bus_.get());
+            execution_event_bus_.get(),
+            // Scope-walking result-set store (capability §30). nullptr leaves
+            // the /api/v1/result-sets routes unregistered.
+            result_set_store_.get());
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -6168,7 +6442,8 @@ private:
                         auto parsed = yuzu::scope::parse(scope_expr);
                         if (parsed) {
                             for (const auto& aid : registry_.evaluate_scope(
-                                     *parsed, tag_store_.get(), custom_properties_store_.get()))
+                                     *parsed, tag_store_.get(), custom_properties_store_.get(),
+                                     result_set_store_.get()))
                                 if (registry_.send_to(aid, cmd))
                                     ++sent;
                         }
@@ -6420,6 +6695,7 @@ private:
     std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
+    std::unique_ptr<ResultSetStore> result_set_store_;
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
@@ -6475,6 +6751,7 @@ private:
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
     std::thread policy_eval_thread_;
+    std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;

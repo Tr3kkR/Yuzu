@@ -17,6 +17,7 @@
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "result_set_store.hpp"
 #include "schedule_engine.hpp"
 #include "software_deployment_store.hpp"
 #include "tag_store.hpp"
@@ -138,7 +139,8 @@ public:
         DeviceTokenStore* device_token_store = nullptr, LicenseStore* license_store = nullptr,
         GuaranteedStateStore* guaranteed_state_store = nullptr,
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
-        ExecutionEventBus* execution_event_bus = nullptr);
+        ExecutionEventBus* execution_event_bus = nullptr,
+        ResultSetStore* result_set_store = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -155,7 +157,8 @@ public:
         DeviceTokenStore* device_token_store = nullptr, LicenseStore* license_store = nullptr,
         GuaranteedStateStore* guaranteed_state_store = nullptr,
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
-        ExecutionEventBus* execution_event_bus = nullptr);
+        ExecutionEventBus* execution_event_bus = nullptr,
+        ResultSetStore* result_set_store = nullptr);
 };
 
 } // namespace yuzu::server

@@ -417,6 +417,19 @@ private:
             return Expression{std::move(cond)};
         }
 
+        // from_result_set:<id-or-alias> — composable-scope short-circuit
+        // (scope walking, capability §30). A bare atom with no operator; it is
+        // lowered to an EXISTS condition on the synthetic attribute, and the
+        // AgentRegistry resolver answers per-device membership against the
+        // result_set_store. Composes with attribute predicates via AND/OR/NOT.
+        if (tok.type == TokenType::Ident && tok.value.starts_with("from_result_set:")) {
+            tokenizer_.next(); // consume the atom
+            Condition cond;
+            cond.attribute = tok.value;
+            cond.op = CompOp::Exists;
+            return Expression{std::move(cond)};
+        }
+
         return parse_condition();
     }
 

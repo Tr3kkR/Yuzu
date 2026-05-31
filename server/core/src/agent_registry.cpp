@@ -4,6 +4,7 @@
 #include <cctype>
 
 #include "custom_properties_store.hpp"
+#include "result_set_store.hpp"
 #include "device_token_store.hpp"
 #include "tag_store.hpp"
 #include "web_utils.hpp"
@@ -1021,12 +1022,19 @@ std::shared_ptr<AgentSession> AgentRegistry::get_session(const std::string& agen
 
 std::vector<std::string>
 AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
-                              const CustomPropertiesStore* props_store) const {
+                              const CustomPropertiesStore* props_store,
+                              const ResultSetStore* rs_store) const {
     std::vector<std::string> matched;
     std::lock_guard lock(mu_);
     for (const auto& [id, session] : agents_) {
         auto resolver = [&](std::string_view attr) -> std::string {
             auto key = std::string(attr);
+            // from_result_set:<id> — composable-scope membership (capability
+            // §30). EXISTS-semantics: "true" iff this device is a member.
+            if (key.starts_with("from_result_set:")) {
+                auto rsid = key.substr(16);
+                return (rs_store && rs_store->contains(rsid, id)) ? "true" : "";
+            }
             if (key == "ostype")
                 return session->os;
             if (key == "hostname")

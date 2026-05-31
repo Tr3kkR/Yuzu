@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Scope walking — composable scope from previous query results (capability §30).**
+  A new per-operator **result set** primitive: a named, TTL-bounded, lineage-tracked
+  set of device IDs that becomes the input scope for the next query or action.
+  `server/core/src/result_set_store.{hpp,cpp}` (new `result_sets.db`, schema v1 via
+  `MigrationRunner`, time-prefixed lexically-sortable `rs_<ts><rand>` ids,
+  RETURNING-idiom writes per #1033, sync + async `pending → materialized` lifecycle,
+  root-first lineage walk, pin/unpin, per-operator 10k quota + 50-pin caps, 5-minute
+  GC sweep). REST surface under `/api/v1/result-sets` (list, direct create,
+  from-inventory-query, members, lineage, pin/unpin, delete) — owner-scoped authz,
+  A4 error envelope, audit on every state transition. The Scope Engine gains a third
+  short-circuit kind, `from_result_set:<id>` (`scope_engine.cpp`), composable with
+  attribute predicates via AND/OR/NOT and resolved per-device by
+  `AgentRegistry::evaluate_scope` (threaded through all command-dispatch sites); stale
+  (offline) members drop silently. A background maintenance thread materialises async
+  result sets from terminal executions and runs the GC sweep; new
+  `yuzu_result_sets_total` / `yuzu_result_sets_alive` / `yuzu_result_set_gc_total` /
+  `yuzu_result_set_quota_rejected` metrics. New `/result-sets` dashboard page
+  (`result_sets_ui.{hpp,cpp}`): sidebar of active sets, lineage breadcrumb, copyable
+  `from_result_set:` scope token, CSV-import create, pin/unpin/delete — HTMX,
+  server-rendered, dark-theme; nav link added across all dashboard pages. The two async
+  producers (from-tar-query / from-instruction-result), the YAML `fromResultSet:` DSL
+  surface, and re-eval land in follow-up PRs. Design: `docs/scope-walking-design.md`.
+
 - **Compliance policies now actually evaluate (check → verdict pipeline).**
   Authored policies + fragments could be created, but nothing evaluated them —
   `PolicyStore::update_agent_status` had no caller and no trigger fired, so
