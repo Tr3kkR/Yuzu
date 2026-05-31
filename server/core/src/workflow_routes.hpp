@@ -41,8 +41,8 @@ public:
 
     /// Callback for scope expression evaluation.
     /// Returns (matched_count, total_agents).
-    using ScopeEstimateFn =
-        std::function<std::pair<std::size_t, std::size_t>(const std::string& expression)>;
+    using ScopeEstimateFn = std::function<std::pair<std::size_t, std::size_t>(
+        const std::string& expression, const std::string& principal)>;
 
     /// Command dispatch callback — sends a command to agents via gRPC.
     /// Returns (command_id, number_of_agents_reached).

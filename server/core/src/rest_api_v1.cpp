@@ -22,6 +22,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <format>
@@ -29,6 +30,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 
 namespace yuzu::server {
 namespace {
@@ -743,7 +745,7 @@ void RestApiV1::register_routes(
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
-    StepUpFn step_up_fn) {
+    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -751,7 +753,8 @@ void RestApiV1::register_routes(
                     std::move(service_group_fn), std::move(tag_push_fn), inventory_store,
                     product_pack_store, sw_deploy_store, device_token_store, license_store,
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
-                    execution_event_bus, std::move(step_up_fn));
+                    execution_event_bus, result_set_store, std::move(command_dispatch_fn),
+                    std::move(step_up_fn));
 }
 
 void RestApiV1::register_routes(
@@ -765,7 +768,7 @@ void RestApiV1::register_routes(
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
-    StepUpFn step_up_fn) {
+    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -2862,6 +2865,693 @@ void RestApiV1::register_routes(
                       res.set_content(list_json(arr.str(), static_cast<int64_t>(results.size())),
                                       "application/json");
                   });
+    }
+
+    // ── Result Sets / Scope Walking (capability 30.1/30.2) ────────────────
+    // Per-operator, owner-scoped result sets. Authz is the owner check
+    // (design §4.1 — phase 1 is owner-only; no RBAC securable type yet, a
+    // ResultSet securable is a follow-up once cross-operator sharing lands).
+    // Errors use the A4 envelope + the result-set error taxonomy. The two
+    // async producers (from-tar-query / from-instruction-result) and re-eval
+    // dispatch a command (create-execution-before-dispatch, UP2-4) and land a
+    // `pending` row that the server maintenance thread materialises once the
+    // producing execution reaches a terminal state (PR-D). They require the
+    // command-dispatch callback + ExecutionTracker; without them they 503.
+    if (result_set_store) {
+        // Serialise a ResultSet row to a JSON object string.
+        auto rs_to_json = [](const ResultSet& r) {
+            JObj o;
+            o.add("id", r.id);
+            o.add("name", r.name);
+            o.add("owner_principal", r.owner_principal);
+            o.add("created_at", r.created_at);
+            o.add("ttl_at", r.ttl_at);
+            o.add("last_used_at", r.last_used_at);
+            o.add("pinned", r.pinned);
+            o.add("parent_id", r.parent_id.value_or(""));
+            o.add("source_kind", r.source_kind);
+            o.add("status", to_string(r.status));
+            o.add("source_execution_id", r.source_execution_id);
+            o.add("device_count", r.device_count);
+            return o.str();
+        };
+
+        // Emit an A4 error with a fresh correlation id.
+        auto rs_err = [](httplib::Response& res, int status, std::string_view msg) {
+            auto cid = detail::make_correlation_id();
+            res.status = status;
+            res.set_content(detail::error_json_a4(status, msg, cid), "application/json");
+        };
+
+        // Load a row and enforce the owner check. Returns nullopt and writes a
+        // 404 (existence-oracle-safe: non-owner is indistinguishable from
+        // missing) when the row is absent or not owned by the session.
+        auto load_owned = [result_set_store, rs_err, audit_fn](
+                              const httplib::Request& req, const std::string& id,
+                              const std::string& owner,
+                              httplib::Response& res) -> std::optional<ResultSet> {
+            auto row = result_set_store->get(id);
+            if (!row || row->owner_principal != owner) {
+                // Audit the failed access so probing the existence oracle leaves
+                // a trail (review finding G). The 404 stays oracle-safe (a
+                // non-owner is indistinguishable from missing); the audit row is
+                // server-side only.
+                audit_fn(req, "result_set.access", "denied", "ResultSet", id,
+                         "not found or not owned");
+                rs_err(res, 404, "RESULT_SET_NOT_FOUND: result set not found");
+                return std::nullopt;
+            }
+            return row;
+        };
+
+        // Resolve a parent reference (canonical `rs_` id OR a per-operator
+        // alias — design §2 "Source query" / §4.1) to a canonical owned id.
+        // Alias pre-resolution at the dispatch layer is the right place: the
+        // owner is known here, whereas `evaluate_scope` (which resolves
+        // `from_result_set:` deep in the dispatch lambda) has no principal to
+        // scope the alias lookup. Writes a 404 and returns nullopt when the
+        // ref doesn't resolve to a row this session owns.
+        auto resolve_owned_parent =
+            [result_set_store, load_owned](const httplib::Request& req, const std::string& raw,
+                                           const std::string& owner,
+                                           httplib::Response& res) -> std::optional<std::string> {
+            std::string id = raw;
+            if (!raw.starts_with("rs_")) {
+                if (auto canon = result_set_store->resolve_alias(owner, raw))
+                    id = *canon;
+                // else: id stays = raw; load_owned() below 404s on the miss.
+            }
+            auto row = load_owned(req, id, owner, res);
+            if (!row)
+                return std::nullopt;
+            return id;
+        };
+
+        // Shared async-producer engine for `from-tar-query` /
+        // `from-instruction-result` / `re-eval`. Implements the
+        // create-execution-BEFORE-dispatch ordering (UP2-4) then lands a
+        // `pending` row the maintenance thread materialises once the
+        // execution reaches a terminal state (design §3.1). `body` is read
+        // only for `parent_id`; everything else is passed explicitly so
+        // re-eval can synthesise a body. Writes the 202 (or an error) on res.
+        auto run_async = [result_set_store, execution_tracker, command_dispatch_fn, audit_fn,
+                          metrics_registry, rs_to_json, rs_err, resolve_owned_parent](
+                             const httplib::Request& req, httplib::Response& res,
+                             const std::string& owner, const std::string& plugin,
+                             const std::string& action,
+                             const std::unordered_map<std::string, std::string>& params,
+                             std::string_view src_kind, const std::string& source_payload,
+                             const std::string& matcher, const nlohmann::json& body,
+                             const std::string& name) {
+            if (!command_dispatch_fn || !execution_tracker) {
+                rs_err(res, 503, "RESULT_SET_DISPATCH_UNAVAILABLE: command dispatch not wired");
+                return;
+            }
+            // Resolve the parent scope. parent_id present → dispatch is scoped
+            // to that set's CURRENT members via the `from_result_set:` scope
+            // kind; absent → broadcast to all connected agents (__all__).
+            std::optional<std::string> parent_id;
+            std::string scope_expr;
+            if (body.contains("parent_id") && body["parent_id"].is_string() &&
+                !body["parent_id"].get<std::string>().empty()) {
+                auto canon =
+                    resolve_owned_parent(req, body["parent_id"].get<std::string>(), owner, res);
+                if (!canon)
+                    return; // resolve_owned_parent wrote 404
+                parent_id = *canon;
+                scope_expr = "from_result_set:" + *canon;
+            }
+
+            // Create-before-dispatch: the execution_id must be registered
+            // command_id→execution_id before any RPC so a FAST loopback agent
+            // can't reply ahead of the mapping (UP2-4).
+            Execution exec;
+            exec.definition_id = std::string(src_kind);
+            exec.status = "running";
+            exec.scope_expression = scope_expr;
+            exec.parameter_values = nlohmann::json(params).dump();
+            exec.dispatched_by = owner;
+            std::string exec_id;
+            if (auto created = execution_tracker->create_execution(exec); created.has_value())
+                exec_id = *created;
+            if (exec_id.empty()) {
+                rs_err(res, 500, "RESULT_SET_INTERNAL: failed to create execution row");
+                return;
+            }
+
+            // Pre-dispatch quota check: never send a (possibly destructive)
+            // command we can't record. create_pending re-checks atomically
+            // below, but rejecting here means the common at-quota case fails
+            // BEFORE any agent executes (review finding B5).
+            if (result_set_store->count_for_owner(owner) >= ResultSetStore::kMaxPerOwner) {
+                if (metrics_registry)
+                    metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
+                execution_tracker->mark_cancelled(exec_id, owner);
+                rs_err(res, 429, std::string(to_string(ResultSetError::QuotaExceeded)) +
+                                     " execution_id=" + exec_id);
+                return;
+            }
+
+            std::string command_id;
+            int sent = 0;
+            try {
+                std::tie(command_id, sent) =
+                    command_dispatch_fn(plugin, action, {}, scope_expr, params, exec_id);
+            } catch (const std::exception& e) {
+                spdlog::error("result-set async producer dispatch failed: {}", e.what());
+                execution_tracker->mark_cancelled(exec_id, owner);
+                rs_err(res, 500, "RESULT_SET_DISPATCH_FAILED: dispatch raised");
+                return;
+            }
+            if (sent == 0) {
+                // No agents in scope — record the attempt (forensic) and tell
+                // the operator rather than leaking a pending row that idles to
+                // the 300s timeout and then materialises empty.
+                execution_tracker->mark_cancelled(exec_id, owner);
+                rs_err(res, 503, "RESULT_SET_NO_AGENTS: no agents reached in the target scope");
+                return;
+            }
+            execution_tracker->set_agents_targeted(exec_id, sent);
+
+            CreateRequest cr;
+            cr.owner_principal = owner;
+            cr.name = name;
+            cr.parent_id = parent_id;
+            cr.source_kind = std::string(src_kind);
+            cr.source_payload = source_payload;
+            cr.matcher = matcher;
+            auto created = result_set_store->create_pending(cr, exec_id);
+            if (!created) {
+                if (metrics_registry && created.error() == ResultSetError::QuotaExceeded)
+                    metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
+                // The command already dispatched but there is no row to
+                // materialise into — cancel the execution so it doesn't idle in
+                // 'running', and surface exec_id so the operator can trace what
+                // was sent (review B5; mirrors the throw / no-agents paths).
+                execution_tracker->mark_cancelled(exec_id, owner);
+                int status = created.error() == ResultSetError::QuotaExceeded ? 429 : 400;
+                rs_err(res, status,
+                       std::string(to_string(created.error())) + " execution_id=" + exec_id);
+                return;
+            }
+            if (metrics_registry)
+                metrics_registry
+                    ->counter("yuzu_result_sets_total",
+                              {{"source_kind", std::string(src_kind)}, {"result", "pending"}})
+                    .increment();
+            audit_fn(req, "result_set.create", "success", "ResultSet", created->id,
+                     std::string(src_kind) + " execution_id=" + exec_id +
+                         " agents=" + std::to_string(sent));
+            // 202 Accepted: membership is not known yet; the client polls
+            // GET /{id} (status flips pending→materialized) or subscribes to
+            // /api/v1/events on source_execution_id.
+            res.status = 202;
+            res.set_content(ok_json(rs_to_json(*created)), "application/json");
+        };
+
+        // GET /api/v1/result-sets — owner-scoped list.
+        sink.Get("/api/v1/result-sets", [auth_fn, result_set_store, rs_to_json](
+                                            const httplib::Request& req, httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            std::string cursor = req.has_param("cursor") ? req.get_param_value("cursor") : "";
+            int limit = 50;
+            if (req.has_param("limit")) {
+                const auto lv = req.get_param_value("limit");
+                int v = 0;
+                std::from_chars(lv.data(), lv.data() + lv.size(), v);
+                if (v > 0 && v <= 500)
+                    limit = v;
+            }
+            std::string next;
+            auto sets = result_set_store->list_by_owner(session->username, cursor, limit, next);
+            JArr arr;
+            for (const auto& s : sets)
+                arr.add_raw(rs_to_json(s));
+            auto data =
+                JObj().raw("result_sets", arr.str()).add("next_cursor", next).str();
+            res.set_content(ok_json(data), "application/json");
+        });
+
+        // POST /api/v1/result-sets — direct create from pre-computed device ids
+        // (e.g. dashboard "I have a CSV"). Synchronous → lands materialized.
+        sink.Post("/api/v1/result-sets",
+                  [auth_fn, audit_fn, result_set_store, metrics_registry, rs_to_json, rs_err,
+                   load_owned](const httplib::Request& req, httplib::Response& res) {
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                rs_err(res, 400, "invalid JSON");
+                return;
+            }
+            CreateRequest cr;
+            cr.owner_principal = session->username;
+            cr.name = body.value("name", "");
+            cr.source_kind = body.value("source_kind", std::string(source_kind::kManualCurate));
+            cr.source_payload = body.contains("source_payload") ? body["source_payload"].dump()
+                                                                : std::string("{}");
+            if (body.contains("parent_id") && body["parent_id"].is_string() &&
+                !body["parent_id"].get<std::string>().empty()) {
+                auto pid = body["parent_id"].get<std::string>();
+                // Owner-check the parent before persisting the lineage edge,
+                // else an operator can parent onto a victim's id and read its
+                // name/source_kind/device_count back via /lineage (review B2).
+                if (!load_owned(req, pid, session->username, res))
+                    return; // load_owned wrote 404
+                cr.parent_id = pid;
+            }
+
+            std::vector<std::string> members;
+            if (body.contains("device_ids") && body["device_ids"].is_array()) {
+                for (const auto& d : body["device_ids"])
+                    if (d.is_string())
+                        members.push_back(d.get<std::string>());
+            }
+            // Reject an oversized array before the store dedups it under its
+            // write lock — bounds the DoS from a giant device_ids body (B4).
+            if (members.size() > static_cast<size_t>(ResultSetStore::kMaxMembersPerSet)) {
+                if (metrics_registry)
+                    metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
+                rs_err(res, 400, to_string(ResultSetError::TooManyMembers));
+                return;
+            }
+
+            auto created = result_set_store->create_materialized(cr, members);
+            if (!created) {
+                if (metrics_registry && created.error() == ResultSetError::QuotaExceeded)
+                    metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
+                int status = created.error() == ResultSetError::QuotaExceeded ? 429 : 400;
+                rs_err(res, status, to_string(created.error()));
+                return;
+            }
+            if (metrics_registry)
+                metrics_registry
+                    ->counter("yuzu_result_sets_total",
+                              {{"source_kind", cr.source_kind}, {"result", "created"}})
+                    .increment();
+            audit_fn(req, "result_set.create", "success", "ResultSet", created->id, cr.source_kind);
+            res.status = 201;
+            res.set_content(ok_json(rs_to_json(*created)), "application/json");
+        });
+
+        // POST /api/v1/result-sets/from-inventory-query — synchronous producer.
+        // Runs the inventory evaluation server-side; the member set is every
+        // agent that matched. When parent_id is given, the candidate set is
+        // narrowed to that set's current members.
+        sink.Post("/api/v1/result-sets/from-inventory-query",
+                  [auth_fn, audit_fn, result_set_store, inventory_store, metrics_registry,
+                   rs_to_json, rs_err,
+                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      if (!inventory_store || !inventory_store->is_open()) {
+                          rs_err(res, 503, "inventory store not available");
+                          return;
+                      }
+                      auto body = nlohmann::json::parse(req.body, nullptr, false);
+                      if (body.is_discarded()) {
+                          rs_err(res, 400, "invalid JSON");
+                          return;
+                      }
+
+                      InventoryEvalRequest eval_req;
+                      eval_req.combine = body.value("combine", "all");
+                      if (body.contains("conditions") && body["conditions"].is_array()) {
+                          for (const auto& c : body["conditions"]) {
+                              InventoryCondition cond;
+                              cond.plugin = c.value("plugin", "");
+                              cond.field = c.value("field", "");
+                              cond.op = c.value("op", "");
+                              cond.value = c.value("value", "");
+                              eval_req.conditions.push_back(std::move(cond));
+                          }
+                      }
+
+                      // Optional parent-scope narrowing.
+                      std::optional<std::unordered_set<std::string>> parent_members;
+                      CreateRequest cr;
+                      cr.owner_principal = session->username;
+                      cr.name = body.value("name", "");
+                      cr.source_kind = std::string(source_kind::kInventoryQuery);
+                      cr.source_payload = body.dump();
+                      if (body.contains("parent_id") && body["parent_id"].is_string() &&
+                          !body["parent_id"].get<std::string>().empty()) {
+                          auto pid = body["parent_id"].get<std::string>();
+                          auto parent = load_owned(req, pid, session->username, res);
+                          if (!parent)
+                              return; // load_owned already wrote 404
+                          cr.parent_id = pid;
+                          std::unordered_set<std::string> ms;
+                          std::string cur;
+                          while (true) {
+                              // Separate in/out cursor: members() clears its
+                              // out-cursor first, so aliasing one variable as
+                              // both rereads page 1 forever once the parent
+                              // exceeds the page size (review finding B3).
+                              std::string next;
+                              auto page = result_set_store->members(pid, cur, 5000, next);
+                              ms.insert(page.begin(), page.end());
+                              if (next.empty())
+                                  break;
+                              cur = std::move(next);
+                          }
+                          parent_members = std::move(ms);
+                      }
+
+                      InventoryQuery iq;
+                      iq.limit = 5000;
+                      auto records_raw = inventory_store->query(iq);
+                      std::vector<std::pair<std::string, std::string>> records;
+                      records.reserve(records_raw.size());
+                      for (const auto& r : records_raw)
+                          records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
+
+                      auto results = evaluate_inventory(eval_req, records);
+                      std::unordered_set<std::string> seen;
+                      std::vector<std::string> members;
+                      for (const auto& r : results) {
+                          if (!r.match)
+                              continue;
+                          if (parent_members && !parent_members->count(r.agent_id))
+                              continue;
+                          if (seen.insert(r.agent_id).second)
+                              members.push_back(r.agent_id);
+                      }
+
+                      auto created = result_set_store->create_materialized(cr, members);
+                      if (!created) {
+                          if (metrics_registry &&
+                              created.error() == ResultSetError::QuotaExceeded)
+                              metrics_registry->counter("yuzu_result_set_quota_rejected")
+                                  .increment();
+                          int status =
+                              created.error() == ResultSetError::QuotaExceeded ? 429 : 400;
+                          rs_err(res, status, to_string(created.error()));
+                          return;
+                      }
+                      if (metrics_registry)
+                          metrics_registry
+                              ->counter("yuzu_result_sets_total",
+                                        {{"source_kind", cr.source_kind}, {"result", "created"}})
+                              .increment();
+                      audit_fn(req, "result_set.create", "success", "ResultSet", created->id,
+                               cr.source_kind);
+                      res.status = 201;
+                      res.set_content(ok_json(rs_to_json(*created)), "application/json");
+                  });
+
+        // POST /api/v1/result-sets/from-tar-query — async producer (design §6).
+        // Dispatches operator SQL to the tar plugin in parent_id's scope (or
+        // __all__); the membership set is every agent that returned ≥1 row
+        // (default) or every SUCCESS responder (`include_empty=true`). The
+        // SQL is sandboxed AGENT-side by TarDatabase::execute_user_query
+        // (read-only authorizer, #760/#631) — the server only length-checks.
+        sink.Post("/api/v1/result-sets/from-tar-query",
+                  [auth_fn, rs_err, run_async](const httplib::Request& req,
+                                               httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      auto body = nlohmann::json::parse(req.body, nullptr, false);
+                      if (body.is_discarded()) {
+                          rs_err(res, 400, "invalid JSON");
+                          return;
+                      }
+                      std::string sql = body.value("sql", "");
+                      if (sql.empty()) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' is required");
+                          return;
+                      }
+                      if (sql.size() > 100000) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB");
+                          return;
+                      }
+                      const bool include_empty = body.value("include_empty", false);
+                      nlohmann::json matcher =
+                          include_empty ? nlohmann::json{{"kind", "any_response"}}
+                                        : nlohmann::json{{"kind", "tar_rows_ge"}, {"n", 1}};
+                      // source_payload — design §3.2 tar_query shape (re-eval reads it).
+                      nlohmann::json payload;
+                      payload["sql"] = sql;
+                      payload["include_empty"] = include_empty;
+                      if (body.contains("parent_id") && body["parent_id"].is_string())
+                          payload["scope_input_id"] = body["parent_id"];
+                      std::unordered_map<std::string, std::string> params{{"sql", sql}};
+                      run_async(req, res, session->username, "tar", "sql", params,
+                                source_kind::kTarQuery, payload.dump(), matcher.dump(), body,
+                                body.value("name", ""));
+                  });
+
+        // POST /api/v1/result-sets/from-instruction-result — async producer.
+        // Runs an InstructionDefinition in parent_id's scope; membership is the
+        // responders whose output row satisfies the operator-supplied `matcher`
+        // (column/op/value — design §3.2, applied by the maintenance thread via
+        // rs_matcher). Mirrors the Chrome-IR hash-check step (design §10).
+        sink.Post("/api/v1/result-sets/from-instruction-result",
+                  [auth_fn, rs_err, instruction_store, run_async](const httplib::Request& req,
+                                                                  httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      if (!instruction_store || !instruction_store->is_open()) {
+                          rs_err(res, 503, "instruction store not available");
+                          return;
+                      }
+                      auto body = nlohmann::json::parse(req.body, nullptr, false);
+                      if (body.is_discarded()) {
+                          rs_err(res, 400, "invalid JSON");
+                          return;
+                      }
+                      std::string instruction_id = body.value("instruction_id", "");
+                      if (instruction_id.empty()) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'instruction_id' is required");
+                          return;
+                      }
+                      auto def = instruction_store->get_definition(instruction_id);
+                      if (!def) {
+                          rs_err(res, 404, "INSTRUCTION_NOT_FOUND: unknown instruction_id");
+                          return;
+                      }
+                      std::unordered_map<std::string, std::string> params;
+                      if (body.contains("params") && body["params"].is_object())
+                          for (auto& [k, v] : body["params"].items())
+                              params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                      std::string matcher = (body.contains("matcher") && body["matcher"].is_object())
+                                                ? body["matcher"].dump()
+                                                : std::string();
+                      // source_payload — design §3.2 instruction_result shape.
+                      nlohmann::json payload;
+                      payload["instruction_id"] = instruction_id;
+                      payload["params"] =
+                          body.contains("params") ? body["params"] : nlohmann::json::object();
+                      if (body.contains("matcher"))
+                          payload["matcher"] = body["matcher"];
+                      if (body.contains("parent_id") && body["parent_id"].is_string())
+                          payload["scope_input_id"] = body["parent_id"];
+                      run_async(req, res, session->username, def->plugin, def->action, params,
+                                source_kind::kInstructionResult, payload.dump(), matcher, body,
+                                body.value("name", ""));
+                  });
+
+        // POST /api/v1/result-sets/{id}/re-eval — re-run the source query and
+        // create a SIBLING set (parent_id = original.parent_id, NOT a child —
+        // design §6/§11). Async sources (tar_query/instruction_result) re-
+        // dispatch and land a new pending row; sync sources are deferred to
+        // PR-G (their re-eval needs the inventory evaluator on this path).
+        sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)",
+                  [auth_fn, rs_err, load_owned, run_async, instruction_store](
+                      const httplib::Request& req, httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      auto id = req.matches[1].str();
+                      auto orig = load_owned(req, id, session->username, res);
+                      if (!orig)
+                          return;
+                      auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
+                      // Synthesise the parent so the sibling shares the
+                      // original's parent (re-eval re-asks the same question
+                      // against the same candidate scope, today's estate).
+                      nlohmann::json synth;
+                      if (orig->parent_id && !orig->parent_id->empty())
+                          synth["parent_id"] = *orig->parent_id;
+                      // Skip the suffix if it's already there, else repeated
+                      // re-evals of a sibling grow "foo (re-eval) (re-eval) …"
+                      // unboundedly (review finding bug_014).
+                      const std::string reeval_name =
+                          orig->name.empty()                  ? std::string()
+                          : orig->name.ends_with(" (re-eval)") ? orig->name
+                                                               : (orig->name + " (re-eval)");
+                      if (orig->source_kind == source_kind::kTarQuery) {
+                          std::string sql = sp.is_object() ? sp.value("sql", "") : "";
+                          if (sql.empty()) {
+                              rs_err(res, 400, "RESULT_SET_BAD_REQUEST: original carries no SQL");
+                              return;
+                          }
+                          std::unordered_map<std::string, std::string> params{{"sql", sql}};
+                          run_async(req, res, session->username, "tar", "sql", params,
+                                    source_kind::kTarQuery, orig->source_payload, orig->matcher,
+                                    synth, reeval_name);
+                      } else if (orig->source_kind == source_kind::kInstructionResult) {
+                          std::string instruction_id =
+                              sp.is_object() ? sp.value("instruction_id", "") : "";
+                          auto def = instruction_store && instruction_store->is_open()
+                                         ? instruction_store->get_definition(instruction_id)
+                                         : std::nullopt;
+                          if (instruction_id.empty() || !def) {
+                              rs_err(res, 400,
+                                     "RESULT_SET_BAD_REQUEST: original instruction unavailable");
+                              return;
+                          }
+                          std::unordered_map<std::string, std::string> params;
+                          if (sp.contains("params") && sp["params"].is_object())
+                              for (auto& [k, v] : sp["params"].items())
+                                  params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                          run_async(req, res, session->username, def->plugin, def->action, params,
+                                    source_kind::kInstructionResult, orig->source_payload,
+                                    orig->matcher, synth, reeval_name);
+                      } else {
+                          rs_err(res, 400,
+                                 "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
+                                 "lands in PR-G");
+                      }
+                  });
+
+        // GET /api/v1/result-sets/{id}
+        sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+))",
+                 [auth_fn, rs_to_json, load_owned](const httplib::Request& req,
+                                                   httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session)
+                         return;
+                     auto row = load_owned(req, req.matches[1].str(), session->username, res);
+                     if (!row)
+                         return;
+                     res.set_content(ok_json(rs_to_json(*row)), "application/json");
+                 });
+
+        // GET /api/v1/result-sets/{id}/members
+        sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/members)",
+                 [auth_fn, result_set_store, load_owned](const httplib::Request& req,
+                                                         httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session)
+                         return;
+                     auto id = req.matches[1].str();
+                     auto row = load_owned(req, id, session->username, res);
+                     if (!row)
+                         return;
+                     std::string cursor =
+                         req.has_param("cursor") ? req.get_param_value("cursor") : "";
+                     int limit = 1000;
+                     if (req.has_param("limit")) {
+                         const auto lv = req.get_param_value("limit");
+                         int v = 0;
+                         std::from_chars(lv.data(), lv.data() + lv.size(), v);
+                         if (v > 0 && v <= 10000)
+                             limit = v;
+                     }
+                     std::string next;
+                     auto devs = result_set_store->members(id, cursor, limit, next);
+                     JArr arr;
+                     for (const auto& d : devs)
+                         arr.add(d);
+                     auto data =
+                         JObj().raw("device_ids", arr.str()).add("next_cursor", next).str();
+                     res.set_content(ok_json(data), "application/json");
+                 });
+
+        // GET /api/v1/result-sets/{id}/lineage
+        sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/lineage)",
+                 [auth_fn, result_set_store, load_owned](const httplib::Request& req,
+                                                         httplib::Response& res) {
+                     auto session = auth_fn(req, res);
+                     if (!session)
+                         return;
+                     auto id = req.matches[1].str();
+                     auto row = load_owned(req, id, session->username, res);
+                     if (!row)
+                         return;
+                     auto chain = result_set_store->lineage(id, session->username);
+                     JArr arr;
+                     for (const auto& n : chain)
+                         arr.add(JObj()
+                                     .add("id", n.id)
+                                     .add("name", n.name)
+                                     .add("source_kind", n.source_kind)
+                                     .add("device_count", n.device_count));
+                     res.set_content(ok_json(JObj().raw("chain", arr.str()).str()),
+                                     "application/json");
+                 });
+
+        // POST /api/v1/result-sets/{id}/pin
+        sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/pin)",
+                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err,
+                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      auto id = req.matches[1].str();
+                      auto row = load_owned(req, id, session->username, res);
+                      if (!row)
+                          return;
+                      auto pinned = result_set_store->pin(id);
+                      if (!pinned) {
+                          int status = pinned.error() == ResultSetError::PinLimit ? 409 : 404;
+                          rs_err(res, status, to_string(pinned.error()));
+                          return;
+                      }
+                      audit_fn(req, "result_set.pin", "success", "ResultSet", id, "");
+                      res.set_content(ok_json(rs_to_json(*pinned)), "application/json");
+                  });
+
+        // POST /api/v1/result-sets/{id}/unpin
+        sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/unpin)",
+                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err,
+                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                      auto session = auth_fn(req, res);
+                      if (!session)
+                          return;
+                      auto id = req.matches[1].str();
+                      auto row = load_owned(req, id, session->username, res);
+                      if (!row)
+                          return;
+                      auto unpinned = result_set_store->unpin(id);
+                      if (!unpinned) {
+                          rs_err(res, 404, to_string(unpinned.error()));
+                          return;
+                      }
+                      audit_fn(req, "result_set.unpin", "success", "ResultSet", id, "");
+                      res.set_content(ok_json(rs_to_json(*unpinned)), "application/json");
+                  });
+
+        // DELETE /api/v1/result-sets/{id}
+        sink.Delete(R"(/api/v1/result-sets/(rs_[0-9a-f]+))",
+                    [auth_fn, audit_fn, result_set_store, rs_err,
+                     load_owned](const httplib::Request& req, httplib::Response& res) {
+                        auto session = auth_fn(req, res);
+                        if (!session)
+                            return;
+                        auto id = req.matches[1].str();
+                        auto row = load_owned(req, id, session->username, res);
+                        if (!row)
+                            return;
+                        auto del = result_set_store->delete_set(id);
+                        if (!del) {
+                            // Pinned sets must be unpinned first (design §6).
+                            int status = del.error() == ResultSetError::Pinned ? 409 : 404;
+                            rs_err(res, status, to_string(del.error()));
+                            return;
+                        }
+                        audit_fn(req, "result_set.delete", "success", "ResultSet", id, "");
+                        res.status = 200;
+                        res.set_content(ok_json(JObj().add("deleted", true).str()),
+                                        "application/json");
+                    });
     }
 
     // ── Device Authorization Tokens (capability 18.8) ─────────────────────
