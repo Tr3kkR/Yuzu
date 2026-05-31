@@ -226,6 +226,10 @@ handle_cast({forward_guardian_message, AgentId, ResponseFrame},
                                       #{count => 1}, #{reason => <<"at_capacity">>}),
                     {noreply, State};
                 false ->
+                    %% Accepted for delivery — count it so the drop counters
+                    %% have a denominator (drop-rate SLO). See yuzu_gw_telemetry.
+                    telemetry:execute([yuzu, gw, guardian, forward_accepted],
+                                      #{count => 1}, #{}),
                     Request = #{agent_id => AgentId, response => ResponseFrame},
                     {Pid, _MonRef} = spawn_monitor(fun() ->
                         case do_rpc('ForwardGuardianMessage', Request, guardian) of
