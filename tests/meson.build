@@ -107,6 +107,7 @@ agent_test_exe = executable(
     'unit/test_filesystem_actions.cpp',
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
+    'unit/test_vuln_scan.cpp',
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
     'unit/test_kv_store.cpp',

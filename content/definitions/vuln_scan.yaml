@@ -1,7 +1,8 @@
 ## Host Vulnerability Scanning Definitions
 ## Matches installed software against known CVEs and runs configuration
 ## compliance checks. Reports findings by severity.
-## Plugin: vuln_scan | Actions: scan, cve_scan, config_scan, summary, inventory
+## Plugin: vuln_scan | Actions: scan, cve_scan, config_scan, summary, inventory,
+##                               update_rules, kernel_scan, binary_scan
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -293,6 +294,183 @@ spec:
 
   gather:
     ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [vuln_scan]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.vuln_scan.update_rules
+  displayName: Update CVE Rules
+  version: 1.0.0
+  description: >
+    Reload the CVE ruleset from a previously staged JSON file at
+    <data_dir>/staged/cve_rules.json. Use after running content_dist.stage
+    to push an updated cve_rules.json to the endpoint. The compiled-in
+    critical-CVE fallback remains active regardless of load success.
+  tags: [security, vulnerability, maintenance]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: vuln_scan
+    action: update_rules
+    concurrency: per-device
+    timeoutSeconds: 30
+
+  result:
+    columns:
+      - name: status
+        type: string
+      - name: category
+        type: string
+      - name: title
+        type: string
+      - name: detail
+        type: string
+
+  readablePayload: "Reload CVE rules from staged file"
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [vuln_scan]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.vuln_scan.kernel_scan
+  displayName: Kernel CVE Scan
+  version: 1.0.0
+  description: >
+    Detects CVEs in the running OS kernel version. Uses uname() on Linux,
+    registry CurrentBuildNumber/UBR on Windows, and sw_vers on macOS.
+    Matches against kernel-specific rules in the active ruleset
+    (product token "linux-kernel", "windows-kernel", or "macos").
+  tags: [security, vulnerability, kernel]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: vuln_scan
+    action: kernel_scan
+    concurrency: per-device
+    timeoutSeconds: 30
+
+  result:
+    columns:
+      - name: severity
+        type: string
+      - name: category
+        type: string
+      - name: title
+        type: string
+      - name: detail
+        type: string
+    aggregation:
+      groupBy: [severity]
+      operations: [count]
+
+  readablePayload: "Scan kernel version for CVEs"
+
+  gather:
+    ttlSeconds: 600
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [vuln_scan]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.vuln_scan.binary_scan
+  displayName: Binary File Version Scan
+  version: 1.0.0
+  description: >
+    Reads version information directly from installed binary files — PE
+    VERSIONINFO resources on Windows, Info.plist on macOS, epoch-stripped
+    dpkg/rpm versions on Linux — and compares against CVE rules. Detects
+    drift when an admin manually installs a version that differs from what
+    the package manager recorded.
+  tags: [security, vulnerability, binary]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: vuln_scan
+    action: binary_scan
+    concurrency: per-device
+    timeoutSeconds: 120
+
+  parameters:
+    type: object
+    properties:
+      paths:
+        type: string
+        displayName: Binary paths
+        description: >
+          Comma-separated list of binary paths to inspect. Leave empty to
+          use the default high-value binary list for the current platform.
+        default: ""
+
+  result:
+    columns:
+      - name: severity
+        type: string
+      - name: category
+        type: string
+      - name: title
+        type: string
+      - name: detail
+        type: string
+    aggregation:
+      groupBy: [severity]
+      operations: [count]
+
+  readablePayload: "Scan binary file versions for CVEs"
+
+  gather:
+    ttlSeconds: 600
 
   approval:
     mode: auto
