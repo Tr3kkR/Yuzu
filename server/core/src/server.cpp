@@ -6200,6 +6200,14 @@ private:
                         if (registry_.send_to(aid, cmd))
                             ++sent;
                 }
+                // Drain gw_pending_ so the push reaches gateway-connected agents.
+                // send_to only QUEUES for a gateway agent (it has no local Subscribe
+                // stream — the gateway holds it); direct agents already got the inline
+                // write. Every other dispatch site drains here; the Guardian push
+                // omitted it, so over a gateway the push silently never arrived and no
+                // guard armed (works in direct mode, breaks via gateway). See
+                // forward_gateway_pending() and docs/guardian-mvp-contract.md G12.
+                forward_gateway_pending();
                 return sent;
             });
 
