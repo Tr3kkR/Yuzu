@@ -50,7 +50,7 @@ struct GuaranteedStateRuleRow {
     std::string spec_json;
     int64_t version{1};
     bool enabled{true};
-    std::string enforcement_mode;  // "enforce" | "audit" | "disabled"
+    std::string enforcement_mode;  // "enforce" | "audit" (validated at the REST boundary; `enabled` controls disable)
     std::string severity;          // "critical" | "high" | "medium" | "low"
     std::string os_target;         // "windows" | "linux" | "macos" | ""=all
     std::string scope_expr;        // server-side scope expression

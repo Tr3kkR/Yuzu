@@ -3505,6 +3505,21 @@ void RestApiV1::register_routes(
         row.os_target = body.value("os_target", std::string{""});
         row.scope_expr = body.value("scope_expr", body.value("scope", std::string{""}));
 
+        // enforcement_mode decides whether the agent WRITES to the endpoint, so
+        // reject anything but enforce|audit. An empty/garbage value would render
+        // as ENFORCING in the dashboard while the agent silently arms audit
+        // (governance C1/B2). Disabling a guard is the `enabled` flag, not a mode.
+        if (row.enforcement_mode != "enforce" && row.enforcement_mode != "audit") {
+            res.status = 400;
+            res.set_content(error_json("enforcement_mode must be 'enforce' or 'audit'"),
+                            "application/json");
+            // Audit the reject (sibling-parity with the update handler + the
+            // invalid-JSON branch — leave a SIEM trail for a malformed/probe body).
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+                     "invalid enforcement_mode");
+            return;
+        }
+
         // Guardian Guards are authored STRUCTURED (contract decisions 1-3): typed
         // spark/assertion/remediation blocks, each {type, map params}. The agent
         // enforces from these (it never parses yaml_source). The server derives the
@@ -3654,6 +3669,18 @@ void RestApiV1::register_routes(
                  updated.enabled = body.value("enabled", updated.enabled);
                  updated.enforcement_mode =
                      body.value("enforcement_mode", updated.enforcement_mode);
+                 // Same enforce|audit guard as create (governance C1/B2), but only
+                 // when the client actually sets the field — so a legacy rule with
+                 // a stale mode can still be updated in its other fields.
+                 if (body.contains("enforcement_mode") && updated.enforcement_mode != "enforce" &&
+                     updated.enforcement_mode != "audit") {
+                     res.status = 400;
+                     res.set_content(error_json("enforcement_mode must be 'enforce' or 'audit'"),
+                                     "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              "invalid enforcement_mode");
+                     return;
+                 }
                  updated.severity = body.value("severity", updated.severity);
                  updated.os_target = body.value("os_target", updated.os_target);
                  updated.scope_expr = body.value("scope_expr", updated.scope_expr);

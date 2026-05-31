@@ -232,7 +232,10 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
                                           : r.os_target == "linux"  ? "L"
                                           : r.os_target == "macos"  ? "M" : r.os_target);
                 const bool on = r.enabled;
-                const std::string mode = r.enforcement_mode.empty() ? "enforce" : r.enforcement_mode;
+                // Empty/unknown renders as audit, NOT enforce: the agent arms
+                // enforce only on an exact "enforce" match, so showing ENFORCING
+                // for an empty mode would be a false-green (governance C1/B2).
+                const std::string mode = (r.enforcement_mode == "enforce") ? "enforce" : "audit";
                 const bool enforcing = (mode == "enforce");
                 const char* badge_color = on ? (enforcing ? "var(--green)" : "var(--yellow)")
                                              : "var(--muted)";
@@ -306,49 +309,54 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
 void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Response& res,
                                         const std::string& rule_id, bool set_enabled, bool enabled,
                                         bool set_mode, const std::string& mode) {
-    if (!store_ || !store_->is_open()) {
-        res.status = 503;
-        res.set_content("<div class=\"mock-note\">Guardian store unavailable.</div>",
+    // Error responses return 200 with an inline banner PREPENDED to the
+    // re-rendered guard list. The dashboard's htmx config does not swap 4xx/5xx
+    // bodies (responseHandling swap:false), so a 4xx/5xx error fragment would
+    // silently never render and the operator would get no feedback (governance
+    // S1). 200 + banner + list keeps the list visible and shows what failed.
+    auto fail = [this, &res](const std::string& msg) {
+        res.status = 200;
+        res.set_content("<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
+                        "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
+                        "margin-bottom:0.5rem;font-size:0.78rem\">&#9888; " +
+                            html_escape(msg) + "</div>" + render_guards_fragment(""),
                         "text/html; charset=utf-8");
-        return;
-    }
+    };
+
+    if (!store_ || !store_->is_open())
+        return fail("Guardian store unavailable.");
     auto rule = store_->get_rule(rule_id);
-    if (!rule) {
-        res.status = 404;
-        res.set_content("<div class=\"mock-note\">No such guard.</div>",
-                        "text/html; charset=utf-8");
-        return;
-    }
+    if (!rule)
+        return fail("No such guard: " + rule_id);
+
     std::string detail;
     if (set_enabled) {
         rule->enabled = enabled;
         detail = enabled ? "enabled=true" : "enabled=false";
     }
     if (set_mode) {
-        if (mode != "enforce" && mode != "audit") {
-            res.status = 400;
-            res.set_content("<div class=\"mock-note\">Invalid mode (expected enforce|audit).</div>",
-                            "text/html; charset=utf-8");
-            return;
-        }
+        if (mode != "enforce" && mode != "audit")
+            return fail("Invalid mode (expected enforce or audit).");
         rule->enforcement_mode = mode;
         detail = "enforcement_mode=" + mode;
     }
-    if (auto r = store_->update_rule(*rule); !r) {
-        res.status = 500;
-        res.set_content("<div class=\"mock-note\">Update failed: " + html_escape(r.error()) +
-                        "</div>",
-                        "text/html; charset=utf-8");
-        return;
-    }
+    if (auto r = store_->update_rule(*rule); !r)
+        return fail("Update failed: " + r.error());
+
     // Auto-deploy so the change reaches agents immediately. full_sync re-pushes
     // the enabled set and (because the agent clears guards on full_sync) tears
     // down the guard for a rule that was just disabled.
     int pushed = -2;
     if (push_fn_)
         pushed = push_fn_(/*scope=*/"", /*full_sync=*/true);
-    audit_fn_(req, "guaranteed_state.push", pushed >= 0 ? "success" : "denied", "GuaranteedState",
-              rule_id, detail + " agents=" + std::to_string(pushed));
+    // Audit the mutation under its OWN verb (not guaranteed_state.push) so "who
+    // enabled enforcement / switched mode" is queryable, and so a push-transport
+    // failure is not logged as an authz denial of a change that already
+    // persisted (governance C2). The deploy outcome rides in the detail.
+    const std::string deploy = pushed >= 0 ? ("deployed agents=" + std::to_string(pushed))
+                                           : "deploy not wired/failed";
+    audit_fn_(req, "guaranteed_state.rule.update", "success", "GuaranteedState", rule_id,
+              detail + " (" + deploy + ")");
     res.set_content(render_guards_fragment(""), "text/html; charset=utf-8");
 }
 
@@ -403,7 +411,7 @@ std::string GuardianRoutes::render_guard_detail_fragment(const std::string& guar
         if (auto r = store_->get_rule(guard_id)) {
             name = r->name;
             severity = r->severity.empty() ? severity : r->severity;
-            mode = r->enforcement_mode.empty() ? mode : r->enforcement_mode;
+            mode = (r->enforcement_mode == "enforce") ? "enforce" : "audit"; // empty→audit (C1/B2)
             os = r->os_target.empty() ? "all" : r->os_target;
             scope = r->scope_expr;
             yaml = r->yaml_source;
@@ -516,7 +524,7 @@ std::string GuardianRoutes::render_guard_form_fragment() const {
         "<option>critical</option><option selected>high</option><option>medium</option><option>low</option>"
         "</select></div>"
         "<div><label>Enforcement mode</label><select name=\"enforcement_mode\">"
-        "<option selected>enforce</option><option>audit</option><option>disabled</option></select></div>"
+        "<option selected>enforce</option><option>audit</option></select></div>"
         "</div>"
         "<label>Spark (trigger)</label><select name=\"spark_type\">"
         "<option value=\"registry-change\">registry-change</option></select>"
