@@ -144,6 +144,17 @@ message CommandRequest {
   // Agent waits (delay_seconds + random[0, stagger_seconds]) before executing.
   int32 stagger_seconds = 6;  // Max random delay in seconds (0 = no stagger)
   int32 delay_seconds   = 7;  // Fixed delay before execution (0 = immediate)
+
+  // Binary payload for commands carrying a serialized proto rather than text
+  // parameters — the Guardian push (plugin="__guard__", action="push_rules")
+  // puts a serialized GuaranteedStatePush here. proto3 string map values must
+  // be valid UTF-8, so binary proto bytes cannot ride in `parameters`.
+  // Mirrors the canonical proto/yuzu/agent/v1/agent.proto field 8. gpb DROPS
+  // any wire field absent from this proto, so both gateway copies
+  // (priv/proto/agent.proto and priv/proto/yuzu/agent/v1/agent.proto) must
+  // carry it. Half A, Guardian gateway fix. See docs/guardian-mvp-contract.md
+  // G2/G12.
+  bytes payload = 8;
 }
 
 message CommandResponse {
