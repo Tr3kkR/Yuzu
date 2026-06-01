@@ -97,6 +97,67 @@ TEST_CASE("InstructionStore: create with invalid type fails", "[instruction_stor
     CHECK(!result.has_value());
 }
 
+// ── spec.scope (scope-walking DSL) validation (PR-E) ────────────────────────
+
+namespace {
+InstructionDefinition scoped_def(const std::string& scope_and_assignment) {
+    InstructionDefinition def;
+    def.name = "Scoped";
+    def.type = "action";
+    def.plugin = "system_info";
+    def.action = "query";
+    def.version = "1.0";
+    def.yaml_source = "apiVersion: yuzu.io/v1alpha1\n"
+                      "kind: InstructionDefinition\n"
+                      "spec:\n" +
+                      scope_and_assignment;
+    return def;
+}
+} // namespace
+
+TEST_CASE("InstructionStore: spec.scope.fromResultSet with static mode is accepted + round-trips",
+          "[instruction_store][scope]") {
+    InstructionStore store(":memory:");
+    auto def = scoped_def("  scope:\n"
+                          "    fromResultSet: rs_abc\n"
+                          "  assignment:\n"
+                          "    mode: static\n");
+    auto r = store.create_definition(def);
+    REQUIRE(r.has_value());
+    auto got = store.get_definition(r.value());
+    REQUIRE(got.has_value());
+    CHECK(got->yaml_source.find("fromResultSet") != std::string::npos);
+}
+
+TEST_CASE("InstructionStore: spec.scope.fromResultSet with dynamic mode is rejected",
+          "[instruction_store][scope]") {
+    InstructionStore store(":memory:");
+    auto r = store.create_definition(scoped_def("  scope:\n"
+                                                "    fromResultSet: rs_abc\n"
+                                                "  assignment:\n"
+                                                "    mode: dynamic\n"));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("static") != std::string::npos);
+}
+
+TEST_CASE("InstructionStore: spec.scope.fromResultSet + assignment.managementGroups is rejected",
+          "[instruction_store][scope]") {
+    InstructionStore store(":memory:");
+    auto r = store.create_definition(scoped_def("  scope:\n"
+                                                "    fromResultSet: rs_abc\n"
+                                                "  assignment:\n"
+                                                "    managementGroups:\n"
+                                                "      - all-devices\n"));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("managementGroups") != std::string::npos);
+}
+
+TEST_CASE("InstructionStore: a scope-less definition is unaffected by PR-E validation",
+          "[instruction_store][scope]") {
+    InstructionStore store(":memory:");
+    CHECK(store.create_definition(make_question("Plain")).has_value());
+}
+
 // ── ID Uniqueness ─────────────────────────────────────────────────────────
 
 TEST_CASE("InstructionStore: auto-generated IDs are unique", "[instruction_store]") {

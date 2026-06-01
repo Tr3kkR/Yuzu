@@ -15,6 +15,7 @@
 #include "event_bus.hpp"
 #include "result_set_store.hpp"
 #include "scope_engine.hpp"
+#include "scope_yaml.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -88,5 +89,84 @@ TEST_CASE("evaluate_scope: from_result_set is owner-scoped (no cross-operator ta
     SECTION("empty principal (untracked raw-dispatch path) resolves nothing") {
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
         CHECK(matched.empty());
+    }
+}
+
+// ── Dispatch-time alias resolution (PR-E) ────────────────────────────────────
+
+TEST_CASE("resolve_scope_aliases: rewrites owner aliases, leaves ids/non-owners",
+          "[scope][result_set][authz]") {
+    yuzu::test::TempDbFile rs_db{std::string_view{"scope-alias-rs-"}};
+    ResultSetStore store(rs_db.path);
+    REQUIRE(store.is_open());
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.name = "alice-suspects"; // per-operator alias
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto set = store.create_materialized(cr, {"agent-win"});
+    REQUIRE(set.has_value());
+    const std::string canonical = "from_result_set:" + set->id;
+
+    SECTION("owner alias is rewritten to the canonical id") {
+        CHECK(resolve_scope_aliases("from_result_set:alice-suspects", "alice", &store) == canonical);
+    }
+    SECTION("composition: only the ref atom is rewritten") {
+        CHECK(resolve_scope_aliases("from_result_set:alice-suspects AND ostype == \"windows\"",
+                                    "alice", &store) == canonical + " AND ostype == \"windows\"");
+    }
+    SECTION("a canonical rs_ id passes through untouched") {
+        CHECK(resolve_scope_aliases(canonical, "alice", &store) == canonical);
+    }
+    SECTION("a non-owner's alias does not resolve (left as-is, no-matches downstream)") {
+        CHECK(resolve_scope_aliases("from_result_set:alice-suspects", "bob", &store) ==
+              "from_result_set:alice-suspects");
+    }
+    SECTION("empty owner is a no-op") {
+        CHECK(resolve_scope_aliases("from_result_set:alice-suspects", "", &store) ==
+              "from_result_set:alice-suspects");
+    }
+    SECTION("an alias inside a quoted literal is never rewritten") {
+        const std::string e = "hostname == \"from_result_set:alice-suspects\"";
+        CHECK(resolve_scope_aliases(e, "alice", &store) == e);
+    }
+}
+
+TEST_CASE("scope_refs_failing_owner_check: flags absent/unowned, not empty-but-owned",
+          "[scope][result_set][authz]") {
+    yuzu::test::TempDbFile rs_db{std::string_view{"scope-fail-rs-"}};
+    ResultSetStore store(rs_db.path);
+    REQUIRE(store.is_open());
+
+    CreateRequest cr;
+    cr.owner_principal = "alice";
+    cr.source_kind = std::string(source_kind::kManualCurate);
+    cr.source_payload = "{}";
+    auto owned = store.create_materialized(cr, {"agent-win"});
+    REQUIRE(owned.has_value());
+    auto empty_owned = store.create_materialized(cr, {}); // owned, zero members
+    REQUIRE(empty_owned.has_value());
+
+    SECTION("an owned, non-empty set is not flagged") {
+        CHECK(scope_refs_failing_owner_check("from_result_set:" + owned->id, "alice", &store)
+                  .empty());
+    }
+    SECTION("an owned but legitimately empty set is not flagged") {
+        CHECK(scope_refs_failing_owner_check("from_result_set:" + empty_owned->id, "alice", &store)
+                  .empty());
+    }
+    SECTION("an absent id is flagged") {
+        auto f = scope_refs_failing_owner_check("from_result_set:rs_does_not_exist", "alice", &store);
+        REQUIRE(f.size() == 1);
+        CHECK(f[0] == "rs_does_not_exist");
+    }
+    SECTION("another operator's id is flagged (not owned)") {
+        auto f = scope_refs_failing_owner_check("from_result_set:" + owned->id, "bob", &store);
+        REQUIRE(f.size() == 1);
+        CHECK(f[0] == owned->id);
+    }
+    SECTION("empty owner yields no findings (no owner context)") {
+        CHECK(scope_refs_failing_owner_check("from_result_set:" + owned->id, "", &store).empty());
     }
 }
