@@ -25,7 +25,9 @@
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
 #include <cstdint>
+#include <functional>
 #include <optional>
+#include <string>
 #include <string_view>
 
 namespace yuzu::agent {
@@ -52,6 +54,29 @@ struct ResilienceConfig {
     std::uint64_t backoff_initial_ms{1000};
     std::uint64_t backoff_max_ms{60000};
 };
+
+/// Canonical param keys for the resilience policy in a rule's `remediation.params`
+/// (design §8.5). THIS is the single source of truth: the agent parses these, and the
+/// C3b server JSON-schema + C3c dashboard form MUST emit exactly these keys (and the
+/// seconds-suffixed ones in seconds). Keep all three in lockstep with this list.
+namespace resilience_keys {
+inline constexpr std::string_view kMode = "mode";                       // persist|backoff|bounded
+inline constexpr std::string_view kMaxAttempts = "max_attempts";        // Bounded cycle cap
+inline constexpr std::string_view kQuietResetS = "quiet_reset_s";       // seconds
+inline constexpr std::string_view kResumeAfterS = "resume_after_s";     // seconds (0 = none)
+inline constexpr std::string_view kBackoffInitialMs = "backoff_initial_ms";
+inline constexpr std::string_view kBackoffMaxMs = "backoff_max_ms";
+inline constexpr std::string_view kEventDebounceMs = "event_debounce_ms";
+} // namespace resilience_keys
+
+/// Build a ResilienceConfig from a param lookup (`get(key)` returns the value or ""
+/// when absent) and write the event-debounce window (ms) to `event_debounce_ms_out`.
+/// Proto-free by design — the agent passes a lookup over the proto map; tests pass a
+/// lookup over a plain map — so the key names + unit conversions + defaults are
+/// deterministically unit-testable. Unknown/garbage values fall back to the default.
+YUZU_EXPORT ResilienceConfig
+parse_resilience_params(const std::function<std::string(std::string_view)>& get,
+                        std::uint64_t& event_debounce_ms_out);
 
 /// Outcome of decide(). The guard ALWAYS detects + emits; this only governs the
 /// remediation write/create and when the watch should wake itself next.

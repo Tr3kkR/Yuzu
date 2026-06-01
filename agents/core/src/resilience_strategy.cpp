@@ -8,9 +8,32 @@
 
 #include <algorithm> // std::min
 #include <cctype>    // std::tolower
+#include <charconv>  // std::from_chars
 #include <string>
 
 namespace yuzu::agent {
+namespace {
+std::uint64_t to_u64(const std::string& v, std::uint64_t dflt) {
+    if (v.empty()) return dflt;
+    std::uint64_t out = dflt;
+    auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), out);
+    return ec == std::errc{} ? out : dflt; // unknown/garbage → default
+}
+} // namespace
+
+ResilienceConfig parse_resilience_params(const std::function<std::string(std::string_view)>& get,
+                                         std::uint64_t& event_debounce_ms_out) {
+    using namespace resilience_keys;
+    ResilienceConfig c;
+    c.mode = parse_resilience_mode(get(kMode));
+    c.max_attempts = static_cast<std::uint32_t>(to_u64(get(kMaxAttempts), 5));
+    c.quiet_reset_ms = to_u64(get(kQuietResetS), 60) * 1000;  // authored in seconds
+    c.resume_after_ms = to_u64(get(kResumeAfterS), 0) * 1000; // authored in seconds
+    c.backoff_initial_ms = to_u64(get(kBackoffInitialMs), 1000);
+    c.backoff_max_ms = to_u64(get(kBackoffMaxMs), 60000);
+    event_debounce_ms_out = to_u64(get(kEventDebounceMs), 1000);
+    return c;
+}
 
 ResilienceMode parse_resilience_mode(std::string_view s) {
     std::string l;

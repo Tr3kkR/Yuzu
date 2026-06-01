@@ -11,6 +11,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
+#include <map>
+#include <string>
+#include <string_view>
+
 using namespace yuzu::agent;
 
 namespace {
@@ -157,4 +162,48 @@ TEST_CASE("parse_resilience_mode: names, case-insensitive, unknown -> Persist",
     CHECK(parse_resilience_mode("BOUNDED") == ResilienceMode::Bounded);
     CHECK(parse_resilience_mode("") == ResilienceMode::Persist);
     CHECK(parse_resilience_mode("nonsense") == ResilienceMode::Persist);
+}
+
+TEST_CASE("parse_resilience_params: canonical keys, seconds->ms, defaults",
+          "[guardian][resilience][strategy][parse][params]") {
+    std::map<std::string, std::string> p;
+    auto get = [&p](std::string_view k) -> std::string {
+        auto it = p.find(std::string(k));
+        return it != p.end() ? it->second : std::string{};
+    };
+    std::uint64_t debounce = 0;
+
+    SECTION("empty params -> defaults (Persist + 1s)") {
+        auto c = parse_resilience_params(get, debounce);
+        CHECK(c.mode == ResilienceMode::Persist);
+        CHECK(c.max_attempts == 5);
+        CHECK(c.quiet_reset_ms == 60'000);
+        CHECK(c.resume_after_ms == 0);
+        CHECK(c.backoff_initial_ms == 1'000);
+        CHECK(c.backoff_max_ms == 60'000);
+        CHECK(debounce == 1'000);
+    }
+
+    SECTION("explicit values, with seconds -> ms conversions") {
+        p = {{"mode", "bounded"},          {"max_attempts", "3"},
+             {"quiet_reset_s", "30"},      {"resume_after_s", "120"},
+             {"backoff_initial_ms", "500"}, {"backoff_max_ms", "8000"},
+             {"event_debounce_ms", "250"}};
+        auto c = parse_resilience_params(get, debounce);
+        CHECK(c.mode == ResilienceMode::Bounded);
+        CHECK(c.max_attempts == 3);
+        CHECK(c.quiet_reset_ms == 30'000);   // 30s -> ms (catches a key typo or missing *1000)
+        CHECK(c.resume_after_ms == 120'000); // 120s -> ms
+        CHECK(c.backoff_initial_ms == 500);
+        CHECK(c.backoff_max_ms == 8'000);
+        CHECK(debounce == 250);
+    }
+
+    SECTION("garbage / empty values fall back to defaults") {
+        p = {{"max_attempts", "abc"}, {"quiet_reset_s", ""}, {"event_debounce_ms", "x"}};
+        auto c = parse_resilience_params(get, debounce);
+        CHECK(c.max_attempts == 5);
+        CHECK(c.quiet_reset_ms == 60'000);
+        CHECK(debounce == 1'000);
+    }
 }

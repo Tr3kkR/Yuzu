@@ -504,27 +504,16 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
     cfg.enforce    = enforce;
 
     // C3: per-rule resilience policy + debounce live in the remediation block's params
-    // (design §8.5). Absent → defaults (Persist + 1s debounce), so existing rules keep
-    // their pre-C3 behaviour. Seconds-suffixed keys are authored in seconds.
+    // (design §8.5; canonical keys + parsing in resilience_strategy.hpp — the single
+    // source of truth the C3b schema and C3c form must match). Absent → defaults
+    // (Persist + 1s debounce), so existing rules keep their pre-C3 behaviour. The proto
+    // Map .find runs INSIDE this DLL, so parse_resilience_params stays proto-free.
     const auto& rem = rule.remediation();
-    auto rparam = [&rem](const char* k) -> std::string {
-        auto it = rem.params().find(k);
+    auto get = [&rem](std::string_view k) -> std::string {
+        auto it = rem.params().find(std::string(k));
         return it != rem.params().end() ? it->second : std::string{};
     };
-    auto rparam_u64 = [&](const char* k, std::uint64_t dflt) -> std::uint64_t {
-        const std::string v = rparam(k);
-        if (v.empty()) return dflt;
-        std::uint64_t out = dflt;
-        auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), out);
-        return ec == std::errc{} ? out : dflt;
-    };
-    cfg.resilience.mode = parse_resilience_mode(rparam("mode"));
-    cfg.resilience.max_attempts = static_cast<std::uint32_t>(rparam_u64("max_attempts", 5));
-    cfg.resilience.quiet_reset_ms = rparam_u64("quiet_reset_s", 60) * 1000;
-    cfg.resilience.resume_after_ms = rparam_u64("resume_after_s", 0) * 1000;
-    cfg.resilience.backoff_initial_ms = rparam_u64("backoff_initial_ms", 1000);
-    cfg.resilience.backoff_max_ms = rparam_u64("backoff_max_ms", 60000);
-    cfg.event_debounce_ms = rparam_u64("event_debounce_ms", 1000);
+    cfg.resilience = parse_resilience_params(get, cfg.event_debounce_ms);
 
     // Route drift through the engine rather than a captured sink copy, so a
     // guard armed before the sink is wired (A2 start_local pre-network) still

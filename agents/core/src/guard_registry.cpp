@@ -54,6 +54,12 @@ namespace {
 // Bounds the SINK only; the enforce remediation is gated separately by the per-rule
 // resilience strategy (C3, design §8.5).
 
+// Fallback re-arm cadence used ONLY when no watch (target or ancestor) could be armed
+// — a rare RegNotifyChangeKeyValue failure on a freshly-opened handle. Without it the
+// INFINITE wait would block forever, silently breaking live-until-disabled. The
+// healthy absent state never uses this — it stays fully event-driven (no poll).
+constexpr std::uint64_t kArmFailRetryMs = 30000;
+
 HKEY parse_hive(const std::string& hive) {
     if (hive == "HKLM") return HKEY_LOCAL_MACHINE;
     if (hive == "HKCU") return HKEY_CURRENT_USER;
@@ -408,10 +414,10 @@ void RegistryGuard::run() {
     // (Re)resolve the nearest existing ancestor from scratch and arm its NAME watch
     // on `ancestor_event`. Armed whenever the target is absent so a (re)creation
     // re-fires — robust to atomic whole-chain creation.
-    auto arm_ancestor = [&]() {
-        if (open_nearest_ancestor(root, cfg_.key, ancestor, ancestor_path))
-            RegNotifyChangeKeyValue(ancestor.get(), FALSE, REG_NOTIFY_CHANGE_NAME, ancestor_event,
-                                    /*async=*/TRUE);
+    auto arm_ancestor = [&]() -> bool {
+        return open_nearest_ancestor(root, cfg_.key, ancestor, ancestor_path) &&
+               RegNotifyChangeKeyValue(ancestor.get(), FALSE, REG_NOTIFY_CHANGE_NAME, ancestor_event,
+                                       /*async=*/TRUE) == ERROR_SUCCESS;
     };
 
     // Single source of truth. Re-resolve from scratch; ARM each subscription BEFORE
@@ -435,7 +441,7 @@ void RegistryGuard::run() {
         }
         // Absent: arm the ancestor (re)creation watch BEFORE re-checking existence,
         // so an atomic whole-chain recreate during this window re-fires ancestor_event.
-        arm_ancestor();
+        const bool ancestor_armed = arm_ancestor();
         if (open_target()) {
             if (RegNotifyChangeKeyValue(target.get(), FALSE, kNotifyFilter, target_event,
                                         /*async=*/TRUE) == ERROR_SUCCESS) {
@@ -448,9 +454,18 @@ void RegistryGuard::run() {
         // writes the value (C2); in audit it just reports the absence. If emit
         // restored the key, arm the value/deletion watch on it immediately.
         emit("<absent>", 0);
-        if (target)
+        if (target) {
             RegNotifyChangeKeyValue(target.get(), FALSE, kNotifyFilter, target_event,
                                     /*async=*/TRUE);
+        } else if (!ancestor_armed && !next_wake_ms) {
+            // Neither a target nor an ancestor watch could be armed (rare notify
+            // failure) and the strategy scheduled no wake — schedule a bounded
+            // degraded re-arm so the guard self-heals instead of blocking forever.
+            spdlog::warn("Guardian RegistryGuard[{}]: could not arm any watch for {}\\{} — "
+                         "degraded re-arm retry in {}ms",
+                         cfg_.rule_id, cfg_.hive, cfg_.key, kArmFailRetryMs);
+            next_wake_ms = kArmFailRetryMs;
+        }
     };
 
     spdlog::info("Guardian RegistryGuard[{}]: watching {}\\{} [{}] (expect {}={}) [resilient]",
