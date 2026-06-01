@@ -469,7 +469,15 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
     if (d.collapsed_count > 0)
         ev.set_drift_rate(static_cast<double>(d.collapsed_count));
     ev.mutable_timestamp()->set_seconds(now_ms / 1000);
+    // Stamp the agent's real platform (mirrors get_status) — not a hardcoded
+    // "windows", which would mislabel every drift event once Linux/macOS guards land.
+#if defined(_WIN32)
     ev.set_platform("windows");
+#elif defined(__APPLE__)
+    ev.set_platform("macos");
+#else
+    ev.set_platform("linux");
+#endif
     sink(ev);
 }
 

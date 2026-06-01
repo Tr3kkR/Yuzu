@@ -3126,11 +3126,16 @@ Create a rule.
 - **Permission:** `GuaranteedState:Write`
 - **Request body:**
 
+A rule may be authored **structured** (the agent-enforceable form) or **legacy** (`yaml_source` only, stored but not agent-enforced). Supply *either* a `spark`+`assertion` pair *or* a `yaml_source`.
+
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `rule_id` | string | Yes | Stable operator-chosen id. Must match `[A-Za-z0-9._-]+`. |
 | `name` | string | Yes | Human-readable name (unique per server). |
-| `yaml_source` | string | Yes | Full rule YAML (`kind: GuaranteedStateRule`). |
+| `spark` | object | Structured | `{type, params}` trigger block, e.g. `{"type":"registry-change"}` or `{"type":"file-change"}`. |
+| `assertion` | object | Structured | `{type, params}` desired-state block, e.g. `registry-value-equals`, `file-exists`, `file-hash-equals`. |
+| `remediation` | object | No | `{type, params}` — `alert-only` (default) or `enforce`. `params` carries the **resilience policy** (`mode`, `max_attempts`, `backoff_*`, …) and `event_debounce_ms`. |
+| `yaml_source` | string | Legacy | Full rule YAML; required only when no structured `spark`+`assertion` is given. The server generates `yaml_source` from the structured form otherwise. |
 | `version` | integer | No | Starting version (default `1`). |
 | `enabled` | boolean | No | Default `true`. |
 | `enforcement_mode` | string | No | `enforce` (default) or `audit`. |
@@ -3138,8 +3143,10 @@ Create a rule.
 | `os_target` | string | No | Empty (any) or `windows` / `linux` / `macos`. |
 | `scope_expr` | string | No | Scope DSL expression selecting target agents. |
 
+The catalog of valid `spark` / `assertion` / `remediation` types and their `params` (including the resilience-policy bounds) is discoverable at [`GET /api/v1/guaranteed-state/schemas`](#get-apiv1guaranteed-stateschemas).
+
 - **Response:** `201` with `data.rule_id`.
-- **4xx:** `400` missing required fields or invalid JSON; `409` on duplicate `rule_id` or duplicate `name`.
+- **4xx:** `400` missing required fields, invalid JSON, or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`.
 - **Audit:** `guaranteed_state.rule.create` (`success` / `denied`).
 
 #### `GET /api/v1/guaranteed-state/rules/{rule_id}`
@@ -3155,9 +3162,9 @@ Fetch a single rule.
 Update a rule. Version is incremented on every successful update regardless of whether any field changed.
 
 - **Permission:** `GuaranteedState:Write`
-- **Request body:** Any subset of the create-body fields (absent fields retain their current values).
+- **Request body:** Any subset of the create-body fields (absent fields retain their current values). A body carrying structured `spark`/`assertion`/`remediation` blocks **re-authors** the Guard (re-deriving the canonical spec and re-validating the resilience policy) rather than dropping them; a metadata-only body leaves the existing spec intact.
 - **Response:** `200` with `data.updated = true` and `data.version`.
-- **4xx:** `400` invalid JSON; `404` rule not found; `409` on name conflict.
+- **4xx:** `400` invalid JSON or an invalid resilience policy (A4 envelope); `404` rule not found; `409` on name conflict.
 - **Audit:** `guaranteed_state.rule.update`.
 
 #### `DELETE /api/v1/guaranteed-state/rules/{rule_id}`
@@ -3213,6 +3220,14 @@ Guaranteed State alerts (placeholder; alert aggregation lands in Guardian PR 11)
 
 - **Permission:** `GuaranteedState:Read`
 - **Response:** empty list in PR 2.
+
+#### `GET /api/v1/guaranteed-state/schemas`
+
+Guard authoring schema catalog — the static registry of `spark` / `assertion` / `remediation` types with per-type JSON Schemas. Driven by the same param-spec table the server-side validator uses, so the discovery surface and the validator cannot diverge. Drives dynamic authoring forms and agentic clients (the dashboard is one consumer).
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** `200` with `{version, schemas[]}`, each entry `{kind, type, json_schema}`. Includes the discriminated `registry-value-equals` encoding (per `value_type`) and the `file-hash-equals` `expected_hash` hex format.
+- **Caching:** carries a content-derived `ETag` and `Cache-Control: public, max-age=300`; a conditional request with `If-None-Match` returns `304 Not Modified`. The catalog is compiled-in, so this endpoint answers even when the rules store is unavailable.
 
 ---
 

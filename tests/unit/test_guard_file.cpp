@@ -21,9 +21,16 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using namespace yuzu::agent;
+
+// Ownership contract (cpp-safety): FileGuard owns a HANDLE + a std::thread; copy or
+// move would double-close / double-join. Must be non-copyable AND non-movable.
+static_assert(!std::is_copy_constructible_v<FileGuard>);
+static_assert(!std::is_copy_assignable_v<FileGuard>);
+static_assert(!std::is_move_constructible_v<FileGuard>);
 
 #ifdef _WIN32
 
@@ -270,6 +277,114 @@ TEST_CASE("FileGuard file-hash-equals: mismatch against a supplied expected hash
         CHECK(col->events.back().expected_value == std::string(64, '0'));
         CHECK(col->events.back().detected_value.size() == 64); // the real hash
     }
+    fs::remove_all(dir);
+}
+
+// ── teardown + resilience (governance Gate-7 hardening) ──────────────────────
+
+TEST_CASE("FileGuard: stop() with a watch armed but no change in-flight returns",
+          "[guardian][guard][file][teardown]") {
+    const auto dir = yuzu::test::unique_temp_path("fileguard-stopclean");
+    fs::create_directories(dir);
+    const auto target = dir / "x.txt";
+    write_file(target);
+    auto col = std::make_shared<FileDriftCollector>();
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-stopclean";
+    cfg.path = target.string();
+    cfg.expect_present = true; // compliant — no drift, watch just armed
+    FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
+    REQUIRE(g.start());
+    g.stop(); // must join promptly with no outstanding-IO crash (test timeout catches a hang)
+    fs::remove_all(dir);
+    SUCCEED();
+}
+
+TEST_CASE("FileGuard: stop() races an in-flight change notification without crashing",
+          "[guardian][guard][file][teardown]") {
+    // Tight start/change/stop loop exercises CancelIo + CloseHandle + join while a
+    // ReadDirectoryChangesW read is outstanding (the teardown UAF window).
+    for (int i = 0; i < 25; ++i) {
+        const auto dir = yuzu::test::unique_temp_path("fileguard-stoprace");
+        fs::create_directories(dir);
+        const auto target = dir / "y.txt";
+        write_file(target, "a");
+        FileGuard::Config cfg;
+        cfg.rule_id = "fg-stoprace";
+        cfg.path = target.string();
+        cfg.expect_present = true;
+        FileGuard g(cfg, [](const GuardDrift&) {});
+        REQUIRE(g.start());
+        write_file(target, "b"); // trigger a notification, then immediately tear down
+        fs::remove(target);
+        g.stop();
+        fs::remove_all(dir);
+    }
+    SUCCEED();
+}
+
+TEST_CASE("FileGuard file-exists: survives parent-dir delete and recreate",
+          "[guardian][guard][file][resilience]") {
+    const auto base = yuzu::test::unique_temp_path("fileguard-resil");
+    const auto parent = base / "sub";
+    const auto target = parent / "watched.txt";
+    fs::create_directories(parent);
+    write_file(target);
+
+    auto col = std::make_shared<FileDriftCollector>();
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-resil";
+    cfg.path = target.string();
+    cfg.expect_present = true;
+    cfg.event_debounce_ms = 50;
+    FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
+    REQUIRE(g.start());
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    // 1) delete the whole parent directory → file is absent → drift.
+    fs::remove_all(parent);
+    REQUIRE(col->wait_count(1, std::chrono::seconds(5)));
+
+    // 2) recreate the parent + file (compliant again), then delete once more — the
+    //    guard must have re-armed via the nearest-ancestor watch and detect again.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    fs::create_directories(parent);
+    write_file(target);
+    std::this_thread::sleep_for(std::chrono::milliseconds(400)); // let it re-arm + re-baseline present
+    fs::remove(target);
+    CHECK(col->wait_count(2, std::chrono::seconds(5))); // second <absent> proves survival
+    g.stop();
+    fs::remove_all(base);
+}
+
+TEST_CASE("FileGuard file-hash-equals: continuous sub-settle writes still get hashed (defer cap)",
+          "[guardian][guard][file][hash]") {
+    // A writer touching the file faster than settle_ms must not starve the hash
+    // forever — max_settle_defer_ms forces an evaluation (UP-1 regression guard).
+    const auto dir = yuzu::test::unique_temp_path("fileguard-defercap");
+    fs::create_directories(dir);
+    const auto target = dir / "churn.txt";
+    write_file(target, "v0");
+
+    auto col = std::make_shared<FileDriftCollector>();
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-defercap";
+    cfg.path = target.string();
+    cfg.assertion = FileGuard::Assertion::HashEquals; // baseline-on-arm = "v0"
+    cfg.settle_ms = 200;             // never quiesces under the 100ms write cadence below
+    cfg.max_settle_defer_ms = 600;   // ...but the cap forces a hash within ~600ms
+    cfg.event_debounce_ms = 50;
+    FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
+    REQUIRE(g.start());
+    std::this_thread::sleep_for(std::chrono::milliseconds(250)); // arm + baseline v0
+
+    for (int i = 1; i <= 14; ++i) { // ~1.4s of continuous changing writes < settle_ms apart
+        write_file(target, "v" + std::to_string(i));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    // Without the defer cap this would never fire (settle never quiesces).
+    CHECK(col->wait_count(1, std::chrono::seconds(3)));
+    g.stop();
     fs::remove_all(dir);
 }
 

@@ -41,11 +41,20 @@
 #endif
 #include <windows.h>
 
+#include "guard_win_handle.hpp"
+
+#include <algorithm>
 #include <cstddef>
 #include <string>
 
 namespace yuzu::agent {
 namespace {
+
+// Degraded re-arm cadence used ONLY when no watch (dir or ancestor) could be armed
+// — a rare failure. Without it the INFINITE wait would block forever, silently
+// breaking live-until-disabled (mirrors RegistryGuard's kArmFailRetryMs). The
+// healthy path never uses this — it stays fully event-driven (no poll).
+constexpr DWORD kArmFailRetryMs = 30000;
 
 std::wstring to_wide(const std::string& s) {
     if (s.empty()) return {};
@@ -107,7 +116,10 @@ void FileGuard::stop() {
     }
 }
 
-void FileGuard::run() {
+void FileGuard::run() try {
+    using detail::ChangeNotifyHandle;
+    using detail::DirHandle;
+    using detail::EventHandle;
     namespace fs = std::filesystem;
     const fs::path target(cfg_.path);
     const fs::path parent = target.parent_path();
@@ -119,11 +131,18 @@ void FileGuard::run() {
     // not a correctness one.
     alignas(DWORD) std::byte notify_buf[32 * 1024];
 
-    HANDLE dir_event = CreateEventW(nullptr, FALSE, FALSE, nullptr); // auto-reset OVERLAPPED hEvent
+    // RAII owners — released on EVERY exit, including an exception unwind (the sink
+    // does a network write and can throw); a leaked HANDLE + std::terminate is what
+    // the manual-cleanup version risked.
+    EventHandle dir_event(CreateEventW(nullptr, FALSE, FALSE, nullptr)); // auto-reset OVERLAPPED hEvent
+    if (!dir_event) {
+        spdlog::error("Guardian FileGuard[{}]: CreateEventW failed — watch not started", cfg_.rule_id);
+        return;
+    }
     OVERLAPPED ov{};
-    ov.hEvent = dir_event;
-    HANDLE h_dir = INVALID_HANDLE_VALUE; // parent dir, open for ReadDirectoryChangesW
-    HANDLE ancestor_event = nullptr;     // FindFirstChangeNotification (waitable)
+    ov.hEvent = dir_event.get();
+    DirHandle h_dir;                   // parent dir, open for ReadDirectoryChangesW
+    ChangeNotifyHandle ancestor_event; // FindFirstChangeNotificationW (normalises -1 → empty)
     bool read_pending = false;
 
     // Collapse-with-count debounce (shared convention with RegistryGuard, H3/#1209).
@@ -134,31 +153,23 @@ void FileGuard::run() {
     std::string baseline;      // captured-on-arm hash when expected_hash is empty
     bool baseline_set = false;
     bool hash_pending = false; // a change is settling before we (re)hash
+    std::chrono::steady_clock::time_point settle_first{}; // when the current settle window began
+    bool arm_retry = false;    // no watch could be armed → degraded bounded re-arm scheduled
 
-    auto close_dir = [&] {
-        if (h_dir != INVALID_HANDLE_VALUE) {
-            CancelIo(h_dir);
-            CloseHandle(h_dir);
-            h_dir = INVALID_HANDLE_VALUE;
-        }
+    auto reset_dir = [&](HANDLE h = nullptr) {
+        h_dir.reset(h);
         read_pending = false;
-    };
-    auto close_ancestor = [&] {
-        if (ancestor_event) {
-            FindCloseChangeNotification(ancestor_event);
-            ancestor_event = nullptr;
-        }
     };
 
     // (Re)issue ReadDirectoryChangesW on the already-open parent handle.
     auto arm_dir_read = [&]() -> bool {
-        if (h_dir == INVALID_HANDLE_VALUE)
+        if (!h_dir)
             return false;
         constexpr DWORD kFilter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
                                   FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE |
                                   FILE_NOTIFY_CHANGE_CREATION;
-        read_pending = ReadDirectoryChangesW(h_dir, notify_buf, sizeof(notify_buf), FALSE, kFilter,
-                                             nullptr, &ov, nullptr) != 0;
+        read_pending = ReadDirectoryChangesW(h_dir.get(), notify_buf, sizeof(notify_buf), FALSE,
+                                             kFilter, nullptr, &ov, nullptr) != 0;
         return read_pending;
     };
 
@@ -245,28 +256,35 @@ void FileGuard::run() {
     };
 
     // Re-resolve the watch from scratch (no eval): arm the parent-dir watch if the
-    // parent exists, else the nearest-ancestor watch for its (re)creation.
+    // parent exists, else the nearest-ancestor watch for its (re)creation. Sets
+    // arm_retry when NEITHER could be armed so the wait loop self-heals.
     auto arm_watch = [&] {
-        close_dir();
-        close_ancestor();
+        reset_dir();
+        ancestor_event.reset();
+        arm_retry = false;
         std::error_code ec;
         if (!parent.empty() && fs::is_directory(parent, ec)) {
-            h_dir = CreateFileW(parent.wstring().c_str(), FILE_LIST_DIRECTORY,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-                                nullptr);
-            if (h_dir != INVALID_HANDLE_VALUE && !arm_dir_read())
-                close_dir();
+            reset_dir(CreateFileW(parent.wstring().c_str(), FILE_LIST_DIRECTORY,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                                  nullptr));
+            if (h_dir && !arm_dir_read())
+                reset_dir();
         }
-        if (h_dir == INVALID_HANDLE_VALUE) {
+        if (!h_dir) {
             fs::path anc = parent;
             std::error_code ec2;
             while (!anc.empty() && !fs::is_directory(anc, ec2))
                 anc = anc.parent_path();
             if (!anc.empty())
-                ancestor_event = FindFirstChangeNotificationW(
+                ancestor_event.reset(FindFirstChangeNotificationW(
                     anc.wstring().c_str(), TRUE,
-                    FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_FILE_NAME);
+                    FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_FILE_NAME));
+            if (!h_dir && !ancestor_event) {
+                arm_retry = true; // both arms failed → bounded degraded re-arm (no deaf-forever)
+                spdlog::warn("Guardian FileGuard[{}]: no watch armed for {} — degraded re-arm in {}ms",
+                             cfg_.rule_id, cfg_.path, kArmFailRetryMs);
+            }
         }
     };
 
@@ -277,19 +295,31 @@ void FileGuard::run() {
             eval_exists();
     };
 
-    // True iff the completed read mentions our target filename (or overflowed).
+    auto begin_settle = [&] {
+        if (!hash_pending) {
+            hash_pending = true;
+            settle_first = std::chrono::steady_clock::now();
+        }
+    };
+
+    // True iff the completed read mentions our target filename (or overflowed). The
+    // record walk is bounded by `bytes` so a malformed/truncated buffer cannot run
+    // past the data the kernel actually returned.
     auto change_is_ours = [&](DWORD bytes) -> bool {
         if (bytes == 0)
             return true; // buffer overflow — can't tell, reconcile
-        auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(notify_buf);
-        for (;;) {
-            const std::wstring_view name(info->FileName, info->FileNameLength / sizeof(WCHAR));
+        std::size_t off = 0;
+        while (off + offsetof(FILE_NOTIFY_INFORMATION, FileName) <= bytes) {
+            auto* info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(notify_buf + off);
+            const std::size_t name_bytes = info->FileNameLength;
+            if (off + offsetof(FILE_NOTIFY_INFORMATION, FileName) + name_bytes > bytes)
+                break; // truncated record — stop
+            const std::wstring_view name(info->FileName, name_bytes / sizeof(WCHAR));
             if (iequals_w(name, fname))
                 return true;
             if (info->NextEntryOffset == 0)
                 break;
-            info = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(
-                reinterpret_cast<const std::byte*>(info) + info->NextEntryOffset);
+            off += info->NextEntryOffset;
         }
         return false;
     };
@@ -305,40 +335,62 @@ void FileGuard::run() {
         DWORD n = 0;
         const DWORD idx_dir = read_pending ? n : 0xFFFFFFFF;
         if (idx_dir != 0xFFFFFFFF)
-            handles[n++] = dir_event;
+            handles[n++] = dir_event.get();
         const DWORD idx_anc = ancestor_event ? n : 0xFFFFFFFF;
         if (idx_anc != 0xFFFFFFFF)
-            handles[n++] = ancestor_event;
+            handles[n++] = ancestor_event.get();
         const DWORD idx_stop = n;
         handles[n++] = static_cast<HANDLE>(stop_event_);
 
-        // Finite timeout only while a hash change is settling (writes are not atomic;
-        // hash once the file quiesces). Otherwise block on OS events (no poll).
-        const DWORD timeout =
-            (hash_mode && hash_pending) ? static_cast<DWORD>(cfg_.settle_ms) : INFINITE;
+        // Timeout selection (no busy-poll): a settling hash change uses the settle
+        // window, but bounded by max_settle_defer so a continuous write storm cannot
+        // starve the hash forever (UP-1); a failed-to-arm watch uses a degraded retry;
+        // otherwise block on OS events.
+        DWORD timeout = INFINITE;
+        if (hash_mode && hash_pending) {
+            const auto deferred = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now() - settle_first)
+                                      .count();
+            const std::uint64_t cap_left =
+                deferred >= static_cast<long long>(cfg_.max_settle_defer_ms)
+                    ? 0
+                    : cfg_.max_settle_defer_ms - static_cast<std::uint64_t>(deferred);
+            timeout = static_cast<DWORD>(std::min<std::uint64_t>(cfg_.settle_ms, cap_left));
+        } else if (arm_retry) {
+            timeout = kArmFailRetryMs;
+        }
+
         const DWORD r = WaitForMultipleObjects(n, handles, FALSE, timeout);
         if (r == WAIT_OBJECT_0 + idx_stop)
             break;
         if (r == WAIT_TIMEOUT) {
-            // Settle window elapsed quietly → hash the now-quiesced content, then
-            // re-resolve the watch (handles a parent deleted during the write).
-            hash_pending = false;
-            eval_hash();
-            arm_watch();
-        } else if (idx_dir != 0xFFFFFFFF && r == WAIT_OBJECT_0 + idx_dir) {
+            if (hash_mode && hash_pending) {
+                // Settle quiesced (or the max-defer cap fired) → hash now, then
+                // re-resolve the watch (handles a parent deleted during the write).
+                hash_pending = false;
+                eval_hash();
+                arm_watch();
+            } else if (arm_retry) {
+                arm_watch(); // degraded re-arm
+                eval_now();
+            }
+            continue;
+        }
+        if (idx_dir != 0xFFFFFFFF && r == WAIT_OBJECT_0 + idx_dir) {
             DWORD bytes = 0;
-            GetOverlappedResult(h_dir, &ov, &bytes, FALSE);
+            const BOOL got = GetOverlappedResult(h_dir.get(), &ov, &bytes, FALSE);
             read_pending = false;
-            const bool ours = change_is_ours(bytes);
+            // On a GetOverlappedResult failure we can't trust the buffer → reconcile.
+            const bool ours = (got == FALSE) || change_is_ours(bytes);
             if (!ours) {
                 if (!arm_dir_read())
                     arm_watch(); // re-arm failed (dir gone) → rebuild
             } else if (hash_mode) {
                 // Defer the (expensive, mid-write-prone) hash to the settle timeout;
-                // just keep the read armed and (re)start the settle countdown.
+                // keep the read armed and (re)start the bounded settle countdown.
                 if (!arm_dir_read())
                     arm_watch();
-                hash_pending = true;
+                begin_settle();
             } else {
                 arm_watch(); // existence: re-resolve + evaluate now
                 eval_exists();
@@ -346,17 +398,23 @@ void FileGuard::run() {
         } else if (idx_anc != 0xFFFFFFFF && r == WAIT_OBJECT_0 + idx_anc) {
             arm_watch();
             if (hash_mode)
-                hash_pending = true; // settle, then hash the (re)created file
+                begin_settle(); // settle, then hash the (re)created file
             else
                 eval_exists();
         } else {
+            spdlog::error("Guardian FileGuard[{}]: WaitForMultipleObjects failed (r={}, err={}) — "
+                          "watch stopping",
+                          cfg_.rule_id, r, GetLastError());
             break; // WAIT_FAILED / WAIT_ABANDONED — unrecoverable
         }
     }
-
-    close_dir();
-    close_ancestor();
-    CloseHandle(dir_event);
+    // RAII: dir_event / h_dir / ancestor_event released by their destructors.
+} catch (const std::exception& e) {
+    spdlog::error("Guardian FileGuard[{}]: watch thread exception: {} — watch stopping", cfg_.rule_id,
+                  e.what());
+} catch (...) {
+    spdlog::error("Guardian FileGuard[{}]: watch thread unknown exception — watch stopping",
+                  cfg_.rule_id);
 }
 
 } // namespace yuzu::agent

@@ -56,6 +56,12 @@ public:
         std::string expected_hash;                       ///< lowercase hex SHA-256; empty = baseline-on-arm
         std::uint64_t max_hash_bytes{64ull * 1024 * 1024}; ///< hashing-DoS cap; over → "<oversize>" drift
         std::uint64_t settle_ms{750};                    ///< coalesce window before hashing (writes are not atomic)
+        /// Upper bound on how long a continuous write storm may defer the hash. The
+        /// settle window restarts on every notification, so without this cap a writer
+        /// touching the file faster than settle_ms would starve the hash forever
+        /// (drift invisible). Once this much has elapsed since the first un-hashed
+        /// change, hash anyway. Default 5s.
+        std::uint64_t max_settle_defer_ms{5000};
         /// Event/sink debounce window (ms) — collapses rapid drift events into a
         /// count (shared convention with RegistryGuard). 0 = emit every drift.
         std::uint64_t event_debounce_ms{1000};

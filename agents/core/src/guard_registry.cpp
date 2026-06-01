@@ -39,6 +39,8 @@
 #endif
 #include <windows.h>
 
+#include "guard_win_handle.hpp"
+
 #include <algorithm>
 #include <charconv>
 #include <cstring>
@@ -255,7 +257,7 @@ void RegistryGuard::stop() {
     }
 }
 
-void RegistryGuard::run() {
+void RegistryGuard::run() try {
     HKEY root = parse_hive(cfg_.hive); // validated in start()
 
     // FIXED wait set: two lifetime auto-reset events + the stop event. We arm/disarm
@@ -263,13 +265,13 @@ void RegistryGuard::run() {
     // classic "read the wrong handle" bug). `target_event` carries value drift +
     // deletion of the watched key (sub-ms fast path); `ancestor_event` carries
     // (re)creation seen at the nearest existing ancestor while the key is absent.
-    HANDLE target_event = CreateEventW(nullptr, /*manualReset=*/FALSE, /*initial=*/FALSE, nullptr);
-    HANDLE ancestor_event = CreateEventW(nullptr, /*manualReset=*/FALSE, /*initial=*/FALSE, nullptr);
+    // RAII owners — released on every exit incl. an exception unwind (the sink does a
+    // network write and can throw); the manual-close version leaked + std::terminate'd.
+    detail::EventHandle target_event(CreateEventW(nullptr, /*manualReset=*/FALSE, /*initial=*/FALSE, nullptr));
+    detail::EventHandle ancestor_event(CreateEventW(nullptr, /*manualReset=*/FALSE, /*initial=*/FALSE, nullptr));
     if (!target_event || !ancestor_event) {
-        if (target_event) CloseHandle(target_event);
-        if (ancestor_event) CloseHandle(ancestor_event);
         spdlog::error("Guardian RegistryGuard[{}]: event creation failed", cfg_.rule_id);
-        return;
+        return; // RAII closes whichever event was created
     }
 
     RegKeyHandle target;       // owned; valid iff the watched key currently exists
@@ -416,7 +418,8 @@ void RegistryGuard::run() {
     // re-fires — robust to atomic whole-chain creation.
     auto arm_ancestor = [&]() -> bool {
         return open_nearest_ancestor(root, cfg_.key, ancestor, ancestor_path) &&
-               RegNotifyChangeKeyValue(ancestor.get(), FALSE, REG_NOTIFY_CHANGE_NAME, ancestor_event,
+               RegNotifyChangeKeyValue(ancestor.get(), FALSE, REG_NOTIFY_CHANGE_NAME,
+                                       ancestor_event.get(),
                                        /*async=*/TRUE) == ERROR_SUCCESS;
     };
 
@@ -427,7 +430,7 @@ void RegistryGuard::run() {
         next_wake_ms.reset(); // fresh evaluation; emit() re-sets it iff the strategy schedules a wake
         // Fast path: the watched key exists → arm value/deletion notify, then read.
         if (open_target()) {
-            if (RegNotifyChangeKeyValue(target.get(), FALSE, kNotifyFilter, target_event,
+            if (RegNotifyChangeKeyValue(target.get(), FALSE, kNotifyFilter, target_event.get(),
                                         /*async=*/TRUE) == ERROR_SUCCESS) {
                 const auto t0 = std::chrono::steady_clock::now();
                 std::string detected = read_value(target.get(), cfg_.value_name);
@@ -443,7 +446,7 @@ void RegistryGuard::run() {
         // so an atomic whole-chain recreate during this window re-fires ancestor_event.
         const bool ancestor_armed = arm_ancestor();
         if (open_target()) {
-            if (RegNotifyChangeKeyValue(target.get(), FALSE, kNotifyFilter, target_event,
+            if (RegNotifyChangeKeyValue(target.get(), FALSE, kNotifyFilter, target_event.get(),
                                         /*async=*/TRUE) == ERROR_SUCCESS) {
                 emit(read_value(target.get(), cfg_.value_name), 0);
                 return;
@@ -455,7 +458,7 @@ void RegistryGuard::run() {
         // restored the key, arm the value/deletion watch on it immediately.
         emit("<absent>", 0);
         if (target) {
-            RegNotifyChangeKeyValue(target.get(), FALSE, kNotifyFilter, target_event,
+            RegNotifyChangeKeyValue(target.get(), FALSE, kNotifyFilter, target_event.get(),
                                     /*async=*/TRUE);
         } else if (!ancestor_armed && !next_wake_ms) {
             // Neither a target nor an ancestor watch could be armed (rare notify
@@ -473,7 +476,8 @@ void RegistryGuard::run() {
 
     reconcile(); // initial compare + initial arm
 
-    HANDLE handles[3] = {target_event, ancestor_event, static_cast<HANDLE>(stop_event_)};
+    HANDLE handles[3] = {target_event.get(), ancestor_event.get(),
+                         static_cast<HANDLE>(stop_event_)};
     while (!stop_.load(std::memory_order_acquire)) {
         // INFINITE unless the strategy scheduled a self-wake (Backoff retry / Bounded
         // resume) — keeps Persist / audit / idle fully quiescent (no busy-wake).
@@ -491,9 +495,14 @@ void RegistryGuard::run() {
             break; // WAIT_FAILED / WAIT_ABANDONED — unrecoverable
     }
 
-    CloseHandle(target_event);
-    CloseHandle(ancestor_event);
-    // RegKeyHandle dtors close target + ancestor.
+    // RAII: target_event / ancestor_event (and RegKeyHandle target / ancestor) close
+    // on scope exit, including an exception unwind.
+} catch (const std::exception& e) {
+    spdlog::error("Guardian RegistryGuard[{}]: watch thread exception: {} — watch stopping",
+                  cfg_.rule_id, e.what());
+} catch (...) {
+    spdlog::error("Guardian RegistryGuard[{}]: watch thread unknown exception — watch stopping",
+                  cfg_.rule_id);
 }
 
 } // namespace yuzu::agent
