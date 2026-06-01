@@ -60,6 +60,7 @@ skill claims anything is "done."
 | `auth.admin_required` denied audit on every 403 | Shipped (gate) | `auth_routes.cpp:150` inside `require_admin` |
 | Private-key permission validation | Shipped | `cert_reloader.cpp:120` `validate_key_file_permissions()` (helper in `file_utils.hpp`); called at startup from `server.cpp` and on hot-reload |
 | Metrics endpoint localhost-only-no-auth | Shipped | `server.cpp:1621` (loopback always unauthenticated; remote behavior toggled by `cfg.metrics_require_auth`) |
+| MFA / TOTP self-service enrollment + login challenge + recovery codes (PR 1 of 3) | Shipped (v0.12, SOC 2 CC6.6) | `server/core/src/totp.{hpp,cpp}` (RFC 6238 + base32); `AuthDB::mfa_*` accessors at `auth_db.cpp` "MFA / TOTP Operations" section; `POST /login` 202-branch + `POST /login/mfa` at `auth_routes.cpp`; Settings panel via `render_mfa_fragment` + `/api/settings/mfa/*` at `settings_routes.cpp`. Step-up (PR 2) and enforcement/`amr` (PR 3) pending. Full reference: `docs/auth-mfa-design.md`. |
 
 ---
 
@@ -75,7 +76,9 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 
 | Feature | Workstream B line | SOC 2 link | Gap class |
 |---|---|---|---|
-| **MFA / 2FA / TOTP for high-risk approvals** | "2FA/TOTP for high-risk approvals" | CC6.6 | **MISSING** |
+| **MFA / 2FA / TOTP — self-service enrollment + login challenge** (PR 1 of MFA ladder; shipped v0.12, `docs/auth-mfa-design.md`) | "2FA/TOTP for high-risk approvals" | CC6.6 | **PARTIAL — base layer shipped, step-up + enforcement pending** |
+| **MFA step-up on high-risk endpoints** (PR 2 of MFA ladder) | same line | CC6.6 | **MISSING** |
+| **MFA enforcement modes (`admin-only` / `required`) + OIDC `amr` short-circuit** (PR 3 of MFA ladder) | same line | CC6.6 | **MISSING** |
 | **Hardened-mode local-password disable** | "Disable local-password fallback in hardened mode" | CC6.3 | **MISSING** |
 | **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **MISSING** |
 | **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **MISSING** |

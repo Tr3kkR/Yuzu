@@ -2403,8 +2403,22 @@ private:
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
-            // Rate limiting — check before auth to protect against brute force
-            bool is_login = (req.path == "/login" && req.method == "POST");
+            // Rate limiting — check before auth to protect against brute force.
+            // Both /login and /login/mfa share the tighter login-rate bucket;
+            // the MFA challenge is part of the same per-IP credential-brute
+            // surface and must not fall through to the looser api_rate_limiter_
+            // (Hermes Agent red-team finding LOW #6, 2026-05-29). The per-
+            // pending-token 5-attempt cap on /login/mfa is the second layer of
+            // this defence and remains in place at AuthRoutes::POST /login/mfa.
+            // `/login/mfa/stepup` joins this bucket (PR2): the endpoint
+            // accepts the same TOTP / recovery code space as `/login/mfa`
+            // so a malicious operator with a stolen valid session could
+            // pound the space to brute-force the secret. Step-up has no
+            // per-pending-token attempts cap (the session IS the
+            // credential), so the per-IP rate limit is the only brake.
+            bool is_login = (req.path == "/login" || req.path == "/login/mfa" ||
+                             req.path == "/login/mfa/stepup") &&
+                            req.method == "POST";
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
                 res.status = 429;
@@ -2415,7 +2429,7 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
-            // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec.
+            // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
             // /health and /api/health are ALSO covered by the early-return
             // exemption at the top of this lambda (which additionally skips
             // rate limiting). They are kept in this list as defense-in-depth
@@ -2423,9 +2437,18 @@ private:
             // /livez|/readyz alone would silently start requiring auth on
             // /health without this lower entry. Governance Gate 7, security
             // re-review LOW. Do not remove either site without updating both.
-            if (req.path == "/login" || req.path == "/health" || req.path == "/api/health" ||
-                req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
-                req.path == "/api/v1/openapi.json" || req.path.starts_with("/static/")) {
+            //
+            // `/login/mfa` MUST be unauthenticated for the same reason `/login`
+            // is: the MFA challenge completes the login. The pending token is
+            // the only credential the caller has at this point — they have no
+            // session cookie yet. Hermes Agent's red-team review (2026-05-29)
+            // caught the omission; without it, MFA-enrolled users are locked
+            // out because every POST /login/mfa redirects to /login before the
+            // route handler runs.
+            if (req.path == "/login" || req.path == "/login/mfa" || req.path == "/health" ||
+                req.path == "/api/health" || req.path == "/auth/oidc/start" ||
+                req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
+                req.path.starts_with("/static/")) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
@@ -3335,6 +3358,29 @@ private:
             res.set_content(kDashboardIndexHtml, "text/html; charset=utf-8");
         });
 
+        // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
+        // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
+        // register_routes sites; DRY'd up here so a future change updates
+        // both surfaces atomically). Hoisted to the top of start_web_server
+        // because SettingsRoutes::register_routes (called just below) and
+        // RestApiV1::register_routes (called later in this same function)
+        // both consume it. The closure captures cfg_ + auth_mgr_ + audit_log
+        // and dispatches into `require_mfa_step_up`. `std::function` copies
+        // it into each call site.
+        StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const auth::Session& session,
+                                     const std::string& action_label) -> bool {
+            if (!auth_mgr_.auth_db_ptr())
+                return true; // defensive — auth_db is always non-null in production
+            return require_mfa_step_up(
+                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
+                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
+                       const std::string& tt, const std::string& ti, const std::string& d) {
+                    return audit_log(r, a, rs, tt, ti, d);
+                },
+                action_label);
+        };
+
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
         settings_routes_ = std::make_unique<SettingsRoutes>();
         settings_routes_->register_routes(
@@ -3362,7 +3408,7 @@ private:
             })
                              : SettingsRoutes::GatewaySessionCountFn{},
             [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
-            /*metrics_registry=*/&metrics_);
+            /*metrics_registry=*/&metrics_, step_up_fn);
 
         // Legacy routes — redirect to dashboard
         web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
@@ -6461,7 +6507,10 @@ private:
             // so the async result-set producers (from-tar-query /
             // from-instruction-result / re-eval) drive the exact dispatch path
             // (PR-D). Empty closure would 503 those routes.
-            command_dispatch_fn);
+            command_dispatch_fn,
+            // PR2 MFA step-up gate for the high-risk REST handlers; empty
+            // closure disables the gate (preserves pre-PR2 behaviour).
+            step_up_fn);
 
         // -- Register MCP server routes ----------------------------------------
 
