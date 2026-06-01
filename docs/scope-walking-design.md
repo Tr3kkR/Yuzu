@@ -265,7 +265,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 | `result_set.pin` / `result_set.unpin` | `success` | |
 | `result_set.delete` | `success` | Pinned sets require explicit unpin first; `delete` of an unpinned set is single-action |
 | `result_set.gc_sweep` | `success` | Aggregate row, written once per sweep with the count |
-| `instruction.scope_resolution_failed` | `failure` | When invocation-time resolve fails. Includes instruction_id, result_set_id, reason |
+| `instruction.scope_resolution_failed` | `failure` | When invocation-time resolve fails (set absent, expired, or not owned). `detail` = `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<result-set id-or-alias> reason=...`; `target_id` = the ref. The `command_id` is the per-dispatch correlation id (joins to the execution/response records). Also increments `yuzu_scope_resolution_failed_total`. |
 
 Prometheus metrics:
 
