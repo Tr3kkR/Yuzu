@@ -47,6 +47,7 @@
 #include "result_set_matcher.hpp"
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
+#include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "mcp_jsonrpc.hpp"
@@ -6698,115 +6699,10 @@ private:
         res.set_content("{\"status\":\"sent\"}", "application/json");
     }
 
-    // -- Scope helpers -------------------------------------------------------
-
-    // Matches scope_engine.cpp read_ident's charset; governs where a
-    // from_result_set:<ref> atom ends.
-    static bool is_scope_ident_char(char c) {
-        unsigned char u = static_cast<unsigned char>(c);
-        return std::isalnum(u) || c == '_' || c == '.' || c == ':' || c == '-' || c == '*';
-    }
-
-    // Rewrite each `from_result_set:<alias>` atom (a ref not already a canonical
-    // rs_ id) to its canonical id via store->resolve_alias(owner, alias), so the
-    // documented alias form (design §7) resolves at the dispatch layer where the
-    // owner is known — the scope resolver itself does not resolve aliases
-    // (agent_registry.cpp). Canonical ids and unresolved aliases are left as-is:
-    // an unknown/unowned ref simply no-matches downstream (stale drops silently,
-    // design §4.3). No-op when owner is empty or store is null, mirroring the
-    // resolver's empty-principal contract so the policy / no-owner dispatch paths
-    // stay inert. Quoted string literals are copied verbatim so a literal
-    // "from_result_set:" inside a value is never rewritten.
-    static std::string resolve_scope_aliases(std::string_view expr, const std::string& owner,
-                                             ResultSetStore* store) {
-        static constexpr std::string_view kPrefix = "from_result_set:";
-        if (owner.empty() || store == nullptr || expr.find(kPrefix) == std::string_view::npos)
-            return std::string(expr);
-        std::string out;
-        out.reserve(expr.size());
-        size_t i = 0;
-        while (i < expr.size()) {
-            char c = expr[i];
-            if (c == '"' || c == '\'') { // copy quoted literal verbatim
-                char quote = c;
-                out += c;
-                for (++i; i < expr.size(); ++i) {
-                    out += expr[i];
-                    if (expr[i] == quote) {
-                        ++i;
-                        break;
-                    }
-                }
-                continue;
-            }
-            bool at_boundary = (i == 0) || !is_scope_ident_char(expr[i - 1]);
-            if (at_boundary && expr.substr(i).starts_with(kPrefix)) {
-                size_t rs = i + kPrefix.size();
-                size_t j = rs;
-                while (j < expr.size() && is_scope_ident_char(expr[j]))
-                    ++j;
-                std::string ref(expr.substr(rs, j - rs));
-                if (!ref.empty() && !ref.starts_with("rs_")) {
-                    if (auto canon = store->resolve_alias(owner, ref))
-                        ref = *canon;
-                }
-                out += kPrefix;
-                out += ref;
-                i = j;
-                continue;
-            }
-            out += c;
-            ++i;
-        }
-        return out;
-    }
-
-    // Return the from_result_set:<ref> atoms in `expr` (already alias-resolved)
-    // that fail the owner check: the set is absent/expired (store->get == none)
-    // or owned by someone else. Distinct from a set that exists, is owned, and
-    // is legitimately empty — that is NOT a failure and is not reported here, so
-    // the caller's audit row (design §7 rule 3) never fires on an empty set or
-    // on individual stale members (which drop silently, design §4.3). Walks the
-    // same token grammar as resolve_scope_aliases; empty when owner is empty or
-    // the store is null (no owner context to check against).
-    static std::vector<std::string> scope_refs_failing_owner_check(std::string_view expr,
-                                                                   const std::string& owner,
-                                                                   ResultSetStore* store) {
-        std::vector<std::string> failing;
-        static constexpr std::string_view kPrefix = "from_result_set:";
-        if (owner.empty() || store == nullptr || expr.find(kPrefix) == std::string_view::npos)
-            return failing;
-        size_t i = 0;
-        while (i < expr.size()) {
-            char c = expr[i];
-            if (c == '"' || c == '\'') {
-                char quote = c;
-                for (++i; i < expr.size(); ++i)
-                    if (expr[i] == quote) {
-                        ++i;
-                        break;
-                    }
-                continue;
-            }
-            bool at_boundary = (i == 0) || !is_scope_ident_char(expr[i - 1]);
-            if (at_boundary && expr.substr(i).starts_with(kPrefix)) {
-                size_t rs = i + kPrefix.size();
-                size_t j = rs;
-                while (j < expr.size() && is_scope_ident_char(expr[j]))
-                    ++j;
-                std::string ref(expr.substr(rs, j - rs));
-                if (!ref.empty()) {
-                    auto set = store->get(ref);
-                    if (!set || set->owner_principal != owner)
-                        failing.push_back(ref);
-                }
-                i = j;
-                continue;
-            }
-            ++i;
-        }
-        return failing;
-    }
+    // Scope-walking dispatch helpers (resolve_scope_aliases /
+    // scope_refs_failing_owner_check) live in scope_yaml.{hpp,cpp} as free
+    // functions in yuzu::server, so the dispatch call sites below bind to them
+    // unqualified and they are unit-testable.
 
     // -- JSON parsing helpers (using nlohmann/json) --------------------------
 

@@ -2,9 +2,12 @@
 
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
+
+class ResultSetStore;
 
 // Scope-walking YAML DSL surface (PR-E, design docs/scope-walking-design.md §7).
 //
@@ -49,5 +52,31 @@ std::optional<std::string> validate_scope_block(const ScopeBlock& sb,
 /// lower-cased), and `EXISTS tag:<name>` per selector tag. Returns "" for an
 /// empty block.
 std::string lower_scope_block(const ScopeBlock& sb);
+
+// ── Dispatch-time result-set reference resolution ────────────────────────────
+//
+// The scope resolver (agent_registry.cpp) owner-checks result-set ids but does
+// NOT resolve per-operator aliases — callers must pre-resolve at the dispatch
+// layer where the owner is known. These free functions do that, sharing the
+// from_result_set:<ref> token grammar of scope_engine.cpp's tokenizer (idents:
+// alnum / _ . : - *) and skipping quoted string literals.
+
+/// Rewrite each `from_result_set:<alias>` atom (a ref not already a canonical
+/// `rs_` id) to its canonical id via store->resolve_alias(owner, alias).
+/// Canonical ids and unresolved aliases are left as-is (they no-match
+/// downstream — stale drops silently, design §4.3). No-op when `owner` is empty
+/// or `store` is null, mirroring the resolver's empty-principal contract.
+std::string resolve_scope_aliases(std::string_view expr, const std::string& owner,
+                                  ResultSetStore* store);
+
+/// Return the `from_result_set:<ref>` atoms in an (already alias-resolved)
+/// expression that fail the owner check: the set is absent/expired
+/// (store->get == nullopt) or owned by another principal. A set that exists, is
+/// owned, and is legitimately empty is NOT reported. Empty when `owner` is empty
+/// or `store` is null (no owner context to check against). Drives the
+/// invocation-time INSTRUCTION_SCOPE_RESOLUTION_FAILED audit row (design §7).
+std::vector<std::string> scope_refs_failing_owner_check(std::string_view expr,
+                                                        const std::string& owner,
+                                                        ResultSetStore* store);
 
 } // namespace yuzu::server

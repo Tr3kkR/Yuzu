@@ -1,5 +1,6 @@
 #include "scope_yaml.hpp"
 
+#include "result_set_store.hpp"
 #include "yaml_scan.hpp"
 
 #include <cctype>
@@ -12,6 +13,13 @@ std::string to_lower(std::string s) {
     for (auto& c : s)
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
+}
+
+// Matches scope_engine.cpp read_ident's charset; governs where a
+// from_result_set:<ref> atom ends.
+bool is_scope_ident_char(char c) {
+    unsigned char u = static_cast<unsigned char>(c);
+    return std::isalnum(u) || c == '_' || c == '.' || c == ':' || c == '-' || c == '*';
 }
 
 } // namespace
@@ -87,6 +95,89 @@ std::string lower_scope_block(const ScopeBlock& sb) {
         out += parts[i];
     }
     return out;
+}
+
+std::string resolve_scope_aliases(std::string_view expr, const std::string& owner,
+                                  ResultSetStore* store) {
+    static constexpr std::string_view kPrefix = "from_result_set:";
+    if (owner.empty() || store == nullptr || expr.find(kPrefix) == std::string_view::npos)
+        return std::string(expr);
+    std::string out;
+    out.reserve(expr.size());
+    size_t i = 0;
+    while (i < expr.size()) {
+        char c = expr[i];
+        if (c == '"' || c == '\'') { // copy quoted literal verbatim
+            char quote = c;
+            out += c;
+            for (++i; i < expr.size(); ++i) {
+                out += expr[i];
+                if (expr[i] == quote) {
+                    ++i;
+                    break;
+                }
+            }
+            continue;
+        }
+        bool at_boundary = (i == 0) || !is_scope_ident_char(expr[i - 1]);
+        if (at_boundary && expr.substr(i).starts_with(kPrefix)) {
+            size_t rs = i + kPrefix.size();
+            size_t j = rs;
+            while (j < expr.size() && is_scope_ident_char(expr[j]))
+                ++j;
+            std::string ref(expr.substr(rs, j - rs));
+            if (!ref.empty() && !ref.starts_with("rs_")) {
+                if (auto canon = store->resolve_alias(owner, ref))
+                    ref = *canon;
+            }
+            out += kPrefix;
+            out += ref;
+            i = j;
+            continue;
+        }
+        out += c;
+        ++i;
+    }
+    return out;
+}
+
+std::vector<std::string> scope_refs_failing_owner_check(std::string_view expr,
+                                                        const std::string& owner,
+                                                        ResultSetStore* store) {
+    std::vector<std::string> failing;
+    static constexpr std::string_view kPrefix = "from_result_set:";
+    if (owner.empty() || store == nullptr || expr.find(kPrefix) == std::string_view::npos)
+        return failing;
+    size_t i = 0;
+    while (i < expr.size()) {
+        char c = expr[i];
+        if (c == '"' || c == '\'') {
+            char quote = c;
+            for (++i; i < expr.size(); ++i)
+                if (expr[i] == quote) {
+                    ++i;
+                    break;
+                }
+            continue;
+        }
+        bool at_boundary = (i == 0) || !is_scope_ident_char(expr[i - 1]);
+        if (at_boundary && expr.substr(i).starts_with(kPrefix)) {
+            size_t rs = i + kPrefix.size();
+            size_t j = rs;
+            while (j < expr.size() && is_scope_ident_char(expr[j]))
+                ++j;
+            std::string ref(expr.substr(rs, j - rs));
+            if (!ref.empty()) {
+                auto set = store->get(ref);
+                if (!set || set->owner_principal != owner)
+                    failing.push_back(ref);
+            }
+            i = j;
+            continue;
+        }
+        ++i;
+    }
+    return failing;
 }
 
 } // namespace yuzu::server
