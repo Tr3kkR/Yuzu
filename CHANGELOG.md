@@ -80,7 +80,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fromResultSet:` is **rejected for now** (a result set's 1h TTL clashes with a
   continuously-evaluated policy; deferred to a follow-up with a policy owner +
   pinned-set semantics). Design: `docs/scope-walking-design.md` §7;
-  `docs/yaml-dsl-spec.md` §9.3.
+  `docs/yaml-dsl-spec.md` §9.3. Validation runs on **both** the create and
+  update definition paths; `selector`/`fromResultSet` values are restricted to
+  the scope-ident charset (no injection / unparseable output) and inline
+  flow-mapping scope is rejected. The dispatch resolution-failure path emits a
+  new `yuzu_scope_resolution_failed_total` metric and `result_set_store` is now
+  covered by `/readyz`.
 
 - **Compliance policies now actually evaluate (check → verdict pipeline).**
   Authored policies + fragments could be created, but nothing evaluated them —
@@ -117,6 +122,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extractor as empty and silently stored no scope. It now lowers via the `scope_yaml`
   path (`selector.platform` → `ostype`, `selector.tags` → `EXISTS tag:`). Scalar
   `scope:` expressions are unchanged. No shipped content used the mapping form.
+  **Upgrade note:** existing policy rows are not migrated, but **re-creating or
+  re-importing** an operator-authored policy that used the `scope: { selector: ... }`
+  mapping form will now apply the selector as a real predicate — where it previously
+  matched all devices (the selector was silently ignored), it will now narrow. Review
+  such policies' intended scope before re-importing. See `docs/user-manual/upgrading.md`.
 
 - **Dashboard scope panel now visible at narrow viewports (≤1280px).** A global
   responsive rule in `server/core/static/yuzu.css` was hiding the right-hand
@@ -187,7 +197,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scope.selector` lowering + the policy `fromResultSet` rejection;
   `test_instruction_store.cpp` pins import validation (static accepted +
   round-trips, dynamic rejected, managementGroups rejected, scope-less
-  unaffected).
+  unaffected). Governance hardening adds: the `update_definition` bypass guard,
+  charset rejection (selector/ref), inline flow-mapping rejection, multi-ref
+  alias rewrite + owner-check, the fail-closed unknown-id case, and a new
+  `test_yaml_scan.cpp` covering the moved line-scanners (incl. adversarial
+  commented-key / quoted-value-leak / prefix-collision inputs).
 
 - **Scope walking.** `tests/unit/server/test_result_set_store.cpp` — 8 cases for
   `ResultSetStore`: synchronous create/get/members, root-first lineage,

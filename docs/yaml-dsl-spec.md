@@ -1277,6 +1277,10 @@ This lowers to the scope-engine string `from_result_set:windows-chrome-suspects 
 1. `fromResultSet` may not be combined with `assignment.managementGroups` — a result set already defines a fixed device set; layering management-group filtering on top is rejected.
 2. When `fromResultSet` is present, `assignment.mode` must be `static` (an omitted mode defaults to static). `dynamic` is rejected — the point of a result set is a fixed target.
 3. References resolve at **invocation** time, not load time. An `InstructionDefinition` carrying a `fromResultSet:` that has since expired is still valid YAML; an invocation-time resolution failure (the set is absent, expired, or not owned) is recorded as an `instruction.scope_resolution_failed` audit row (`INSTRUCTION_SCOPE_RESOLUTION_FAILED`) carrying the result-set id and reason, and the dispatch targets zero of that set's devices.
+4. `fromResultSet` (id or alias), `selector.platform`, and each `selector.tags` entry must contain only letters, digits, and `_ . : * -` (the scope-ident charset). A space, quote, or operator character is rejected at load — these values are lowered into a scope-engine token, so anything else would produce an unparseable or ambiguous expression. **Choose result-set aliases (`name`) from this charset**; an alias with a space cannot be referenced from a scope.
+5. The `scope:` block must use **block form** (`scope:` on its own line, children indented beneath). Inline flow-mapping (`scope: {fromResultSet: x}`) is rejected — the runtime YAML scanner reads only the block form.
+
+> Tag presence (`EXISTS tag:<name>`) requires the tag to have a **non-empty value**; a device carrying a tag with an empty value is treated as not having it.
 
 **Current support (this release):**
 
