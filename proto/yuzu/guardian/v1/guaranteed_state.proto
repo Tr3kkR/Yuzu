@@ -22,7 +22,9 @@ message GuaranteedStateRule {
   string yaml_source = 3;       // Verbatim source, authoritative form
   uint64 version = 4;
   bool enabled = 5;
-  string enforcement_mode = 6;  // "enforce" | "audit" | "disabled"
+  string enforcement_mode = 6;  // "enforce" | "audit" — disable is enabled=false (field 5),
+                                // NOT a third mode value (M3 / #1209). Store + REST validate
+                                // mode in {enforce, audit}; `enabled` is the on/off gate.
   bytes signature = 7;          // HMAC-SHA256 over the canonical JSON (contract G3, deferred)
 
   // Structured, typed enforcement content — the agent's source of truth (it never

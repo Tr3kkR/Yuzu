@@ -158,6 +158,19 @@ void GuaranteedStateStore::create_tables() {
             ALTER TABLE guaranteed_state_rules
                 ADD COLUMN spec_json TEXT NOT NULL DEFAULT '';
         )"},
+        {3, R"(
+            -- Monotonic policy-generation counter (M6 / #1209). Single-row meta
+            -- table keyed by name so future scalar markers can share it. Seeded
+            -- to 0; bumped to 1 on the first rule mutation. Replaces the wall-clock
+            -- seconds the push proto used to carry, which could repeat (two pushes
+            -- in one second) or step backwards (NTP correction) and so wedge the
+            -- heartbeat reconcile.
+            CREATE TABLE IF NOT EXISTS guardian_meta (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO guardian_meta(key, value) VALUES ('policy_generation', 0);
+        )"},
     };
     if (!MigrationRunner::run(db_, "guaranteed_state_store", kMigrations)) {
         // Include enough detail in the log for an on-call operator to triage
@@ -242,6 +255,7 @@ GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
         return std::unexpected("insert failed: " + err);
     }
     sqlite3_finalize(stmt);
+    bump_policy_generation_locked();  // rule set changed → new generation
     return result;
 }
 
@@ -297,6 +311,7 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
     sqlite3_finalize(stmt);
     if (changed == 0)
         return std::unexpected("not found: rule_id '" + row.rule_id + "'");
+    bump_policy_generation_locked();  // rule set changed → new generation
     return {};
 }
 
@@ -321,7 +336,39 @@ GuaranteedStateStore::delete_rule(const std::string& rule_id) {
     sqlite3_finalize(stmt);
     if (changed == 0)
         return std::unexpected("not found: rule_id '" + rule_id + "'");
+    bump_policy_generation_locked();  // rule set changed → new generation
     return {};
+}
+
+void GuaranteedStateStore::bump_policy_generation_locked() {
+    if (!db_)
+        return;
+    // Fixed single-row UPDATE; no parameters and no sqlite3_changes() read, so it
+    // is safe to run via exec and adds no #1033 race site. Caller holds mtx_.
+    char* err = nullptr;
+    if (sqlite3_exec(db_,
+                     "UPDATE guardian_meta SET value = value + 1 "
+                     "WHERE key = 'policy_generation';",
+                     nullptr, nullptr, &err) != SQLITE_OK) {
+        spdlog::warn("GuaranteedStateStore: policy_generation bump failed: {}",
+                     err ? err : "(unknown)");
+        sqlite3_free(err);
+    }
+}
+
+uint64_t GuaranteedStateStore::current_policy_generation() const {
+    std::shared_lock lock(mtx_);
+    if (!db_)
+        return 0;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT value FROM guardian_meta WHERE key = 'policy_generation'",
+                           -1, &stmt, nullptr) != SQLITE_OK)
+        return 0;
+    uint64_t gen = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        gen = static_cast<uint64_t>(sqlite3_column_int64(stmt, 0));
+    sqlite3_finalize(stmt);
+    return gen;
 }
 
 std::optional<GuaranteedStateRuleRow>

@@ -336,9 +336,10 @@ GuardianDispatchResult GuardianEngine::dispatch(const apb::CommandRequest& cmd) 
         // the `parameters` string map: proto3 string-map values must be valid UTF-8,
         // and raw proto bytes are not (the server's UTF-8 validator rejects the whole
         // CommandRequest before it reaches us). `bytes` is binary-safe across embedded
-        // NUL bytes. NOTE: the Erlang gateway's field-by-field re-encoder currently
-        // DROPS this field — gateway mode is not yet wired (see agent.proto
-        // CommandRequest.payload gateway caveat + G12).
+        // NUL bytes. The Erlang gateway preserves `payload` end-to-end: field 8 is
+        // mirrored into its vendored agent.proto and it forwards the decoded request
+        // straight through gpb (proven by yuzu_gw_guardian_wire_tests). Works in both
+        // direct and gateway mode. See agent.proto CommandRequest.payload + G12.
         const std::string& push_bytes = cmd.payload();
         if (push_bytes.empty()) {
             res.exit_code = 1;
@@ -456,6 +457,12 @@ void GuardianEngine::emit_guard_event(const RegistryDrift& d) {
     } else {
         ev.set_event_type("drift.detected");
     }
+    // drift_rate carries the count of ADDITIONAL drift detections the agent-side
+    // sink debounce collapsed into this single event over its window (H3 / #1209):
+    // 0 = sole detection in its window; a high value means a competing writer was
+    // churning the value and the burst was folded to keep the event store bounded.
+    if (d.collapsed_count > 0)
+        ev.set_drift_rate(static_cast<double>(d.collapsed_count));
     ev.mutable_timestamp()->set_seconds(now_ms / 1000);
     ev.set_platform("windows");
     sink(ev);

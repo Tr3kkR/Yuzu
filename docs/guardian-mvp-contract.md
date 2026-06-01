@@ -432,11 +432,17 @@ use the `frontend-design` plugin** (product UI, not marketing). Page pattern:
   *not* "notifications currently live" — a watch that dies post-startup keeps
   `guard_healthy=true` while reconciliation silently covers at interval latency; the
   dashboard health badge must reflect that, not overclaim.
-- **G7 — `action` vs `enforcement_mode` (RESOLVED).** Not redundant — orthogonal:
-  `remediation.action` (`alert-only|enforce|quarantine`) = authored intent;
-  `enforcement_mode` (`enforce|audit|disabled`) = operational master gate. Effective =
-  `disabled` (no guard) > `audit` (force alert-only, ignore action) > `enforce` (do
-  `action`). Keeps a per-rule operational dry-run/kill lever (design §6.1). MVP Slice A =
+- **G7 — `action` vs `enforcement_mode` (RESOLVED; mode taxonomy revised M3 / #1209).**
+  Not redundant — orthogonal: `remediation.action` (`alert-only|enforce|quarantine`) =
+  authored intent; `enforcement_mode` (`enforce|audit`) = operational mode, and the
+  separate `enabled` boolean (proto field 5) is the on/off kill lever. Effective =
+  `!enabled` (no guard) > `audit` (force alert-only, ignore action) > `enforce` (do
+  `action`). **Revision:** an earlier draft folded "disabled" into the mode as a third
+  value (`enforce|audit|disabled`); the shipped store + REST instead validate
+  `mode ∈ {enforce, audit}` and route disable through `enabled` — which the dashboard
+  enable/disable toggle and the agent's `if (!rule.enabled) continue` arming guard both
+  rely on. The 2-state mode + `enabled` together are the master gate. Keeps a per-rule
+  operational dry-run/kill lever (design §6.1). MVP Slice A =
   `action:alert-only` + `mode:enforce`; Slice C adds `action:enforce`; `quarantine`
   deferred.
 - **G9 — schema-registry storage (RESOLVED: static C++ catalog).** Guardian types are

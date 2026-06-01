@@ -45,13 +45,27 @@ intercept(AgentId, ResponseFrame) ->
             passthrough
     end.
 
-%% @doc A frame is a Guardian side-channel message iff its `plugin` field is
-%% the reserved "__guard__" name. Reads the binary key first then the atom key,
+%% @doc A frame is a Guardian side-channel message iff its `plugin` field is the
+%% reserved "__guard__" name AND it carries no `command_id` — i.e. it is an
+%% UNSOLICITED drift event, not a reply. A "__guard__" frame that DOES carry a
+%% command_id is a SOLICITED reply (get_status / push_rules) and must take the
+%% normal command-correlation path so its `pending` entry completes and the
+%% caller is answered — intercepting it here would strand the pending entry and
+%% drop the reply (H2 / #1209). Reads the binary key first then the atom key,
 %% mirroring how yuzu_gw_agent reads command_id/plugin (gpb maps decode yields
 %% atom keys; the binary-key fallback keeps it robust to either shape).
 -spec is_guardian_frame(term()) -> boolean().
 is_guardian_frame(Frame) when is_map(Frame) ->
-    ?GUARD_PLUGIN =:= maps:get(<<"plugin">>, Frame,
-                               maps:get(plugin, Frame, undefined));
+    Plugin = maps:get(<<"plugin">>, Frame, maps:get(plugin, Frame, undefined)),
+    CmdId = maps:get(<<"command_id">>, Frame, maps:get(command_id, Frame, undefined)),
+    ?GUARD_PLUGIN =:= Plugin andalso is_empty_command_id(CmdId);
 is_guardian_frame(_) ->
     false.
+
+%% A solicited reply always carries a non-empty command_id; an unsolicited event
+%% leaves it unset, which gpb decodes as <<>> (or the key is absent → undefined).
+-spec is_empty_command_id(term()) -> boolean().
+is_empty_command_id(undefined) -> true;
+is_empty_command_id(<<>>) -> true;
+is_empty_command_id("") -> true;
+is_empty_command_id(_) -> false.

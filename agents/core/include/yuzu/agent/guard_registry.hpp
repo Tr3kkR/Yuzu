@@ -41,6 +41,13 @@ struct RegistryDrift {
     bool remediation_success{false};
     std::uint64_t remediation_latency_us{0};
     std::string remediation_action;   ///< "registry-write" when a write-back was attempted
+
+    /// Number of ADDITIONAL drift detections collapsed into this report by the
+    /// sink debounce window (H3 / #1209). 0 = this is the only detection in its
+    /// window; >0 means a competing writer was churning the value and N further
+    /// detections were folded into this single event instead of flooding the
+    /// event store. Surfaced as drift_rate on the wire.
+    std::uint64_t collapsed_count{0};
 };
 
 /// One registry-value watch. start() opens the key, runs an initial compare, and

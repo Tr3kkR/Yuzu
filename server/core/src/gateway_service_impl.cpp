@@ -562,13 +562,15 @@ GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* /*contex
     }
 
     const auto& resp = request->response();
-    if (resp.plugin() != "__guard__") {
-        // Defence-in-depth: the gateway only forwards "__guard__" frames, but a
-        // mislabelled frame must not be ingested as a Guardian event. Drop it
-        // (still ack — we consumed the RPC).
-        spdlog::warn("[gateway] ForwardGuardianMessage: non-guardian frame (plugin='{}') from "
-                     "agent {} — dropping",
-                     resp.plugin(), agent_id);
+    if (resp.plugin() != "__guard__" || !resp.command_id().empty()) {
+        // Defence-in-depth: the gateway only forwards UNSOLICITED "__guard__" events
+        // (no command_id) here; a mislabelled frame, or a SOLICITED reply that should
+        // have gone through normal command correlation (command_id set — H2 / #1209),
+        // must not be ingested as a Guardian event. Drop it (still ack — we consumed
+        // the RPC). A solicited reply reaching this path is a gateway routing bug.
+        spdlog::warn("[gateway] ForwardGuardianMessage: not an unsolicited guardian event "
+                     "(plugin='{}', command_id='{}') from agent {} — dropping",
+                     resp.plugin(), resp.command_id(), agent_id);
         response->set_acknowledged(true);
         return grpc::Status::OK;
     }

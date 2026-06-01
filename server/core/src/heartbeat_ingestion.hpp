@@ -21,6 +21,8 @@
  * between the direct and gateway paths.
  */
 
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -59,11 +61,23 @@ public:
     void ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb, std::string_view agent_id,
                 std::string_view via);
 
+    /// Guardian heartbeat reconcile (M5 / #1209). Invoked once per heartbeat that
+    /// carries the `yuzu.guardian_generation` tag, with the agent's applied policy
+    /// generation. The server wires this to compare against the current generation
+    /// and re-push a lagging agent — the convergence path for an agent that was
+    /// offline at push time or has just reconnected. Optional; unset = no reconcile.
+    using GuardianReconcileFn =
+        std::function<void(std::string_view agent_id, std::uint64_t agent_generation)>;
+    void set_guardian_reconcile_fn(GuardianReconcileFn fn) {
+        guardian_reconcile_fn_ = std::move(fn);
+    }
+
 private:
     detail::AgentRegistry& registry_;
     detail::AgentHealthStore* health_store_;
     FleetTopologyStore* fleet_topology_store_;
     MetricsRegistry* metrics_;
+    GuardianReconcileFn guardian_reconcile_fn_;
 };
 
 } // namespace yuzu::server

@@ -274,6 +274,7 @@ yuzu_server_core_lib = static_library(
     'src/policy_store.cpp',
     'src/policy_evaluator.cpp',
     'src/guaranteed_state_store.cpp',
+    'src/guardian_push_builder.cpp',
     'src/guardian_ingest.cpp',
     'src/runtime_config_store.cpp',
     'src/custom_properties_store.cpp',

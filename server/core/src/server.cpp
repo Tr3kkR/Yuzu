@@ -40,6 +40,7 @@
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
 #include "guaranteed_state_store.hpp"
+#include "guardian_push_builder.hpp"
 #include "guaranteed_state.pb.h"
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
@@ -1027,6 +1028,53 @@ public:
             agent_service_.set_heartbeat_ingestion(heartbeat_ingestion_.get());
             if (gateway_service_)
                 gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
+
+            // Guardian heartbeat reconcile (M5 / #1209). The agent reports its
+            // applied policy generation on every heartbeat; if it trails the
+            // current generation it missed a push (was offline when the push fired,
+            // or has just reconnected — sync_with_server is a no-op pull), so
+            // re-push its applicable rules. Reads the generation, never bumps it, so
+            // catching one lagging agent up does not make the rest of the fleet look
+            // stale (the cascade M6's monotonic counter is designed to avoid).
+            heartbeat_ingestion_->set_guardian_reconcile_fn(
+                [this](std::string_view agent_id_sv, std::uint64_t agent_gen) {
+                    if (!guaranteed_state_store_)
+                        return;
+                    const std::uint64_t current =
+                        guaranteed_state_store_->current_policy_generation();
+                    if (agent_gen >= current)
+                        return;  // agent already at or ahead of current policy
+                    const std::string agent_id(agent_id_sv);
+                    auto sess = registry_.get_session(agent_id);
+                    if (!sess)
+                        return;
+                    // Same per-agent filtering as the fan-out (M4): only rules that
+                    // target this agent's OS and name it in scope.
+                    const auto rules = guaranteed_state_store_->list_rules();
+                    auto push = guardian::build_agent_push(
+                        rules, sess->os,
+                        [&](const std::string& expr) {
+                            if (auto parsed = yuzu::scope::parse(expr)) {
+                                for (const auto& id : registry_.evaluate_scope(
+                                         *parsed, tag_store_.get(),
+                                         custom_properties_store_.get()))
+                                    if (id == agent_id)
+                                        return true;
+                            }
+                            return false;
+                        },
+                        /*full_sync=*/true, current);
+                    ::yuzu::agent::v1::CommandRequest cmd;
+                    cmd.set_command_id("__guard__-reconcile-" + std::to_string(current));
+                    cmd.set_plugin("__guard__");
+                    cmd.set_action("push_rules");
+                    cmd.set_payload(push.SerializeAsString());
+                    if (registry_.send_to(agent_id, cmd)) {
+                        forward_gateway_pending();
+                        spdlog::info("Guardian: reconciled agent {} (generation {} -> {})", agent_id,
+                                     agent_gen, current);
+                    }
+                });
         }
 
         // Initialize tag store
@@ -6147,68 +6195,75 @@ private:
                 const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
                                        std::chrono::system_clock::now().time_since_epoch())
                                        .count();
-                ::yuzu::guardian::v1::GuaranteedStatePush push;
-                push.set_full_sync(full_sync);
-                push.set_policy_generation(static_cast<std::uint64_t>(now_s));
-                for (const auto& row : guaranteed_state_store_->list_rules()) {
-                    if (!row.enabled)
-                        continue;
-                    auto* r = push.add_rules();
-                    r->set_rule_id(row.rule_id);
-                    r->set_name(row.name);
-                    r->set_version(static_cast<std::uint64_t>(row.version));
-                    r->set_enabled(row.enabled);
-                    r->set_enforcement_mode(row.enforcement_mode);
-                    if (row.spec_json.empty())
-                        continue; // legacy yaml_source-only rule — not agent-enforceable
-                    auto spec = nlohmann::json::parse(row.spec_json, nullptr, false);
-                    if (!spec.is_object())
-                        continue;
-                    auto fill = [](::yuzu::guardian::v1::GuardianSpecBlock* blk,
-                                   const nlohmann::json& j) {
-                        if (!j.is_object())
-                            return;
-                        blk->set_type(j.value("type", std::string{}));
-                        if (j.contains("params") && j["params"].is_object()) {
-                            const auto& params = j["params"];
-                            // Iterator form, not `auto& [k, v]`: MSVC C3493s on
-                            // structured bindings referenced inside a lambda body.
-                            for (auto it = params.begin(); it != params.end(); ++it)
-                                (*blk->mutable_params())[it.key()] =
-                                    it.value().is_string() ? it.value().get<std::string>()
-                                                           : it.value().dump();
-                        }
-                    };
-                    if (spec.contains("spark"))
-                        fill(r->mutable_spark(), spec["spark"]);
-                    if (spec.contains("assertion"))
-                        fill(r->mutable_assertion(), spec["assertion"]);
-                    if (spec.contains("remediation"))
-                        fill(r->mutable_remediation(), spec["remediation"]);
-                }
-                ::yuzu::agent::v1::CommandRequest cmd;
-                cmd.set_command_id("__guard__-push-" + std::to_string(now_s));
-                cmd.set_plugin("__guard__");
-                cmd.set_action("push_rules");
-                // Binary serialized proto rides in the `payload` bytes field, not the
-                // `parameters` string map: proto3 string values must be valid UTF-8, and
-                // raw GuaranteedStatePush bytes are not. See agent.proto CommandRequest.payload.
-                cmd.set_payload(push.SerializeAsString());
-                int sent = 0;
+                // Read (never bump) the monotonic generation: a reconcile re-push
+                // (M5) must carry the SAME generation as the policy-change push that
+                // minted it, otherwise catching one lagging agent up would make the
+                // rest of the fleet look stale and trigger a reconcile storm. The
+                // store bumps the counter on rule mutations; we only read it here.
+                // Replaces wall-clock seconds, which could repeat or step backwards
+                // and wedge the heartbeat reconcile. (M6 / #1209.)
+                const std::uint64_t generation =
+                    guaranteed_state_store_->current_policy_generation();
+                const auto rules = guaranteed_state_store_->list_rules();
+
+                // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
+                // toggle to the affected rule's scope_expr (was the whole fleet); an
+                // empty scope still means fleet-wide.
+                std::vector<std::string> targets;
                 if (scope.empty()) {
-                    sent = registry_.send_to_all(cmd);
+                    targets = registry_.all_ids();
                 } else if (scope.starts_with("group:") && mgmt_group_store_) {
                     for (const auto& m : mgmt_group_store_->get_members(scope.substr(6)))
-                        if (registry_.send_to(m.agent_id, cmd))
-                            ++sent;
+                        targets.push_back(m.agent_id);
                 } else {
                     auto parsed = yuzu::scope::parse(scope);
                     if (!parsed)
                         return -1;
-                    for (const auto& aid : registry_.evaluate_scope(
-                             *parsed, tag_store_.get(), custom_properties_store_.get()))
-                        if (registry_.send_to(aid, cmd))
-                            ++sent;
+                    targets = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                       custom_properties_store_.get());
+                }
+
+                // Per-rule scope membership, evaluated once per distinct scope_expr
+                // and cached, so the fan-out is O(agents + distinct_scopes) rather
+                // than O(agents × rules).
+                std::unordered_map<std::string, std::unordered_set<std::string>> scope_cache;
+                auto agent_in_scope = [&](const std::string& aid,
+                                          const std::string& expr) -> bool {
+                    auto it = scope_cache.find(expr);
+                    if (it == scope_cache.end()) {
+                        std::unordered_set<std::string> ids;
+                        if (auto parsed = yuzu::scope::parse(expr)) {
+                            auto v = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                              custom_properties_store_.get());
+                            ids.insert(v.begin(), v.end());
+                        }
+                        it = scope_cache.emplace(expr, std::move(ids)).first;
+                    }
+                    return it->second.contains(aid);
+                };
+
+                // Build and send a per-agent FILTERED push (M4 / #1209): each agent
+                // receives only the enabled rules that target its OS and name it in
+                // scope, so a Linux box is no longer handed Windows registry guards.
+                int sent = 0;
+                for (const auto& aid : targets) {
+                    auto sess = registry_.get_session(aid);
+                    const std::string agent_os = sess ? sess->os : std::string{};
+                    auto push = guardian::build_agent_push(
+                        rules, agent_os,
+                        [&](const std::string& expr) { return agent_in_scope(aid, expr); },
+                        full_sync, generation);
+
+                    ::yuzu::agent::v1::CommandRequest cmd;
+                    cmd.set_command_id("__guard__-push-" + std::to_string(now_s));
+                    cmd.set_plugin("__guard__");
+                    cmd.set_action("push_rules");
+                    // Binary serialized proto rides in the `payload` bytes field, not the
+                    // `parameters` string map: proto3 string values must be valid UTF-8, and
+                    // raw GuaranteedStatePush bytes are not. See agent.proto CommandRequest.payload.
+                    cmd.set_payload(push.SerializeAsString());
+                    if (registry_.send_to(aid, cmd))
+                        ++sent;
                 }
                 // Drain gw_pending_ so the push reaches gateway-connected agents.
                 // send_to only QUEUES for a gateway agent (it has no local Subscribe

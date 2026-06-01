@@ -25,10 +25,19 @@
 
 #include <charconv>
 #include <cstring>
+#include <optional>
 #include <vector>
 
 namespace yuzu::agent {
 namespace {
+
+// Sink debounce window (H3 / #1209, contract decision 10 default-on). A competing
+// writer can wake RegNotifyChangeKeyValue arbitrarily fast; without a window every
+// wakeup would emit one event, growing the event store unbounded. Drifts within a
+// window of the last EMITTED event are collapsed into a count carried on the next
+// emission. This bounds the SINK only — the enforce write-back still runs on every
+// wakeup (write-side fight-loop rate-limiting is a separate, deferred concern).
+constexpr auto kSinkDebounceWindow = std::chrono::seconds(1);
 
 HKEY parse_hive(const std::string& hive) {
     if (hive == "HKLM") return HKEY_LOCAL_MACHINE;
@@ -173,6 +182,11 @@ void RegistryGuard::run() {
     std::wstring wkey = to_wide(cfg_.key);
     HKEY key = nullptr;
 
+    // Sink-debounce state (H3 / #1209). Only this guard's run() thread touches
+    // these, so no synchronisation is needed.
+    std::optional<std::chrono::steady_clock::time_point> last_emit;
+    std::uint64_t suppressed = 0;
+
     auto emit = [&](const std::string& detected, std::uint64_t latency_us) {
         if (detected == cfg_.expected) return; // compliant
         RegistryDrift d;
@@ -207,6 +221,19 @@ void RegistryGuard::run() {
                              cfg_.rule_id, cfg_.hive, cfg_.key, cfg_.value_name, detected,
                              cfg_.value_type);
         }
+        // Collapse-with-count debounce: emit the first drift immediately, fold
+        // subsequent drifts within the window into `suppressed`, and attach that
+        // count to the next post-window emission so the operator still sees the
+        // burst happened. Bounds the SINK only; the enforce write-back above ran
+        // regardless (write-side fight-loop rate-limiting is deferred).
+        const auto now = std::chrono::steady_clock::now();
+        if (last_emit && (now - *last_emit) < kSinkDebounceWindow) {
+            ++suppressed;
+            return;
+        }
+        d.collapsed_count = suppressed;
+        suppressed = 0;
+        last_emit = now;
         if (sink_) sink_(d);
     };
 

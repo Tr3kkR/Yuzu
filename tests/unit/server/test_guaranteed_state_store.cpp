@@ -104,6 +104,44 @@ TEST_CASE("GuaranteedStateStore: opens in-memory and runs migrations",
     CHECK(store.event_count() == 0);
 }
 
+// ── M6 / #1209: monotonic policy generation ─────────────────────────────────
+
+TEST_CASE("GuaranteedStateStore: policy_generation bumps monotonically on mutations",
+          "[guaranteed_state_store][generation]") {
+    GuaranteedStateStore store(":memory:");
+    CHECK(store.current_policy_generation() == 0);  // seeded at 0
+
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    CHECK(store.current_policy_generation() == 1);  // create bumped
+
+    auto r = make_rule("r1", "guard-one");
+    r.enabled = false;
+    REQUIRE(store.update_rule(r));
+    CHECK(store.current_policy_generation() == 2);  // update bumped
+
+    REQUIRE(store.delete_rule("r1"));
+    CHECK(store.current_policy_generation() == 3);  // delete bumped
+
+    // A failed mutation (unknown rule) must NOT advance the generation —
+    // otherwise a reconcile would chase a phantom version.
+    CHECK_FALSE(store.update_rule(make_rule("nope", "missing")));
+    CHECK(store.current_policy_generation() == 3);
+}
+
+TEST_CASE("GuaranteedStateStore: policy_generation persists across reopen",
+          "[guaranteed_state_store][generation]") {
+    TempDbFile tmp;
+    {
+        GuaranteedStateStore store(tmp.path);
+        REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+        CHECK(store.current_policy_generation() == 1);
+    }
+    // Reopen: the counter is persisted, not reset — an agent that applied
+    // generation 1 before a server restart must not look stale afterwards.
+    GuaranteedStateStore reopened(tmp.path);
+    CHECK(reopened.current_policy_generation() == 1);
+}
+
 // ── Rule CRUD ──────────────────────────────────────────────────────────────
 
 TEST_CASE("GuaranteedStateStore: rule round-trip", "[guaranteed_state_store][rules]") {

@@ -901,14 +901,21 @@ grpc::Status AgentServiceImpl::Subscribe(
     while (stream->Read(&resp)) {
         registry_.touch_activity(agent_id);
 
-        // Guardian side-channel (contract G2 / step 5): unsolicited agent→server
-        // messages over the reserved "__guard__" plugin. Routed at the TOP of the
-        // loop body — BEFORE the RUNNING/terminal status split — so they never enter
-        // the response store / executions drawer. Status-agnostic: Guardian messages
-        // arrive as SUCCESS, so mirroring the in-RUNNING __timing__ intercept would
-        // miss them. agent_id is server-stamped from the cert-bound session, never
-        // self-reported. See docs/guardian-mvp-contract.md.
-        if (resp.plugin() == "__guard__") {
+        // Guardian side-channel (contract G2 / step 5): UNSOLICITED agent→server
+        // messages over the reserved "__guard__" plugin (drift events). Routed at
+        // the TOP of the loop body — BEFORE the RUNNING/terminal status split — so
+        // they never enter the response store / executions drawer. Status-agnostic:
+        // Guardian events arrive as SUCCESS, so mirroring the in-RUNNING __timing__
+        // intercept would miss them. agent_id is server-stamped from the cert-bound
+        // session, never self-reported.
+        //
+        // The empty-command_id guard is load-bearing (H2 / #1209): a __guard__ reply
+        // that DOES carry a command_id is a SOLICITED reply (get_status / push_rules)
+        // and must NOT be swallowed here — it has to fall through to the normal
+        // command-response path so its caller is answered and the gateway's pending
+        // map for that command_id completes. Only command_id-less events are the
+        // side-channel. See docs/guardian-mvp-contract.md.
+        if (resp.plugin() == "__guard__" && resp.command_id().empty()) {
             // Guardian side-channel — route through the shared ingest so the
             // direct and gateway-proxied (GatewayUpstreamServiceImpl::
             // ForwardGuardianMessage) paths cannot diverge. agent_id is

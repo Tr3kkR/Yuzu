@@ -40,3 +40,29 @@ intercept_passthrough_test() ->
                  yuzu_gw_guardian:intercept(<<"agent-1">>,
                                             #{plugin => <<"inventory">>,
                                               command_id => <<"c1">>})).
+
+%% H2 / #1209: a "__guard__" frame that carries a command_id is a SOLICITED reply
+%% (get_status / push_rules), NOT an unsolicited event. It must classify as
+%% non-guardian so it takes the normal command-correlation path and its `pending`
+%% entry completes — intercepting it would strand the pending entry and drop the
+%% reply. Covers both key shapes.
+solicited_guard_reply_atom_key_not_event_test() ->
+    ?assertNot(yuzu_gw_guardian:is_guardian_frame(
+                 #{plugin => <<"__guard__">>, command_id => <<"__guard__-push-123">>})).
+
+solicited_guard_reply_binary_key_not_event_test() ->
+    ?assertNot(yuzu_gw_guardian:is_guardian_frame(
+                 #{<<"plugin">> => <<"__guard__">>,
+                   <<"command_id">> => <<"__guard__-push-123">>})).
+
+%% Empty-string / empty-binary command_id is still an unsolicited event.
+empty_command_id_is_event_test() ->
+    ?assert(yuzu_gw_guardian:is_guardian_frame(
+              #{plugin => <<"__guard__">>, command_id => <<>>})).
+
+intercept_solicited_guard_reply_passthrough_test() ->
+    %% The solicited reply must pass through (no upstream forward).
+    ?assertEqual(passthrough,
+                 yuzu_gw_guardian:intercept(<<"agent-1">>,
+                                            #{plugin => <<"__guard__">>,
+                                              command_id => <<"__guard__-push-9">>})).
