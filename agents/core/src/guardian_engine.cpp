@@ -421,7 +421,7 @@ void GuardianEngine::set_event_sink(EventSink sink) {
     event_sink_ = std::move(sink);
 }
 
-void GuardianEngine::emit_guard_event(const RegistryDrift& d) {
+void GuardianEngine::emit_guard_event(const GuardDrift& d) {
     // Snapshot the sink under sink_mtx_, then release BEFORE the (potentially
     // blocking) network send — never hold the lock across the sink call, and
     // never take mtx_ here (a guard worker can fire while apply_rules/stop hold
@@ -442,7 +442,7 @@ void GuardianEngine::emit_guard_event(const RegistryDrift& d) {
     ev.set_event_id(d.rule_id + "-" + std::to_string(now_ms) + "-" + std::to_string(seq));
     ev.set_rule_id(d.rule_id);
     ev.set_rule_name(d.rule_name);
-    ev.set_guard_type("registry");
+    ev.set_guard_type(d.guard_type); // "registry" | "file" — set by the producing guard
     ev.set_guard_category("event");
     ev.set_detected_value(d.detected_value);
     ev.set_expected_value(d.expected_value);
@@ -518,7 +518,7 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
     // Route drift through the engine rather than a captured sink copy, so a
     // guard armed before the sink is wired (A2 start_local pre-network) still
     // delivers once set_event_sink runs. emit_guard_event takes sink_mtx_ only.
-    auto guard_sink = [this](const RegistryDrift& d) { emit_guard_event(d); };
+    auto guard_sink = [this](const GuardDrift& d) { emit_guard_event(d); };
 
     if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
         if (it->second)

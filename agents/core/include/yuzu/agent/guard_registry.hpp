@@ -16,6 +16,7 @@
  */
 
 #include <yuzu/plugin.h>  // YUZU_EXPORT
+#include <yuzu/agent/guard.hpp>                 // IGuard, GuardDrift, GuardSink
 #include <yuzu/agent/resilience_strategy.hpp>  // ResilienceConfig (C3 retry policy)
 
 #include <atomic>
@@ -26,36 +27,15 @@
 
 namespace yuzu::agent {
 
-/// What the guard observed when a watched value drifted from its expected state.
-struct RegistryDrift {
-    std::string rule_id;
-    std::string rule_name;
-    std::string detected_value;   ///< string-encoded live value, or "<absent>"
-    std::string expected_value;   ///< string-encoded expected (registry-value-equals)
-    std::uint64_t detection_latency_us{0};
-
-    // Remediation (enforce mode only). When the guard is armed with
-    // Config::enforce=true it writes `expected_value` back on drift, before
-    // reporting, and records the outcome here. In audit mode all three stay at
-    // their defaults (attempted=false) and the guard only observes.
-    bool remediation_attempted{false};
-    bool remediation_success{false};
-    std::uint64_t remediation_latency_us{0};
-    std::string remediation_action;   ///< "registry-write" when a write-back was attempted
-
-    /// Number of ADDITIONAL drift detections collapsed into this report by the
-    /// sink debounce window (H3 / #1209). 0 = this is the only detection in its
-    /// window; >0 means a competing writer was churning the value and N further
-    /// detections were folded into this single event instead of flooding the
-    /// event store. Surfaced as drift_rate on the wire.
-    std::uint64_t collapsed_count{0};
-};
+/// Registry drift report alias — the common GuardDrift, kept as a name for the
+/// registry guard's call sites and tests. A registry guard leaves
+/// `guard_type` at its "registry" default.
+using RegistryDrift = GuardDrift;
 
 /// One registry-value watch. start() opens the key, runs an initial compare, and
 /// arms RegNotifyChangeKeyValue on a dedicated thread that re-reads + compares on
-/// every change and re-arms. (The RegNotify re-arm gap is the reconciliation
-/// guard's job — deferred to Slice A.2.)
-class YUZU_EXPORT RegistryGuard {
+/// every change and re-arms (resilient, nearest-ancestor re-arm — C1/C2).
+class YUZU_EXPORT RegistryGuard : public IGuard {
 public:
     struct Config {
         std::string rule_id;
@@ -74,20 +54,20 @@ public:
         /// count. 0 = emit every drift. Default 1000 (the prior hard-coded value).
         std::uint64_t event_debounce_ms{1000};
     };
-    using Sink = std::function<void(const RegistryDrift&)>;
+    using Sink = GuardSink;
 
     RegistryGuard(Config cfg, Sink sink);
-    ~RegistryGuard();
+    ~RegistryGuard() override;
     RegistryGuard(const RegistryGuard&) = delete;
     RegistryGuard& operator=(const RegistryGuard&) = delete;
 
     /// Open the key, run an initial compare, arm the watch, and start the watch
     /// thread. Returns false if the guard could not be started (invalid hive, or
     /// non-Windows build).
-    bool start();
-    void stop();
+    bool start() override;
+    void stop() override;
 
-    const std::string& rule_id() const { return cfg_.rule_id; }
+    const std::string& rule_id() const override { return cfg_.rule_id; }
 
 private:
     void run();
