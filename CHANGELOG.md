@@ -43,8 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before any high-risk mutation lands. New helper `require_mfa_step_up()`
   in `server/core/src/mfa_step_up.{hpp,cpp}` evaluates the gate: api/mcp
   tokens bypass (the bearer credential is itself the step-up moment),
-  non-enrolled users bypass (consistent with PR1's `optional` enforcement
-  model), and stale sessions (now − `mfa_verified_at` > `mfa_step_up_
+  OIDC/SSO sessions bypass (the identity lives in the IdP — no local
+  `users` row or TOTP to step up against; `amr`-claim enforcement is the
+  PR3 work), non-enrolled users bypass (consistent with PR1's `optional`
+  enforcement model), and stale sessions (now − `mfa_verified_at` > `mfa_step_up_
   window_secs`, default 300 s) receive a 401 A4 envelope `{"error":
   {"code":401,"message":"MFA step-up required",...},"meta":{"api_version":
   "v1","mfa_step_up_required":true,"challenge_url":"/login/mfa/stepup"}}`

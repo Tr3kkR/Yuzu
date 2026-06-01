@@ -23,7 +23,20 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     // Bearer-credential principals are step-up-exempt by design. Token
     // issuance was the step-up moment; the token itself does not
     // re-prompt. Mirrors the /auth-and-authz skill's documented scope.
-    if (session.auth_source == "api_token" || session.auth_source == "mcp_token") {
+    //
+    // OIDC/SSO sessions are also exempt for now. The identity lives in
+    // the IdP: `create_oidc_session` never writes a `users` row, so
+    // there is no local TOTP secret to step up against and no way for
+    // the operator to clear the gate. Without this exemption every OIDC
+    // session fails the `mfa_status()` lookup below with `UserNotFound`
+    // and is permanently locked out of all gated endpoints (PR #1199
+    // review HIGH). Enforcing MFA on SSO sessions via the `amr` claim is
+    // the documented PR3 work; until then SSO MFA is the IdP's job. The
+    // auth-source check (rather than discriminating on `UserNotFound`
+    // below) is deliberate: it keeps a local user deleted mid-request
+    // fail-closed, exempting only genuine external identities.
+    if (session.auth_source == "api_token" || session.auth_source == "mcp_token" ||
+        session.auth_source == "oidc") {
         return true;
     }
 

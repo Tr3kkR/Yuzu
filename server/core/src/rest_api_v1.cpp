@@ -4199,11 +4199,13 @@ void RestApiV1::register_routes(
                                                  guaranteed_state_store,
                                                  iso_now](const httplib::Request& req,
                                                           httplib::Response& res) {
-        // PR2 governance Gate 4 consistency-B2: canonical order is
+        // PR2 governance Gate 4 consistency-B2: order is
         // auth_fn → perm_fn → step_up_fn → store-null guard. Resolving
         // the session up front means a single map lookup and avoids the
-        // re-resolve race that the prior order opened up. Mirrors POST
-        // /api/v1/tokens and DELETE /api/v1/sessions.
+        // re-resolve race that the prior order opened up. (The
+        // token/session handlers run perm_fn before auth_fn; both
+        // orderings are safe because step_up_fn always runs last, after
+        // auth_fn has populated `session` — PR #1199 review LOW.)
         auto session = auth_fn(req, res);
         if (!session)
             return;

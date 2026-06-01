@@ -278,6 +278,18 @@ out of every high-risk surface by disabling MFA.
 
 ## OIDC interop (PR 3 — design)
 
+**Until PR 3 lands, OIDC/SSO sessions are exempt from local step-up.**
+An OIDC identity lives in the IdP — `create_oidc_session` never writes a
+`users` row, so there is no local TOTP secret to step up against and a
+`mfa_status()` lookup for such a session returns `UserNotFound`.
+`require_mfa_step_up` therefore treats `auth_source == "oidc"` like a
+bearer credential and returns `true` (pass) in its early exemption
+block. Without this, every OIDC session — including an admin mapped via
+their Entra group — would fail the gate closed and be permanently
+locked out of all 11 gated endpoints (PR #1199 review HIGH). MFA on SSO
+sessions is the IdP's responsibility until the `amr` short-circuit below
+ships.
+
 Microsoft Entra and most OIDC IdPs assert the methods used to
 authenticate via the `amr` claim (RFC 8176, plus the Entra-specific
 `mfa` value). Today `IdTokenClaims` does not parse `amr`. PR 3:
@@ -287,6 +299,11 @@ authenticate via the `amr` claim (RFC 8176, plus the Entra-specific
 3. In `auth_routes.cpp:565-631` (the `/auth/callback` handler), if `amr`
    contains any of `mfa`, `otp`, `hwk`, `face`, `fpt`, `iris`, `pin`,
    `sms`, `swk`, `tel`, `user` → `session.mfa_verified_at = iat`.
+
+4. Removes the `auth_source == "oidc"` early exemption in
+   `require_mfa_step_up` (added by PR 2, see above) so OIDC sessions are
+   gated against the `amr`-seeded `mfa_verified_at` instead of being
+   unconditionally exempt.
 
 The same step-up window applies. If the IdP-asserted MFA is older than
 `mfa_step_up_window_secs`, the user is re-prompted via the local TOTP

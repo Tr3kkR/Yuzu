@@ -19,6 +19,13 @@
 ///     the step-up moment (per `/auth-and-authz` skill, "MFA on every
 ///     API-token call" is explicitly out of scope; token issuance
 ///     happened with full MFA).
+///   - OIDC/SSO sessions — the identity lives in the IdP, there is no
+///     local `users` row or TOTP secret to step up against, and the
+///     `mfa_status()` lookup for such a session returns `UserNotFound`.
+///     Without this exemption every OIDC session fails closed and is
+///     permanently locked out of the gated endpoints (PR #1199 review
+///     HIGH). Enforcing MFA on SSO sessions via the `amr` claim is the
+///     documented PR3 work.
 ///   - Sessions belonging to users without MFA enrolled — consistent
 ///     with PR1's enforcement model (`optional` mode only kicks in
 ///     once a user opts into MFA).
@@ -27,7 +34,7 @@
 ///     in main.cpp).
 ///
 /// Requires step-up (returns false) when:
-///   - principal is a session ("local" or "oidc" auth_source) AND
+///   - principal is a local session ("local" auth_source) AND
 ///   - user is MFA-enrolled AND
 ///   - `now - session.mfa_verified_at > window_secs`
 ///

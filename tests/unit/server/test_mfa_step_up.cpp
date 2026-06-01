@@ -291,19 +291,47 @@ TEST_CASE_METHOD(StepUpFixture,
     CHECK(body["meta"]["mfa_step_up_required"] == true);
 }
 
-TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: OIDC sessions are subject to step-up",
+TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: OIDC sessions bypass the gate",
                  "[mfa][stepup]") {
+    // PR #1199 review HIGH: OIDC/SSO identities live in the IdP and have
+    // no local `users` row to step up against. The gate must exempt them
+    // (like bearer tokens) rather than fail closed, or every OIDC session
+    // is permanently locked out of all 11 gated endpoints. `amr`-claim
+    // enforcement on SSO sessions is the documented PR3 work.
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
-    // OIDC session, no proof recorded — must require step-up just like local.
-    auto session = make_session("alice", "oidc");
 
-    CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                                    "POST /api/v1/tokens"));
-    CHECK(res.status == 401);
-    REQUIRE(audits.size() == 1);
-    CHECK(audits[0].action == "mfa.step_up.required");
+    // Even when the OIDC username happens to collide with a local row
+    // that is MFA-enrolled (alice), the exemption is unconditional.
+    auto enrolled = make_session("alice", "oidc");
+    CHECK(require_mfa_step_up(req, res, enrolled, *db, /*window_secs=*/300, audit_fn,
+                             "POST /api/v1/tokens"));
+    CHECK(res.status == 200);
+    CHECK(res.body.empty());
+    CHECK(audits.empty());
+}
+
+TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: OIDC session with no users row passes (production case)",
+                 "[mfa][stepup]") {
+    // The real-world OIDC state: a session whose username has NO row in
+    // `users` at all (create_oidc_session never upserts). Before the fix
+    // this hit mfa_status() == UserNotFound and fell into the fail-closed
+    // 401 branch — a permanent lockout. Regression guard for PR #1199
+    // review HIGH: it must pass cleanly with no 401 and no audit row.
+    httplib::Request req;
+    httplib::Response res;
+    res.status = 200;
+    // "carol" was never seeded — no users row exists for her.
+    REQUIRE_FALSE(db->mfa_status("carol").has_value());
+    auto session = make_session("carol", "oidc");
+
+    CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
+                              "DELETE /api/v1/sessions"));
+    CHECK(res.status == 200);
+    CHECK(res.body.empty());
+    CHECK(audits.empty());
 }
 
 TEST_CASE_METHOD(StepUpFixture,
