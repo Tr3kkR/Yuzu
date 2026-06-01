@@ -19,6 +19,7 @@
  */
 
 #include <yuzu/agent/guardian_engine.hpp>
+#include <yuzu/agent/guard_file.hpp>
 #include <yuzu/agent/guard_registry.hpp>
 #include <yuzu/agent/kv_store.hpp>
 
@@ -479,8 +480,58 @@ void GuardianEngine::stop_all_guards_locked() {
 }
 
 bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule& rule) {
-    // MVP: only the Windows Registry Spark. RegistryGuard::start() no-ops off Windows.
-    // Returns true iff a guard was actually armed (so callers can count accurately).
+    // Spark dispatch. Each Spark type maps to a guard implementation, all no-op off
+    // Windows for the MVP. Returns true iff a guard was actually armed (so callers
+    // can count accurately).
+
+    // ── file-change Spark (Change B) — realtime file watch via FileGuard ──────
+    if (rule.spark().type() == "file-change") {
+        const auto& fa = rule.assertion();
+        if (fa.type() != "file-exists")
+            return false; // file-hash-equals is B2; any other assertion stays unarmed
+        auto aparam = [&fa](const char* k) -> std::string {
+            auto it = fa.params().find(k);
+            return it != fa.params().end() ? it->second : std::string{};
+        };
+        FileGuard::Config fcfg;
+        fcfg.rule_id = rule.rule_id();
+        fcfg.rule_name = rule.name();
+        fcfg.path = aparam("path");
+        // expected presence: "absent" → drift when the file EXISTS; anything else
+        // (default "present") → drift when the file is missing / has been deleted.
+        fcfg.expect_present = (aparam("expected") != "absent");
+        // The event-debounce window shares remediation.params with the resilience
+        // keys; a file guard is detection-only, so the resilience MODES do not apply
+        // — only event_debounce_ms is read (single-sourced via parse_resilience_params,
+        // the returned ResilienceConfig is intentionally discarded).
+        const auto& frem = rule.remediation();
+        auto fget = [&frem](std::string_view k) -> std::string {
+            auto it = frem.params().find(std::string(k));
+            return it != frem.params().end() ? it->second : std::string{};
+        };
+        parse_resilience_params(fget, fcfg.event_debounce_ms);
+        const std::string log_path = fcfg.path;
+        const bool log_expect = fcfg.expect_present;
+
+        auto file_sink = [this](const GuardDrift& d) { emit_guard_event(d); };
+        if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
+            if (it->second)
+                it->second->stop();
+            guards_.erase(it);
+        }
+        auto fguard = std::make_unique<FileGuard>(std::move(fcfg), std::move(file_sink));
+        if (fguard->start()) {
+            guards_.emplace(rule.rule_id(), std::move(fguard));
+            spdlog::info("Guardian: file guard armed for rule '{}' (path={}, expect {})",
+                         rule.rule_id(), log_path, log_expect ? "present" : "absent");
+            return true;
+        }
+        spdlog::warn("Guardian: file guard for rule '{}' did not start (non-Windows or empty path)",
+                     rule.rule_id());
+        return false;
+    }
+
+    // ── registry-change Spark (C1/C2) — RegistryGuard ─────────────────────────
     if (rule.spark().type() != "registry-change")
         return false;
     const auto& a = rule.assertion();
