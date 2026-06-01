@@ -3619,8 +3619,18 @@ private:
                     }
                 }
             } else if (!scope_expr.empty()) {
-                // Scope expression dispatch
-                auto parsed = yuzu::scope::parse(scope_expr);
+                // Scope expression dispatch.
+                // Owner principal for from_result_set: resolution (review B1).
+                // This raw path is untracked (no execution row), so read the
+                // session directly; auth already passed require_permission above.
+                std::string principal;
+                if (auto s = require_auth(req, res))
+                    principal = s->username;
+                // Resolve from_result_set: aliases against the operator's owned
+                // sets before parsing (PR-E): the scope resolver does not.
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                auto parsed = yuzu::scope::parse(resolved_scope);
                 if (!parsed) {
                     res.status = 400;
                     res.set_content(
@@ -3628,12 +3638,6 @@ private:
                         "application/json");
                     return;
                 }
-                // Owner principal for from_result_set: resolution (review B1).
-                // This raw path is untracked (no execution row), so read the
-                // session directly; auth already passed require_permission above.
-                std::string principal;
-                if (auto s = require_auth(req, res))
-                    principal = s->username;
                 auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get(),
                                                             custom_properties_store_.get(),
                                                             result_set_store_.get(), principal);
@@ -6006,20 +6010,23 @@ private:
                             ++sent;
                 }
             } else if (!scope_expr.empty()) {
-                auto parsed = yuzu::scope::parse(scope_expr);
+                // from_result_set: is owner-scoped; recover the dispatching
+                // operator from the execution row (run_async / workflow /
+                // scheduled all create it with dispatched_by before dispatch).
+                // This is how owner-checked result-set resolution reaches the
+                // tracked dispatch paths without threading a param through the
+                // shared CommandDispatchFn (review finding B1).
+                std::string principal;
+                if (scope_expr.find("from_result_set:") != std::string::npos &&
+                    !execution_id.empty() && execution_tracker_) {
+                    if (auto ex = execution_tracker_->get_execution(execution_id))
+                        principal = ex->dispatched_by;
+                }
+                // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                auto parsed = yuzu::scope::parse(resolved_scope);
                 if (parsed) {
-                    // from_result_set: is owner-scoped; recover the dispatching
-                    // operator from the execution row (run_async / workflow /
-                    // scheduled all create it with dispatched_by before dispatch).
-                    // This is how owner-checked result-set resolution reaches the
-                    // tracked dispatch paths without threading a param through the
-                    // shared CommandDispatchFn (review finding B1).
-                    std::string principal;
-                    if (scope_expr.find("from_result_set:") != std::string::npos &&
-                        !execution_id.empty() && execution_tracker_) {
-                        if (auto ex = execution_tracker_->get_execution(execution_id))
-                            principal = ex->dispatched_by;
-                    }
                     auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
                                                             custom_properties_store_.get(),
                                                             result_set_store_.get(), principal);
@@ -6327,7 +6334,9 @@ private:
         wf_deps.scope_fn =
             [this](const std::string& expression,
                    const std::string& principal) -> std::pair<std::size_t, std::size_t> {
-            auto parsed = yuzu::scope::parse(expression);
+            // Resolve from_result_set: aliases for the estimate too (PR-E).
+            auto resolved = resolve_scope_aliases(expression, principal, result_set_store_.get());
+            auto parsed = yuzu::scope::parse(resolved);
             if (!parsed)
                 return {0, registry_.agent_count()};
             auto matched =
@@ -6528,16 +6537,19 @@ private:
                                     ++sent;
                         }
                     } else if (!scope_expr.empty() && scope_expr != "__all__") {
-                        auto parsed = yuzu::scope::parse(scope_expr);
+                        // Owner-scoped from_result_set: recover the principal
+                        // from the MCP-created execution row (review B1).
+                        std::string principal;
+                        if (scope_expr.find("from_result_set:") != std::string::npos &&
+                            !execution_id.empty() && execution_tracker_) {
+                            if (auto ex = execution_tracker_->get_execution(execution_id))
+                                principal = ex->dispatched_by;
+                        }
+                        // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                        auto resolved_scope = resolve_scope_aliases(scope_expr, principal,
+                                                                    result_set_store_.get());
+                        auto parsed = yuzu::scope::parse(resolved_scope);
                         if (parsed) {
-                            // Owner-scoped from_result_set: recover the principal
-                            // from the MCP-created execution row (review B1).
-                            std::string principal;
-                            if (scope_expr.find("from_result_set:") != std::string::npos &&
-                                !execution_id.empty() && execution_tracker_) {
-                                if (auto ex = execution_tracker_->get_execution(execution_id))
-                                    principal = ex->dispatched_by;
-                            }
                             for (const auto& aid : registry_.evaluate_scope(
                                      *parsed, tag_store_.get(), custom_properties_store_.get(),
                                      result_set_store_.get(), principal))
@@ -6654,6 +6666,69 @@ private:
             return;
         }
         res.set_content("{\"status\":\"sent\"}", "application/json");
+    }
+
+    // -- Scope helpers -------------------------------------------------------
+
+    // Matches scope_engine.cpp read_ident's charset; governs where a
+    // from_result_set:<ref> atom ends.
+    static bool is_scope_ident_char(char c) {
+        unsigned char u = static_cast<unsigned char>(c);
+        return std::isalnum(u) || c == '_' || c == '.' || c == ':' || c == '-' || c == '*';
+    }
+
+    // Rewrite each `from_result_set:<alias>` atom (a ref not already a canonical
+    // rs_ id) to its canonical id via store->resolve_alias(owner, alias), so the
+    // documented alias form (design §7) resolves at the dispatch layer where the
+    // owner is known — the scope resolver itself does not resolve aliases
+    // (agent_registry.cpp). Canonical ids and unresolved aliases are left as-is:
+    // an unknown/unowned ref simply no-matches downstream (stale drops silently,
+    // design §4.3). No-op when owner is empty or store is null, mirroring the
+    // resolver's empty-principal contract so the policy / no-owner dispatch paths
+    // stay inert. Quoted string literals are copied verbatim so a literal
+    // "from_result_set:" inside a value is never rewritten.
+    static std::string resolve_scope_aliases(std::string_view expr, const std::string& owner,
+                                             ResultSetStore* store) {
+        static constexpr std::string_view kPrefix = "from_result_set:";
+        if (owner.empty() || store == nullptr || expr.find(kPrefix) == std::string_view::npos)
+            return std::string(expr);
+        std::string out;
+        out.reserve(expr.size());
+        size_t i = 0;
+        while (i < expr.size()) {
+            char c = expr[i];
+            if (c == '"' || c == '\'') { // copy quoted literal verbatim
+                char quote = c;
+                out += c;
+                for (++i; i < expr.size(); ++i) {
+                    out += expr[i];
+                    if (expr[i] == quote) {
+                        ++i;
+                        break;
+                    }
+                }
+                continue;
+            }
+            bool at_boundary = (i == 0) || !is_scope_ident_char(expr[i - 1]);
+            if (at_boundary && expr.substr(i).starts_with(kPrefix)) {
+                size_t rs = i + kPrefix.size();
+                size_t j = rs;
+                while (j < expr.size() && is_scope_ident_char(expr[j]))
+                    ++j;
+                std::string ref(expr.substr(rs, j - rs));
+                if (!ref.empty() && !ref.starts_with("rs_")) {
+                    if (auto canon = store->resolve_alias(owner, ref))
+                        ref = *canon;
+                }
+                out += kPrefix;
+                out += ref;
+                i = j;
+                continue;
+            }
+            out += c;
+            ++i;
+        }
+        return out;
     }
 
     // -- JSON parsing helpers (using nlohmann/json) --------------------------
