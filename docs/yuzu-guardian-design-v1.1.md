@@ -1098,10 +1098,16 @@ Remediation sets per-rule `remediating_` atomic flag → guard suppresses evalua
 
 > **Implementation status.** All three modes + the parameters below are wired
 > **agent-side** (the guard reads them from `remediation.params`; absent → `Persist`
-> + 1 s debounce, so existing rules are unchanged). Still outstanding: **server-side
-> schema validation + `GET /schemas` discovery (C3b)** and the **dashboard form
-> (C3c)** — until C3c, the modes are authored via the structured `remediation` block
-> over REST, not the UI. `Escalation` remains post-MVP.
+> + 1 s debounce, so existing rules are unchanged). **C3b landed** server-side:
+> create/update validate + canonicalise the resilience params (mode-relevant bounds,
+> lenient-in / canonical-out, A4 error envelope) and `GET /api/v1/guaranteed-state/schemas`
+> publishes the type catalog incl. the resilience subschema — both driven by one
+> param-spec table (`server/core/src/guardian_resilience_schema.{hpp,cpp}`), with a
+> cross-check test binding its keys to the agent's `resilience_keys`. A structured
+> `PUT` now re-authors the Guard (validates the new policy) instead of silently
+> dropping the blocks. Still outstanding: the **dashboard form (C3c)** — until then,
+> the modes are authored via the structured `remediation` block over REST, not the UI.
+> `Escalation` remains post-MVP.
 
 A resilience mode governs **what a guard does, in enforce mode, when the watched
 state keeps drifting** — i.e. during an active fight with a competing writer. Modes

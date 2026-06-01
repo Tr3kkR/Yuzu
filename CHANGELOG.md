@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian resilience-policy validation + schema discovery (C3b).** The
+  structured Guard create/update path now validates and canonicalises the
+  per-rule resilience policy carried in `remediation.params` (`mode`
+  persist|backoff|bounded, `max_attempts`, `quiet_reset_s`, `resume_after_s`,
+  `backoff_initial_ms`, `backoff_max_ms`, `event_debounce_ms`). Validation is
+  lenient-in / canonical-out — only the chosen mode's load-bearing params are
+  range-checked (a `persist` rule carrying stray `backoff_*` is accepted),
+  values are stored canonical, and failures (e.g. Bounded `max_attempts: 0`,
+  `backoff_initial_ms` > `backoff_max_ms`, overflow-prone seconds) return the A4
+  error envelope. One param-spec table
+  (`server/core/src/guardian_resilience_schema.{hpp,cpp}`) drives both the
+  validator and the published JSON Schema, so the discovery surface and the
+  validator cannot disagree; a cross-check unit test binds the table's keys to
+  the agent's `resilience_keys`. New `GET /api/v1/guaranteed-state/schemas`
+  returns the static type catalog (spark/assertion/remediation + resilience
+  subschema + discriminated `registry-value-equals` encoding), cacheable via a
+  content-derived `ETag` / `If-None-Match` (`304`). A structured `PUT` now
+  re-authors the Guard (re-validating the policy) instead of silently dropping
+  the blocks; the guardian create/update handlers emit the A4 envelope uniformly.
 - **Compliance policies now actually evaluate (check → verdict pipeline).**
   Authored policies + fragments could be created, but nothing evaluated them —
   `PolicyStore::update_agent_status` had no caller and no trigger fired, so

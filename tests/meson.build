@@ -199,6 +199,7 @@ if build_server
       'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',
       'unit/server/test_guardian_push_builder.cpp',
+      'unit/server/test_guardian_resilience_schema.cpp',
       'unit/server/test_heartbeat_ingestion.cpp',
       'unit/server/test_compliance_eval.cpp',
       'unit/server/test_cel_eval.cpp',
@@ -242,6 +243,11 @@ if build_server
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
+      # C3b cross-check: test_guardian_resilience_schema.cpp includes the agent's
+      # resilience_strategy.hpp for resilience_keys to assert the server param-spec
+      # table matches the agent parser (contract G9 drift guard). Header-only
+      # constexpr — no link to yuzu_agent_core, just the include path.
+      include_directories('../agents/core/include'),
     ],
     # httplib.h is header-only and its Client/Server class layout depends on
     # CPPHTTPLIB_OPENSSL_SUPPORT — yuzu_server_core compiles every TU with

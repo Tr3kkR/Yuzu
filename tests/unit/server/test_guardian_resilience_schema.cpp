@@ -1,0 +1,199 @@
+/**
+ * test_guardian_resilience_schema.cpp — C3b server-side resilience param
+ * validation + the published JSON Schema catalog (guardian_resilience_schema.hpp
+ * / guardian_schema_registry.hpp).
+ *
+ * The DRIFT GUARD that matters: the param-spec table is the single source for
+ * BOTH the validator and the schema, and the final TEST_CASE binds that table's
+ * key set to the agent's resilience_keys (the contract G9 schema↔handler
+ * cross-check). A rename on either side fails here. This file is the only place
+ * the server test binary reaches into the agent include tree — header-only
+ * constexpr, no link (see tests/meson.build).
+ */
+
+#include "guardian_resilience_schema.hpp"
+#include "guardian_schema_registry.hpp"
+
+#include <yuzu/agent/resilience_strategy.hpp> // resilience_keys (cross-check)
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <string>
+#include <string_view>
+#include <vector>
+
+using namespace yuzu::server::guardian;
+using nlohmann::json;
+
+namespace {
+// Validate a params object built from a JSON literal; return the (mutated)
+// params plus whether it was accepted.
+struct Outcome {
+    bool ok;
+    std::string message;
+    json params;
+};
+Outcome run(json params) {
+    auto err = validate_and_canonicalize_resilience_params(params);
+    return {!err.has_value(), err ? err->message : std::string{}, std::move(params)};
+}
+} // namespace
+
+TEST_CASE("resilience validate: empty / persist defaults accepted", "[guardian][resilience][validate]") {
+    CHECK(run(json::object()).ok);
+    CHECK(run(json{{"mode", "persist"}}).ok);
+    // mode canonicalised to lowercase token
+    auto o = run(json{{"mode", "PERSIST"}});
+    CHECK(o.ok);
+    CHECK(o.params["mode"] == "persist");
+}
+
+TEST_CASE("resilience validate: mode must be a known token", "[guardian][resilience][validate]") {
+    CHECK_FALSE(run(json{{"mode", "nonsense"}}).ok);
+    CHECK_FALSE(run(json{{"mode", 3}}).ok); // not a string
+    auto o = run(json{{"mode", "Backoff"}});
+    CHECK(o.ok);
+    CHECK(o.params["mode"] == "backoff");
+}
+
+TEST_CASE("resilience validate: Bounded max_attempts bounds", "[guardian][resilience][validate][bounded]") {
+    // 0 degenerates to never-give-up (== Persist) — rejected (min 1).
+    CHECK_FALSE(run(json{{"mode", "bounded"}, {"max_attempts", 0}}).ok);
+    // absent → default 5, accepted.
+    CHECK(run(json{{"mode", "bounded"}}).ok);
+    // present + in range → accepted and canonicalised to a decimal string.
+    auto o = run(json{{"mode", "bounded"}, {"max_attempts", 3}});
+    CHECK(o.ok);
+    CHECK(o.params["max_attempts"] == "3");
+    // numeric string accepted equally (lenient-in).
+    CHECK(run(json{{"mode", "bounded"}, {"max_attempts", "3"}}).ok);
+}
+
+TEST_CASE("resilience validate: quiet_reset_s=0 rejected when relevant",
+          "[guardian][resilience][validate][bounded]") {
+    // quiet_reset_s=0 → quiet always true → never gives up; min is 1.
+    CHECK_FALSE(run(json{{"mode", "bounded"}, {"quiet_reset_s", 0}}).ok);
+    CHECK(run(json{{"mode", "bounded"}, {"quiet_reset_s", 30}}).ok);
+}
+
+TEST_CASE("resilience validate: resume_after_s=0 and event_debounce_ms=0 are valid",
+          "[guardian][resilience][validate]") {
+    CHECK(run(json{{"mode", "bounded"}, {"resume_after_s", 0}}).ok); // 0 = stay given up
+    CHECK(run(json{{"mode", "persist"}, {"event_debounce_ms", 0}}).ok); // 0 = no debounce
+}
+
+TEST_CASE("resilience validate: Backoff initial <= max cross-field",
+          "[guardian][resilience][validate][backoff]") {
+    CHECK(run(json{{"mode", "backoff"}, {"backoff_initial_ms", 500}, {"backoff_max_ms", 8000}}).ok);
+    CHECK_FALSE(
+        run(json{{"mode", "backoff"}, {"backoff_initial_ms", 8000}, {"backoff_max_ms", 500}}).ok);
+    // initial against the DEFAULT max (60000): 100000 > 60000 → rejected even
+    // though max is absent (effective-value cross-check).
+    CHECK_FALSE(run(json{{"mode", "backoff"}, {"backoff_initial_ms", 100000}}).ok);
+}
+
+TEST_CASE("resilience validate: overflow-bounded seconds", "[guardian][resilience][validate]") {
+    // Far beyond the 1-year cap — must reject, not wrap when the agent does *1000.
+    CHECK_FALSE(run(json{{"mode", "bounded"}, {"quiet_reset_s", 99999999999ull}}).ok);
+}
+
+TEST_CASE("resilience validate: lenient-in passes through mode-irrelevant params",
+          "[guardian][resilience][validate][lenient]") {
+    // A Persist rule carrying backoff_* is NOT rejected, and the irrelevant value
+    // is passed through untouched (even if it would be out of range / garbage for
+    // Backoff).
+    auto o = run(json{{"mode", "persist"}, {"backoff_initial_ms", 999999999}});
+    CHECK(o.ok);
+    CHECK(o.params["backoff_initial_ms"] == 999999999); // untouched (still a number)
+    CHECK(run(json{{"mode", "persist"}, {"backoff_initial_ms", "fast"}}).ok); // garbage, irrelevant
+}
+
+TEST_CASE("resilience validate: load-bearing param must be a non-negative integer",
+          "[guardian][resilience][validate]") {
+    CHECK_FALSE(run(json{{"mode", "bounded"}, {"max_attempts", "abc"}}).ok);
+    CHECK_FALSE(run(json{{"mode", "bounded"}, {"max_attempts", -1}}).ok);
+    CHECK_FALSE(run(json{{"mode", "bounded"}, {"max_attempts", 1.5}}).ok);
+}
+
+TEST_CASE("resilience schema: shape + bounds", "[guardian][resilience][schema]") {
+    auto s = resilience_params_schema();
+    REQUIRE(s.is_object());
+    CHECK(s["type"] == "object");
+    const auto& props = s["properties"];
+    REQUIRE(props.contains("mode"));
+    CHECK(props["mode"]["enum"] == json::array({"persist", "backoff", "bounded"}));
+    REQUIRE(props.contains("max_attempts"));
+    CHECK(props["max_attempts"]["minimum"] == 1);
+    // mode-relevance is machine-discoverable
+    CHECK(props["max_attempts"]["x-applies-to-modes"] == json::array({"bounded"}));
+    // other remediation params may coexist in remediation.params
+    CHECK(s["additionalProperties"] == true);
+}
+
+TEST_CASE("schema catalog: parses, lists Slice-A types, stable content ETag",
+          "[guardian][schema][catalog]") {
+    const auto& cat = guardian_schema_catalog();
+    CHECK_FALSE(cat.etag.empty());
+    // built-once cache → identical ETag across calls
+    CHECK(guardian_schema_catalog().etag == cat.etag);
+
+    auto j = json::parse(cat.json);
+    REQUIRE(j.contains("schemas"));
+    REQUIRE(j["schemas"].is_array());
+    std::vector<std::string> types;
+    for (const auto& e : j["schemas"]) {
+        CHECK(e.contains("kind"));
+        CHECK(e.contains("type"));
+        // G9 shape: {kind, type, json_schema} — the schema is nested and is a
+        // WELL-FORMED JSON Schema (type:object), not the discriminator clobbered
+        // over the schema's own type keyword.
+        REQUIRE(e.contains("json_schema"));
+        CHECK(e["json_schema"]["type"] == "object");
+        CHECK(e["json_schema"]["properties"].contains("type"));
+        types.push_back(e["type"].get<std::string>());
+    }
+    auto has = [&](const char* t) {
+        return std::find(types.begin(), types.end(), t) != types.end();
+    };
+    CHECK(has("registry-change"));
+    CHECK(has("registry-value-equals"));
+    CHECK(has("alert-only"));
+    CHECK(has("enforce"));
+
+    // The assertion type publishes the registry value-equals params + the
+    // discriminated `expected` encoding (decision 3).
+    for (const auto& e : j["schemas"]) {
+        if (e["type"] == "registry-value-equals") {
+            const auto& props = e["json_schema"]["properties"]["params"]["properties"];
+            CHECK(props.contains("hive"));
+            CHECK(props.contains("value_type"));
+            CHECK(props.contains("expected"));
+            CHECK(e["json_schema"]["properties"]["params"].contains("allOf")); // discriminators
+        }
+    }
+}
+
+TEST_CASE("CROSS-CHECK: server param-spec keys == agent resilience_keys (G9 drift guard)",
+          "[guardian][resilience][crosscheck]") {
+    using namespace yuzu::agent::resilience_keys;
+    std::vector<std::string_view> agent_keys = {kMode,
+                                                kMaxAttempts,
+                                                kQuietResetS,
+                                                kResumeAfterS,
+                                                kBackoffInitialMs,
+                                                kBackoffMaxMs,
+                                                kEventDebounceMs};
+    std::sort(agent_keys.begin(), agent_keys.end());
+
+    auto server_keys = resilience_param_keys(); // already sorted
+
+    // If this fails, the server schema/validator and the agent parser disagree on
+    // a key name — an author following GET /schemas would set a param the agent
+    // silently ignores. Re-sync resilience_keys (agent) and the kParams table
+    // (server) before merging.
+    CHECK(server_keys.size() == agent_keys.size());
+    CHECK(std::vector<std::string_view>(server_keys.begin(), server_keys.end()) == agent_keys);
+}

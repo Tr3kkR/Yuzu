@@ -440,3 +440,153 @@ TEST_CASE("REST gs.alerts: empty list placeholder", "[rest][guaranteed_state][al
     REQUIRE(j["data"].is_array());
     CHECK(j["data"].empty());
 }
+
+// ── C3b: structured authoring + resilience validation + schema discovery ─────
+
+namespace {
+// A full structured Guard body (spark + assertion + remediation). `resilience`
+// is the remediation.params object carrying the C3b resilience policy.
+std::string make_structured_body(const std::string& rule_id, const std::string& name,
+                                 const std::string& remediation_type, nlohmann::json resilience) {
+    nlohmann::json j;
+    j["rule_id"] = rule_id;
+    j["name"] = name;
+    j["enforcement_mode"] = "enforce";
+    j["severity"] = "high";
+    j["spark"] = {{"type", "registry-change"}, {"params", nlohmann::json::object()}};
+    j["assertion"] = {{"type", "registry-value-equals"},
+                      {"params",
+                       {{"hive", "HKLM"},
+                        {"key", "SOFTWARE\\YuzuTest"},
+                        {"value_name", "Flag"},
+                        {"value_type", "REG_DWORD"},
+                        {"expected", "1"}}}};
+    j["remediation"] = {{"type", remediation_type}, {"params", std::move(resilience)}};
+    return j.dump();
+}
+} // namespace
+
+TEST_CASE("REST gs.rules: structured create validates + canonicalises resilience params",
+          "[rest][guaranteed_state][create][resilience]") {
+    RestGsHarness h;
+    auto res = h.sink.Post(
+        "/api/v1/guaranteed-state/rules",
+        make_structured_body("r-res", "bounded-guard", "enforce",
+                             {{"mode", "BOUNDED"}, {"max_attempts", 3}}));
+    REQUIRE(res);
+    CHECK(res->status == 201);
+
+    auto stored = h.store->get_rule("r-res");
+    REQUIRE(stored.has_value());
+    REQUIRE_FALSE(stored->spec_json.empty());
+    auto spec = nlohmann::json::parse(stored->spec_json);
+    const auto& params = spec["remediation"]["params"];
+    // Canonical-out: mode lowercased, numeric stored as a decimal string.
+    CHECK(params["mode"].get<std::string>() == "bounded");
+    CHECK(params["max_attempts"].get<std::string>() == "3");
+}
+
+TEST_CASE("REST gs.rules: invalid resilience params → 400 A4 envelope + denied audit",
+          "[rest][guaranteed_state][create][resilience][validation]") {
+    RestGsHarness h;
+    auto res = h.sink.Post(
+        "/api/v1/guaranteed-state/rules",
+        make_structured_body("r-bad", "bad-guard", "enforce",
+                             {{"mode", "bounded"}, {"max_attempts", 0}})); // 0 invalid
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = nlohmann::json::parse(res->body);
+    // A4 envelope shape (contract decision 3).
+    REQUIRE(j.contains("error"));
+    CHECK(j["error"]["code"].get<int>() == 400);
+    CHECK(j["error"].contains("correlation_id"));
+    CHECK(j["error"].contains("remediation"));
+    CHECK(j["meta"]["api_version"].get<std::string>() == "v1");
+    // Rule not persisted; reject audited.
+    CHECK_FALSE(h.store->get_rule("r-bad").has_value());
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.rule.create");
+    CHECK(h.audit_log[0].result == "denied");
+}
+
+TEST_CASE("REST gs.rules: PUT re-authors structured spec (no silent drop)",
+          "[rest][guaranteed_state][crud][resilience]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      make_structured_body("r-edit", "edit-guard", "enforce",
+                                           {{"mode", "persist"}}))
+                ->status == 201);
+
+    // Tune the resilience policy via PUT — the pre-C3b PUT returned 200 but
+    // silently dropped structured blocks. Now it must re-derive the spec.
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-edit",
+                          make_structured_body("r-edit", "edit-guard", "enforce",
+                                               {{"mode", "bounded"}, {"max_attempts", 2}}));
+    REQUIRE(upd);
+    CHECK(upd->status == 200);
+
+    auto stored = h.store->get_rule("r-edit");
+    REQUIRE(stored.has_value());
+    auto spec = nlohmann::json::parse(stored->spec_json);
+    CHECK(spec["remediation"]["params"]["mode"].get<std::string>() == "bounded");
+    CHECK(spec["remediation"]["params"]["max_attempts"].get<std::string>() == "2");
+    CHECK(stored->version == 2);
+}
+
+TEST_CASE("REST gs.rules: PUT with an incomplete structured body → 400 (not silently dropped)",
+          "[rest][guaranteed_state][crud][resilience]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      RestGsHarness::make_rule_body("r-meta", "meta-guard"))
+                ->status == 201);
+    // A remediation block with no spark/assertion is an incomplete structured
+    // edit — rejected explicitly rather than 200-and-drop.
+    nlohmann::json partial;
+    partial["remediation"] = {{"type", "enforce"}, {"params", {{"mode", "bounded"}}}};
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-meta", partial.dump());
+    REQUIRE(upd);
+    CHECK(upd->status == 400);
+    auto j = nlohmann::json::parse(upd->body);
+    CHECK(j["error"]["message"].get<std::string>().find("spark") != std::string::npos);
+}
+
+TEST_CASE("REST gs.rules: metadata-only PUT preserves the existing structured spec",
+          "[rest][guaranteed_state][crud][resilience]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      make_structured_body("r-keep", "keep-guard", "enforce",
+                                           {{"mode", "backoff"}, {"backoff_initial_ms", 500}}))
+                ->status == 201);
+    // Toggle enabled only — must not wipe spec_json.
+    nlohmann::json meta;
+    meta["enabled"] = false;
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-keep", meta.dump());
+    REQUIRE(upd);
+    CHECK(upd->status == 200);
+    auto stored = h.store->get_rule("r-keep");
+    REQUIRE(stored.has_value());
+    REQUIRE_FALSE(stored->spec_json.empty());
+    auto spec = nlohmann::json::parse(stored->spec_json);
+    CHECK(spec["remediation"]["params"]["mode"].get<std::string>() == "backoff");
+}
+
+TEST_CASE("REST gs.schemas: catalog + ETag revalidation", "[rest][guaranteed_state][schemas]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/schemas");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const std::string etag = res->get_header_value("ETag");
+    CHECK_FALSE(etag.empty());
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j.contains("schemas"));
+    CHECK(j["schemas"].is_array());
+
+    // Conditional GET with the matching ETag → 304 Not Modified.
+    auto cached = h.sink.Get("/api/v1/guaranteed-state/schemas",
+                             {{"If-None-Match", etag}});
+    REQUIRE(cached);
+    CHECK(cached->status == 304);
+}

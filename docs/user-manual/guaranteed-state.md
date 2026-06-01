@@ -145,6 +145,45 @@ Both require **`GuaranteedState:Write` *and* `GuaranteedState:Push`** (they muta
 >
 > **Offline convergence:** an agent that was offline or unreachable when a rule changed re-converges automatically on reconnect. It reports its applied policy generation (`yuzu.guardian_generation`) in each heartbeat; the server re-pushes when that generation is behind the current store generation (rate-limited per agent). No manual re-push is needed after a network partition.
 
+## Resilience policy (enforce-retry behaviour)
+
+When a guard is enforcing and a competing writer keeps reverting the value, a **resilience policy** governs how the agent re-enforces. The policy travels as string entries in the structured Guard's `remediation.params` (no proto change) and is validated + canonicalised by the server on create/update.
+
+| Param | Applies to mode | Default | Meaning |
+|---|---|---|---|
+| `mode` | all | `persist` | `persist` (re-enforce on every drift, sub-ms, never give up), `backoff` (exponential delay between re-enforcements, never gives up), or `bounded` (give up after N re-fix cycles in one fight; keep detecting + alerting). |
+| `max_attempts` | bounded | `5` | Consecutive re-fix cycles before giving up. Must be ≥ 1 (`0` would never give up — use `persist` for that). |
+| `quiet_reset_s` | backoff, bounded | `60` | Sustained no-drift gap (seconds) that resets the Bounded counter / Backoff exponent. |
+| `resume_after_s` | bounded | `0` | After giving up, auto-resume this many seconds later. `0` = stay given up until an admin re-pushes. |
+| `backoff_initial_ms` | backoff | `1000` | Initial re-enforcement delay; doubles up to `backoff_max_ms`. Must be ≤ `backoff_max_ms`. |
+| `backoff_max_ms` | backoff | `60000` | Cap on the exponential delay. |
+| `event_debounce_ms` | all | `1000` | Collapse-with-count window for repeated drift events. `0` = emit every event. |
+
+```bash
+curl -X POST https://yuzu.example.com/api/v1/guaranteed-state/rules \
+  -H "Authorization: Bearer $YUZU_TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "rule_id": "block-rdp-outbound", "name": "Block outbound RDP",
+    "enforcement_mode": "enforce",
+    "spark":      {"type": "registry-change",       "params": {}},
+    "assertion":  {"type": "registry-value-equals", "params": {"hive": "HKLM", "key": "SYSTEM\\CurrentControlSet\\Services\\TermService", "value_name": "Start", "value_type": "REG_DWORD", "expected": "4"}},
+    "remediation":{"type": "enforce", "params": {"mode": "bounded", "max_attempts": "3", "resume_after_s": "3600"}}
+  }'
+```
+
+**Validation is lenient-in / canonical-out.** Only the chosen mode's load-bearing params are range-checked, so a `persist` rule that carries stray `backoff_*` values is accepted, not rejected. Values are stored canonical (`mode` lowercased, numerics as decimal strings), and `GET` echoes the form you would re-`POST`. An invalid value (e.g. `bounded` with `max_attempts: 0`, or `backoff_initial_ms` > `backoff_max_ms`) returns `400` with the structured **A4 error envelope** (`error.code` / `error.message` / `error.correlation_id` / `error.remediation`) so an agentic author can self-correct. The same validation runs on `PUT` — a structured update re-authors the Guard rather than silently dropping the blocks.
+
+> Resilience modes apply **in enforce mode only** (an audit guard always just detects and alerts). `event_debounce_ms` applies in both modes.
+
+## Schema discovery
+
+`GET /api/v1/guaranteed-state/schemas` returns the static catalog of Guard `spark` / `assertion` / `remediation` types with per-type JSON Schemas — including the resilience subschema above and the discriminated `registry-value-equals` encoding (the `expected` format keyed on `value_type`). It is the machine-discoverable source dynamic authoring forms and agentic clients build against (the same schema the server validates with). Requires `GuaranteedState:Read`. The response is cacheable: it carries a content-derived `ETag`, and a conditional request (`If-None-Match`) returns `304 Not Modified`.
+
+```bash
+curl -H "Authorization: Bearer $YUZU_TOKEN" \
+  https://yuzu.example.com/api/v1/guaranteed-state/schemas
+```
+
 ## Upgrading from a detect-only build
 
 > **Breaking behaviour change.** `enforcement_mode` defaults to **`enforce`**, and enforce mode now **writes to the endpoint registry** on drift. A rule authored on a pre-enforcement build (when Guardian was detect-only) will begin **remediating** on the next push after the agents are upgraded — with no further opt-in. Before upgrading agents: audit existing rules (`GET /api/v1/guaranteed-state/rules`), set `enforcement_mode: audit` on any rule you want to keep detect-only, and re-push. HKLM-scoped enforce rules require the agent service account to have write access to the key.

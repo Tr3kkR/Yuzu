@@ -1,6 +1,8 @@
 #include "rest_api_v1.hpp"
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
+#include "guardian_rule_spec.hpp"
+#include "guardian_schema_registry.hpp"
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
 #include "rest_a4_envelope.hpp"
@@ -534,7 +536,10 @@ const std::string& openapi_spec() {
         R"json(,
     "/guaranteed-state/rules": {
       "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "503": {"description": "service unavailable"}}},
-      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields or invalid JSON"}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
+      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+. Structured authoring: pass spark/assertion/remediation {type, params} blocks; remediation.params resilience policy is validated (mode persist|backoff|bounded + bounds). Validation failures use the A4 error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields, invalid JSON, or invalid resilience params"}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
+    },
+    "/guaranteed-state/schemas": {
+      "get": {"summary": "Guard authoring schema registry", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Static catalog of spark/assertion/remediation types with per-type JSON Schemas (discriminated subschemas for value-dependent formats; resilience policy subschema for remediation). Cacheable via ETag/If-None-Match (304).", "responses": {"200": {"description": "Schema catalog"}, "304": {"description": "Not modified (ETag matched)"}}}
     },
     "/guaranteed-state/rules/{rule_id}": {
       "get": {"summary": "Get a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "404": {"description": "Rule not found"}}},
@@ -3479,20 +3484,48 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
+    // Schema-registry discovery surface (contract G9 / decision 3): the static
+    // catalog of Guard spark/assertion/remediation types + per-type JSON Schemas
+    // (discriminated subschemas for value-dependent formats). Agentic-first
+    // (A1/A2) — drives the dashboard's create/edit form (C3c) and any agentic
+    // author. Cacheable: a content-derived ETag lets a client fetch-once and
+    // revalidate cheaply (NFR-kind). Does NOT require the store — the catalog is
+    // compiled-in, so it answers even when the rules DB is unavailable.
+    sink.Get("/api/v1/guaranteed-state/schemas",
+             [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const auto& catalog = guardian::guardian_schema_catalog();
+                 res.set_header("ETag", catalog.etag);
+                 res.set_header("Cache-Control", "public, max-age=300");
+                 if (req.get_header_value("If-None-Match") == catalog.etag) {
+                     res.status = 304; // not modified — client's cached copy is current
+                     return;
+                 }
+                 res.set_content(catalog.json, "application/json");
+             });
+
     sink.Post("/api/v1/guaranteed-state/rules", [auth_fn, perm_fn, audit_fn, guaranteed_state_store,
                                                  iso_now](const httplib::Request& req,
                                                           httplib::Response& res) {
         if (!perm_fn(req, res, "GuaranteedState", "Write"))
             return;
+        // Authoring errors return the A4 structured envelope (contract decision 3)
+        // so an agentic author self-corrects; the whole create handler speaks A4
+        // uniformly (not a mix of A4 + plain error_json across sibling branches).
+        const auto cid = detail::make_correlation_id();
         if (!guaranteed_state_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
             return;
         }
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.is_object()) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::error_json_a4(400, "invalid JSON", cid,
+                                                  "send a JSON object request body"),
+                            "application/json");
             return;
         }
         GuaranteedStateRuleRow row;
@@ -3511,7 +3544,8 @@ void RestApiV1::register_routes(
         // (governance C1/B2). Disabling a guard is the `enabled` flag, not a mode.
         if (row.enforcement_mode != "enforce" && row.enforcement_mode != "audit") {
             res.status = 400;
-            res.set_content(error_json("enforcement_mode must be 'enforce' or 'audit'"),
+            res.set_content(detail::error_json_a4(400, "enforcement_mode must be 'enforce' or 'audit'",
+                                                  cid, "set enforcement_mode to 'enforce' or 'audit'"),
                             "application/json");
             // Audit the reject (sibling-parity with the update handler + the
             // invalid-JSON branch — leave a SIEM trail for a malformed/probe body).
@@ -3521,58 +3555,39 @@ void RestApiV1::register_routes(
         }
 
         // Guardian Guards are authored STRUCTURED (contract decisions 1-3): typed
-        // spark/assertion/remediation blocks, each {type, map params}. The agent
-        // enforces from these (it never parses yaml_source). The server derives the
-        // authoritative canonical spec_json plus a human-readable yaml_source
-        // rendering. A legacy yaml_source-only body is still accepted (stored, but
-        // not agent-enforceable — spec_json stays empty) so pre-structured callers
-        // and tests keep working during the transition. See guardian-mvp-contract.md.
-        auto json_block = [&](const char* key) -> nlohmann::json {
-            if (body.contains(key) && body[key].is_object())
-                return body[key];
-            return nlohmann::json::object();
-        };
-        nlohmann::json spark = json_block("spark");
-        nlohmann::json assertion = json_block("assertion");
-        nlohmann::json remediation = json_block("remediation");
-        const std::string spark_type = spark.value("type", std::string{});
-        const std::string assertion_type = assertion.value("type", std::string{});
-        const bool structured = !spark_type.empty() && !assertion_type.empty();
-
-        if (structured) {
-            // Detect-and-alert is the MVP default remediation.
-            if (remediation.empty())
-                remediation = {{"type", "alert-only"}, {"params", nlohmann::json::object()}};
-            nlohmann::json spec;
-            spec["name"] = row.name;
-            spec["version"] = row.version;
-            spec["enabled"] = row.enabled;
-            spec["enforcement_mode"] = row.enforcement_mode;
-            spec["spark"] = spark;
-            spec["assertion"] = assertion;
-            spec["remediation"] = remediation;
-            // Authoritative structured form. NOTE: a structured dump, not yet
-            // JCS-canonicalised — full RFC-8785 canonicalisation lands with rule
-            // signing (contract G3, deferred).
-            row.spec_json = spec.dump();
-            // yaml_source is a generated, never-parsed human-readable rendering
-            // (decision 1). JSON is a valid YAML subset, so a header-commented
-            // pretty dump is an honest rendering; block-YAML output is cosmetic.
-            row.yaml_source =
-                "# Guardian Guard (generated rendering — authoritative form is the "
-                "structured spec)\n" +
-                spec.dump(2) + "\n";
+        // spark/assertion/remediation blocks, each {type, map params}. derive_rule_spec
+        // builds the authoritative canonical spec_json + a human-readable yaml_source
+        // rendering and validates the remediation.params resilience policy (C3b). A
+        // legacy yaml_source-only body is still accepted (structured=false; stored but
+        // not agent-enforceable) so pre-structured callers and tests keep working.
+        auto spec = guardian::derive_rule_spec(body, row.name, row.version, row.enabled,
+                                               row.enforcement_mode);
+        if (spec.error) {
+            res.status = 400;
+            res.set_content(
+                detail::error_json_a4(400, spec.error->message, cid, spec.error->remediation),
+                "application/json");
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+                     spec.error->message);
+            return;
+        }
+        if (spec.structured) {
+            row.spec_json = std::move(spec.spec_json);
+            row.yaml_source = std::move(spec.yaml_source);
         } else {
             // Legacy path: yaml_source supplied directly, no structured spec.
             row.yaml_source = body.value("yaml_source", std::string{});
         }
 
         if (row.rule_id.empty() || row.name.empty() ||
-            (!structured && row.yaml_source.empty())) {
+            (!spec.structured && row.yaml_source.empty())) {
             res.status = 400;
             res.set_content(
-                error_json("rule_id and name are required, plus either a structured "
-                           "spark+assertion or a yaml_source"),
+                detail::error_json_a4(
+                    400,
+                    "rule_id and name are required, plus either a structured "
+                    "spark+assertion or a yaml_source",
+                    cid, "provide rule_id, name and a spark+assertion (or yaml_source)"),
                 "application/json");
             return;
         }
@@ -3588,11 +3603,12 @@ void RestApiV1::register_routes(
         if (!result) {
             if (is_conflict_error(result.error())) {
                 res.status = 409;
-                res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                res.set_content(detail::error_json_a4(409, strip_conflict_prefix(result.error()), cid,
+                                                      "choose a unique rule_id and name"),
                                 "application/json");
             } else {
                 res.status = 400;
-                res.set_content(error_json(result.error()), "application/json");
+                res.set_content(detail::error_json_a4(400, result.error(), cid), "application/json");
             }
             audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
                      result.error());
@@ -3629,22 +3645,29 @@ void RestApiV1::register_routes(
               iso_now](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Write"))
                      return;
+                 // A4 envelope across the whole update handler (contract decision 3),
+                 // uniform with the create handler.
+                 const auto cid = detail::make_correlation_id();
                  if (!guaranteed_state_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
                      return;
                  }
                  auto id = req.matches[1].str();
                  auto existing = guaranteed_state_store->get_rule(id);
                  if (!existing) {
                      res.status = 404;
-                     res.set_content(error_json("rule not found"), "application/json");
+                     res.set_content(detail::error_json_a4(404, "rule not found", cid),
+                                     "application/json");
                      return;
                  }
                  auto body = nlohmann::json::parse(req.body, nullptr, false);
                  if (body.is_discarded() || !body.is_object()) {
                      res.status = 400;
-                     res.set_content(error_json("invalid JSON"), "application/json");
+                     res.set_content(detail::error_json_a4(400, "invalid JSON", cid,
+                                                           "send a JSON object request body"),
+                                     "application/json");
                      // Mirror the /push handler's invalid-body audit (BL-6): a
                      // mutating REST path that rejects a malformed body should
                      // leave a denied audit trail so SIEM sees the probe/fuzz
@@ -3665,7 +3688,6 @@ void RestApiV1::register_routes(
                  // request-shape mistake into a server-error alertable event.
                  // Mirrors the POST handler's body.value(...) pattern.
                  updated.name = body.value("name", updated.name);
-                 updated.yaml_source = body.value("yaml_source", updated.yaml_source);
                  updated.enabled = body.value("enabled", updated.enabled);
                  updated.enforcement_mode =
                      body.value("enforcement_mode", updated.enforcement_mode);
@@ -3675,7 +3697,9 @@ void RestApiV1::register_routes(
                  if (body.contains("enforcement_mode") && updated.enforcement_mode != "enforce" &&
                      updated.enforcement_mode != "audit") {
                      res.status = 400;
-                     res.set_content(error_json("enforcement_mode must be 'enforce' or 'audit'"),
+                     res.set_content(detail::error_json_a4(400,
+                                                           "enforcement_mode must be 'enforce' or 'audit'",
+                                                           cid, "set enforcement_mode to 'enforce' or 'audit'"),
                                      "application/json");
                      audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
                               "invalid enforcement_mode");
@@ -3685,6 +3709,32 @@ void RestApiV1::register_routes(
                  updated.os_target = body.value("os_target", updated.os_target);
                  updated.scope_expr = body.value("scope_expr", updated.scope_expr);
                  updated.version = existing->version + 1;
+
+                 // A structured body re-authors the Guard (contract §8): re-derive the
+                 // canonical spec + yaml_source and re-validate the resilience policy
+                 // (C3b) rather than the pre-C3b behaviour of silently dropping the
+                 // blocks on a 200. A metadata-only body (no spark/assertion/remediation)
+                 // keeps the existing spec_json and just applies any yaml_source
+                 // override. derive_rule_spec sees the bumped version so the embedded
+                 // spec.version matches the row.
+                 auto spec = guardian::derive_rule_spec(body, updated.name, updated.version,
+                                                        updated.enabled, updated.enforcement_mode);
+                 if (spec.error) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, spec.error->message, cid, spec.error->remediation),
+                         "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              spec.error->message);
+                     return;
+                 }
+                 if (spec.structured) {
+                     updated.spec_json = std::move(spec.spec_json);
+                     updated.yaml_source = std::move(spec.yaml_source);
+                 } else {
+                     updated.yaml_source = body.value("yaml_source", updated.yaml_source);
+                 }
+
                  updated.updated_at = iso_now();
                  auto session = auth_fn(req, res);
                  if (session)
@@ -3694,11 +3744,13 @@ void RestApiV1::register_routes(
                  if (!result) {
                      if (is_conflict_error(result.error())) {
                          res.status = 409;
-                         res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                         res.set_content(detail::error_json_a4(409, strip_conflict_prefix(result.error()),
+                                                               cid, "choose a unique name"),
                                          "application/json");
                      } else {
                          res.status = 400;
-                         res.set_content(error_json(result.error()), "application/json");
+                         res.set_content(detail::error_json_a4(400, result.error(), cid),
+                                         "application/json");
                      }
                      audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
                               result.error());
