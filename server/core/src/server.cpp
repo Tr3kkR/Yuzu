@@ -2284,6 +2284,25 @@ private:
         return auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
     }
 
+    // PR-E: emit the invocation-time scope-resolution-failure audit row (design
+    // §7 rule 3) when a from_result_set: ref resolves to an absent/expired or
+    // not-owned set. Req-less so every dispatch path (REST, tracked, MCP) emits
+    // uniformly; carries the result-set id + reason for the forensic chain.
+    void audit_scope_resolution_failed(const std::string& principal, const std::string& ref) {
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.action = "instruction.scope_resolution_failed";
+        ev.target_type = "result_set";
+        ev.target_id = ref;
+        ev.detail = "INSTRUCTION_SCOPE_RESOLUTION_FAILED: result set not found, "
+                    "expired, or not owned by principal";
+        ev.result = "failure";
+        (void)audit_store_->log(ev);
+    }
+
     // Apply stored runtime config overrides on startup
     void apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
@@ -3630,6 +3649,11 @@ private:
                 // sets before parsing (PR-E): the scope resolver does not.
                 auto resolved_scope =
                     resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                // Forensic row when a referenced set is absent/expired/unowned
+                // (design §7 rule 3); does not abort dispatch.
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, ref);
                 auto parsed = yuzu::scope::parse(resolved_scope);
                 if (!parsed) {
                     res.status = 400;
@@ -6025,6 +6049,9 @@ private:
                 // Resolve from_result_set: aliases at the dispatch layer (PR-E).
                 auto resolved_scope =
                     resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, ref);
                 auto parsed = yuzu::scope::parse(resolved_scope);
                 if (parsed) {
                     auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
@@ -6548,6 +6575,9 @@ private:
                         // Resolve from_result_set: aliases at the dispatch layer (PR-E).
                         auto resolved_scope = resolve_scope_aliases(scope_expr, principal,
                                                                     result_set_store_.get());
+                        for (const auto& ref : scope_refs_failing_owner_check(
+                                 resolved_scope, principal, result_set_store_.get()))
+                            audit_scope_resolution_failed(principal, ref);
                         auto parsed = yuzu::scope::parse(resolved_scope);
                         if (parsed) {
                             for (const auto& aid : registry_.evaluate_scope(
@@ -6729,6 +6759,53 @@ private:
             ++i;
         }
         return out;
+    }
+
+    // Return the from_result_set:<ref> atoms in `expr` (already alias-resolved)
+    // that fail the owner check: the set is absent/expired (store->get == none)
+    // or owned by someone else. Distinct from a set that exists, is owned, and
+    // is legitimately empty — that is NOT a failure and is not reported here, so
+    // the caller's audit row (design §7 rule 3) never fires on an empty set or
+    // on individual stale members (which drop silently, design §4.3). Walks the
+    // same token grammar as resolve_scope_aliases; empty when owner is empty or
+    // the store is null (no owner context to check against).
+    static std::vector<std::string> scope_refs_failing_owner_check(std::string_view expr,
+                                                                   const std::string& owner,
+                                                                   ResultSetStore* store) {
+        std::vector<std::string> failing;
+        static constexpr std::string_view kPrefix = "from_result_set:";
+        if (owner.empty() || store == nullptr || expr.find(kPrefix) == std::string_view::npos)
+            return failing;
+        size_t i = 0;
+        while (i < expr.size()) {
+            char c = expr[i];
+            if (c == '"' || c == '\'') {
+                char quote = c;
+                for (++i; i < expr.size(); ++i)
+                    if (expr[i] == quote) {
+                        ++i;
+                        break;
+                    }
+                continue;
+            }
+            bool at_boundary = (i == 0) || !is_scope_ident_char(expr[i - 1]);
+            if (at_boundary && expr.substr(i).starts_with(kPrefix)) {
+                size_t rs = i + kPrefix.size();
+                size_t j = rs;
+                while (j < expr.size() && is_scope_ident_char(expr[j]))
+                    ++j;
+                std::string ref(expr.substr(rs, j - rs));
+                if (!ref.empty()) {
+                    auto set = store->get(ref);
+                    if (!set || set->owner_principal != owner)
+                        failing.push_back(ref);
+                }
+                i = j;
+                continue;
+            }
+            ++i;
+        }
+        return failing;
     }
 
     // -- JSON parsing helpers (using nlohmann/json) --------------------------
