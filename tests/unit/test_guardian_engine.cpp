@@ -96,9 +96,10 @@ struct GuardianFixture {
     }
 
     // A rule that actually arms a RegistryGuard on Windows (registry-change spark
-    // + registry-value-equals assertion). The key need not exist — an absent key
-    // makes the guard worker exit immediately, which is the UP-1 "dead thread
-    // still in guards_" case we want get_status to report fail-closed.
+    // + registry-value-equals assertion). The key need not exist — post-C1 the
+    // guard worker stays ALIVE on a nearest-ancestor watch (waiting for the key to
+    // appear) instead of exiting; get_status is still fail-closed because there is
+    // no self-test verdict yet, so the rule reports "errored" regardless.
     static gpb::GuaranteedStateRule make_registry_rule(const std::string& id,
                                                        const std::string& mode) {
         gpb::GuaranteedStateRule r = make_rule(id, id);
@@ -266,12 +267,15 @@ TEST_CASE("GuardianEngine: get_status is fail-closed — an armed guard is never
     GuardianFixture f;
     gpb::GuaranteedStatePush p;
     p.set_full_sync(true);
-    *p.add_rules() = GuardianFixture::make_registry_rule("reg-1", "enforce");
+    // audit (not enforce) so this status test never triggers C2's enforce-mode key
+    // recreation as a side effect — it only needs an armed guard to assert
+    // fail-closed status, which holds regardless of enforcement mode.
+    *p.add_rules() = GuardianFixture::make_registry_rule("reg-1", "audit");
     // Serialize-then-dispatch so the params Map is parsed INSIDE the agent DLL
     // (the #501 cross-image hash-seed reason the helper exists). On Windows this
-    // arms a real RegistryGuard (the absent key makes its worker exit at once —
-    // the UP-1 dead-thread case); off-Windows no guard arms. Either way the
-    // status MUST be fail-closed.
+    // arms a real RegistryGuard (post-C1 its worker stays alive on a nearest-
+    // ancestor watch while the key is absent); off-Windows no guard arms. Either
+    // way the status MUST be fail-closed.
     auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
     REQUIRE(dr.exit_code == 0);
 

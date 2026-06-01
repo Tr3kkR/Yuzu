@@ -121,9 +121,10 @@ Yuzu Agent
     │   └── Re-entrancy protection (suppresses self-triggered events)
     │
     ├── Resilience Strategy (per-rule configurable)
-    │   ├── Fixed — N failures then cooldown + alert
+    │   ├── Persist — immediate, sub-ms, never gives up (default)
     │   ├── Backoff — exponential delay, never gives up
-    │   ├── Escalation — try method A, then B, then C, then terminal action
+    │   ├── Bounded — give up after N cycles, then keep detecting + alert
+    │   ├── Escalation — forward design (post-MVP): A → B → C → terminal
     │   └── Race Detector — sliding window drift rate tracking
     │
     └── Audit Journal
@@ -426,8 +427,8 @@ spec:
     params: { ... }                  # Not required when method: auto
 
     resilience:
-      strategy: fixed | backoff | escalation
-      # Strategy-specific config (see Section 8.5)
+      mode: persist | backoff | bounded     # Persist today; Backoff/Bounded = C3; escalation post-MVP
+      # Mode-specific config (see Section 8.5)
 
   audit:
     severity: critical | high | medium | low
@@ -657,7 +658,7 @@ spec:
     method: firewall-api
     params: { port: 445, protocol: TCP, direction: inbound, action: block }
     resilience:
-      strategy: escalation
+      mode: escalation     # forward design (post-MVP) — see §8.5
       steps:
         - method: firewall-api
           params: { port: 445, protocol: TCP, direction: inbound, action: block }
@@ -711,9 +712,9 @@ spec:
     method: restart-service
     params: { service_name: "CSFalconService" }
     resilience:
-      strategy: backoff
-      initial_delay: 5s
-      multiplier: 2
+      mode: backoff
+      backoff_initial_ms: 5000
+      backoff_max_ms: 60000
       max_delay: 300s
       jitter: true
   audit:
@@ -785,10 +786,9 @@ spec:
     params:
       command: "pwsh.exe -NonInteractive -Command Start-MpScan -ScanType FullScan"
     resilience:
-      strategy: fixed
-      max_failures: 3
-      cooldown: 86400s
-      on_open: alert
+      mode: bounded
+      max_attempts: 3
+      resume_after_s: 86400    # auto-retry daily; omit to require a human
   audit:
     severity: high
     notify: true
@@ -1009,7 +1009,7 @@ agents/core/src/state_evaluator.hpp/.cpp    Assertion evaluation
 agents/core/src/remediation_engine.hpp/.cpp Corrective actions
 agents/core/src/guard_audit.hpp/.cpp        Local audit journal
 agents/core/src/assertion_types.hpp/.cpp    Assertion type registry
-agents/core/src/resilience_strategy.hpp/.cpp  Fixed/backoff/escalation
+agents/core/src/resilience_strategy.hpp/.cpp  Persist/Backoff/Bounded (Escalation forward)
 agents/core/src/race_detector.hpp/.cpp      Drift rate tracking
 ```
 
@@ -1088,15 +1088,62 @@ public:
 
 Remediation sets per-rule `remediating_` atomic flag → guard suppresses evaluation during active remediation → flag clears after remediation + 5ms delay.
 
-### 8.5 Resilience strategies
+### 8.5 Resilience modes (enforcement retry policy)
 
-**Fixed:** N consecutive failures → open (cooldown + alert). Good for simple toggle rules.
+> **Canonical vocabulary (decided 2026-06-01).** These three modes supersede the
+> earlier `fixed | backoff | escalation` naming. `Backoff` keeps its meaning; the
+> old `Fixed` is renamed **`Bounded`** and refined; **`Persist`** is new and is the
+> default. `Escalation` is retained below as forward design but is **deferred for
+> the MVP** — it terminates in quarantine (§11.7), a subsystem the MVP lacks.
 
-**Backoff:** Exponential delay (initial × 2^n, capped at max). Never gives up. Good for transient adversaries.
+> **Implementation status.** Only **`Persist`** is wired into the agent today (it is
+> the guard's default behaviour — write the expected value back on every drift, and
+> recreate a deleted key in enforce mode). **`Backoff`, `Bounded`, the parameters
+> below, and the dashboard form land in C3**; until then the agent honours `Persist`
+> and ignores any other authored mode/params. The example rules and parameter names
+> below describe the C3 design, not current behaviour.
 
-**Escalation:** Chain of methods (A → B → C → terminal action). Each step has own failure threshold. Good for critical security rules with defence in depth.
+A resilience mode governs **what a guard does, in enforce mode, when the watched
+state keeps drifting** — i.e. during an active fight with a competing writer. Modes
+are **enforce-only**: an audit-mode guard always just detects and alerts, never
+retries. They are **per-rule**, and **only `Persist` carries the sub-millisecond
+enforcement guarantee** — the others trade latency or coverage for it by design.
 
-**Race detection:** Sliding window tracks drift rate. If >10 drifts/5s, adjusts strategy behaviour (fixed opens immediately, backoff jumps to max, escalation advances).
+- **`Persist`** *(default)* — re-enforce immediately on every drift; sub-ms; never
+  give up. The agent's baseline "write the expected value back on every
+  notification" behaviour. Best for high-value toggles that must be restored
+  instantly, accepting CPU spent fighting a fast adversary.
+- **`Backoff`** — exponential delay between re-enforcements (initial × 2^n, capped
+  at max); never gives up. Trades enforcement latency for calm, bounding CPU/event
+  churn against a noisy or transient adversary. Choosing it is an explicit opt-out
+  of the sub-ms guarantee.
+- **`Bounded`** — give up after **X consecutive re-fix cycles** in one ongoing
+  fight. Each fix *succeeds* and the adversary immediately re-flips, so the counter
+  tracks *cycles*, not *failures*. A quiet window of sustained compliance
+  (`quiet_reset_s`) resets the counter, so a value that drifts once a month never
+  creeps toward the cap over the guard's lifetime. On give-up the guard **stops
+  writing, keeps detecting, and raises an alert** — it stays alive and observing
+  (drift remains visible on the events stream) and stays given-up until an admin
+  re-pushes / re-enables the rule. Optional `resume_after_s` re-arms remediation
+  automatically (default off — give-up is a hand-off to a human).
+- **`Escalation`** *(forward design, post-MVP)* — chain of methods (A → B → C →
+  terminal action such as quarantine), each step with its own failure threshold,
+  for critical rules wanting defence in depth.
+
+**Configuration.** Mode and its parameters (`max_attempts`, `quiet_reset_s`,
+`backoff_initial_ms`, `backoff_max_ms`, `resume_after_s`) plus the debounce windows
+(§6.5) are authored per-rule and travel as string entries in the rule's
+`remediation.params` map (input debounce in `spark.params`) — **no proto change**.
+The param shape lives in the server-side JSON-Schema registry (`guardian-mvp-contract.md`
+decisions 1 & 3), which also feeds the `GET /schemas` discovery surface. The
+dashboard create/edit form will expose the fields; the agent will read them in (C3)
+`start_guard_for_rule_locked`. Rules that omit them fall back to `Persist` + the
+default 1 s event-debounce, so the addition is backward-compatible with no migration.
+
+**Race detection** *(forward).* A sliding window over drift rate can adjust mode
+behaviour under a flood (> N drifts / window): `Bounded` gives up immediately,
+`Backoff` jumps straight to max delay. Optional for the MVP — `Bounded`'s
+quiet-window reset already supplies basic rate-awareness.
 
 ---
 
@@ -1538,7 +1585,7 @@ If `post_remediation` is not specified, the agent enforces file content only. Th
 | **A. Core framework** | GuardianEngine, PolicyCache, GuardManager, StateEvaluator, RemediationEngine, AuditJournal | `guardian_engine.*`, `guard_manager.*`, `state_evaluator.*`, `remediation_engine.*`, `guard_audit.*` |
 | **B. Event guards** | RegistryGuard + re-entrancy protection | `guard_registry.*` |
 | **C. Core assertions** | `firewall-port-blocked`, `registry-value-equals`, `service-disabled`, `service-running` | `assertion_types.*` |
-| **D. Resilience** | Fixed, backoff, escalation strategies; race detector | `resilience_strategy.*`, `race_detector.*` |
+| **D. Resilience** | Persist, Backoff, Bounded modes (Escalation forward); race detector | `resilience_strategy.*`, `race_detector.*` |
 | **E. Core remediation** | `registry-write`, `firewall-api`, `service-control` | `remediation_engine.cpp` |
 | **F. Condition guards** | ProcessGuard, SoftwareGuard, ComplianceGuard, WMIGuard | `guard_process.*`, `guard_software.*`, `guard_compliance.*`, `guard_wmi.*` |
 | **G. Condition assertions** | `process-running`, `software-updated-within`, `av-scan-within`, `wmi-value-equals` | `assertion_types.cpp` |
