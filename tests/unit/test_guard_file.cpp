@@ -24,6 +24,9 @@
 #include <vector>
 
 using namespace yuzu::agent;
+
+#ifdef _WIN32
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -64,8 +67,6 @@ void write_file(const fs::path& p, const std::string& s = "x") {
 }
 
 } // namespace
-
-#ifdef _WIN32
 
 TEST_CASE("FileGuard file-exists: detects deletion in realtime", "[guardian][guard][file]") {
     const auto dir = yuzu::test::unique_temp_path("fileguard-del");

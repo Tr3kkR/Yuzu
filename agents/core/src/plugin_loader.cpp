@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <cerrno>
+#include <cstdint> // std::uintmax_t (sha256_file bounded-read counter, used before the #ifdef)
 #include <cstring>
 #include <fstream>
 #include <sstream>

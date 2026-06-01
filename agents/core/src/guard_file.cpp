@@ -194,10 +194,10 @@ void FileGuard::run() {
         }
     };
 
-    // file-hash-equals: drift when content (size pre-filter + bounded SHA-256)
-    // differs from the baseline / expected hash. Reads the PATH (independent of the
-    // dir handle) so it is correct regardless of watch state. Fail-loud on
-    // absent / oversize / unreadable — never a silent "compliant" (G11/N3).
+    // file-hash-equals: drift when content (bounded SHA-256) differs from the
+    // baseline / expected hash. Reads the PATH (independent of the dir handle) so it
+    // is correct regardless of watch state. Fail-loud on absent / oversize /
+    // unreadable — never a silent "compliant" (G11/N3).
     auto eval_hash = [&] {
         std::error_code ec;
         const std::string expected_disp =
@@ -218,8 +218,11 @@ void FileGuard::run() {
             report("<oversize>", expected_disp);
             return;
         }
-        // Size pre-filter: a baseline of known size that no longer matches is
-        // definitely changed — report without hashing (cheap common case).
+        // Hash on each settled change — once per quiescence window, so cheap, and it
+        // puts the actual digest in every drift report. Bounded by max_hash_bytes (a
+        // TOCTOU-grow / DoS defence). NB: a size-delta pre-filter to skip hashing was
+        // considered and dropped — the per-event cost is negligible and unconditional
+        // hashing keeps the forensic digest (a size-only signal would lose it).
         const std::string cur =
             sha256_file(target, static_cast<std::size_t>(cfg_.max_hash_bytes));
         if (cur.empty()) {

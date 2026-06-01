@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint> // SIZE_MAX (sha256_file max_bytes default)
 #include <expected>
 #include <filesystem>
 #include <memory>
