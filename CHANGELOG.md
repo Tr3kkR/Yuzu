@@ -57,6 +57,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   callback + ExecutionTracker (threaded into `RestApiV1::register_routes`); without
   them they return `503`. Design: `docs/scope-walking-design.md` §3.1/§3.3/§6/§8.3/§10.
 
+- **Scope walking — YAML `fromResultSet:` DSL surface (PR-E).** A `spec.scope:`
+  block may now carry `fromResultSet:` (a canonical `rs_` id or a per-operator
+  alias), optionally refined by a `selector:` composed with `AND`. New
+  `scope_yaml.{hpp,cpp}` (with the YAML line-scanners factored out of
+  `policy_store.cpp` into shared `yaml_scan.{hpp,cpp}`) parses, validates, and
+  lowers the block to the existing scope-engine grammar:
+  `selector.platform` → `ostype == "<value>"`, each `selector.tags` entry →
+  `EXISTS tag:<name>` (presence; Yuzu tags are key=value), AND-composed with the
+  `from_result_set:<ref>` atom. Validation (design §7): `fromResultSet` may not
+  be combined with `assignment.managementGroups`, and requires
+  `assignment.mode: static` — enforced at definition import
+  (`InstructionStore::create_definition`) and policy create. `from_result_set:`
+  **aliases now resolve at the dispatch layer** against the operator's owned sets
+  (`resolve_scope_aliases` at the generic REST, tracked, MCP, and
+  `/api/scope/estimate` paths) — previously only producer `parent_id` resolved
+  aliases, so an alias in a scope silently matched nothing. An invocation-time
+  resolution failure (the referenced set is absent, expired, or not owned) now
+  emits an `instruction.scope_resolution_failed` audit row
+  (`INSTRUCTION_SCOPE_RESOLUTION_FAILED`). Resolution stays lazy: a definition
+  carrying a since-expired `fromResultSet:` is still valid YAML. Policy
+  `fromResultSet:` is **rejected for now** (a result set's 1h TTL clashes with a
+  continuously-evaluated policy; deferred to a follow-up with a policy owner +
+  pinned-set semantics). Design: `docs/scope-walking-design.md` §7;
+  `docs/yaml-dsl-spec.md` §9.3.
+
 - **Compliance policies now actually evaluate (check → verdict pipeline).**
   Authored policies + fragments could be created, but nothing evaluated them —
   `PolicyStore::update_agent_status` had no caller and no trigger fired, so
@@ -86,6 +111,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   / `yuzu_server_policy_eval_errors_total` metrics.
 
 ### Fixed
+
+- **`scope.selector:` policies now lower to a real scope (PR-E).** A Policy whose
+  `spec.scope:` opened a `selector:` mapping was previously read by the scalar
+  extractor as empty and silently stored no scope. It now lowers via the `scope_yaml`
+  path (`selector.platform` → `ostype`, `selector.tags` → `EXISTS tag:`). Scalar
+  `scope:` expressions are unchanged. No shipped content used the mapping form.
 
 - **Dashboard scope panel now visible at narrow viewports (≤1280px).** A global
   responsive rule in `server/core/static/yuzu.css` was hiding the right-hand
@@ -141,6 +172,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removes the bearer-reference property (review E, by design).
 
 ### Tests
+
+- **Scope walking — YAML `fromResultSet:` DSL (PR-E).** New
+  `tests/unit/server/test_scope_yaml.cpp` (`[scope][dsl]`, 15 cases): the lowering
+  table (`fromResultSet`, `selector.platform` → `ostype`, `selector.tags` →
+  `EXISTS tag:`, full composition), the design §7 validation rules
+  (managementGroups exclusion, static-mode requirement, empty/over-long ref),
+  scalar-scope backward compatibility, rule-3 load-time validity, and the
+  lowered-string round-trip through `yuzu::scope::parse`.
+  `test_scope_walking_authz.cpp` gains `resolve_scope_aliases` (owner alias
+  rewrite, composition, `rs_` passthrough, non-owner / empty-owner no-op,
+  quoted-literal skip) and `scope_refs_failing_owner_check` (absent/unowned
+  flagged; owned-but-empty not flagged) coverage. `test_policy_store.cpp` pins
+  `scope.selector` lowering + the policy `fromResultSet` rejection;
+  `test_instruction_store.cpp` pins import validation (static accepted +
+  round-trips, dynamic rejected, managementGroups rejected, scope-less
+  unaffected).
 
 - **Scope walking.** `tests/unit/server/test_result_set_store.cpp` — 8 cases for
   `ResultSetStore`: synchronous create/get/members, root-first lineage,

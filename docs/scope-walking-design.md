@@ -210,7 +210,9 @@ Validation rules (enforced at YAML load by `definition_store_*`):
 2. When `fromResultSet` is present, `assignment.mode` must be `static`. The whole point of a result set is a fixed target — `dynamic` re-evaluation against management groups would defeat it.
 3. Result-set references are resolved at instruction *invocation* time, not YAML load time, so an `InstructionDefinition` carrying `fromResultSet:` is valid YAML even if the referenced set has expired by the time it is invoked. Invocation-time resolution failure surfaces as `INSTRUCTION_SCOPE_RESOLUTION_FAILED` with the result-set ID and reason in the audit row.
 
-The DSL spec (`docs/yaml-dsl-spec.md` §9 expression language and §3.2 `scope:` block) gains a new normative subsection covering these rules, with the Chrome IR walkthrough as the anchoring example.
+The DSL spec (`docs/yaml-dsl-spec.md` §9.3) carries the normative subsection covering these rules, with the Chrome IR walkthrough as the anchoring example.
+
+**Status (PR-E).** Shipped: the `selector:` / `fromResultSet:` mapping parses and lowers (`scope_yaml.{hpp,cpp}` — `selector.platform` → `ostype`, `selector.tags` → `EXISTS tag:`); rules 1–2 are enforced at create on both the policy and instruction paths; rule 3 is enforced at dispatch via the `instruction.scope_resolution_failed` audit row. `from_result_set:` aliases are resolved at the dispatch layer (`resolve_scope_aliases`) against the operator's owned sets, including the `/api/scope/estimate` preview. A behaviour fix rode along: a `scope.selector:` mapping previously read as an empty scalar and stored no scope — it now lowers. **Deferred:** policy `fromResultSet:` — a result set's TTL clashes with continuous policy evaluation, so `create_policy` rejects it pending a `Policy.owner_principal` field, `PolicyEvaluator` result-set wiring, and a pinned-set requirement (PR-E2); and a definition-embedded scope that auto-applies at dispatch (the operator supplies the dispatch scope for now).
 
 ## 8. Dashboard surface
 
@@ -331,7 +333,7 @@ This walkthrough is the reference test for end-to-end correctness. A regression 
 | PR-B | `result_set_store.cpp` + `result_sets.db` schema + REST routes (§6) + audit hooks (§9) | Server-side storage and API only |
 | PR-C | Scope Engine `from_result_set:` kind (§4) + dashboard scope chip + sidebar + breadcrumb | UI integration of the primitive |
 | PR-D | TAR SQL frame consumes / produces result sets via §6 routes | First end-to-end loop in the dashboard |
-| PR-E | DSL `fromResultSet:` (§7) + `definition_store` validation + DSL spec amendment | YAML surface |
+| PR-E | DSL `fromResultSet:` (§7) + definition/policy validation + DSL spec amendment | **Shipped** — instruction-side validation + `selector:` lowering + dispatch alias resolution + `scope_resolution_failed` audit. **Policy `fromResultSet:` deferred to PR-E2** (owner field + `PolicyEvaluator` wiring + pinned-set rule). |
 | PR-F | Reference walkthrough integration test (§10) | Regression net |
 | PR-G | Live re-eval, pin storm guards, GC sweep, Prometheus + audit polish | Operational hardening |
 | PR-H | Process tree viewer (separate slice — see `docs/tar-dashboard.md` §6) | Builds on PR-D's frame pattern |
