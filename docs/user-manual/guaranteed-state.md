@@ -61,7 +61,33 @@ spec:
     value_type: REG_DWORD
 ```
 
-Only the Windows `registry` guard ships in PR 3. Linux (inotify/netlink/D-Bus) and macOS (Endpoint Security) guards are on the roadmap.
+Two Windows guard types ship today: the **registry** guard (above) and the **file** guard (below). Linux (inotify/netlink/D-Bus) and macOS (Endpoint Security / FSEvents) guards are on the roadmap.
+
+## File guards — detect a file changed or deleted, in realtime
+
+A `file-change` spark watches a file via `ReadDirectoryChangesW` on its parent directory — kernel-notified, **no polling**, so detection is realtime. The watch is resilient: it survives the parent directory (and its whole ancestor chain) being deleted and recreated. Two assertions decide what counts as drift:
+
+| Assertion | Drift when | Key params |
+|---|---|---|
+| `file-exists` | the file's presence differs from `expected` | `path` (required), `expected` = `present` (default → fires on **delete**) or `absent` (tripwire → fires on **create**) |
+| `file-hash-equals` | the file's **content** differs from a baseline | `path` (required), `expected_hash` (64-char SHA-256 hex; **empty → baseline captured on arm**), `max_bytes` (hashing cap, default 64 MiB → larger files report `<oversize>`), `settle_ms` (quiescence window before hashing, default 750) |
+
+`file-hash-equals` uses a size pre-filter then a **bounded SHA-256**, and waits for the file to quiesce before hashing (a write is not atomic), so a no-op rewrite of identical bytes is **not** reported as drift — only a real content change is. Absent / oversize / unreadable states are reported (`<absent>` / `<oversize>` / `<unreadable>`), never a silent "compliant". File guards are **detection-only** (file-content remediation is deferred); `enforcement_mode` still gates whether the rule is active, but there is no write-back.
+
+```bash
+# Alert if a sensitive config is modified OR deleted, in realtime.
+curl -X POST https://yuzu.example.com/api/v1/guaranteed-state/rules \
+  -H "Authorization: Bearer $YUZU_TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "rule_id": "watch-hosts", "name": "hosts file integrity",
+    "enforcement_mode": "audit",
+    "spark":      {"type": "file-change", "params": {}},
+    "assertion":  {"type": "file-hash-equals", "params": {"path": "C:\\Windows\\System32\\drivers\\etc\\hosts"}},
+    "remediation":{"type": "alert-only", "params": {}}
+  }'
+```
+
+The full type catalog — including these file types and the `expected_hash` format — is discoverable at `GET /api/v1/guaranteed-state/schemas` (see [Schema discovery](#schema-discovery)).
 
 ## Workflow
 

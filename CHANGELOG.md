@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian `file-change` spark — realtime file change/deletion detection (Change B).**
+  A new agent guard watches a target file via `ReadDirectoryChangesW` on its
+  parent directory — kernel-notified, no polling, so detection is realtime — and
+  is resilient like the registry guard (survives the parent directory and its
+  whole ancestor chain being deleted and recreated; reconciles from scratch).
+  Two assertions: **`file-exists`** drifts when the file's presence differs from
+  `expected` (`present` → fires on delete; `absent` → tripwire, fires on create),
+  and **`file-hash-equals`** drifts when content (size pre-filter + bounded
+  SHA-256) differs from a baseline (`expected_hash` supplied, or captured on arm)
+  — with a settle window before hashing (writes are not atomic), so a no-op
+  identical rewrite is not reported as drift, and absent/oversize/unreadable are
+  reported rather than silently treated as compliant. Detection-only (file-content
+  remediation deferred); Windows-only (Linux/macOS later). Internally: a new
+  `IGuard` interface lets the engine hold registry and file guards
+  polymorphically; `sha256_file()` gained a backward-compatible bounded-read
+  (`max_bytes`) to defend a hashing-DoS / TOCTOU-grow on an attacker-controlled
+  path. The `/api/v1/guaranteed-state/schemas` catalog now lists `file-change` /
+  `file-exists` / `file-hash-equals` (with an `expected_hash` hex-format check),
+  so the discovery surface and dashboard form know them.
 - **Guardian dashboard guard-create form is now functional (C3c).** The
   `/guardian` "New Guard" form was a static stub that audited every submission
   as `denied`. It now renders a structured create form for the Windows registry

@@ -162,6 +162,10 @@ TEST_CASE("schema catalog: parses, lists Slice-A types, stable content ETag",
     CHECK(has("registry-value-equals"));
     CHECK(has("alert-only"));
     CHECK(has("enforce"));
+    // Change B file types.
+    CHECK(has("file-change"));
+    CHECK(has("file-exists"));
+    CHECK(has("file-hash-equals"));
 
     // The assertion type publishes the registry value-equals params + the
     // discriminated `expected` encoding (decision 3).
@@ -172,6 +176,19 @@ TEST_CASE("schema catalog: parses, lists Slice-A types, stable content ETag",
             CHECK(props.contains("value_type"));
             CHECK(props.contains("expected"));
             CHECK(e["json_schema"]["properties"]["params"].contains("allOf")); // discriminators
+        }
+        if (e["type"] == "file-hash-equals") {
+            const auto& props = e["json_schema"]["properties"]["params"]["properties"];
+            CHECK(props.contains("path"));
+            CHECK(props.contains("expected_hash"));
+            // hex-digest format check (the file-type analogue of the registry
+            // discriminated subschemas).
+            CHECK(props["expected_hash"].contains("pattern"));
+        }
+        if (e["type"] == "file-exists") {
+            const auto& props = e["json_schema"]["properties"]["params"]["properties"];
+            CHECK(props.contains("path"));
+            CHECK(props["expected"]["enum"] == json::array({"present", "absent"}));
         }
     }
 }

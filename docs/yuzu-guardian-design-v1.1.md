@@ -51,7 +51,8 @@ The guard types below are Windows-specific. See Section 15 for Linux equivalents
 ```
 Guards
 ├── Event Guards (real-time, kernel-backed user-mode APIs)
-│   ├── Registry Guard       RegNotifyChangeKeyValue          ~0ms latency
+│   ├── Registry Guard       RegNotifyChangeKeyValue          ~0ms latency   [implemented]
+│   ├── File Guard           ReadDirectoryChangesW            ~0ms latency   [implemented]
 │   ├── ETW Guard            OpenTrace / ProcessTrace          ~1-5ms latency
 │   ├── WFP Guard            FwpmFilterSubscribeChanges0       ~0ms latency
 │   └── SCM Guard            NotifyServiceStatusChange         ~0ms latency
@@ -64,6 +65,8 @@ Guards
 ```
 
 **Event guards** block on kernel wait handles and fire within microseconds of a change. They are appropriate for configuration settings that can change at any moment and must be immediately reverted.
+
+**File Guard (implemented — Change B).** Watches a target file in real time via `ReadDirectoryChangesW` on its parent directory (no polling — unlike the Trigger Engine's mtime poll), resilient like the Registry Guard (survives the parent directory and its whole ancestor chain being deleted and recreated; reconciles from scratch on every wake). Two assertions: **`file-exists`** drifts when the file's presence differs from the expected state (`expected: present` → fires on delete; `expected: absent` → tripwire, fires on create), and **`file-hash-equals`** drifts when the content (size pre-filter + bounded SHA-256) differs from a baseline (`expected_hash` supplied, or captured on arm) — with a settle window before hashing because a write is not atomic, so a no-op identical rewrite is *not* drift. Detection-only: file-content remediation needs the Content Distribution subsystem and is deferred. Windows-only for the MVP (Linux inotify / macOS FSEvents are Section 15 / 19 work).
 
 **Condition guards** run on a configurable schedule (default intervals vary by type: 30s for process checks, 3600s for software freshness). They evaluate a condition against a threshold and raise a drift event if the condition is not met. They are appropriate for time-based compliance checks where "within X hours/days" is the requirement.
 

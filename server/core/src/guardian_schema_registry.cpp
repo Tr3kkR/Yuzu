@@ -98,6 +98,72 @@ json registry_change_params() {
     };
 }
 
+// file-change spark (Change B): matched on `type` only — the watched file is the
+// assertion's `path`. Realtime via ReadDirectoryChangesW on the parent directory
+// (Windows MVP; Linux inotify / macOS FSEvents later).
+json file_change_params() {
+    return json{
+        {"type", "object"},
+        {"description", "No params: the watch target is the assertion's `path`."},
+        {"properties", json::object()},
+        {"additionalProperties", true},
+    };
+}
+
+// file-exists assertion: realtime detection of a file being created or deleted.
+json file_exists_params() {
+    json props = {
+        {"path",
+         {{"type", "string"},
+          {"description", "Absolute path of the file to watch (canonicalised on the agent)."}}},
+        {"expected",
+         {{"type", "string"},
+          {"enum", json::array({"present", "absent"})},
+          {"default", "present"},
+          {"description", "Desired state: present → drift when the file is deleted; absent → "
+                          "tripwire, drift when the file is created."}}},
+    };
+    return json{
+        {"type", "object"},
+        {"properties", std::move(props)},
+        {"required", json::array({"path"})},
+        {"additionalProperties", false},
+    };
+}
+
+// file-hash-equals assertion: realtime content-change detection. `expected_hash`
+// is a 64-char lowercase SHA-256 hex (the pattern is the discriminated format
+// check, mirroring registry value_type's encoding subschemas); empty = baseline
+// captured on arm.
+json file_hash_equals_params() {
+    json props = {
+        {"path", {{"type", "string"}, {"description", "Absolute path of the file to watch."}}},
+        {"expected_hash",
+         {{"type", "string"},
+          {"pattern", "^([0-9a-fA-F]{64})?$"},
+          {"description", "Known-good SHA-256 hex (64 chars). Empty → baseline captured on arm "
+                          "(drift on any later content change)."}}},
+        {"max_bytes",
+         {{"type", json::array({"integer", "string"})},
+          {"minimum", 1},
+          {"default", 67108864},
+          {"description", "Hashing-DoS cap (bytes). A file larger than this reports <oversize> "
+                          "rather than being hashed."}}},
+        {"settle_ms",
+         {{"type", json::array({"integer", "string"})},
+          {"minimum", 0},
+          {"default", 750},
+          {"description", "Quiescence window (ms) before hashing — coalesces mid-write "
+                          "notifications so a partial write is not reported as drift."}}},
+    };
+    return json{
+        {"type", "object"},
+        {"properties", std::move(props)},
+        {"required", json::array({"path"})},
+        {"additionalProperties", false},
+    };
+}
+
 json build_catalog() {
     json schemas = json::array();
 
@@ -115,9 +181,18 @@ json build_catalog() {
     add("spark", "registry-change",
         block_schema("registry-change", "Registry change trigger", registry_change_params(),
                      /*params_required=*/false));
+    add("spark", "file-change",
+        block_schema("file-change", "File change trigger (realtime)", file_change_params(),
+                     /*params_required=*/false));
     add("assertion", "registry-value-equals",
         block_schema("registry-value-equals", "Registry value equals",
                      registry_value_equals_params(), /*params_required=*/true));
+    add("assertion", "file-exists",
+        block_schema("file-exists", "File exists / absent", file_exists_params(),
+                     /*params_required=*/true));
+    add("assertion", "file-hash-equals",
+        block_schema("file-hash-equals", "File content matches a hash", file_hash_equals_params(),
+                     /*params_required=*/true));
     // Resilience policy lives in remediation.params for BOTH actions (it is read
     // for every guard); the mode/backoff/bounded params take effect only when the
     // guard actually enforces — event_debounce_ms applies in alert-only too. The
