@@ -19,6 +19,7 @@
 
 #include "guaranteed_state_store.hpp"
 #include "store_errors.hpp"
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -74,23 +75,10 @@ GuaranteedStateEventRow make_event(std::string event_id, std::string rule_id,
 // RAII guard for a per-test temp database file. Constructed FIRST so the
 // destructor fires even if downstream construction throws (prior governance
 // memory qe-B1 — partial-construction leaks when RAII wraps come later).
-struct TempDbFile {
-    std::filesystem::path path;
-    TempDbFile() {
-        auto tmp = std::filesystem::temp_directory_path();
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        path = tmp / ("yuzu-gs-test-" + std::to_string(gen()) + ".db");
-    }
-    ~TempDbFile() noexcept {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        std::filesystem::remove(path.string() + "-wal", ec);
-        std::filesystem::remove(path.string() + "-shm", ec);
-    }
-    TempDbFile(const TempDbFile&) = delete;
-    TempDbFile& operator=(const TempDbFile&) = delete;
-};
+// Use the shared fixture (unique_temp_path + -wal/-shm cleanup) rather than a
+// local random_device variant — matches the CLAUDE.md test-helper mandate and
+// avoids the flake-#473 salt pitfalls (qa-S4 / #1209).
+using yuzu::test::TempDbFile;
 
 } // namespace
 

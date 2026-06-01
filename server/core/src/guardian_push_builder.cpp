@@ -16,6 +16,18 @@ std::string to_lower(std::string_view s) {
     return out;
 }
 
+// Canonical OS token for matching. The agent reports kAgentOs
+// ("windows" | "linux" | "darwin"); rule authors write os_target "macos". Map
+// darwin->macos so a macOS rule matches a Darwin agent, and lower-case so the
+// match is case-insensitive. Compared for EXACT equality (not substring) so a
+// short/ambiguous target like "win" cannot spuriously match "darwin" (#1209).
+std::string normalize_os(std::string_view s) {
+    std::string v = to_lower(s);
+    if (v == "darwin")
+        return "macos";
+    return v;
+}
+
 // Marshal one spec block (spark / assertion / remediation) from the canonical
 // spec_json into the proto. Mirrors the server's authoritative spec_json shape:
 // non-string param values are dumped to their JSON text so the agent receives a
@@ -46,7 +58,7 @@ bool os_target_matches(std::string_view target, std::string_view agent_os) {
                       // Failing closed here would silently drop every OS-targeted
                       // guard for an agent whose session has no os (disconnect race,
                       // partial registration) — worse than the pre-M4 send-all.
-    return to_lower(agent_os).find(to_lower(target)) != std::string::npos;
+    return normalize_os(target) == normalize_os(agent_os);
 }
 
 ::yuzu::guardian::v1::GuaranteedStatePush

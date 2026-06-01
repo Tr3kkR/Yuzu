@@ -1687,7 +1687,6 @@ private:
     // pointers remain stable after map insertions.
     std::unordered_map<std::string, std::unique_ptr<PluginContextImpl>> per_plugin_ctx_;
     std::unique_ptr<KvStore> kv_store_;
-    std::unique_ptr<GuardianEngine> guardian_;
     // Drives interval / file-change / service-status triggers that plugins
     // register during init(). Owned here; a non-owning pointer is handed to
     // every per-plugin context so yuzu_register_trigger can reach it.
@@ -1712,6 +1711,12 @@ private:
     // stream is torn down, so a guard firing mid-teardown can never write to a
     // cancelled stream.
     std::shared_ptr<SubscribeStream> guardian_sink_stream_;
+    // Declared AFTER stream_write_mu_ + guardian_sink_stream_ so it is DESTROYED
+    // FIRST (reverse declaration order): ~GuardianEngine joins the guard worker
+    // threads, which must happen while the mutex + sink-stream holder those
+    // workers write through are still alive (H4 / #1209). Body-initialized in the
+    // ctor (after kv_store_), so the later declaration does not affect construction.
+    std::unique_ptr<GuardianEngine> guardian_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;

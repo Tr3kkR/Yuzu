@@ -437,6 +437,11 @@ spec:
   version: 1
   enabled: true
   enforcement_mode: enforce | audit | disabled
+  # NOTE (MVP / contract G7, #1209): the shipped MVP implements only
+  # `enforce | audit` here and expresses "disabled" via the separate `enabled:
+  # false` boolean above, not a third mode value. The store + REST validate
+  # mode in {enforce, audit}. The 3-state master-override described below is the
+  # forward design.
   # enforcement_mode is a master override:
   #   enforce  — rule operates as configured (action field takes effect)
   #   audit    — forces all actions to alert-only regardless of the action field
@@ -1336,7 +1341,7 @@ Rules with `action: enforce` or `action: quarantine` can modify endpoint state. 
 
 **Rules that bypass approval:**
 - New rules with `action: alert-only` — passive detection only, cannot modify endpoints. Deployed immediately.
-- Modifications that reduce enforcement scope (e.g., `enforce` → `disabled`, `enforce` → `audit`, narrowing scope expression). These make the system less aggressive, not more.
+- Modifications that reduce enforcement scope (e.g., disabling a rule via `enabled: false` (MVP) or `enforce` → `disabled` (forward design), `enforce` → `audit`, narrowing scope expression). These make the system less aggressive, not more.
 
 **Configurable controls:**
 - Global setting: `require_approval_for_enforcement: true` (default true, can be disabled for dev/test environments)

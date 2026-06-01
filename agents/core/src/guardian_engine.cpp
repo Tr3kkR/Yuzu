@@ -149,10 +149,14 @@ GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id)
     : kv_{kv}, agent_id_{std::move(agent_id)} {}
 
 GuardianEngine::~GuardianEngine() {
-    // Explicit (not = default): join the guard worker threads here via stop()
-    // so teardown does not depend on member declaration order. Workers call
-    // emit_guard_event(), which reads event_sink_/sink_mtx_/event_seq_ — those
-    // must outlive the join. stop() is idempotent.
+    // Explicit (not = default): join the guard worker threads here via stop().
+    // Workers call emit_guard_event(), which reads THIS engine's own
+    // event_sink_/sink_mtx_/event_seq_ — GuardianEngine members, so they outlive
+    // this join regardless of declaration order. NOTE (H4 / #1209): the sink
+    // callback also reaches AgentImpl-side state (stream_write_mu_ +
+    // guardian_sink_stream_); that is kept safe by AgentImpl declaring `guardian_`
+    // AFTER those members (engine tears down — and joins — first) and by
+    // AgentImpl::stop() joining guards before its own teardown. stop() is idempotent.
     stop();
 }
 

@@ -139,7 +139,11 @@ The Guardian dashboard guard list (`/guardian`) exposes per-guard controls:
 
 Both require **`GuaranteedState:Write` *and* `GuaranteedState:Push`** (they mutate the rule *and* deploy it). On change the server updates the rule, **auto-deploys a full-sync push to all in-scope agents** (so it takes effect live), audits the mutation under `guaranteed_state.rule.update`, and re-renders the list. These are dashboard HTMX fragments, not REST endpoints — for scripted control use `PUT /api/v1/guaranteed-state/rules/<id>` (`enforcement_mode` must be `enforce` or `audit`) then `POST .../push`.
 
-> **Note:** the auto-deploy is a **full-fleet** `full_sync` push on every per-rule toggle; scoping it to the rule's own scope is a tracked follow-up. Avoid rapid toggling on a large fleet during initial rollout.
+> **Note:** the auto-deploy pushes only to the rule's own `scope_expr` (an empty scope = the whole fleet), so a single toggle does **not** fan out to agents outside that rule's targeting. `full_sync` is always set so an agent that had the rule enabled disarms it correctly on disable (the agent has no per-rule removal verb).
+>
+> **Dashboard reads require `GuaranteedState:Read`** — an authenticated user without it gets a 403 on each data panel (the page shell still loads). The status rollup shows the live guard count from the store, not a fabricated compliance percentage.
+>
+> **Offline convergence:** an agent that was offline or unreachable when a rule changed re-converges automatically on reconnect. It reports its applied policy generation (`yuzu.guardian_generation`) in each heartbeat; the server re-pushes when that generation is behind the current store generation (rate-limited per agent). No manual re-push is needed after a network partition.
 
 ## Upgrading from a detect-only build
 

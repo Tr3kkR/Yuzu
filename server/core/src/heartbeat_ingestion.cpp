@@ -37,7 +37,9 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
             std::uint64_t gen = 0;
             const auto& v = it->second;
             auto [ptr, ec] = std::from_chars(v.data(), v.data() + v.size(), gen);
-            if (ec == std::errc())
+            // Require the WHOLE tag to parse (ptr at end) — "123abc" must be
+            // rejected, not silently read as 123 (cpp-expert / #1209).
+            if (ec == std::errc() && ptr == v.data() + v.size())
                 guardian_reconcile_fn_(agent_id_str, gen);
         }
     }

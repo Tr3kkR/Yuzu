@@ -39,6 +39,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Guardian (#1209): H1–H4 + M1–M8 backend hardening.** Dashboard toggle pushes
+  only the rule's own `scope_expr` (no whole-fleet toggle storm — H1). The
+  `__guard__` side-channel is classified by `plugin=__guard__` **and** empty
+  `command_id`, so solicited `push_rules` replies complete their gateway
+  round-trip instead of being dropped (H2). Per-guard event-sink collapse-with-
+  count debounce caps event-store flooding from a competing writer (H3). The
+  agent event-sink writes through a current-stream holder reset under lock, so a
+  guard firing during a reconnect teardown can't write to a cancelled stream
+  (H4). Dashboard data panels gated on `GuaranteedState:Read` (M1); honest
+  empty-state and an unmistakable DEMO banner — no fabricated "148/148 compliant"
+  rollup on a live console (M2). `enforcement_mode` reconciled to `enforce|audit`
+  + the `enabled` boolean (M3). Per-agent push filtering by `os_target` +
+  `scope_expr` (M4). Heartbeat-carried `policy_generation` drives a per-agent
+  rate-limited server reconcile so offline-at-push agents converge on reconnect
+  (M5), backed by a monotonic persisted generation counter (M6). The reconcile
+  re-push is metered (`yuzu_server_guardian_reconciles_total`,
+  `..._pushes_dispatched_total`, `..._policy_generation`) and audited
+  (`guaranteed_state.reconcile`). H5 (MCP + `/schemas` agentic-first parity)
+  tracked separately as #1210.
 - **Dashboard scope panel now visible at narrow viewports (≤1280px).** A global
   responsive rule in `server/core/static/yuzu.css` was hiding the right-hand
   agent/device selector panel (`.scope`) on any browser window 1280px wide or

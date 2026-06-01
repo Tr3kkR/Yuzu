@@ -909,12 +909,10 @@ grpc::Status AgentServiceImpl::Subscribe(
         // intercept would miss them. agent_id is server-stamped from the cert-bound
         // session, never self-reported.
         //
-        // The empty-command_id guard is load-bearing (H2 / #1209): a __guard__ reply
-        // that DOES carry a command_id is a SOLICITED reply (get_status / push_rules)
-        // and must NOT be swallowed here — it has to fall through to the normal
-        // command-response path so its caller is answered and the gateway's pending
-        // map for that command_id completes. Only command_id-less events are the
-        // side-channel. See docs/guardian-mvp-contract.md.
+        // The empty-command_id guard is load-bearing (H2 / #1209): only a
+        // command_id-LESS __guard__ message is an unsolicited drift event to
+        // ingest. A __guard__ message that DOES carry a command_id is a SOLICITED
+        // reply (push_rules / get_status) and must NOT be ingested as an event.
         if (resp.plugin() == "__guard__" && resp.command_id().empty()) {
             // Guardian side-channel — route through the shared ingest so the
             // direct and gateway-proxied (GatewayUpstreamServiceImpl::
@@ -925,6 +923,15 @@ grpc::Status AgentServiceImpl::Subscribe(
                 ingest_guardian_response(*guaranteed_state_store_, agent_id, resp);
             continue;
         }
+        // Solicited __guard__ replies (push_rules / reconcile carry a command_id)
+        // are fire-and-forget on this DIRECT Subscribe loop — no server caller
+        // blocks on a __guard__ command_id, so drop them rather than persist a
+        // row-per-agent-per-push in the response store / executions drawer (hp-F1 /
+        // #1209). (For gateway-connected agents the reply is correlated and its
+        // pending entry cleared on the gateway by yuzu_gw_guardian's passthrough,
+        // not here.)
+        if (resp.plugin() == "__guard__")
+            continue;
 
         if (resp.status() == pb::CommandResponse::RUNNING) {
             // Intercept __timing__ metadata

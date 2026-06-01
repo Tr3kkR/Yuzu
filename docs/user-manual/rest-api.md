@@ -3097,7 +3097,7 @@ Receive file uploads from agents via the `content_dist` plugin's `upload_file` a
 
 ### Guaranteed State
 
-Operator-facing surface for the Guardian (Guaranteed State) policy engine. See [Guaranteed State](guaranteed-state.md) for the feature guide, YAML rule schema, and the PR-2 limitation that all rules report `errored` until the agent-side guards land in Guardian PR 3.
+Operator-facing surface for the Guardian (Guaranteed State) policy engine. See [Guaranteed State](guaranteed-state.md) for the feature guide and YAML rule schema. The Windows registry guard is live end-to-end (detect → enforce write-back → event ingest); per-guard fleet compliance aggregation on the `/status` endpoints lands in Guardian PR 4.
 
 **RBAC matrix:**
 
@@ -3170,7 +3170,7 @@ Delete a rule.
 
 #### `POST /api/v1/guaranteed-state/push`
 
-Queue a push of the active rule set to scoped agents. Returns `202 Accepted` — agent delivery is asynchronous. In the PR-2 ship of Guardian the fan-out to agents is **not** wired; the endpoint accepts and audits the request so dashboards and SIEM pipelines can be exercised end-to-end. Fan-out lands in Guardian PR 3.
+Queue a push of the active rule set to scoped agents. Returns `202 Accepted` — agent delivery is asynchronous. The fan-out is live: the server resolves `scope` to the in-scope agents and delivers each a per-agent filtered rule set (only rules whose `os_target` and `scope_expr` match that agent).
 
 - **Permission:** `GuaranteedState:Push`
 - **Request body:**
@@ -3180,9 +3180,9 @@ Queue a push of the active rule set to scoped agents. Returns `202 Accepted` —
 | `scope` | string | No | Scope DSL selector. Empty = all agents. |
 | `full_sync` | boolean | No | If `true`, agents replace their rule set; otherwise they merge. |
 
-- **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.scope`.
+- **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.agents` (number of agents the push was dispatched to), `data.scope`.
 - **4xx:** `400` if the JSON body is present but not an object.
-- **Audit:** `guaranteed_state.push` (`success`, detail includes `fan_out_deferred_pr3=true` while PR 2 is in effect).
+- **Audit:** `guaranteed_state.push` (`success`). A server-initiated re-push to a lagging agent on heartbeat reconnect is audited separately under `guaranteed_state.reconcile` (principal `system`).
 
 #### `GET /api/v1/guaranteed-state/events`
 
@@ -3195,14 +3195,14 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 
 #### `GET /api/v1/guaranteed-state/status`
 
-Fleet-wide status rollup. PR 2 returns placeholder zeros; fleet aggregation lands in Guardian PR 4.
+Fleet-wide status rollup. Returns placeholder counts today; full fleet aggregation lands in Guardian PR 4.
 
 - **Permission:** `GuaranteedState:Read`
 - **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
 
 #### `GET /api/v1/guaranteed-state/status/{agent_id}`
 
-Per-agent status. PR 2 placeholder; per-agent aggregation lands in Guardian PR 4.
+Per-agent status. Returns placeholder counts today; per-agent aggregation lands in Guardian PR 4.
 
 - **Permission:** `GuaranteedState:Read`
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.

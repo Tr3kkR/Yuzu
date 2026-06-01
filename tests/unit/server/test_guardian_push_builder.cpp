@@ -51,8 +51,15 @@ const auto never_in_scope = [](const std::string&) { return false; };
 TEST_CASE("guardian::os_target_matches", "[guardian_push_builder]") {
     CHECK(guardian::os_target_matches("", "windows"));        // empty target = all OSes
     CHECK(guardian::os_target_matches("windows", "windows"));
-    CHECK(guardian::os_target_matches("windows", "Windows 11 Pro"));  // case-insensitive substring
+    CHECK(guardian::os_target_matches("WINDOWS", "windows"));  // case-insensitive
     CHECK_FALSE(guardian::os_target_matches("windows", "linux"));
+    // The agent reports kAgentOs "darwin"; rule os_target authors "macos" — they
+    // normalize to the same token so a macOS rule reaches a Darwin agent (#1209).
+    CHECK(guardian::os_target_matches("macos", "darwin"));
+    // Exact-token, NOT substring: a short/ambiguous target must not cross-match
+    // (the old substring match made "win" hit "darwin"). #1209 regression guard.
+    CHECK_FALSE(guardian::os_target_matches("win", "darwin"));
+    CHECK_FALSE(guardian::os_target_matches("linux", "linuxmint"));
     // Unknown agent OS fails OPEN (send it, agent decides) — never silently drop a
     // guard for an agent whose session has no os. Regression guard for #1209/H1-M4.
     CHECK(guardian::os_target_matches("linux", ""));
