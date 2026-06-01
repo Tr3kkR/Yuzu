@@ -1096,12 +1096,12 @@ Remediation sets per-rule `remediating_` atomic flag → guard suppresses evalua
 > default. `Escalation` is retained below as forward design but is **deferred for
 > the MVP** — it terminates in quarantine (§11.7), a subsystem the MVP lacks.
 
-> **Implementation status.** Only **`Persist`** is wired into the agent today (it is
-> the guard's default behaviour — write the expected value back on every drift, and
-> recreate a deleted key in enforce mode). **`Backoff`, `Bounded`, the parameters
-> below, and the dashboard form land in C3**; until then the agent honours `Persist`
-> and ignores any other authored mode/params. The example rules and parameter names
-> below describe the C3 design, not current behaviour.
+> **Implementation status.** All three modes + the parameters below are wired
+> **agent-side** (the guard reads them from `remediation.params`; absent → `Persist`
+> + 1 s debounce, so existing rules are unchanged). Still outstanding: **server-side
+> schema validation + `GET /schemas` discovery (C3b)** and the **dashboard form
+> (C3c)** — until C3c, the modes are authored via the structured `remediation` block
+> over REST, not the UI. `Escalation` remains post-MVP.
 
 A resilience mode governs **what a guard does, in enforce mode, when the watched
 state keeps drifting** — i.e. during an active fight with a competing writer. Modes
@@ -1134,11 +1134,11 @@ enforcement guarantee** — the others trade latency or coverage for it by desig
 `backoff_initial_ms`, `backoff_max_ms`, `resume_after_s`) plus the debounce windows
 (§6.5) are authored per-rule and travel as string entries in the rule's
 `remediation.params` map (input debounce in `spark.params`) — **no proto change**.
-The param shape lives in the server-side JSON-Schema registry (`guardian-mvp-contract.md`
-decisions 1 & 3), which also feeds the `GET /schemas` discovery surface. The
-dashboard create/edit form will expose the fields; the agent will read them in (C3)
-`start_guard_for_rule_locked`. Rules that omit them fall back to `Persist` + the
-default 1 s event-debounce, so the addition is backward-compatible with no migration.
+The agent reads them in `start_guard_for_rule_locked` (C3a). Server-side schema
+validation + the `GET /schemas` discovery surface (`guardian-mvp-contract.md`
+decisions 1 & 3) are C3b; the dashboard create/edit form is C3c. Rules that omit
+them fall back to `Persist` + the default 1 s event-debounce, so the addition is
+backward-compatible with no migration.
 
 **Race detection** *(forward).* A sliding window over drift rate can adjust mode
 behaviour under a flood (> N drifts / window): `Bounded` gives up immediately,

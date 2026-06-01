@@ -113,6 +113,7 @@ agent_test_exe = executable(
     'unit/test_trigger_engine.cpp',
     'unit/test_guardian_engine.cpp',
     'unit/test_guard_registry.cpp',
+    'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
   ),
   include_directories: [

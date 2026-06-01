@@ -39,6 +39,7 @@
 #endif
 #include <windows.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cstring>
 #include <optional>
@@ -48,13 +49,10 @@
 namespace yuzu::agent {
 namespace {
 
-// Sink debounce window (H3 / #1209, contract decision 10 default-on). A competing
-// writer can wake RegNotifyChangeKeyValue arbitrarily fast; without a window every
-// wakeup would emit one event, growing the event store unbounded. Drifts within a
-// window of the last EMITTED event are collapsed into a count carried on the next
-// emission. This bounds the SINK only — the enforce write-back still runs on every
-// wakeup (write-side fight-loop rate-limiting is the C3 resilience-mode concern).
-constexpr auto kSinkDebounceWindow = std::chrono::seconds(1);
+// Event/sink debounce (H3 / #1209): rapid drifts within Config::event_debounce_ms of
+// the last EMITTED event are collapsed into a count carried on the next emission.
+// Bounds the SINK only; the enforce remediation is gated separately by the per-rule
+// resilience strategy (C3, design §8.5).
 
 HKEY parse_hive(const std::string& hive) {
     if (hive == "HKLM") return HKEY_LOCAL_MACHINE;
@@ -277,6 +275,20 @@ void RegistryGuard::run() {
     std::uint64_t suppressed = 0;
     bool ro_fallback_warned = false; // UP-2 read-only fallback warned once
 
+    // C3: per-rule retry policy. Consulted ONLY in enforce mode and ONLY to gate the
+    // remediation write/create — detection + event emission happen regardless, so a
+    // backed-off / given-up guard still reports drift. `next_wake_ms` carries a
+    // strategy-scheduled self-wake (Backoff retry / Bounded resume cooldown) to the
+    // wait loop; reset at the top of each reconcile().
+    ResilienceStrategy strategy{cfg_.resilience};
+    std::optional<std::uint64_t> next_wake_ms;
+    auto now_ms = [] {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    };
+
     // C2: recreate the watched key when it is absent (enforce only). RegCreateKeyExW
     // creates EVERY missing key in the path in one call (the atomic whole-chain
     // create C1's reconcile()-from-scratch is built to tolerate). Opens with the
@@ -307,41 +319,55 @@ void RegistryGuard::run() {
         // write_value() returns false → reported as remediation.failed. C1 does NOT
         // (re)create the key — that is C2.
         if (cfg_.enforce) {
-            d.remediation_attempted = true;
-            const auto r0 = std::chrono::steady_clock::now();
-            bool ok;
-            if (!target) {
-                // C2: the key itself is gone — recreate it (whole chain) THEN write
-                // the value. write_value uses the freshly-opened handle create_target
-                // stores in `target`. If create is denied, ok stays false below.
-                d.remediation_action = "registry-create";
-                ok = create_target() &&
-                     write_value(target.get(), cfg_.value_name, cfg_.value_type, cfg_.expected);
+            // C3: the resilience strategy decides whether to fix THIS drift and when
+            // to wake next. It gates only the write/create — we always build + emit
+            // the event below, so a backed-off / given-up guard still alerts.
+            const ResilienceDecision dec = strategy.decide(now_ms());
+            next_wake_ms = dec.next_wake_ms;
+            if (dec.remediate) {
+                d.remediation_attempted = true;
+                const auto r0 = std::chrono::steady_clock::now();
+                bool ok;
+                if (!target) {
+                    // C2: the key itself is gone — recreate it (whole chain) THEN write
+                    // the value. write_value uses the freshly-opened handle create_target
+                    // stores in `target`. If create is denied, ok stays false below.
+                    d.remediation_action = "registry-create";
+                    ok = create_target() &&
+                         write_value(target.get(), cfg_.value_name, cfg_.value_type, cfg_.expected);
+                } else {
+                    d.remediation_action = "registry-write";
+                    ok = write_value(target.get(), cfg_.value_name, cfg_.value_type, cfg_.expected);
+                }
+                d.remediation_latency_us = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - r0)
+                        .count());
+                d.remediation_success = ok;
+                if (ok)
+                    spdlog::info("Guardian RegistryGuard[{}]: {} {}\\{} [{}] {} -> {} ({}us)",
+                                 cfg_.rule_id, d.remediation_action, cfg_.hive, cfg_.key,
+                                 cfg_.value_name, detected, cfg_.expected, d.remediation_latency_us);
+                else
+                    spdlog::warn("Guardian RegistryGuard[{}]: enforce {} FAILED for {}\\{} [{}] "
+                                 "(detected={}, type={}{})",
+                                 cfg_.rule_id, d.remediation_action, cfg_.hive, cfg_.key,
+                                 cfg_.value_name, detected, cfg_.value_type,
+                                 target.get() ? "" : ", key absent");
             } else {
-                d.remediation_action = "registry-write";
-                ok = write_value(target.get(), cfg_.value_name, cfg_.value_type, cfg_.expected);
+                // Backoff window or Bounded give-up: drift detected + reported (this
+                // event is the alert) but the fix is withheld this cycle.
+                spdlog::info("Guardian RegistryGuard[{}]: drift {}\\{} [{}] detected={} -- "
+                             "{}, not remediating",
+                             cfg_.rule_id, cfg_.hive, cfg_.key, cfg_.value_name, detected,
+                             dec.gave_up ? "given up (alert)" : "backing off");
             }
-            d.remediation_latency_us = static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - r0)
-                    .count());
-            d.remediation_success = ok;
-            if (ok)
-                spdlog::info("Guardian RegistryGuard[{}]: {} {}\\{} [{}] {} -> {} ({}us)",
-                             cfg_.rule_id, d.remediation_action, cfg_.hive, cfg_.key,
-                             cfg_.value_name, detected, cfg_.expected, d.remediation_latency_us);
-            else
-                spdlog::warn("Guardian RegistryGuard[{}]: enforce {} FAILED for {}\\{} [{}] "
-                             "(detected={}, type={}{})",
-                             cfg_.rule_id, d.remediation_action, cfg_.hive, cfg_.key,
-                             cfg_.value_name, detected, cfg_.value_type,
-                             target.get() ? "" : ", key absent");
         }
         // Collapse-with-count debounce: emit the first drift immediately, fold
         // subsequent drifts within the window into `suppressed`, attach that count
         // to the next post-window emission. Bounds the SINK only.
         const auto now = std::chrono::steady_clock::now();
-        if (last_emit && (now - *last_emit) < kSinkDebounceWindow) {
+        if (last_emit && (now - *last_emit) < std::chrono::milliseconds(cfg_.event_debounce_ms)) {
             ++suppressed;
             return;
         }
@@ -392,6 +418,7 @@ void RegistryGuard::run() {
     // it reads/checks (edge-triggered: a change during the read re-fires the armed
     // event), then emit. Carries no incremental per-level state.
     auto reconcile = [&]() {
+        next_wake_ms.reset(); // fresh evaluation; emit() re-sets it iff the strategy schedules a wake
         // Fast path: the watched key exists → arm value/deletion notify, then read.
         if (open_target()) {
             if (RegNotifyChangeKeyValue(target.get(), FALSE, kNotifyFilter, target_event,
@@ -433,10 +460,20 @@ void RegistryGuard::run() {
 
     HANDLE handles[3] = {target_event, ancestor_event, static_cast<HANDLE>(stop_event_)};
     while (!stop_.load(std::memory_order_acquire)) {
-        DWORD r = WaitForMultipleObjects(3, handles, FALSE, INFINITE);
-        if (r == WAIT_OBJECT_0 + 2) break;                        // stop event signaled
-        if (r != WAIT_OBJECT_0 && r != WAIT_OBJECT_0 + 1) break;  // wait failed
-        reconcile();
+        // INFINITE unless the strategy scheduled a self-wake (Backoff retry / Bounded
+        // resume) — keeps Persist / audit / idle fully quiescent (no busy-wake).
+        const DWORD timeout =
+            next_wake_ms ? static_cast<DWORD>(std::min<std::uint64_t>(*next_wake_ms, 0xFFFFFFFEull))
+                         : INFINITE;
+        DWORD r = WaitForMultipleObjects(3, handles, FALSE, timeout);
+        if (r == WAIT_OBJECT_0 + 2) break; // stop event signaled
+        // Target drift/deletion, ancestor (re)creation, OR a scheduled-retry timeout
+        // all re-run reconcile(). WAIT_TIMEOUT must NOT break — that would silently end
+        // the guard the instant a Backoff/Bounded delay expired (live-until-disabled).
+        if (r == WAIT_OBJECT_0 || r == WAIT_OBJECT_0 + 1 || r == WAIT_TIMEOUT)
+            reconcile();
+        else
+            break; // WAIT_FAILED / WAIT_ABANDONED — unrecoverable
     }
 
     CloseHandle(target_event);

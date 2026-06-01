@@ -141,6 +141,14 @@ struct DriftCollector {
             if (it->detected_value == val) return *it;
         return {};
     }
+    bool wait_size(std::size_t n, std::chrono::milliseconds to) {
+        std::unique_lock lk(m);
+        return cv.wait_for(lk, to, [&] { return events.size() >= n; });
+    }
+    RegistryDrift at(std::size_t i) {
+        std::lock_guard lk(m);
+        return events.at(i);
+    }
 };
 
 } // namespace
@@ -408,6 +416,51 @@ TEST_CASE("RegistryGuard audit: does NOT recreate a deleted key (C2 invariant)",
 
     CHECK(res_get_flag() == 0xFFFFFFFFu);                // audit left the key gone
     CHECK_FALSE(col.find_detected("<absent>").remediation_attempted);
+
+    guard.stop();
+    res_cleanup();
+}
+
+TEST_CASE("RegistryGuard Bounded: stops fixing after the cap (give-up flows through the guard)",
+          "[guardian][guard][registry][resilience][bounded]") {
+    res_cleanup();
+    res_make_parent();
+    res_set_flag(0); // drift initially (expected 1)
+
+    RegistryGuard::Config cfg;
+    cfg.rule_id = "bounded-guard";
+    cfg.rule_name = "bounded guard";
+    cfg.hive = "HKCU";
+    cfg.key = kResKeyA;
+    cfg.value_name = "Flag";
+    cfg.value_type = "REG_DWORD";
+    cfg.expected = "1";
+    cfg.enforce = true;
+    cfg.resilience.mode = ResilienceMode::Bounded;
+    cfg.resilience.max_attempts = 1;        // fix once, then give up
+    cfg.resilience.quiet_reset_ms = 60'000; // keep the two drifts "consecutive"
+    cfg.resilience.resume_after_ms = 0;     // stay given up
+    cfg.event_debounce_ms = 0;              // emit every drift (deterministic for the test)
+
+    DriftCollector col;
+    RegistryGuard guard(std::move(cfg), [&col](const RegistryDrift& d) { col(d); });
+    REQUIRE(guard.start());
+    using namespace std::chrono_literals;
+
+    // Cycle 1: drift → remediated (within the cap of 1). The fix lands inside emit()
+    // before the event fires, so the value is already restored.
+    REQUIRE(col.wait_size(1, 5s));
+    CHECK(col.at(0).remediation_attempted);
+    CHECK(col.at(0).remediation_success);
+    CHECK(res_get_flag() == 1u);
+
+    // Cycle 2: drift again → exceeds the cap → GIVE UP: still detected + reported,
+    // but the strategy withholds the write, so the value stays wrong.
+    res_set_flag(0);
+    REQUIRE(col.wait_size(2, 5s));
+    CHECK_FALSE(col.at(1).remediation_attempted); // give-up gated the write
+    std::this_thread::sleep_for(300ms);           // give any erroneous write time to land
+    CHECK(res_get_flag() == 0u);                  // still wrong — Bounded gave up
 
     guard.stop();
     res_cleanup();

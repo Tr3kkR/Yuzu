@@ -16,6 +16,7 @@
  */
 
 #include <yuzu/plugin.h>  // YUZU_EXPORT
+#include <yuzu/agent/resilience_strategy.hpp>  // ResilienceConfig (C3 retry policy)
 
 #include <atomic>
 #include <cstdint>
@@ -65,6 +66,13 @@ public:
         std::string value_type;  ///< "REG_DWORD" | "REG_SZ" | ... (load-bearing in enforce mode: selects the write-back encoding)
         std::string expected;    ///< string-encoded (G4): DWORD=decimal, SZ=literal
         bool enforce{false};     ///< true = write `expected` back on drift (registry-write remediation); false = observe/audit only
+        /// C3: per-rule enforcement retry policy (Persist/Backoff/Bounded). Default
+        /// Persist (immediate, never give up) = the pre-C3 behaviour, so existing
+        /// rules are unchanged. Consulted in enforce mode only.
+        ResilienceConfig resilience{};
+        /// C3: event/sink debounce window (ms) — collapses rapid drift events into a
+        /// count. 0 = emit every drift. Default 1000 (the prior hard-coded value).
+        std::uint64_t event_debounce_ms{1000};
     };
     using Sink = std::function<void(const RegistryDrift&)>;
 
