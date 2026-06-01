@@ -22,6 +22,19 @@ bool is_scope_ident_char(char c) {
     return std::isalnum(u) || c == '_' || c == '.' || c == ':' || c == '-' || c == '*';
 }
 
+// A value that is safe to interpolate into a lowered scope-engine string as a
+// single token: non-empty and entirely scope-ident chars (no space, quote,
+// paren, or operator). Anything else could inject grammar or produce an
+// unparseable expression (governance sec-L1 / dsl-S1).
+bool is_safe_scope_token(const std::string& s) {
+    if (s.empty())
+        return false;
+    for (char c : s)
+        if (!is_scope_ident_char(c))
+            return false;
+    return true;
+}
+
 } // namespace
 
 ScopeBlock parse_scope_block(const std::string& yaml_source) {
@@ -52,8 +65,22 @@ ScopeBlock parse_scope_block(const std::string& yaml_source) {
 std::optional<std::string> validate_scope_block(const ScopeBlock& sb,
                                                 const std::string& assignment_mode,
                                                 bool assignment_has_mgmt_groups) {
+    // Selector values are interpolated into the lowered scope-engine string
+    // (`ostype == "<platform>"`, `EXISTS tag:<name>`); restrict them to the
+    // scope-ident charset so each stays a single token — no grammar injection
+    // (sec-L1) and no unparseable output (dsl-S1). Applies to selector-only
+    // blocks too, hence before the fromResultSet early-return.
+    if (sb.has_selector) {
+        if (!sb.selector_platform.empty() && !is_safe_scope_token(sb.selector_platform))
+            return "spec.scope.selector.platform may contain only letters, digits, and _ . : * -";
+        for (const auto& t : sb.selector_tags)
+            if (!is_safe_scope_token(t))
+                return "spec.scope.selector.tags entry '" + t +
+                       "' may contain only letters, digits, and _ . : * -";
+    }
+
     // Rules 1+2 only constrain the fromResultSet form. A selector-only or empty
-    // block is always valid (a scalar scope expression never reaches here).
+    // block is otherwise valid (a scalar scope expression never reaches here).
     if (!sb.has_from_result_set)
         return std::nullopt;
 
@@ -62,6 +89,10 @@ std::optional<std::string> validate_scope_block(const ScopeBlock& sb,
                "(rs_...) or a per-operator alias";
     if (sb.from_result_set.size() > 128)
         return "spec.scope.fromResultSet id or alias must be 1-128 chars";
+    if (!is_safe_scope_token(sb.from_result_set))
+        return "spec.scope.fromResultSet '" + sb.from_result_set +
+               "' may contain only letters, digits, and _ . : * - (it lowers to a "
+               "from_result_set:<ref> scope atom)";
 
     if (assignment_has_mgmt_groups)
         return "scope.fromResultSet cannot be combined with assignment.managementGroups: a "

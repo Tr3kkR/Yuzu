@@ -383,6 +383,35 @@ InstructionStore::create_definition(const InstructionDefinition& def) {
     return create_definition_impl(def);
 }
 
+namespace {
+
+// Shared spec.scope validation for the create AND update paths (PR-E governance
+// arch-B1/UP-4): validating only at create was bypassable via update_definition
+// (reachable from the dashboard YAML-edit PUT and the response-template persist
+// path), so a clean definition could be edited to carry a forbidden
+// fromResultSet+dynamic / +managementGroups combo. Both paths now run this.
+// Only errors when spec.scope.fromResultSet is present with a forbidden combo;
+// scope-less and selector-only definitions (incl. all bundled content) pass.
+// Resolution is deferred to dispatch — a since-expired fromResultSet is still
+// valid here. Also caps oversize input (UP-3, mirrors PolicyStore) and rejects
+// the inline flow-mapping form the block-form line-scanners cannot see (UP-6).
+std::optional<std::string> validate_definition_scope(const std::string& yaml_source) {
+    if (yaml_source.empty())
+        return std::nullopt;
+    if (yaml_source.size() > 1048576)
+        return "yaml_source too large (max 1MB)";
+    auto raw_scope = yaml_scan::extract_yaml_value(yaml_source, "scope");
+    if (!raw_scope.empty() && raw_scope.front() == '{')
+        return "inline flow-mapping scope is not supported; use the block form "
+               "(scope: <newline> indented fromResultSet: <id-or-alias>)";
+    auto sb = parse_scope_block(yaml_source);
+    auto asn = yaml_scan::extract_yaml_section(yaml_source, "spec.assignment");
+    return validate_scope_block(sb, yaml_scan::extract_yaml_value(asn, "mode"),
+                                !yaml_scan::extract_yaml_list(asn, "managementGroups").empty());
+}
+
+} // namespace
+
 std::expected<std::string, std::string>
 InstructionStore::create_definition_impl(const InstructionDefinition& def) {
     if (!db_)
@@ -394,22 +423,8 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
     if (def.plugin.empty())
         return std::unexpected("plugin is required");
 
-    // PR-E (scope-walking YAML DSL): validate an optional spec.scope block. This
-    // is the central INSERT for every creation path (REST create, import,
-    // build-time bundled content), so the check applies uniformly. It only
-    // errors when spec.scope.fromResultSet is present with a forbidden combo
-    // (assignment.managementGroups, or assignment.mode: dynamic) — scope-less
-    // and selector-only definitions, including all bundled content, pass
-    // untouched, so boot stays safe. Resolution is deferred to dispatch:
-    // a definition carrying a since-expired fromResultSet is still valid here.
-    if (!def.yaml_source.empty()) {
-        auto sb = parse_scope_block(def.yaml_source);
-        auto asn = yaml_scan::extract_yaml_section(def.yaml_source, "spec.assignment");
-        if (auto err = validate_scope_block(
-                sb, yaml_scan::extract_yaml_value(asn, "mode"),
-                !yaml_scan::extract_yaml_list(asn, "managementGroups").empty()))
-            return std::unexpected(*err);
-    }
+    if (auto err = validate_definition_scope(def.yaml_source))
+        return std::unexpected(*err);
 
     auto id = def.id.empty() ? generate_id() : def.id;
     auto now = now_epoch();
@@ -504,6 +519,11 @@ InstructionStore::update_definition(const InstructionDefinition& def) {
         return std::unexpected("database not open");
     if (def.id.empty())
         return std::unexpected("id is required for update");
+
+    // arch-B1/UP-4: the same scope-block validation the create path enforces —
+    // update_definition must not be a bypass for the fromResultSet rules.
+    if (auto err = validate_definition_scope(def.yaml_source))
+        return std::unexpected(*err);
 
     const char* sql = R"(
         UPDATE instruction_definitions SET

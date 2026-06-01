@@ -669,6 +669,10 @@ PolicyStore::create_policy(const std::string& yaml_source) {
     // backward-compatible form). A `scope:` that opens a mapping carries the
     // scope-walking DSL (PR-E): `selector:` and/or `fromResultSet:`.
     auto scope = extract_yaml_value(yaml_source, "scope");
+    if (!scope.empty() && scope.front() == '{')
+        return std::unexpected(
+            "inline flow-mapping scope is not supported; use the block form "
+            "(scope: <newline> indented selector:/fromResultSet:)");
     if (scope.empty()) {
         auto sb = parse_scope_block(yaml_source);
         if (sb.has_from_result_set)
@@ -676,6 +680,11 @@ PolicyStore::create_policy(const std::string& yaml_source) {
                 "spec.scope.fromResultSet is not yet supported for policies (follow-up "
                 "PR-E2): a result set's 1h TTL does not match a continuously-evaluated "
                 "policy. Use a selector or a scope expression.");
+        // Validate the selector charset (sec-L1/dsl-S1) before lowering.
+        auto asn = extract_yaml_section(yaml_source, "spec.assignment");
+        if (auto err = validate_scope_block(sb, extract_yaml_value(asn, "mode"),
+                                            !extract_yaml_list(asn, "managementGroups").empty()))
+            return std::unexpected(*err);
         // Lower a selector-only block. Before PR-E a `scope.selector:` mapping
         // was read by the scalar extractor as empty and silently stored no
         // scope; it now lowers to a real predicate.
