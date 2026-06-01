@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian dashboard guard-create form is now functional (C3c).** The
+  `/guardian` "New Guard" form was a static stub that audited every submission
+  as `denied`. It now renders a structured create form for the Windows registry
+  types — name, severity, enforcement mode, the `registry-value-equals`
+  assertion fields, the remediation action, and a resilience-policy fieldset
+  (mode + tuning params) — and actually persists the Guard. The handler builds
+  the structured spec from the form fields and runs it through the **same
+  `derive_rule_spec` path the REST create uses** (single source: identical
+  validation + canonicalisation), so an invalid resilience policy is rejected
+  with an inline banner rather than silently accepted. Success returns a
+  confirmation panel plus an out-of-band guards-list refresh and a toast; the
+  Guard is created unscoped (draft — device targeting is set at the Baseline).
+  Audited under `guaranteed_state.rule.create`.
 - **Guardian resilience-policy validation + schema discovery (C3b).** The
   structured Guard create/update path now validates and canonicalises the
   per-rule resilience policy carried in `remediation.params` (`mode`

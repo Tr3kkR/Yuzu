@@ -145,6 +145,10 @@ Both require **`GuaranteedState:Write` *and* `GuaranteedState:Push`** (they muta
 >
 > **Offline convergence:** an agent that was offline or unreachable when a rule changed re-converges automatically on reconnect. It reports its applied policy generation (`yuzu.guardian_generation`) in each heartbeat; the server re-pushes when that generation is behind the current store generation (rate-limited per agent). No manual re-push is needed after a network partition.
 
+### 7. Create a Guard from the dashboard
+
+The **+ New Guard** button (top of `/guardian`) opens a structured create form for the Windows registry types: name, severity, enforcement mode, the `registry-value-equals` assertion (hive / key / value name / value type / expected), the remediation action (`alert-only` or `enforce`), and the [resilience policy](#resilience-policy-enforce-retry-behaviour) fieldset (mode + the mode-relevant tuning params; blanks use defaults). Submitting builds the same structured Guard the REST `POST /rules` endpoint accepts and runs it through the **same validation** (so an invalid resilience policy is rejected with an inline banner naming exactly what to fix). On success the Guard is created **unscoped (draft)** — device targeting is set at the Baseline, not per-Guard — and the guard list refreshes in place. Requires `GuaranteedState:Write`; audited under `guaranteed_state.rule.create`.
+
 ## Resilience policy (enforce-retry behaviour)
 
 When a guard is enforcing and a competing writer keeps reverting the value, a **resilience policy** governs how the agent re-enforces. The policy travels as string entries in the structured Guard's `remediation.params` (no proto change) and is validated + canonicalised by the server on create/update.

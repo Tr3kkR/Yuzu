@@ -5,11 +5,14 @@
 #include "guardian_routes.hpp"
 
 #include "guaranteed_state_store.hpp"
+#include "guardian_rule_spec.hpp"
+#include "secure_random.hpp"
 #include "web_utils.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <cctype>
 #include <string>
 #include <vector>
 
@@ -78,6 +81,35 @@ constexpr std::array<MockBaseline, 3> kMockBaselines{{
 }};
 
 // ── Display helpers ─────────────────────────────────────────────────────────
+
+// Slugify a Guard name into the rule_id prefix: lowercase, keep [a-z0-9._-],
+// collapse other runs to a single '-', trim; falls back to "guard".
+std::string slugify(const std::string& name) {
+    std::string s;
+    bool dash = false;
+    for (unsigned char c : name) {
+        char lc = static_cast<char>(std::tolower(c));
+        const bool ok = (lc >= 'a' && lc <= 'z') || (lc >= '0' && lc <= '9') || lc == '.' ||
+                        lc == '_' || lc == '-';
+        if (ok) {
+            s.push_back(lc);
+            dash = false;
+        } else if (!dash && !s.empty()) {
+            s.push_back('-');
+            dash = true;
+        }
+    }
+    if (s.size() > 48) s.resize(48);
+    while (!s.empty() && s.back() == '-') s.pop_back();
+    return s.empty() ? "guard" : s;
+}
+
+// Short unique suffix for a generated rule_id. CSPRNG hex; epoch fallback if the
+// PRNG is unavailable (id uniqueness is a UNIQUE-constraint concern, not security).
+std::string short_id() {
+    if (auto h = random_hex(4); h) return *h;
+    return std::to_string(now_epoch_seconds());
+}
 
 // Worst-of severity ranking for a fleet/rollup badge (contract decision 5):
 // remediation_failed/errored (red) > drifted (amber) > compliant (green).
@@ -414,6 +446,123 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
     res.set_content(render_guards_fragment(""), "text/html; charset=utf-8");
 }
 
+void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib::Response& res) {
+    auto param = [&](const char* k) -> std::string {
+        return req.has_param(k) ? req.get_param_value(k) : std::string{};
+    };
+    // Errors return 200 + an inline banner above a fresh form — htmx's swap:false
+    // on 4xx/5xx would otherwise drop the body and the operator would see nothing
+    // (same convention as apply_guard_change). Re-entry of values is a known wart
+    // (the form re-renders blank); the banner names exactly what to fix.
+    auto fail = [this, &res](const std::string& msg) {
+        res.status = 200;
+        res.set_content("<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
+                        "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
+                        "margin-bottom:0.5rem;font-size:0.78rem\">&#9888; " +
+                            html_escape(msg) + "</div>" + render_guard_form_fragment(),
+                        "text/html; charset=utf-8");
+    };
+
+    if (!store_ || !store_->is_open())
+        return fail("Guardian store unavailable.");
+
+    const std::string name = param("name");
+    const std::string key = param("key");
+    const std::string value_type = param("value_type");
+    const std::string expected = param("expected");
+    const std::string enforcement_mode =
+        param("enforcement_mode").empty() ? "enforce" : param("enforcement_mode");
+    // Form-level required checks — clearer than a downstream empty-assertion guard.
+    if (name.empty() || key.empty() || value_type.empty() || expected.empty())
+        return fail("Name, key, value type and expected value are required.");
+
+    nlohmann::json assertion_params;
+    assertion_params["hive"] = param("hive").empty() ? "HKLM" : param("hive");
+    assertion_params["key"] = key;
+    assertion_params["value_name"] = param("value_name"); // "" = key default value
+    assertion_params["value_type"] = value_type;
+    assertion_params["expected"] = expected;
+
+    // Remediation params = the resilience policy. Only include fields the operator
+    // actually set so blanks fall through to defaults rather than being rejected as
+    // a non-numeric "" (lenient-in).
+    nlohmann::json rem_params;
+    rem_params["mode"] = param("resilience_mode").empty() ? "persist" : param("resilience_mode");
+    auto add_num = [&](const char* k) {
+        const std::string v = param(k);
+        if (!v.empty()) rem_params[k] = v;
+    };
+    add_num("max_attempts");
+    add_num("quiet_reset_s");
+    add_num("resume_after_s");
+    add_num("backoff_initial_ms");
+    add_num("backoff_max_ms");
+    add_num("event_debounce_ms");
+
+    const std::string action =
+        param("remediation_action").empty() ? "alert-only" : param("remediation_action");
+
+    nlohmann::json body;
+    body["spark"] = {{"type", "registry-change"}, {"params", nlohmann::json::object()}};
+    body["assertion"] = {{"type", "registry-value-equals"}, {"params", std::move(assertion_params)}};
+    body["remediation"] = {{"type", action}, {"params", std::move(rem_params)}};
+
+    // Single source: the same derivation + resilience validation the REST create
+    // uses, so the dashboard and the API produce identical specs.
+    auto spec = guardian::derive_rule_spec(body, name, /*version=*/1, /*enabled=*/true,
+                                           enforcement_mode);
+    if (spec.error)
+        return fail(spec.error->message);
+
+    GuaranteedStateRuleRow row;
+    row.rule_id = slugify(name) + "-" + short_id(); // matches [A-Za-z0-9._-]+
+    row.name = name;
+    row.spec_json = std::move(spec.spec_json);
+    row.yaml_source = std::move(spec.yaml_source);
+    row.version = 1;
+    row.enabled = true;
+    row.enforcement_mode = enforcement_mode;
+    row.severity = param("severity").empty() ? "medium" : param("severity");
+    row.os_target = "windows"; // registry guards are Windows-only today
+    row.scope_expr = "";        // unscoped draft — device targeting is set at the Baseline
+    const std::string now = format_iso_utc(now_epoch_seconds());
+    row.created_at = now;
+    row.updated_at = now;
+    if (auto session = auth_fn_(req, res)) {
+        row.created_by = session->username;
+        row.updated_by = session->username;
+    }
+
+    if (auto r = store_->create_rule(row); !r)
+        return fail("Create failed: " + r.error());
+
+    audit_fn_(req, "guaranteed_state.rule.create", "success", "GuaranteedState", row.rule_id,
+              row.name + " (mode=" + row.enforcement_mode + ", action=" + action + ")");
+
+    // Success: a confirmation panel in the detail pane, an out-of-band refresh of
+    // the guards list, and a toast (the dashboard's HX-Trigger convention).
+    res.set_header("HX-Trigger", R"({"showToast":{"message":"Guard created","level":"success"}})");
+    std::string html =
+        "<div class=\"detail-panel\"><h3>Guard created</h3>"
+        "<div class=\"kv\"><div class=\"k\">Name</div><div>" +
+        html_escape(row.name) +
+        "</div>"
+        "<div class=\"k\">ID</div><div style=\"font-family:var(--mono);font-size:0.75rem\">" +
+        html_escape(row.rule_id) +
+        "</div>"
+        "<div class=\"k\">Mode</div><div>" +
+        html_escape(row.enforcement_mode) + " / " + html_escape(action) +
+        "</div></div>"
+        "<div class=\"mock-note\">Created unscoped (draft). Add it to a Baseline to deploy it to "
+        "agents.</div>"
+        "<div class=\"form-actions\"><button class=\"btn btn-secondary\" "
+        "hx-get=\"/fragments/guardian/guard-form\" hx-target=\"#guardian-detail\" "
+        "hx-swap=\"innerHTML\">New Guard</button></div></div>"
+        "<div id=\"guardian-guards\" hx-swap-oob=\"innerHTML\">" +
+        render_guards_fragment("") + "</div>";
+    res.set_content(html, "text/html; charset=utf-8");
+}
+
 std::string GuardianRoutes::render_events_fragment(const std::string& type_filter,
                                                    const std::string& severity_filter) const {
     (void)severity_filter;
@@ -579,46 +728,83 @@ std::string GuardianRoutes::render_baseline_detail_fragment(const std::string& b
 }
 
 std::string GuardianRoutes::render_guard_form_fragment() const {
-    // TODO(guardian-backend): make this schema-driven from
-    //   GET /api/v1/guaranteed-state/schemas  (catalog + per-type JSON Schema
-    //   with discriminated subschemas). For now a representative static form
-    //   for the Slice-A registry types; submission is stubbed.
+    // Structured create form for the Slice-A registry types (the only spark /
+    // assertion types the agent implements today). Field names map 1:1 to the
+    // structured Guard the POST handler builds and feeds to derive_rule_spec, so
+    // the dashboard and the REST API produce identical specs + validation. The
+    // resilience fieldset emits exactly the keys the agent reads / the /schemas
+    // registry publishes. A fuller schema-driven dynamic renderer (one consumer
+    // of GET /schemas) is a forward step once more types exist.
+    const char* fieldset =
+        "border:1px solid var(--border);border-radius:0.4rem;padding:0.6rem 0.75rem;margin:0.5rem 0";
+    const char* hint = "color:var(--muted);font-size:0.72rem;margin-bottom:0.4rem";
     std::string html =
         "<div class=\"detail-panel\"><h3>New Guard</h3>"
         "<form class=\"gs-form\" hx-post=\"/fragments/guardian/guards\" "
         "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">"
-        "<label>Name</label><input name=\"name\" placeholder=\"block-smb-445\">"
+        "<label>Name</label><input name=\"name\" placeholder=\"block-smb-445\" required>"
         "<div class=\"form-row\">"
         "<div><label>Severity</label><select name=\"severity\">"
         "<option>critical</option><option selected>high</option><option>medium</option><option>low</option>"
         "</select></div>"
         "<div><label>Enforcement mode</label><select name=\"enforcement_mode\">"
-        "<option selected>enforce</option><option>audit</option></select></div>"
+        "<option value=\"enforce\" selected>enforce</option><option value=\"audit\">audit</option></select></div>"
         "</div>"
-        "<label>Spark (trigger)</label><select name=\"spark_type\">"
-        "<option value=\"registry-change\">registry-change</option></select>"
-        "<label>Assertion</label><select name=\"assertion_type\">"
-        "<option value=\"registry-value-equals\">registry-value-equals</option></select>"
+        "<fieldset style=\"";
+    html += fieldset;
+    html +=
+        "\"><legend>Assertion &mdash; registry-value-equals</legend>"
         "<div class=\"form-row\">"
-        "<div><label>Hive</label><select name=\"hive\"><option>HKLM</option><option>HKCU</option></select></div>"
+        "<div><label>Hive</label><select name=\"hive\">"
+        "<option>HKLM</option><option>HKCU</option><option>HKCR</option><option>HKU</option><option>HKCC</option>"
+        "</select></div>"
         "<div><label>Value type</label><select name=\"value_type\">"
-        "<option>REG_DWORD</option><option>REG_SZ</option><option>REG_QWORD</option></select></div>"
+        "<option>REG_DWORD</option><option>REG_QWORD</option><option>REG_SZ</option>"
+        "<option>REG_EXPAND_SZ</option><option>REG_BINARY</option></select></div>"
         "</div>"
-        "<label>Key</label><input name=\"key\" placeholder=\"SOFTWARE\\\\YuzuTest\">"
+        "<label>Key</label><input name=\"key\" placeholder=\"SOFTWARE\\\\YuzuTest\" required>"
         "<div class=\"form-row\">"
-        "<div><label>Value name</label><input name=\"value_name\" placeholder=\"Flag\"></div>"
-        "<div><label>Expected</label><input name=\"expected\" placeholder=\"1\"></div>"
+        "<div><label>Value name</label><input name=\"value_name\" placeholder=\"Flag (blank = default value)\"></div>"
+        "<div><label>Expected</label><input name=\"expected\" placeholder=\"1\" required></div>"
+        "</div></fieldset>"
+        "<label>Remediation action</label><select name=\"remediation_action\">"
+        "<option value=\"alert-only\" selected>alert-only (detect &amp; report)</option>"
+        "<option value=\"enforce\">enforce (write the expected value back)</option></select>"
+        "<fieldset style=\"";
+    html += fieldset;
+    html += "\"><legend>Resilience policy</legend><div style=\"";
+    html += hint;
+    html +=
+        "\">Governs re-enforcement when a value keeps drifting (enforce only). Fields not "
+        "relevant to the chosen mode are ignored; blanks use the defaults.</div>"
+        "<label>Mode</label><select name=\"resilience_mode\">"
+        "<option value=\"persist\" selected>persist &mdash; fix on every drift, never give up</option>"
+        "<option value=\"backoff\">backoff &mdash; exponential delay, never give up</option>"
+        "<option value=\"bounded\">bounded &mdash; give up after N cycles</option></select>"
+        "<div class=\"form-row\">"
+        "<div><label>Max attempts (bounded)</label>"
+        "<input name=\"max_attempts\" type=\"number\" min=\"1\" placeholder=\"5\"></div>"
+        "<div><label>Quiet reset (s)</label>"
+        "<input name=\"quiet_reset_s\" type=\"number\" min=\"1\" placeholder=\"60\"></div>"
         "</div>"
-        "<label>Remediation</label><select name=\"remediation_action\">"
-        "<option value=\"alert-only\" selected>alert-only</option>"
-        "<option value=\"enforce\">enforce (registry-write)</option></select>"
+        "<div class=\"form-row\">"
+        "<div><label>Resume after (s, bounded)</label>"
+        "<input name=\"resume_after_s\" type=\"number\" min=\"0\" placeholder=\"0 = stay given up\"></div>"
+        "<div><label>Event debounce (ms)</label>"
+        "<input name=\"event_debounce_ms\" type=\"number\" min=\"0\" placeholder=\"1000\"></div>"
+        "</div>"
+        "<div class=\"form-row\">"
+        "<div><label>Backoff initial (ms)</label>"
+        "<input name=\"backoff_initial_ms\" type=\"number\" min=\"1\" placeholder=\"1000\"></div>"
+        "<div><label>Backoff max (ms)</label>"
+        "<input name=\"backoff_max_ms\" type=\"number\" min=\"1\" placeholder=\"60000\"></div>"
+        "</div></fieldset>"
         "<div class=\"form-actions\">"
         "<button type=\"submit\" class=\"btn btn-secondary\">Create Guard</button></div>"
         "</form>"
-        "<div class=\"mock-note\">Form is a static scaffold for the Slice-A registry types. It will be "
-        "generated from the schema-registry discovery surface "
-        "(<code>GET /api/v1/guaranteed-state/schemas</code>, discriminated subschemas) and submit a "
-        "structured create when those land. Scope/targeting is set at the Baseline, not per-Guard.</div></div>";
+        "<div class=\"mock-note\">A new Guard is created unscoped (draft); device targeting is set at "
+        "the Baseline, not per-Guard. Authoring schemas: "
+        "<code>GET /api/v1/guaranteed-state/schemas</code>.</div></div>";
     return html;
 }
 
@@ -738,22 +924,13 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
                 res.set_content(render_baseline_form_fragment(), "text/html; charset=utf-8");
             });
 
-    // -- Mock create (Guard) — structured create lands with the backend ----
+    // -- Structured create (Guard) ----------------------------------------
+    // Build a structured Guard from the create-form fields and persist it via
+    // the shared derive_rule_spec path (single source with the REST create).
     svr.Post("/fragments/guardian/guards",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
-                 const std::string name =
-                     req.has_param("name") ? req.get_param_value("name") : "(unnamed)";
-                 audit_fn_(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", name,
-                           "dashboard mock - structured create not yet wired");
-                 res.set_content(
-                     "<div class=\"detail-panel\"><div class=\"empty-state\">Guard authoring is not "
-                     "wired yet &mdash; the structured create endpoint is being built on "
-                     "<code>feat/guardian-mvp</code>. Submitted draft: <strong>" +
-                         html_escape(name) +
-                         "</strong>.</div><div class=\"mock-note\">Will POST a structured Guard "
-                         "(spark/assertion/remediation) to the create endpoint.</div></div>",
-                     "text/html; charset=utf-8");
+                 create_guard_from_form(req, res);
              });
 
     // -- Live guard controls: enable/disable + audit↔enforce, auto-deploy --

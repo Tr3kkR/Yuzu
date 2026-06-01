@@ -91,6 +91,15 @@ private:
                             const std::string& rule_id, bool set_enabled, bool enabled,
                             bool set_mode, const std::string& mode);
 
+    /// Create a structured Guard from the dashboard create-form POST. Builds the
+    /// structured spec from form fields, reuses guardian::derive_rule_spec (the
+    /// same validation + canonicalisation the REST create uses — single source),
+    /// persists via the store, and responds with a success panel + an
+    /// out-of-band guards-list refresh. Validation/store errors return 200 + an
+    /// inline banner over the re-rendered form (htmx does not swap 4xx bodies).
+    /// Backs `POST /fragments/guardian/guards`.
+    void create_guard_from_form(const httplib::Request& req, httplib::Response& res);
+
     // -- Dependency pointers (stored by register_routes) -----------------------
     AuthFn auth_fn_;
     PermFn perm_fn_;
