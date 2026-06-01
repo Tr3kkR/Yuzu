@@ -49,6 +49,10 @@ struct FileDriftCollector {
             return false;
         });
     }
+    bool wait_count(std::size_t min, std::chrono::milliseconds to) {
+        std::unique_lock lk(m);
+        return cv.wait_for(lk, to, [&] { return events.size() >= min; });
+    }
     std::size_t size() {
         std::lock_guard lk(m);
         return events.size();
@@ -155,6 +159,116 @@ TEST_CASE("FileGuard file-exists: compliant present state is quiet", "[guardian]
     std::this_thread::sleep_for(std::chrono::milliseconds(800)); // a compliant guard must not emit
     g.stop();
     CHECK(col->size() == 0);
+    fs::remove_all(dir);
+}
+
+// ── file-hash-equals (B2) ────────────────────────────────────────────────────
+
+TEST_CASE("FileGuard file-hash-equals: detects a content change", "[guardian][guard][file][hash]") {
+    const auto dir = yuzu::test::unique_temp_path("fileguard-hash");
+    fs::create_directories(dir);
+    const auto target = dir / "content.txt";
+    write_file(target, "version-one");
+
+    auto col = std::make_shared<FileDriftCollector>();
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-hash";
+    cfg.path = target.string();
+    cfg.assertion = FileGuard::Assertion::HashEquals; // empty expected_hash → baseline-on-arm
+    cfg.settle_ms = 100;
+    cfg.event_debounce_ms = 50;
+    FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
+
+    REQUIRE(g.start());
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // arm + baseline; no drift yet
+    CHECK(col->size() == 0);
+    write_file(target, "version-two-different"); // content changes
+    REQUIRE(col->wait_count(1, std::chrono::seconds(5)));
+    g.stop();
+    {
+        std::lock_guard lk(col->m);
+        const auto& last = col->events.back();
+        CHECK(last.guard_type == "file");
+        CHECK(last.detected_value.size() == 64); // a real SHA-256 hex, not a sentinel
+    }
+    fs::remove_all(dir);
+}
+
+TEST_CASE("FileGuard file-hash-equals: identical-content rewrite stays quiet",
+          "[guardian][guard][file][hash]") {
+    const auto dir = yuzu::test::unique_temp_path("fileguard-hash-quiet");
+    fs::create_directories(dir);
+    const auto target = dir / "stable.txt";
+    write_file(target, "unchanging");
+
+    auto col = std::make_shared<FileDriftCollector>();
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-hash-quiet";
+    cfg.path = target.string();
+    cfg.assertion = FileGuard::Assertion::HashEquals;
+    cfg.settle_ms = 100;
+    cfg.event_debounce_ms = 50;
+    FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
+
+    REQUIRE(g.start());
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // baseline
+    write_file(target, "unchanging"); // rewrite SAME bytes → notification, but hash unchanged
+    std::this_thread::sleep_for(std::chrono::milliseconds(600)); // settle + eval window
+    g.stop();
+    CHECK(col->size() == 0); // content-change semantics: a no-op rewrite is not drift
+    fs::remove_all(dir);
+}
+
+TEST_CASE("FileGuard file-hash-equals: oversize is reported, not silently skipped",
+          "[guardian][guard][file][hash]") {
+    const auto dir = yuzu::test::unique_temp_path("fileguard-hash-big");
+    fs::create_directories(dir);
+    const auto target = dir / "big.bin";
+    write_file(target, std::string(4096, 'A')); // 4 KiB
+
+    auto col = std::make_shared<FileDriftCollector>();
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-hash-big";
+    cfg.path = target.string();
+    cfg.assertion = FileGuard::Assertion::HashEquals;
+    cfg.max_hash_bytes = 64; // far below the file size
+    cfg.settle_ms = 100;
+    cfg.event_debounce_ms = 50;
+    FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
+
+    REQUIRE(g.start());
+    // Fail-loud at arm: too large to verify within the DoS cap → "<oversize>" drift.
+    CHECK(col->wait_for_detected("<oversize>", std::chrono::seconds(5)));
+    g.stop();
+    fs::remove_all(dir);
+}
+
+TEST_CASE("FileGuard file-hash-equals: mismatch against a supplied expected hash drifts",
+          "[guardian][guard][file][hash]") {
+    const auto dir = yuzu::test::unique_temp_path("fileguard-hash-exp");
+    fs::create_directories(dir);
+    const auto target = dir / "watched.cfg";
+    write_file(target, "actual-content");
+
+    auto col = std::make_shared<FileDriftCollector>();
+    FileGuard::Config cfg;
+    cfg.rule_id = "fg-hash-exp";
+    cfg.path = target.string();
+    cfg.assertion = FileGuard::Assertion::HashEquals;
+    cfg.expected_hash = std::string(64, '0'); // a hash the real content cannot match
+    cfg.settle_ms = 100;
+    cfg.event_debounce_ms = 50;
+    FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
+
+    REQUIRE(g.start());
+    // Operator-supplied baseline: the initial compare already drifts (content != expected).
+    REQUIRE(col->wait_count(1, std::chrono::seconds(5)));
+    g.stop();
+    {
+        std::lock_guard lk(col->m);
+        CHECK(col->events.back().expected_value == std::string(64, '0'));
+        CHECK(col->events.back().detected_value.size() == 64); // the real hash
+    }
     fs::remove_all(dir);
 }
 

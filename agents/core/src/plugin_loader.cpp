@@ -45,7 +45,7 @@ namespace yuzu::agent {
 
 // ── SHA-256 file hashing ─────────────────────────────────────────────────────
 
-std::string sha256_file(const std::filesystem::path& path) {
+std::string sha256_file(const std::filesystem::path& path, std::size_t max_bytes) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {
         spdlog::error("sha256_file: cannot open {}", path.string());
@@ -56,6 +56,7 @@ std::string sha256_file(const std::filesystem::path& path) {
     char buf[kBufSize];
     constexpr size_t kDigestLen = 32;
     unsigned char digest[kDigestLen]{};
+    std::uintmax_t hashed_total = 0; // bounded-read guard against max_bytes
 
 #ifdef _WIN32
     BCRYPT_ALG_HANDLE alg = nullptr;
@@ -74,6 +75,12 @@ std::string sha256_file(const std::filesystem::path& path) {
     }
 
     while (f.read(buf, kBufSize) || f.gcount() > 0) {
+        hashed_total += static_cast<std::uintmax_t>(f.gcount());
+        if (hashed_total > max_bytes) { // exceeds the read cap — refuse (oversize)
+            BCryptDestroyHash(hash);
+            BCryptCloseAlgorithmProvider(alg, 0);
+            return {};
+        }
         if (!BCRYPT_SUCCESS(BCryptHashData(hash, reinterpret_cast<PUCHAR>(buf),
                                            static_cast<ULONG>(f.gcount()), 0))) {
             BCryptDestroyHash(hash);
@@ -98,6 +105,11 @@ std::string sha256_file(const std::filesystem::path& path) {
     }
 
     while (f.read(buf, kBufSize) || f.gcount() > 0) {
+        hashed_total += static_cast<std::uintmax_t>(f.gcount());
+        if (hashed_total > max_bytes) { // exceeds the read cap — refuse (oversize)
+            EVP_MD_CTX_free(ctx);
+            return {};
+        }
         EVP_DigestUpdate(ctx, buf, static_cast<size_t>(f.gcount()));
         if (f.eof())
             break;

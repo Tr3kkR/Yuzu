@@ -487,19 +487,42 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
     // ── file-change Spark (Change B) — realtime file watch via FileGuard ──────
     if (rule.spark().type() == "file-change") {
         const auto& fa = rule.assertion();
-        if (fa.type() != "file-exists")
-            return false; // file-hash-equals is B2; any other assertion stays unarmed
+        const std::string atype = fa.type();
+        if (atype != "file-exists" && atype != "file-hash-equals")
+            return false; // unknown assertion stays unarmed (G11: errored upstream)
         auto aparam = [&fa](const char* k) -> std::string {
             auto it = fa.params().find(k);
             return it != fa.params().end() ? it->second : std::string{};
+        };
+        auto aparam_u64 = [&aparam](const char* k, std::uint64_t dflt) -> std::uint64_t {
+            const std::string v = aparam(k);
+            if (v.empty())
+                return dflt;
+            std::uint64_t out = dflt;
+            auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), out);
+            return ec == std::errc{} ? out : dflt;
         };
         FileGuard::Config fcfg;
         fcfg.rule_id = rule.rule_id();
         fcfg.rule_name = rule.name();
         fcfg.path = aparam("path");
-        // expected presence: "absent" → drift when the file EXISTS; anything else
-        // (default "present") → drift when the file is missing / has been deleted.
-        fcfg.expect_present = (aparam("expected") != "absent");
+        if (atype == "file-hash-equals") {
+            // Content-change detection: drift when size + SHA-256 differ from the
+            // expected hash (empty → baseline captured on arm). max_bytes caps the
+            // hashing-DoS; settle_ms coalesces mid-write notifications.
+            fcfg.assertion = FileGuard::Assertion::HashEquals;
+            fcfg.expected_hash = aparam("expected_hash");
+            for (auto& c : fcfg.expected_hash) // normalise to the lowercase hex sha256_file emits
+                if (c >= 'A' && c <= 'Z')
+                    c = static_cast<char>(c - 'A' + 'a');
+            fcfg.max_hash_bytes = aparam_u64("max_bytes", fcfg.max_hash_bytes);
+            fcfg.settle_ms = aparam_u64("settle_ms", fcfg.settle_ms);
+        } else {
+            // file-exists: "absent" → drift when the file EXISTS; anything else
+            // (default "present") → drift when the file is missing / has been deleted.
+            fcfg.assertion = FileGuard::Assertion::Exists;
+            fcfg.expect_present = (aparam("expected") != "absent");
+        }
         // The event-debounce window shares remediation.params with the resilience
         // keys; a file guard is detection-only, so the resilience MODES do not apply
         // — only event_debounce_ms is read (single-sourced via parse_resilience_params,
@@ -511,7 +534,10 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
         };
         parse_resilience_params(fget, fcfg.event_debounce_ms);
         const std::string log_path = fcfg.path;
-        const bool log_expect = fcfg.expect_present;
+        const std::string log_mode =
+            atype == "file-hash-equals"
+                ? std::string("hash-equals")
+                : std::string(fcfg.expect_present ? "expect present" : "expect absent");
 
         auto file_sink = [this](const GuardDrift& d) { emit_guard_event(d); };
         if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
@@ -522,8 +548,8 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
         auto fguard = std::make_unique<FileGuard>(std::move(fcfg), std::move(file_sink));
         if (fguard->start()) {
             guards_.emplace(rule.rule_id(), std::move(fguard));
-            spdlog::info("Guardian: file guard armed for rule '{}' (path={}, expect {})",
-                         rule.rule_id(), log_path, log_expect ? "present" : "absent");
+            spdlog::info("Guardian: file guard armed for rule '{}' (path={}, {})", rule.rule_id(),
+                         log_path, log_mode);
             return true;
         }
         spdlog::warn("Guardian: file guard for rule '{}' did not start (non-Windows or empty path)",

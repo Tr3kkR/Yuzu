@@ -39,11 +39,23 @@ namespace yuzu::agent {
 /// the sink. Detection-only.
 class YUZU_EXPORT FileGuard : public IGuard {
 public:
+    /// Which desired-state check the guard evaluates on a change.
+    enum class Assertion {
+        Exists,    ///< file-exists (B1): presence vs expect_present
+        HashEquals ///< file-hash-equals (B2): content (size + SHA-256) vs a baseline
+    };
+
     struct Config {
         std::string rule_id;
         std::string rule_name;
-        std::string path;          ///< target file (canonicalised at start)
-        bool expect_present{true}; ///< file-exists: desired presence (drift when actual != this)
+        std::string path; ///< target file (canonicalised at start)
+        Assertion assertion{Assertion::Exists};
+        // file-exists:
+        bool expect_present{true}; ///< desired presence (drift when actual != this)
+        // file-hash-equals:
+        std::string expected_hash;                       ///< lowercase hex SHA-256; empty = baseline-on-arm
+        std::uint64_t max_hash_bytes{64ull * 1024 * 1024}; ///< hashing-DoS cap; over → "<oversize>" drift
+        std::uint64_t settle_ms{750};                    ///< coalesce window before hashing (writes are not atomic)
         /// Event/sink debounce window (ms) — collapses rapid drift events into a
         /// count (shared convention with RegistryGuard). 0 = emit every drift.
         std::uint64_t event_debounce_ms{1000};
