@@ -7,7 +7,143 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **`POST /login` now returns HTTP 202 (not 200) for MFA-enrolled users.**
+  Programmatic clients (CI pipelines, automation scripts, health checks)
+  that called `POST /login` and gated on `HTTP 200 + {"status":"ok"}` will
+  fail silently the first time the authenticating user enrolls in TOTP MFA.
+  Handle the 202 branch: read `mfa_pending_token` from the JSON body and
+  POST it along with the 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX`
+  recovery code) to `POST /login/mfa` to obtain a session cookie. Clients
+  using API tokens or OIDC are unaffected.
+- **Audit verb taxonomy on every new MFA emission site uses the
+  `target_type="User"` (PascalCase) and `result ∈ {ok, error}` vocabulary
+  from `docs/observability-conventions.md`.** SIEM and Grafana rules that
+  filter on the historical lowercase `target_type="user"` + `success/failure`
+  strings used by `auth.login` / `auth.oidc_login` will not match the new
+  `mfa.*` rows. Existing auth.* sites remain on the historical vocabulary
+  for backwards compatibility (separate tracking issue).
+- **Recovery code format changed from `XXXXX-XXXXX` (50 bits) to
+  `XXXX-XXXX-XXXX-XXXX` (80 bits, four base32 groups).** Codes issued by
+  prior PR1 commits are no longer the canonical shape but remain valid
+  until consumed or regenerated.
+- **`AuthDB::remove_user` now also clears MFA enrollment state.** Soft-
+  deleting a user nulls their `mfa_totp_secret`, clears `mfa_enrolled_at`,
+  and DELETEs every `mfa_recovery_codes` row owned by the user — SOC 2 CC6.8
+  requires credentials be revoked on termination. Any external code or
+  ops tooling that relied on the prior "soft delete leaves MFA intact"
+  behavior must update.
+
 ### Added
+
+- **MFA step-up on 11 high-risk REST + Settings surfaces (PR 2 of the MFA
+  ladder; SOC 2 CC6.6).** Closes the privileged-access control gap by
+  re-prompting for fresh TOTP / recovery proof on session-cookie callers
+  before any high-risk mutation lands. New helper `require_mfa_step_up()`
+  in `server/core/src/mfa_step_up.{hpp,cpp}` evaluates the gate: api/mcp
+  tokens bypass (the bearer credential is itself the step-up moment),
+  OIDC/SSO sessions bypass (the identity lives in the IdP — no local
+  `users` row or TOTP to step up against; `amr`-claim enforcement is the
+  PR3 work), non-enrolled users bypass (consistent with PR1's `optional`
+  enforcement model), and stale sessions (now − `mfa_verified_at` > `mfa_step_up_
+  window_secs`, default 300 s) receive a 401 A4 envelope `{"error":
+  {"code":401,"message":"MFA step-up required",...},"meta":{"api_version":
+  "v1","mfa_step_up_required":true,"challenge_url":"/login/mfa/stepup"}}`
+  plus a `mfa.step_up.required` audit row. A new route `POST
+  /login/mfa/stepup` accepts an authenticated session cookie + a TOTP
+  code (6 digits) or recovery code; strict-shape gate (same as PR1's
+  `/login/mfa`) defeats the CPU-DoS shape oracle. Success refreshes
+  `Session::mfa_verified_at` via `AuthManager::mark_session_mfa_verified`
+  and emits `mfa.step_up.passed`; failure emits `mfa.step_up.failed`.
+  The dashboard auto-intercepts the envelope (`htmx:responseError`) and
+  prompts inline so HTMX-driven UI flows complete without operator
+  context-switch. The 11 sites wired in this PR:
+  - `POST /api/v1/tokens` (token mint — high-impact bearer credential)
+  - `DELETE /api/v1/tokens/{id}` (token revoke)
+  - `DELETE /api/v1/sessions` (admin force-logout of another principal)
+  - `POST /api/v1/software-packages` (introduces executable content)
+  - `POST /api/v1/software-deployments/{id}/start` (push to live agents)
+  - `POST /api/v1/guaranteed-state/rules` (Guardian rule create — drives
+    auto-remediation policy)
+  - `PUT /api/v1/guaranteed-state/rules/{id}` (Guardian rule update)
+  - `DELETE /api/v1/guaranteed-state/rules/{id}` (Guardian rule delete —
+    added in Gate 4 consistency-B1 closure; removing a rule is as
+    destructive as updating one)
+  - `POST /api/v1/guaranteed-state/push` (Guardian rule fan-out)
+  - `DELETE /api/settings/users/{username}` (destroys a principal)
+  - `POST /api/settings/users/{username}/role` (promotes / demotes
+    authority)
+  New CLI flag `--mfa-step-up-window-secs` (default 300; 0 disables the
+  gate — emit a startup `WARN`). New Prometheus metric
+  `yuzu_auth_mfa_step_up_total{method,result}` (counter). Tests:
+  `tests/unit/server/test_mfa_step_up.cpp` (9 cases / 108 assertions —
+  every branch of the gate decision tree) + extensions to
+  `tests/unit/server/test_auth_routes_mfa.cpp` (5 new cases for
+  `/login/mfa/stepup`: TOTP / recovery success, no-session, missing
+  code, wrong code). Docs: `docs/auth-mfa-design.md` step-up section
+  marked implemented; `docs/user-manual/{authentication,rest-api}.md`
+  document the new endpoint + the 401 envelope on each gated site.
+  Plan note: the original plan called for 11 sites including `POST
+  /api/v1/file-retrieval`; that endpoint turned out to be the
+  agent-side push-back (authenticated via mTLS / device token, not a
+  session cookie) so step-up does not apply. Guardian rule DELETE was
+  added during governance Gate 4 to keep the destructive-Guardian
+  surface uniform — final scope is 11 sites.
+
+  The helper fails CLOSED on auth_db errors (governance Gate 4 UP-4 /
+  qe Gate 3 BLOCKING fix): a `mfa_status()` failure or a row-not-found
+  on the user emits a 401 with `reason=mfa_status_unavailable
+  (fail-closed)` rather than silently bypassing the gate. Test:
+  `test_mfa_step_up.cpp` "store error fails CLOSED" case.
+
+- **Scope walking — composable scope from previous query results (capability §30).**
+  A new per-operator **result set** primitive: a named, TTL-bounded, lineage-tracked
+  set of device IDs that becomes the input scope for the next query or action.
+  `server/core/src/result_set_store.{hpp,cpp}` (new `result_sets.db`, schema v1 via
+  `MigrationRunner`, time-prefixed lexically-sortable `rs_<ts><rand>` ids,
+  RETURNING-idiom writes per #1033, sync + async `pending → materialized` lifecycle,
+  root-first lineage walk, pin/unpin, per-operator 10k quota + 50-pin caps, 5-minute
+  GC sweep). REST surface under `/api/v1/result-sets` (list, direct create,
+  from-inventory-query, members, lineage, pin/unpin, delete) — owner-scoped authz,
+  A4 error envelope, audit on every state transition. The Scope Engine gains a third
+  short-circuit kind, `from_result_set:<id>` (`scope_engine.cpp`), composable with
+  attribute predicates via AND/OR/NOT and resolved per-device by
+  `AgentRegistry::evaluate_scope` (threaded through all command-dispatch sites); stale
+  (offline) members drop silently. A background maintenance thread materialises async
+  result sets from terminal executions and runs the GC sweep; new
+  `yuzu_result_sets_total` / `yuzu_result_sets_alive` / `yuzu_result_set_gc_total` /
+  `yuzu_result_set_quota_rejected` metrics. New `/result-sets` dashboard page
+  (`result_sets_ui.{hpp,cpp}`): sidebar of active sets, lineage breadcrumb, copyable
+  `from_result_set:` scope token, CSV-import create, pin/unpin/delete — HTMX,
+  server-rendered, dark-theme; nav link added across all dashboard pages. The two async
+  producers (from-tar-query / from-instruction-result), the YAML `fromResultSet:` DSL
+  surface, and re-eval land in follow-up PRs. Design: `docs/scope-walking-design.md`.
+
+- **Scope walking — async result-set producers + TAR SQL frame (PR-D).** The two
+  asynchronous producers now create result sets by dispatching a command and
+  materialising membership once the producing execution reaches a terminal state:
+  `POST /api/v1/result-sets/from-tar-query` (dispatches operator SQL to the tar
+  plugin in the parent set's scope — or `__all__` — and includes every agent that
+  returned ≥1 row, or all responders with `include_empty=true`) and
+  `POST /api/v1/result-sets/from-instruction-result` (runs an InstructionDefinition
+  and filters responders by an operator-supplied `{column,op,value|value_set}`
+  matcher — the Chrome-IR hash-check step). Both follow the
+  create-execution-**before**-dispatch ordering (UP2-4) and return `202` with a
+  `pending` row carrying `source_execution_id`; the server maintenance thread applies
+  the matcher (new `result_set_matcher.{hpp,cpp}` — `tar_rows_ge` / `any_response` /
+  column-op over both the tar pipe shape and JSON array-of-objects) and flips the row
+  to `materialized`. `POST /api/v1/result-sets/{id}/re-eval` re-runs an async set's
+  source query as a **sibling** (shares the original's parent). Parent references
+  accept a per-operator **alias** as well as the canonical `rs_` id (resolved at the
+  dispatch layer where the owner is known). New `yuzu_result_sets_total{result="pending"}`
+  metric path. The TAR dashboard's "Ad-hoc TAR SQL" frame (`tar_page_ui.cpp`) is now
+  live: a reusable **scope chip** (your result sets + `__all__`), a SQL editor, and a
+  one-click "Run & create result set" that dispatches, polls the pending set, and
+  surfaces the materialised device count + copyable `from_result_set:` token — HTMX,
+  server-rendered, dark-theme. The async producer routes require the command-dispatch
+  callback + ExecutionTracker (threaded into `RestApiV1::register_routes`); without
+  them they return `503`. Design: `docs/scope-walking-design.md` §3.1/§3.3/§6/§8.3/§10.
 
 - **Compliance policies now actually evaluate (check → verdict pipeline).**
   Authored policies + fragments could be created, but nothing evaluated them —
@@ -36,8 +172,192 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`~ServerImpl` now calls `stop()`); caller-supplied `remediate` agent lists are
   intersected with the policy's own scope; new `yuzu_server_policy_verdicts_total`
   / `yuzu_server_policy_eval_errors_total` metrics.
+- **MFA / TOTP — PR 1 of the `/auth-and-authz` skill P0 #1 ladder (SOC 2
+  CC6.6).** First shippable slice of MFA: RFC 6238 TOTP self-service
+  enrollment via Settings → Multi-Factor Authentication, login challenge
+  after password verify, recovery codes. Step-up on high-risk endpoints
+  and OIDC `amr` interop ship in subsequent PRs of the same ladder.
+  - `auth.db` schema v2 migration: `users.mfa_totp_secret` (BLOB, raw 20-byte
+    HMAC-SHA1 key per RFC 4226 §4 R6, at-rest protected by the existing
+    0600 file mode), `users.mfa_enrolled_at`, `users.mfa_disabled_at`,
+    `users.mfa_last_counter` (replay floor), `sessions.mfa_verified_at`,
+    new tables `mfa_recovery_codes` (PBKDF2-SHA256 hashed, single-use)
+    and `auth_kv` (provisioned empty for future encryption-at-rest).
+  - New `server/core/src/totp.{hpp,cpp}` — RFC 6238 TOTP generator/verifier
+    (30 s step, 6 digits, ±1 step skew with replay protection), RFC 4648
+    base32 enc/dec, otpauth URI builder, CSPRNG secret and recovery-code
+    generation. Tested against RFC 6238 Appendix B SHA-1 vectors.
+  - `AuthDB::mfa_init_enrollment` / `mfa_verify_enrollment` /
+    `mfa_verify_login_code` / `mfa_consume_recovery_code` /
+    `mfa_regenerate_recovery_codes` / `mfa_disable` / `mfa_status` /
+    `mfa_mark_session_stepup` — new MFA accessor surface on the existing
+    AuthDB instance.
+  - `AuthManager` additions: `verify_password` (creds-only check, no
+    session), `create_local_session(user, role, mfa_verified)`,
+    `mark_session_mfa_verified(token)`, `auth_db_ptr()` accessor.
+  - `Session::mfa_verified_at` field (step-up window comparison).
+  - `Config::mfa_enforcement` (`optional` | `admin-only` | `required`,
+    default `optional`), `Config::mfa_step_up_window_secs` (default 300),
+    `Config::mfa_login_pending_secs` (default 120). CLI flags
+    `--mfa-enforcement`, `--mfa-step-up-window-secs`,
+    `--mfa-login-pending-secs` (envs `YUZU_MFA_*`). PR1 honours
+    `optional` semantics only; non-default values emit a startup `WARN`.
+  - `POST /login` now returns HTTP 202 + `{"status":"mfa_required",
+    "mfa_pending_token":"…","expires_in":N}` if the user is MFA-enrolled;
+    the login page swaps to a TOTP form and posts to `POST /login/mfa`
+    (TOTP code or recovery code; same endpoint). Each pending token is
+    capped at 5 attempts before invalidation.
+  - Settings page gains a Multi-Factor Authentication section with
+    enroll / verify / regenerate / disable HTMX handlers under
+    `/fragments/settings/mfa` and `/api/settings/mfa/*` (admin-only in
+    PR1; per-user surface is a follow-up). All 4 mutating POSTs carry
+    `Origin`/`Referer` CSRF protection via an `origin_safe` helper
+    (default-port normalised, userinfo rejected, audit detail
+    sanitised + 128 B capped).
+  - New audit verbs: `mfa.enroll.initiated`, `mfa.enroll.verified`,
+    `mfa.enroll.failed`, `mfa.disabled`, `mfa.login.required`,
+    `mfa.login.verified`, `mfa.login.failed`, `mfa.recovery_codes.generated`,
+    `mfa.recovery_code.used`, `csrf.denied`. Step-up verbs
+    (`mfa.step_up.required`, `mfa.step_up.passed`, `mfa.step_up.failed`)
+    added in PR 2.
+  - Prometheus metrics: `yuzu_auth_mfa_logins_total{method,result}`,
+    `yuzu_auth_mfa_pending_tokens` gauge,
+    `yuzu_auth_mfa_challenges_issued_total`.
+  - Docs: `docs/auth-mfa-design.md` (architecture), updated
+    `docs/auth-architecture.md`, user-manual updates
+    (`authentication.md`, `rest-api.md`, `server-admin.md`),
+    `docs/ops-runbooks/auth-db-recovery.md` Emergency MFA disable
+    break-glass procedure.
+  - Tests: `tests/unit/server/test_totp.cpp` (RFC 6238 vectors, base32,
+    drift / replay) and `tests/unit/server/test_mfa_store.cpp` (end-to-end
+    AuthDB enroll → verify → login → recovery → disable).
+
+### Fixed
+
+- **Dashboard scope panel now visible at narrow viewports (≤1280px).** A global
+  responsive rule in `server/core/static/yuzu.css` was hiding the right-hand
+  agent/device selector panel (`.scope`) on any browser window 1280px wide or
+  narrower — a common laptop resolution — making connected agents invisible
+  until the operator widened the window past ~1400px. The rule was inherited
+  from an unrelated `.main-grid` layout. Now only the optional history rail is
+  hidden at that breakpoint; the scope panel reflows to a two-column layout and
+  stays fully accessible. The 1281–1440px band also received grid hardening
+  (`minmax(0,1fr)` middle track + `min-width:0`) so the instruction bar's
+  minimum content size can no longer push the panel off-screen.
+
+- **Scope walking — `from_result_set:` is owner-scoped end-to-end (the merge-blocking
+  IDOR, review B1).** `AgentRegistry::evaluate_scope` resolved `from_result_set:<id>`
+  with no owner check, so any operator with `Execution:Execute` could embed another
+  operator's `rs_` id in a scope and dispatch commands to that operator's curated
+  devices. The dispatching principal is now threaded into `evaluate_scope`;
+  referenced sets are preloaded once via the new owner-checked
+  `ResultSetStore::member_set_owned` (a set the caller does not own resolves to an
+  empty membership and never matches), which also removes the per-agent under-lock
+  store query (review F). Tracked dispatch paths (REST async producers, workflows,
+  scheduled, MCP) recover the principal from the execution's `dispatched_by`;
+  `/api/command` reads the session; server-authored policy scopes intentionally do
+  not resolve `from_result_set:`. A used set is `touch`-ed so it does not GC
+  mid-investigation (review I).
+- **Cross-operator result-set metadata leak via `/lineage` closed (review B2).**
+  Direct `POST /api/v1/result-sets` owner-checks `parent_id` before persisting the
+  lineage edge, and `ResultSetStore::lineage` is owner-filtered (the walk stops at
+  the first cross-owner ancestor) — a child can no longer parent onto a victim's id
+  and read its name / source_kind / device_count back.
+- **Result-set DoS vectors bounded (review B3, B4, K).** Fixed an infinite loop in
+  `from-inventory-query` parent pagination (an aliased in/out cursor re-read page one
+  forever once a parent exceeded the 5000 page size); added a `kMaxMembersPerSet` cap
+  (100k) on the JSON-array and CSV-import create paths; bounded the
+  `from_result_set:` scope token to 128 chars in the parser.
+- **Async producers no longer orphan a destructive dispatch (review B5).** `run_async`
+  does a pre-dispatch quota check and, on any post-dispatch `create_pending` failure,
+  calls `mark_cancelled` and surfaces `execution_id` — matching the throw / no-agents
+  paths so the execution cannot idle in `running` after agents already executed.
+- **Dashboard result-set fragments stop faking success (review merged_bug_009).**
+  Pin / unpin / CSV-create honour the store's `std::expected`: they audit the real
+  outcome (no false `success` rows) and surface failures via a `showToast` HX-Trigger
+  instead of silently re-rendering as if the action succeeded.
+- **Failed result-set access is audited (review G) + observability/correctness nits.**
+  Non-owner / not-found 404s emit a `result_set.access` `denied` audit row with the
+  attempted id (existence-oracle trail); the maintenance thread only increments
+  `yuzu_result_sets_total{result="materialized"}` on success (`materialize_failed`
+  otherwise — bug_008); `gc_sweep` returns the real deleted count and logs on failure
+  (D); `device_count` reflects distinct members after `INSERT OR IGNORE` dedup (L);
+  `lineage` has a visited-set cycle guard (J); re-eval no longer appends ` (re-eval)`
+  unboundedly (bug_014); result-set `limit` params parse via `std::from_chars` (M).
+  `rs_` ids stay non-CSPRNG display identifiers per the #801 convention now that B1
+  removes the bearer-reference property (review E, by design).
 
 ### Tests
+
+- **Route-level MFA test harness (closes PR1 deferred quality-engineer
+  SHOULD-FIX).** Hermes Agent's red-team round on PR1 caught the
+  CRITICAL `/login/mfa` pre-routing exemption bug within 30 s of live
+  curl probing because the internal governance pipeline reviewed
+  handlers statically without exercising the wire path. This change
+  closes that gap with two new test files that drive every MFA-touching
+  handler through an in-process `TestRouteSink` (TSan-clean per #438).
+  - **`AuthRoutes::register_routes` dual overload**: mirrors the
+    `SettingsRoutes` pattern. Existing `httplib::Server&` overload becomes
+    a 2-line shim that constructs `HttplibRouteSink` and delegates to a
+    new `HttpRouteSink&` overload that owns every lambda. Production
+    behaviour is unchanged; tests get a TSan-safe in-process dispatch
+    seam.
+  - **`tests/unit/server/test_auth_routes_mfa.cpp`** — 10 cases covering
+    `POST /login` (no-MFA fast-path + MFA-enrolled 202 branch + bad
+    password), `POST /login/mfa` (valid TOTP, valid recovery code,
+    invalid pending token, 5-attempts-cap, strict-shape gate routing
+    non-6-digit to recovery, pending-token TTL expiry, atomic erase
+    under concurrent submit with same valid token), and the dual audit
+    emission contract (`mfa.login.verified` + `auth.login`,
+    `mfa.recovery_code.used` + `auth.login`).
+  - **`tests/unit/server/test_settings_routes_mfa.cpp`** — 12 cases
+    covering the 5 `/api/settings/mfa/*` routes (init reveal +
+    Cache-Control: no-store contract, double-init → MfaAlreadyEnrolled
+    message, recovery-codes regenerate, disable atomicity, non-admin
+    403), and the `origin_safe` CSRF gate (same-origin pass,
+    cross-origin 403 with `csrf.denied` audit, default-port :443
+    normalisation, userinfo / RFC-6454 rejection, no-Origin
+    non-browser pass-through, Referer fallback).
+
+- **Scope walking.** `tests/unit/server/test_result_set_store.cpp` — 8 cases for
+  `ResultSetStore`: synchronous create/get/members, root-first lineage,
+  owner-scoped alias resolution, pin/unpin + pinned-delete rejection, async
+  create → materialize, touch TTL extension, GC sweep, and the per-owner quota
+  counter. `tests/unit/server/test_result_sets_ui.cpp` — 7 render cases for the
+  result-sets dashboard surface including an explicit XSS test (operator-supplied
+  names are HTML-escaped). `tests/unit/server/test_scope_engine.cpp` — 3 added
+  cases for the `from_result_set:` scope kind: bare-atom parse, composition with
+  attribute predicates (AND), and per-device membership evaluation
+  (member+predicate match, non-member drop). All on `TempDbFile` helpers.
+
+- **Scope walking PR-D.** `tests/unit/server/test_result_set_matcher.cpp` — 11 cases
+  for the async membership matcher (pure `(matcher, status, output)` function):
+  non-success never qualifies, empty/blank → SUCCESS default, `any_response`,
+  `tar_rows_ge` thresholds + tar `error|` → 0 rows, `tar_row_count` trailer +
+  line-count fallback, unknown-kind conservative exclude, column ops
+  (`eq`/`in`/`contains`/`exists`) over both the tar pipe shape and the JSON
+  array-of-objects fallback, and the malformed-matcher fallbacks.
+  `tests/unit/server/test_rest_result_sets_async.cpp` — 14 HTTP-level cases (real
+  `ResultSetStore` + `ExecutionTracker`, fake recording dispatch closure):
+  from-tar-query 202/pending shape + create-before-dispatch ordering, `__all__` vs
+  `from_result_set:<parent>` scope, **alias pre-resolution** to canonical id,
+  unknown-alias 404, `include_empty` → `any_response` matcher, missing-sql 400,
+  zero-agents 503 (execution cancelled, no pending row), dispatch-throw 500,
+  unwired-dispatch 503, from-instruction-result plugin/action/matcher persistence +
+  unknown-instruction 404, and re-eval sibling parent / unsupported-kind 400 /
+  not-found 404.
+
+- **Scope walking — review remediation.** `tests/unit/server/test_scope_walking_authz.cpp`
+  — cross-operator `evaluate_scope` authorization: the set owner resolves exactly the
+  set's members, while a non-owner and an empty principal resolve nothing (the B1
+  IDOR is blocked). `tests/unit/server/test_result_set_store.cpp` gains 7 cases: GC
+  actually deletes expired unpinned rows and returns the count (D), per-set member cap
+  (B4), `device_count` distinct-dedup (L), owner-scoped `member_set_owned` (B1),
+  lineage stops at a cross-owner ancestor (B2) and terminates on a `parent_id` cycle
+  (J), and >5000-member pagination terminates (B3); its lineage assertions move to
+  the owner-arg `lineage`. `test_workflow_routes.cpp` updated for the principal-arg
+  scope-estimate callback. (`test_scope_engine.cpp` is unchanged — its existing
+  `from_result_set:` cases pass under the relaxed length-bound token validation.)
 
 - `tests/unit/server/test_policy_evaluator.cpp` — 10 cases for the new
   `PolicyEvaluator`: compliant/non_compliant multi-agent fan-out, non-responder
@@ -106,6 +426,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first-run setup, read empty stdin, and died on the password floor. The file
   is a PBKDF2-SHA256 hash (no cleartext), so 0644 is correct for a
   containerized launcher.
+- **CRITICAL — `POST /login/mfa` was unreachable behind the pre-routing
+  auth gate** (Hermes Agent red-team review, 2026-05-29). The exemption
+  list at `server.cpp:2393` covered `/login` but not `/login/mfa`, so
+  every unauthenticated POST to the MFA challenge was redirected to
+  `/login` before the route handler ran — the MFA login flow was
+  completely deadlocked in any deployment with the gate enabled. The
+  internal governance review missed this because PR1 deferred route-
+  level integration tests. Added `/login/mfa` to the exemption list
+  with a comment crediting the Hermes finding.
+- **HIGH — `/login/mfa` was bypassing the login-specific rate limiter**
+  (Hermes Agent LOW #6 escalated by the credential-brute compounding
+  effect). `is_login = req.path == "/login"` at `server.cpp:2374` did
+  not match `/login/mfa`, so MFA submissions fell through to the looser
+  `api_rate_limiter_` bucket. Expanded the predicate to cover both
+  paths so per-IP rate-limit defence applies to both legs of credential
+  auth. The per-pending-token 5-attempt cap remains as the second layer.
+- **MEDIUM — CSRF protection on the five `/api/settings/mfa/*` POST
+  routes** (Hermes Agent MEDIUM #2). The mutating MFA settings routes
+  (`init`, `verify`, `recovery-codes`, `disable`) relied on session-
+  cookie auth (`SameSite=Lax`) without `Origin` / `Referer` checks; a
+  stolen cookie could be replayed cross-site to strip a victim's MFA.
+  Added an `origin_safe` helper that requires `Origin` (or `Referer`
+  fallback) host to match the request `Host` header on browser POSTs;
+  non-browser clients (curl, automation) that omit both headers pass
+  through. Mismatched host returns 403 with audit verb `csrf.denied`
+  (`target_type="Endpoint"`) for SIEM correlation. Audit detail strings
+  are sanitised (control + high-bit bytes stripped, each field capped at
+  128 B), default ports `:443`/`:80` are normalised so a TLS-terminating
+  reverse proxy that rewrites `Host` to the port-less form does not
+  false-deny, and userinfo (`@`) plus fragment / query (`?`, `#`) in the
+  Origin URL are rejected per RFC 6454.
+
+  **Deferred scope (Gate 4 SHOULD S2 — known follow-up):** `origin_safe`
+  is wired into the 4 mutating MFA POSTs only. 11 sibling state-changing
+  Settings POSTs remain CSRF-unprotected:
+  `/api/settings/users` (and `/role`), `/api/settings/api-tokens`,
+  `/api/settings/plugin-signing/{upload,clear,require}`,
+  `/api/settings/oidc` (and `/test`), `/api/settings/{cert-upload,
+  cert-paste}`, `/api/settings/enrollment-tokens`, `/api/settings/tls`.
+  These were unprotected before PR1 too — the asymmetry is documented
+  here so it isn't mistaken for a regression. A follow-up PR wraps every
+  admin HTMX mutation with the same helper.
 
 ### Tests
 

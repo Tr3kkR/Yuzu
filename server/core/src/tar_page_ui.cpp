@@ -134,6 +134,93 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
     }
     .tar-row-error { color: var(--mds-color-theme-indicator-error); }
     .tar-row-error td { font-style: italic; }
+
+    /* Scope chip (design §8.3) — reusable header for query frames. */
+    .scope-chip-row {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin-bottom: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .scope-chip-label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--mds-color-theme-text-tertiary);
+      font-weight: 600;
+    }
+    .scope-chip-select {
+      background: var(--surface);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 0.25rem;
+      padding: 0.3rem 0.5rem;
+      font-size: 0.8rem;
+      max-width: 24rem;
+    }
+    .scope-chip-meta {
+      font-size: 0.75rem;
+      color: var(--mds-color-theme-text-tertiary);
+    }
+    .tar-sql-textarea {
+      width: 100%;
+      box-sizing: border-box;
+      background: var(--mds-color-state-hover);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 0.25rem;
+      padding: 0.6rem;
+      font-family: var(--mono, monospace);
+      font-size: 0.8rem;
+      resize: vertical;
+    }
+    .tar-sql-controls {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      margin-top: 0.6rem;
+      flex-wrap: wrap;
+    }
+    .tar-sql-name {
+      flex: 1 1 16rem;
+      min-width: 12rem;
+      background: var(--surface);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 0.25rem;
+      padding: 0.35rem 0.5rem;
+      font-size: 0.8rem;
+    }
+    .tar-sql-empty {
+      font-size: 0.75rem;
+      color: var(--mds-color-theme-text-tertiary);
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+    .tar-sql-controls button {
+      padding: 0.4rem 0.9rem;
+      font-size: 0.8rem;
+      background: var(--accent);
+      color: var(--mds-color-text-on-accent);
+      border: none;
+      border-radius: 0.25rem;
+      cursor: pointer;
+    }
+    .tar-sql-controls button:disabled { opacity: 0.5; cursor: default; }
+    .tar-sql-result {
+      margin-top: 0.75rem;
+      font-size: 0.82rem;
+      color: var(--mds-color-theme-text-tertiary);
+    }
+    .tar-sql-result a { color: var(--accent); }
+    .tar-sql-result code {
+      background: var(--mds-color-state-hover);
+      padding: 0.1rem 0.35rem;
+      border-radius: 0.25rem;
+    }
+    .tar-sql-result.error { color: var(--mds-color-theme-indicator-error); }
   </style>
 </head>
 <body>
@@ -147,6 +234,7 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
     <a href="/compliance" class="nav-link">Compliance</a>
     <a href="/tar" class="nav-link active">TAR</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
+    <a href="/result-sets" class="nav-link">Result Sets</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
     <span class="nav-spacer"></span>
     <span class="nav-user" id="nav-user"></span>
@@ -194,17 +282,37 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- ── Ad-hoc TAR SQL frame (Phase 15.D — pending) ──────────────── -->
+    <!-- ── Ad-hoc TAR SQL frame (Phase 15.D — scope walking) ────────── -->
     <div class="tar-frame" id="frame-tar-sql">
       <div class="tar-frame-header">
         <h2 class="tar-frame-title">Ad-hoc TAR SQL</h2>
+        <div class="tar-frame-actions">
+          <button class="btn-secondary" id="tar-sql-refresh-scopes"
+                  title="Reload your result sets">Refresh scopes</button>
+        </div>
       </div>
       <div class="tar-frame-body">
-        <div class="tar-frame-coming-soon">
-          The scope-walking-aware SQL frame relocates here in
-          <a href="https://github.com/Tr3kkR/Yuzu/issues/550" target="_blank">issue #550</a>
-          (Phase 15.D). Today the frame still lives on the main dashboard.
+        <!-- Scope chip (design §8.3): pick the candidate scope this query
+             narrows. Submitting creates a NEW result set parented at the
+             selected set. Standard scopes (__all__) carry no parent. -->
+        <div class="scope-chip-row">
+          <label class="scope-chip-label" for="tar-sql-scope">Scope</label>
+          <select id="tar-sql-scope" class="scope-chip-select">
+            <option value="__all__">__all__ — entire fleet</option>
+          </select>
+          <span class="scope-chip-meta" id="tar-sql-scope-meta"></span>
         </div>
+        <textarea id="tar-sql-text" class="tar-sql-textarea" rows="4" spellcheck="false"
+                  placeholder="SELECT DISTINCT pid FROM process_live WHERE name = 'chrome.exe'"></textarea>
+        <div class="tar-sql-controls">
+          <input type="text" id="tar-sql-name" class="tar-sql-name"
+                 placeholder="Name (optional) e.g. windows-chrome-suspects" maxlength="120">
+          <label class="tar-sql-empty">
+            <input type="checkbox" id="tar-sql-include-empty"> include responders with 0 rows
+          </label>
+          <button id="tar-sql-run">Run &amp; create result set</button>
+        </div>
+        <div class="tar-sql-result" id="tar-sql-result"></div>
       </div>
     </div>
 
@@ -226,7 +334,11 @@ extern const char* const kTarPageHtml = R"HTM(<!DOCTYPE html>
 
   <div id="toast-container" class="toast-container"></div>
 
-<script>
+)HTM"
+// Split here (not a content boundary): MSVC caps a single string literal at
+// 16380 chars (C2026) and this page exceeds it. Adjacent raw-string literals
+// are concatenated by the compiler, so the rendered HTML is byte-identical.
+R"HTM(<script>
 function showToast(message, level) {
   var c = document.getElementById('toast-container');
   if (!c) return;
@@ -260,6 +372,126 @@ fetch('/api/me').then(function(r){return r.json()}).then(function(d){
     if(sl) sl.style.display = 'none';
   }
 });
+
+// ── Scope-walking SQL frame (Phase 15.D) ─────────────────────────────────
+// Drives the scope chip + ad-hoc TAR SQL against the REST result-set API.
+// Selecting a scope picks the candidate set; running the query dispatches
+// tar.sql to that scope and creates a NEW result set parented at it, then
+// polls until the async maintenance thread materialises membership.
+(function() {
+  var scopeSel  = document.getElementById('tar-sql-scope');
+  var scopeMeta = document.getElementById('tar-sql-scope-meta');
+  var sqlText   = document.getElementById('tar-sql-text');
+  var nameInput = document.getElementById('tar-sql-name');
+  var emptyChk  = document.getElementById('tar-sql-include-empty');
+  var runBtn    = document.getElementById('tar-sql-run');
+  var resultBox = document.getElementById('tar-sql-result');
+  var refreshBtn= document.getElementById('tar-sql-refresh-scopes');
+  if (!scopeSel || !runBtn) return;
+
+  // id -> {name, device_count, status} for the meta line.
+  var scopeIndex = {};
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function(c) {
+      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c];
+    });
+  }
+
+  function renderMeta() {
+    var v = scopeSel.value;
+    if (v === '__all__') { scopeMeta.textContent = 'entire fleet — no parent'; return; }
+    var s = scopeIndex[v];
+    if (!s) { scopeMeta.textContent = ''; return; }
+    var bits = [s.device_count + ' devices'];
+    if (s.status && s.status !== 'materialized') bits.push(s.status);
+    scopeMeta.textContent = bits.join(' · ');
+  }
+
+  function loadScopes() {
+    fetch('/api/v1/result-sets?limit=200').then(function(r){return r.json();}).then(function(j){
+      var sets = (j.data && j.data.result_sets) || [];
+      var keep = scopeSel.value;
+      scopeIndex = {};
+      while (scopeSel.options.length > 1) scopeSel.remove(1);
+      sets.forEach(function(s){
+        scopeIndex[s.id] = s;
+        var label = (s.name ? s.name : s.id) + ' — ' + s.device_count + ' devices'
+                  + (s.status && s.status !== 'materialized' ? ' (' + s.status + ')' : '');
+        var opt = document.createElement('option');
+        opt.value = s.id; opt.textContent = label;
+        scopeSel.appendChild(opt);
+      });
+      if (keep && (keep === '__all__' || scopeIndex[keep])) scopeSel.value = keep;
+      renderMeta();
+    }).catch(function(){ /* leave __all__ only */ });
+  }
+
+  // Poll a freshly-created pending set until membership materialises.
+  function pollSet(id, name, tries) {
+    fetch('/api/v1/result-sets/' + encodeURIComponent(id)).then(function(r){return r.json();})
+      .then(function(j){
+        var s = j.data || {};
+        if (s.status === 'pending' && tries > 0) {
+          setTimeout(function(){ pollSet(id, name, tries - 1); }, 2000);
+          return;
+        }
+        if (s.status === 'failed') {
+          resultBox.className = 'tar-sql-result error';
+          resultBox.innerHTML = 'Result set <code>' + esc(id) + '</code> failed to materialise.';
+        } else if (s.status === 'pending') {
+          resultBox.className = 'tar-sql-result';
+          resultBox.innerHTML = 'Result set <code>' + esc(id) + '</code> still pending — '
+            + '<a href="/result-sets">view in Result Sets</a>.';
+        } else {
+          resultBox.className = 'tar-sql-result';
+          resultBox.innerHTML = 'Created <code>' + esc(name || id) + '</code> — <strong>'
+            + esc(s.device_count) + '</strong> device(s). '
+            + 'Copy scope token <code>from_result_set:' + esc(id) + '</code> · '
+            + '<a href="/result-sets">open</a>';
+          loadScopes();
+        }
+        runBtn.disabled = false;
+      }).catch(function(){ runBtn.disabled = false; });
+  }
+
+  function run() {
+    var sql = sqlText.value.trim();
+    if (!sql) { showToast('Enter a SQL query', 'warning'); return; }
+    var body = { sql: sql, include_empty: !!emptyChk.checked };
+    var nm = nameInput.value.trim();
+    if (nm) body.name = nm;
+    if (scopeSel.value && scopeSel.value !== '__all__') body.parent_id = scopeSel.value;
+    runBtn.disabled = true;
+    resultBox.className = 'tar-sql-result';
+    resultBox.textContent = 'Dispatching to agents…';
+    fetch('/api/v1/result-sets/from-tar-query', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+    }).then(function(r){ return r.json().then(function(j){ return {status:r.status, body:j}; }); })
+      .then(function(res){
+        if (res.status === 202 && res.body.data) {
+          var s = res.body.data;
+          resultBox.innerHTML = 'Dispatched (execution <code>' + esc(s.source_execution_id)
+            + '</code>) — awaiting responses…';
+          pollSet(s.id, s.name, 150);
+        } else {
+          var msg = (res.body.error && (res.body.error.message || res.body.error)) || 'request failed';
+          resultBox.className = 'tar-sql-result error';
+          resultBox.textContent = msg;
+          runBtn.disabled = false;
+        }
+      }).catch(function(){
+        resultBox.className = 'tar-sql-result error';
+        resultBox.textContent = 'network error';
+        runBtn.disabled = false;
+      });
+  }
+
+  scopeSel.addEventListener('change', renderMeta);
+  runBtn.addEventListener('click', run);
+  if (refreshBtn) refreshBtn.addEventListener('click', loadScopes);
+  loadScopes();
+})();
 </script>
 </body></html>
 )HTM";

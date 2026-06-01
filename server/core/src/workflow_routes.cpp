@@ -892,7 +892,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        auto [matched, total] = scope_fn(expression);
+        auto [matched, total] = scope_fn(expression, session->username);
         res.set_content(nlohmann::json({{"matched", matched}, {"total", total}}).dump(),
                         "application/json");
     });
