@@ -137,7 +137,42 @@ TEST_CASE("InstructionStore: spec.scope.fromResultSet with dynamic mode is rejec
                                                 "  assignment:\n"
                                                 "    mode: dynamic\n"));
     REQUIRE_FALSE(r.has_value());
-    CHECK(r.error().find("static") != std::string::npos);
+    CHECK(r.error().find("requires assignment.mode: static") != std::string::npos);
+}
+
+TEST_CASE("InstructionStore: update_definition enforces the same scope validation (arch-B1)",
+          "[instruction_store][scope]") {
+    InstructionStore store(":memory:");
+    // Create a clean definition...
+    auto def = scoped_def("  scope:\n    fromResultSet: rs_abc\n  assignment:\n    mode: static\n");
+    auto created = store.create_definition(def);
+    REQUIRE(created.has_value());
+    // ...then try to edit in a forbidden dynamic-mode combo: must be rejected,
+    // not silently stored (the bypass governance arch-B1/UP-4 closed).
+    InstructionDefinition edit = def;
+    edit.id = created.value();
+    edit.yaml_source =
+        "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nspec:\n"
+        "  scope:\n    fromResultSet: rs_abc\n  assignment:\n    mode: dynamic\n";
+    auto updated = store.update_definition(edit);
+    REQUIRE_FALSE(updated.has_value());
+    CHECK(updated.error().find("requires assignment.mode: static") != std::string::npos);
+}
+
+TEST_CASE("InstructionStore: inline flow-mapping scope is rejected (UP-6)",
+          "[instruction_store][scope]") {
+    InstructionStore store(":memory:");
+    InstructionDefinition def;
+    def.name = "Inline";
+    def.type = "action";
+    def.plugin = "system_info";
+    def.action = "query";
+    def.version = "1.0";
+    def.yaml_source = "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nspec:\n"
+                      "  scope: {fromResultSet: rs_abc}\n";
+    auto r = store.create_definition(def);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("inline flow-mapping") != std::string::npos);
 }
 
 TEST_CASE("InstructionStore: spec.scope.fromResultSet + assignment.managementGroups is rejected",
@@ -149,7 +184,8 @@ TEST_CASE("InstructionStore: spec.scope.fromResultSet + assignment.managementGro
                                                 "    managementGroups:\n"
                                                 "      - all-devices\n"));
     REQUIRE_FALSE(r.has_value());
-    CHECK(r.error().find("managementGroups") != std::string::npos);
+    CHECK(r.error().find("cannot be combined with assignment.managementGroups") !=
+          std::string::npos);
 }
 
 TEST_CASE("InstructionStore: a scope-less definition is unaffected by PR-E validation",

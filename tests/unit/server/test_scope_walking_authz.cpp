@@ -90,6 +90,13 @@ TEST_CASE("evaluate_scope: from_result_set is owner-scoped (no cross-operator ta
         auto matched = registry.evaluate_scope(*expr, nullptr, nullptr, &store, "");
         CHECK(matched.empty());
     }
+
+    SECTION("an unknown result-set id resolves to nothing — fail-closed, not match-all (UP-14)") {
+        auto e2 = yuzu::scope::parse("from_result_set:rs_does_not_exist");
+        REQUIRE(e2.has_value());
+        auto matched = registry.evaluate_scope(*e2, nullptr, nullptr, &store, "alice");
+        CHECK(matched.empty());
+    }
 }
 
 // ── Dispatch-time alias resolution (PR-E) ────────────────────────────────────
@@ -115,6 +122,11 @@ TEST_CASE("resolve_scope_aliases: rewrites owner aliases, leaves ids/non-owners"
     SECTION("composition: only the ref atom is rewritten") {
         CHECK(resolve_scope_aliases("from_result_set:alice-suspects AND ostype == \"windows\"",
                                     "alice", &store) == canonical + " AND ostype == \"windows\"");
+    }
+    SECTION("two refs: the alias resolves, a canonical rs_ id passes through") {
+        CHECK(resolve_scope_aliases(
+                  "from_result_set:alice-suspects AND from_result_set:" + set->id, "alice",
+                  &store) == canonical + " AND " + canonical);
     }
     SECTION("a canonical rs_ id passes through untouched") {
         CHECK(resolve_scope_aliases(canonical, "alice", &store) == canonical);
@@ -165,6 +177,12 @@ TEST_CASE("scope_refs_failing_owner_check: flags absent/unowned, not empty-but-o
         auto f = scope_refs_failing_owner_check("from_result_set:" + owned->id, "bob", &store);
         REQUIRE(f.size() == 1);
         CHECK(f[0] == owned->id);
+    }
+    SECTION("mixed owned + absent: only the absent ref is flagged") {
+        auto f = scope_refs_failing_owner_check(
+            "from_result_set:" + owned->id + " AND from_result_set:rs_ghost", "alice", &store);
+        REQUIRE(f.size() == 1);
+        CHECK(f[0] == "rs_ghost");
     }
     SECTION("empty owner yields no findings (no owner context)") {
         CHECK(scope_refs_failing_owner_check("from_result_set:" + owned->id, "", &store).empty());

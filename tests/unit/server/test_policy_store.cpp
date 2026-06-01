@@ -364,6 +364,25 @@ scope:
     CHECK(result.error().find("fromResultSet") != std::string::npos);
 }
 
+TEST_CASE("PolicyStore: inline flow-mapping scope is rejected (UP-6)",
+          "[policy_store][policy][scope]") {
+    PolicyStore store(":memory:");
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+
+    std::string yaml = R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: Inline Policy
+fragment: )" + frag.value() +
+                       R"(
+scope: {selector: {platform: windows}}
+)";
+    auto result = store.create_policy(yaml);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("inline flow-mapping") != std::string::npos);
+}
+
 TEST_CASE("PolicyStore: query policies with filters", "[policy_store][policy]") {
     PolicyStore store(":memory:");
 

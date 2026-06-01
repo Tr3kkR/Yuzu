@@ -199,6 +199,7 @@ if build_server
       'unit/server/test_result_sets_ui.cpp',
       'unit/server/test_scope_walking_authz.cpp',
       'unit/server/test_scope_yaml.cpp',
+      'unit/server/test_yaml_scan.cpp',
       'unit/server/test_policy_store.cpp',
       'unit/server/test_policy_evaluator.cpp',
       'unit/server/test_guaranteed_state_store.cpp',

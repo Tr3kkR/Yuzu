@@ -128,7 +128,8 @@ TEST_CASE("scope_yaml: validate rule 1 — fromResultSet + managementGroups is r
     sb.from_result_set = "rs_x";
     auto err = validate_scope_block(sb, /*mode=*/"static", /*has_mgmt=*/true);
     REQUIRE(err.has_value());
-    CHECK(err->find("managementGroups") != std::string::npos);
+    // Pin the full discriminator, not just the word (qe-1).
+    CHECK(err->find("cannot be combined with assignment.managementGroups") != std::string::npos);
 }
 
 TEST_CASE("scope_yaml: validate rule 2 — fromResultSet requires static mode", "[scope][dsl]") {
@@ -139,7 +140,7 @@ TEST_CASE("scope_yaml: validate rule 2 — fromResultSet requires static mode", 
     SECTION("dynamic is rejected") {
         auto err = validate_scope_block(sb, "dynamic", false);
         REQUIRE(err.has_value());
-        CHECK(err->find("static") != std::string::npos);
+        CHECK(err->find("requires assignment.mode: static") != std::string::npos);
     }
     SECTION("static is accepted") {
         CHECK_FALSE(validate_scope_block(sb, "static", false).has_value());
@@ -158,6 +159,46 @@ TEST_CASE("scope_yaml: validate rejects an empty or over-long fromResultSet", "[
     long_ref.has_from_result_set = true;
     long_ref.from_result_set = std::string(129, 'a');
     CHECK(validate_scope_block(long_ref, "", false).has_value());
+}
+
+TEST_CASE("scope_yaml: validate rejects selector/ref values that would inject or break grammar",
+          "[scope][dsl]") {
+    // sec-L1 / dsl-S1: selector and ref values are interpolated into the lowered
+    // scope string; anything outside the scope-ident charset is rejected so the
+    // result is a single well-formed token, never injectable or unparseable.
+    SECTION("platform with an embedded quote (injection) is rejected") {
+        ScopeBlock sb;
+        sb.has_selector = true;
+        sb.selector_platform = "windows\" OR ostype == \"linux";
+        auto err = validate_scope_block(sb, "", false);
+        REQUIRE(err.has_value());
+        CHECK(err->find("selector.platform") != std::string::npos);
+    }
+    SECTION("a tag with a space (would break EXISTS tag:) is rejected") {
+        ScopeBlock sb;
+        sb.has_selector = true;
+        sb.selector_tags = {"my tag"};
+        auto err = validate_scope_block(sb, "", false);
+        REQUIRE(err.has_value());
+        CHECK(err->find("selector.tags") != std::string::npos);
+    }
+    SECTION("a fromResultSet ref with a space (alias dsl-S2) is rejected") {
+        ScopeBlock sb;
+        sb.has_from_result_set = true;
+        sb.from_result_set = "my suspects";
+        auto err = validate_scope_block(sb, "", false);
+        REQUIRE(err.has_value());
+        CHECK(err->find("fromResultSet") != std::string::npos);
+    }
+    SECTION("clean selector + ref values pass") {
+        ScopeBlock sb;
+        sb.has_selector = true;
+        sb.selector_platform = "windows";
+        sb.selector_tags = {"prod", "edge-1"};
+        sb.has_from_result_set = true;
+        sb.from_result_set = "windows-chrome-suspects";
+        CHECK_FALSE(validate_scope_block(sb, "static", false).has_value());
+    }
 }
 
 TEST_CASE("scope_yaml: rule 3 — a definition carrying an expired-looking ref is valid YAML",
