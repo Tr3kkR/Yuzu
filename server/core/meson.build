@@ -247,6 +247,8 @@ yuzu_server_core_lib = static_library(
     'src/audit_store.cpp',
     'src/tag_store.cpp',
     'src/scope_engine.cpp',
+    'src/yaml_scan.cpp',
+    'src/scope_yaml.cpp',
     'src/analytics_event_store.cpp',
     'src/analytics_sinks.cpp',
     'src/data_export.cpp',

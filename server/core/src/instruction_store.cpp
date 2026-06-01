@@ -2,7 +2,9 @@
 #include "migration_runner.hpp"
 #include "product_pack_store.hpp" // ProductPackStore::verify_signature (#1073)
 #include "response_templates_engine.hpp"
+#include "scope_yaml.hpp"
 #include "store_errors.hpp"
+#include "yaml_scan.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -391,6 +393,23 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
         return std::unexpected("type must be 'question' or 'action'");
     if (def.plugin.empty())
         return std::unexpected("plugin is required");
+
+    // PR-E (scope-walking YAML DSL): validate an optional spec.scope block. This
+    // is the central INSERT for every creation path (REST create, import,
+    // build-time bundled content), so the check applies uniformly. It only
+    // errors when spec.scope.fromResultSet is present with a forbidden combo
+    // (assignment.managementGroups, or assignment.mode: dynamic) — scope-less
+    // and selector-only definitions, including all bundled content, pass
+    // untouched, so boot stays safe. Resolution is deferred to dispatch:
+    // a definition carrying a since-expired fromResultSet is still valid here.
+    if (!def.yaml_source.empty()) {
+        auto sb = parse_scope_block(def.yaml_source);
+        auto asn = yaml_scan::extract_yaml_section(def.yaml_source, "spec.assignment");
+        if (auto err = validate_scope_block(
+                sb, yaml_scan::extract_yaml_value(asn, "mode"),
+                !yaml_scan::extract_yaml_list(asn, "managementGroups").empty()))
+            return std::unexpected(*err);
+    }
 
     auto id = def.id.empty() ? generate_id() : def.id;
     auto now = now_epoch();
