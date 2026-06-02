@@ -69,6 +69,24 @@ TEST_CASE("yaml_scan: yaml_has_key skips comments and is not fooled by substring
     CHECK(yaml_has_key("mode: static\n", "mode"));
 }
 
+TEST_CASE("yaml_scan: extract_yaml_value skips keys inside comments (#1221 MEDIUM-2)",
+          "[yaml_scan]") {
+    // A whole-line commented key must not be returned, even though its 'key:'
+    // token is preceded by whitespace (the old anchor check alone passed it).
+    CHECK(extract_yaml_value("  # fromResultSet: rs_evil\n", "fromResultSet").empty());
+    // A real key AFTER a commented decoy line wins; the decoy is skipped, not
+    // returned (regression guard for the policy scalar-scope footgun).
+    CHECK(extract_yaml_value("  # fromResultSet: rs_evil\n  fromResultSet: rs_real\n",
+                             "fromResultSet") == "rs_real");
+    // An inline trailing comment that mentions a key-like token is not a key.
+    CHECK(extract_yaml_value("selector:    # fromResultSet: rs_evil\n  platform: x\n",
+                             "fromResultSet")
+              .empty());
+    // A '#' inside the value (no preceding whitespace) is NOT a comment marker —
+    // a legitimate value containing '#' is still returned intact.
+    CHECK(extract_yaml_value("channel: prod#1\n", "channel") == "prod#1");
+}
+
 TEST_CASE("yaml_scan: a key inside a quoted value does not leak into a sibling section",
           "[yaml_scan]") {
     // Adversarial: 'fromResultSet' appears inside a description value, NOT as a

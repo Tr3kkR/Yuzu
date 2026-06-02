@@ -14,6 +14,27 @@ std::string extract_yaml_value(const std::string& yaml, const std::string& key) 
             pos = yaml.find(search, pos + 1);
             continue;
         }
+        // Reject a match that sits inside a YAML comment: either a whole-line
+        // comment (first non-whitespace char is '#') or text after an inline '#'
+        // comment marker earlier on the line. A '#' counts as a marker only at
+        // line start or when preceded by whitespace (YAML requires a space before
+        // an inline comment), so `foo#bar` in a value is not treated as one. This
+        // mirrors yaml_has_key's comment-awareness so a commented key like
+        // `# fromResultSet: rs_x` is never mistaken for a real one (#1221 MEDIUM-2).
+        auto line_begin = yaml.rfind('\n', pos);
+        line_begin = (line_begin == std::string::npos) ? 0 : line_begin + 1;
+        bool in_comment = false;
+        for (auto k = line_begin; k < pos; ++k) {
+            if (yaml[k] == '#' &&
+                (k == line_begin || yaml[k - 1] == ' ' || yaml[k - 1] == '\t')) {
+                in_comment = true;
+                break;
+            }
+        }
+        if (in_comment) {
+            pos = yaml.find(search, pos + 1);
+            continue;
+        }
         auto vstart = pos + search.size();
         // Skip whitespace after colon
         while (vstart < yaml.size() && (yaml[vstart] == ' ' || yaml[vstart] == '\t'))

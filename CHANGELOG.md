@@ -264,6 +264,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Scope-walking PR-E follow-ups — policy `fromResultSet:` bypass + YAML scanner
+  hardening (#1221).** Two robustness gaps from the #1215 review, both fail-closed
+  before this change: (1) a **scalar** policy scope (`scope: from_result_set:rs_x`)
+  slipped past the policy `fromResultSet` rejection — `extract_yaml_value` returned
+  it non-empty, skipping the mapping-form check — and was stored verbatim;
+  `PolicyStore::create_policy` now rejects the `from_result_set:` atom in either the
+  scalar or mapping form. (2) `yaml_scan::extract_yaml_value` is now comment-aware
+  (it skips keys inside whole-line and inline `#` comments, matching `yaml_has_key`),
+  so a commented `# fromResultSet:` decoy can no longer be picked up; `yaml_scan.hpp`
+  gains an isolate-via-`extract_yaml_section`-first security contract for the
+  now-authorization-load-bearing scanners. No behaviour change for valid content.
+
 - **`scope.selector:` policies now lower to a real scope (PR-E).** A Policy whose
   `spec.scope:` opened a `selector:` mapping was previously read by the scalar
   extractor as empty and silently stored no scope. It now lowers via the `scope_yaml`
