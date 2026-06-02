@@ -1361,6 +1361,7 @@ Query audit events.
 | `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result=success`. Emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
+| `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; the dispatch targets zero devices from that set and continues. |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result=success`. Detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row. |
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
@@ -3836,6 +3837,8 @@ Estimate how many agents match a scope expression.
   "expression": "os = 'windows' AND tag:environment = 'production'"
 }
 ```
+
+A `from_result_set:<id-or-alias>` reference in the expression is resolved against the authenticated principal's owned result sets before the estimate is computed (see the [scope DSL §9.3](../yaml-dsl-spec.md)). An alias that resolves to an absent, expired, or unowned set counts as zero members.
 
 ---
 

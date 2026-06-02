@@ -47,6 +47,7 @@
 #include "result_set_matcher.hpp"
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
+#include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "mcp_jsonrpc.hpp"
@@ -264,6 +265,14 @@ public:
                           "gauge");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
+        // gov PR-E OBS-2: a from_result_set: scope ref resolved to an
+        // absent/expired/not-owned set at dispatch. Audit rows are not
+        // Prometheus-alertable; this counter makes the failure mode (silent
+        // under-scope to zero targets) visible to an on-call SRE.
+        metrics_.describe("yuzu_scope_resolution_failed_total",
+                          "from_result_set: scope references that failed owner-checked "
+                          "resolution at dispatch (set absent, expired, or not owned)",
+                          "counter");
         // Audit-pipeline observability (governance PR4 OBS-4). Increments when
         // audit_store->add_event()'s SQLite step does not return DONE — pages
         // operators that the audit chain itself is degraded.
@@ -2284,6 +2293,40 @@ private:
         return auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
     }
 
+    // PR-E: emit the invocation-time scope-resolution-failure audit row (design
+    // §7 rule 3) when a from_result_set: ref resolves to an absent/expired or
+    // not-owned set. Req-less so every dispatch path (REST, tracked, MCP) emits
+    // uniformly. Carries the dispatch/instruction correlation id (command_id),
+    // the result-set ref, principal + role, and reason — the forensic chain the
+    // design §10 walkthrough requires (gov C-B1/F1). Also increments a
+    // Prometheus counter so the failure is alertable rather than buried in
+    // audit.db (gov OBS-2), and logs at warn so a signal survives even when the
+    // audit write itself fails (gov OBS-3 / F3 / UP-2).
+    void audit_scope_resolution_failed(const std::string& principal,
+                                       const std::string& principal_role,
+                                       const std::string& command_id, const std::string& ref) {
+        metrics_.counter("yuzu_scope_resolution_failed_total").increment();
+        spdlog::warn("scope resolution failed: command={} principal={} ref={} "
+                     "(result set absent, expired, or not owned)",
+                     command_id, principal.empty() ? "unknown" : principal, ref);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "instruction.scope_resolution_failed";
+        ev.target_type = "result_set";
+        ev.target_id = ref;
+        ev.detail = "INSTRUCTION_SCOPE_RESOLUTION_FAILED command=" + command_id + " ref=" + ref +
+                    " reason=result set not found, expired, or not owned by principal";
+        ev.result = "failure";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: instruction.scope_resolution_failed "
+                          "(command={} ref={})",
+                          command_id, ref);
+    }
+
     // Apply stored runtime config overrides on startup
     void apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
@@ -2742,6 +2785,13 @@ private:
                 // dashboard would not detect the half-state. Pairs with the
                 // workflow_routes.cpp install handler's `is_open()` guard.
                 {"product_pack_store", product_pack_store_ && product_pack_store_->is_open()},
+                // gov PR-E OBS-1: ResultSetStore became load-bearing — every
+                // scoped command dispatch and the /api/scope/estimate preview
+                // resolve from_result_set: aliases and owner-check membership
+                // against it. A failed migration / corrupt result_sets.db would
+                // silently degrade every scoped dispatch to zero targets while
+                // /readyz reported "ready".
+                {"result_set_store", result_set_store_ && result_set_store_->is_open()},
             };
 
             std::string failed_list;
@@ -3665,8 +3715,25 @@ private:
                     }
                 }
             } else if (!scope_expr.empty()) {
-                // Scope expression dispatch
-                auto parsed = yuzu::scope::parse(scope_expr);
+                // Scope expression dispatch.
+                // Owner principal for from_result_set: resolution (review B1).
+                // This raw path is untracked (no execution row), so read the
+                // session directly; auth already passed require_permission above.
+                std::string principal, principal_role;
+                if (auto s = require_auth(req, res)) {
+                    principal = s->username;
+                    principal_role = auth::role_to_string(s->role);
+                }
+                // Resolve from_result_set: aliases against the operator's owned
+                // sets before parsing (PR-E): the scope resolver does not.
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                // Forensic row when a referenced set is absent/expired/unowned
+                // (design §7 rule 3); does not abort dispatch.
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, principal_role, command_id, ref);
+                auto parsed = yuzu::scope::parse(resolved_scope);
                 if (!parsed) {
                     res.status = 400;
                     res.set_content(
@@ -3674,12 +3741,6 @@ private:
                         "application/json");
                     return;
                 }
-                // Owner principal for from_result_set: resolution (review B1).
-                // This raw path is untracked (no execution row), so read the
-                // session directly; auth already passed require_permission above.
-                std::string principal;
-                if (auto s = require_auth(req, res))
-                    principal = s->username;
                 auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get(),
                                                             custom_properties_store_.get(),
                                                             result_set_store_.get(), principal);
@@ -6052,20 +6113,29 @@ private:
                             ++sent;
                 }
             } else if (!scope_expr.empty()) {
-                auto parsed = yuzu::scope::parse(scope_expr);
+                // from_result_set: is owner-scoped; recover the dispatching
+                // operator from the execution row (run_async / workflow /
+                // scheduled all create it with dispatched_by before dispatch).
+                // This is how owner-checked result-set resolution reaches the
+                // tracked dispatch paths without threading a param through the
+                // shared CommandDispatchFn (review finding B1).
+                std::string principal;
+                if (scope_expr.find("from_result_set:") != std::string::npos &&
+                    !execution_id.empty() && execution_tracker_) {
+                    if (auto ex = execution_tracker_->get_execution(execution_id))
+                        principal = ex->dispatched_by;
+                }
+                // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                // Role is not available on the tracked path (principal recovered
+                // from the execution row, no live session); principal + command
+                // id still identify the actor for the forensic chain.
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                auto parsed = yuzu::scope::parse(resolved_scope);
                 if (parsed) {
-                    // from_result_set: is owner-scoped; recover the dispatching
-                    // operator from the execution row (run_async / workflow /
-                    // scheduled all create it with dispatched_by before dispatch).
-                    // This is how owner-checked result-set resolution reaches the
-                    // tracked dispatch paths without threading a param through the
-                    // shared CommandDispatchFn (review finding B1).
-                    std::string principal;
-                    if (scope_expr.find("from_result_set:") != std::string::npos &&
-                        !execution_id.empty() && execution_tracker_) {
-                        if (auto ex = execution_tracker_->get_execution(execution_id))
-                            principal = ex->dispatched_by;
-                    }
                     auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
                                                             custom_properties_store_.get(),
                                                             result_set_store_.get(), principal);
@@ -6373,7 +6443,9 @@ private:
         wf_deps.scope_fn =
             [this](const std::string& expression,
                    const std::string& principal) -> std::pair<std::size_t, std::size_t> {
-            auto parsed = yuzu::scope::parse(expression);
+            // Resolve from_result_set: aliases for the estimate too (PR-E).
+            auto resolved = resolve_scope_aliases(expression, principal, result_set_store_.get());
+            auto parsed = yuzu::scope::parse(resolved);
             if (!parsed)
                 return {0, registry_.agent_count()};
             auto matched =
@@ -6577,16 +6649,25 @@ private:
                                     ++sent;
                         }
                     } else if (!scope_expr.empty() && scope_expr != "__all__") {
-                        auto parsed = yuzu::scope::parse(scope_expr);
+                        // Owner-scoped from_result_set: recover the principal
+                        // from the MCP-created execution row (review B1).
+                        std::string principal;
+                        if (scope_expr.find("from_result_set:") != std::string::npos &&
+                            !execution_id.empty() && execution_tracker_) {
+                            if (auto ex = execution_tracker_->get_execution(execution_id))
+                                principal = ex->dispatched_by;
+                        }
+                        // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                        auto resolved_scope = resolve_scope_aliases(scope_expr, principal,
+                                                                    result_set_store_.get());
+                        // Role unavailable on the MCP path (principal recovered
+                        // from the MCP-created execution row); principal + command
+                        // id identify the actor for the forensic chain.
+                        for (const auto& ref : scope_refs_failing_owner_check(
+                                 resolved_scope, principal, result_set_store_.get()))
+                            audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                        auto parsed = yuzu::scope::parse(resolved_scope);
                         if (parsed) {
-                            // Owner-scoped from_result_set: recover the principal
-                            // from the MCP-created execution row (review B1).
-                            std::string principal;
-                            if (scope_expr.find("from_result_set:") != std::string::npos &&
-                                !execution_id.empty() && execution_tracker_) {
-                                if (auto ex = execution_tracker_->get_execution(execution_id))
-                                    principal = ex->dispatched_by;
-                            }
                             for (const auto& aid : registry_.evaluate_scope(
                                      *parsed, tag_store_.get(), custom_properties_store_.get(),
                                      result_set_store_.get(), principal))
@@ -6704,6 +6785,11 @@ private:
         }
         res.set_content("{\"status\":\"sent\"}", "application/json");
     }
+
+    // Scope-walking dispatch helpers (resolve_scope_aliases /
+    // scope_refs_failing_owner_check) live in scope_yaml.{hpp,cpp} as free
+    // functions in yuzu::server, so the dispatch call sites below bind to them
+    // unqualified and they are unit-testable.
 
     // -- JSON parsing helpers (using nlohmann/json) --------------------------
 
