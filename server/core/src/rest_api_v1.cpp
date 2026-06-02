@@ -745,7 +745,7 @@ void RestApiV1::register_routes(
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
-    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn) {
+    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -753,7 +753,8 @@ void RestApiV1::register_routes(
                     std::move(service_group_fn), std::move(tag_push_fn), inventory_store,
                     product_pack_store, sw_deploy_store, device_token_store, license_store,
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
-                    execution_event_bus, result_set_store, std::move(command_dispatch_fn));
+                    execution_event_bus, result_set_store, std::move(command_dispatch_fn),
+                    std::move(step_up_fn));
 }
 
 void RestApiV1::register_routes(
@@ -767,7 +768,7 @@ void RestApiV1::register_routes(
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
-    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn) {
+    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1241,9 +1242,9 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    sink.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, token_store, rbac_store, mgmt_store,
-                                 tag_store, metrics_registry](const httplib::Request& req,
-                                                              httplib::Response& res) {
+    sink.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, step_up_fn, token_store, rbac_store,
+                                 mgmt_store, tag_store, metrics_registry](
+                                    const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Write"))
             return;
         if (!token_store) {
@@ -1254,6 +1255,11 @@ void RestApiV1::register_routes(
 
         auto session = auth_fn(req, res);
         if (!session)
+            return;
+        // PR2 — MFA step-up gate. Token issuance is high-risk
+        // (creates a long-lived bearer credential); require fresh MFA
+        // proof so a hijacked session cannot mint replacement creds.
+        if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/tokens"))
             return;
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -1390,7 +1396,7 @@ void RestApiV1::register_routes(
         res.set_content(ok_json(resp.str()), "application/json");
     });
 
-    sink.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, token_store](
+    sink.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, step_up_fn, token_store](
                                               const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Delete"))
             return;
@@ -1402,6 +1408,10 @@ void RestApiV1::register_routes(
 
         auto session = auth_fn(req, res);
         if (!session)
+            return;
+        // PR2 — MFA step-up gate. Token revocation can kill an
+        // operator's automation; require fresh MFA proof.
+        if (step_up_fn && !step_up_fn(req, res, *session, "DELETE /api/v1/tokens/{id}"))
             return;
 
         auto token_id = req.matches[1].str();
@@ -1564,13 +1574,17 @@ void RestApiV1::register_routes(
     // parameter is required AND validated with `is_valid_username` so a
     // NUL byte in the input cannot truncate the SQL bind in a way that
     // diverges from the in-memory `==` comparison (sec-H1 / UP-8).
-    sink.Delete("/api/v1/sessions", [auth_fn, perm_fn, audit_fn, session_revoke_fn](
+    sink.Delete("/api/v1/sessions", [auth_fn, perm_fn, audit_fn, step_up_fn, session_revoke_fn](
                                         const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "UserManagement", "Write"))
             return;
         auto session = auth_fn(req, res);
         if (!session)
             return;
+        // PR2 Gate 2 sec-M2: empty-username defensive check runs FIRST
+        // (sec-M1 invariant) — never emit an audit row carrying an
+        // empty principal, even from the step-up gate. Step-up runs
+        // immediately after, before any state mutation.
         if (session->username.empty()) {
             // sec-M1: empty caller username would mis-attribute the
             // self-vs-cross-user audit action selection below.
@@ -1578,6 +1592,10 @@ void RestApiV1::register_routes(
             res.set_content(error_json("session has empty username", 500), "application/json");
             return;
         }
+        // PR2 — MFA step-up gate. Admin force-logout of another user
+        // is high-risk; require fresh MFA proof.
+        if (step_up_fn && !step_up_fn(req, res, *session, "DELETE /api/v1/sessions"))
+            return;
         if (!session_revoke_fn) {
             res.status = 503;
             res.set_content(error_json("service unavailable", 503), "application/json");
@@ -3711,13 +3729,18 @@ void RestApiV1::register_routes(
                                      "application/json");
                  });
 
-        sink.Post("/api/v1/software-packages", [auth_fn, perm_fn, audit_fn,
+        sink.Post("/api/v1/software-packages", [auth_fn, perm_fn, audit_fn, step_up_fn,
                                                 sw_deploy_store](const httplib::Request& req,
                                                                  httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
             if (!perm_fn(req, res, "SoftwareDeployment", "Write"))
+                return;
+            // PR2 — MFA step-up gate. Uploading a software package
+            // introduces executable content into the fleet; require
+            // fresh MFA proof.
+            if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/software-packages"))
                 return;
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
@@ -3880,12 +3903,17 @@ void RestApiV1::register_routes(
 
         sink.Post(
             R"(/api/v1/software-deployments/([a-f0-9]+)/start)",
-            [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req,
-                                                          httplib::Response& res) {
+            [auth_fn, perm_fn, audit_fn, step_up_fn, sw_deploy_store](
+                const httplib::Request& req, httplib::Response& res) {
                 auto session = auth_fn(req, res);
                 if (!session)
                     return;
                 if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
+                    return;
+                // PR2 — MFA step-up gate. Starting a deployment pushes
+                // packages onto live endpoints; require fresh MFA proof.
+                if (step_up_fn &&
+                    !step_up_fn(req, res, *session, "POST /api/v1/software-deployments/{id}/start"))
                     return;
                 auto id = req.matches[1].str();
                 if (sw_deploy_store->start_deployment(id)) {
@@ -4167,10 +4195,23 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    sink.Post("/api/v1/guaranteed-state/rules", [auth_fn, perm_fn, audit_fn, guaranteed_state_store,
+    sink.Post("/api/v1/guaranteed-state/rules", [auth_fn, perm_fn, audit_fn, step_up_fn,
+                                                 guaranteed_state_store,
                                                  iso_now](const httplib::Request& req,
                                                           httplib::Response& res) {
+        // PR2 governance Gate 4 consistency-B2: order is
+        // auth_fn → perm_fn → step_up_fn → store-null guard. Resolving
+        // the session up front means a single map lookup and avoids the
+        // re-resolve race that the prior order opened up. (The
+        // token/session handlers run perm_fn before auth_fn; both
+        // orderings are safe because step_up_fn always runs last, after
+        // auth_fn has populated `session` — PR #1199 review LOW.)
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
         if (!perm_fn(req, res, "GuaranteedState", "Write"))
+            return;
+        if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/rules"))
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
@@ -4199,11 +4240,8 @@ void RestApiV1::register_routes(
                             "application/json");
             return;
         }
-        auto session = auth_fn(req, res);
-        if (session) {
-            row.created_by = session->username;
-            row.updated_by = session->username;
-        }
+        row.created_by = session->username;
+        row.updated_by = session->username;
         row.created_at = iso_now();
         row.updated_at = row.created_at;
 
@@ -4248,9 +4286,16 @@ void RestApiV1::register_routes(
              });
 
     sink.Put(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
-             [auth_fn, perm_fn, audit_fn, guaranteed_state_store,
+             [auth_fn, perm_fn, audit_fn, step_up_fn, guaranteed_state_store,
               iso_now](const httplib::Request& req, httplib::Response& res) {
+                 auto session = auth_fn(req, res);
+                 if (!session)
+                     return;
                  if (!perm_fn(req, res, "GuaranteedState", "Write"))
+                     return;
+                 if (step_up_fn &&
+                     !step_up_fn(req, res, *session,
+                                 "PUT /api/v1/guaranteed-state/rules/{id}"))
                      return;
                  if (!guaranteed_state_store) {
                      res.status = 503;
@@ -4297,9 +4342,7 @@ void RestApiV1::register_routes(
                  updated.scope_expr = body.value("scope_expr", updated.scope_expr);
                  updated.version = existing->version + 1;
                  updated.updated_at = iso_now();
-                 auto session = auth_fn(req, res);
-                 if (session)
-                     updated.updated_by = session->username;
+                 updated.updated_by = session->username;
 
                  auto result = guaranteed_state_store->update_rule(updated);
                  if (!result) {
@@ -4325,9 +4368,21 @@ void RestApiV1::register_routes(
              });
 
     sink.Delete(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
-                [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
-                                                            httplib::Response& res) {
+                [auth_fn, perm_fn, audit_fn, step_up_fn,
+                 guaranteed_state_store](const httplib::Request& req,
+                                         httplib::Response& res) {
+                    // PR2 Gate 4 consistency-B1: Guardian rule DELETE is
+                    // equally destructive to UPDATE — gating both keeps
+                    // a hijacked session from removing auto-remediation
+                    // policy.
+                    auto session = auth_fn(req, res);
+                    if (!session)
+                        return;
                     if (!perm_fn(req, res, "GuaranteedState", "Delete"))
+                        return;
+                    if (step_up_fn &&
+                        !step_up_fn(req, res, *session,
+                                    "DELETE /api/v1/guaranteed-state/rules/{id}"))
                         return;
                     if (!guaranteed_state_store) {
                         res.status = 503;
@@ -4351,10 +4406,15 @@ void RestApiV1::register_routes(
     // POST /push — fan-out is wired in PR 3 (agent-side dispatch + scope
     // expansion). PR 2 acks the request and audits the operator action so
     // dashboards and audit-trail tooling can be exercised end-to-end now.
-    sink.Post("/api/v1/guaranteed-state/push", [perm_fn, audit_fn,
+    sink.Post("/api/v1/guaranteed-state/push", [auth_fn, perm_fn, audit_fn, step_up_fn,
                                                 guaranteed_state_store](const httplib::Request& req,
                                                                         httplib::Response& res) {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
         if (!perm_fn(req, res, "GuaranteedState", "Push"))
+            return;
+        if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/push"))
             return;
         if (!guaranteed_state_store) {
             res.status = 503;

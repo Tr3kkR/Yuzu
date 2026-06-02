@@ -133,6 +133,21 @@ struct Config {
     int rate_limit{100};      // Max API requests/second per IP
     int login_rate_limit{10}; // Max login attempts/second per IP
 
+    // MFA / TOTP — `/auth-and-authz` skill gap matrix P0 #1, SOC 2 CC6.6.
+    // See docs/auth-mfa-design.md. PR1 ships enforcement="optional" (self-
+    // service enrollment, no enforcement at login). PR3 wires admin-only /
+    // required by gating /login against users.mfa_enrolled_at.
+    std::string mfa_enforcement{"optional"}; // "optional" | "admin-only" | "required"
+    /// How long after a successful MFA proof (login or step-up) high-risk
+    /// endpoints accept the session as "stepped up" without re-prompting.
+    /// Default 300 s mirrors common bank/SaaS UX. Lowering to <60 s pushes
+    /// every privileged click through TOTP; raising to >900 s weakens
+    /// the CC6.6 evidence chain.
+    int mfa_step_up_window_secs{300};
+    /// How long the intermediate "mfa_pending" token is valid (window
+    /// between password success and TOTP submission). Default 120 s.
+    int mfa_login_pending_secs{120};
+
     // MCP (Model Context Protocol) server
     bool mcp_disable{false};   // Kill switch: reject all MCP requests
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only
