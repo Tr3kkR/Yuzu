@@ -22,9 +22,20 @@ namespace yuzu::server::yaml_scan {
 //
 // NOT a general-purpose YAML parser. Sufficient for yuzu.io/v1alpha1 DSL.
 //
+// SECURITY CONTRACT (#1215 review / #1221 MEDIUM-2): these scanners are now
+// load-bearing for authorization decisions (scope_yaml lowers a `scope:` block
+// that gates which devices a command targets). `extract_yaml_value` and
+// `extract_yaml_section` locate a key by substring (`find(key + ":")`), so a key
+// that is a superstring of another, or the same key under a sibling section, can
+// be matched if you scan the WHOLE document. Any new security-relevant lookup
+// MUST first isolate the owning block with `extract_yaml_section(<dotted.path>)`
+// and scan within that, the way `scope_yaml::parse_scope_block` does. Raw
+// whole-document `extract_yaml_value` is for non-authorization fields only.
+//
 // History: these four functions lived in policy_store.cpp's anonymous namespace
 // until PR-E (scope-walking YAML DSL) needed them in a second translation unit.
-// Behaviour is preserved verbatim from that move; `yaml_has_key` is new.
+// `yaml_has_key` is new; `extract_yaml_value` gained comment-awareness in the
+// #1215 follow-up (it now skips keys inside `#` comments, matching yaml_has_key).
 
 /// Extract a scalar value for `key`. Returns empty when the key is absent or
 /// opens a mapping/sequence (so callers can use emptiness to mean "not a

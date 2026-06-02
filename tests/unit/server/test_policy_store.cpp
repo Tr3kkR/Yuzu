@@ -364,6 +364,43 @@ scope:
     CHECK(result.error().find("fromResultSet") != std::string::npos);
 }
 
+TEST_CASE("PolicyStore: scalar scope.fromResultSet is also rejected (#1221 MEDIUM-1)",
+          "[policy_store][policy][scope]") {
+    PolicyStore store(":memory:");
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+
+    // The mapping form above is rejected via parse_scope_block. The SCALAR form
+    // (`scope: from_result_set:rs_abc`) makes extract_yaml_value non-empty, which
+    // pre-fix skipped the `scope.empty()` branch and stored the ref verbatim —
+    // bypassing the policy ban (fail-closed at eval, but a latent live path for
+    // PR-E2). It must be rejected at create with the same fromResultSet error.
+    std::string yaml = R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: Scalar RS Policy
+fragment: )" + frag.value() +
+                       R"(
+scope: from_result_set:rs_abc
+)";
+    auto result = store.create_policy(yaml);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("fromResultSet") != std::string::npos);
+
+    // The same ref composed into a larger scalar expression is likewise rejected.
+    std::string yaml2 = R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: Composed RS Policy
+fragment: )" + frag.value() +
+                        R"(
+scope: ostype == "windows" AND from_result_set:rs_abc
+)";
+    auto result2 = store.create_policy(yaml2);
+    REQUIRE_FALSE(result2.has_value());
+    CHECK(result2.error().find("fromResultSet") != std::string::npos);
+}
+
 TEST_CASE("PolicyStore: inline flow-mapping scope is rejected (UP-6)",
           "[policy_store][policy][scope]") {
     PolicyStore store(":memory:");

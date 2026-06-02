@@ -673,6 +673,17 @@ PolicyStore::create_policy(const std::string& yaml_source) {
         return std::unexpected(
             "inline flow-mapping scope is not supported; use the block form "
             "(scope: <newline> indented selector:/fromResultSet:)");
+    // PR-E2: result sets are not yet valid in a continuously-evaluated policy (a
+    // result set's ~1h TTL does not match a policy that re-evaluates forever), in
+    // EITHER form. The mapping form is rejected in the scope.empty() branch below
+    // via parse_scope_block; this catches the SCALAR form (`scope: from_result_set:rs_x`)
+    // that branch would otherwise skip because extract_yaml_value returns it
+    // non-empty — closing the policy fromResultSet bypass (#1221 MEDIUM-1).
+    if (scope.find("from_result_set:") != std::string::npos)
+        return std::unexpected(
+            "spec.scope.fromResultSet is not yet supported for policies (follow-up "
+            "PR-E2): a result set's 1h TTL does not match a continuously-evaluated "
+            "policy. Use a selector or a scope expression.");
     if (scope.empty()) {
         auto sb = parse_scope_block(yaml_source);
         if (sb.has_from_result_set)

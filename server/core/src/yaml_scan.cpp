@@ -14,6 +14,27 @@ std::string extract_yaml_value(const std::string& yaml, const std::string& key) 
             pos = yaml.find(search, pos + 1);
             continue;
         }
+        // Reject a match that sits inside a YAML comment: either a whole-line
+        // comment (first non-whitespace char is '#') or text after an inline '#'
+        // comment marker earlier on the line. A '#' counts as a marker only at
+        // line start or when preceded by whitespace (YAML requires a space before
+        // an inline comment), so `foo#bar` in a value is not treated as one. This
+        // mirrors yaml_has_key's comment-awareness so a commented key like
+        // `# fromResultSet: rs_x` is never mistaken for a real one (#1221 MEDIUM-2).
+        auto line_begin = yaml.rfind('\n', pos);
+        line_begin = (line_begin == std::string::npos) ? 0 : line_begin + 1;
+        bool in_comment = false;
+        for (auto k = line_begin; k < pos; ++k) {
+            if (yaml[k] == '#' &&
+                (k == line_begin || yaml[k - 1] == ' ' || yaml[k - 1] == '\t')) {
+                in_comment = true;
+                break;
+            }
+        }
+        if (in_comment) {
+            pos = yaml.find(search, pos + 1);
+            continue;
+        }
         auto vstart = pos + search.size();
         // Skip whitespace after colon
         while (vstart < yaml.size() && (yaml[vstart] == ' ' || yaml[vstart] == '\t'))
@@ -206,7 +227,24 @@ std::string extract_yaml_section(const std::string& yaml, const std::string& dot
         remaining = (dot == std::string::npos) ? "" : remaining.substr(dot + 1);
 
         auto search = segment + ":";
-        auto pos = current.find(search);
+        // Anchor to a real key: the match must be the first non-whitespace token
+        // on its line, not a `segment:` substring sitting inside a value, a
+        // description, or a comment. Unanchored find() previously mis-anchored on
+        // such a substring, mis-computed key_indent, and returned an empty block —
+        // silently dropping the whole section (for a policy that means the scope
+        // predicate vanishes and it matches the entire fleet: fail-OPEN).
+        // (#1221 MEDIUM-2 / #1215 adversarial H-2.)
+        size_t pos = std::string::npos;
+        for (size_t p = current.find(search); p != std::string::npos;
+             p = current.find(search, p + 1)) {
+            auto ls = current.rfind('\n', p);
+            size_t lb = (ls == std::string::npos) ? 0 : ls + 1;
+            auto fnw = current.find_first_not_of(" \t", lb);
+            if (fnw == p) { // `segment:` is the line's first non-whitespace token
+                pos = p;
+                break;
+            }
+        }
         if (pos == std::string::npos)
             return {};
 
