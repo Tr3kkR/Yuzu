@@ -226,7 +226,7 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 
     %% Upstream C++ server (GatewayUpstream service)
     {upstream_addr, "127.0.0.1"},
-    {upstream_port, 50051},
+    {upstream_port, 50055},
 
     %% Upstream connection pool size
     {upstream_pool_size, 16},
@@ -296,7 +296,7 @@ the address and port for the GatewayUpstream service. This port must match
 `upstream_port` in `sys.config`:
 
 ```bash
-yuzu-server --gateway-upstream "0.0.0.0:50051"
+yuzu-server --gateway-upstream "0.0.0.0:50055"
 ```
 
 > **Known limitation — gateway origin-IP attribution (#1064).** On the gateway
@@ -377,7 +377,7 @@ This starts the gateway with all applications loaded, useful for debugging.
 | Dependency | Version | Purpose |
 |---|---|---|
 | grpcbox | 0.17.1 | gRPC server and client (HTTP/2, protobuf) |
-| gpb | 4.21.2 | Protobuf compiler and runtime |
+| gpb | 4.21.7 | Protobuf compiler and runtime |
 | telemetry | 1.3.0 | Metrics event API |
 | prometheus | 4.11.0 | Prometheus exposition |
 | prometheus_httpd | 2.1.2 | HTTP endpoint for Prometheus scraping |

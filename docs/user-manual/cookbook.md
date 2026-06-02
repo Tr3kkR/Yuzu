@@ -14,7 +14,7 @@ All Python examples use the `requests` library with Bearer token authentication:
 import requests, time, json
 
 YUZU = "https://yuzu.example.com"         # Your Yuzu server URL
-TOKEN = "yuzu_tok_abc123..."               # API token from Settings > API Tokens
+TOKEN = "yuzu_abc123..."               # API token from Settings > API Tokens
 HEADERS = {"X-Yuzu-Token": TOKEN, "Content-Type": "application/json"}
 
 def execute(definition_id, scope="", params=None):
@@ -660,7 +660,7 @@ The `remote_host` field is resolved via reverse DNS at the moment the connection
 import requests, time, json
 
 YUZU = "https://yuzu.example.com"
-TOKEN = "yuzu_tok_abc123..."
+TOKEN = "yuzu_abc123..."
 HEADERS = {"X-Yuzu-Token": TOKEN, "Content-Type": "application/json"}
 
 TARGET_HOSTNAME = "example.com"
