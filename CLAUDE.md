@@ -278,7 +278,7 @@ GitHub issues at `github.com/Tr3kkR/Yuzu` via the `gh` CLI. See `docs/agents/iss
 
 ### Triage labels
 
-Canonical defaults (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`); only `wontfix` exists in the repo's label set today. See `docs/agents/triage-labels.md`.
+Canonical defaults (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`) — all five now exist in the repo's label set, alongside a broader categorization set (`bug`, `security`, `P0`/`P1`/`P2`, `enhancement`, `documentation`, `reliability`, workstream-* and phase-* tags, etc.). See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
