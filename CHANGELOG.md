@@ -272,8 +272,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PolicyStore::create_policy` now rejects the `from_result_set:` atom in either the
   scalar or mapping form. (2) `yaml_scan::extract_yaml_value` is now comment-aware
   (it skips keys inside whole-line and inline `#` comments, matching `yaml_has_key`),
-  so a commented `# fromResultSet:` decoy can no longer be picked up; `yaml_scan.hpp`
-  gains an isolate-via-`extract_yaml_section`-first security contract for the
+  so a commented `# fromResultSet:` decoy can no longer be picked up; and
+  `extract_yaml_section` now anchors on line-leading keys instead of an unanchored
+  `find()`, so a `scope:` substring inside a description/value no longer mis-anchors
+  the section walk and silently drops the whole block (which, for a policy, would
+  fail **open** to a fleet-wide match). `yaml_scan.hpp` gains an
+  isolate-via-`extract_yaml_section`-first security contract for the
   now-authorization-load-bearing scanners. No behaviour change for valid content.
 
 - **`scope.selector:` policies now lower to a real scope (PR-E).** A Policy whose

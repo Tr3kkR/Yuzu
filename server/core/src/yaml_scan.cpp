@@ -227,7 +227,24 @@ std::string extract_yaml_section(const std::string& yaml, const std::string& dot
         remaining = (dot == std::string::npos) ? "" : remaining.substr(dot + 1);
 
         auto search = segment + ":";
-        auto pos = current.find(search);
+        // Anchor to a real key: the match must be the first non-whitespace token
+        // on its line, not a `segment:` substring sitting inside a value, a
+        // description, or a comment. Unanchored find() previously mis-anchored on
+        // such a substring, mis-computed key_indent, and returned an empty block —
+        // silently dropping the whole section (for a policy that means the scope
+        // predicate vanishes and it matches the entire fleet: fail-OPEN).
+        // (#1221 MEDIUM-2 / #1215 adversarial H-2.)
+        size_t pos = std::string::npos;
+        for (size_t p = current.find(search); p != std::string::npos;
+             p = current.find(search, p + 1)) {
+            auto ls = current.rfind('\n', p);
+            size_t lb = (ls == std::string::npos) ? 0 : ls + 1;
+            auto fnw = current.find_first_not_of(" \t", lb);
+            if (fnw == p) { // `segment:` is the line's first non-whitespace token
+                pos = p;
+                break;
+            }
+        }
         if (pos == std::string::npos)
             return {};
 

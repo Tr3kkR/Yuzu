@@ -87,6 +87,40 @@ TEST_CASE("yaml_scan: extract_yaml_value skips keys inside comments (#1221 MEDIU
     CHECK(extract_yaml_value("channel: prod#1\n", "channel") == "prod#1");
 }
 
+TEST_CASE("yaml_scan: extract_yaml_section anchors to line-leading keys (#1215 H-2)",
+          "[yaml_scan]") {
+    // A `scope:` substring inside a description value must NOT mis-anchor the
+    // section walk. Pre-fix, find() matched the substring, mis-computed the
+    // indent, and returned an empty block — dropping the real scope (fail-OPEN
+    // for policies). The real `scope:` block must still be returned intact.
+    std::string yaml = "spec:\n"
+                       "  description: \"see scope: foo for details\"\n"
+                       "  scope:\n"
+                       "    fromResultSet: rs_x\n";
+    auto scope = extract_yaml_section(yaml, "spec.scope");
+    CHECK(extract_yaml_value(scope, "fromResultSet") == "rs_x");
+    // A commented section header must not be anchored to either.
+    std::string yaml2 = "# scope: {fromResultSet: rs_evil}\n"
+                        "spec:\n"
+                        "  scope:\n"
+                        "    fromResultSet: rs_real\n";
+    auto scope2 = extract_yaml_section(yaml2, "spec.scope");
+    CHECK(extract_yaml_value(scope2, "fromResultSet") == "rs_real");
+}
+
+TEST_CASE("yaml_scan: a commented inline-mapping scope: line is not extracted (#1215 H-1)",
+          "[yaml_scan]") {
+    // validate_definition_scope reads extract_yaml_value(yaml, "scope") to detect
+    // the inline flow-mapping form. A *commented* `# scope: {...}` line must not
+    // be picked up, or a legitimate definition keeping sample YAML in a comment
+    // is falsely rejected. The real mapping scope: opens a block → returns empty.
+    std::string yaml = "# scope: {fromResultSet: rs_evil}\n"
+                       "spec:\n"
+                       "  scope:\n"
+                       "    fromResultSet: rs_abc\n";
+    CHECK(extract_yaml_value(yaml, "scope").empty());
+}
+
 TEST_CASE("yaml_scan: a key inside a quoted value does not leak into a sibling section",
           "[yaml_scan]") {
     // Adversarial: 'fromResultSet' appears inside a description value, NOT as a
