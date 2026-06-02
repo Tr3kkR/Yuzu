@@ -1,7 +1,7 @@
 # MFA (TOTP) — Yuzu design reference
 
 Status: **PR 1 + PR 2 of 3 shipped (v0.13+)** — self-service enrollment,
-login challenge, recovery codes (PR 1) and step-up on 10 high-risk
+login challenge, recovery codes (PR 1) and step-up on 11 high-risk
 REST + Settings surfaces (PR 2). PR 3 adds OIDC `amr` short-circuit and
 enforcement modes (`admin-only` / `required`).
 
@@ -249,8 +249,18 @@ Browser                    Server (POST /api/v1/sessions)    AuthDB
 
 Step-up sites (from the discovery pass): user delete + role change in
 Settings; token create/revoke, session revoke, Guardian rule create /
-update / push, software-package create + deployment execute, file
-retrieval upload in REST API v1. Eleven sites total.
+update / delete / push, software-package create + deployment execute in
+REST API v1. Eleven sites total.
+
+`POST /api/v1/file-retrieval` was in the original discovery list but is
+**not** a step-up site. It is agent-originated push-back — the only
+caller is the agent's `content_dist` plugin uploading a file it
+retrieved on the operator's behalf, not a browser operator acting on a
+session cookie. Step-up evaluates a session's `mfa_verified_at` against
+a local `users`-row enrollment; an agent upload has neither, so the gate
+has nothing to evaluate. Guardian rule **delete** took its place in the
+high-risk set during PR 2 governance (removing a remediation rule is as
+destructive as updating one), keeping the count at eleven.
 
 ---
 
