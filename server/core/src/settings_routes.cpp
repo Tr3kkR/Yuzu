@@ -4292,6 +4292,29 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
+                  // Self-target guard (PR3 / docs-mfa invariant #7). Under an
+                  // active enforcement mode an operator may not strip MFA
+                  // from their own account: it would force re-enrollment at
+                  // their next login and leave the current privileged
+                  // session unable to clear the step-up gate. `required`
+                  // protects every role; `admin-only` protects admins. The
+                  // block is audited and surfaced inline (matching the
+                  // handler's other error paths — fragment + message, no
+                  // status override, so the HTMX swap still renders).
+                  const std::string mfa_mode = cfg_ ? cfg_->mfa_enforcement : "optional";
+                  const bool enforcement_protects_self =
+                      mfa_enforcement_protects(mfa_mode, session->role);
+                  if (enforcement_protects_self) {
+                      audit_fn_(req, "mfa.disabled", "error", "User", session->username,
+                                "blocked: mfa_enforcement=" + mfa_mode);
+                      res.set_content(
+                          render_mfa_fragment(
+                              session->username, {}, {}, {}, {},
+                              "MFA is required by policy (enforcement=" + mfa_mode +
+                                  ") and cannot be disabled for your account."),
+                          "text/html; charset=utf-8");
+                      return;
+                  }
                   auto r = db->mfa_disable(session->username);
                   if (!r) {
                       audit_fn_(req, "mfa.disabled", "error", "User", session->username,

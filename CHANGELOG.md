@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **`--mfa-enforcement=admin-only` and `--mfa-enforcement=required` now
+  ENFORCE (previously a logged no-op).** PR 1/PR 2 accepted these values
+  for forward-compatibility and documented them as no-ops (the server
+  emitted a startup `WARN`). PR 3 wires real enforcement: an un-enrolled
+  login subject to enforcement is redirected through TOTP enrollment
+  (`POST /login/mfa/enroll`) before any session is minted. **An operator
+  who staged `--mfa-enforcement=admin-only|required` based on the prior
+  no-op documentation will hit live enforcement immediately on upgrade.**
+  Before upgrading: ensure all affected accounts are enrolled, or set the
+  flag back to `optional`, upgrade, then re-enable after verifying
+  enrollment. The startup line for non-default modes changes from `WARN`
+  (no-op) to `INFO` (enforcement active). See
+  `docs/user-manual/upgrading.md` for the full pre-flight checklist,
+  including the SSO `amr` requirement and single-admin guidance.
+- **OIDC/SSO sessions are now MFA-gated via the IdP `amr` claim instead of
+  being blanket-exempt from step-up.** An SSO session whose IdP attests a
+  multi-factor login (RFC 8176 `amr` containing `mfa`/`otp`/`hwk`/`fpt`/
+  `face`/`iris`/`sms`/`swk`/`tel`) clears high-risk endpoints without a
+  redundant prompt and re-prompts (via re-SSO) once the assertion ages
+  past `--mfa-step-up-window-secs`. An SSO session whose IdP does **not**
+  attest MFA still passes the gate (no second factor to step up — Yuzu
+  cannot mint a factor for an external identity), exactly as before PR 3.
+  **If you require MFA for SSO users, configure your IdP to assert `amr`
+  and verify it pre-flight before enabling enforcement.**
+
 - **`POST /login` now returns HTTP 202 (not 200) for MFA-enrolled users.**
   Programmatic clients (CI pipelines, automation scripts, health checks)
   that called `POST /login` and gated on `HTTP 200 + {"status":"ok"}` will
@@ -37,6 +62,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MFA enforcement modes + login-time enrollment bootstrap + OIDC `amr`
+  gating (PR 3 of the MFA ladder — ladder complete; SOC 2 CC6.6).**
+  - **Enforcement.** `--mfa-enforcement=admin-only|required` (env
+    `YUZU_MFA_ENFORCEMENT`) now enforces. An un-enrolled login subject to
+    enforcement gets a new `POST /login` 202 variant
+    `{"status":"mfa_enrollment_required","mfa_pending_token","otpauth_uri",
+    "secret_base32","expires_in"}` (distinguished from the existing
+    `mfa_required` challenge by `status`) and completes via the new
+    **`POST /login/mfa/enroll`** (confirms the first TOTP code against a
+    provisional secret, mints an MFA-verified session, returns one-time
+    recovery codes). No session is minted until enrollment completes; if
+    `auth_db` is unavailable under enforcement, `/login` fails **closed**
+    (503) rather than minting an unprotected session. The endpoint shares
+    the `is_login` per-IP rate-limit bucket + the 5-attempt-per-pending
+    cap. New audit verb `mfa.enroll.required`; `mfa.enroll.verified` /
+    `mfa.enroll.failed` now also fire from the login bootstrap. New
+    metric label `yuzu_auth_mfa_logins_total{method="enroll"}`.
+  - **Self-target guard.** `POST /api/settings/mfa/disable` refuses to
+    disable an operator's own MFA while enforcement protects their role
+    (`required` → all roles, `admin-only` → admins); audited as
+    `mfa.disabled`/`error`, detail `blocked: mfa_enforcement=<mode>`.
+  - **OIDC `amr` short-circuit.** OIDC sessions are no longer blanket-
+    exempt from step-up. `/auth/callback` parses the RFC 8176 `amr` claim
+    and, when it attests MFA (`amr_asserts_mfa()` allowlist: `mfa`, `otp`,
+    `hwk`, `fpt`, `face`, `iris`, `sms`, `swk`, `tel` — single-factor
+    `pin`/`user`/`pwd` excluded), seeds `Session::mfa_verified_at`
+    anchored to the IdP `iat` in the `steady_clock` domain (NTP-step
+    resistant). An OIDC session with an attested-but-stale proof is
+    re-prompted via re-SSO (`challenge_url=/auth/oidc/start`); one without
+    any attested MFA passes the gate (Yuzu cannot mint a factor for an
+    external identity — gating it would livelock a non-MFA IdP).
+    `/login/mfa/stepup` now rejects OIDC callers with a precise 400
+    pointing back to SSO.
+  - Tests: `test_mfa_step_up.cpp` (OIDC gating, window boundary,
+    `amr_asserts_mfa` allowlist incl. single-factor exclusions),
+    `test_auth_routes_mfa.cpp` (enforcement bootstrap, `/login/mfa/enroll`
+    success/exhaustion/malformed/concurrent/503, cross-token replay),
+    `test_settings_routes_mfa.cpp` (self-target disable guard),
+    `test_oidc_provider.cpp` (`amr` parse + malformed/float `iat`
+    type-guard). Docs: `docs/auth-mfa-design.md`,
+    `docs/user-manual/{authentication,rest-api,server-admin,upgrading}.md`,
+    `docs/ops-runbooks/auth-db-recovery.md`.
+
 - **MFA step-up on 11 high-risk REST + Settings surfaces (PR 2 of the MFA
   ladder; SOC 2 CC6.6).** Closes the privileged-access control gap by
   re-prompting for fresh TOTP / recovery proof on session-cookie callers
@@ -44,8 +112,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in `server/core/src/mfa_step_up.{hpp,cpp}` evaluates the gate: api/mcp
   tokens bypass (the bearer credential is itself the step-up moment),
   OIDC/SSO sessions bypass (the identity lives in the IdP — no local
-  `users` row or TOTP to step up against; `amr`-claim enforcement is the
-  PR3 work), non-enrolled users bypass (consistent with PR1's `optional`
+  `users` row or TOTP to step up against; **superseded in PR 3 by `amr`-claim
+  gating — see the PR 3 entry above**), non-enrolled users bypass (consistent with PR1's `optional`
   enforcement model), and stale sessions (now − `mfa_verified_at` > `mfa_step_up_
   window_secs`, default 300 s) receive a 401 A4 envelope `{"error":
   {"code":401,"message":"MFA step-up required",...},"meta":{"api_version":

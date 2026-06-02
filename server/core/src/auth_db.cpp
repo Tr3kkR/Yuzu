@@ -1056,6 +1056,64 @@ namespace {
 constexpr int kRecoveryCodeCount = 10;
 constexpr int kRecoveryCodePbkdfIters = 100'000;
 
+// Txn-free core of recovery-code regeneration: DELETE the user's existing
+// codes and INSERT `kRecoveryCodeCount` fresh ones. The CALLER MUST hold an
+// open TxnGuard — this function neither begins nor commits, so it can be
+// composed atomically with another mutation (e.g. the enrollment-verify
+// stamp; governance UP-12). Returns the raw codes for one-time display, or
+// an error with the transaction left for the caller to roll back.
+[[nodiscard]] std::expected<std::vector<std::string>, AuthDBError>
+regenerate_recovery_codes_locked(sqlite3* db, const std::string& username) {
+    static const char* del_sql = "DELETE FROM mfa_recovery_codes WHERE username = ?";
+    sqlite3_stmt* del = nullptr;
+    if (sqlite3_prepare_v2(db, del_sql, -1, &del, nullptr) != SQLITE_OK) {
+        return std::unexpected(AuthDBError::StatementPrepareFailed);
+    }
+    sqlite3_bind_text(del, 1, username.c_str(), -1, SQLITE_STATIC);
+    if (sqlite3_step(del) != SQLITE_DONE) {
+        sqlite3_finalize(del);
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    sqlite3_finalize(del);
+
+    static const char* ins_sql = R"(
+        INSERT INTO mfa_recovery_codes (username, code_hash, code_salt)
+        VALUES (?, ?, ?)
+    )";
+    std::vector<std::string> raw_codes;
+    raw_codes.reserve(kRecoveryCodeCount);
+    for (int i = 0; i < kRecoveryCodeCount; ++i) {
+        auto code = mfa::random_recovery_code();
+        // Normalise for hashing (strip '-', uppercase) — same shape the
+        // consumer will pass into mfa_consume_recovery_code.
+        std::string norm;
+        norm.reserve(code.size());
+        for (char c : code) {
+            if (c == '-' || c == ' ')
+                continue;
+            norm += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        auto salt = auth::AuthManager::random_bytes(16);
+        auto salt_hex = auth::AuthManager::bytes_to_hex(salt);
+        auto hash = auth::AuthManager::pbkdf2_sha256(norm, salt, kRecoveryCodePbkdfIters);
+
+        sqlite3_stmt* ins = nullptr;
+        if (sqlite3_prepare_v2(db, ins_sql, -1, &ins, nullptr) != SQLITE_OK) {
+            return std::unexpected(AuthDBError::StatementPrepareFailed);
+        }
+        sqlite3_bind_text(ins, 1, username.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(ins, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins, 3, salt_hex.c_str(), -1, SQLITE_TRANSIENT);
+        auto rc = sqlite3_step(ins);
+        sqlite3_finalize(ins);
+        if (rc != SQLITE_DONE) {
+            return std::unexpected(AuthDBError::WriteFailed);
+        }
+        raw_codes.push_back(std::move(code));
+    }
+    return raw_codes;
+}
+
 // Read the TOTP secret blob + enrolled-at + last-counter for a user.
 // Returns empty optional if the user is not provisional and not enrolled
 // (i.e. no secret blob). Caller wraps in higher-level error handling.
@@ -1241,14 +1299,30 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
         return std::unexpected(AuthDBError::InvalidCredentials);
     }
 
-    // Stamp enrolled_at + persist the matched counter to prevent same-step
-    // replay between enrollment-verify and the first real login.
+    // Stamp enrolled_at + generate recovery codes ATOMICALLY (governance
+    // UP-12). Two failure modes the prior two-statement form left open:
+    //   (a) the stamp UPDATE matched zero rows (user deactivated/deleted
+    //       between load_mfa_row and here) but `SQLITE_DONE` reads as
+    //       success → the user is "enrolled" with no enrolled_at and a
+    //       session is minted. `RETURNING 1` makes `SQLITE_ROW` the proof
+    //       that a row was actually written.
+    //   (b) the stamp committed but recovery-code generation then failed
+    //       → user enrolled with ZERO recovery codes, and a retry hits
+    //       MfaAlreadyEnrolled → permanent lockout. Running both under one
+    //       TxnGuard means a code-gen failure rolls the stamp back too, so
+    //       the user stays provisional and can simply retry.
+    TxnGuard txn(impl_->db);
+    if (!txn.active()) {
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+
     static const char* sql = R"(
         UPDATE users
         SET mfa_enrolled_at = CURRENT_TIMESTAMP,
             mfa_last_counter = ?,
             updated_at = CURRENT_TIMESTAMP
         WHERE username = ? AND is_active = 1
+        RETURNING 1
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(impl_->db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -1258,10 +1332,20 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
     sqlite3_bind_text(stmt, 2, username.c_str(), -1, SQLITE_STATIC);
     auto rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
-    if (rc != SQLITE_DONE) {
+    if (rc != SQLITE_ROW) {
+        // No row written (user deactivated/deleted mid-request) or a write
+        // error — fail closed; TxnGuard rolls back.
         return std::unexpected(AuthDBError::WriteFailed);
     }
-    return mfa_regenerate_recovery_codes(username);
+
+    auto raw_codes = regenerate_recovery_codes_locked(impl_->db, username);
+    if (!raw_codes) {
+        return std::unexpected(raw_codes.error()); // TxnGuard rolls back the stamp too
+    }
+    if (!txn.commit()) {
+        return std::unexpected(AuthDBError::WriteFailed);
+    }
+    return raw_codes;
 }
 
 std::expected<bool, AuthDBError>
@@ -1409,59 +1493,15 @@ AuthDB::mfa_regenerate_recovery_codes(const std::string& username) {
     // would leave the operator with 0 < N < 10 valid codes AND no raw
     // codes returned (function fails before yielding the vector). The
     // operator would have to call mfa_disable to recover (Gate 3 cpp-
-    // safety BLOCKING + performance S1).
+    // safety BLOCKING + performance S1). The DELETE+INSERT core is shared
+    // with mfa_verify_enrollment via regenerate_recovery_codes_locked.
     TxnGuard txn(impl_->db);
     if (!txn.active()) {
         return std::unexpected(AuthDBError::WriteFailed);
     }
-
-    // Wipe existing codes (consumed or otherwise) before inserting fresh.
-    static const char* del_sql = "DELETE FROM mfa_recovery_codes WHERE username = ?";
-    sqlite3_stmt* del = nullptr;
-    if (sqlite3_prepare_v2(impl_->db, del_sql, -1, &del, nullptr) != SQLITE_OK) {
-        return std::unexpected(AuthDBError::StatementPrepareFailed);
-    }
-    sqlite3_bind_text(del, 1, username.c_str(), -1, SQLITE_STATIC);
-    if (sqlite3_step(del) != SQLITE_DONE) {
-        sqlite3_finalize(del);
-        return std::unexpected(AuthDBError::WriteFailed);
-    }
-    sqlite3_finalize(del);
-
-    static const char* ins_sql = R"(
-        INSERT INTO mfa_recovery_codes (username, code_hash, code_salt)
-        VALUES (?, ?, ?)
-    )";
-    std::vector<std::string> raw_codes;
-    raw_codes.reserve(kRecoveryCodeCount);
-    for (int i = 0; i < kRecoveryCodeCount; ++i) {
-        auto code = mfa::random_recovery_code();
-        // Normalise for hashing (strip '-', uppercase) — same shape the
-        // consumer will pass into mfa_consume_recovery_code.
-        std::string norm;
-        norm.reserve(code.size());
-        for (char c : code) {
-            if (c == '-' || c == ' ')
-                continue;
-            norm += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        }
-        auto salt = auth::AuthManager::random_bytes(16);
-        auto salt_hex = auth::AuthManager::bytes_to_hex(salt);
-        auto hash = auth::AuthManager::pbkdf2_sha256(norm, salt, kRecoveryCodePbkdfIters);
-
-        sqlite3_stmt* ins = nullptr;
-        if (sqlite3_prepare_v2(impl_->db, ins_sql, -1, &ins, nullptr) != SQLITE_OK) {
-            return std::unexpected(AuthDBError::StatementPrepareFailed);
-        }
-        sqlite3_bind_text(ins, 1, username.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(ins, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(ins, 3, salt_hex.c_str(), -1, SQLITE_TRANSIENT);
-        auto rc = sqlite3_step(ins);
-        sqlite3_finalize(ins);
-        if (rc != SQLITE_DONE) {
-            return std::unexpected(AuthDBError::WriteFailed);
-        }
-        raw_codes.push_back(std::move(code));
+    auto raw_codes = regenerate_recovery_codes_locked(impl_->db, username);
+    if (!raw_codes) {
+        return std::unexpected(raw_codes.error()); // TxnGuard rolls back
     }
     if (!txn.commit()) {
         return std::unexpected(AuthDBError::WriteFailed);

@@ -1,9 +1,11 @@
 # MFA (TOTP) — Yuzu design reference
 
-Status: **PR 1 + PR 2 of 3 shipped (v0.13+)** — self-service enrollment,
-login challenge, recovery codes (PR 1) and step-up on 11 high-risk
-REST + Settings surfaces (PR 2). PR 3 adds OIDC `amr` short-circuit and
-enforcement modes (`admin-only` / `required`).
+Status: **PR 1 + PR 2 + PR 3 of 3 shipped (v0.13+)** — self-service
+enrollment, login challenge, recovery codes (PR 1); step-up on 11
+high-risk REST + Settings surfaces (PR 2); OIDC `amr` short-circuit plus
+enforcement modes (`admin-only` / `required`) with login-time enrollment
+bootstrap (PR 3). The MFA ladder is complete; the remaining MFA-adjacent
+work is the at-rest secret encryption follow-up (see "At-rest protection").
 
 This doc is the single design reference for Yuzu's MFA implementation.
 For why MFA matters at all and where it sits in the broader A&A roadmap,
@@ -264,60 +266,123 @@ destructive as updating one), keeping the count at eleven.
 
 ---
 
-## Enforcement modes (PR 3 — design)
+## Enforcement modes (PR 3 — shipped)
 
-`Config::mfa_enforcement`:
+`Config::mfa_enforcement` (CLI `--mfa-enforcement`, env
+`YUZU_MFA_ENFORCEMENT`):
 
-- `optional` (default, ships in PR 1) — users may enrol themselves, but
-  login does not require it. Operators get a self-service security
-  posture.
-- `admin-only` — `POST /login` rejects an admin who is not enrolled with
-  a redirect to the enrolment UI. Non-admins are unaffected.
+- `optional` (default) — users may enrol themselves, but login does not
+  require it. Operators get a self-service security posture.
+- `admin-only` — an admin without MFA must enrol before login completes.
+  Non-admins are unaffected.
 - `required` — same enforcement for every role.
 
-The redirect target is the same Settings panel that PR 1 ships; no
-separate "enrolment-only" UI.
+**Login-time enrollment bootstrap.** A hard `POST /login` rejection would
+deadlock — the Settings enrollment panel needs a session, which the
+rejected user does not have. Instead the enforced un-enrolled login
+reuses PR 1's pending-token machinery:
 
-Self-target guard interaction: the existing destruction guard at
-`settings_routes.cpp:434/1830/2488` is extended so an admin cannot
-`mfa_disable` their own account while `mfa_enforcement != optional`.
-Without that, an admin in a hardened deployment could lock themselves
-out of every high-risk surface by disabling MFA.
+1. `POST /login` verifies the password, sees the user is un-enrolled and
+   that enforcement applies, calls `mfa_init_enrollment`, and returns
+   **HTTP 202** `{"status":"mfa_enrollment_required","mfa_pending_token",
+   "otpauth_uri","secret_base32","expires_in"}` — no session cookie.
+   Audit: `mfa.enroll.required`.
+2. The login page swaps to an enrollment form (QR/secret + code field).
+3. `POST /login/mfa/enroll` confirms the first TOTP code against the
+   provisional secret (`mfa_verify_enrollment`), promotes it to enrolled,
+   mints the **MFA-verified** session, and returns the one-time recovery
+   codes. Audit: `mfa.enroll.verified` + `mfa.recovery_codes.generated` +
+   `auth.login`.
+
+The enrollment token (`MfaPending::enrollment == true`) and the login
+challenge token are mutually exclusive: each endpoint rejects the other's
+token type so neither can be replayed across paths. `/login/mfa/enroll`
+joins the `is_login` per-IP rate-limit bucket and the per-pending
+5-attempt cap, so the provisional secret can't be brute-forced. If
+enforcement is configured but `auth_db` is unavailable, `/login` fails
+**closed** (503) rather than minting an unprotected session.
+
+Self-target guard: `POST /api/settings/mfa/disable` refuses to disable an
+operator's own MFA while enforcement protects their role (`required` →
+all roles; `admin-only` → admins). The block is audited
+(`mfa.disabled`/`error`, detail `blocked: mfa_enforcement=<mode>`) and
+surfaced inline in the Settings fragment. Without it an admin in a
+hardened deployment could strip their own MFA and be forced back through
+enrollment at the next login (or, mid-session, lose access to every
+step-up-gated surface).
+
+**Accepted residual (UP-15).** Under enforcement, a caller who already
+knows a valid password can distinguish "enrolled" (`200`) from "enforced
+but un-enrolled" (`202 mfa_enrollment_required`) from "not enforced for
+this role" — a minor account-posture oracle. This is inherent to a
+login-time enrollment flow (the user must be told to enroll) and is only
+exposed to someone who has already passed password authentication, so it
+is accepted rather than closed.
 
 ---
 
-## OIDC interop (PR 3 — design)
+## OIDC interop (PR 3 — shipped)
 
-**Until PR 3 lands, OIDC/SSO sessions are exempt from local step-up.**
-An OIDC identity lives in the IdP — `create_oidc_session` never writes a
+Before PR 3, OIDC/SSO sessions were blanket-exempt from local step-up:
+an OIDC identity lives in the IdP — `create_oidc_session` never writes a
 `users` row, so there is no local TOTP secret to step up against and a
-`mfa_status()` lookup for such a session returns `UserNotFound`.
-`require_mfa_step_up` therefore treats `auth_source == "oidc"` like a
-bearer credential and returns `true` (pass) in its early exemption
-block. Without this, every OIDC session — including an admin mapped via
-their Entra group — would fail the gate closed and be permanently
-locked out of all 11 gated endpoints (PR #1199 review HIGH). MFA on SSO
-sessions is the IdP's responsibility until the `amr` short-circuit below
-ships.
+`mfa_status()` lookup for such a session returns `UserNotFound`. The PR 2
+gate therefore treated `auth_source == "oidc"` like a bearer credential
+and passed it unconditionally; without that exemption every OIDC session
+would have failed the gate **closed** and been locked out of every gated
+endpoint (PR #1199 review HIGH).
 
-Microsoft Entra and most OIDC IdPs assert the methods used to
-authenticate via the `amr` claim (RFC 8176, plus the Entra-specific
-`mfa` value). Today `IdTokenClaims` does not parse `amr`. PR 3:
+PR 3 replaces the blanket exemption with `amr`-driven gating. Microsoft
+Entra and most OIDC IdPs assert the methods used to authenticate via the
+`amr` claim (RFC 8176, plus the Entra-specific `mfa` value):
 
-1. Adds `std::vector<std::string> amr` to `IdTokenClaims`.
-2. Parses it in `oidc_provider.cpp` alongside the existing claims.
-3. In `auth_routes.cpp:565-631` (the `/auth/callback` handler), if `amr`
-   contains any of `mfa`, `otp`, `hwk`, `face`, `fpt`, `iris`, `pin`,
-   `sms`, `swk`, `tel`, `user` → `session.mfa_verified_at = iat`.
+1. `std::vector<std::string> amr` is parsed into `IdTokenClaims`
+   (`oidc_provider.cpp`, tolerating both the spec's array form and a lone
+   string from non-conformant IdPs). All claim extraction is now type-
+   guarded (`is_string`/`is_number`), so a malformed `sub`/`iat` on a
+   signature-valid token cannot throw an uncaught `type_error` out of
+   `parse_id_token` (`iat` is load-bearing in PR 3 — governance sec-M1).
+2. `amr_asserts_mfa()` (in `mfa_step_up.{hpp,cpp}`) is the policy
+   allowlist: `mfa`, `otp`, `hwk`, `face`, `fpt`, `iris`, `sms`, `swk`,
+   `tel`. `pwd` (password-only) and the **single-factor** `pin` / `user`
+   ("user presence") are deliberately excluded — admitting them would let
+   a non-MFA login satisfy the gate (governance UP-7). Matching is
+   case-sensitive per RFC 8176 (fail-safe: a mixed-case value is rejected,
+   never wrongly admitted).
+3. `/auth/callback` seeds the new session's `mfa_verified_at` only when
+   `amr_asserts_mfa(claims.amr)` is true **and `iat > 0`**. **Clock-domain
+   note:** the design originally said `mfa_verified_at = iat`, but `iat` is
+   wall-clock and `Session::mfa_verified_at` is `steady_clock` (hard
+   invariant #5, NTP-step resistance). The handler computes the
+   assertion's age (`system_now − iat`, clamped at 0 for IdP-clock-ahead
+   skew) **in the system-clock domain before** the cast to
+   `steady_clock::duration`, then sets `mfa_verified_at = steady_now −
+   age`, so a stale IdP assertion still re-prompts. A missing/zero `iat`
+   is **not** seeded (fabricating a fresh window from a timestampless
+   assertion would let a replayed `amr`-without-`iat` token look fresh —
+   governance UP-9); such a session simply falls into the "no proof"
+   branch below, which passes.
+4. `require_mfa_step_up` no longer early-exempts `oidc`. It skips the local
+   `mfa_status` lookup for OIDC sessions (there is no `users` row) and:
+   - **No seeded proof** (`mfa_verified_at` default — the IdP did not
+     attest MFA, or omitted `iat`): **PASS**. There is no second factor to
+     step up against, exactly like an un-enrolled local user. Failing here
+     would 401 → `/auth/oidc/start` → silent re-SSO → same `amr`-less token
+     → 401 … an infinite lockout loop, re-opening the PR #1199 HIGH for
+     every non-MFA IdP (governance UP-5/UP-6). This is never weaker than
+     the PR 2 blanket exemption it replaces.
+   - **Fresh `amr`-seeded proof** (within `mfa_step_up_window_secs`):
+     PASS — the SSO login's MFA clears the gate without a redundant prompt.
+   - **Stale `amr`-seeded proof** (older than the window): FAIL, with the
+     remediation pointing back through SSO (`challenge_url =
+     /auth/oidc/start`) — an external identity has no local secret for
+     `/login/mfa/stepup`. `/login/mfa/stepup` itself rejects an OIDC caller
+     with a precise 400 (governance cons-B1).
 
-4. Removes the `auth_source == "oidc"` early exemption in
-   `require_mfa_step_up` (added by PR 2, see above) so OIDC sessions are
-   gated against the `amr`-seeded `mfa_verified_at` instead of being
-   unconditionally exempt.
-
-The same step-up window applies. If the IdP-asserted MFA is older than
-`mfa_step_up_window_secs`, the user is re-prompted via the local TOTP
-flow.
+   (`api_token` / `mcp_token` remain unconditionally exempt.) A future
+   opt-in `--mfa-oidc-amr-required` can hard-gate even the no-proof case
+   for operators who have confirmed their IdP asserts `amr` (tracked
+   follow-up).
 
 ---
 
@@ -329,17 +394,20 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 | Verb | When |
 |---|---|
 | `mfa.enroll.initiated` | `POST /api/settings/mfa/init` — secret generated |
-| `mfa.enroll.verified` | `POST /api/settings/mfa/verify` — first code accepted |
-| `mfa.enroll.failed` | First code rejected |
-| `mfa.disabled` | `POST /api/settings/mfa/disable` |
+| `mfa.enroll.required` | `POST /login` blocked an un-enrolled login under enforcement and issued an enrollment-pending token (PR 3) |
+| `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll` — first code accepted |
+| `mfa.enroll.failed` | First code rejected (Settings or login bootstrap) |
+| `mfa.disabled` | `POST /api/settings/mfa/disable` (`error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
 | `mfa.login.required` | `POST /login` returned a pending token |
 | `mfa.login.verified` | `POST /login/mfa` TOTP code accepted |
 | `mfa.login.failed` | `POST /login/mfa` rejected (TOTP or recovery) |
-| `mfa.recovery_codes.generated` | Enrollment or regenerate |
+| `mfa.recovery_codes.generated` | Enrollment, regenerate, or login bootstrap |
 | `mfa.recovery_code.used` | `POST /login/mfa` accepted a recovery code |
 
 PR 2 adds `mfa.step_up.required`, `mfa.step_up.passed`,
-`mfa.step_up.failed`.
+`mfa.step_up.failed`. PR 3 adds `mfa.enroll.required` and routes
+`mfa.enroll.verified` / `mfa.enroll.failed` through the new
+`POST /login/mfa/enroll` bootstrap endpoint as well as Settings.
 
 For SOC 2 evidence, the relevant compliance control is CC6.6
 (privileged access). The `mfa.enroll.verified` row plus the every-login
@@ -359,15 +427,25 @@ MFA-verified" assertion auditors look for.
   case-and-separator-insensitive recovery code matching.
 - End-to-end / UAT coverage: enroll via Settings, log out, log back in
   with TOTP code, perform an admin action. `bash scripts/start-UAT.sh`.
-- PR 2 will add route-level tests for the step-up surface using the same
-  `HttpRouteSink` test pattern that `test_workflow_routes.cpp` uses.
+- `tests/unit/server/test_mfa_step_up.cpp` — gate decision tree, including
+  PR 3 OIDC gating (fresh `amr` proof passes, no/stale proof → 401 with
+  `challenge_url=/auth/oidc/start`) and the `amr_asserts_mfa` allowlist.
+- `tests/unit/server/test_auth_routes_mfa.cpp` — route-level coverage for
+  `/login/mfa` (PR 2) and the PR 3 enforcement bootstrap: enforced
+  un-enrolled login → 202 enrollment challenge, `/login/mfa/enroll`
+  completion, `admin-only` role-scoping, already-enrolled login still
+  gets the challenge, and cross-endpoint token-replay rejection.
+- `tests/unit/server/test_settings_routes_mfa.cpp` — the self-target
+  disable guard under `required` / `admin-only`.
+- `tests/unit/server/test_oidc_provider.cpp` — `amr` claim parsing (array,
+  lone-string, and absent forms).
 
 ---
 
 ## Hard invariants (do not regress)
 
-When extending the MFA surface (step-up PR, enforcement PR, encryption-
-at-rest PR) make sure none of these regress:
+When extending the MFA surface (the remaining encryption-at-rest PR, or
+any later auth work) make sure none of these regress:
 
 1. **TOTP secrets never leave `auth.db`.** `mfa_init_enrollment` returns
    the secret to the operator exactly once (one-time reveal); after
@@ -391,6 +469,17 @@ at-rest PR) make sure none of these regress:
    failure for `mfa.enroll`, `mfa.login`, and `mfa.step_up`. The
    CC6.6 evidence chain is the success row + the failure row together
    — losing either side breaks it.
-7. **Self-target guard extends to MFA disable** once enforcement is
-   wired (PR 3). Admin can not disable their own MFA in `required` or
-   `admin-only` mode.
+7. **Self-target guard extends to MFA disable** (wired in PR 3). An
+   operator cannot disable their own MFA while enforcement protects their
+   role — `required` protects every role, `admin-only` protects admins.
+8. **OIDC step-up gating must not livelock a non-MFA IdP** (PR 3,
+   governance UP-5). `require_mfa_step_up` skips the local `mfa_status`
+   lookup for `auth_source == "oidc"` (no `users` row). An OIDC session
+   with **no** `amr`-seeded proof MUST pass (it has no factor to step up;
+   gating it loops it through `/auth/oidc/start` forever). Only an OIDC
+   session that carries an `amr`-seeded proof is freshness-gated. Two
+   regressions to guard against: (a) failing closed on the missing `users`
+   row — locks out every SSO operator (the original PR #1199 HIGH); (b)
+   gating the no-proof case — the UP-5 livelock. The seeded timestamp must
+   stay in the `steady_clock` domain (see #5), and `/login/mfa/stepup`
+   must keep rejecting OIDC callers (no local secret to verify).

@@ -9,6 +9,7 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -23,72 +24,74 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     // Bearer-credential principals are step-up-exempt by design. Token
     // issuance was the step-up moment; the token itself does not
     // re-prompt. Mirrors the /auth-and-authz skill's documented scope.
-    //
-    // OIDC/SSO sessions are also exempt for now. The identity lives in
-    // the IdP: `create_oidc_session` never writes a `users` row, so
-    // there is no local TOTP secret to step up against and no way for
-    // the operator to clear the gate. Without this exemption every OIDC
-    // session fails the `mfa_status()` lookup below with `UserNotFound`
-    // and is permanently locked out of all gated endpoints (PR #1199
-    // review HIGH). Enforcing MFA on SSO sessions via the `amr` claim is
-    // the documented PR3 work; until then SSO MFA is the IdP's job. The
-    // auth-source check (rather than discriminating on `UserNotFound`
-    // below) is deliberate: it keeps a local user deleted mid-request
-    // fail-closed, exempting only genuine external identities.
-    if (session.auth_source == "api_token" || session.auth_source == "mcp_token" ||
-        session.auth_source == "oidc") {
+    if (session.auth_source == "api_token" || session.auth_source == "mcp_token") {
         return true;
     }
 
-    // Look up the user's MFA enrollment status. Distinguish two cases:
-    //
-    //   (a) store error / user-deleted-mid-request (`!status`) — fail
-    //       CLOSED: the gate cannot evaluate, so the request is denied.
-    //       Fail-open here would let an attacker exploit auth_db
-    //       transients (lock contention, corrupted row, deleted-then-
-    //       requested user) to bypass step-up entirely on every gated
-    //       site. Governance Gate 4 UP-4 / unhappy-path BLOCKING.
-    //
-    //   (b) user not enrolled (`!status->enrolled`) — fall through to
-    //       the existing role/permission gate. Under
-    //       `mfa_enforcement != optional` such a user would have been
-    //       rejected at login, so reaching here implies `optional`
-    //       mode. Consistent with PR1's enforcement model.
-    auto status = auth_db.mfa_status(session.username);
-    if (!status) {
-        // Fail closed. Emit a distinct audit verb so SRE can grep for
-        // store-error events vs legitimate stale-session denials.
-        if (audit_fn) {
-            try {
-                (void)audit_fn(req, "mfa.step_up.required", "error", "Endpoint",
-                               action_label,
-                               "user=" + session.username +
-                                   " reason=mfa_status_unavailable (fail-closed)");
-            } catch (const std::exception& ex) {
-                spdlog::warn("mfa_step_up: audit emission threw: {}", ex.what());
-            } catch (...) {
-                spdlog::warn("mfa_step_up: audit emission threw non-std exception");
+    // OIDC/SSO sessions (PR3) carry no local `users` row, so the
+    // enrollment lookup below would return `UserNotFound` and — were we
+    // to run it — fail closed and lock every SSO operator out of the
+    // gated endpoints (the PR #1199 HIGH the old blanket exemption
+    // guarded). Instead we skip the local lookup entirely and gate the
+    // OIDC session purely on `session.mfa_verified_at`, which
+    // /auth/callback seeds from the IdP `amr` claim. A local TOTP step-up
+    // is meaningless for an external identity, so the remediation steers
+    // the operator back through SSO (see the source-specific challenge
+    // URL on the failure path below).
+    const bool is_oidc = session.auth_source == "oidc";
+
+    if (!is_oidc) {
+        // Look up the local user's MFA enrollment status. Distinguish:
+        //
+        //   (a) store error / user-deleted-mid-request (`!status`) — fail
+        //       CLOSED: the gate cannot evaluate, so the request is
+        //       denied. Fail-open here would let an attacker exploit
+        //       auth_db transients (lock contention, corrupted row,
+        //       deleted-then-requested user) to bypass step-up on every
+        //       gated site. Governance Gate 4 UP-4 / unhappy-path
+        //       BLOCKING.
+        //
+        //   (b) user not enrolled (`!status->enrolled`) — fall through to
+        //       the existing role/permission gate. Under
+        //       `mfa_enforcement != optional` such a user is required to
+        //       enrol at login (PR3), so a not-enrolled local session
+        //       reaching here implies `optional` mode.
+        auto status = auth_db.mfa_status(session.username);
+        if (!status) {
+            // Fail closed. Emit a distinct audit verb so SRE can grep for
+            // store-error events vs legitimate stale-session denials.
+            if (audit_fn) {
+                try {
+                    (void)audit_fn(req, "mfa.step_up.required", "error", "Endpoint",
+                                   action_label,
+                                   "user=" + session.username +
+                                       " reason=mfa_status_unavailable (fail-closed)");
+                } catch (const std::exception& ex) {
+                    spdlog::warn("mfa_step_up: audit emission threw: {}", ex.what());
+                } catch (...) {
+                    spdlog::warn("mfa_step_up: audit emission threw non-std exception");
+                }
             }
+            spdlog::error("require_mfa_step_up: mfa_status({}) failed — failing closed",
+                          session.username);
+            nlohmann::json envelope_fail = {
+                {"error",
+                 {{"code", 401},
+                  {"message", "MFA step-up required"},
+                  {"correlation_id", detail::make_correlation_id()},
+                  {"remediation",
+                   "auth_db unavailable — retry shortly or contact an administrator"}}},
+                {"meta",
+                 {{"api_version", "v1"},
+                  {"mfa_step_up_required", true},
+                  {"challenge_url", "/login/mfa/stepup"}}}};
+            res.status = 401;
+            res.set_content(envelope_fail.dump(), "application/json");
+            return false;
         }
-        spdlog::error("require_mfa_step_up: mfa_status({}) failed — failing closed",
-                      session.username);
-        nlohmann::json envelope_fail = {
-            {"error",
-             {{"code", 401},
-              {"message", "MFA step-up required"},
-              {"correlation_id", detail::make_correlation_id()},
-              {"remediation",
-               "auth_db unavailable — retry shortly or contact an administrator"}}},
-            {"meta",
-             {{"api_version", "v1"},
-              {"mfa_step_up_required", true},
-              {"challenge_url", "/login/mfa/stepup"}}}};
-        res.status = 401;
-        res.set_content(envelope_fail.dump(), "application/json");
-        return false;
-    }
-    if (!status->enrolled) {
-        return true;
+        if (!status->enrolled) {
+            return true;
+        }
     }
 
     // Compute proof age. A default-constructed `mfa_verified_at`
@@ -96,6 +99,24 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     // session yet" — treat as infinitely stale.
     const auto now = std::chrono::steady_clock::now();
     const bool no_proof = session.mfa_verified_at.time_since_epoch().count() == 0;
+
+    // OIDC sessions whose IdP did not attest MFA carry no seeded proof
+    // (no `amr` → `/auth/callback` never set `mfa_verified_at`). They have
+    // no second factor to step up against, exactly like an un-enrolled
+    // local user — so they PASS, not fail. Gating them here would 401 →
+    // `/auth/oidc/start` → silent re-SSO → same `amr`-less token → 401 …
+    // an infinite lockout loop, re-opening the PR #1199 HIGH for every
+    // non-MFA IdP (governance UP-5/UP-6). MFA on a non-MFA-IdP SSO session
+    // is the IdP's responsibility; Yuzu cannot mint a factor for an
+    // external identity. An OIDC session that DOES carry an `amr`-seeded
+    // proof falls through to the freshness check below (stale → re-SSO),
+    // so this is never weaker than the PR2 blanket exemption it replaces.
+    // A future opt-in (`--mfa-oidc-amr-required`) can harden this for
+    // operators who have confirmed their IdP asserts `amr`.
+    if (is_oidc && no_proof) {
+        return true;
+    }
+
     const auto age = no_proof ? std::chrono::seconds::max()
                               : std::chrono::duration_cast<std::chrono::seconds>(
                                     now - session.mfa_verified_at);
@@ -106,19 +127,26 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     // Step-up required. Build the 401 A4 envelope with the extra
     // `meta.mfa_step_up_required` + `meta.challenge_url` fields the
     // dashboard JS / agentic-worker client uses to drive the
-    // re-prompt flow.
+    // re-prompt flow. The challenge differs by identity source: a local
+    // session re-proves via the TOTP step-up endpoint; an OIDC session
+    // has no local secret, so it must re-authenticate through SSO to
+    // refresh the IdP MFA assertion.
+    const char* challenge_url = is_oidc ? "/auth/oidc/start" : "/login/mfa/stepup";
+    const char* remediation =
+        is_oidc ? "Re-authenticate via SSO to refresh the identity provider's MFA assertion, "
+                  "then retry"
+                : "POST /login/mfa/stepup with current TOTP code or a recovery code, then retry";
     const auto cid = detail::make_correlation_id();
     nlohmann::json envelope = {
         {"error",
          {{"code", 401},
           {"message", "MFA step-up required"},
           {"correlation_id", cid},
-          {"remediation",
-           "POST /login/mfa/stepup with current TOTP code or a recovery code, then retry"}}},
+          {"remediation", remediation}}},
         {"meta",
          {{"api_version", "v1"},
           {"mfa_step_up_required", true},
-          {"challenge_url", "/login/mfa/stepup"}}}};
+          {"challenge_url", challenge_url}}}};
     res.status = 401;
     res.set_content(envelope.dump(), "application/json");
 
@@ -139,6 +167,43 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
             spdlog::warn("mfa_step_up: audit emission threw non-std exception");
         }
     }
+    return false;
+}
+
+bool amr_asserts_mfa(const std::vector<std::string>& amr) {
+    // RFC 8176 method references that constitute (or imply) a factor
+    // beyond a shared secret, plus Entra's non-standard "mfa" aggregate.
+    // Matches the allowlist documented in docs/auth-mfa-design.md "OIDC
+    // interop". Deliberately EXCLUDED:
+    //   - "pwd": the single factor step-up exists to strengthen.
+    //   - "pin"/"user": single-factor presence/knowledge (device-unlock PIN,
+    //     "user presence") — not a second factor. Admitting them let a
+    //     non-MFA login satisfy the gate (governance UP-7). "sms"/"tel" are
+    //     weak but ARE a possession-based second factor, so they stay; a
+    //     future --mfa-oidc-amr-strong flag can tighten further.
+    static constexpr std::string_view kMfaMethods[] = {"mfa",  "otp", "hwk", "face",
+                                                       "fpt",  "iris", "sms", "swk",
+                                                       "tel"};
+    for (const auto& m : amr) {
+        for (const auto& known : kMfaMethods) {
+            if (m == known) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool mfa_enforcement_protects(std::string_view mode, auth::Role role) {
+    if (mode == "required") {
+        return true;
+    }
+    if (mode == "admin-only") {
+        return role == auth::Role::admin;
+    }
+    // "optional", or any value CLI validation should have rejected → not
+    // enforced. Fail-safe: an unexpected mode never silently locks anyone
+    // out, and CLI11 IsMember already rejects unknown values at startup.
     return false;
 }
 

@@ -167,11 +167,30 @@ private:
     /// is erased and the operator must restart with a fresh password
     /// submission. Closes Gate 2 H1 + unhappy-path UP-11 (rate-limit
     /// gap → CPU DoS via PBKDF2 amplification).
+    /// Discriminates the two pending-token flavours that share the
+    /// `mfa_pending_` map (PR3). An enum rather than a bool so a third kind
+    /// (e.g. a future password-reset or WebAuthn challenge) is an additive
+    /// variant rather than a second bool — and so the cross-endpoint guards
+    /// read as `kind != PendingKind::enrollment` (self-documenting).
+    enum class PendingKind {
+        /// Login challenge for an already-enrolled user, resolved by
+        /// POST /login/mfa (verify a TOTP/recovery code vs the live secret).
+        login_challenge,
+        /// Enrollment challenge issued when `mfa_enforcement` blocks an
+        /// un-enrolled login, resolved by POST /login/mfa/enroll (confirm the
+        /// provisional secret's first code, then mint the session).
+        enrollment,
+    };
+
     struct MfaPending {
         std::string username;
         auth::Role role{auth::Role::user};
         std::chrono::steady_clock::time_point expires_at{};
         int attempts{0};
+        /// Default is a login challenge. Each endpoint rejects the other's
+        /// kind, so an enrollment token can't be replayed at the
+        /// login-challenge endpoint or vice versa.
+        PendingKind kind{PendingKind::login_challenge};
     };
     static constexpr int kMfaMaxAttemptsPerPending = 5;
     mutable std::mutex mfa_pending_mu_;

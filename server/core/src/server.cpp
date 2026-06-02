@@ -2459,8 +2459,13 @@ private:
             // pound the space to brute-force the secret. Step-up has no
             // per-pending-token attempts cap (the session IS the
             // credential), so the per-IP rate limit is the only brake.
+            // `/login/mfa/enroll` joins it too (PR3): it confirms the first
+            // code against a provisional TOTP secret during enforced
+            // enrollment, so it is the same online-guessing surface and
+            // must not fall through to the looser bucket.
             bool is_login = (req.path == "/login" || req.path == "/login/mfa" ||
-                             req.path == "/login/mfa/stepup") &&
+                             req.path == "/login/mfa/stepup" ||
+                             req.path == "/login/mfa/enroll") &&
                             req.method == "POST";
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
@@ -2488,7 +2493,12 @@ private:
             // caught the omission; without it, MFA-enrolled users are locked
             // out because every POST /login/mfa redirects to /login before the
             // route handler runs.
-            if (req.path == "/login" || req.path == "/login/mfa" || req.path == "/health" ||
+            // `/login/mfa/enroll` (PR3) is also pre-session: it completes
+            // an enforced login for an un-enrolled user who has only the
+            // enrollment-pending token, not a cookie. (`/login/mfa/stepup`
+            // is deliberately NOT here — it requires an existing session.)
+            if (req.path == "/login" || req.path == "/login/mfa" ||
+                req.path == "/login/mfa/enroll" || req.path == "/health" ||
                 req.path == "/api/health" || req.path == "/auth/oidc/start" ||
                 req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
                 req.path.starts_with("/static/")) {

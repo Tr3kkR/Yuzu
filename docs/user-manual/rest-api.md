@@ -3413,9 +3413,9 @@ These endpoints drive the **Settings → Multi-Factor Authentication** card. The
 **`POST /api/settings/mfa/disable`** — Clear MFA state for the logged-in admin.
 
 - **Permission:** Admin only.
-- **Effect:** Atomic UPDATE users (clears `mfa_totp_secret`, `mfa_enrolled_at`; stamps `mfa_disabled_at`) + DELETE `mfa_recovery_codes` inside a `BEGIN IMMEDIATE / COMMIT` transaction.
-- **Response (200):** HTML fragment showing the "Not enrolled" state.
-- **Audit:** `mfa.disabled` / `ok` (or `error` on DB failure).
+- **Effect:** Atomic UPDATE users (clears `mfa_totp_secret`, `mfa_enrolled_at`; stamps `mfa_disabled_at`) + DELETE `mfa_recovery_codes` inside a `BEGIN IMMEDIATE / COMMIT` transaction. **Self-target guard (PR 3):** while `--mfa-enforcement` protects the caller's role (`required` → all roles; `admin-only` → admins), the disable is refused — the operator cannot strip the MFA that policy requires of them.
+- **Response (200):** HTML fragment showing the "Not enrolled" state, or, when the self-target guard fires, the unchanged "Enabled" fragment with an inline "MFA is required by policy" message.
+- **Audit:** `mfa.disabled` / `ok` (or `error` on DB failure, or `error` + detail `blocked: mfa_enforcement=<mode>` when the self-target guard refuses the disable).
 
 > **Note — admin force-disable for other users:** the PR 1 endpoints are self-service only. An admin cannot disable another user's MFA via the dashboard or REST in this release; that feature is planned. For emergency lockout recovery use the break-glass procedure in `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable.
 
@@ -4416,11 +4416,13 @@ username=admin&password=secretpass
 
 | Status | Condition | Body |
 |---|---|---|
-| `200` + `Set-Cookie: yuzu_session=…` | Credentials valid; user has no MFA enrolled | `{"status":"ok"}` |
-| `202` | Credentials valid; user has TOTP MFA enrolled | `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — complete the challenge by posting the pending token + TOTP code (or recovery code) to `POST /login/mfa` |
+| `200` + `Set-Cookie: yuzu_session=…` | Credentials valid; user has no MFA enrolled and no enforcement applies | `{"status":"ok"}` |
+| `202` (`mfa_required`) | Credentials valid; user **has** TOTP MFA enrolled | `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — complete the challenge by posting the pending token + TOTP code (or recovery code) to `POST /login/mfa` |
+| `202` (`mfa_enrollment_required`) | Credentials valid; user is **un-enrolled** and `--mfa-enforcement` (`admin-only` for admins / `required` for all) requires MFA | `{"status":"mfa_enrollment_required","mfa_pending_token":"<opaque>","otpauth_uri":"otpauth://...","secret_base32":"...","expires_in":120}` — show the QR/secret and complete enrollment via `POST /login/mfa/enroll` |
 | `401` | Invalid credentials | `{"error":{"code":401,"message":"Invalid username or password"}}` |
+| `503` | Enforcement applies but `auth.db` is unavailable (fail-closed; no session minted) | `{"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"}}` |
 
-The `mfa_pending_token` is a 32-byte hex (64-char) opaque random; its lifetime is `cfg.mfa_login_pending_secs` (default 120 s). The pending state lives in process memory and is lost on server restart, and is not shared across HA replicas without sticky sessions.
+**Distinguish the two 202 variants by the `status` field**: `mfa_required` routes to `POST /login/mfa` (the user already has a secret); `mfa_enrollment_required` routes to `POST /login/mfa/enroll` (the user must enroll first). The `mfa_pending_token` is a 32-byte hex (64-char) opaque random; its lifetime is `cfg.mfa_login_pending_secs` (default 120 s). The pending state lives in process memory and is lost on server restart, and is not shared across HA replicas without sticky sessions.
 
 #### `POST /login/mfa`
 
@@ -4443,6 +4445,32 @@ The endpoint distinguishes TOTP from recovery by code shape — exactly 6 ASCII 
 | `200` + `Set-Cookie: yuzu_session=…` | Code accepted | `{"status":"ok"}` |
 | `401` | Invalid or expired pending token, or rejected code | `{"error":{"code":401,"message":"Invalid verification code"}}` — the wire body is identical for all failure modes so an attacker cannot distinguish "this pending token is valid; my code was wrong" from "this pending token is unknown." The distinguishing detail is in the audit `detail` column only. |
 
+An enrollment-pending token issued by the `mfa_enrollment_required` branch is **rejected** here (use `POST /login/mfa/enroll`); a login-challenge token is likewise rejected at the enroll endpoint.
+
+#### `POST /login/mfa/enroll`
+
+Complete enforced TOTP enrollment for an un-enrolled user. Called after receiving HTTP 202 `mfa_enrollment_required` from `POST /login` (only reachable under `--mfa-enforcement=admin-only|required`). The `POST /login` 202 already revealed the `otpauth_uri` + `secret_base32` for the user to scan; this endpoint confirms the first code, promotes the provisional secret to enrolled, mints the session, and returns the one-time recovery codes.
+
+**Permission:** None (unauthenticated — the enrollment-pending token is the bearer).
+
+**Request body (form-encoded):**
+
+```
+mfa_pending_token=<64-hex>&code=<6-digit TOTP>
+```
+
+Only a 6-digit TOTP code is accepted (recovery codes do not exist until enrollment completes). Shares the `is_login` per-IP rate-limit bucket and the 5-attempts-per-pending cap.
+
+**Responses:**
+
+| Status | Condition | Body |
+|---|---|---|
+| `200` + `Set-Cookie: yuzu_session=…` | Code accepted; enrollment complete, session minted | `{"status":"ok","recovery_codes":["XXXX-XXXX-XXXX-XXXX", … 10 total]}` — revealed **once**; save them |
+| `401` | Invalid/expired pending token, wrong token type, malformed or rejected code, or attempts exhausted | `{"error":{"code":401,"message":"Invalid verification code"}}` (uniform body; discriminator in the audit `detail`) |
+| `503` | `auth.db` unavailable | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
+
+**Audit:** on success `mfa.enroll.verified` + `mfa.recovery_codes.generated` + `auth.login`; on failure `mfa.enroll.failed`.
+
 #### `POST /login/mfa/stepup`
 
 Refresh a session's MFA proof so the next high-risk REST/Settings mutation is accepted within the `mfa_step_up_window_secs` window (PR 2 of the MFA ladder). Called automatically by the dashboard HTMX layer when a request to a step-up-gated endpoint returns `401 mfa_step_up_required`; programmatic clients invoke it directly.
@@ -4462,7 +4490,7 @@ Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpret
 | Status | Condition | Body |
 |---|---|---|
 | `200` | Code accepted; session's `mfa_verified_at` refreshed to now | `{"status":"ok"}` |
-| `400` | Missing `code`, or principal is an API/MCP token | `{"error":{"code":400,"message":"missing code"}}` or `step-up is for session-cookie callers only` |
+| `400` | Missing `code`, or principal is an API/MCP token, or an **OIDC** session (OIDC re-proves via SSO, not local step-up — the body points to `/auth/oidc/start`) | `{"error":{"code":400,"message":"missing code"}}` / `step-up is for session-cookie callers only` / `OIDC sessions re-prove MFA by re-authenticating with the identity provider …` |
 | `401` | No session cookie, or rejected code | `{"error":{"code":401,"message":"MFA step-up failed"}}` |
 | `503` | `auth_db` unavailable (transient) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
 
@@ -4496,6 +4524,8 @@ The following 11 endpoints return `401` with an MFA step-up envelope when the ca
 - `DELETE /api/settings/users/{username}` (delete user)
 - `POST /api/settings/users/{username}/role` (change user role)
 
+For **OIDC** sessions the envelope's `challenge_url` is `/auth/oidc/start` (and the remediation points at re-SSO) instead of `/login/mfa/stepup` — an external identity has no local TOTP secret to step up against. An OIDC session whose IdP did not attest MFA at all (no `amr`) passes the gate rather than being blocked.
+
 Envelope shape:
 
 ```json
@@ -4514,7 +4544,7 @@ Envelope shape:
 }
 ```
 
-`meta.mfa_step_up_required` is the boolean discriminator that distinguishes this 401 from an "unauthenticated" 401; `meta.challenge_url` lets a forward-compatible client route to a future operator-configurable step-up path without re-templating. API token / MCP token principals **never see this 401** — the gate skips them entirely (the bearer credential was issued as part of an authenticated session and is itself the step-up).
+`meta.mfa_step_up_required` is the boolean discriminator that distinguishes this 401 from an "unauthenticated" 401; `meta.challenge_url` tells the client where to re-prove — `/login/mfa/stepup` for local sessions, `/auth/oidc/start` for OIDC sessions. API token / MCP token principals **never see this 401** — the gate skips them entirely (the bearer credential was issued as part of an authenticated session and is itself the step-up).
 
 #### `POST /logout`
 

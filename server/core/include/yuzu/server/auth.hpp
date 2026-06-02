@@ -270,10 +270,20 @@ public:
 
     /// Create a session for an externally-authenticated user (OIDC).
     /// Role: admin if user is in the admin group, or email/name matches a local admin.
+    ///
+    /// `mfa_verified_at` seeds the new session's MFA-proof timestamp. The
+    /// caller passes a non-default `steady_clock` value only when the IdP
+    /// attested a multi-factor login via the `amr` claim (PR3 / SOC 2
+    /// CC6.6). A default-constructed value leaves the session un-stepped-up,
+    /// so the local step-up gate prompts for a TOTP code on the first
+    /// high-risk action. Must be `steady_clock` (not the wall-clock `iat`)
+    /// so an NTP step cannot extend the step-up window — see
+    /// docs/auth-mfa-design.md hard invariant #5.
     std::string create_oidc_session(const std::string& display_name, const std::string& email,
                                     const std::string& oidc_sub,
                                     const std::vector<std::string>& groups = {},
-                                    const std::string& admin_group_id = {});
+                                    const std::string& admin_group_id = {},
+                                    std::chrono::steady_clock::time_point mfa_verified_at = {});
 
     const std::filesystem::path& config_path() const { return cfg_path_; }
 

@@ -49,6 +49,11 @@ struct IdTokenClaims {
     int64_t exp{0};
     int64_t iat{0};
     std::vector<std::string> groups; // Entra security group object IDs
+    /// RFC 8176 Authentication Method Reference values asserted by the IdP
+    /// (Entra adds the non-standard "mfa" value). Parsed so /auth/callback
+    /// can seed the session's MFA-verified timestamp when the IdP attests a
+    /// multi-factor login. Empty when the IdP omits the claim.
+    std::vector<std::string> amr;
 };
 
 /// Cached JWK public key for JWT signature verification.

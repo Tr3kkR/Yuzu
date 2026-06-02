@@ -35,6 +35,7 @@
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <filesystem>
@@ -581,6 +582,304 @@ TEST_CASE("POST /login/mfa/stepup with wrong TOTP returns 401 + mfa.step_up.fail
         }
     }
     CHECK(saw_totp_reject);
+}
+
+// ── /login/mfa/enroll + enforcement bootstrap tests (PR3) ─────────────────
+
+TEST_CASE("POST /login under mfa_enforcement=required: un-enrolled user gets 202 enrollment "
+          "challenge, no cookie",
+          "[mfa][enroll][routes][auth_routes]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required"; // cfg_ is held by reference
+    auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(res->body.find(R"("status":"mfa_enrollment_required")") != std::string::npos);
+    CHECK(res->body.find(R"("otpauth_uri")") != std::string::npos);
+    CHECK(res->body.find(R"("secret_base32")") != std::string::npos);
+    // No session is minted until the operator confirms the first code.
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(h.count_audits("mfa.enroll.required", "alice") >= 1);
+    CHECK(h.count_audits("auth.login", "alice") == 0);
+}
+
+TEST_CASE("POST /login/mfa/enroll completes enforced enrollment: 200 + cookie + recovery codes",
+          "[mfa][enroll][routes][auth_routes]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    std::string pending = body.at("mfa_pending_token");
+    std::string secret = body.at("secret_base32");
+
+    auto code = h.totp_at(secret, 0);
+    auto step2 = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 200);
+    CHECK(step2->get_header_value("Set-Cookie").find("yuzu_session=") != std::string::npos);
+    auto rbody = nlohmann::json::parse(step2->body);
+    CHECK(rbody.at("status") == "ok");
+    REQUIRE(rbody.contains("recovery_codes"));
+    CHECK(rbody.at("recovery_codes").size() == 10);
+    CHECK(h.count_audits("mfa.enroll.verified", "alice") >= 1);
+    CHECK(h.count_audits("mfa.recovery_codes.generated", "alice") >= 1);
+    CHECK(h.count_audits("auth.login", "alice") >= 1);
+    // The user is now genuinely enrolled.
+    auto status = h.auth_db.mfa_status("alice");
+    REQUIRE(status.has_value());
+    CHECK(status->enrolled);
+}
+
+TEST_CASE("POST /login under mfa_enforcement=admin-only: admin enrolls, regular user logs in "
+          "normally",
+          "[mfa][enroll][routes][auth_routes]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "admin-only";
+
+    // Un-enrolled admin → enrollment challenge, no cookie.
+    auto a = h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                         "application/x-www-form-urlencoded");
+    REQUIRE(a);
+    CHECK(a->status == 202);
+    CHECK(a->body.find(R"("status":"mfa_enrollment_required")") != std::string::npos);
+    CHECK(a->get_header_value("Set-Cookie").empty());
+
+    // Un-enrolled regular user → normal session, enforcement does not apply.
+    auto u = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                         "application/x-www-form-urlencoded");
+    REQUIRE(u);
+    CHECK(u->status == 200);
+    CHECK(u->get_header_value("Set-Cookie").find("yuzu_session=") != std::string::npos);
+    CHECK(h.count_audits("mfa.enroll.required", "alice") == 0);
+}
+
+TEST_CASE("POST /login under enforcement: already-enrolled user gets the login challenge, not "
+          "enrollment",
+          "[mfa][enroll][routes][auth_routes]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    h.enroll_mfa("alice");
+    auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(res->body.find(R"("status":"mfa_required")") != std::string::npos);
+    CHECK(res->body.find("mfa_enrollment_required") == std::string::npos);
+}
+
+TEST_CASE("enrollment token replayed at /login/mfa is rejected",
+          "[mfa][enroll][routes][auth_routes]") {
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto e1 = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                          "application/x-www-form-urlencoded");
+    REQUIRE(e1->status == 202);
+    auto ebody = nlohmann::json::parse(e1->body);
+    std::string enroll_token = ebody.at("mfa_pending_token");
+    std::string secret = ebody.at("secret_base32");
+    auto code = h.totp_at(secret, 0);
+
+    auto bad = h.sink.Post("/login/mfa",
+                           form({{"mfa_pending_token", enroll_token}, {"code", code}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(bad);
+    CHECK(bad->status == 401);
+    AuditQuery q;
+    q.action = "mfa.login.failed";
+    auto rows = h.audit_store->query(q);
+    bool saw = false;
+    for (const auto& r : rows) {
+        if (r.detail.find("enrollment token used at login-challenge endpoint") !=
+            std::string::npos) {
+            saw = true;
+            break;
+        }
+    }
+    CHECK(saw);
+}
+
+TEST_CASE("login-challenge token replayed at /login/mfa/enroll is rejected",
+          "[mfa][enroll][routes][auth_routes]") {
+    AuthRoutesHarness h;
+    auto secret = h.enroll_mfa("admin");
+    auto step1 = h.sink.Post("/login",
+                             form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    std::string login_token = body.at("mfa_pending_token");
+    auto code = h.totp_at(secret, 1);
+
+    auto bad = h.sink.Post("/login/mfa/enroll",
+                           form({{"mfa_pending_token", login_token}, {"code", code}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(bad);
+    CHECK(bad->status == 401);
+    AuditQuery q;
+    q.action = "mfa.enroll.failed";
+    auto rows = h.audit_store->query(q);
+    bool saw = false;
+    for (const auto& r : rows) {
+        if (r.detail.find("login-challenge token used at enrollment endpoint") !=
+            std::string::npos) {
+            saw = true;
+            break;
+        }
+    }
+    CHECK(saw);
+}
+
+TEST_CASE("POST /login enforced + auth_db unavailable fails CLOSED with 503",
+          "[mfa][enroll][routes][auth_routes]") {
+    // GOVERNANCE qe-B1 / SOC 2 CC6.6 fail-closed. Under enforcement, if the
+    // store that holds TOTP secrets is unavailable, /login must refuse to
+    // mint a session (503) rather than silently mint an unprotected one.
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    h.auth_mgr.set_auth_db(nullptr); // verify_password still works (in-memory users_)
+    auto res = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Set-Cookie").empty());
+    CHECK(h.count_audits("mfa.enroll.required", "alice") >= 1);
+}
+
+TEST_CASE("POST /login/mfa/enroll + auth_db unavailable fails CLOSED with 503",
+          "[mfa][enroll][routes][auth_routes]") {
+    // qe-B1: the enroll endpoint's own 503 fail-closed branch.
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    std::string pending = body.at("mfa_pending_token");
+
+    h.auth_mgr.set_auth_db(nullptr); // store drops out before the confirm
+    auto step2 = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", "123456"}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 503);
+    CHECK(step2->get_header_value("Set-Cookie").empty());
+    CHECK(h.count_audits("mfa.enroll.failed", "alice") >= 1);
+}
+
+TEST_CASE("POST /login/mfa/enroll attempts cap erases pending after 5 failures",
+          "[mfa][enroll][routes][auth_routes]") {
+    // qe-B2: enrollment-bootstrap brute-force cap parity with /login/mfa.
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    std::string pending = body.at("mfa_pending_token");
+    std::string secret = body.at("secret_base32");
+
+    for (int i = 0; i < 5; ++i) {
+        auto r = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", "000000"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 401);
+    }
+    // 6th attempt with the CORRECT code — entry was erased after the 5th
+    // failure, so it still 401s (token gone).
+    auto good = h.sink.Post("/login/mfa/enroll",
+                            form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 0)}}),
+                            "application/x-www-form-urlencoded");
+    REQUIRE(good);
+    CHECK(good->status == 401);
+    AuditQuery q;
+    q.action = "mfa.enroll.failed";
+    auto rows = h.audit_store->query(q);
+    bool saw_exhausted = false;
+    for (const auto& r : rows) {
+        if (r.detail.find("attempts exhausted") != std::string::npos) {
+            saw_exhausted = true;
+            break;
+        }
+    }
+    CHECK(saw_exhausted);
+}
+
+TEST_CASE("POST /login/mfa/enroll non-6-digit code is rejected as malformed, token survives",
+          "[mfa][enroll][routes][auth_routes]") {
+    // qe-S1: shape gate. Recovery codes don't exist at enroll time, so a
+    // non-6-digit code is "malformed", not routed to recovery.
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    std::string pending = body.at("mfa_pending_token");
+    std::string secret = body.at("secret_base32");
+
+    auto bad = h.sink.Post("/login/mfa/enroll",
+                           form({{"mfa_pending_token", pending}, {"code", "12345"}}),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(bad);
+    CHECK(bad->status == 401);
+    AuditQuery q;
+    q.action = "mfa.enroll.failed";
+    auto rows = h.audit_store->query(q);
+    bool saw_malformed = false;
+    for (const auto& r : rows) {
+        if (r.detail.find("malformed") != std::string::npos)
+            saw_malformed = true;
+    }
+    CHECK(saw_malformed);
+    // Token survived (attempts < cap) — the correct code now completes.
+    auto good = h.sink.Post("/login/mfa/enroll",
+                            form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 0)}}),
+                            "application/x-www-form-urlencoded");
+    REQUIRE(good);
+    CHECK(good->status == 200);
+}
+
+TEST_CASE("POST /login/mfa/enroll concurrent submit with same token: exactly one wins",
+          "[mfa][enroll][routes][auth_routes]") {
+    // qe-S2: the enroll endpoint's atomic move-out-on-lookup must mint
+    // exactly one session under a same-token race, like /login/mfa.
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    std::string pending = body.at("mfa_pending_token");
+    std::string code = h.totp_at(body.at("secret_base32"), 0);
+
+    std::atomic<int> successes{0};
+    std::atomic<int> failures{0};
+    auto worker = [&]() {
+        auto r = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", code}}),
+                             "application/x-www-form-urlencoded");
+        if (r && r->status == 200)
+            ++successes;
+        else
+            ++failures;
+    };
+    std::thread t1(worker);
+    std::thread t2(worker);
+    t1.join();
+    t2.join();
+    CHECK(successes.load() == 1);
+    CHECK(failures.load() == 1);
 }
 
 TEST_CASE("POST /login/mfa concurrent submit with same token: exactly one wins",

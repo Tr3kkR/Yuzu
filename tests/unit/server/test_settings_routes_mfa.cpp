@@ -290,6 +290,57 @@ TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
     CHECK(status->recovery_codes_remaining == 0);
 }
 
+TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement (PR3 invariant)",
+          "[mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    // Enroll admin first.
+    auto init = h.auth_db.mfa_init_enrollment("admin", "Yuzu");
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db.mfa_verify_enrollment("admin", code).has_value());
+
+    // Turn on enforcement (cfg is held by reference by SettingsRoutes).
+    h.cfg.mfa_enforcement = "required";
+
+    auto res = post_same_origin(h.sink, "/api/settings/mfa/disable");
+    REQUIRE(res);
+    CHECK(res->status == 200); // fragment-with-error convention, not a hard status
+    CHECK(res->body.find("required by policy") != std::string::npos);
+    // Audit captures the policy block.
+    CHECK(h.has_audit("mfa.disabled", "error", "admin"));
+    CHECK(h.audit_detail("mfa.disabled").find("blocked: mfa_enforcement=required") !=
+          std::string::npos);
+    // Crucially, MFA is STILL enrolled — the disable did not take effect.
+    auto status = h.auth_db.mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK(status->enrolled);
+}
+
+TEST_CASE("POST /api/settings/mfa/disable under admin-only blocks admins but the gate is "
+          "role-scoped",
+          "[mfa][routes][settings]") {
+    MfaSettingsHarness h;
+    auto init = h.auth_db.mfa_init_enrollment("admin", "Yuzu");
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    REQUIRE(h.auth_db.mfa_verify_enrollment("admin", code).has_value());
+
+    h.cfg.mfa_enforcement = "admin-only";
+    // Admin (session_role defaults to admin) is protected.
+    auto res = post_same_origin(h.sink, "/api/settings/mfa/disable");
+    REQUIRE(res);
+    CHECK(res->body.find("required by policy") != std::string::npos);
+    auto status = h.auth_db.mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK(status->enrolled);
+}
+
 TEST_CASE("Non-admin same-origin POST: 403 from admin_fn after origin_safe passes",
           "[mfa][routes][settings]") {
     MfaSettingsHarness h;

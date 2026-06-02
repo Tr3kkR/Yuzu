@@ -170,9 +170,11 @@ int main(int argc, char* argv[]) {
 
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
-                   "MFA enforcement: optional|admin-only|required (default: optional). "
-                   "PR1 ships only \"optional\" semantics (self-service enrollment); "
-                   "admin-only/required wire up in a follow-up PR.")
+                   "MFA enforcement (default: optional). \"optional\" = self-service "
+                   "enrollment, login never requires it. \"admin-only\" = admins must "
+                   "enrol before login completes. \"required\" = every role must enrol. "
+                   "Under admin-only/required an un-enrolled login is redirected through "
+                   "TOTP enrollment (POST /login/mfa/enroll) before a session is minted.")
         ->default_val("optional")
         ->check(CLI::IsMember({"optional", "admin-only", "required"}))
         ->envname("YUZU_MFA_ENFORCEMENT");
@@ -357,20 +359,16 @@ int main(int argc, char* argv[]) {
     CLI11_PARSE(app, argc, argv);
 
     // ── MFA enforcement mode advisory ──
-    // PR1 of the TOTP MFA ladder honours only `optional` semantics. The
-    // flag accepts `admin-only` and `required` for forward-compat so
-    // operators can stage their service files now, but those values are
-    // silent no-ops until the enforcement PR ships. Make the silent
-    // no-op loud at startup — operators who expect enforcement will see
-    // the warning in journald and adjust expectations (Gate 6 sre +
-    // enterprise-readiness ER-ASSURANCE-2).
+    // Surface the active enforcement mode once at startup so an auditor
+    // reading the boot log can confirm the deployment's posture (SOC 2
+    // CC6.6 evidence). `admin-only` and `required` redirect an un-enrolled
+    // login through TOTP enrollment before a session is minted; `optional`
+    // (default) leaves enrollment self-service.
     if (cfg.mfa_enforcement != "optional") {
-        spdlog::warn(
-            "--mfa-enforcement={} is set but this build only honours \"optional\" semantics. "
-            "Admin-only / required enforcement modes are scheduled for a follow-up PR; until "
-            "then no MFA enrollment is required for login. Set --mfa-enforcement=optional to "
-            "silence this warning.",
-            cfg.mfa_enforcement);
+        spdlog::info("MFA enforcement active: mode={} — un-enrolled {} must complete TOTP "
+                     "enrollment at login before a session is issued.",
+                     cfg.mfa_enforcement,
+                     cfg.mfa_enforcement == "required" ? "users" : "admins");
     }
     // PR2 governance Gate 2 sec-M6: the step-up gate honours
     // window_secs <= 0 as an "escape hatch" that lets every request
