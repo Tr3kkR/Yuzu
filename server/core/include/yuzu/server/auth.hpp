@@ -43,6 +43,12 @@ struct Session {
     std::string oidc_sub;             // OIDC subject claim (empty for local auth)
     std::string token_scope_service;  // Non-empty = token scoped to this service
     std::string mcp_tier;             // "readonly", "operator", "supervised", or "" (not MCP)
+    /// Timestamp of the most recent successful MFA proof on this session
+    /// (login completion or step-up). Default-constructed sentinel means
+    /// "no MFA proof yet". Compared against
+    /// `steady_clock::now() - cfg.mfa_step_up_window_secs` by high-risk
+    /// route handlers. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
+    std::chrono::steady_clock::time_point mfa_verified_at{};
 };
 
 // ── Enrollment tokens (Tier 2) ──────────────────────────────────────────────
@@ -159,6 +165,28 @@ public:
     std::optional<std::string> authenticate(const std::string& username,
                                             const std::string& password);
 
+    /// Verify a username+password without creating a session. Returns the
+    /// user's legacy role on match, nullopt on failure (unknown user /
+    /// bad password / user soft-deleted in AuthDB). Used by the MFA-aware
+    /// login flow at AuthRoutes::POST /login to decide between "mint full
+    /// session now" (no MFA enrolled) and "issue a pending token, wait
+    /// for TOTP" (MFA enrolled). Histogram metrics observed on every call
+    /// using the same labels as authenticate().
+    std::optional<Role> verify_password(const std::string& username, const std::string& password);
+
+    /// Create a session for a user who has already cleared the password
+    /// and any required MFA checks. Mirrors create_oidc_session but with
+    /// `auth_source="local"`. If `mfa_verified` is true, stamps
+    /// `mfa_verified_at = steady_clock::now()` so the step-up window
+    /// covers immediate high-risk actions taken right after login.
+    std::string create_local_session(const std::string& username, Role role, bool mfa_verified);
+
+    /// Stamp `mfa_verified_at = steady_clock::now()` on the named session.
+    /// Returns true if the session existed and was updated. Used by the
+    /// /login/mfa/stepup route (PR 2) to mark an already-issued session
+    /// as freshly MFA-verified.
+    bool mark_session_mfa_verified(const std::string& token);
+
     /// Look up a session by cookie token.
     std::optional<Session> validate_session(const std::string& token) const;
 
@@ -215,6 +243,13 @@ public:
     /// If not set, falls back to config file I/O (backwards compatible).
     void set_auth_db(yuzu::server::AuthDB* db) { auth_db_ = db; }
 
+    /// Non-owning AuthDB pointer (or nullptr if not configured). Exposed
+    /// for the MFA-aware login flow at AuthRoutes::POST /login, which
+    /// needs to call mfa_status / mfa_verify_login_code without taking
+    /// AuthDB as a new constructor parameter. AuthManager remains the
+    /// owner of the wiring decision.
+    yuzu::server::AuthDB* auth_db_ptr() const noexcept { return auth_db_; }
+
     /// True iff a configured AuthDB is set AND it reports `is_ready()`.
     /// Wired into /readyz; operators rely on this to detect a corrupt or
     /// half-migrated auth.db without having to scrape spdlog. Returns
@@ -227,6 +262,11 @@ public:
     /// Optional; if null, authenticate() emits no metric (used by tests
     /// that don't construct the server's MetricsRegistry).
     void set_metrics_registry(yuzu::MetricsRegistry* m) { metrics_ = m; }
+
+    /// Non-owning MetricsRegistry pointer (or nullptr in test/cli
+    /// contexts). Exposed so AuthRoutes can emit MFA-domain counters
+    /// without taking MetricsRegistry as another constructor parameter.
+    yuzu::MetricsRegistry* metrics_registry() const noexcept { return metrics_; }
 
     /// Create a session for an externally-authenticated user (OIDC).
     /// Role: admin if user is in the admin group, or email/name matches a local admin.

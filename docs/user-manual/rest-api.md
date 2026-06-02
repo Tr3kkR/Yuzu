@@ -1361,6 +1361,7 @@ Query audit events.
 | `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result=success`. Emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
+| `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; the dispatch targets zero devices from that set and continues. |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
 | `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result=success`. Detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row. |
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
@@ -3377,6 +3378,49 @@ These endpoints drive the **Settings → Plugin Code Signing** card. The four `/
 
 ---
 
+### Settings — Multi-Factor Authentication (MFA / TOTP)
+
+These endpoints drive the **Settings → Multi-Factor Authentication** card. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than JSON. All five require an admin session and target `#mfa-section` for swap-in. SOC 2 CC6.6 — see `docs/auth-mfa-design.md`.
+
+**`GET /fragments/settings/mfa`** — Render the MFA card for the logged-in admin.
+
+- **Permission:** Admin only.
+- **Response (200):** HTML fragment showing current status (`Not enrolled` / `Enabled` / `Disabled`), recovery codes remaining, and the operative action buttons.
+
+**`POST /api/settings/mfa/init`** — Begin TOTP enrollment.
+
+- **Permission:** Admin only.
+- **Effect:** Generates a fresh 20-byte CSPRNG secret and stores it provisionally (`mfa_enrolled_at` stays NULL). Re-running on an already-provisional row rotates the secret; refused if the user is already enrolled (`MfaAlreadyEnrolled` → 200 with error message in the fragment).
+- **Response (200):** HTML fragment containing the `otpauth://` URI + base32 secret as a one-time reveal, plus the verify-code form. Response carries `Cache-Control: no-store, private`, `Pragma: no-cache`, and `Referrer-Policy: no-referrer` so browsers / proxies / CDNs cannot retain the material.
+- **Audit:** `mfa.enroll.initiated` / `ok` (or `error` on failure).
+
+**`POST /api/settings/mfa/verify`** — Confirm enrollment by submitting the first TOTP code.
+
+- **Permission:** Admin only.
+- **Request body (form-encoded):** `code=<6-digit TOTP from authenticator>`.
+- **Effect on success:** Sets `mfa_enrolled_at = CURRENT_TIMESTAMP`, advances `mfa_last_counter` to the matched counter (replay defence), generates 10 single-use recovery codes (PBKDF2-SHA256 hashed in `mfa_recovery_codes`).
+- **Response (200, success):** HTML fragment with the 10 recovery codes as a one-time reveal (`XXXX-XXXX-XXXX-XXXX`, 80 bits each). Same `Cache-Control: no-store` headers as `init`.
+- **Response (200, failure):** Re-renders the verify form with an instruction to wait for the next 30 s code. Provisional row survives so the operator's authenticator app keeps working; the secret is NOT re-revealed.
+- **Audit:** `mfa.enroll.verified` + `mfa.recovery_codes.generated` on success; `mfa.enroll.failed` on rejection.
+
+**`POST /api/settings/mfa/recovery-codes`** — Regenerate the 10 recovery codes.
+
+- **Permission:** Admin only. Requires existing enrollment.
+- **Effect:** Atomic DELETE + 10×INSERT inside a `BEGIN IMMEDIATE / COMMIT` transaction. All prior codes (consumed and unconsumed) are invalidated.
+- **Response (200):** HTML fragment with the fresh 10 codes as a one-time reveal. Same `Cache-Control: no-store` headers.
+- **Audit:** `mfa.recovery_codes.generated` / `ok` (detail = `10 codes issued (rotation)`).
+
+**`POST /api/settings/mfa/disable`** — Clear MFA state for the logged-in admin.
+
+- **Permission:** Admin only.
+- **Effect:** Atomic UPDATE users (clears `mfa_totp_secret`, `mfa_enrolled_at`; stamps `mfa_disabled_at`) + DELETE `mfa_recovery_codes` inside a `BEGIN IMMEDIATE / COMMIT` transaction.
+- **Response (200):** HTML fragment showing the "Not enrolled" state.
+- **Audit:** `mfa.disabled` / `ok` (or `error` on DB failure).
+
+> **Note — admin force-disable for other users:** the PR 1 endpoints are self-service only. An admin cannot disable another user's MFA via the dashboard or REST in this release; that feature is planned. For emergency lockout recovery use the break-glass procedure in `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable.
+
+---
+
 ### Settings — User Management
 
 These endpoints drive the **Settings → Users** tab. They are legacy (no `/v1/` prefix) and return HTMX fragments rather than the standard JSON envelope. All three require an admin session and the dashboard swaps the response body into `#user-section`.
@@ -3793,6 +3837,8 @@ Estimate how many agents match a scope expression.
   "expression": "os = 'windows' AND tag:environment = 'production'"
 }
 ```
+
+A `from_result_set:<id-or-alias>` reference in the expression is resolved against the authenticated principal's owned result sets before the estimate is computed (see the [scope DSL §9.3](../yaml-dsl-spec.md)). An alias that resolves to an absent, expired, or unowned set counts as zero members.
 
 ---
 
@@ -4356,7 +4402,9 @@ These endpoints manage user sessions and SSO flows.
 
 #### `POST /login`
 
-Authenticate with username and password. Sets the `yuzu_session` cookie on success.
+Authenticate with username and password.
+
+**Permission:** None (unauthenticated).
 
 **Request body (form-encoded):**
 
@@ -4364,8 +4412,109 @@ Authenticate with username and password. Sets the `yuzu_session` cookie on succe
 username=admin&password=secretpass
 ```
 
-**Success:** Redirect to `/` (dashboard).
-**Failure:** Redirect to `/login?error=1`.
+**Responses:**
+
+| Status | Condition | Body |
+|---|---|---|
+| `200` + `Set-Cookie: yuzu_session=…` | Credentials valid; user has no MFA enrolled | `{"status":"ok"}` |
+| `202` | Credentials valid; user has TOTP MFA enrolled | `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` — complete the challenge by posting the pending token + TOTP code (or recovery code) to `POST /login/mfa` |
+| `401` | Invalid credentials | `{"error":{"code":401,"message":"Invalid username or password"}}` |
+
+The `mfa_pending_token` is a 32-byte hex (64-char) opaque random; its lifetime is `cfg.mfa_login_pending_secs` (default 120 s). The pending state lives in process memory and is lost on server restart, and is not shared across HA replicas without sticky sessions.
+
+#### `POST /login/mfa`
+
+Complete a pending MFA login. Called after receiving HTTP 202 from `POST /login`.
+
+**Permission:** None (unauthenticated — the pending token is the bearer).
+
+**Request body (form-encoded):**
+
+```
+mfa_pending_token=<64-hex>&code=<6-digit TOTP or XXXX-XXXX-XXXX-XXXX recovery code>
+```
+
+The endpoint distinguishes TOTP from recovery by code shape — exactly 6 ASCII digits is interpreted as TOTP; anything else routes through recovery-code validation. Each pending token allows at most 5 attempts before being invalidated; once invalidated the operator must start over from `POST /login`.
+
+**Responses:**
+
+| Status | Condition | Body |
+|---|---|---|
+| `200` + `Set-Cookie: yuzu_session=…` | Code accepted | `{"status":"ok"}` |
+| `401` | Invalid or expired pending token, or rejected code | `{"error":{"code":401,"message":"Invalid verification code"}}` — the wire body is identical for all failure modes so an attacker cannot distinguish "this pending token is valid; my code was wrong" from "this pending token is unknown." The distinguishing detail is in the audit `detail` column only. |
+
+#### `POST /login/mfa/stepup`
+
+Refresh a session's MFA proof so the next high-risk REST/Settings mutation is accepted within the `mfa_step_up_window_secs` window (PR 2 of the MFA ladder). Called automatically by the dashboard HTMX layer when a request to a step-up-gated endpoint returns `401 mfa_step_up_required`; programmatic clients invoke it directly.
+
+**Permission:** Existing session cookie (local or OIDC `auth_source`). API token / MCP token principals are step-up-exempt — they receive `400` here ("step-up is for session-cookie callers only — re-issue the API token to refresh MFA proof").
+
+**Request body (form-encoded):**
+
+```
+code=<6-digit TOTP or XXXX-XXXX-XXXX-XXXX recovery code>
+```
+
+Same strict-shape gate as `POST /login/mfa`: exactly 6 ASCII digits is interpreted as TOTP, anything else as a recovery code. There is no per-request attempts cap (the session is itself the credential and is rate-limited at the server layer via the shared `is_login` bucket).
+
+**Responses:**
+
+| Status | Condition | Body |
+|---|---|---|
+| `200` | Code accepted; session's `mfa_verified_at` refreshed to now | `{"status":"ok"}` |
+| `400` | Missing `code`, or principal is an API/MCP token | `{"error":{"code":400,"message":"missing code"}}` or `step-up is for session-cookie callers only` |
+| `401` | No session cookie, or rejected code | `{"error":{"code":401,"message":"MFA step-up failed"}}` |
+| `503` | `auth_db` unavailable (transient) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
+
+**Audit verbs:** `mfa.step_up.passed` on success (`detail=method=totp` or `method=recovery`); `mfa.step_up.failed` on each rejection with the rejection reason in `detail`.
+
+**Example:**
+
+```bash
+# After a high-risk request returned 401 + mfa_step_up_required, post your
+# current TOTP code (or a recovery code) to refresh the session's MFA proof:
+curl -s -X POST https://yuzu.example.com/login/mfa/stepup \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --cookie "yuzu_session=<session>" \
+  -d "code=123456"
+# 200 {"status":"ok"}
+```
+
+#### Step-up envelope on high-risk endpoints
+
+The following 11 endpoints return `401` with an MFA step-up envelope when the calling session's `mfa_verified_at` is older than `mfa_step_up_window_secs`:
+
+- `POST /api/v1/tokens` (mint API token)
+- `DELETE /api/v1/tokens/{id}` (revoke API token)
+- `DELETE /api/v1/sessions` (admin force-logout another user)
+- `POST /api/v1/software-packages` (upload software package)
+- `POST /api/v1/software-deployments/{id}/start` (start deployment)
+- `POST /api/v1/guaranteed-state/rules` (create Guardian rule)
+- `PUT /api/v1/guaranteed-state/rules/{id}` (update Guardian rule)
+- `DELETE /api/v1/guaranteed-state/rules/{id}` (delete Guardian rule)
+- `POST /api/v1/guaranteed-state/push` (fan out Guardian rules)
+- `DELETE /api/settings/users/{username}` (delete user)
+- `POST /api/settings/users/{username}/role` (change user role)
+
+Envelope shape:
+
+```json
+{
+  "error": {
+    "code": 401,
+    "message": "MFA step-up required",
+    "correlation_id": "req-...",
+    "remediation": "POST /login/mfa/stepup with current TOTP code or a recovery code, then retry"
+  },
+  "meta": {
+    "api_version": "v1",
+    "mfa_step_up_required": true,
+    "challenge_url": "/login/mfa/stepup"
+  }
+}
+```
+
+`meta.mfa_step_up_required` is the boolean discriminator that distinguishes this 401 from an "unauthenticated" 401; `meta.challenge_url` lets a forward-compatible client route to a future operator-configurable step-up path without re-templating. API token / MCP token principals **never see this 401** — the gate skips them entirely (the bearer credential was issued as part of an authenticated session and is itself the step-up).
 
 #### `POST /logout`
 

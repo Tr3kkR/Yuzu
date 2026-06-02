@@ -21,7 +21,9 @@
 #include <expected>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -46,6 +48,14 @@ enum class AuthDBError : std::uint8_t {
     InvalidUsername,
     InvalidCredentials,
     UserAlreadyExists,
+    /// Returned when an MFA-domain operation finds the user already
+    /// enrolled (e.g. mfa_init_enrollment called twice). Distinct from
+    /// `UserAlreadyExists` (which is a create-time conflict for the
+    /// users row) so SIEM rules and call-site error handlers can
+    /// distinguish "you already have MFA — disable first" from "user
+    /// account already exists at creation" — both surface as 409 to
+    /// the wire, but the audit-detail and operator messaging differ.
+    MfaAlreadyEnrolled,
 };
 
 // ── AuthDB Class ─────────────────────────────────────────────────────────────
@@ -55,6 +65,17 @@ public:
     /// Construct with the directory where auth.db should live.
     /// Call initialize() before any other method.
     explicit AuthDB(const std::filesystem::path& data_dir);
+
+    /// Construct with an explicit cleanup-thread cadence.
+    /// `cleanup_interval_secs` ≤ 0 disables the background reaper
+    /// entirely — used by unit tests that construct + destruct many
+    /// AuthDB instances back-to-back (see PR #1199: on macOS arm64 the
+    /// rapid `std::jthread` create/destroy cycle was triggering a
+    /// non-deterministic SIGSEGV in `test_mfa_store.cpp`). Production
+    /// callers use the single-argument overload and inherit the
+    /// 60-second default.
+    AuthDB(const std::filesystem::path& data_dir, int cleanup_interval_secs);
+
     ~AuthDB();
 
     // Non-copyable, non-movable
@@ -91,6 +112,17 @@ public:
 
     /// List all active users.
     std::expected<std::vector<auth::UserEntry>, AuthDBError> list_users();
+
+    /// Stamp `users.last_login_at = CURRENT_TIMESTAMP` for the named
+    /// user. Called by AuthManager after every successful local /
+    /// recovery-code login (the MFA-verified login path stamps it as
+    /// part of the same UPDATE that advances mfa_last_counter, so
+    /// this method is only needed for the no-MFA and OIDC paths).
+    /// SOC 2 CC7.2 — without it, `last_login_at` reports stale data on
+    /// dashboards and access reviews. Best-effort; failure is logged
+    /// but not surfaced to the caller (session creation has already
+    /// succeeded at the call site).
+    void touch_last_login(const std::string& username);
 
     /// Soft-delete a user (sets is_active = 0).
     /// Also invalidates all sessions for this user.
@@ -145,6 +177,102 @@ public:
     /// Called periodically by the background cleanup thread that
     /// `initialize()` spawns; safe to call manually as well.
     std::expected<int, AuthDBError> cleanup_expired_sessions();
+
+    /// Reap provisional MFA enrollment rows (init'd but never verified)
+    /// older than `older_than`. Clears `mfa_totp_secret` to NULL on any
+    /// row whose `mfa_enrolled_at IS NULL` AND `updated_at` is older
+    /// than the cutoff. Returns the count of rows cleared. SOC 2 CC6.6 —
+    /// dangling provisional secrets are usable until verified, and a
+    /// stale provisional row that survives indefinitely is a CC6.6
+    /// finding. Called on the same 60 s cadence as
+    /// `cleanup_expired_sessions`.
+    std::expected<int, AuthDBError>
+    cleanup_provisional_mfa(std::chrono::seconds older_than = std::chrono::hours(1));
+
+    // ── MFA / TOTP Operations ────────────────────────────────────────────
+    //
+    // SOC 2 CC6.6 (privileged access). See docs/auth-mfa-design.md and
+    // `/auth-and-authz` skill gap matrix entry P0 #1.
+    //
+    // Lifecycle: mfa_init_enrollment writes a fresh 20-byte HMAC-SHA1
+    // secret to users.mfa_totp_secret but leaves mfa_enrolled_at NULL —
+    // the row is "provisional" until mfa_verify_enrollment lands a code
+    // that proves the user has actually scanned the otpauth URI. Calling
+    // mfa_init_enrollment again on a provisional row rotates the secret
+    // and resets mfa_last_counter; calling it on an already-enrolled row
+    // returns AuthDBError::UserAlreadyExists (caller must mfa_disable first).
+    //
+    // Replay protection: mfa_verify_login_code persists the matched
+    // counter as mfa_last_counter and rejects any subsequent code <= that
+    // value within the ±skew window. The skew is hard-coded to ±1 step
+    // (90 s effective window) — RFC 6238 recommends a small skew and the
+    // server clock is assumed to be NTP-synced.
+
+    struct MfaStatus {
+        bool enrolled{false};
+        // SQLite DATETIME strings ("YYYY-MM-DD HH:MM:SS UTC") or empty.
+        // Returned as strings rather than parsed time_points because v1 only
+        // displays them; converting at the DB boundary would require chrono
+        // parsing helpers that aren't yet in tree.
+        std::string enrolled_at;
+        std::string disabled_at;
+        int recovery_codes_remaining{0};
+    };
+
+    struct MfaEnrollmentInit {
+        std::string secret_base32;
+        std::string otpauth_uri;
+    };
+
+    /// Read MFA status for a user. Returns a zero-initialised MfaStatus
+    /// (enrolled=false, recovery_codes_remaining=0) if the row exists
+    /// but has no MFA configured.
+    std::expected<MfaStatus, AuthDBError> mfa_status(const std::string& username);
+
+    /// Generate a fresh TOTP secret and write it as provisional. Returns
+    /// the base32 form + otpauth URI for the enrollment UI. Idempotent on
+    /// provisional rows; returns UserAlreadyExists on already-enrolled rows.
+    std::expected<MfaEnrollmentInit, AuthDBError>
+    mfa_init_enrollment(const std::string& username, std::string_view issuer);
+
+    /// Verify the first code against the provisional secret. On success,
+    /// stamps mfa_enrolled_at = CURRENT_TIMESTAMP, generates 10 recovery
+    /// codes (returned raw, hashed in DB), and returns the codes for the
+    /// one-time reveal. Idempotent on already-enrolled rows: returns
+    /// UserAlreadyExists.
+    std::expected<std::vector<std::string>, AuthDBError>
+    mfa_verify_enrollment(const std::string& username, std::string_view code);
+
+    /// Verify a TOTP code for login or step-up. Persists the matched
+    /// counter to mfa_last_counter on success. Returns true on match,
+    /// false on no-match. Rejects (false) if the user is not enrolled.
+    std::expected<bool, AuthDBError> mfa_verify_login_code(const std::string& username,
+                                                          std::string_view code);
+
+    /// Consume a single recovery code for login or step-up. Returns true
+    /// if the code matched an unconsumed row (and that row is now
+    /// consumed). False on no-match (also false if the user has no
+    /// recovery codes / is not enrolled).
+    std::expected<bool, AuthDBError> mfa_consume_recovery_code(const std::string& username,
+                                                               std::string_view raw_code);
+
+    /// Wipe the user's existing recovery codes and issue 10 fresh ones.
+    /// Returns the raw codes for one-time display. Requires the user to
+    /// be enrolled; returns UserNotFound on no enrollment.
+    std::expected<std::vector<std::string>, AuthDBError>
+    mfa_regenerate_recovery_codes(const std::string& username);
+
+    /// Disable MFA for a user. Clears the secret blob, stamps
+    /// mfa_disabled_at, and deletes all recovery codes. Idempotent on
+    /// not-enrolled rows.
+    std::expected<void, AuthDBError> mfa_disable(const std::string& username);
+
+    /// Update sessions.mfa_verified_at = CURRENT_TIMESTAMP on the row
+    /// matching session_token. Returns SessionNotFound if no row.
+    /// In-memory session state (AuthManager::sessions_) is updated by
+    /// the caller — this method only persists to DB.
+    std::expected<void, AuthDBError>
+    mfa_mark_session_stepup(const std::string& session_token);
 
     // ── Enrollment Token Operations ───────────────────────────────────────
 
