@@ -15,7 +15,8 @@ namespace yuzu::server {
 
 bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
                          const auth::Session& session, AuthDB& auth_db, int window_secs,
-                         const StepUpAuditFn& audit_fn, const std::string& action_label) {
+                         const StepUpAuditFn& audit_fn, const std::string& action_label,
+                         std::string_view mfa_enforcement) {
     // Escape hatch — operator disabled the gate. Treated as fresh.
     if (window_secs <= 0) {
         return true;
@@ -101,19 +102,26 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     const bool no_proof = session.mfa_verified_at.time_since_epoch().count() == 0;
 
     // OIDC sessions whose IdP did not attest MFA carry no seeded proof
-    // (no `amr` → `/auth/callback` never set `mfa_verified_at`). They have
-    // no second factor to step up against, exactly like an un-enrolled
-    // local user — so they PASS, not fail. Gating them here would 401 →
-    // `/auth/oidc/start` → silent re-SSO → same `amr`-less token → 401 …
-    // an infinite lockout loop, re-opening the PR #1199 HIGH for every
-    // non-MFA IdP (governance UP-5/UP-6). MFA on a non-MFA-IdP SSO session
-    // is the IdP's responsibility; Yuzu cannot mint a factor for an
-    // external identity. An OIDC session that DOES carry an `amr`-seeded
-    // proof falls through to the freshness check below (stale → re-SSO),
-    // so this is never weaker than the PR2 blanket exemption it replaces.
-    // A future opt-in (`--mfa-oidc-amr-required`) can harden this for
-    // operators who have confirmed their IdP asserts `amr`.
-    if (is_oidc && no_proof) {
+    // (no `amr` → `/auth/callback` never set `mfa_verified_at`). Whether
+    // that PASSES depends on enforcement, symmetric with how a local user
+    // is treated (Hermes adversarial + cyber A4/B1, governance UP-6):
+    //   - mode does NOT protect this principal's role (e.g. `optional`, or
+    //     `admin-only` for a non-admin) → PASS. There is no factor to step
+    //     up; gating would 401 → `/auth/oidc/start` → silent re-SSO → same
+    //     `amr`-less token → 401 … an infinite lockout loop for every
+    //     non-MFA IdP (the PR #1199 HIGH / UP-5). This keeps the default
+    //     deployment safe and is never weaker than the PR2 blanket exempt.
+    //   - mode DOES protect this role (`required`, or `admin-only` for an
+    //     admin) → step up (fall through to the 401 below, challenge =
+    //     re-SSO). The operator asked for MFA on this principal; an SSO
+    //     login the IdP did not MFA must re-authenticate. If the IdP never
+    //     asserts `amr` this is a deployment misconfiguration, recoverable
+    //     by restarting in `optional` (docs/ops-runbooks/auth-db-recovery
+    //     .md) — the same "you required MFA but provided no way to satisfy
+    //     it" footgun a local `required` deployment has.
+    // An OIDC session that DOES carry an `amr`-seeded proof always falls
+    // through to the freshness check below regardless of mode.
+    if (is_oidc && no_proof && !mfa_enforcement_protects(mfa_enforcement, session.role)) {
         return true;
     }
 

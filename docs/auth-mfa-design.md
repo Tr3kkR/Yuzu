@@ -311,13 +311,58 @@ hardened deployment could strip their own MFA and be forced back through
 enrollment at the next login (or, mid-session, lose access to every
 step-up-gated surface).
 
-**Accepted residual (UP-15).** Under enforcement, a caller who already
-knows a valid password can distinguish "enrolled" (`200`) from "enforced
-but un-enrolled" (`202 mfa_enrollment_required`) from "not enforced for
-this role" — a minor account-posture oracle. This is inherent to a
-login-time enrollment flow (the user must be told to enroll) and is only
-exposed to someone who has already passed password authentication, so it
-is accepted rather than closed.
+### Threat model — residual risks (reviewed, accepted/mitigated)
+
+- **Enrollment-bootstrap TOFU takeover (Hermes H-1).** Under enforcement,
+  an attacker who holds a victim's *password* but no second factor can,
+  on a still-un-enrolled account, complete the login-time enrollment
+  (bind their own authenticator, receive the recovery codes) before the
+  victim ever logs in — locking the victim out. This is **not a new
+  capability** vs `optional` mode (there, a password-holder can already
+  enrol MFA via Settings and lock the victim out); enforcement only makes
+  it more automatic by revealing the provisional secret at login. It is a
+  trust-on-first-use property of any self-service enrollment. **Mitigations
+  in place / tracked:** (a) the documented rollout — enrol all users under
+  `optional` *before* switching to `required` (upgrading.md) leaves no
+  un-enrolled account to hijack; (b) every bootstrap emits
+  `mfa.enroll.required` + `mfa.enroll.verified` audit rows for SOC/SIEM
+  alerting; (c) break-glass admin reset (#1226) and an out-of-band /
+  admin-provisioned enrollment channel are the durable fixes (roadmap).
+  The fundamental control remains "don't let the password be compromised."
+- **Stale-`iat` SSO re-prompt churn / livelock (Hermes M-1 + governance
+  UP-D6).** An IdP that re-issues id_tokens with a *stale* `iat` (does not
+  refresh it on re-auth) can leave an MFA'd SSO session perpetually past the
+  step-up window, re-prompting on every high-risk action. Under `required`
+  (where a no-`amr` session is also gated, A4/B1) this becomes a hard re-SSO
+  loop for high-risk endpoints rather than mere churn. Conformant IdPs
+  refresh `iat` on re-authentication, which resolves it; the iat-anchoring
+  is deliberate (a genuinely old MFA assertion *should* re-prompt).
+  Recovery for a misconfigured IdP is the out-of-band restart in `optional`
+  (a server restart, NOT an in-app login, so it survives the loop). Treated
+  as an IdP-configuration limitation, documented, not worked around
+  (clamping would defeat the staleness check). The future-`iat`/`nbf`
+  rejection uses a generous 300 s skew (not the 60 s `exp` skew) so honest
+  NTP drift does not cause a total SSO outage (UP-D4).
+- **Pending-token load-shed (Hermes H-2).** The in-memory pending map is
+  capped (`mfa_pending_cap_`, default 50k); at capacity `/login` 202
+  issuance is load-shed with a 503 and a `yuzu_auth_mfa_pending_load_shed_total`
+  counter (+ a `warn` log) for alerting. The cap bounds the O(n)-reap CPU/
+  lock DoS to O(n)·rps; a time-ordered map for O(log n) reap is a tracked
+  follow-up. A distributed flood of *valid-credential* logins can still fill
+  the cap and 503 legitimate logins fleet-wide until reap (≤ TTL) — the
+  per-IP `login_rate_limiter_` blunts single-source; distributed-with-valid-
+  creds is the residual, monitored via the new counter.
+- **Pending-token timing side-channel (Hermes M-2).** The "token not found"
+  path returns faster than "token found, code verified"; a precise attacker
+  could distinguish a valid pending token by timing. Low value (tokens are
+  32-byte random, 120 s TTL, 5-attempt cap, rate-limited) and pre-existing;
+  noted, not fixed.
+- **Account-posture oracle (UP-15).** Under enforcement, a caller who
+  already knows a valid password can distinguish "enrolled" (`200`) from
+  "enforced but un-enrolled" (`202 mfa_enrollment_required`). Inherent to a
+  login-time enrollment flow and only exposed post-password; accepted.
+  Aggressive per-username throttling belongs to the account-lockout work
+  (auth-and-authz roadmap), not here.
 
 ---
 
@@ -365,24 +410,36 @@ Entra and most OIDC IdPs assert the methods used to authenticate via the
 4. `require_mfa_step_up` no longer early-exempts `oidc`. It skips the local
    `mfa_status` lookup for OIDC sessions (there is no `users` row) and:
    - **No seeded proof** (`mfa_verified_at` default — the IdP did not
-     attest MFA, or omitted `iat`): **PASS**. There is no second factor to
-     step up against, exactly like an un-enrolled local user. Failing here
-     would 401 → `/auth/oidc/start` → silent re-SSO → same `amr`-less token
-     → 401 … an infinite lockout loop, re-opening the PR #1199 HIGH for
-     every non-MFA IdP (governance UP-5/UP-6). This is never weaker than
-     the PR 2 blanket exemption it replaces.
+     attest MFA, or omitted `iat`): the outcome is **enforcement-symmetric**
+     with how a local user is treated, keyed on
+     `mfa_enforcement_protects(mode, session.role)`:
+     - mode does **not** protect this role (`optional`, or `admin-only` for
+       a non-admin) → **PASS**. There is no second factor to step up;
+       gating would 401 → `/auth/oidc/start` → silent re-SSO → same
+       `amr`-less token → 401 … an infinite lockout loop for every non-MFA
+       IdP (governance UP-5/UP-6). This keeps the default deployment safe
+       and is never weaker than the PR 2 blanket exemption.
+     - mode **does** protect this role (`required`, or `admin-only` for an
+       admin) → **step up** (re-SSO). The operator required MFA for this
+       principal, so an SSO login the IdP did not MFA must re-authenticate
+       — symmetric with a local `required` user being forced to enrol. If
+       the IdP never asserts `amr`, this is a deployment misconfiguration,
+       recoverable by restarting in `optional`
+       (docs/ops-runbooks/auth-db-recovery.md). (Hermes adversarial + cyber
+       A4/B1 — closes the CC6.6 "enforcement that doesn't enforce on SSO"
+       gap; supersedes the originally-deferred `--mfa-oidc-amr-required`
+       flag by tying the behaviour to the enforcement mode itself.)
    - **Fresh `amr`-seeded proof** (within `mfa_step_up_window_secs`):
-     PASS — the SSO login's MFA clears the gate without a redundant prompt.
-   - **Stale `amr`-seeded proof** (older than the window): FAIL, with the
-     remediation pointing back through SSO (`challenge_url =
-     /auth/oidc/start`) — an external identity has no local secret for
-     `/login/mfa/stepup`. `/login/mfa/stepup` itself rejects an OIDC caller
-     with a precise 400 (governance cons-B1).
+     PASS regardless of mode — the SSO login's MFA clears the gate without
+     a redundant prompt.
+   - **Stale `amr`-seeded proof** (older than the window): FAIL regardless
+     of mode, remediation = re-SSO (`challenge_url = /auth/oidc/start`); an
+     external identity has no local secret for `/login/mfa/stepup`, which
+     itself rejects an OIDC caller with a precise 400 (governance cons-B1).
 
-   (`api_token` / `mcp_token` remain unconditionally exempt.) A future
-   opt-in `--mfa-oidc-amr-required` can hard-gate even the no-proof case
-   for operators who have confirmed their IdP asserts `amr` (tracked
-   follow-up).
+   (`api_token` / `mcp_token` remain unconditionally exempt.) The
+   enforcement mode is threaded into `require_mfa_step_up` from the shared
+   `StepUpFn` closure (server.cpp) — see hard invariant #8.
 
 ---
 
@@ -472,14 +529,19 @@ any later auth work) make sure none of these regress:
 7. **Self-target guard extends to MFA disable** (wired in PR 3). An
    operator cannot disable their own MFA while enforcement protects their
    role — `required` protects every role, `admin-only` protects admins.
-8. **OIDC step-up gating must not livelock a non-MFA IdP** (PR 3,
-   governance UP-5). `require_mfa_step_up` skips the local `mfa_status`
-   lookup for `auth_source == "oidc"` (no `users` row). An OIDC session
-   with **no** `amr`-seeded proof MUST pass (it has no factor to step up;
-   gating it loops it through `/auth/oidc/start` forever). Only an OIDC
-   session that carries an `amr`-seeded proof is freshness-gated. Two
-   regressions to guard against: (a) failing closed on the missing `users`
-   row — locks out every SSO operator (the original PR #1199 HIGH); (b)
-   gating the no-proof case — the UP-5 livelock. The seeded timestamp must
-   stay in the `steady_clock` domain (see #5), and `/login/mfa/stepup`
-   must keep rejecting OIDC callers (no local secret to verify).
+8. **OIDC step-up gating is enforcement-symmetric and must not livelock the
+   DEFAULT deployment** (PR 3, governance UP-5/UP-6 + Hermes A4/B1).
+   `require_mfa_step_up` skips the local `mfa_status` lookup for
+   `auth_source == "oidc"` (no `users` row). An OIDC session with **no**
+   `amr`-seeded proof passes **iff** `mfa_enforcement_protects(mode, role)`
+   is false (i.e. `optional`, or `admin-only` for a non-admin) — gating the
+   default/unprotected case loops it through `/auth/oidc/start` forever
+   (UP-5). Under a mode that protects the role it is gated (re-SSO), so
+   enforcement actually enforces on SSO. Regressions to guard against: (a)
+   failing closed on the missing `users` row — locks out every SSO operator
+   (original PR #1199 HIGH); (b) gating the no-proof case **under
+   `optional`** — the UP-5 livelock for the default deployment; (c)
+   *passing* the no-proof case **under `required`** — the CC6.6 enforcement
+   gap (Hermes A4/B1). The enforcement mode must stay threaded into the
+   gate. The seeded timestamp must stay in the `steady_clock` domain (#5),
+   and `/login/mfa/stepup` must keep rejecting OIDC callers.

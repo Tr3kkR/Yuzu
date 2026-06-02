@@ -48,6 +48,7 @@ struct IdTokenClaims {
     std::string nonce;
     int64_t exp{0};
     int64_t iat{0};
+    int64_t nbf{0}; // not-before (RFC 7519 §4.1.5); 0 = absent
     std::vector<std::string> groups; // Entra security group object IDs
     /// RFC 8176 Authentication Method Reference values asserted by the IdP
     /// (Entra adds the non-standard "mfa" value). Parsed so /auth/callback

@@ -46,12 +46,18 @@ What changes on upgrade if the flag is set to `admin-only` or `required`:
 2. Upgrade with the flag set and accept that affected un-enrolled users will
    be walked through enrollment on their next login.
 
-**SSO / OIDC pre-flight (required reading if you use SSO):** under enforcement,
-OIDC sessions are MFA-gated by the IdP's `amr` claim. Yuzu cannot mint a
-second factor for an external identity, so a non-MFA SSO login still passes
-the gate — but if you *intend* to require MFA for SSO users, **verify your IdP
-asserts an `amr` claim containing a recognized MFA method** (Entra: `mfa`;
-others: `otp`/`hwk`/etc., RFC 8176) *before* relying on enforcement for SSO.
+**SSO / OIDC pre-flight (required reading if you use SSO):** under
+`required` (and `admin-only` for admin SSO users), OIDC sessions are
+MFA-gated by the IdP's `amr` claim — an SSO login the IdP did **not** MFA
+is blocked from high-risk endpoints (it must re-authenticate via SSO),
+symmetric with a local user being forced to enrol. Yuzu cannot mint a
+second factor for an external identity, so **before enabling
+`required`/`admin-only` with SSO you MUST verify your IdP asserts an `amr`
+claim containing a recognized MFA method** (Entra: `mfa`; others:
+`otp`/`hwk`/etc., RFC 8176). If it does not, affected SSO users will be
+unable to reach high-risk endpoints — recoverable by restarting in
+`optional` (see `docs/ops-runbooks/auth-db-recovery.md`). Under `optional`,
+no IdP `amr` configuration is required (SSO sessions pass the gate).
 
 **Single-admin deployments:** do not first-boot a fresh single-admin
 deployment straight into `required`. Enroll the admin under `optional` first,

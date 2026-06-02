@@ -586,6 +586,29 @@ TEST_CASE("POST /login/mfa/stepup with wrong TOTP returns 401 + mfa.step_up.fail
 
 // ── /login/mfa/enroll + enforcement bootstrap tests (PR3) ─────────────────
 
+TEST_CASE("POST /login load-sheds with 503 when the pending-token map is at capacity (H-2)",
+          "[mfa][routes][auth_routes]") {
+    // Hermes H-2 / governance qe-B: the pending-map cap is exercised via the
+    // test-only seam (the production 50k is impractical to fill). The login
+    // challenge and enrollment issuance sites share byte-identical cap logic
+    // (consistency-auditor verified), so the challenge path covers both.
+    AuthRoutesHarness h;
+    h.auth_routes->set_mfa_pending_cap_for_test(2);
+    h.enroll_mfa("admin");
+    for (int i = 0; i < 2; ++i) {
+        auto r = h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                             "application/x-www-form-urlencoded");
+        REQUIRE(r);
+        CHECK(r->status == 202); // fills the map to the cap
+    }
+    auto shed = h.sink.Post("/login", form({{"username", "admin"}, {"password", "adminpassword1"}}),
+                            "application/x-www-form-urlencoded");
+    REQUIRE(shed);
+    CHECK(shed->status == 503);
+    CHECK(shed->body.find("too many pending authentications") != std::string::npos);
+    CHECK(shed->get_header_value("Set-Cookie").empty());
+}
+
 TEST_CASE("POST /login under mfa_enforcement=required: un-enrolled user gets 202 enrollment "
           "challenge, no cookie",
           "[mfa][enroll][routes][auth_routes]") {
@@ -751,9 +774,11 @@ TEST_CASE("POST /login enforced + auth_db unavailable fails CLOSED with 503",
     CHECK(h.count_audits("mfa.enroll.required", "alice") >= 1);
 }
 
-TEST_CASE("POST /login/mfa/enroll + auth_db unavailable fails CLOSED with 503",
+TEST_CASE("POST /login/mfa/enroll + auth_db unavailable fails closed with uniform 401",
           "[mfa][enroll][routes][auth_routes]") {
-    // qe-B1: the enroll endpoint's own 503 fail-closed branch.
+    // qe-B1 + Hermes L-1: the enroll db-null branch fails closed with the
+    // uniform 401 body (matching /login/mfa), not a distinct 503 that would
+    // leak pending-token validity during a store outage. No session minted.
     AuthRoutesHarness h;
     h.cfg.mfa_enforcement = "required";
     auto step1 =
@@ -768,7 +793,7 @@ TEST_CASE("POST /login/mfa/enroll + auth_db unavailable fails CLOSED with 503",
                              form({{"mfa_pending_token", pending}, {"code", "123456"}}),
                              "application/x-www-form-urlencoded");
     REQUIRE(step2);
-    CHECK(step2->status == 503);
+    CHECK(step2->status == 401);
     CHECK(step2->get_header_value("Set-Cookie").empty());
     CHECK(h.count_audits("mfa.enroll.failed", "alice") >= 1);
 }

@@ -152,9 +152,11 @@ API token / MCP token principals **bypass step-up entirely** — the token itsel
 OIDC/SSO sessions carry no local TOTP secret, so they cannot use `/login/mfa/stepup` (it returns `400` for an OIDC caller, pointing back to SSO). Instead, the step-up gate honours the IdP's RFC 8176 `amr` claim:
 
 - If the IdP attested a multi-factor login (`amr` contains `mfa`, `otp`, `hwk`, `fpt`, `face`, `iris`, `sms`, `swk`, or `tel`), the session is treated as stepped-up. Once that proof ages past `--mfa-step-up-window-secs`, high-risk endpoints return `401` with `challenge_url=/auth/oidc/start` — the operator re-authenticates through SSO to refresh it.
-- If the IdP did **not** attest MFA, the OIDC session passes the gate. Yuzu cannot mint a second factor for an externally-owned identity, so MFA on SSO sessions is the IdP's responsibility.
+- If the IdP did **not** attest MFA, the outcome depends on the enforcement mode, symmetric with how a local user is treated:
+  - Under `optional` (or `admin-only` for a non-admin SSO user): the session **passes** the gate. Yuzu cannot mint a second factor for an externally-owned identity, so for the default posture MFA on SSO is the IdP's responsibility.
+  - Under `required` (or `admin-only` for an admin SSO user): the session is **gated** — high-risk endpoints return `401` pointing to re-SSO. The operator required MFA for this principal, so an SSO login the IdP did not MFA must re-authenticate (just as a local `required` user is forced to enrol).
 
-**To require MFA for SSO users, configure your IdP to assert `amr` and verify it pre-flight before turning on `--mfa-enforcement`.** A future `--mfa-oidc-amr-required` opt-in will hard-gate SSO sessions for operators who have confirmed their IdP asserts `amr`.
+**Therefore, before turning on `--mfa-enforcement=required` (or `admin-only` for admin SSO users), configure your IdP to assert `amr` and verify it pre-flight** — otherwise those SSO users will be unable to reach high-risk endpoints (recoverable by restarting in `optional`; see the runbook). Under `optional`, no IdP `amr` configuration is required.
 
 #### Login-time enrollment (PR 3)
 

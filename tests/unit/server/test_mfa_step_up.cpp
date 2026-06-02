@@ -327,11 +327,65 @@ TEST_CASE_METHOD(StepUpFixture,
     REQUIRE_FALSE(db->mfa_status("carol").has_value()); // no local row
     auto session = make_session("carol", "oidc");       // default-constructed proof
 
+    // Pass "optional" explicitly so the UP-5 invariant is not silently tied
+    // to the parameter default (governance qe SHOULD).
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                             "DELETE /api/v1/sessions"));
+                             "DELETE /api/v1/sessions", "optional"));
     CHECK(res.status == 200);
     CHECK(res.body.empty());
     CHECK(audits.empty());
+}
+
+TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: OIDC no-proof is GATED under enforcement (A4/B1)",
+                 "[mfa][stepup][oidc][enforce]") {
+    // Hermes adversarial + cyber A4/B1 + governance UP-6: under enforcement
+    // that protects the principal's role, an SSO login the IdP did not MFA
+    // must step up (re-SSO), symmetric with a local user being forced to
+    // enroll. (The default/optional case — no-proof passes — is the
+    // separate UP-5 regression test above.)
+    httplib::Request req;
+    REQUIRE_FALSE(db->mfa_status("carol").has_value()); // oidc, no local row
+
+    // required → every role gated. carol is a user-role oidc session.
+    {
+        httplib::Response res;
+        res.status = 200;
+        auto s = make_session("carol", "oidc"); // no proof
+        CHECK_FALSE(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "required"));
+        CHECK(res.status == 401);
+        auto body = nlohmann::json::parse(res.body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["meta"]["challenge_url"] == "/auth/oidc/start");
+    }
+
+    // admin-only → a non-admin oidc session still PASSES (not protected)…
+    {
+        httplib::Response res;
+        res.status = 200;
+        auto s = make_session("carol", "oidc"); // user role
+        CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "admin-only"));
+        CHECK(res.status == 200);
+    }
+    // …but an admin oidc session under admin-only is gated.
+    {
+        httplib::Response res;
+        res.status = 200;
+        auto s = make_session("alice", "oidc"); // admin role (make_session maps alice→admin)
+        CHECK_FALSE(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "admin-only"));
+        CHECK(res.status == 401);
+    }
+
+    // A FRESH amr-seeded proof passes even under `required` — enforcement
+    // gates the no-proof case, not a session the IdP actually MFA'd
+    // (guards against a future refactor broadening the gate to all OIDC).
+    {
+        httplib::Response res;
+        res.status = 200;
+        auto s = make_session("carol", "oidc", std::chrono::steady_clock::now());
+        CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "required"));
+        CHECK(res.status == 200);
+    }
 }
 
 TEST_CASE_METHOD(StepUpFixture,

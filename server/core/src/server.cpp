@@ -3438,7 +3438,7 @@ private:
                        const std::string& tt, const std::string& ti, const std::string& d) {
                     return audit_log(r, a, rs, tt, ti, d);
                 },
-                action_label);
+                action_label, cfg_.mfa_enforcement);
         };
 
         // -- Settings routes (extracted to settings_routes.cpp) ---------------

@@ -256,6 +256,11 @@ std::expected<IdTokenClaims, std::string> OidcProvider::parse_id_token(const std
         if (v > 0.0 && v < kMaxEpoch)
             claims.iat = static_cast<int64_t>(v);
     }
+    if (j.contains("nbf") && j["nbf"].is_number()) {
+        double v = j["nbf"].get<double>();
+        if (v > 0.0 && v < kMaxEpoch)
+            claims.nbf = static_cast<int64_t>(v);
+    }
 
     // aud can be a string or array
     if (j.contains("aud")) {
@@ -314,6 +319,23 @@ OidcProvider::validate_claims(const IdTokenClaims& claims,
         return std::unexpected("missing or invalid exp claim");
     if (claims.exp + kClockSkew < now)
         return std::unexpected("token expired");
+    // Reject a future-dated `iat` (Hermes A1/L-2). PR3 seeds the MFA
+    // step-up window from `iat`; a grossly future-dated token is an
+    // IdP-key-compromise lever. Use a GENEROUS future skew (not the tight
+    // 60 s `exp` skew) — real IdP↔server NTP drift routinely exceeds 60 s,
+    // and Okta/Entra default their own `iat`/`nbf` tolerance to ~300 s.
+    // Rejecting at 60 s turned ordinary clock drift into a total SSO outage
+    // (governance UP-D4). Within the window the future `iat` is clamped to
+    // "now" during seeding anyway (auth_routes.cpp), so a generous bound
+    // costs no freshness — it only rejects the clearly-forged case.
+    constexpr int64_t kFutureSkew = 300;
+    if (claims.iat > 0 && claims.iat > now + kFutureSkew)
+        return std::unexpected("iat is in the future");
+    // Honour `nbf` (RFC 7519 §4.1.5) if present — a pre-issued token must
+    // not be accepted before its validity window (Hermes A3) — with the
+    // same generous skew so NTP drift does not reject legitimate tokens.
+    if (claims.nbf > 0 && claims.nbf > now + kFutureSkew)
+        return std::unexpected("token not yet valid (nbf)");
 
     if (claims.nonce != expected_nonce)
         return std::unexpected("nonce mismatch");

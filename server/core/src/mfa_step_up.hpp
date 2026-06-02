@@ -85,7 +85,8 @@ using StepUpAuditFn = std::function<bool(const httplib::Request&,
 bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
                          const auth::Session& session, AuthDB& auth_db,
                          int window_secs, const StepUpAuditFn& audit_fn,
-                         const std::string& action_label);
+                         const std::string& action_label,
+                         std::string_view mfa_enforcement = "optional");
 
 /// True if the IdP `amr` claim attests a multi-factor (or otherwise
 /// strong) authentication that should seed a session's MFA-verified

@@ -4421,6 +4421,7 @@ username=admin&password=secretpass
 | `202` (`mfa_enrollment_required`) | Credentials valid; user is **un-enrolled** and `--mfa-enforcement` (`admin-only` for admins / `required` for all) requires MFA | `{"status":"mfa_enrollment_required","mfa_pending_token":"<opaque>","otpauth_uri":"otpauth://...","secret_base32":"...","expires_in":120}` — show the QR/secret and complete enrollment via `POST /login/mfa/enroll` |
 | `401` | Invalid credentials | `{"error":{"code":401,"message":"Invalid username or password"}}` |
 | `503` | Enforcement applies but `auth.db` is unavailable (fail-closed; no session minted) | `{"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"}}` |
+| `503` | The in-memory pending-challenge map is at capacity (server under a `/login` flood; transient load-shed) | `{"error":{"code":503,"message":"too many pending authentications, retry shortly"}}` — retry after a short back-off; emits `yuzu_auth_mfa_pending_load_shed_total` |
 
 **Distinguish the two 202 variants by the `status` field**: `mfa_required` routes to `POST /login/mfa` (the user already has a secret); `mfa_enrollment_required` routes to `POST /login/mfa/enroll` (the user must enroll first). The `mfa_pending_token` is a 32-byte hex (64-char) opaque random; its lifetime is `cfg.mfa_login_pending_secs` (default 120 s). The pending state lives in process memory and is lost on server restart, and is not shared across HA replicas without sticky sessions.
 
@@ -4524,7 +4525,7 @@ The following 11 endpoints return `401` with an MFA step-up envelope when the ca
 - `DELETE /api/settings/users/{username}` (delete user)
 - `POST /api/settings/users/{username}/role` (change user role)
 
-For **OIDC** sessions the envelope's `challenge_url` is `/auth/oidc/start` (and the remediation points at re-SSO) instead of `/login/mfa/stepup` — an external identity has no local TOTP secret to step up against. An OIDC session whose IdP did not attest MFA at all (no `amr`) passes the gate rather than being blocked.
+For **OIDC** sessions the envelope's `challenge_url` is `/auth/oidc/start` (and the remediation points at re-SSO) instead of `/login/mfa/stepup` — an external identity has no local TOTP secret to step up against. An OIDC session whose IdP did not attest MFA at all (no `amr`) passes the gate under `--mfa-enforcement=optional`, but is **gated** (re-SSO) under `required` (or `admin-only` for an admin) — symmetric with a local user being forced to enrol.
 
 Envelope shape:
 

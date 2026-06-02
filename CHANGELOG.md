@@ -28,11 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multi-factor login (RFC 8176 `amr` containing `mfa`/`otp`/`hwk`/`fpt`/
   `face`/`iris`/`sms`/`swk`/`tel`) clears high-risk endpoints without a
   redundant prompt and re-prompts (via re-SSO) once the assertion ages
-  past `--mfa-step-up-window-secs`. An SSO session whose IdP does **not**
-  attest MFA still passes the gate (no second factor to step up — Yuzu
-  cannot mint a factor for an external identity), exactly as before PR 3.
-  **If you require MFA for SSO users, configure your IdP to assert `amr`
-  and verify it pre-flight before enabling enforcement.**
+  past `--mfa-step-up-window-secs`. An SSO session whose IdP did **not**
+  attest MFA is handled symmetrically with local users: under `optional`
+  (or `admin-only` for a non-admin) it passes the gate (Yuzu cannot mint a
+  factor for an external identity); under `required` (or `admin-only` for
+  an admin) it is gated and must re-authenticate through SSO. **If you
+  enable `required`/`admin-only` with SSO, configure your IdP to assert
+  `amr` and verify it pre-flight** — otherwise affected SSO users cannot
+  reach high-risk endpoints (recoverable by restarting in `optional`).
 
 - **`POST /login` now returns HTTP 202 (not 200) for MFA-enrolled users.**
   Programmatic clients (CI pipelines, automation scripts, health checks)
@@ -91,8 +94,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     anchored to the IdP `iat` in the `steady_clock` domain (NTP-step
     resistant). An OIDC session with an attested-but-stale proof is
     re-prompted via re-SSO (`challenge_url=/auth/oidc/start`); one without
-    any attested MFA passes the gate (Yuzu cannot mint a factor for an
-    external identity — gating it would livelock a non-MFA IdP).
+    any attested MFA is treated **symmetrically with a local user** under
+    the active enforcement mode — passes under `optional` (or `admin-only`
+    for a non-admin), gated (re-SSO) under `required` (or `admin-only` for
+    an admin). See the Breaking Changes entry above and
+    `docs/user-manual/upgrading.md` for the SSO `amr` pre-flight.
     `/login/mfa/stepup` now rejects OIDC callers with a precise 400
     pointing back to SSO.
   - Tests: `test_mfa_step_up.cpp` (OIDC gating, window boundary,

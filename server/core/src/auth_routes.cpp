@@ -630,16 +630,39 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             auto pending_token =
                 auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(32));
+            bool at_capacity = false;
             {
                 std::lock_guard lock(mfa_pending_mu_);
                 reap_mfa_pending_locked();
-                MfaPending entry;
-                entry.username = username;
-                entry.role = *role_opt;
-                entry.kind = PendingKind::enrollment;
-                entry.expires_at = std::chrono::steady_clock::now() +
-                                   std::chrono::seconds(cfg_.mfa_login_pending_secs);
-                mfa_pending_[pending_token] = std::move(entry);
+                if (mfa_pending_.size() >= mfa_pending_cap_) {
+                    at_capacity = true; // load-shed (Hermes H-2)
+                } else {
+                    MfaPending entry;
+                    entry.username = username;
+                    entry.role = *role_opt;
+                    entry.kind = PendingKind::enrollment;
+                    entry.expires_at = std::chrono::steady_clock::now() +
+                                       std::chrono::seconds(cfg_.mfa_login_pending_secs);
+                    mfa_pending_[pending_token] = std::move(entry);
+                }
+            }
+            if (at_capacity) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"too many pending authentications, retry shortly"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                // Observable load-shed (governance sec-MED / UP-D3): a
+                // counter for alerting + a (per-event, not audit) warn.
+                // Deliberately NOT an audit row — a flood would amplify
+                // audit writes; the counter is the aggregated signal.
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_mfa_pending_load_shed_total", {{"kind", "enrollment"}})
+                        .increment();
+                }
+                spdlog::warn("MFA pending-token map at capacity ({}) — shedding enrollment "
+                             "challenge for source {}",
+                             mfa_pending_cap_, req.remote_addr);
+                return;
             }
             res.status = 202;
             // The provisional secret is revealed exactly once here — the
@@ -690,15 +713,34 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // token and require POST /login/mfa to complete.
         auto pending_token =
             auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(32));
+        bool challenge_at_capacity = false;
         {
             std::lock_guard lock(mfa_pending_mu_);
             reap_mfa_pending_locked();
-            MfaPending entry;
-            entry.username = username;
-            entry.role = *role_opt;
-            entry.expires_at = std::chrono::steady_clock::now() +
-                               std::chrono::seconds(cfg_.mfa_login_pending_secs);
-            mfa_pending_[pending_token] = std::move(entry);
+            if (mfa_pending_.size() >= mfa_pending_cap_) {
+                challenge_at_capacity = true; // load-shed (Hermes H-2)
+            } else {
+                MfaPending entry;
+                entry.username = username;
+                entry.role = *role_opt;
+                entry.expires_at = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(cfg_.mfa_login_pending_secs);
+                mfa_pending_[pending_token] = std::move(entry);
+            }
+        }
+        if (challenge_at_capacity) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"too many pending authentications, retry shortly"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_mfa_pending_load_shed_total", {{"kind", "challenge"}})
+                    .increment();
+            }
+            spdlog::warn("MFA pending-token map at capacity ({}) — shedding login challenge for "
+                         "source {}",
+                         mfa_pending_cap_, req.remote_addr);
+            return;
         }
         res.status = 202;
         nlohmann::json body = {{"status", "mfa_required"},
@@ -955,10 +997,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         auto* db = auth_mgr_.auth_db_ptr();
         if (!db) {
-            res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"auth_db unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            // Uniform 401 (NOT 503) on db-null: matches the /login/mfa
+            // sibling and avoids leaking "this pending token is valid" via
+            // a distinct status during a store outage (Hermes L-1). The
+            // real reason is in the audit detail only.
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
             audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
                                     "auth_db unavailable");

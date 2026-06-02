@@ -193,6 +193,23 @@ private:
         PendingKind kind{PendingKind::login_challenge};
     };
     static constexpr int kMfaMaxAttemptsPerPending = 5;
+    /// Hard cap on the in-memory pending-token map. `reap_mfa_pending_locked`
+    /// is an O(n) scan held under `mfa_pending_mu_`, so an unbounded map
+    /// turns a distributed /login flood (many IPs, each bypassing the per-IP
+    /// login rate-limiter) into an O(n²) lock-contention / CPU DoS that
+    /// serialises all logins (Hermes adversarial H-2). At the cap, new
+    /// challenges are load-shed with a 503 rather than growing the map.
+    /// 50k entries × ~120 s TTL tolerates a very large legitimate burst.
+    static constexpr std::size_t kMaxPendingTokens = 50'000;
+
+public:
+    /// Lower the pending-token cap for tests (the production default 50k is
+    /// impractical to fill in a unit test). Test-only seam — governance
+    /// qe-B: the load-shed branch must be exercised.
+    void set_mfa_pending_cap_for_test(std::size_t cap) { mfa_pending_cap_ = cap; }
+
+private:
+    std::size_t mfa_pending_cap_{kMaxPendingTokens};
     mutable std::mutex mfa_pending_mu_;
     std::unordered_map<std::string, MfaPending> mfa_pending_;
 

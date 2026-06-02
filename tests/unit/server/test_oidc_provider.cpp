@@ -269,6 +269,92 @@ TEST_CASE("OIDC: validate_claims — missing exp is rejected (Gate 8)", "[oidc]"
     CHECK(result.error().find("exp") != std::string::npos);
 }
 
+TEST_CASE("OIDC: validate_claims — future iat is rejected (Hermes A1)", "[oidc][amr]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.nonce = "n";
+    claims.exp = now + 3600;
+    claims.iat = now + 7200; // 2h in the future, well past clock skew
+
+    auto result = provider.validate_claims(claims, "n");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("future") != std::string::npos);
+}
+
+TEST_CASE("OIDC: validate_claims — iat within clock-skew window is accepted (UP-D4)",
+          "[oidc][amr]") {
+    // The future-iat rejection uses a generous 300 s skew so honest IdP/
+    // server NTP drift does not cause a total SSO outage. A token issued
+    // ~a minute "ahead" must still be accepted.
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.nonce = "n";
+    claims.exp = now + 3600;
+    claims.iat = now + 120; // 2 min ahead — within the 300 s tolerance
+
+    CHECK(provider.validate_claims(claims, "n").has_value());
+}
+
+TEST_CASE("OIDC: validate_claims — nbf in the past is accepted", "[oidc][amr]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.nonce = "n";
+    claims.exp = now + 3600;
+    claims.iat = now;
+    claims.nbf = now - 60; // already valid
+
+    CHECK(provider.validate_claims(claims, "n").has_value());
+}
+
+TEST_CASE("OIDC: validate_claims — nbf in the future is rejected (Hermes A3)", "[oidc][amr]") {
+    OidcConfig cfg;
+    cfg.issuer = "https://issuer";
+    cfg.client_id = "my-client";
+    OidcProvider provider(std::move(cfg));
+
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    IdTokenClaims claims;
+    claims.iss = "https://issuer";
+    claims.aud = "my-client";
+    claims.nonce = "n";
+    claims.exp = now + 3600;
+    claims.iat = now;
+    claims.nbf = now + 1800; // not valid for another 30 min
+
+    auto result = provider.validate_claims(claims, "n");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("nbf") != std::string::npos);
+}
+
 TEST_CASE("OIDC: validate_claims — wrong issuer", "[oidc]") {
     OidcConfig cfg;
     cfg.issuer = "https://expected";
