@@ -28,6 +28,7 @@ __declspec(allocate(".CRT$XCB"))
 
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
+#include "guaranteed_state.pb.h"
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
@@ -64,6 +65,7 @@ namespace yuzu::agent {
 namespace {
 
 namespace pb = ::yuzu::agent::v1;
+namespace gpb = ::yuzu::guardian::v1;
 constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 
 #if defined(_WIN32)
@@ -1158,6 +1160,35 @@ public:
                 }
                 spdlog::info("Subscribe stream opened - waiting for commands");
 
+                // Step 4: publish this stream as the Guardian sink target and wire
+                // the event-sink now the stream is up and BEFORE any push arrives, so
+                // a guard started by a push has a live sink. Drift events ship as a
+                // self-describing CommandResponse{plugin:"__guard__", action:"event",
+                // payload}. The sink captures only `this` and writes through
+                // guardian_sink_stream_ (H4 / #1209): a guard worker fires
+                // asynchronously and outlives any single stream, so capturing a
+                // specific `stream` would let it write to a cancelled stream across a
+                // reconnect. The holder is reset on read-loop exit, under the same
+                // mutex, before the stream is torn down.
+                if (guardian_) {
+                    {
+                        std::lock_guard lock(stream_write_mu_);
+                        guardian_sink_stream_ = stream;
+                    }
+                    guardian_->set_event_sink([this](const gpb::GuaranteedStateEvent& ev) {
+                        pb::CommandResponse resp;
+                        resp.set_plugin("__guard__");
+                        resp.set_action("event");
+                        resp.set_status(pb::CommandResponse::SUCCESS);
+                        resp.set_payload(ev.SerializeAsString());
+                        std::lock_guard lock(stream_write_mu_);
+                        if (guardian_sink_stream_)
+                            guardian_sink_stream_->Write(resp, grpc::WriteOptions());
+                        // else: link is down between reconnects — event dropped
+                        // (durable event buffering is Guardian A3).
+                    });
+                }
+
                 // 4b. Spawn OTA update check thread
                 if (cfg_.auto_update && updater_) {
                     auto* raw_stub = static_cast<void*>(stub.get());
@@ -1236,6 +1267,15 @@ public:
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
                             tags["yuzu.healthy"] = "1";
+                            // Guardian policy generation (M5 / #1209): lets the
+                            // server detect an agent that missed a push (offline at
+                            // push time, or reconnected) and re-push it without a
+                            // manual operator action. Always emitted — including
+                            // generation 0 — so an agent that has never received a
+                            // push still converges once rules exist server-side.
+                            if (guardian_)
+                                tags["yuzu.guardian_generation"] =
+                                    std::to_string(guardian_->policy_generation());
 
                             // PR 10: attach pushed fleet snapshot if the
                             // pump produced something newer than what
@@ -1342,6 +1382,11 @@ public:
                             resp.set_exit_code(dr.exit_code);
                             resp.set_output(std::move(dr.output));
                         }
+                        // Stamp the response so the server routes it via the Guardian
+                        // ingest branch (plugin=="__guard__") and skips the response
+                        // store / executions drawer. action mirrors the request.
+                        resp.set_plugin("__guard__");
+                        resp.set_action(cmd.action());
                         metrics_
                             .counter("yuzu_agent_commands_executed_total",
                                      {{"plugin", "__guard__"}})
@@ -1533,6 +1578,18 @@ public:
 
                 subscribe_ctx_.store(nullptr, std::memory_order_release);
 
+                // Detach the Guardian event-sink from this (now broken) stream BEFORE
+                // it is torn down (H4 / #1209). Taking stream_write_mu_ waits for any
+                // in-flight sink Write to finish, then nulls the holder so a guard
+                // worker firing during teardown drops the event instead of writing to
+                // a cancelled stream. Guards keep running across the reconnect; the
+                // next iteration republishes the new stream and the heartbeat reconcile
+                // (M5) catches up any generation missed while the link was down.
+                {
+                    std::lock_guard lock(stream_write_mu_);
+                    guardian_sink_stream_.reset();
+                }
+
                 // Destroy thread pool BEFORE stream goes out of scope — this drains
                 // the queue, waits for in-flight tasks, and joins all worker threads,
                 // ensuring no task holds a dangling stream pointer.
@@ -1630,7 +1687,6 @@ private:
     // pointers remain stable after map insertions.
     std::unordered_map<std::string, std::unique_ptr<PluginContextImpl>> per_plugin_ctx_;
     std::unique_ptr<KvStore> kv_store_;
-    std::unique_ptr<GuardianEngine> guardian_;
     // Drives interval / file-change / service-status triggers that plugins
     // register during init(). Owned here; a non-owning pointer is handed to
     // every per-plugin context so yuzu_register_trigger can reach it.
@@ -1647,6 +1703,20 @@ private:
     std::vector<PluginHandle> plugins_;
     std::vector<std::string> plugin_names_;
     std::mutex stream_write_mu_;
+    // Current Subscribe stream the Guardian event-sink writes through (H4 / #1209).
+    // Guarded by stream_write_mu_. Guard worker threads outlive any single stream
+    // and fire asynchronously, so the sink must NOT capture a specific stream: it
+    // reads this holder under the lock and drops the event if it is null (link down
+    // between reconnects). Set on stream open, reset on read-loop exit BEFORE the
+    // stream is torn down, so a guard firing mid-teardown can never write to a
+    // cancelled stream.
+    std::shared_ptr<SubscribeStream> guardian_sink_stream_;
+    // Declared AFTER stream_write_mu_ + guardian_sink_stream_ so it is DESTROYED
+    // FIRST (reverse declaration order): ~GuardianEngine joins the guard worker
+    // threads, which must happen while the mutex + sink-stream holder those
+    // workers write through are still alive (H4 / #1209). Body-initialized in the
+    // ctor (after kv_store_), so the later declaration does not affect construction.
+    std::unique_ptr<GuardianEngine> guardian_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::unique_ptr<Updater> updater_;
     std::thread update_thread_;

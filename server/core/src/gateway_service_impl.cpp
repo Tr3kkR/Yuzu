@@ -9,6 +9,8 @@
 #include "enrollment_token_rejection.hpp"
 #include "fleet_topology_store.hpp"
 #include "grpc_audit_signal.hpp"
+#include "guaranteed_state_store.hpp"
+#include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
@@ -529,6 +531,57 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* /*context*/,
                      static_cast<int>(request->event()), agent_id);
         response->set_acknowledged(false);
         return grpc::Status::OK;
+    }
+
+    response->set_acknowledged(true);
+    return grpc::Status::OK;
+}
+
+// -- ForwardGuardianMessage ---------------------------------------------------
+
+grpc::Status
+GatewayUpstreamServiceImpl::ForwardGuardianMessage(grpc::ServerContext* /*context*/,
+                                                   const gw::ForwardGuardianRequest* request,
+                                                   gw::ForwardGuardianAck* response) {
+    const auto& agent_id = request->agent_id();
+
+    // agent_id is gateway-asserted (the gateway stamps the agent's bound
+    // Subscribe-stream identity, not a value from the frame). Do a cheap
+    // diagnostic lookup, but LOG-AND-ACCEPT on a miss rather than reject: the
+    // registry's gateway view is populated by best-effort NotifyStreamStatus
+    // (dropped while the upstream circuit is open), so a strict "must be
+    // registered" gate would silently lose real drift events during exactly
+    // the reconnect storms Guardian most needs to report. Accept matches the
+    // best-effort durability posture (durable buffering is Guardian A3). Debug
+    // level so the happy path (agent always registered via ProxyRegister) does
+    // not spam logs at fleet scale.
+    if (!registry_.get_session(agent_id)) {
+        spdlog::debug("[gateway] ForwardGuardianMessage: agent {} not in registry "
+                      "(accepting anyway — best-effort)",
+                      agent_id);
+    }
+
+    const auto& resp = request->response();
+    if (resp.plugin() != "__guard__" || !resp.command_id().empty()) {
+        // Defence-in-depth: the gateway only forwards UNSOLICITED "__guard__" events
+        // (no command_id) here; a mislabelled frame, or a SOLICITED reply that should
+        // have gone through normal command correlation (command_id set — H2 / #1209),
+        // must not be ingested as a Guardian event. Drop it (still ack — we consumed
+        // the RPC). A solicited reply reaching this path is a gateway routing bug.
+        spdlog::warn("[gateway] ForwardGuardianMessage: not an unsolicited guardian event "
+                     "(plugin='{}', command_id='{}') from agent {} — dropping",
+                     resp.plugin(), resp.command_id(), agent_id);
+        response->set_acknowledged(true);
+        return grpc::Status::OK;
+    }
+
+    if (guaranteed_state_store_) {
+        // Shared one-true-path ingest (same fn the direct Subscribe loop uses).
+        ingest_guardian_response(*guaranteed_state_store_, agent_id, resp);
+    } else {
+        spdlog::warn("[gateway] ForwardGuardianMessage: no guaranteed-state store wired — "
+                     "dropping event from agent {}",
+                     agent_id);
     }
 
     response->set_acknowledged(true);

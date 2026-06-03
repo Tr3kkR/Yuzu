@@ -121,6 +121,12 @@ agent_plugins(Info) ->
 %%%===================================================================
 
 %% @doc Ensure a CommandRequest map has all required fields.
+%%
+%% NOTE: this normaliser is NOT on the command-forward path — the gateway
+%% forwards the decoded CommandRequest straight through gpb, which preserves
+%% every field. It is kept faithful (it copies `payload`, the Guardian push
+%% bytes) purely so it can never become a silent strip point if a future
+%% refactor routes commands through it (M8 / #1209).
 -spec encode_command_request(map()) -> map().
 encode_command_request(Cmd) ->
     #{command_id => command_id(Cmd),
@@ -128,6 +134,8 @@ encode_command_request(Cmd) ->
       action     => command_action(Cmd),
       parameters => maps:get(parameters, Cmd,
                              maps:get(<<"parameters">>, Cmd, #{})),
+      payload    => maps:get(payload, Cmd,
+                             maps:get(<<"payload">>, Cmd, <<>>)),
       expires_at => maps:get(expires_at, Cmd,
                              maps:get(<<"expires_at">>, Cmd, undefined))}.
 
