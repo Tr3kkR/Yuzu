@@ -96,6 +96,18 @@ extern const char* const kLoginHtml =
       <div class="error-msg" id="error-msg" role="alert" aria-live="polite"></div>
     </form>
 
+    <form id="mfa-form" onsubmit="doMfa(event)" style="display:none">
+      <div class="subtitle">Enter the 6-digit code from your authenticator app, or one of your recovery codes.</div>
+      <input type="hidden" id="mfa-pending-token">
+      <div class="field">
+        <label for="mfa-code">Verification code</label>
+        <input type="text" id="mfa-code" name="code" autocomplete="one-time-code"
+               inputmode="numeric" autofocus required>
+      </div>
+      <button type="submit" class="btn-login" id="btn-mfa" aria-label="Verify">Verify</button>
+      <div class="error-msg" id="mfa-error-msg" role="alert" aria-live="polite"></div>
+    </form>
+
     <div class="sso-section" id="sso-section">
       <button class="btn-sso" id="btn-sso" disabled>Sign in with SSO (OIDC)</button>
       <div class="sso-label" id="sso-label">Coming soon</div>
@@ -121,28 +133,47 @@ extern const char* const kLoginHtml =
       xhr.onload = function() {
         if (xhr.status === 200) {
           window.location.href = '/';
-        } else {
-          // Server returns the structured envelope:
-          //   {"error":{"code":N,"message":"..."},"meta":{...}}
-          // Pre-envelope responses used a flat string "error".
-          var msg = '';
+          return;
+        }
+        if (xhr.status === 202) {
+          // MFA enrolled — swap to the TOTP form.
           try {
             var resp = JSON.parse(xhr.responseText);
-            if (resp && resp.error) {
-              if (typeof resp.error === 'string') {
-                msg = resp.error;
-              } else if (typeof resp.error === 'object' && resp.error.message) {
-                msg = resp.error.message;
-              }
+            if (resp && resp.status === 'mfa_required' && resp.mfa_pending_token) {
+              document.getElementById('mfa-pending-token').value = resp.mfa_pending_token;
+              document.getElementById('login-form').style.display = 'none';
+              var ssoSection = document.getElementById('sso-section');
+              if (ssoSection) ssoSection.style.display = 'none';
+              var mfaForm = document.getElementById('mfa-form');
+              mfaForm.style.display = '';
+              document.getElementById('mfa-code').focus();
+              return;
             }
-          } catch(ex) { /* fall through to default */ }
-          if (!msg) {
-            msg = (xhr.status === 401) ? 'Invalid username or password'
-                                       : 'Login failed (' + xhr.status + ')';
-          }
-          errEl.textContent = msg;
+          } catch(ex) { /* fall through to error display */ }
+          errEl.textContent = 'Login failed (' + xhr.status + ')';
           btn.disabled = false;
+          return;
         }
+        // Server returns the structured envelope:
+        //   {"error":{"code":N,"message":"..."},"meta":{...}}
+        // Pre-envelope responses used a flat string "error".
+        var msg = '';
+        try {
+          var resp = JSON.parse(xhr.responseText);
+          if (resp && resp.error) {
+            if (typeof resp.error === 'string') {
+              msg = resp.error;
+            } else if (typeof resp.error === 'object' && resp.error.message) {
+              msg = resp.error.message;
+            }
+          }
+        } catch(ex) { /* fall through to default */ }
+        if (!msg) {
+          msg = (xhr.status === 401) ? 'Invalid username or password'
+                                     : 'Login failed (' + xhr.status + ')';
+        }
+        errEl.textContent = msg;
+        btn.disabled = false;
       };
       xhr.onerror = function() {
         errEl.textContent = 'Network error';
@@ -150,6 +181,47 @@ extern const char* const kLoginHtml =
       };
       xhr.send('username=' + encodeURIComponent(username) +
                '&password=' + encodeURIComponent(password));
+    }
+
+    function doMfa(e) {
+      e.preventDefault();
+      var btn = document.getElementById('btn-mfa');
+      var errEl = document.getElementById('mfa-error-msg');
+      btn.disabled = true;
+      errEl.textContent = '';
+
+      var pending = document.getElementById('mfa-pending-token').value;
+      var code = document.getElementById('mfa-code').value;
+
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/login/mfa');
+      xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+      xhr.onload = function() {
+        if (xhr.status === 200) {
+          window.location.href = '/';
+          return;
+        }
+        var msg = '';
+        try {
+          var resp = JSON.parse(xhr.responseText);
+          if (resp && resp.error && resp.error.message) {
+            msg = resp.error.message;
+          }
+        } catch(ex) { /* default below */ }
+        if (!msg) {
+          msg = 'Invalid verification code';
+        }
+        errEl.textContent = msg;
+        btn.disabled = false;
+        document.getElementById('mfa-code').focus();
+        document.getElementById('mfa-code').select();
+      };
+      xhr.onerror = function() {
+        errEl.textContent = 'Network error';
+        btn.disabled = false;
+      };
+      xhr.send('mfa_pending_token=' + encodeURIComponent(pending) +
+               '&code=' + encodeURIComponent(code));
     }
 
     function startOidc() {

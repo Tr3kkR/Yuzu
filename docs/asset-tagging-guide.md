@@ -485,6 +485,8 @@ NOT tag:environment == "Dev"
 
 This allows you to target instructions, policies, and reports at specific device subsets based on their tags.
 
+For **presence** (a tag key exists on the device, regardless of value) use `EXISTS tag:<name>` rather than an equality. The YAML `spec.scope.selector.tags` block-form authoring surface lowers each listed tag to `EXISTS tag:<name>` — a presence check — so a `selector.tags: [production]` entry matches any device carrying a `production` tag with a non-empty value. For value-equality matching, use the explicit `tag:<key> == "<value>"` form shown above.
+
 ---
 
 ## REST API Reference
