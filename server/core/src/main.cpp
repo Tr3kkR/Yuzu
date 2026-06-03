@@ -1,6 +1,8 @@
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+
+#include "audit_store.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
@@ -245,6 +247,16 @@ int main(int argc, char* argv[]) {
     app.add_option("--token-label", gen_label, "Label prefix for generated tokens");
     app.add_option("--token-max-uses", gen_max_uses, "Max uses per token (default: 1)");
     app.add_option("--token-ttl-hours", gen_ttl_hours, "Token TTL in hours (0 = no expiry)");
+
+    // Break-glass MFA reset mode (runs and exits, no server startup). Clears a
+    // user's MFA enrollment out-of-band so an operator locked out by MFA
+    // enforcement (lost device, IdP not asserting amr, sole admin who could not
+    // enroll) can recover. Run on the server host as the service account. The
+    // reset is audited (unlike the manual SQL break-glass it replaces). #1226.
+    std::string mfa_reset_user;
+    app.add_option("--mfa-reset", mfa_reset_user,
+                   "Break-glass: clear MFA enrollment for the named user, then exit "
+                   "(audited recovery from MFA lockout)");
 
     // NVD CVE feed options
     int nvd_sync_hours = 4;
@@ -655,6 +667,81 @@ int main(int argc, char* argv[]) {
         // and AuthManager has gone out of scope.
         auth_mgr.set_auth_db(auth_db.get());
         spdlog::info("AuthManager configured to use AuthDB for persistence");
+    }
+
+    // -- Break-glass MFA reset mode (exits without starting server) -----------
+    // Out-of-band recovery for an operator locked out by MFA enforcement.
+    // Runs on the server host as the service account; clears the user's MFA
+    // and writes an audit row (the manual SQL break-glass it replaces bypassed
+    // the audit chain — #1226). Under enforcement the user is walked through
+    // re-enrollment at their next login.
+    if (!mfa_reset_user.empty()) {
+        if (!auth_db) {
+            spdlog::error("--mfa-reset requires the persistent auth store (auth.db); none is "
+                          "configured for data dir '{}'",
+                          cfg.data_dir.string());
+            return EXIT_FAILURE;
+        }
+        // Defence-in-depth: validate the CLI arg before it touches the store
+        // (governance sec-LOW-1). The SQL is parameterised and user_exists
+        // would reject a non-conforming value anyway, but validating up front
+        // keeps the charset guarantee local to the entry point.
+        if (!yuzu::server::is_valid_username(mfa_reset_user)) {
+            spdlog::error("--mfa-reset: '{}' is not a valid username", mfa_reset_user);
+            std::cerr << "error: invalid username\n";
+            return EXIT_FAILURE;
+        }
+        auto exists = auth_db->user_exists(mfa_reset_user);
+        if (!exists) {
+            // Distinguish a store error from a genuinely-absent user so an
+            // operator mid-lockout isn't misled (governance cpp-safety SHOULD).
+            spdlog::error("--mfa-reset: auth store error checking '{}': {}", mfa_reset_user,
+                          static_cast<int>(exists.error()));
+            std::cerr << "error: auth store unavailable\n";
+            return EXIT_FAILURE;
+        }
+        if (!*exists) {
+            spdlog::error("--mfa-reset: user '{}' not found", mfa_reset_user);
+            std::cerr << "error: user '" << mfa_reset_user << "' not found\n";
+            return EXIT_FAILURE;
+        }
+        if (auto r = auth_db->mfa_disable(mfa_reset_user); !r) {
+            spdlog::error("--mfa-reset: failed to clear MFA for '{}'", mfa_reset_user);
+            return EXIT_FAILURE;
+        }
+        // Audit the break-glass with the OS account that ran it as the
+        // principal — the manual SQL path produced no audit row, which is a
+        // SOC 2 CC6.6 evidence gap this closes.
+        const char* os_user = std::getenv("USER");
+        if (!os_user)
+            os_user = std::getenv("USERNAME"); // Windows
+        yuzu::server::AuditStore audit(cfg.data_dir / "audit.db");
+        if (audit.is_open()) {
+            yuzu::server::AuditEvent ev;
+            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+            ev.principal = os_user ? os_user : "unknown";
+            ev.principal_role = "break-glass";
+            ev.action = "mfa.reset.breakglass";
+            ev.target_type = "User";
+            ev.target_id = mfa_reset_user;
+            ev.result = "success";
+            ev.detail = "MFA enrollment cleared via --mfa-reset CLI";
+            if (!audit.log(ev)) {
+                spdlog::warn("--mfa-reset: MFA cleared but the audit row failed to persist — "
+                             "record this reset manually in your change-management system");
+            }
+        } else {
+            spdlog::warn("--mfa-reset: audit.db unavailable — record this reset manually");
+        }
+        spdlog::info("Break-glass: MFA cleared for '{}'. The user can now sign in with their "
+                     "password alone; under MFA enforcement they will be walked through "
+                     "enrollment at next login.",
+                     mfa_reset_user);
+        std::cout << "{\"status\":\"ok\",\"user\":\"" << mfa_reset_user
+                  << "\",\"action\":\"mfa.reset.breakglass\"}\n";
+        return EXIT_SUCCESS;
     }
 
     // -- Batch token generation mode (exits without starting server) ----------

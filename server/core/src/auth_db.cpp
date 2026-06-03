@@ -1232,6 +1232,26 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
         return std::unexpected(AuthDBError::MfaAlreadyEnrolled);
     }
 
+    // Reuse, don't rotate (#1227). If a PROVISIONAL secret already exists
+    // (not yet enrolled — we just checked — but a secret blob is present),
+    // return its base32 + otpauth URI instead of minting a fresh one.
+    // Re-initialising during the enrollment window — two browser tabs, a
+    // retried `/login` bootstrap, a re-opened Settings panel — must not
+    // invalidate the QR the operator already scanned. The provisional
+    // secret is reaped by cleanup_provisional_mfa if abandoned, which
+    // bounds the re-reveal window. (Once ENROLLED, init is rejected above,
+    // so the confirmed secret is never re-revealed — invariant #1 holds for
+    // enrolled secrets; provisional secrets are re-revealable to the
+    // already-authenticated caller within the enrollment window.)
+    if (auto existing = load_mfa_row(impl_->db, username);
+        existing && !existing->secret.empty()) {
+        auto secret_view = std::string_view(
+            reinterpret_cast<const char*>(existing->secret.data()), existing->secret.size());
+        auto secret_b32 = mfa::base32_encode(secret_view);
+        auto uri = mfa::otpauth_uri(issuer, username, secret_b32);
+        return MfaEnrollmentInit{std::move(secret_b32), std::move(uri)};
+    }
+
     // Generate fresh secret + write as provisional (mfa_enrolled_at stays NULL).
     auto secret_bytes = mfa::random_secret();
     auto secret_view = std::string_view(reinterpret_cast<const char*>(secret_bytes.data()),

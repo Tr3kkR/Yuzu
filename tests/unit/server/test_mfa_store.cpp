@@ -128,13 +128,24 @@ TEST_CASE_METHOD(MfaFixture, "mfa_verify_enrollment rejects wrong code", "[mfa][
     REQUIRE_FALSE(s->enrolled); // still provisional
 }
 
-TEST_CASE_METHOD(MfaFixture, "double init reuses provisional slot", "[mfa][store]") {
+TEST_CASE_METHOD(MfaFixture, "double init reuses the provisional secret (no rotation, #1227)",
+                 "[mfa][store]") {
     auto first = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(first.has_value());
     auto second = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(second.has_value());
-    // Secret rotated.
-    REQUIRE(first->secret_base32 != second->secret_base32);
+    // #1227: re-initialising a PROVISIONAL row returns the SAME secret + URI.
+    // A second browser tab / retried /login bootstrap / re-opened Settings
+    // panel must not invalidate the QR the operator already scanned.
+    // (Rotation only happens once the provisional secret is reaped by
+    // cleanup_provisional_mfa or the user is mfa_disabled.) The
+    // confirmed-enrollment one-time-reveal property is unaffected — see the
+    // "init refuses if already enrolled" case below.
+    CHECK(first->secret_base32 == second->secret_base32);
+    CHECK(first->otpauth_uri == second->otpauth_uri);
+    // And a code from the first QR still verifies after the second init.
+    auto code = code_for_now(first->secret_base32);
+    CHECK(db->mfa_verify_enrollment("alice", code).has_value());
 }
 
 TEST_CASE_METHOD(MfaFixture, "init refuses if already enrolled", "[mfa][store]") {
@@ -289,9 +300,16 @@ TEST_CASE_METHOD(MfaFixture, "disable clears secret and recovery codes", "[mfa][
     REQUIRE_FALSE(s->disabled_at.empty());
     REQUIRE(s->recovery_codes_remaining == 0);
 
-    // Re-init works after disable.
+    // Re-init works after disable AND mints a FRESH secret — rotation
+    // resumes once the provisional/enrolled secret is cleared (#1227: reuse
+    // applies ONLY to a live provisional row; mfa_disable nulls the secret,
+    // so load_mfa_row returns empty and init falls through to mint-fresh).
     auto reinit = db->mfa_init_enrollment("alice", "Yuzu");
     REQUIRE(reinit.has_value());
+    CHECK(reinit->secret_base32 != init->secret_base32);
+    // The fresh secret completes a new enroll → verify cycle end-to-end.
+    auto new_code = code_for_now(reinit->secret_base32);
+    CHECK(db->mfa_verify_enrollment("alice", new_code).has_value());
 }
 
 TEST_CASE_METHOD(MfaFixture, "verify_login_code on disabled user always fails", "[mfa][store]") {

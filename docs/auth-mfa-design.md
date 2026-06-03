@@ -509,10 +509,18 @@ MFA-verified" assertion auditors look for.
 When extending the MFA surface (the remaining encryption-at-rest PR, or
 any later auth work) make sure none of these regress:
 
-1. **TOTP secrets never leave `auth.db`.** `mfa_init_enrollment` returns
-   the secret to the operator exactly once (one-time reveal); after
-   that, no read path returns the bytes — even the `mfa_status`
-   accessor only reports `enrolled / disabled / count`.
+1. **TOTP secrets never leave `auth.db` after enrollment confirms.**
+   Once a user is **enrolled**, no read path returns the secret bytes —
+   even `mfa_status` only reports `enrolled / disabled / count`, and
+   `mfa_init_enrollment` refuses (`MfaAlreadyEnrolled`). A **provisional**
+   (un-confirmed) secret is re-revealable to the already-authenticated
+   caller for the duration of the enrollment window: `mfa_init_enrollment`
+   on a provisional row **reuses** the existing secret rather than
+   rotating it (#1227), so a second tab / retried `/login` bootstrap does
+   not invalidate the QR already scanned. The provisional secret is reaped
+   by `cleanup_provisional_mfa` if abandoned, bounding the re-reveal
+   window. Break-glass (`--mfa-reset`, #1226) clears the secret entirely
+   (it never reveals it).
 2. **Replay protection persists.** `mfa_last_counter` is the floor on
    every accepted code. Step-up verifies must update it too.
 3. **`mfa_disable` is atomic against in-flight verifies.** The

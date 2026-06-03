@@ -223,21 +223,48 @@ restart.
 ## Emergency MFA disable (break-glass)
 
 **When to use.** An operator (typically an admin) has lost both their
-authenticator device AND every recovery code they were issued. They
-cannot log in. The Settings → Multi-Factor Authentication panel is
-gated behind login so the dashboard path is unreachable. PR1 of the MFA
-ladder does not include an admin "force-disable for user X" REST route;
-that ships in a follow-up.
+authenticator device AND every recovery code they were issued — or has
+been locked out by MFA enforcement (the IdP not asserting `amr`, a sole
+admin who could not enroll). They cannot log in, and the Settings →
+Multi-Factor Authentication panel is gated behind login so the dashboard
+path is unreachable.
 
-**Authorisation.** Direct DB write — must run on the server host as the
-service account that owns `auth.db` (typically `_yuzu` / `yuzu` /
-`NT SERVICE\YuzuAgent`; see `docs/agent-privilege-model.md`). Every
-emergency disable should be logged in your change-management system
-with the operator name, time, and reason — the audit chain in
-`audit.db` will NOT contain a row for this disable (it bypasses the
-audit-emitting code path).
+### Preferred: the `--mfa-reset` CLI (audited, #1226)
 
-**Procedure (Unix).**
+`yuzu-server --mfa-reset <username>` clears the user's MFA enrollment and
+exits **without starting the server**. Unlike the manual SQL below it
+**writes an audit row** (`mfa.reset.breakglass`, principal = the OS
+account that ran it) — so the break-glass is captured in `audit.db`, not
+just your change-management system.
+
+**Authorisation.** Run on the server host as the service account that
+owns `auth.db` (typically `_yuzu` / `yuzu` / `NT SERVICE\YuzuAgent`; see
+`docs/agent-privilege-model.md`). No TLS/HTTPS flags are required (the
+command never serves).
+
+```bash
+sudo -u _yuzu yuzu-server \
+  --config /etc/yuzu/yuzu-server.cfg \
+  --data-dir /var/lib/yuzu \
+  --mfa-reset alice
+# {"status":"ok","user":"alice","action":"mfa.reset.breakglass"}
+```
+
+It is safe to run while the server is up: the CLI opens its **own**
+`auth.db` connection (it does not talk to the running server process), and
+the clear is a single atomic transaction — SQLite's WAL + FULLMUTEX
+serialise it against the server's concurrent reads/writes. The user can now
+sign in with their password alone;
+under MFA enforcement they will be walked through enrollment at next
+login. Still record the action (operator, time, reason) in your
+change-management system — the `audit.db` row plus that record form the
+SOC 2 CC6.6 break-glass evidence chain.
+
+### Fallback: direct SQL (no built binary available)
+
+If a `yuzu-server` binary is not available on the host, the equivalent
+DB surgery is below. **This path does NOT write an audit row** — record
+it manually.
 
 ```bash
 # 1. Stop the server so SQLite is not contended (optional but safer).
