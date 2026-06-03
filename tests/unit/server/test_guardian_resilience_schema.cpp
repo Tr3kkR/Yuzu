@@ -14,6 +14,7 @@
 #include "guardian_resilience_schema.hpp"
 #include "guardian_schema_registry.hpp"
 
+#include <yuzu/agent/guard_registry.hpp>      // registry_support::kHives / kValueTypes (cross-check)
 #include <yuzu/agent/resilience_strategy.hpp> // resilience_keys (cross-check)
 
 #include <catch2/catch_test_macros.hpp>
@@ -213,4 +214,67 @@ TEST_CASE("CROSS-CHECK: server param-spec keys == agent resilience_keys (G9 drif
     // (server) before merging.
     CHECK(server_keys.size() == agent_keys.size());
     CHECK(std::vector<std::string_view>(server_keys.begin(), server_keys.end()) == agent_keys);
+}
+
+namespace {
+// Pull the `enum` array of a registry-value-equals param out of the published
+// catalog, as sorted std::strings.
+std::vector<std::string> schema_registry_enum(const char* param) {
+    auto j = json::parse(guardian_schema_catalog().json);
+    std::vector<std::string> out;
+    for (const auto& e : j["schemas"]) {
+        if (e["type"] == "registry-value-equals") {
+            const auto& p = e["json_schema"]["properties"]["params"]["properties"][param]["enum"];
+            for (const auto& v : p)
+                out.push_back(v.get<std::string>());
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+std::vector<std::string> sorted_strings(const std::vector<std::string_view>& in) {
+    std::vector<std::string> out;
+    for (auto sv : in)
+        out.emplace_back(sv);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+template <std::size_t N>
+std::vector<std::string> sorted_strings(const std::string_view (&in)[N]) {
+    std::vector<std::string> out;
+    for (auto sv : in)
+        out.emplace_back(sv);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+} // namespace
+
+TEST_CASE("CROSS-CHECK: registry hive/value_type schema == server set == agent set (H2 drift guard)",
+          "[guardian][registry][crosscheck]") {
+    using namespace yuzu::agent;
+
+    // If any of these fail, the menu we publish (and the dashboard form, and the
+    // derive_rule_spec validator — all driven from the server accessors) offers a
+    // registry hive or value type the agent's RegistryGuard can't read/write. A
+    // guard authored against it reports perpetual false drift (audit) or perpetual
+    // remediation.failed (enforce). Re-sync registry_support::kHives / kValueTypes
+    // (agent) and kRegistryHives / kRegistryValueTypes (server) before merging.
+    SECTION("hives") {
+        auto schema = schema_registry_enum("hive");
+        auto server = sorted_strings(supported_registry_hives());
+        auto agent = sorted_strings(registry_support::kHives);
+        CHECK(schema == server);
+        CHECK(server == agent);
+        // The unsupported hive that previously leaked through must be gone.
+        CHECK(std::find(agent.begin(), agent.end(), "HKCC") == agent.end());
+    }
+    SECTION("value types") {
+        auto schema = schema_registry_enum("value_type");
+        auto server = sorted_strings(supported_registry_value_types());
+        auto agent = sorted_strings(registry_support::kValueTypes);
+        CHECK(schema == server);
+        CHECK(server == agent);
+        CHECK(std::find(agent.begin(), agent.end(), "REG_BINARY") == agent.end());
+        CHECK(std::find(agent.begin(), agent.end(), "REG_MULTI_SZ") == agent.end());
+    }
 }

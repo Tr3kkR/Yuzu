@@ -332,8 +332,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (M5), backed by a monotonic persisted generation counter (M6). The reconcile
   re-push is metered (`yuzu_server_guardian_reconciles_total`,
   `..._pushes_dispatched_total`, `..._policy_generation`) and audited
-  (`guaranteed_state.reconcile`). H5 (MCP + `/schemas` agentic-first parity)
-  tracked separately as #1210.
+  (`guaranteed_state.reconcile`).
+- **Guardian MVP pre-merge review hardening (PR #1220).** Three blocking review
+  findings fixed before merge: (H1) **enforce-mode registry writes are gated by a
+  dangerous-key denylist** — `derive_rule_spec` now refuses an
+  `enforcement_mode:"enforce"` rule whose key targets a high-blast-radius
+  persistence / privilege location (autorun `CurrentVersion\Run*`, Image File
+  Execution Options, Winlogon, `…\Services\…`, `…\Policies\…`, SafeBoot,
+  BootExecute), returning the A4 envelope (contract §6 gate; the SYSTEM-privileged
+  fleet-wide write path no longer ships ungated). (H2) **the published
+  `/schemas` enum, the dashboard form, and the validator now offer only the
+  registry hives/value-types the agent actually decodes** — `HKCC`, `REG_BINARY`
+  and `REG_MULTI_SZ` are removed (they produced perpetual false drift /
+  remediation-failed); a single server-side source drives the schema enum and the
+  validator, cross-checked against the agent's `registry_support` constants by a
+  unit test. (#3) **the schema catalog is now discoverable on the MCP plane** —
+  `get_guardian_schemas` tool + `yuzu://guardian/schemas` resource, gated
+  `GuaranteedState:Read`, returning the byte-identical REST catalog (contract §4
+  decision 3 / §9 G9; supersedes the #1210 deferral). Plus: server-side validation
+  of spark/assertion params (rejects `max_bytes:"0"`, non-numeric numerics, bad
+  hive/value_type/expected_hash); whole-string numeric parsing on the agent
+  (`"123abc"` no longer parses as `123`); overflow-safe backoff doubling and
+  seconds→ms conversion; and a corrected `guaranteed_state.proto` transport
+  comment (`payload` bytes, not `params`/`output`).
 - **Scope-walking PR-E follow-ups — policy `fromResultSet:` bypass + YAML scanner
   hardening (#1221).** Two robustness gaps from the #1215 review, both fail-closed
   before this change: (1) a **scalar** policy scope (`scope: from_result_set:rs_x`)

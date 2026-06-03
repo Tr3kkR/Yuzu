@@ -9,12 +9,18 @@ option cc_enable_arenas = true;
 // Guaranteed State wire protocol for the Yuzu Guardian engine.
 // See docs/yuzu-guardian-design-v1.1.md § 7.
 //
-// Transport reuses the existing CommandRequest/CommandResponse bidi stream
-// via the reserved plugin name "__guard__" with these actions:
-//   Server -> Agent:  plugin="__guard__" action="push_rules" params=GuaranteedStatePush
-//   Agent  -> Server: plugin="__guard__" action="event"      output=GuaranteedStateEvent
+// Transport reuses the existing CommandRequest/CommandResponse bidi stream via
+// the reserved plugin name "__guard__" with these actions. Each message body is a
+// serialized proto carried in the binary-safe `payload` (bytes) field of the
+// CommandRequest / CommandResponse — NOT the `parameters` map or the `output`
+// string. proto3 string values must be valid UTF-8 and serialized proto bytes are
+// not; `payload` is binary-safe and survives the gateway re-encode. See
+// agent.proto CommandRequest.payload / CommandResponse.payload and
+// docs/guardian-mvp-contract.md G2.
+//   Server -> Agent:  plugin="__guard__" action="push_rules"  payload=GuaranteedStatePush
+//   Agent  -> Server: plugin="__guard__" action="event"       payload=GuaranteedStateEvent
 //   Server -> Agent:  plugin="__guard__" action="get_status"
-//   Agent  -> Server: plugin="__guard__" action="status"     output=GuaranteedStateStatus
+//   Agent  -> Server: plugin="__guard__" action="status"      payload=GuaranteedStateStatus
 
 message GuaranteedStateRule {
   string rule_id = 1;

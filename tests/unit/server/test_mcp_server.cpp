@@ -494,6 +494,8 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 
 #include "mcp_server.hpp"
 
+#include "guardian_schema_registry.hpp" // guardian_schema_catalog (REST↔MCP parity)
+
 #include <httplib.h>
 
 #include <memory>
@@ -770,6 +772,49 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
     CHECK(ts.audit_log.back() == "mcp.list_agents|success");
 }
 
+// ── Guardian schema discovery on the MCP plane (contract §4 dec.3 / §9 G9) ───
+// The schema catalog must be discoverable on BOTH the REST plane and the MCP
+// plane, byte-for-byte identical (single source: guardian_schema_catalog), so an
+// agentic client on either channel self-discovers Guard authoring the same way.
+
+TEST_CASE("MCP Integration: get_guardian_schemas matches the REST catalog",
+          "[mcp][integration][guardian]") {
+    McpTestServer ts;
+    ts.start("readonly"); // GuaranteedState:Read is allowed on every MCP tier
+
+    const auto rest_catalog =
+        nlohmann::json::parse(yuzu::server::guardian::guardian_schema_catalog().json);
+
+    // tools/call get_guardian_schemas → content[0].text is the catalog JSON.
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"get_guardian_schemas"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+    CHECK(content[0]["type"] == "text");
+    auto tool_catalog = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    REQUIRE(tool_catalog.contains("schemas"));
+    CHECK(tool_catalog == rest_catalog); // identical to REST — single source
+    CHECK(ts.audit_log.back() == "mcp.get_guardian_schemas|success");
+
+    // resources/read yuzu://guardian/schemas → contents[0].text is the same.
+    auto rres = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":8,"params":{"uri":"yuzu://guardian/schemas"}})");
+    REQUIRE(rres);
+    CHECK(rres->status == 200);
+    auto rbody = nlohmann::json::parse(rres->body);
+    REQUIRE(rbody.contains("result"));
+    auto& contents = rbody["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() >= 1);
+    auto resource_catalog = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(resource_catalog == rest_catalog);
+}
+
 // ── 5. tools/call with unknown tool — kMethodNotFound ───────────────────────
 
 TEST_CASE("MCP Integration: tools/call unknown tool returns error", "[mcp][integration]") {
@@ -851,7 +896,8 @@ TEST_CASE("MCP Integration: invalid JSON returns parse error", "[mcp][integratio
 
 // ── 10. resources/list — verify resource count ──────────────────────────────
 
-TEST_CASE("MCP Integration: resources/list returns 3 resources", "[mcp][integration]") {
+TEST_CASE("MCP Integration: resources/list returns the expected resources",
+          "[mcp][integration]") {
     McpTestServer ts;
     ts.start();
 
@@ -865,7 +911,13 @@ TEST_CASE("MCP Integration: resources/list returns 3 resources", "[mcp][integrat
     REQUIRE(result.contains("resources"));
     auto& resources = result["resources"];
     REQUIRE(resources.is_array());
-    CHECK(resources.size() == 3);
+    CHECK(resources.size() == 4); // health, compliance, audit, guardian schemas
+
+    // The Guardian schema discovery resource is advertised on the MCP plane.
+    std::set<std::string> uris;
+    for (const auto& r : resources)
+        uris.insert(r["uri"].get<std::string>());
+    CHECK(uris.count("yuzu://guardian/schemas") == 1);
 
     // Each resource should have uri, name, description, mimeType
     for (const auto& r : resources) {

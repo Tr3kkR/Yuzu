@@ -17,6 +17,8 @@
 /// `rest_api_v1.cpp` only ever sees the serialised string.
 
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace yuzu::server::guardian {
 
@@ -29,5 +31,18 @@ struct SchemaCatalog {
 /// The catalog, built once on first call (static local) and cached. Pure after
 /// construction; safe to share by const reference across request handlers.
 const SchemaCatalog& guardian_schema_catalog();
+
+/// Registry hive / value-type tokens the agent's RegistryGuard can actually read
+/// and write (agent source: `registry_support::kHives` / `kValueTypes` in
+/// `agents/core/include/yuzu/agent/guard_registry.hpp`). ONE server-side source
+/// for: the published JSON-Schema enums (registry-value-equals), the authoring
+/// validator (`guardian_rule_spec.cpp` `derive_rule_spec`), and any other server
+/// surface. Publishing a hive/type the agent can't decode produces a guard that
+/// reports perpetual false `drift.detected` (audit) or perpetual
+/// `remediation.failed` (enforce) — the "confidently-wrong guard" failure mode
+/// H2 closes. A cross-check unit test binds these to the agent constants so the
+/// two sets can never drift apart again (contract G9 schema↔handler guard).
+const std::vector<std::string_view>& supported_registry_hives();
+const std::vector<std::string_view>& supported_registry_value_types();
 
 } // namespace yuzu::server::guardian

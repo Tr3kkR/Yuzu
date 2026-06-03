@@ -19,8 +19,11 @@ namespace yuzu::server::guardian {
 // `agent_os` (unknown OS — e.g. a disconnect race or partial registration) also
 // returns true: fail OPEN so a guard is never silently dropped, matching the
 // pre-M4 send-all posture (the agent marks an inapplicable guard errored). Match
-// is otherwise case-insensitive and substring, so a verbose agent platform string
-// ("Windows 11 Pro") still matches the normalized target token ("windows").
+// is otherwise by canonical OS token: BOTH sides are normalised (`normalize_os` —
+// lowercased and mapped to a canonical token such as "windows"/"linux"/"macos")
+// and then compared for EQUALITY, so a verbose agent platform string ("Windows 11
+// Pro") still matches the target "windows" without the false positives a raw
+// substring test would admit (e.g. "win" inside "darwin").
 bool os_target_matches(std::string_view target, std::string_view agent_os);
 
 // Build the GuaranteedStatePush addressed to a SINGLE agent. Includes only

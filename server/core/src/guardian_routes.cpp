@@ -755,12 +755,16 @@ std::string GuardianRoutes::render_guard_form_fragment() const {
     html +=
         "\"><legend>Assertion &mdash; registry-value-equals</legend>"
         "<div class=\"form-row\">"
+        // Hive / value-type options are exactly the agent-supported set
+        // (registry_support::kHives / kValueTypes); a server cross-check test keeps
+        // this form, the /schemas enum, and the agent in lock-step (H2). Do not add
+        // HKCC / REG_BINARY / REG_MULTI_SZ here — the agent decodes none of them.
         "<div><label>Hive</label><select name=\"hive\">"
-        "<option>HKLM</option><option>HKCU</option><option>HKCR</option><option>HKU</option><option>HKCC</option>"
+        "<option>HKLM</option><option>HKCU</option><option>HKCR</option><option>HKU</option>"
         "</select></div>"
         "<div><label>Value type</label><select name=\"value_type\">"
         "<option>REG_DWORD</option><option>REG_QWORD</option><option>REG_SZ</option>"
-        "<option>REG_EXPAND_SZ</option><option>REG_BINARY</option></select></div>"
+        "<option>REG_EXPAND_SZ</option></select></div>"
         "</div>"
         "<label>Key</label><input name=\"key\" placeholder=\"SOFTWARE\\\\YuzuTest\" required>"
         "<div class=\"form-row\">"

@@ -23,9 +23,27 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace yuzu::agent {
+
+/// The registry hives and value types the RegistryGuard actually decodes —
+/// `parse_hive()` maps these hives, and `read_value()`/`write_value()` encode
+/// these value types (guard_registry.cpp). THIS is the agent-side source of
+/// truth: the C3b server JSON-Schema enums and the dashboard form MUST publish
+/// exactly these sets, and the `derive_rule_spec` validator MUST reject anything
+/// outside them — otherwise a guard authored against an unhandled hive/type reads
+/// back as "<unsupported-type>" forever (perpetual false drift in audit, perpetual
+/// remediation.failed in enforce). A server↔agent cross-check unit test binds the
+/// published enums to these arrays so the two can never drift apart (H2 / G9).
+/// Header-only constexpr so the server test binary can read them without linking
+/// the (Windows-only) guard implementation — same pattern as `resilience_keys`.
+namespace registry_support {
+inline constexpr std::string_view kHives[] = {"HKLM", "HKCU", "HKCR", "HKU"};
+inline constexpr std::string_view kValueTypes[] = {"REG_DWORD", "REG_QWORD", "REG_SZ",
+                                                   "REG_EXPAND_SZ"};
+} // namespace registry_support
 
 /// Registry drift report alias — the common GuardDrift, kept as a name for the
 /// registry guard's call sites and tests. A registry guard leaves
