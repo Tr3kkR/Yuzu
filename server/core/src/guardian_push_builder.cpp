@@ -1,9 +1,12 @@
 #include "guardian_push_builder.hpp"
 
+#include "guardian_rule_spec.hpp" // dangerous_enforce_key_in_spec (H1 push backstop)
+
 #include <algorithm>
 #include <cctype>
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 namespace yuzu::server::guardian {
 
@@ -81,7 +84,25 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
         r->set_name(row.name);
         r->set_version(static_cast<std::uint64_t>(row.version));
         r->set_enabled(row.enabled);
-        r->set_enforcement_mode(row.enforcement_mode);
+
+        // Enforce-write denylist backstop (H1): a rule can reach enforce mode via
+        // create, the REST metadata-only update, OR the dashboard mode toggle — the
+        // create-time validator only covers the first. This is the ONE chokepoint
+        // every push funnels through, so neutralise a denylisted enforce-write here
+        // regardless of how it got into the store: downgrade to audit so the guard
+        // still DETECTS drift but never writes to the protected key. Authoring-time
+        // rejects give the operator a clear 400; this catches legacy rows and any
+        // future authoring path. See docs/guardian-mvp-contract.md §6.
+        std::string mode = row.enforcement_mode;
+        if (mode == "enforce") {
+            if (std::string why = dangerous_enforce_key_in_spec(row.spec_json); !why.empty()) {
+                spdlog::warn("Guardian push: rule {} ('{}') requests enforce on {} — downgrading to "
+                             "audit (dangerous-key denylist, contract §6/H1)",
+                             row.rule_id, row.name, why);
+                mode = "audit";
+            }
+        }
+        r->set_enforcement_mode(mode);
 
         if (row.spec_json.empty())
             continue;  // legacy yaml_source-only rule — header only, not enforceable

@@ -28,40 +28,6 @@ std::string ascii_lower(std::string_view s) {
     return out;
 }
 
-// True when an ENFORCE-mode registry write at `key` would land on a
-// high-blast-radius persistence / privilege key. The agent performs this write
-// with the deployment service account's privilege (SYSTEM in production) on every
-// in-scope endpoint at once, so a single mis-scoped enforce rule aimed at one of
-// these could change what boots — or what runs as SYSTEM — fleet-wide with no
-// second check. Contract §6 made this denylist a hard gate before the enforce
-// write path ships (H1). Over-blocking is deliberate: audit mode still observes
-// these keys; only the *write* is refused. Match is case-insensitive on a
-// separator-normalised path, so HKLM and HKCU autoruns are both covered. Returns
-// the matched class (for the operator-facing error) or "" if the key is allowed.
-std::string dangerous_enforce_key(std::string_view key) {
-    std::string k = ascii_lower(key);
-    for (auto& c : k)
-        if (c == '/')
-            c = '\\';
-    struct Denied {
-        std::string_view token;
-        std::string_view why;
-    };
-    static constexpr Denied kDenied[] = {
-        {"currentversion\\run", "an autorun key (Run / RunOnce / RunServices)"},
-        {"image file execution options", "an Image File Execution Options key (debugger hijack)"},
-        {"winlogon", "a Winlogon key (Userinit / Shell logon hijack)"},
-        {"\\services\\", "a service-configuration key (ImagePath / Start / Type)"},
-        {"\\policies\\", "a system / explorer policy key"},
-        {"safeboot", "the SafeBoot configuration"},
-        {"bootexecute", "the Session Manager BootExecute autorun"},
-    };
-    for (const auto& d : kDenied)
-        if (k.find(d.token) != std::string::npos)
-            return std::string(d.why);
-    return {};
-}
-
 bool in_set(const std::vector<std::string_view>& set, const std::string& v) {
     return std::find(set.begin(), set.end(), v) != set.end();
 }
@@ -113,7 +79,7 @@ validate_assertion_params(const std::string& assertion_type, const nlohmann::jso
                 "use a value type published by GET /api/v1/guaranteed-state/schemas "
                 "(REG_DWORD, REG_QWORD, REG_SZ, REG_EXPAND_SZ)"};
         if (enforcement_mode == "enforce")
-            if (std::string why = dangerous_enforce_key(key); !why.empty())
+            if (std::string why = dangerous_enforce_registry_key(key); !why.empty())
                 return ResilienceParamError{
                     "enforce-mode registry write to " + why + " is not permitted",
                     "author this Guard in audit mode (enforcement_mode=\"audit\") to observe "
@@ -170,6 +136,67 @@ validate_assertion_params(const std::string& assertion_type, const nlohmann::jso
 }
 
 } // namespace
+
+std::string dangerous_enforce_registry_key(std::string_view key) {
+    // Canonicalise to the path the registry actually resolves before matching the
+    // denylist tokens: lowercase (registry is case-insensitive); '/'→'\' (forward
+    // slash is not a registry separator); collapse repeated '\' runs (so a doubled
+    // backslash can't dodge a token — MEDIUM-2). A leading '\' is then prepended so
+    // the separator-anchored tokens ("\services\", "\policies\") match even when the
+    // key begins with the component. The agent hands the raw key to
+    // RegOpenKeyExW/RegCreateKeyExW, which ignore empty path components, so these
+    // variants all resolve to the same key — the gate must treat them the same.
+    std::string lowered = ascii_lower(key);
+    std::string canon;
+    canon.reserve(lowered.size() + 1);
+    canon += '\\';
+    bool prev_sep = true;
+    for (char c : lowered) {
+        if (c == '\\' || c == '/') {
+            if (!prev_sep)
+                canon += '\\';
+            prev_sep = true;
+        } else {
+            canon += c;
+            prev_sep = false;
+        }
+    }
+
+    struct Denied {
+        std::string_view token;
+        std::string_view why;
+    };
+    static constexpr Denied kDenied[] = {
+        {"currentversion\\run", "an autorun key (Run / RunOnce / RunServices)"},
+        {"image file execution options", "an Image File Execution Options key (debugger hijack)"},
+        {"winlogon", "a Winlogon key (Userinit / Shell logon hijack)"},
+        {"\\services\\", "a service-configuration key (ImagePath / Start / Type)"},
+        {"\\policies\\", "a system / explorer policy key"},
+        {"safeboot", "the SafeBoot configuration"},
+        {"bootexecute", "the Session Manager BootExecute autorun"},
+    };
+    for (const auto& d : kDenied)
+        if (canon.find(d.token) != std::string::npos)
+            return std::string(d.why);
+    return {};
+}
+
+std::string dangerous_enforce_key_in_spec(const std::string& spec_json) {
+    if (spec_json.empty())
+        return {};
+    auto spec = nlohmann::json::parse(spec_json, nullptr, /*allow_exceptions=*/false);
+    if (!spec.is_object() || !spec.contains("assertion") || !spec["assertion"].is_object())
+        return {};
+    const auto& assertion = spec["assertion"];
+    if (assertion.value("type", std::string{}) != "registry-value-equals")
+        return {};
+    if (!assertion.contains("params") || !assertion["params"].is_object())
+        return {};
+    const auto& params = assertion["params"];
+    if (!params.contains("key") || !params["key"].is_string())
+        return {};
+    return dangerous_enforce_registry_key(params["key"].get<std::string>());
+}
 
 RuleSpecResult derive_rule_spec(const nlohmann::json& body, const std::string& name,
                                 std::int64_t version, bool enabled,

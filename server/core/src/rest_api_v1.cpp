@@ -4469,6 +4469,29 @@ void RestApiV1::register_routes(
                      updated.yaml_source = std::move(spec.yaml_source);
                  } else {
                      updated.yaml_source = body.value("yaml_source", updated.yaml_source);
+                     // Metadata-only update keeps the existing spec_json, so
+                     // derive_rule_spec's assertion validator did NOT run. If this
+                     // update flips the rule into enforce mode, re-check the STORED
+                     // assertion against the dangerous-key denylist — otherwise an
+                     // audit guard on a protected key can be promoted to a
+                     // SYSTEM-write past the H1 gate (contract §6).
+                     if (updated.enforcement_mode == "enforce") {
+                         if (std::string why =
+                                 guardian::dangerous_enforce_key_in_spec(updated.spec_json);
+                             !why.empty()) {
+                             res.status = 400;
+                             res.set_content(
+                                 detail::error_json_a4(
+                                     400, "enforce mode not permitted: this guard targets " + why,
+                                     cid,
+                                     "keep this guard in audit mode, or re-author it against a key "
+                                     "outside the protected persistence/privilege set"),
+                                 "application/json");
+                             audit_fn(req, "guaranteed_state.rule.update", "denied",
+                                      "GuaranteedState", id, "enforce on denylisted key");
+                             return;
+                         }
+                     }
                  }
 
                  updated.updated_at = iso_now();

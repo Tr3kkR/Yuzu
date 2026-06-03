@@ -12,6 +12,7 @@
  */
 
 #include "guardian_resilience_schema.hpp"
+#include "guardian_rule_spec.hpp" // derive_rule_spec + dangerous-key denylist (H1)
 #include "guardian_schema_registry.hpp"
 
 #include <yuzu/agent/guard_registry.hpp>      // registry_support::kHives / kValueTypes (cross-check)
@@ -277,4 +278,85 @@ TEST_CASE("CROSS-CHECK: registry hive/value_type schema == server set == agent s
         CHECK(std::find(agent.begin(), agent.end(), "REG_BINARY") == agent.end());
         CHECK(std::find(agent.begin(), agent.end(), "REG_MULTI_SZ") == agent.end());
     }
+}
+
+namespace {
+// Build a registry-value-equals rule body for derive_rule_spec.
+json reg_rule_body(const std::string& key, const std::string& remediation_type) {
+    return json{
+        {"spark", {{"type", "registry-change"}, {"params", json::object()}}},
+        {"assertion",
+         {{"type", "registry-value-equals"},
+          {"params",
+           {{"hive", "HKLM"}, {"key", key}, {"value_name", "Flag"}, {"value_type", "REG_SZ"},
+            {"expected", "1"}}}}},
+        {"remediation", {{"type", remediation_type}, {"params", json::object()}}},
+    };
+}
+} // namespace
+
+TEST_CASE("H1: enforce-mode write to a denylisted key is rejected (contract §6)",
+          "[guardian][denylist][h1]") {
+    // Every named §6 class is refused when the rule is in enforce mode.
+    const std::vector<std::string> denied = {
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\sethc.exe",
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+        "SYSTEM\\CurrentControlSet\\Services\\YuzuFake",
+        "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+    };
+    for (const auto& key : denied) {
+        INFO("denied key=" << key);
+        auto r = derive_rule_spec(reg_rule_body(key, "enforce"), "g", 1, true, "enforce");
+        CHECK(r.error.has_value());
+    }
+    // The SAME key is permitted in AUDIT mode — detection must still observe it.
+    auto audit = derive_rule_spec(
+        reg_rule_body("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "alert-only"), "g", 1,
+        true, "audit");
+    CHECK_FALSE(audit.error.has_value());
+    CHECK(audit.structured);
+    // A benign key in enforce mode is allowed.
+    auto benign =
+        derive_rule_spec(reg_rule_body("SOFTWARE\\YuzuTest\\Flag", "enforce"), "g", 1, true, "enforce");
+    CHECK_FALSE(benign.error.has_value());
+}
+
+TEST_CASE("H1: denylist normalisation resists separator/case evasion",
+          "[guardian][denylist][h1]") {
+    // doubled backslash, forward slashes, leading separator, mixed case all canonicalise.
+    CHECK_FALSE(dangerous_enforce_registry_key(
+                    "software\\microsoft\\windows\\currentversion\\\\run")
+                    .empty());
+    CHECK_FALSE(dangerous_enforce_registry_key("SOFTWARE/Microsoft/Windows/CurrentVersion/Run")
+                    .empty());
+    CHECK_FALSE(
+        dangerous_enforce_registry_key("\\SYSTEM\\CurrentControlSet\\Services\\Foo").empty());
+    CHECK_FALSE(dangerous_enforce_registry_key("system\\currentcontrolset\\services\\bar").empty());
+    // benign keys are not over-matched: 'run' as a non-autorun substring is fine.
+    CHECK(dangerous_enforce_registry_key("software\\acme\\running_total").empty());
+    CHECK(dangerous_enforce_registry_key("software\\acme\\services_list").empty());
+    CHECK(dangerous_enforce_registry_key("software\\yuzutest\\flag").empty());
+}
+
+TEST_CASE("H1: dangerous_enforce_key_in_spec inspects the stored spec_json",
+          "[guardian][denylist][h1]") {
+    // The audit→enforce bypass guard relies on detecting a denylisted key in a
+    // stored (already-created, audit-mode) spec.
+    auto clean = derive_rule_spec(reg_rule_body("SOFTWARE\\YuzuTest\\Flag", "alert-only"), "g", 1,
+                                  true, "audit");
+    REQUIRE(clean.structured);
+    CHECK(dangerous_enforce_key_in_spec(clean.spec_json).empty());
+
+    auto stored = derive_rule_spec(
+        reg_rule_body("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "alert-only"), "g", 1,
+        true, "audit");
+    REQUIRE(stored.structured);
+    CHECK_FALSE(dangerous_enforce_key_in_spec(stored.spec_json).empty());
+
+    // Robust to junk.
+    CHECK(dangerous_enforce_key_in_spec("").empty());
+    CHECK(dangerous_enforce_key_in_spec("not json").empty());
+    CHECK(dangerous_enforce_key_in_spec("{}").empty());
 }
