@@ -17,6 +17,59 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## ⚠️ Breaking: `--mfa-enforcement` now enforces
+
+Releases before this one accepted `--mfa-enforcement=admin-only` and
+`--mfa-enforcement=required` but treated them as **no-ops** (the parser
+accepted the value for forward-compat and the server emitted a startup
+`WARN`). **This release makes them enforce.** If you staged the flag based
+on that prior documentation, enforcement goes live the instant you start
+the new build.
+
+What changes on upgrade if the flag is set to `admin-only` or `required`:
+
+- An **un-enrolled** user covered by the mode can no longer log in directly.
+  `POST /login` returns a 202 `mfa_enrollment_required` challenge and the
+  user must complete TOTP enrollment (scan QR → enter first code at
+  `POST /login/mfa/enroll`) before a session is minted. This is a no-lockout
+  bootstrap, **but** it requires the user to enroll at their next login.
+- The startup log line for non-default modes changes from `WARN` (no-op) to
+  `INFO` (enforcement active).
+- An operator can no longer disable their own MFA while the mode protects
+  their role.
+
+**Before upgrading with the flag set, do ONE of:**
+
+1. **Recommended:** leave the flag at `optional`, upgrade, have all affected
+   users enroll (Settings → Multi-Factor Authentication), *then* set
+   `admin-only`/`required` and restart. or
+2. Upgrade with the flag set and accept that affected un-enrolled users will
+   be walked through enrollment on their next login.
+
+**SSO / OIDC pre-flight (required reading if you use SSO):** under
+`required` (and `admin-only` for admin SSO users), OIDC sessions are
+MFA-gated by the IdP's `amr` claim — an SSO login the IdP did **not** MFA
+is blocked from high-risk endpoints (it must re-authenticate via SSO),
+symmetric with a local user being forced to enrol. Yuzu cannot mint a
+second factor for an external identity, so **before enabling
+`required`/`admin-only` with SSO you MUST verify your IdP asserts an `amr`
+claim containing a recognized MFA method** (Entra: `mfa`; others:
+`otp`/`hwk`/etc., RFC 8176). If it does not, affected SSO users will be
+unable to reach high-risk endpoints — recoverable by restarting in
+`optional` (see `docs/ops-runbooks/auth-db-recovery.md`). Under `optional`,
+no IdP `amr` configuration is required (SSO sessions pass the gate).
+
+**Single-admin deployments:** do not first-boot a fresh single-admin
+deployment straight into `required`. Enroll the admin under `optional` first,
+then switch. If you do start with `required`, the admin must complete
+login-time enrollment within `--mfa-login-pending-secs` (default 120s); if
+the token expires, restart with `optional`, log in, enroll, then re-enable.
+
+**Recovery if you get locked out** (IdP doesn't assert `amr`, or the sole
+admin can't enroll): restart the server with `--mfa-enforcement=optional`
+(this re-seeds the in-memory config), log in, resolve enrollment, then
+re-enable. See `docs/ops-runbooks/auth-db-recovery.md`.
+
 ## Upgrade Order
 
 Always upgrade in this order:

@@ -281,6 +281,56 @@ manually record:
 Per SOC 2 CC6.6 the break-glass procedure is itself an auditable event
 and the manual record is the evidence chain.
 
+## Locked out by MFA enforcement misconfiguration (PR 3)
+
+`--mfa-enforcement=admin-only|required` (PR 3) can lock operators out in
+two ways that are NOT "lost device" — they are policy/IdP
+misconfigurations. The recovery is the same first move: **bring the server
+back up in `optional` mode**, fix the underlying state, then re-enable.
+
+**Symptom A — SSO users can't reach high-risk endpoints.** Your IdP does
+not assert an `amr` claim containing a recognized MFA method, so OIDC
+sessions are never seeded with an MFA proof. (Note: such sessions still
+*pass* the step-up gate — they are not blocked from normal operation — so
+this only bites if you expected SSO step-up to enforce MFA.) Fix the IdP's
+authorization-server policy to emit `amr` (Entra: `mfa`; others: `otp` /
+`hwk` / etc.), then re-test. No server surgery needed.
+
+**Symptom B — the sole admin can't complete login-time enrollment.** A
+fresh single-admin deployment was started straight into `required`, and
+the admin's enrollment-pending token expired (default
+`--mfa-login-pending-secs=120`) before they scanned the QR, OR
+`mfa_init_enrollment` failed transiently. No session was minted and the
+dashboard is unreachable.
+
+**Recovery procedure.**
+
+```bash
+# 1. Restart the server with enforcement relaxed. This re-seeds the
+#    in-memory config from the flag/env; auth.db is untouched.
+sudo systemctl stop yuzu-server
+sudo systemctl set-environment YUZU_MFA_ENFORCEMENT=optional   # or edit the unit's flag
+sudo systemctl start yuzu-server
+
+# 2. Log in with password alone, enroll via Settings → Multi-Factor
+#    Authentication (this issues a fresh secret + recovery codes), and
+#    SAVE the recovery codes.
+
+# 3. Once the required accounts are enrolled, restore enforcement and
+#    restart.
+sudo systemctl unset-environment YUZU_MFA_ENFORCEMENT          # back to the unit default
+sudo systemctl restart yuzu-server
+```
+
+On Windows, edit the service's `YUZU_MFA_ENFORCEMENT` environment variable
+(or the `--mfa-enforcement` argument in the service definition), then
+`Restart-Service YuzuServer`.
+
+**Prevention.** Enroll the admin under `optional` *before* switching to
+`required`, and validate your IdP's `amr` assertion before relying on
+enforcement for SSO users. See `docs/user-manual/upgrading.md` §
+"⚠️ Breaking: `--mfa-enforcement` now enforces".
+
 ## Post-restore migration check
 
 If you restore `auth.db` from a backup taken before the v2 schema
