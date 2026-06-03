@@ -19,13 +19,6 @@
 ///     the step-up moment (per `/auth-and-authz` skill, "MFA on every
 ///     API-token call" is explicitly out of scope; token issuance
 ///     happened with full MFA).
-///   - OIDC/SSO sessions — the identity lives in the IdP, there is no
-///     local `users` row or TOTP secret to step up against, and the
-///     `mfa_status()` lookup for such a session returns `UserNotFound`.
-///     Without this exemption every OIDC session fails closed and is
-///     permanently locked out of the gated endpoints (PR #1199 review
-///     HIGH). Enforcing MFA on SSO sessions via the `amr` claim is the
-///     documented PR3 work.
 ///   - Sessions belonging to users without MFA enrolled — consistent
 ///     with PR1's enforcement model (`optional` mode only kicks in
 ///     once a user opts into MFA).
@@ -34,17 +27,29 @@
 ///     in main.cpp).
 ///
 /// Requires step-up (returns false) when:
-///   - principal is a local session ("local" auth_source) AND
-///   - user is MFA-enrolled AND
+///   - principal is a local session ("local" auth_source) AND user is
+///     MFA-enrolled, OR principal is an OIDC session (PR3 — no local
+///     enrollment lookup; gated purely on the `amr`-seeded timestamp);
+///     AND
 ///   - `now - session.mfa_verified_at > window_secs`
+///
+/// OIDC interop (PR3): an OIDC session carries no local `users` row, so
+/// the enrollment lookup is skipped for it. Its `mfa_verified_at` is
+/// seeded in /auth/callback from the IdP `amr` claim (see
+/// `amr_asserts_mfa` below). A session whose IdP login did not attest MFA
+/// — or whose attestation is older than the window — fails the gate; the
+/// remediation points the operator back through SSO (`/auth/oidc/start`)
+/// rather than the local `/login/mfa/stepup` flow, which has no secret to
+/// verify for an external identity.
 ///
 /// Side effects on failure:
 ///   - `res.status = 401`
 ///   - `res.body` = A4 envelope: `{"error":{"code":401,"message":
 ///     "MFA step-up required","correlation_id":"req-...",
-///     "remediation":"POST /login/mfa/stepup with current TOTP code or
-///     a recovery code, then retry"},"meta":{"api_version":"v1",
-///     "mfa_step_up_required":true,"challenge_url":"/login/mfa/stepup"}}`
+///     "remediation":"<source-specific>"},"meta":{"api_version":"v1",
+///     "mfa_step_up_required":true,"challenge_url":"<source-specific>"}}`
+///     where the challenge_url is `/login/mfa/stepup` for local sessions
+///     and `/auth/oidc/start` for OIDC sessions.
 ///   - emits audit row: `mfa.step_up.required`, result=`error`,
 ///     target_type=`Endpoint`, target_id=`<action_label>`, detail=
 ///     username + age of last MFA proof in seconds.
@@ -55,6 +60,8 @@
 
 #include <functional>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace httplib {
 struct Request;
@@ -78,7 +85,26 @@ using StepUpAuditFn = std::function<bool(const httplib::Request&,
 bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
                          const auth::Session& session, AuthDB& auth_db,
                          int window_secs, const StepUpAuditFn& audit_fn,
-                         const std::string& action_label);
+                         const std::string& action_label,
+                         std::string_view mfa_enforcement = "optional");
+
+/// True if the IdP `amr` claim attests a multi-factor (or otherwise
+/// strong) authentication that should seed a session's MFA-verified
+/// timestamp. The allowlist follows RFC 8176 plus Entra's non-standard
+/// `mfa` value, per docs/auth-mfa-design.md "OIDC interop". `pwd`
+/// (password-only) and the single-factor `pin`/`user` are deliberately
+/// excluded. Free function so PR3's /auth/callback wiring is unit-testable
+/// without standing up an OIDC provider.
+bool amr_asserts_mfa(const std::vector<std::string>& amr);
+
+/// Single source of truth for the `--mfa-enforcement` predicate: does the
+/// given mode require MFA for a principal of `role`? `required` → every
+/// role; `admin-only` → admins only; anything else (`optional` or an
+/// unexpected value) → not enforced (fail-safe). Shared by the `/login`
+/// enrollment bootstrap and the Settings self-target disable guard so the
+/// `required || (admin-only && admin)` logic lives in exactly one place
+/// (governance arch-S1 — was duplicated and drift-prone).
+bool mfa_enforcement_protects(std::string_view mode, auth::Role role);
 
 /// Per-surface adapter — wires AuthDB + window_secs + audit_fn into a
 /// 3-argument callable that downstream `register_routes` overloads can

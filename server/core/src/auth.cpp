@@ -775,7 +775,8 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
 std::string AuthManager::create_oidc_session(const std::string& display_name,
                                              const std::string& email, const std::string& oidc_sub,
                                              const std::vector<std::string>& groups,
-                                             const std::string& admin_group_id) {
+                                             const std::string& admin_group_id,
+                                             std::chrono::steady_clock::time_point mfa_verified_at) {
     std::unique_lock lock(mu_);
 
     // Determine role: admin if user is in the configured admin group.
@@ -798,6 +799,7 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     s.expires_at = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source = "oidc";
     s.oidc_sub = oidc_sub;
+    s.mfa_verified_at = mfa_verified_at;
     sessions_[token] = std::move(s);
 
     spdlog::info("OIDC session created for '{}' (email={}, sub={}, role={})",

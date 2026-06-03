@@ -26,7 +26,7 @@ curl -s -c cookies.txt -X POST http://localhost:8080/login \
   -d "username=admin&password=s3cret"
 ```
 
-On success the response is a `200 OK` with a JSON body `{"status":"ok"}` and a `Set-Cookie` header containing the `yuzu_session` token. **For users enrolled in TOTP MFA the response is HTTP 202** with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` and no cookie — the operator must complete the challenge by posting the pending token + a 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `/login/mfa`, which then mints the session cookie. See the [Multi-Factor Authentication (TOTP)](#multi-factor-authentication-totp) section below for the full flow. The `cookies.txt` file now contains the session cookie. Use it on subsequent requests:
+On success the response is a `200 OK` with a JSON body `{"status":"ok"}` and a `Set-Cookie` header containing the `yuzu_session` token. **For users enrolled in TOTP MFA the response is HTTP 202** with body `{"status":"mfa_required","mfa_pending_token":"<opaque>","expires_in":120}` and no cookie — the operator must complete the challenge by posting the pending token + a 6-digit TOTP code (or a `XXXX-XXXX-XXXX-XXXX` recovery code) to `/login/mfa`, which then mints the session cookie. Under MFA enforcement (`--mfa-enforcement=admin-only|required`) an **un-enrolled** user instead receives a 202 with `{"status":"mfa_enrollment_required", ...}` and must enroll via `/login/mfa/enroll` first — distinguish the two 202 cases by the `status` field. See the [Multi-Factor Authentication (TOTP)](#multi-factor-authentication-totp) section below for the full flow. The `cookies.txt` file now contains the session cookie. Use it on subsequent requests:
 
 ```bash
 curl -s -b cookies.txt http://localhost:8080/api/v1/me
@@ -53,8 +53,8 @@ Yuzu supports RFC 6238 TOTP (Time-based One-Time Passwords) as a second factor f
 #### Enrollment
 
 1. Sign in as an admin. Navigate to **Settings → Multi-Factor Authentication**.
-2. Click **Enable MFA**. The server generates a fresh 20-byte secret and renders an `otpauth://` URI plus the base32 secret as a one-time reveal (`Cache-Control: no-store` is set so the response will not be cached by browsers or proxies).
-3. Scan the QR code (most apps render it from the `otpauth://` URI) or type the base32 secret in manually.
+2. Click **Enable MFA**. The server generates a fresh 20-byte secret and renders it as an **inline QR code** in the page, plus the base32 secret and `otpauth://` URI as text for manual entry — a one-time reveal (`Cache-Control: no-store` is set so the response will not be cached by browsers or proxies).
+3. Scan the QR code with your authenticator app, or type the base32 secret in manually if you can't scan.
 4. Enter the next 6-digit code shown by your authenticator app and click **Confirm**.
 5. The server confirms enrollment and reveals 10 single-use recovery codes in the format `XXXX-XXXX-XXXX-XXXX` (80 bits of entropy). **Save the codes somewhere safe** — they are shown exactly once.
 6. From now on, every login by this account will prompt for a TOTP code after the password.
@@ -93,7 +93,7 @@ If a user loses both their authenticator and all 10 recovery codes, MFA must be 
 
 | Flag | Default | Description |
 |---|---|---|
-| `--mfa-enforcement` | `optional` | `optional`: users enroll voluntarily. `admin-only`: admins must enroll. `required`: all users must enroll. **This release ships `optional` semantics only**; non-default values are accepted for forward compatibility but emit a startup warning until the enforcement PR lands. |
+| `--mfa-enforcement` | `optional` | `optional`: users enroll voluntarily; login never requires it. `admin-only`: an admin without MFA must enroll before login completes. `required`: every role must enroll. Under `admin-only`/`required` an un-enrolled login is redirected through TOTP enrollment (`POST /login/mfa/enroll`) before a session is minted; the startup log emits an `INFO` line naming the active mode. **Breaking:** in releases before this one these values were accepted but a no-op — see `docs/user-manual/upgrading.md` before enabling. For SSO users see "MFA on SSO sessions" below — your IdP must assert an `amr` MFA method. |
 | `--mfa-step-up-window-secs` | `300` | Seconds after a TOTP proof during which high-risk endpoints accept the session as "stepped up" without re-prompting. Set to `0` to disable the step-up gate entirely (escape hatch — emits a startup `WARN`). |
 | `--mfa-login-pending-secs` | `120` | Lifetime of the intermediate `mfa_pending_token` between password success and TOTP submission. The pending state lives in process memory and is lost on server restart. |
 
@@ -104,9 +104,10 @@ Each flag also accepts the matching `YUZU_MFA_*` environment variable.
 Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` lists the full vocabulary). The verbs are:
 
 - `mfa.enroll.initiated` — secret generated, awaiting verify
-- `mfa.enroll.verified` — first code accepted; enrollment is live
-- `mfa.enroll.failed` — first code rejected
-- `mfa.disabled` — operator or admin cleared the secret
+- `mfa.enroll.required` — `POST /login` blocked an un-enrolled login under enforcement and issued an enrollment-pending token (PR 3)
+- `mfa.enroll.verified` — first code accepted; enrollment is live (Settings or the `POST /login/mfa/enroll` bootstrap)
+- `mfa.enroll.failed` — first code rejected (Settings or login bootstrap)
+- `mfa.disabled` — operator or admin cleared the secret (`error` + detail `blocked: mfa_enforcement=<mode>` when the self-target guard refuses a disable under enforcement)
 - `mfa.login.required` — `POST /login` returned a 202 pending challenge
 - `mfa.login.verified` — `POST /login/mfa` TOTP accepted, session minted
 - `mfa.login.failed` — `POST /login/mfa` rejected the code or the pending token
@@ -120,7 +121,7 @@ Every MFA state transition emits an audit row (`docs/user-manual/audit-log.md` l
 
 #### Step-up on high-risk surfaces (PR 2)
 
-Ten REST + Settings endpoints (token mint/revoke, admin session revoke, software package create / deployment start, Guardian rule create/update/push, user delete, user role change) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
+Eleven REST + Settings endpoints (token mint/revoke, admin session revoke, software package create / deployment start, Guardian rule create/update/delete/push, user delete, user role change) require a fresh MFA proof on the calling session before the mutation lands. If the proof is older than `--mfa-step-up-window-secs`, the endpoint returns HTTP `401` with an A4 envelope:
 
 ```json
 {
@@ -145,6 +146,35 @@ Dashboard HTMX flows auto-intercept this envelope and prompt the operator inline
 3. On `200 OK`, retry the original request — the session is now "stepped up" for `--mfa-step-up-window-secs` seconds.
 
 API token / MCP token principals **bypass step-up entirely** — the token itself was issued as a long-lived bearer credential through an authenticated session and does not re-prompt. Step-up applies to session-cookie principals only.
+
+#### MFA on SSO sessions (PR 3)
+
+OIDC/SSO sessions carry no local TOTP secret, so they cannot use `/login/mfa/stepup` (it returns `400` for an OIDC caller, pointing back to SSO). Instead, the step-up gate honours the IdP's RFC 8176 `amr` claim:
+
+- If the IdP attested a multi-factor login (`amr` contains `mfa`, `otp`, `hwk`, `fpt`, `face`, `iris`, `sms`, `swk`, or `tel`), the session is treated as stepped-up. Once that proof ages past `--mfa-step-up-window-secs`, high-risk endpoints return `401` with `challenge_url=/auth/oidc/start` — the operator re-authenticates through SSO to refresh it.
+- If the IdP did **not** attest MFA, the outcome depends on the enforcement mode, symmetric with how a local user is treated:
+  - Under `optional` (or `admin-only` for a non-admin SSO user): the session **passes** the gate. Yuzu cannot mint a second factor for an externally-owned identity, so for the default posture MFA on SSO is the IdP's responsibility.
+  - Under `required` (or `admin-only` for an admin SSO user): the session is **gated** — high-risk endpoints return `401` pointing to re-SSO. The operator required MFA for this principal, so an SSO login the IdP did not MFA must re-authenticate (just as a local `required` user is forced to enrol).
+
+**Therefore, before turning on `--mfa-enforcement=required` (or `admin-only` for admin SSO users), configure your IdP to assert `amr` and verify it pre-flight** — otherwise those SSO users will be unable to reach high-risk endpoints (recoverable by restarting in `optional`; see the runbook). Under `optional`, no IdP `amr` configuration is required.
+
+#### Login-time enrollment (PR 3)
+
+Under `--mfa-enforcement=admin-only|required`, an un-enrolled login does not 200. `POST /login` (after a valid password) returns a second 202 variant distinguished by `status`:
+
+```json
+{"status":"mfa_enrollment_required","mfa_pending_token":"<opaque>","otpauth_uri":"otpauth://...","secret_base32":"...","expires_in":120}
+```
+
+The browser shows the QR / secret, the operator scans it, and posts the pending token + the first 6-digit code to **`POST /login/mfa/enroll`**, which confirms enrollment, mints an MFA-verified session cookie, and returns the one-time recovery codes:
+
+```bash
+curl -s -c cookies.txt -X POST http://localhost:8080/login/mfa/enroll \
+  -d 'mfa_pending_token=<from-202>&code=123456'
+# {"status":"ok","recovery_codes":["XXXX-XXXX-XXXX-XXXX", ...]}
+```
+
+The recovery codes are revealed **once** here, exactly as in Settings enrollment — save them before continuing. The endpoint shares the `/login` rate-limit bucket and the 5-attempt-per-pending cap. If `auth_db` is unavailable the enforced login fails closed (`503`) rather than minting an unprotected session.
 
 ### Logout
 

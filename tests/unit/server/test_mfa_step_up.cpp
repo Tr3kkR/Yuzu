@@ -291,47 +291,193 @@ TEST_CASE_METHOD(StepUpFixture,
     CHECK(body["meta"]["mfa_step_up_required"] == true);
 }
 
-TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: OIDC sessions bypass the gate",
-                 "[mfa][stepup]") {
-    // PR #1199 review HIGH: OIDC/SSO identities live in the IdP and have
-    // no local `users` row to step up against. The gate must exempt them
-    // (like bearer tokens) rather than fail closed, or every OIDC session
-    // is permanently locked out of all 11 gated endpoints. `amr`-claim
-    // enforcement on SSO sessions is the documented PR3 work.
+TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: OIDC session with fresh amr-seeded proof passes",
+                 "[mfa][stepup][oidc]") {
+    // PR3: OIDC sessions are no longer blanket-exempt. /auth/callback seeds
+    // mfa_verified_at from the IdP `amr` claim. A session whose IdP login
+    // attested MFA recently clears the gate WITHOUT a local users-row
+    // lookup (carol has no row, proving the lookup is skipped).
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
+    REQUIRE_FALSE(db->mfa_status("carol").has_value()); // no local row
+    auto session = make_session("carol", "oidc", std::chrono::steady_clock::now());
 
-    // Even when the OIDC username happens to collide with a local row
-    // that is MFA-enrolled (alice), the exemption is unconditional.
-    auto enrolled = make_session("alice", "oidc");
-    CHECK(require_mfa_step_up(req, res, enrolled, *db, /*window_secs=*/300, audit_fn,
-                             "POST /api/v1/tokens"));
+    CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
+                              "POST /api/v1/tokens"));
     CHECK(res.status == 200);
     CHECK(res.body.empty());
     CHECK(audits.empty());
 }
 
 TEST_CASE_METHOD(StepUpFixture,
-                 "require_mfa_step_up: OIDC session with no users row passes (production case)",
-                 "[mfa][stepup]") {
-    // The real-world OIDC state: a session whose username has NO row in
-    // `users` at all (create_oidc_session never upserts). Before the fix
-    // this hit mfa_status() == UserNotFound and fell into the fail-closed
-    // 401 branch — a permanent lockout. Regression guard for PR #1199
-    // review HIGH: it must pass cleanly with no 401 and no audit row.
+                 "require_mfa_step_up: OIDC session WITHOUT MFA proof PASSES (UP-5 regression)",
+                 "[mfa][stepup][oidc]") {
+    // GOVERNANCE UP-5 regression. An SSO login from an IdP that did not
+    // attest MFA (no amr → mfa_verified_at default) has no second factor to
+    // step up against — it must PASS, exactly like an un-enrolled local
+    // user. Failing it would 401 → /auth/oidc/start → silent re-SSO → same
+    // amr-less token → 401 … an infinite lockout loop re-opening the PR
+    // #1199 HIGH for every non-MFA IdP. The gate must NOT consult the local
+    // users row (carol has none) and must NOT fail closed.
     httplib::Request req;
     httplib::Response res;
     res.status = 200;
-    // "carol" was never seeded — no users row exists for her.
-    REQUIRE_FALSE(db->mfa_status("carol").has_value());
-    auto session = make_session("carol", "oidc");
+    REQUIRE_FALSE(db->mfa_status("carol").has_value()); // no local row
+    auto session = make_session("carol", "oidc");       // default-constructed proof
 
+    // Pass "optional" explicitly so the UP-5 invariant is not silently tied
+    // to the parameter default (governance qe SHOULD).
     CHECK(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
-                              "DELETE /api/v1/sessions"));
+                             "DELETE /api/v1/sessions", "optional"));
     CHECK(res.status == 200);
     CHECK(res.body.empty());
     CHECK(audits.empty());
+}
+
+TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: OIDC no-proof is GATED under enforcement (A4/B1)",
+                 "[mfa][stepup][oidc][enforce]") {
+    // Hermes adversarial + cyber A4/B1 + governance UP-6: under enforcement
+    // that protects the principal's role, an SSO login the IdP did not MFA
+    // must step up (re-SSO), symmetric with a local user being forced to
+    // enroll. (The default/optional case — no-proof passes — is the
+    // separate UP-5 regression test above.)
+    httplib::Request req;
+    REQUIRE_FALSE(db->mfa_status("carol").has_value()); // oidc, no local row
+
+    // required → every role gated. carol is a user-role oidc session.
+    {
+        httplib::Response res;
+        res.status = 200;
+        auto s = make_session("carol", "oidc"); // no proof
+        CHECK_FALSE(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "required"));
+        CHECK(res.status == 401);
+        auto body = nlohmann::json::parse(res.body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["meta"]["challenge_url"] == "/auth/oidc/start");
+    }
+
+    // admin-only → a non-admin oidc session still PASSES (not protected)…
+    {
+        httplib::Response res;
+        res.status = 200;
+        auto s = make_session("carol", "oidc"); // user role
+        CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "admin-only"));
+        CHECK(res.status == 200);
+    }
+    // …but an admin oidc session under admin-only is gated.
+    {
+        httplib::Response res;
+        res.status = 200;
+        auto s = make_session("alice", "oidc"); // admin role (make_session maps alice→admin)
+        CHECK_FALSE(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "admin-only"));
+        CHECK(res.status == 401);
+    }
+
+    // A FRESH amr-seeded proof passes even under `required` — enforcement
+    // gates the no-proof case, not a session the IdP actually MFA'd
+    // (guards against a future refactor broadening the gate to all OIDC).
+    {
+        httplib::Response res;
+        res.status = 200;
+        auto s = make_session("carol", "oidc", std::chrono::steady_clock::now());
+        CHECK(require_mfa_step_up(req, res, s, *db, 300, audit_fn, "X", "required"));
+        CHECK(res.status == 200);
+    }
+}
+
+TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: window boundary — age == window passes, age > window fails",
+                 "[mfa][stepup]") {
+    // The comparison is inclusive (`age <= window_secs`). A local enrolled
+    // session proven exactly `window_secs` ago passes; one second past
+    // fails. Guards the boundary against an off-by-one regression.
+    httplib::Request req;
+    const auto now = std::chrono::steady_clock::now();
+
+    httplib::Response res_at;
+    res_at.status = 200;
+    auto at = make_session("alice", "local", now - std::chrono::seconds(300));
+    CHECK(require_mfa_step_up(req, res_at, at, *db, /*window_secs=*/300, audit_fn, "X"));
+    CHECK(res_at.status == 200);
+
+    httplib::Response res_past;
+    res_past.status = 200;
+    auto past = make_session("alice", "local", now - std::chrono::seconds(301));
+    CHECK_FALSE(require_mfa_step_up(req, res_past, past, *db, /*window_secs=*/300, audit_fn, "X"));
+    CHECK(res_past.status == 401);
+}
+
+TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: OIDC session with stale amr proof is gated",
+                 "[mfa][stepup][oidc]") {
+    httplib::Request req;
+    httplib::Response res;
+    res.status = 200;
+    // amr attested MFA, but 600s ago; window is 300s → stale.
+    auto session = make_session("carol", "oidc",
+                                std::chrono::steady_clock::now() - std::chrono::seconds(600));
+
+    CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/300, audit_fn,
+                                    "POST /api/v1/tokens"));
+    CHECK(res.status == 401);
+    auto body = nlohmann::json::parse(res.body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["meta"]["challenge_url"] == "/auth/oidc/start");
+}
+
+TEST_CASE("mfa_enforcement_protects: single source of truth for the enforcement predicate",
+          "[mfa][stepup][enforce]") {
+    using yuzu::server::mfa_enforcement_protects;
+    using yuzu::server::auth::Role;
+    // optional → never protects.
+    CHECK_FALSE(mfa_enforcement_protects("optional", Role::admin));
+    CHECK_FALSE(mfa_enforcement_protects("optional", Role::user));
+    // admin-only → admins only.
+    CHECK(mfa_enforcement_protects("admin-only", Role::admin));
+    CHECK_FALSE(mfa_enforcement_protects("admin-only", Role::user));
+    // required → every role.
+    CHECK(mfa_enforcement_protects("required", Role::admin));
+    CHECK(mfa_enforcement_protects("required", Role::user));
+    // Unknown value → fail-safe (not enforced; CLI validation rejects it
+    // upstream so this never locks anyone out on a typo).
+    CHECK_FALSE(mfa_enforcement_protects("bogus", Role::admin));
+    CHECK_FALSE(mfa_enforcement_protects("", Role::admin));
+}
+
+TEST_CASE("amr_asserts_mfa: MFA-bearing methods are recognised, password-only is not",
+          "[mfa][stepup][oidc][amr]") {
+    using yuzu::server::amr_asserts_mfa;
+    // Empty / single-factor → false.
+    CHECK_FALSE(amr_asserts_mfa({}));
+    CHECK_FALSE(amr_asserts_mfa({"pwd"}));
+    CHECK_FALSE(amr_asserts_mfa({"pwd", "rba"})); // risk-based, no factor
+    CHECK_FALSE(amr_asserts_mfa({"unknown", "method"}));
+
+    // Single-factor presence/knowledge methods are NOT MFA (governance
+    // UP-7): a device-unlock PIN or "user presence" must not satisfy the
+    // gate.
+    CHECK_FALSE(amr_asserts_mfa({"pin"}));
+    CHECK_FALSE(amr_asserts_mfa({"user"}));
+    CHECK_FALSE(amr_asserts_mfa({"pwd", "pin"}));
+
+    // Case-sensitive per RFC 8176 (Entra emits lowercase "mfa"). A
+    // mixed-case value is conservatively rejected — fail-safe (the session
+    // is gated/re-SSO'd, never wrongly admitted). Documents the behavior so
+    // a future normalization change is detectable.
+    CHECK_FALSE(amr_asserts_mfa({"MFA"}));
+    CHECK_FALSE(amr_asserts_mfa({"Otp"}));
+
+    // Entra aggregate + RFC 8176 factor references → true.
+    CHECK(amr_asserts_mfa({"mfa"}));
+    CHECK(amr_asserts_mfa({"pwd", "otp"}));     // password + one-time-code
+    CHECK(amr_asserts_mfa({"pwd", "hwk"}));     // hardware key
+    CHECK(amr_asserts_mfa({"fpt"}));            // fingerprint
+    CHECK(amr_asserts_mfa({"face"}));
+    CHECK(amr_asserts_mfa({"sms"}));            // weak but a possession factor
+    CHECK(amr_asserts_mfa({"x", "y", "mfa"}));  // any position
 }
 
 TEST_CASE_METHOD(StepUpFixture,
