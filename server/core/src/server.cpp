@@ -40,6 +40,8 @@
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
 #include "guaranteed_state_store.hpp"
+#include "guardian_push_builder.hpp"
+#include "guaranteed_state.pb.h"
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
@@ -53,6 +55,7 @@
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
+#include "guardian_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -1037,6 +1040,123 @@ public:
             agent_service_.set_heartbeat_ingestion(heartbeat_ingestion_.get());
             if (gateway_service_)
                 gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
+
+            // Guardian heartbeat reconcile (M5 / #1209). The agent reports its
+            // applied policy generation on every heartbeat; if it trails the
+            // current generation it missed a push (was offline when the push fired,
+            // or has just reconnected — sync_with_server is a no-op pull), so
+            // re-push its applicable rules. Reads the generation, never bumps it, so
+            // catching one lagging agent up does not make the rest of the fleet look
+            // stale (the cascade M6's monotonic counter is designed to avoid).
+            heartbeat_ingestion_->set_guardian_reconcile_fn(
+                [this](std::string_view agent_id_sv, std::uint64_t agent_gen) {
+                    if (!guaranteed_state_store_)
+                        return;
+                    const std::uint64_t current =
+                        guaranteed_state_store_->current_policy_generation();
+                    if (agent_gen >= current)
+                        return;  // agent already at or ahead of current policy
+                    const std::string agent_id(agent_id_sv);
+
+                    // Per-agent rate limit (#1209 hardening: sec-MED1/perf-S1/S2).
+                    // Claim the slot under the lock BEFORE any work so concurrent
+                    // heartbeats from the same agent can't both reconcile, and a
+                    // stuck/hostile agent can't turn every heartbeat into a registry
+                    // scan. Wall-clock based so it self-heals a re-registered/wiped
+                    // agent after the interval (no generation-keyed dedupe hole).
+                    constexpr auto kGuardianReconcileMinInterval = std::chrono::seconds(25);
+                    const auto reconcile_now = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard lk(guardian_reconcile_mu_);
+                        auto last = guardian_last_reconcile_.find(agent_id);
+                        if (last != guardian_last_reconcile_.end() &&
+                            (reconcile_now - last->second) < kGuardianReconcileMinInterval) {
+                            metrics_
+                                .counter("yuzu_server_guardian_reconciles_total",
+                                         {{"result", "rate_limited"}})
+                                .increment();
+                            return;
+                        }
+                        guardian_last_reconcile_[agent_id] = reconcile_now;  // claim
+                    }
+
+                    auto sess = registry_.get_session(agent_id);
+                    if (!sess) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "no_session"}})
+                            .increment();
+                        return;
+                    }
+                    // Per-agent filtering as the fan-out (M4): only rules that target
+                    // this agent's OS and name it in scope. Cache scope membership
+                    // across rules sharing a scope_expr within this one reconcile.
+                    const auto rules = guaranteed_state_store_->list_rules();
+                    std::unordered_map<std::string, bool> scope_member;
+                    auto push = guardian::build_agent_push(
+                        rules, sess->os,
+                        [&](const std::string& expr) {
+                            auto cached = scope_member.find(expr);
+                            if (cached != scope_member.end())
+                                return cached->second;
+                            bool member = false;
+                            if (auto parsed = yuzu::scope::parse(expr)) {
+                                for (const auto& id : registry_.evaluate_scope(
+                                         *parsed, tag_store_.get(),
+                                         custom_properties_store_.get()))
+                                    if (id == agent_id) {
+                                        member = true;
+                                        break;
+                                    }
+                            }
+                            scope_member.emplace(expr, member);
+                            return member;
+                        },
+                        /*full_sync=*/true, current);
+                    ::yuzu::agent::v1::CommandRequest cmd;
+                    // Unique per re-push (random suffix) so a same-generation reconcile
+                    // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
+                    cmd.set_command_id(
+                        "__guard__-reconcile-" + std::to_string(current) + "-" +
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
+                    cmd.set_plugin("__guard__");
+                    cmd.set_action("push_rules");
+                    cmd.set_payload(push.SerializeAsString());
+                    if (registry_.send_to(agent_id, cmd)) {
+                        forward_gateway_pending();
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "sent"}})
+                            .increment();
+                        metrics_
+                            .counter("yuzu_server_guardian_pushes_dispatched_total",
+                                     {{"reason", "reconcile"}})
+                            .increment();
+                        metrics_.gauge("yuzu_server_guardian_policy_generation")
+                            .set(static_cast<double>(current));
+                        // Durable audit of a system-initiated enforcement re-deploy
+                        // (SOC2 CC7.2/CC7.4 — comp-F1). Deduped above → at most one
+                        // row per agent per interval, not per heartbeat.
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            ev.principal = "system";
+                            ev.action = "guaranteed_state.reconcile";
+                            ev.target_type = "GuaranteedState";
+                            ev.target_id = agent_id;
+                            ev.detail = "heartbeat reconcile re-push (generation " +
+                                        std::to_string(agent_gen) + " -> " +
+                                        std::to_string(current) + ")";
+                            ev.result = "success";
+                            (void)audit_store_->log(ev);
+                        }
+                        spdlog::info("Guardian: reconciled agent {} (generation {} -> {})",
+                                     agent_id, agent_gen, current);
+                    }
+                });
         }
 
         // Initialize tag store
@@ -1318,6 +1438,15 @@ public:
                 guaranteed_state_store_->start_cleanup();
                 spdlog::info("GuaranteedStateStore initialized at {} (retention={}d)",
                              gs_db.string(), cfg_.guardian_event_retention_days);
+                // Step 5: ingest agent `__guard__` events arriving on the Subscribe
+                // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
+                agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
+                // Guardian Half B: gateway-connected agents' drift events arrive
+                // via GatewayUpstream.ForwardGuardianMessage, not the direct
+                // Subscribe loop — wire the same store so they ingest through the
+                // shared path. Gateway service exists only in gateway mode.
+                if (gateway_service_)
+                    gateway_service_->set_guaranteed_state_store(guaranteed_state_store_.get());
             }
         }
 
@@ -6303,6 +6432,28 @@ private:
             policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
             policy_evaluator_.get());
 
+        // GuardianRoutes — /guardian + /fragments/guardian/* (Guaranteed State
+        // dashboard; docs/guardian-mvp-contract.md §8). Fragment renderers are
+        // mock-backed (contract-shaped) until the parallel backend on
+        // feat/guardian-mvp lands; live data is used where it already exists
+        // (rule CRUD + event query on GuaranteedStateStore).
+        guardian_routes_ = std::make_unique<GuardianRoutes>();
+        guardian_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, audit_fn,
+            [this](const std::string& event_type, const httplib::Request& req,
+                   const nlohmann::json& attrs, const nlohmann::json& payload_data) {
+                emit_event(event_type, req, attrs, payload_data);
+            },
+            guaranteed_state_store_.get(),
+            [this]() -> std::string { return registry_.to_json(); },
+            // Dashboard enforcement toggle deploys via the same push fan-out the
+            // REST endpoint uses. guardian_push_fn_ is assigned just below during
+            // REST wiring; this lambda reads it at toggle-time (runtime), never at
+            // registration time, so the ordering is fine.
+            [this](const std::string& scope, bool full_sync) -> int {
+                return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
+            });
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
@@ -6582,7 +6733,113 @@ private:
             command_dispatch_fn,
             // PR2 MFA step-up gate for the high-risk REST handlers; empty
             // closure disables the gate (preserves pre-PR2 behaviour).
-            step_up_fn);
+            step_up_fn,
+            // Step 3 — Guardian push fan-out. Resolve scope → in-scope agents, build the
+            // GuaranteedStatePush from the store's enabled rules (typed
+            // spark/assertion/remediation from spec_json) and deliver as a
+            // `__guard__`/push_rules CommandRequest via the agent dispatch path (reuses
+            // the instruction-dispatch scope→send_to idiom). Returns the agent count, or
+            // -1 on an unparseable scope. See docs/guardian-mvp-contract.md (step 3/G12).
+            // Also stored into guardian_push_fn_ (member) so the dashboard enforcement
+            // toggle deploys via this exact fan-out. The parenthesised assignment yields
+            // the assigned std::function, which is what gets passed here by value.
+            (guardian_push_fn_ = [this](const std::string& scope, bool full_sync) -> int {
+                if (!guaranteed_state_store_)
+                    return 0;
+                const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                // Read (never bump) the monotonic generation: a reconcile re-push
+                // (M5) must carry the SAME generation as the policy-change push that
+                // minted it, otherwise catching one lagging agent up would make the
+                // rest of the fleet look stale and trigger a reconcile storm. The
+                // store bumps the counter on rule mutations; we only read it here.
+                // Replaces wall-clock seconds, which could repeat or step backwards
+                // and wedge the heartbeat reconcile. (M6 / #1209.)
+                const std::uint64_t generation =
+                    guaranteed_state_store_->current_policy_generation();
+                const auto rules = guaranteed_state_store_->list_rules();
+
+                // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
+                // toggle to the affected rule's scope_expr (was the whole fleet); an
+                // empty scope still means fleet-wide.
+                std::vector<std::string> targets;
+                if (scope.empty()) {
+                    targets = registry_.all_ids();
+                } else if (scope.starts_with("group:") && mgmt_group_store_) {
+                    for (const auto& m : mgmt_group_store_->get_members(scope.substr(6)))
+                        targets.push_back(m.agent_id);
+                } else {
+                    auto parsed = yuzu::scope::parse(scope);
+                    if (!parsed)
+                        return -1;
+                    targets = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                       custom_properties_store_.get());
+                }
+
+                // Per-rule scope membership, evaluated once per distinct scope_expr
+                // and cached, so the fan-out is O(agents + distinct_scopes) rather
+                // than O(agents × rules).
+                std::unordered_map<std::string, std::unordered_set<std::string>> scope_cache;
+                auto agent_in_scope = [&](const std::string& aid,
+                                          const std::string& expr) -> bool {
+                    auto it = scope_cache.find(expr);
+                    if (it == scope_cache.end()) {
+                        std::unordered_set<std::string> ids;
+                        if (auto parsed = yuzu::scope::parse(expr)) {
+                            auto v = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                              custom_properties_store_.get());
+                            ids.insert(v.begin(), v.end());
+                        }
+                        it = scope_cache.emplace(expr, std::move(ids)).first;
+                    }
+                    return it->second.contains(aid);
+                };
+
+                // Build and send a per-agent FILTERED push (M4 / #1209): each agent
+                // receives only the enabled rules that target its OS and name it in
+                // scope, so a Linux box is no longer handed Windows registry guards.
+                int sent = 0;
+                for (const auto& aid : targets) {
+                    auto sess = registry_.get_session(aid);
+                    const std::string agent_os = sess ? sess->os : std::string{};
+                    auto push = guardian::build_agent_push(
+                        rules, agent_os,
+                        [&](const std::string& expr) { return agent_in_scope(aid, expr); },
+                        full_sync, generation);
+
+                    ::yuzu::agent::v1::CommandRequest cmd;
+                    // Unique per push (random suffix) so two pushes in the same second
+                    // can't collide on the agent's replay-dedup set (hp-F2/cons-S1).
+                    cmd.set_command_id(
+                        "__guard__-push-" + std::to_string(now_s) + "-" +
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
+                    cmd.set_plugin("__guard__");
+                    cmd.set_action("push_rules");
+                    // Binary serialized proto rides in the `payload` bytes field, not the
+                    // `parameters` string map: proto3 string values must be valid UTF-8, and
+                    // raw GuaranteedStatePush bytes are not. See agent.proto CommandRequest.payload.
+                    cmd.set_payload(push.SerializeAsString());
+                    if (registry_.send_to(aid, cmd)) {
+                        ++sent;
+                        metrics_
+                            .counter("yuzu_server_guardian_pushes_dispatched_total",
+                                     {{"reason", "policy_change"}})
+                            .increment();
+                    }
+                }
+                metrics_.gauge("yuzu_server_guardian_policy_generation")
+                    .set(static_cast<double>(generation));
+                // Drain gw_pending_ so the push reaches gateway-connected agents.
+                // send_to only QUEUES for a gateway agent (it has no local Subscribe
+                // stream — the gateway holds it); direct agents already got the inline
+                // write. Every other dispatch site drains here; the Guardian push
+                // omitted it, so over a gateway the push silently never arrived and no
+                // guard armed (works in direct mode, breaks via gateway). See
+                // forward_gateway_pending() and docs/guardian-mvp-contract.md G12.
+                forward_gateway_pending();
+                return sent;
+            }));
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -6936,6 +7193,24 @@ private:
     std::unique_ptr<SettingsRoutes> settings_routes_;
     std::unique_ptr<mcp::McpServer> mcp_server_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
+    std::unique_ptr<GuardianRoutes> guardian_routes_;
+    // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
+    // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
+    // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
+    // which point it is set.
+    std::function<int(const std::string&, bool)> guardian_push_fn_;
+
+    // Guardian heartbeat-reconcile per-agent rate limit (#1209 hardening:
+    // sec-MED1 / perf-S1 / perf-S2). Without it, a lagging — or hostile, tight-
+    // looping — agent turns EVERY heartbeat into a full reconcile (list_rules +
+    // per-rule registry-mutex scope scan), an asymmetric CPU amplifier. We allow
+    // at most one reconcile re-push per agent per kGuardianReconcileMinInterval;
+    // a genuinely-once-lagging agent still converges on its first heartbeat. Map
+    // is agent_id -> last reconcile time, guarded by its own mutex.
+    std::mutex guardian_reconcile_mu_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        guardian_last_reconcile_;
+
     std::unique_ptr<DashboardRoutes> dashboard_routes_;
     std::unique_ptr<WorkflowRoutes> workflow_routes_;
     std::unique_ptr<NotificationRoutes> notification_routes_;

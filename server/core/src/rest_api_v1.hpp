@@ -84,6 +84,11 @@ public:
                                        const std::string& target_id, const std::string& detail)>;
     using ServiceGroupFn = std::function<void(const std::string& service_value)>;
     using TagPushFn = std::function<void(const std::string& agent_id, const std::string& key)>;
+    /// Guardian rule push fan-out (contract step 3 / G12): resolve the scope →
+    /// in-scope agents, build the GuaranteedStatePush from the store, and deliver via
+    /// the agent dispatch path. Returns the number of agents pushed to, or -1 on an
+    /// invalid scope expression. Injected from server.cpp where the registry/scope live.
+    using GuardianPushFn = std::function<int(const std::string& scope, bool full_sync)>;
 
     /// Outcome of a session-revocation REST call. `cookie_sessions_revoked`
     /// is the number of in-memory cookie sessions wiped (the operationally
@@ -160,7 +165,7 @@ public:
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
-        StepUpFn step_up_fn = {});
+        StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -186,7 +191,7 @@ public:
         yuzu::MetricsRegistry* metrics_registry = nullptr, SessionRevokeFn session_revoke_fn = {},
         ExecutionEventBus* execution_event_bus = nullptr,
         ResultSetStore* result_set_store = nullptr, CommandDispatchFn command_dispatch_fn = {},
-        StepUpFn step_up_fn = {});
+        StepUpFn step_up_fn = {}, GuardianPushFn guardian_push_fn = {});
 };
 
 } // namespace yuzu::server
