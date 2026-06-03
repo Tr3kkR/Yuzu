@@ -214,6 +214,8 @@ TEST_CASE("POST /api/settings/mfa/init reveals secret with Cache-Control: no-sto
     // headers added by PR1's set_no_store helper.
     CHECK(res->body.find("otpauth://totp/Yuzu") != std::string::npos);
     CHECK(res->body.find("Base32 secret") != std::string::npos);
+    // The provisional reveal now renders the inline SVG QR (#1232 wiring).
+    CHECK(res->body.find("<svg") != std::string::npos);
     CHECK(res->get_header_value("Cache-Control") == "no-store, private");
     CHECK(res->get_header_value("Pragma") == "no-cache");
     CHECK(res->get_header_value("Referrer-Policy") == "no-referrer");

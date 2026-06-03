@@ -20,10 +20,15 @@ CC6.6 — privileged access).
 - **TOTP only.** RFC 6238, HMAC-SHA1, 30 s step, 6 digits. Works with
   every shipping authenticator app out of the box. WebAuthn / FIDO2 is
   deliberately deferred.
-- **Per-user enrollment via the Settings page.** Operator scans an
-  `otpauth://` URI (one-time reveal in the existing `<div
-  class="token-reveal">` pattern), enters the next code from their
-  authenticator to confirm, receives 10 single-use base32 recovery codes.
+- **Per-user enrollment via the Settings page.** Operator scans an inline
+  SVG QR code (server-rendered from the `otpauth://` URI by the vendored
+  Nayuki `qrcodegen`; see `server/core/src/mfa_qr.{hpp,cpp}` and issue
+  #1232), or enters the base32 secret manually — a one-time reveal in the
+  existing `<div class="token-reveal">` pattern. They then enter the next
+  code from their authenticator to confirm, and receive 10 single-use
+  base32 recovery codes. The same QR is rendered in the login-time
+  enrollment-bootstrap form (delivered to the browser via the `qr_svg`
+  field of the `/login` 202 response).
 - **Login challenge.** `POST /login` accepts the password and, if the
   user has TOTP enrolled, returns HTTP 202 + an opaque short-lived
   `mfa_pending_token` instead of minting a session. The browser swaps to

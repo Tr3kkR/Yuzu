@@ -6,6 +6,7 @@
 
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
+#include "mfa_qr.hpp"
 #include "plugin_signing_helpers.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
@@ -815,19 +816,34 @@ std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
     //       failures should not fish the secret back).
     if (!enrollment_pending_for_verify.empty()) {
         if (!new_otpauth_uri.empty()) {
+            // Server-rendered QR (issue #1232). The SVG is from the trusted
+            // qrcodegen encoder over our own otpauth URI — not operator input —
+            // so it is injected raw (it must not be html_escaped or it won't
+            // render). Empty on encode failure → text fallback still shows.
+            const std::string qr_svg = otpauth_qr_svg(new_otpauth_uri);
             html += "<div class=\"token-reveal\">"
                     "  <div class=\"token-reveal-header\">"
                     "    SCAN THIS WITH YOUR AUTHENTICATOR APP — secret shown only once"
-                    "  </div>"
-                    "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
-                    "margin-top:0.25rem\">otpauth URI:</div>"
-                    "  <code style=\"display:block;word-break:break-all\">" +
-                    html_escape(new_otpauth_uri) +
-                    "</code>"
-                    "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
+                    "  </div>";
+            if (!qr_svg.empty()) {
+                html += "  <div style=\"display:flex;justify-content:center;margin:0.75rem 0\">"
+                        "    <div style=\"background:#fff;padding:8px;border-radius:6px;"
+                        "line-height:0\">" +
+                        qr_svg +
+                        "</div>"
+                        "  </div>"
+                        "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
+                        "text-align:center\">Can't scan? Enter the secret below manually.</div>";
+            }
+            html += "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
                     "margin-top:0.5rem\">Base32 secret (manual entry):</div>"
                     "  <code>" +
                     html_escape(new_secret_b32) +
+                    "</code>"
+                    "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
+                    "margin-top:0.5rem\">otpauth URI:</div>"
+                    "  <code style=\"display:block;word-break:break-all\">" +
+                    html_escape(new_otpauth_uri) +
                     "</code>"
                     "</div>";
         } else {
@@ -844,7 +860,8 @@ std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
                 "  <div class=\"mini-field\">"
                 "    <label>Verification code from your app</label>"
                 "    <input type=\"text\" name=\"code\" inputmode=\"numeric\" "
-                "autocomplete=\"one-time-code\" required style=\"width:120px\">"
+                "autocomplete=\"one-time-code\" autocapitalize=\"none\" autocorrect=\"off\" "
+                "spellcheck=\"false\" required style=\"width:120px\">"
                 "  </div>"
                 "  <button class=\"btn btn-primary\" type=\"submit\">Confirm</button>"
                 "  <button class=\"btn btn-secondary\" type=\"submit\""

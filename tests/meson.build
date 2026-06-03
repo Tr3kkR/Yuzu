@@ -167,6 +167,7 @@ if build_server
       'unit/server/test_settings_routes_mfa.cpp',
       'unit/server/test_totp.cpp',
       'unit/server/test_mfa_step_up.cpp',
+      'unit/server/test_mfa_qr.cpp',
       'unit/server/test_mfa_store.cpp',
       'unit/server/test_auto_approve.cpp',
       'unit/server/test_cidr_match.cpp',

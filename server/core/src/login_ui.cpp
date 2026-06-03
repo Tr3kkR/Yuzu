@@ -96,6 +96,7 @@ extern const char* const kLoginHtml =
       <div class="field">
         <label for="username">Username</label>
         <input type="text" id="username" name="username" autocomplete="username"
+               autocapitalize="none" autocorrect="off" spellcheck="false"
                aria-label="Username" autofocus required>
       </div>
       <div class="field">
@@ -113,6 +114,7 @@ extern const char* const kLoginHtml =
       <div class="field">
         <label for="mfa-code">Verification code</label>
         <input type="text" id="mfa-code" name="code" autocomplete="one-time-code"
+               autocapitalize="none" autocorrect="off" spellcheck="false"
                inputmode="numeric" autofocus required>
       </div>
       <button type="submit" class="btn-login" id="btn-mfa" aria-label="Verify">Verify</button>
@@ -123,15 +125,22 @@ extern const char* const kLoginHtml =
       <div class="subtitle">Multi-factor authentication is required. Scan this with your
         authenticator app, then enter the 6-digit code it shows to finish signing in.</div>
       <input type="hidden" id="enroll-pending-token">
+      <div id="enroll-qr" style="display:none;justify-content:center;margin:0 0 0.5rem 0">
+        <div style="background:#fff;padding:8px;border-radius:6px;line-height:0"></div>
+      </div>
+      <div id="enroll-qr-hint" style="display:none;font-size:0.7rem;
+        color:var(--mds-color-theme-text-tertiary);text-align:center;margin-bottom:0.5rem">
+        Can't scan? Enter the secret below manually.</div>
       <div class="enroll-secret">
-        <div class="enroll-secret-label">otpauth URI</div>
-        <code id="enroll-otpauth" style="display:block;word-break:break-all"></code>
-        <div class="enroll-secret-label" style="margin-top:0.5rem">Base32 secret (manual entry)</div>
+        <div class="enroll-secret-label">Base32 secret (manual entry)</div>
         <code id="enroll-secret"></code>
+        <div class="enroll-secret-label" style="margin-top:0.5rem">otpauth URI</div>
+        <code id="enroll-otpauth" style="display:block;word-break:break-all"></code>
       </div>
       <div class="field">
         <label for="enroll-code">Verification code</label>
         <input type="text" id="enroll-code" name="code" autocomplete="one-time-code"
+               autocapitalize="none" autocorrect="off" spellcheck="false"
                inputmode="numeric" required>
       </div>
       <button type="submit" class="btn-login" id="btn-enroll" aria-label="Enable and sign in">Enable &amp; Sign In</button>
@@ -194,6 +203,19 @@ extern const char* const kLoginHtml =
               document.getElementById('enroll-pending-token').value = resp.mfa_pending_token;
               document.getElementById('enroll-otpauth').textContent = resp.otpauth_uri || '';
               document.getElementById('enroll-secret').textContent = resp.secret_base32 || '';
+              // qr_svg is server-rendered (qrcodegen over our own otpauth URI),
+              // not user input — safe to inject as markup. Empty → keep hidden,
+              // the manual secret above is the fallback.
+              var qrWrap = document.getElementById('enroll-qr');
+              var qrHint = document.getElementById('enroll-qr-hint');
+              if (resp.qr_svg) {
+                qrWrap.firstElementChild.innerHTML = resp.qr_svg;
+                qrWrap.style.display = 'flex';
+                qrHint.style.display = '';
+              } else {
+                qrWrap.style.display = 'none';
+                qrHint.style.display = 'none';
+              }
               loginForm.style.display = 'none';
               if (ssoSection) ssoSection.style.display = 'none';
               document.getElementById('enroll-form').style.display = '';

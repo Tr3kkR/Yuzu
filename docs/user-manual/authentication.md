@@ -53,8 +53,8 @@ Yuzu supports RFC 6238 TOTP (Time-based One-Time Passwords) as a second factor f
 #### Enrollment
 
 1. Sign in as an admin. Navigate to **Settings → Multi-Factor Authentication**.
-2. Click **Enable MFA**. The server generates a fresh 20-byte secret and renders an `otpauth://` URI plus the base32 secret as a one-time reveal (`Cache-Control: no-store` is set so the response will not be cached by browsers or proxies).
-3. Scan the QR code (most apps render it from the `otpauth://` URI) or type the base32 secret in manually.
+2. Click **Enable MFA**. The server generates a fresh 20-byte secret and renders it as an **inline QR code** in the page, plus the base32 secret and `otpauth://` URI as text for manual entry — a one-time reveal (`Cache-Control: no-store` is set so the response will not be cached by browsers or proxies).
+3. Scan the QR code with your authenticator app, or type the base32 secret in manually if you can't scan.
 4. Enter the next 6-digit code shown by your authenticator app and click **Confirm**.
 5. The server confirms enrollment and reveals 10 single-use recovery codes in the format `XXXX-XXXX-XXXX-XXXX` (80 bits of entropy). **Save the codes somewhere safe** — they are shown exactly once.
 6. From now on, every login by this account will prompt for a TOTP code after the password.

@@ -12,6 +12,7 @@
 
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
+#include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
 #include "rest_a4_envelope.hpp"
 
@@ -673,6 +674,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                    {"mfa_pending_token", pending_token},
                                    {"otpauth_uri", init->otpauth_uri},
                                    {"secret_base32", init->secret_base32},
+                                   // Server-rendered inline SVG QR (#1232). May be
+                                   // "" on encode failure → the form falls back to
+                                   // the textual secret.
+                                   {"qr_svg", otpauth_qr_svg(init->otpauth_uri)},
                                    {"expires_in", cfg_.mfa_login_pending_secs}};
             res.set_content(body.dump(), "application/json");
             audit_log_for_principal(req, "mfa.enroll.required", "ok", username,

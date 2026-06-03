@@ -65,6 +65,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **MFA enrollment QR code (#1232).** Both MFA enrollment surfaces — the
+  Settings panel and the login-time enrollment-bootstrap form — now render
+  a scannable QR code (server-side inline SVG via the vendored Nayuki
+  `qrcodegen`, MIT) in addition to the manual base32 secret. The `/login`
+  202 `mfa_enrollment_required` response gains a `qr_svg` field (inline SVG,
+  or empty string on encode failure → fall back to the text secret).
+  Previously only manual key entry was possible.
+
 - **MFA enforcement modes + login-time enrollment bootstrap + OIDC `amr`
   gating (PR 3 of the MFA ladder — ladder complete; SOC 2 CC6.6).**
   - **Enforcement.** `--mfa-enforcement=admin-only|required` (env
@@ -337,6 +345,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     AuthDB enroll → verify → login → recovery → disable).
 
 ### Fixed
+
+- **Login inputs no longer auto-capitalise on iOS (#1233).** The username,
+  MFA-code, and enrollment-code fields on the login page — and the MFA
+  verify-code field in Settings — now carry `autocapitalize="none"`,
+  `autocorrect="off"`, and `spellcheck="false"`, so iOS Safari/WebKit no
+  longer turns `admin` into `Admin` (usernames are case-sensitive).
 
 - **Scope-walking PR-E follow-ups — policy `fromResultSet:` bypass + YAML scanner
   hardening (#1221).** Two robustness gaps from the #1215 review, both fail-closed

@@ -621,6 +621,8 @@ TEST_CASE("POST /login under mfa_enforcement=required: un-enrolled user gets 202
     CHECK(res->body.find(R"("status":"mfa_enrollment_required")") != std::string::npos);
     CHECK(res->body.find(R"("otpauth_uri")") != std::string::npos);
     CHECK(res->body.find(R"("secret_base32")") != std::string::npos);
+    // The server-rendered QR SVG rides along in the 202 body (#1232 wiring).
+    CHECK(res->body.find(R"("qr_svg":"<svg)") != std::string::npos);
     // No session is minted until the operator confirms the first code.
     CHECK(res->get_header_value("Set-Cookie").empty());
     CHECK(h.count_audits("mfa.enroll.required", "alice") >= 1);
