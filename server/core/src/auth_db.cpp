@@ -1245,6 +1245,21 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
     // already-authenticated caller within the enrollment window.)
     if (auto existing = load_mfa_row(impl_->db, username);
         existing && !existing->secret.empty()) {
+        // TOCTOU guard: load_mfa_row reads mfa_totp_secret AND mfa_enrolled_at
+        // in one SELECT, so existing->enrolled is a consistent snapshot of the
+        // row at this read. The mfa_status() enrolled-check above is a SEPARATE
+        // statement; on a FULLMUTEX shared connection a concurrent
+        // mfa_verify_enrollment can stamp enrolled between the two. Re-checking
+        // the freshly-loaded row closes that window: if the secret is now
+        // CONFIRMED we must never re-reveal it (invariant #1) — reject as
+        // already-enrolled, exactly as the top check would have. Re-reveal is
+        // limited to genuinely-provisional secrets within the enrollment window.
+        if (existing->enrolled) {
+            spdlog::warn("mfa_init_enrollment: enrolled between status-check and reuse-load "
+                         "(concurrent verify) — refusing to re-reveal: {}",
+                         username);
+            return std::unexpected(AuthDBError::MfaAlreadyEnrolled);
+        }
         auto secret_view = std::string_view(
             reinterpret_cast<const char*>(existing->secret.data()), existing->secret.size());
         auto secret_b32 = mfa::base32_encode(secret_view);

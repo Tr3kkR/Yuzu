@@ -26,7 +26,9 @@
 // clang-format on
 #include <crtdbg.h>
 #include <io.h>
+#include <lmcons.h>  // UNLEN for GetUserNameA
 #else
+#include <pwd.h>     // getpwuid for the real OS principal
 #include <unistd.h>
 #endif
 #include <sqlite3.h>
@@ -51,6 +53,54 @@ static void on_signal(int sig) {
     (void)sig;
     if (auto* s = g_server.load(std::memory_order_acquire))
         s->stop();
+}
+
+// Resolve the real OS account running this process for break-glass audit
+// attribution. Reads the kernel-authoritative identity (getpwuid(geteuid) /
+// GetUserNameA) rather than getenv("USER"), which is inherited from the parent
+// and trivially forgeable — a forged principal would poison the very evidence
+// the break-glass audit row exists to provide (#1226 H-2).
+static std::string resolve_os_principal() {
+#ifdef _WIN32
+    char name[UNLEN + 1];
+    DWORD len = static_cast<DWORD>(sizeof(name));
+    if (GetUserNameA(name, &len) && len > 1) {
+        return std::string(name, len - 1); // len counts the trailing NUL
+    }
+    return "unknown";
+#else
+    if (struct passwd* pw = ::getpwuid(::geteuid()); pw && pw->pw_name && pw->pw_name[0] != '\0') {
+        return std::string(pw->pw_name);
+    }
+    return "unknown";
+#endif
+}
+
+// Minimal RFC 8259 string-content escaper for emitting a username inside a JSON
+// status line. is_valid_username already restricts the charset so no escaping is
+// strictly needed today, but output-encoding (not input validation) is the
+// correct defence: this stays correct if the validator is ever relaxed (#1226 M-2).
+static std::string json_escape(std::string_view s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char c : s) {
+        switch (c) {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (static_cast<unsigned char>(c) < 0x20) {
+                out += std::format("\\u{:04x}", static_cast<unsigned char>(c));
+            } else {
+                out += c;
+            }
+        }
+    }
+    return out;
 }
 
 int main(int argc, char* argv[]) {
@@ -705,42 +755,61 @@ int main(int argc, char* argv[]) {
             std::cerr << "error: user '" << mfa_reset_user << "' not found\n";
             return EXIT_FAILURE;
         }
+        // Audit is MANDATORY for break-glass: the whole point of #1226 is to
+        // replace the manual-SQL path that left no evidence (SOC 2 CC6.6). So
+        // open + verify the audit store is WRITABLE *before* mutating MFA — if
+        // it isn't, refuse to proceed rather than silently clear a second factor
+        // with no record (H-1). This also gives the operator an actionable error
+        // instead of a buried warning during a stressful recovery.
+        yuzu::server::AuditStore audit(cfg.data_dir / "audit.db");
+        if (!audit.is_open()) {
+            spdlog::error("--mfa-reset: audit store (audit.db in '{}') is not writable; refusing "
+                          "to clear MFA without an audit record. Fix audit.db permissions/disk and "
+                          "retry, or perform the reset via your documented break-glass SQL path "
+                          "(which you must then record in change management).",
+                          cfg.data_dir.string());
+            std::cerr << "error: audit store unavailable; refusing to clear MFA without an audit "
+                         "record\n";
+            return EXIT_FAILURE;
+        }
         if (auto r = auth_db->mfa_disable(mfa_reset_user); !r) {
             spdlog::error("--mfa-reset: failed to clear MFA for '{}'", mfa_reset_user);
             return EXIT_FAILURE;
         }
-        // Audit the break-glass with the OS account that ran it as the
-        // principal — the manual SQL path produced no audit row, which is a
-        // SOC 2 CC6.6 evidence gap this closes.
-        const char* os_user = std::getenv("USER");
-        if (!os_user)
-            os_user = std::getenv("USERNAME"); // Windows
-        yuzu::server::AuditStore audit(cfg.data_dir / "audit.db");
-        if (audit.is_open()) {
-            yuzu::server::AuditEvent ev;
-            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                               std::chrono::system_clock::now().time_since_epoch())
-                               .count();
-            ev.principal = os_user ? os_user : "unknown";
-            ev.principal_role = "break-glass";
-            ev.action = "mfa.reset.breakglass";
-            ev.target_type = "User";
-            ev.target_id = mfa_reset_user;
-            ev.result = "success";
-            ev.detail = "MFA enrollment cleared via --mfa-reset CLI";
-            if (!audit.log(ev)) {
-                spdlog::warn("--mfa-reset: MFA cleared but the audit row failed to persist — "
-                             "record this reset manually in your change-management system");
-            }
-        } else {
-            spdlog::warn("--mfa-reset: audit.db unavailable — record this reset manually");
+        // Attribute the break-glass to the KERNEL-AUTHORITATIVE OS identity, not
+        // getenv("USER") — the env var is inherited from the parent and trivially
+        // forgeable (USER=root ./yuzu-server --mfa-reset ...), which would let the
+        // actor poison the very evidence this audit exists to provide (H-2).
+        const std::string os_user = resolve_os_principal();
+        yuzu::server::AuditEvent ev;
+        ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+        ev.principal = os_user;
+        ev.principal_role = "break-glass";
+        ev.action = "mfa.reset.breakglass";
+        ev.target_type = "User";
+        ev.target_id = mfa_reset_user;
+        ev.result = "success";
+        ev.detail = std::format("MFA enrollment cleared via --mfa-reset CLI (os_identity={})",
+                                os_user);
+        if (!audit.log(ev)) {
+            // The pre-check passed but the write failed (e.g. disk filled mid-op).
+            // MFA is already cleared; fail loudly and non-zero so automation and
+            // the operator know the evidence row is missing and must be recorded.
+            spdlog::error("--mfa-reset: MFA cleared for '{}' but the audit row failed to persist — "
+                          "record this reset manually in your change-management system NOW",
+                          mfa_reset_user);
+            std::cerr << "error: MFA cleared but audit row failed to persist; record this reset "
+                         "manually\n";
+            return EXIT_FAILURE;
         }
         spdlog::info("Break-glass: MFA cleared for '{}'. The user can now sign in with their "
                      "password alone; under MFA enforcement they will be walked through "
                      "enrollment at next login.",
                      mfa_reset_user);
-        std::cout << "{\"status\":\"ok\",\"user\":\"" << mfa_reset_user
-                  << "\",\"action\":\"mfa.reset.breakglass\"}\n";
+        std::cout << std::format("{{\"status\":\"ok\",\"user\":\"{}\",\"action\":\"{}\"}}\n",
+                                 json_escape(mfa_reset_user), "mfa.reset.breakglass");
         return EXIT_SUCCESS;
     }
 

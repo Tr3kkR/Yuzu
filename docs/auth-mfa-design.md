@@ -521,6 +521,33 @@ any later auth work) make sure none of these regress:
    by `cleanup_provisional_mfa` if abandoned, bounding the re-reveal
    window. Break-glass (`--mfa-reset`, #1226) clears the secret entirely
    (it never reveals it).
+
+   **TOCTOU guard (do not remove).** The reuse path reads the row twice
+   on a `SQLITE_OPEN_FULLMUTEX` connection with no surrounding
+   transaction: `mfa_status()` (enrolled-check) then `load_mfa_row()`
+   (secret fetch). A concurrent `mfa_verify_enrollment` on another thread
+   can stamp `mfa_enrolled_at` between those two statements. Because
+   `load_mfa_row` reads `mfa_totp_secret` and `mfa_enrolled_at` in the
+   **same** SELECT, its `enrolled` flag is a consistent snapshot — so the
+   reuse branch re-checks `!existing->enrolled` and returns
+   `MfaAlreadyEnrolled` if the row enrolled mid-init, rather than
+   re-revealing a now-**confirmed** secret. Reuse is gated on a
+   genuinely-provisional snapshot only; this is what keeps the "enrolled
+   secrets never re-revealed" half of the invariant true under
+   concurrency.
+
+   **Re-reveal grants no new capability.** Reaching `mfa_init_enrollment`
+   requires already being authenticated *as that user* (settings session,
+   or a `/login` bootstrap that has already passed the password). An actor
+   who can reach init can therefore already complete enrollment by binding
+   their own authenticator regardless of whether the secret rotates per
+   call — so reuse-vs-rotate does not expand what a password-holder can do
+   to a not-yet-enrolled account. It only extends the *window* over which
+   the same provisional secret is observable, bounded by
+   `cleanup_provisional_mfa` (default 1h, 60s floor). Optional anomaly
+   hardening (per-user init rate-limit, distinct `mfa.enroll.reused` audit
+   verb, tighter window) is tracked as a follow-up, not a correctness
+   requirement.
 2. **Replay protection persists.** `mfa_last_counter` is the floor on
    every accepted code. Step-up verifies must update it too.
 3. **`mfa_disable` is atomic against in-flight verifies.** The

@@ -237,10 +237,46 @@ exits **without starting the server**. Unlike the manual SQL below it
 account that ran it) — so the break-glass is captured in `audit.db`, not
 just your change-management system.
 
-**Authorisation.** Run on the server host as the service account that
-owns `auth.db` (typically `_yuzu` / `yuzu` / `NT SERVICE\YuzuAgent`; see
-`docs/agent-privilege-model.md`). No TLS/HTTPS flags are required (the
-command never serves).
+**Authorisation — read the threat model.** `--mfa-reset` is a deliberate
+break-glass primitive: it strips a user's second factor with **no MFA,
+admin-password, or token check of its own**. The *only* enforced control
+is OS-level access — anyone who can execute a `yuzu-server` binary with
+**read access to `data-dir/auth.db`** can downgrade **any** user
+(including the sole admin) to password-only auth. It does not verify it is
+*actually* running as the service account; "run as the service account" is
+the operational expectation, not a code-enforced gate. Treat host access
+to `auth.db` as equivalent to MFA-reset authority for every account, and
+protect it accordingly:
+
+- Run on the server host as the service account that owns `auth.db`
+  (typically `_yuzu` / `yuzu` / `NT SERVICE\YuzuAgent`; see
+  `docs/agent-privilege-model.md`).
+- Keep `data-dir` (and `auth.db`) `0700`/`0600`, owned by the service
+  account, so unprivileged local users cannot read it and thus cannot
+  wield the primitive.
+- Gate the invocation behind a narrow `sudoers` entry (a dedicated
+  break-glass group, ideally with a separate approver) rather than broad
+  `sudo` — the audit principal is the real OS identity (`getpwuid` /
+  `GetUserNameA`, **not** the forgeable `$USER`/`$USERNAME` env var), so a
+  tight sudoers entry gives you trustworthy attribution.
+
+**Detective control — alert on the audit action.** Because the CLI exits
+without starting the server, it emits **no Prometheus metric** — the
+`audit.db` row is the detective signal. Configure your SIEM/log pipeline
+to raise a high-severity alert whenever an `mfa.reset.breakglass` action
+appears in `audit_events`; an unexpected one is an authentication-downgrade
+event and should page on-call.
+
+No TLS/HTTPS flags are required (the command never serves).
+
+**Audit is mandatory and fail-closed (#1226 hardening).** The CLI opens
+and verifies `audit.db` is **writable before** it clears any MFA; if the
+audit store is unavailable (disk full, permissions, corruption) it
+**refuses to proceed and exits non-zero** rather than silently clearing a
+second factor with no evidence. If the audit write fails *after* the clear
+(e.g. disk fills mid-operation) it also exits non-zero with a loud
+"record this reset manually NOW" message. A `{"status":"ok",...}` line on
+stdout with exit code 0 therefore means an audit row **did** persist.
 
 ```bash
 sudo -u _yuzu yuzu-server \
