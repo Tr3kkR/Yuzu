@@ -48,6 +48,13 @@ struct GuaranteedStateRuleRow {
     // from. yaml_source is rendered one-way from this. See
     // docs/guardian-mvp-contract.md decisions 1-2. Empty for pre-migration rows.
     std::string spec_json;
+    // RESERVED (stored, not yet evaluated): the Guard's Prerequisites — a Scope
+    // expression over device facts that must hold for the Guard to apply on a
+    // device, finer than a Baseline's management-group assignment. Authoring +
+    // live agent-side evaluation are engine-dependent and MVP-deferred (the
+    // scope engine must become a shared server+agent lib first); see
+    // docs/guardian-baseline-model.md. Empty for rules with no Prerequisites.
+    std::string prerequisites;
     int64_t version{1};
     bool enabled{true};
     std::string enforcement_mode;  // "enforce" | "audit" (validated at the REST boundary; `enabled` controls disable)
@@ -151,6 +158,14 @@ public:
     // A *reconcile* re-push reads this value WITHOUT bumping it, so catching one
     // lagging agent up never makes the rest of the fleet look stale.
     uint64_t current_policy_generation() const;
+
+    // Bump the persisted policy generation WITHOUT mutating any rule. The
+    // Baseline deploy path calls this: deploying (or undeploying) a Baseline
+    // changes which Guards are active on the fleet — the desired set — without
+    // editing any rule, and the heartbeat reconcile keys off the generation to
+    // decide an agent is stale. Takes the write lock (do NOT call while holding
+    // it). The rule-mutation methods bump internally via the _locked variant.
+    void bump_policy_generation();
 
     // Observability — lock-free cumulative counters for Prometheus scraping.
     // Cover the counts that a Prometheus alert on ingest health wants (bytes

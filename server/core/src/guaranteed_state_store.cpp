@@ -171,6 +171,15 @@ void GuaranteedStateStore::create_tables() {
             );
             INSERT OR IGNORE INTO guardian_meta(key, value) VALUES ('policy_generation', 0);
         )"},
+        {4, R"(
+            -- RESERVED: per-Guard Prerequisites — a Scope expression over device
+            -- facts gating applicability, finer than a Baseline's management-group
+            -- assignment. Stored now so the Baseline backend can author against a
+            -- stable column; authoring + live agent-side evaluation are engine-
+            -- dependent and MVP-deferred. See docs/guardian-baseline-model.md.
+            ALTER TABLE guaranteed_state_rules
+                ADD COLUMN prerequisites TEXT NOT NULL DEFAULT '';
+        )"},
     };
     if (!MigrationRunner::run(db_, "guaranteed_state_store", kMigrations)) {
         // Include enough detail in the log for an on-call operator to triage
@@ -207,8 +216,8 @@ GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
         INSERT INTO guaranteed_state_rules
             (rule_id, name, yaml_source, version, enabled, enforcement_mode,
              severity, os_target, scope_expr, signature, created_at, updated_at,
-             created_by, updated_by, spec_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             created_by, updated_by, spec_json, prerequisites)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -234,6 +243,7 @@ GuaranteedStateStore::create_rule(const GuaranteedStateRuleRow& row) {
     sqlite3_bind_text(stmt, 13, row.created_by.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 14, row.updated_by.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 15, row.spec_json.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 16, row.prerequisites.c_str(), -1, SQLITE_TRANSIENT);
 
     const int step = sqlite3_step(stmt);
     std::expected<void, std::string> result;
@@ -270,7 +280,7 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
             name = ?, yaml_source = ?, version = ?, enabled = ?,
             enforcement_mode = ?, severity = ?, os_target = ?,
             scope_expr = ?, signature = ?, updated_at = ?, updated_by = ?,
-            spec_json = ?
+            spec_json = ?, prerequisites = ?
         WHERE rule_id = ?
     )";
     sqlite3_stmt* stmt = nullptr;
@@ -294,7 +304,8 @@ GuaranteedStateStore::update_rule(const GuaranteedStateRuleRow& row) {
     sqlite3_bind_text(stmt, 10, row.updated_at.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 11, row.updated_by.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 12, row.spec_json.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 13, row.rule_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 13, row.prerequisites.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 14, row.rule_id.c_str(), -1, SQLITE_TRANSIENT);
 
     const int step = sqlite3_step(stmt);
     if (step != SQLITE_DONE) {
@@ -356,6 +367,13 @@ void GuaranteedStateStore::bump_policy_generation_locked() {
     }
 }
 
+void GuaranteedStateStore::bump_policy_generation() {
+    std::unique_lock lock(mtx_);
+    if (!db_)
+        return;
+    bump_policy_generation_locked();
+}
+
 uint64_t GuaranteedStateStore::current_policy_generation() const {
     std::shared_lock lock(mtx_);
     if (!db_)
@@ -380,7 +398,7 @@ GuaranteedStateStore::get_rule(const std::string& rule_id) const {
     const char* sql = R"(
         SELECT rule_id, name, yaml_source, version, enabled, enforcement_mode,
                severity, os_target, scope_expr, signature, created_at, updated_at,
-               created_by, updated_by, spec_json
+               created_by, updated_by, spec_json, prerequisites
         FROM guaranteed_state_rules WHERE rule_id = ?
     )";
     sqlite3_stmt* stmt = nullptr;
@@ -406,6 +424,7 @@ GuaranteedStateStore::get_rule(const std::string& rule_id) const {
         r.created_by = col_text(stmt, 12);
         r.updated_by = col_text(stmt, 13);
         r.spec_json = col_text(stmt, 14);
+        r.prerequisites = col_text(stmt, 15);
         out = std::move(r);
     }
     sqlite3_finalize(stmt);
@@ -421,7 +440,7 @@ std::vector<GuaranteedStateRuleRow> GuaranteedStateStore::list_rules() const {
     const char* sql = R"(
         SELECT rule_id, name, yaml_source, version, enabled, enforcement_mode,
                severity, os_target, scope_expr, signature, created_at, updated_at,
-               created_by, updated_by, spec_json
+               created_by, updated_by, spec_json, prerequisites
         FROM guaranteed_state_rules ORDER BY name
     )";
     sqlite3_stmt* stmt = nullptr;
@@ -445,6 +464,7 @@ std::vector<GuaranteedStateRuleRow> GuaranteedStateStore::list_rules() const {
         r.created_by = col_text(stmt, 12);
         r.updated_by = col_text(stmt, 13);
         r.spec_json = col_text(stmt, 14);
+        r.prerequisites = col_text(stmt, 15);
         rows.push_back(std::move(r));
     }
     sqlite3_finalize(stmt);
