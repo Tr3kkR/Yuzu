@@ -208,6 +208,8 @@ extern const char* const kGuardianHtml =
     .kv { display: grid; grid-template-columns: 130px 1fr; gap: 0.3rem 1rem;
           font-size: 0.78rem; margin-bottom: 0.75rem; }
     .kv .k { color: var(--muted); }
+    /* let long unbreakable values (registry key paths) wrap instead of clipping */
+    .kv > div { min-width: 0; overflow-wrap: anywhere; }
     .detail-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
     .detail-table th {
       text-align: left; padding: 0.35rem 0.5rem;
@@ -467,20 +469,8 @@ extern const char* const kGuardianHtml =
     </div>
 
     <!-- ── Detail drill-in (guard / baseline / forms) ───────── -->
-    <div class="section">
-      <div class="section-header">
-        <svg class="icon"><use href="/static/icons.svg#info"></use></svg>
-        Detail
-      </div>
-      <div class="section-body">
-        <div id="guardian-detail">
-          <div class="empty-state">
-            Select a Guard or Baseline above, or use <strong>+ New Guard</strong> /
-            <strong>+ New Baseline</strong> to compose one.
-          </div>
-        </div>
-      </div>
-    </div>
+    <!-- Guard / Baseline detail opens in the modal (#guardian-modal-content),
+         like New Guard — no inline detail panel at the bottom of the page. -->
 
   </div>
 
@@ -595,6 +585,11 @@ extern const char* const kGuardianHtml =
     document.body.addEventListener('showToast', function(e) {
       var d = e.detail || {};
       showToast(d.message || 'Done', d.level || 'success');
+    });
+    /* Close the detail modal in response to an HX-Trigger (used after a Baseline
+       delete, where the modal's subject no longer exists). */
+    document.body.addEventListener('guardianModalClose', function() {
+      guardianCloseModal();
     });
 
     /* ── Populate nav bar + context bar ─────────────────────── */

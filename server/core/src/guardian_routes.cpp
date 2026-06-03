@@ -19,6 +19,7 @@
 #include <cctype>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -163,6 +164,58 @@ std::string event_type_class(const std::string& type) {
     for (const auto* k : known)
         if (s == k) return "et-" + s;
     return "et-generic";
+}
+
+// "value_name" / "expected-hash" → "Value name" / "Expected hash" (generic
+// fallback label for an assertion param not given an explicit label below).
+std::string humanize_key(const std::string& key) {
+    std::string s = key;
+    for (auto& c : s)
+        if (c == '_' || c == '-') c = ' ';
+    if (!s.empty()) s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+    return s;
+}
+
+// Render the assertion's specific values (what the guard checks) as <div class=kv>
+// rows: a label + value, with the expected value highlighted in `hi`. Registry +
+// file params get friendly labels (Key combines hive\\key, Name = value_name,
+// Type = value_type); anything else is humanised. Empty if no params.
+std::string render_assertion_values(const nlohmann::json& asrt, const std::string& hi) {
+    if (!asrt.is_object())
+        return {};
+    const auto& p = asrt.value("params", nlohmann::json::object());
+    if (!p.is_object() || p.empty())
+        return {};
+    auto as_str = [](const nlohmann::json& v) {
+        return v.is_string() ? v.get<std::string>() : v.dump();
+    };
+    auto row = [&](const std::string& label, const std::string& val, bool highlight) {
+        return "<div class=\"k\">" + html_escape(label) + "</div><div" +
+               (highlight ? (" style=\"color:" + hi + ";font-weight:700\"") : std::string{}) + ">" +
+               html_escape(val) + "</div>";
+    };
+    std::string out;
+    std::unordered_set<std::string> shown;
+    if (p.contains("key")) {  // registry: combine hive\\key into one "Key"
+        std::string key = p.contains("hive") ? as_str(p["hive"]) + "\\" : "";
+        key += as_str(p["key"]);
+        out += row("Key", key, false);
+        shown.insert("hive");
+        shown.insert("key");
+    } else if (p.contains("hive")) {
+        out += row("Hive", as_str(p["hive"]), false);
+        shown.insert("hive");
+    }
+    if (p.contains("value_name")) { out += row("Name", as_str(p["value_name"]), false); shown.insert("value_name"); }
+    if (p.contains("value_type")) { out += row("Type", as_str(p["value_type"]), false); shown.insert("value_type"); }
+    if (p.contains("path")) { out += row("Path", as_str(p["path"]), false); shown.insert("path"); }
+    if (p.contains("expected")) { out += row("Expected value", as_str(p["expected"]), true); shown.insert("expected"); }
+    if (p.contains("expected_hash")) { out += row("Expected hash", as_str(p["expected_hash"]), true); shown.insert("expected_hash"); }
+    for (auto it = p.begin(); it != p.end(); ++it) {
+        if (shown.count(it.key())) continue;
+        out += row(humanize_key(it.key()), as_str(it.value()), it.key().rfind("expected", 0) == 0);
+    }
+    return out;
 }
 
 } // namespace
@@ -323,9 +376,10 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
                     for (const auto& [bid, bname] : dit->second) {
                         if (!first) deploy_html += ", ";
                         first = false;
-                        deploy_html += "<a class=\"gi-bl\" hx-get=\"/fragments/guardian/baseline/" +
+                        deploy_html += "<a class=\"gi-bl\" onclick=\"guardianOpenModal()\" "
+                                       "hx-get=\"/fragments/guardian/baseline/" +
                                        html_escape(bid) +
-                                       "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
+                                       "\" hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">" +
                                        html_escape(bname) + "</a>";
                     }
                 } else {
@@ -338,8 +392,9 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
                 html += "<div class=\"guard-item\">"
                         "<div class=\"gi-main\">"
                         "<div class=\"gi-left\" style=\"cursor:pointer\" "
+                        "onclick=\"guardianOpenModal()\" "
                         "hx-get=\"/fragments/guardian/guard/" + rid +
-                        "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">"
+                        "\" hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">"
                         "<div class=\"gi-row1\">"
                         "<span class=\"guard-name\">" + html_escape(r.name) + "</span>"
                         "<span class=\"gi-mode " + std::string(mode_cls) + "\">" + mode_label +
@@ -377,8 +432,10 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
             if (!status_filter.empty() && status_filter != g.status) continue;
             const char* health_cls = g.healthy ? "health-ok" : "health-bad";
             const char* health_lbl = g.healthy ? "&#9679; healthy" : "&#9679; unhealthy";
-            html += "<div class=\"guard-item\" hx-get=\"/fragments/guardian/guard/" +
-                    std::string(g.id) + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">"
+            html += "<div class=\"guard-item\" style=\"cursor:pointer\" "
+                    "onclick=\"guardianOpenModal()\" hx-get=\"/fragments/guardian/guard/" +
+                    std::string(g.id) +
+                    "\" hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">"
                     "<div class=\"guard-item-top\">"
                     "<span class=\"guard-name\">" + std::string(g.name) + "</span>"
                     "<span class=\"guard-os\">" + std::string(g.os) + "</span>"
@@ -667,8 +724,11 @@ void GuardianRoutes::create_baseline_from_form(const httplib::Request& req,
 
 void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Response& res,
                                      const std::string& baseline_id) {
+    // Errors render inside the modal (the action buttons target #guardian-modal-content).
     auto panel = [](const std::string& msg) {
-        return "<div class=\"detail-panel\"><div class=\"empty-state\">" + msg + "</div></div>";
+        return "<div class=\"gs-modal-card\"><div class=\"gs-modal-body\"><div class=\"empty-state\">" +
+               msg + "</div></div><div class=\"gs-modal-footer\"><button type=\"button\" "
+               "class=\"btn btn-secondary\" onclick=\"guardianCloseModal()\">Close</button></div></div>";
     };
     if (!baseline_store_ || !baseline_store_->is_open()) {
         audit_fn_(req, "guaranteed_state.baseline.deploy", "denied", "GuaranteedState", baseline_id,
@@ -726,11 +786,14 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
 
     res.set_header("HX-Trigger",
                    R"({"showToast":{"message":"Baseline deployed","level":"success"}})");
-    // Re-render the detail panel (Deploy → Re-deploy, shows last-deployed) plus an
-    // out-of-band refresh of the baselines list so its lifecycle badge updates too.
+    // Re-render the detail modal (Deploy → Re-deploy, shows last-deployed) in place,
+    // plus out-of-band refreshes of both lists (the baseline lifecycle badge and the
+    // guards' "Deployed:" links both change on deploy).
     std::string html = render_baseline_detail_fragment(baseline_id) +
                        "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
-                       render_baselines_fragment() + "</div>";
+                       render_baselines_fragment() + "</div>"
+                       "<div id=\"guardian-guards\" hx-swap-oob=\"innerHTML\">" +
+                       render_guards_fragment("") + "</div>";
     res.set_content(html, "text/html; charset=utf-8");
 }
 
@@ -802,16 +865,23 @@ void GuardianRoutes::update_baseline_from_form(const httplib::Request& req, http
                                   ? R"({"showToast":{"message":"Saved — Re-deploy to apply to agents","level":"warning"}})"
                                   : R"({"showToast":{"message":"Baseline saved","level":"success"}})";
     res.set_header("HX-Trigger", toast);
+    // Re-render the detail modal (replacing the edit form) + refresh both lists OOB
+    // (member changes can change which guards show as deployed-under this baseline).
     std::string html = render_baseline_detail_fragment(baseline_id) +
                        "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
-                       render_baselines_fragment() + "</div>";
+                       render_baselines_fragment() + "</div>"
+                       "<div id=\"guardian-guards\" hx-swap-oob=\"innerHTML\">" +
+                       render_guards_fragment("") + "</div>";
     res.set_content(html, "text/html; charset=utf-8");
 }
 
 void GuardianRoutes::delete_baseline_action(const httplib::Request& req, httplib::Response& res,
                                             const std::string& baseline_id) {
+    // Errors render inside the modal (the Delete button targets #guardian-modal-content).
     auto panel = [](const std::string& msg) {
-        return "<div class=\"detail-panel\"><div class=\"empty-state\">" + msg + "</div></div>";
+        return "<div class=\"gs-modal-card\"><div class=\"gs-modal-body\"><div class=\"empty-state\">" +
+               msg + "</div></div><div class=\"gs-modal-footer\"><button type=\"button\" "
+               "class=\"btn btn-secondary\" onclick=\"guardianCloseModal()\">Close</button></div></div>";
     };
     if (!baseline_store_ || !baseline_store_->is_open()) {
         audit_fn_(req, "guaranteed_state.baseline.delete", "denied", "GuaranteedState", baseline_id,
@@ -851,11 +921,15 @@ void GuardianRoutes::delete_baseline_action(const httplib::Request& req, httplib
     audit_fn_(req, "guaranteed_state.baseline.delete", "success", "GuaranteedState", baseline_id,
               detail);
 
+    // Close the modal (its subject is gone) and refresh both lists out-of-band.
+    // No main-target content → htmx clears #guardian-modal-content; guardianModalClose
+    // then hides the overlay.
     res.set_header("HX-Trigger",
-                   R"({"showToast":{"message":"Baseline deleted","level":"success"}})");
-    std::string html = panel("Baseline deleted.") +
-                       "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
-                       render_baselines_fragment() + "</div>";
+                   R"({"guardianModalClose":true,"showToast":{"message":"Baseline deleted","level":"success"}})");
+    std::string html = "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
+                       render_baselines_fragment() + "</div>"
+                       "<div id=\"guardian-guards\" hx-swap-oob=\"innerHTML\">" +
+                       render_guards_fragment("") + "</div>";
     res.set_content(html, "text/html; charset=utf-8");
 }
 
@@ -908,84 +982,100 @@ std::string GuardianRoutes::render_events_fragment(const std::string& type_filte
 }
 
 std::string GuardianRoutes::render_guard_detail_fragment(const std::string& guard_id) const {
-    // Header fields prefer a real rule lookup; the rest is mock.
-    std::string name = guard_id, severity = "high", mode = "Enforce", os = "windows",
-                scope = "tag:production-workstations", yaml, spec_json;
-    bool real_rule = false;
-    bool enabled = true;
+    std::string name = guard_id, severity = "high", os = "windows", yaml, spec_json;
+    bool real_rule = false, enabled = true, enforcing = false;
     if (store_ && store_->is_open()) {
         if (auto r = store_->get_rule(guard_id)) {
             real_rule = true;
             name = r->name;
             severity = r->severity.empty() ? severity : r->severity;
-            // Observe (watch/audit — empty→Observe per C1/B2) or Enforce. Display word
-            // only; stored value unchanged.
-            mode = (r->enforcement_mode == "enforce") ? "Enforce" : "Observe";
+            // Observe (watch/audit — empty→Observe per C1/B2) or Enforce.
+            enforcing = (r->enforcement_mode == "enforce");
             enabled = r->enabled;
             os = r->os_target.empty() ? "all" : r->os_target;
-            scope = r->scope_expr;
             yaml = r->yaml_source;
             spec_json = r->spec_json;
         }
     }
+    const std::string mode = enforcing ? "Enforce" : "Observe";
+    const std::string mode_color = enforcing ? "var(--yellow)" : "#a5d6ff";
+    const std::string verb = enforcing ? "Enforcing" : "Observing";
+    const std::string phrasing =
+        enforcing ? "Writes the expected value back on drift, then re-checks (Enforce)."
+                  : "Alerts on drift from the expected value &mdash; no write-back (Observe).";
 
-    // Composition line: read the real spark/assertion/remediation from spec_json so
-    // a file guard does not render as "registry-change". Falls back to the registry
-    // example only on the no-backend demo path (empty/unparseable spec).
-    std::string composition = "Spark (registry-change) &rarr; Assertion (registry-value-equals) "
-                              "&rarr; alert";
-    if (real_rule && !spec_json.empty()) {
-        if (auto j = nlohmann::json::parse(spec_json, nullptr, false); !j.is_discarded()) {
-            const std::string sp = j.value("spark", nlohmann::json::object()).value("type", "");
-            const std::string as = j.value("assertion", nlohmann::json::object()).value("type", "");
-            const std::string rem = j.value("remediation", nlohmann::json::object()).value("type", "");
-            if (!sp.empty() && !as.empty())
-                composition = "Spark (" + html_escape(sp) + ") &rarr; Assertion (" +
-                              html_escape(as) + ") &rarr; " + html_escape(rem.empty() ? "alert" : rem);
+    // Which DEPLOYED Baselines deliver this guard (links into the same modal).
+    std::string deployed_html = "<span style=\"color:var(--muted)\">not deployed</span>";
+    if (baseline_store_ && baseline_store_->is_open()) {
+        std::string links;
+        for (const auto& bid : baseline_store_->baselines_containing_rule(guard_id)) {
+            auto b = baseline_store_->get_baseline(bid);
+            if (!b || b->lifecycle != kBaselineDeployed)
+                continue;
+            if (!links.empty()) links += ", ";
+            links += "<a class=\"gi-bl\" onclick=\"guardianOpenModal()\" "
+                     "hx-get=\"/fragments/guardian/baseline/" + html_escape(bid) +
+                     "\" hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">" +
+                     html_escape(b->name) + "</a>";
+        }
+        if (!links.empty()) deployed_html = links;
+    }
+
+    // Parse spec_json for the composition + the specific values it checks.
+    std::string spark_t, assert_t, rem_t, values_html;
+    if (!spec_json.empty()) {
+        if (auto j = nlohmann::json::parse(spec_json, nullptr, false); j.is_object()) {
+            const auto asrt = j.value("assertion", nlohmann::json::object());
+            spark_t = j.value("spark", nlohmann::json::object()).value("type", "");
+            assert_t = asrt.value("type", "");
+            rem_t = j.value("remediation", nlohmann::json::object()).value("type", "");
+            values_html = render_assertion_values(asrt, mode_color);
         }
     }
-    if (yaml.empty())
-        yaml = "apiVersion: yuzu.io/v1alpha1\nkind: GuaranteedStateRule\nmetadata:\n  name: " +
-               name + "\nspec:\n  spark:\n    type: registry-change\n  assertion:\n    "
-               "type: registry-value-equals\n  remediation:\n    action: alert-only";
 
-    std::string html;
-    // Header status: for a REAL authored rule the live compliance status is not
-    // known here (the agent reports fail-closed and per-agent rollup is unwired),
-    // so show an honest "status pending" rather than a fabricated green
-    // "compliant" badge (M2 / #1209). Only the no-backend demo path shows the
-    // sample badge.
-    const std::string header_badge =
-        real_rule ? std::string("<span style=\"font-size:0.7rem;color:var(--muted);"
-                                "border:1px solid var(--muted);padding:0.1rem 0.4rem;"
-                                "border-radius:0.3rem\">status pending</span>")
-                  : status_badge("compliant");
-    html += "<div class=\"detail-panel\"><h3>" + html_escape(name) + " " + header_badge + "</h3>";
+    std::string html =
+        "<div class=\"gs-modal-card\"><div class=\"gs-modal-header\"><h3>" + html_escape(name) +
+        " <span style=\"font-size:0.7rem;color:var(--muted);border:1px solid var(--muted);"
+        "padding:0.1rem 0.4rem;border-radius:0.3rem\">status pending</span></h3>"
+        "<button type=\"button\" class=\"gs-modal-close\" onclick=\"guardianCloseModal()\" "
+        "aria-label=\"Close\">&times;</button></div><div class=\"gs-modal-body\">";
+
     html += "<div class=\"kv\">"
             "<div class=\"k\">Severity</div><div>" + html_escape(severity) + "</div>"
-            "<div class=\"k\">Mode</div><div>" + html_escape(mode) + "</div>"
+            "<div class=\"k\">Mode</div><div style=\"color:" + mode_color + ";font-weight:700\">" +
+            mode + "</div>"
             "<div class=\"k\">Status</div><div style=\"color:" +
             std::string(enabled ? "var(--green)" : "var(--muted)") + ";font-weight:600\">" +
             (enabled ? "enabled" : "disabled") + "</div>"
             "<div class=\"k\">OS target</div><div>" + html_escape(os) + "</div>"
-            "<div class=\"k\">Scope</div><div style=\"font-family:var(--mono);font-size:0.75rem\">" +
-            html_escape(scope.empty() ? "(set at Baseline level)" : scope) + "</div>"
-            "<div class=\"k\">Composition</div><div>" + composition + "</div>"
+            "<div class=\"k\">Deployed under</div><div>" + deployed_html + "</div>"
             "</div>";
 
-    html += demo_banner("example per-agent compliance");
-    html += "<div style=\"font-size:0.75rem;font-weight:600;margin:0.5rem 0 0.3rem\">Agent compliance</div>";
-    html += "<table class=\"detail-table\"><thead><tr><th>Agent</th><th>Status</th>"
-            "<th>Last check</th><th>Drifts</th><th>Remediations</th></tr></thead><tbody>"
-            "<tr><td>DESKTOP-A3F</td><td>" + status_badge("compliant") + "</td><td>10:42:31</td><td>3</td><td>3</td></tr>"
-            "<tr><td>DESKTOP-K7M</td><td>" + status_badge("compliant") + "</td><td>10:35:14</td><td>1</td><td>1</td></tr>"
-            "<tr><td>LAPTOP-B92</td><td>" + status_badge("drifted") + "</td><td>10:40:05</td><td>1</td><td>0</td></tr>"
-            "</tbody></table>";
+    if (!values_html.empty()) {
+        html += "<div style=\"font-weight:600;font-size:0.8rem;margin:0.5rem 0 0.35rem;color:" +
+                mode_color + "\">" + verb + "</div>"
+                "<div class=\"kv\">" + values_html + "</div>"
+                "<div style=\"font-size:0.7rem;color:var(--muted);margin-bottom:0.4rem\">" +
+                phrasing + "</div>";
+    }
 
-    html += "<div style=\"font-size:0.75rem;font-weight:600;margin:0.75rem 0 0.3rem\">YAML source "
-            "<span style=\"font-weight:400;color:var(--muted)\">(server-rendered, read-only)</span></div>";
-    html += "<pre class=\"yaml\">" + html_escape(yaml) + "</pre>";
-    html += "</div>";
+    if (!spark_t.empty() || !yaml.empty()) {
+        html += "<details style=\"font-size:0.72rem;color:var(--muted)\">"
+                "<summary style=\"cursor:pointer\">Composition / YAML</summary>";
+        if (!spark_t.empty() && !assert_t.empty())
+            html += "<div style=\"margin:0.3rem 0 0.2rem\">Spark (" + html_escape(spark_t) +
+                    ") &rarr; Assertion (" + html_escape(assert_t) + ") &rarr; " +
+                    html_escape(rem_t.empty() ? "alert" : rem_t) + "</div>";
+        if (!yaml.empty())
+            html += "<pre class=\"yaml\">" + html_escape(yaml) + "</pre>";
+        html += "</details>";
+    }
+    if (!real_rule)
+        html += "<div class=\"mock-note\">No backend rule found for this id.</div>";
+
+    html += "</div><div class=\"gs-modal-footer\">"
+            "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"guardianCloseModal()\">"
+            "Close</button></div></div>";
     return html;
 }
 
@@ -1040,8 +1130,9 @@ std::string GuardianRoutes::render_baselines_fragment() const {
         html += "<div class=\"baseline-card\">"
                 "<div class=\"baseline-top\">"
                 "<span class=\"baseline-name\" style=\"cursor:pointer\" "
+                "onclick=\"guardianOpenModal()\" "
                 "hx-get=\"/fragments/guardian/baseline/" + rid +
-                "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + html_escape(b.name) +
+                "\" hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">" + html_escape(b.name) +
                 "</span>"
                 "<span class=\"lifecycle-" + std::string(deployed ? "deployed" : "draft") +
                 "\" style=\"font-size:0.72rem;font-weight:600\">" +
@@ -1051,9 +1142,9 @@ std::string GuardianRoutes::render_baselines_fragment() const {
                 "<div class=\"guard-meta\">"
                 "<span>" + std::to_string(members) + " guards</span>"
                 "<span style=\"margin-left:auto\">"
-                "<button class=\"btn btn-secondary btn-sm\" "
+                "<button class=\"btn btn-secondary btn-sm\" onclick=\"guardianOpenModal()\" "
                 "hx-post=\"/fragments/guardian/baseline/" + rid + "/deploy\" "
-                "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
+                "hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">" +
                 (deployed ? "Re-deploy" : "Deploy") + "</button></span>"
                 "</div></div>";
     }
@@ -1061,102 +1152,109 @@ std::string GuardianRoutes::render_baselines_fragment() const {
 }
 
 std::string GuardianRoutes::render_baseline_detail_fragment(const std::string& baseline_id) const {
-    std::string html = "<div class=\"detail-panel\">";
-    if (!baseline_store_ || !baseline_store_->is_open()) {
-        html += "<div class=\"empty-state\">Baseline store unavailable.</div></div>";
-        return html;
-    }
+    // Small modal-card wrapper so error states still render inside the modal.
+    auto card = [](const std::string& title, const std::string& body, const std::string& footer) {
+        return "<div class=\"gs-modal-card\"><div class=\"gs-modal-header\"><h3>" + title +
+               "</h3><button type=\"button\" class=\"gs-modal-close\" onclick=\"guardianCloseModal()\" "
+               "aria-label=\"Close\">&times;</button></div><div class=\"gs-modal-body\">" + body +
+               "</div>" + footer + "</div>";
+    };
+    if (!baseline_store_ || !baseline_store_->is_open())
+        return card("Baseline", "<div class=\"empty-state\">Baseline store unavailable.</div>", "");
     auto b = baseline_store_->get_baseline(baseline_id);
-    if (!b) {
-        html += "<div class=\"empty-state\">Baseline not found.</div></div>";
-        return html;
-    }
+    if (!b)
+        return card("Baseline", "<div class=\"empty-state\">Baseline not found.</div>", "");
+
     const bool deployed = b->lifecycle == kBaselineDeployed;
     const auto members = baseline_store_->get_members(baseline_id);
     const auto assign = baseline_store_->get_assignment(baseline_id);
+    const std::string bid = html_escape(b->baseline_id);
 
-    html += "<h3>" + html_escape(b->name) + " <span class=\"lifecycle-" +
-            std::string(deployed ? "deployed" : "draft") + "\" style=\"font-size:0.72rem\">" +
-            (deployed ? "deployed" : "draft") + "</span></h3>";
+    const std::string title =
+        html_escape(b->name) + " <span class=\"lifecycle-" +
+        std::string(deployed ? "deployed" : "draft") + "\" style=\"font-size:0.72rem\">" +
+        (deployed ? "deployed" : "draft") + "</span>";
+
+    std::string body;
     if (!b->description.empty())
-        html += "<div style=\"color:var(--muted);font-size:0.8rem;margin-bottom:0.5rem\">" +
+        body += "<div style=\"color:var(--muted);font-size:0.8rem;margin-bottom:0.5rem\">" +
                 html_escape(b->description) + "</div>";
-
-    // Persistent "needs re-deploy" warning: member edits to a deployed Baseline
-    // do not reach agents until Re-deploy. Shown until the live member set matches
-    // the deployed snapshot again.
+    // Persistent "needs re-deploy" warning: member edits to a deployed Baseline do
+    // not reach agents until Re-deploy.
     if (baseline_members_drifted(*b))
-        html += "<div style=\"background:rgba(255,176,32,0.12);border:1px solid var(--yellow);"
+        body += "<div style=\"background:rgba(255,176,32,0.12);border:1px solid var(--yellow);"
                 "color:var(--yellow);padding:0.45rem 0.7rem;border-radius:0.4rem;"
                 "margin-bottom:0.6rem;font-size:0.74rem;font-weight:600\">&#9888; Member guards "
                 "changed since last deploy &mdash; <strong>Re-deploy</strong> to apply the change "
                 "to agents.</div>";
 
-    html += "<div class=\"kv\">"
+    body += "<div class=\"kv\">"
             "<div class=\"k\">Member guards</div><div>" + std::to_string(members.size()) + "</div>"
             "<div class=\"k\">Assignment</div><div>" +
             (assign.empty() ? std::string("(no management groups yet)")
-                            : std::to_string(assign.size()) + " group(s)") +
-            "</div>";
+                            : std::to_string(assign.size()) + " group(s)") + "</div>";
     if (deployed && b->deployed_at > 0)
-        html += "<div class=\"k\">Last deployed</div><div>" + html_escape(format_iso_utc(b->deployed_at)) +
+        body += "<div class=\"k\">Last deployed</div><div>" +
+                html_escape(format_iso_utc(b->deployed_at)) +
                 (b->deployed_by.empty() ? "" : " by " + html_escape(b->deployed_by)) + "</div>";
-    html += "</div>";
+    body += "</div>";
 
-    // Member guards — resolve rule_id → human name via the Guard store (small N).
-    html += "<div style=\"font-size:0.75rem;font-weight:600;margin:0.6rem 0 0.3rem\">Member guards</div>";
+    // Member guards — clickable links that open the guard detail in the same modal.
+    body += "<div style=\"font-size:0.75rem;font-weight:600;margin:0.6rem 0 0.3rem\">Member guards</div>";
     if (members.empty()) {
-        html += empty_state("No guards in this baseline",
+        body += empty_state("No guards in this baseline",
                             "Add guards when creating or editing the baseline.");
     } else {
-        html += "<ul class=\"bl-member-list\" style=\"margin:0;padding-left:1.1rem;font-size:0.8rem\">";
+        body += "<ul class=\"bl-member-list\" style=\"margin:0;padding-left:1.1rem;font-size:0.8rem\">";
         for (const auto& rid : members) {
             std::string label = rid;
             if (store_ && store_->is_open())
                 if (auto r = store_->get_rule(rid); r && !r->name.empty())
                     label = r->name;
-            html += "<li>" + html_escape(label) + "</li>";
+            body += "<li><a class=\"gi-bl\" onclick=\"guardianOpenModal()\" "
+                    "hx-get=\"/fragments/guardian/guard/" + html_escape(rid) +
+                    "\" hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">" +
+                    html_escape(label) + "</a></li>";
         }
-        html += "</ul>";
+        body += "</ul>";
     }
 
-    // Assignment — included/excluded management groups. The picker is deferred
-    // until the global management-group feature lands; until then a Baseline has
-    // no device targeting and Deploy applies fleet-wide (see the hint below).
-    html += "<div style=\"font-size:0.75rem;font-weight:600;margin:0.6rem 0 0.3rem\">"
+    // Assignment — deferred until management groups land.
+    body += "<div style=\"font-size:0.75rem;font-weight:600;margin:0.6rem 0 0.3rem\">"
             "Assignment <span style=\"font-weight:400;color:var(--muted)\">(management groups)</span></div>";
     if (assign.empty()) {
-        html += empty_state("Targeting not available yet",
+        body += empty_state("Targeting not available yet",
                             "Management-group targeting (included / excluded groups) lands when the "
                             "global management-group feature is ready.");
     } else {
-        html += "<ul style=\"margin:0;padding-left:1.1rem;font-size:0.8rem\">";
+        body += "<ul style=\"margin:0;padding-left:1.1rem;font-size:0.8rem\">";
         for (const auto& a : assign)
-            html += "<li>" + html_escape(a.disposition) + ": <code>" + html_escape(a.group_id) +
+            body += "<li>" + html_escape(a.disposition) + ": <code>" + html_escape(a.group_id) +
                     "</code></li>";
-        html += "</ul>";
+        body += "</ul>";
     }
-
-    html += "<div class=\"mock-note\" style=\"margin-top:0.5rem\">Deploy currently applies this "
+    body += "<div class=\"mock-note\" style=\"margin-top:0.5rem\">Deploy currently applies this "
             "baseline's enabled guards <strong>fleet-wide</strong> (all agents, OS-filtered per "
             "guard). Per-group targeting arrives with management groups.</div>";
-    const std::string bid = html_escape(b->baseline_id);
-    html += "<div class=\"form-actions\" style=\"margin-top:0.6rem;gap:0.4rem\">"
-            // Edit opens the modal with the pre-filled form (rename + add/remove guards).
-            "<button class=\"btn btn-secondary\" onclick=\"guardianOpenModal()\" "
-            "hx-get=\"/fragments/guardian/baseline/" + bid + "/edit\" "
-            "hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">Edit</button>"
-            "<button class=\"btn btn-secondary\" hx-post=\"/fragments/guardian/baseline/" + bid +
-            "/deploy\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
-            (deployed ? "Re-deploy" : "Deploy") + "</button>"
-            "<button class=\"btn btn-secondary\" style=\"color:var(--red)\" "
-            "hx-post=\"/fragments/guardian/baseline/" + bid + "/delete\" "
-            "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-            "hx-confirm=\"Delete this baseline? Guards it uniquely delivers will be removed from "
-            "agents on the next reconcile.\">Delete</button>"
-            "</div>";
-    html += "</div>";
-    return html;
+
+    // Footer actions — all re-render into the modal (#guardian-modal-content).
+    const std::string footer =
+        "<div class=\"gs-modal-footer\">"
+        "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"guardianOpenModal()\" "
+        "hx-get=\"/fragments/guardian/baseline/" + bid + "/edit\" "
+        "hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">Edit</button>"
+        "<button type=\"button\" class=\"btn btn-secondary\" "
+        "hx-post=\"/fragments/guardian/baseline/" + bid +
+        "/deploy\" hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">" +
+        (deployed ? "Re-deploy" : "Deploy") + "</button>"
+        "<button type=\"button\" class=\"btn btn-secondary\" style=\"color:var(--red)\" "
+        "hx-post=\"/fragments/guardian/baseline/" + bid + "/delete\" "
+        "hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\" "
+        "hx-confirm=\"Delete this baseline? Guards it uniquely delivers will be removed from "
+        "agents on the next reconcile.\">Delete</button>"
+        "</div>";
+
+    return card(title, body, footer);
 }
 
 std::string GuardianRoutes::render_guard_form_fragment() const {
