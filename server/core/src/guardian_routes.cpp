@@ -5,15 +5,21 @@
 #include "guardian_routes.hpp"
 
 #include "guaranteed_state_store.hpp"
+#include "baseline_store.hpp"
+#include "guardian_form_render.hpp"
 #include "guardian_rule_spec.hpp"
 #include "secure_random.hpp"
+#include "store_errors.hpp"
 #include "web_utils.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 // Guardian page HTML (defined in guardian_ui.cpp).
@@ -63,21 +69,6 @@ constexpr std::array<MockEvent, 6> kMockEvents{{
     {"10:38:12", "guard.armed", "edr-agent-running", "SRV-DC01", "Self-test round-trip OK"},
     {"10:36:40", "guard.unhealthy", "reg-watch-legacy", "DESKTOP-K7M", "KEY_NOTIFY denied &mdash; watch deaf"},
     {"10:35:14", "resilience.escalated", "block-smb-445", "DESKTOP-K7M", "firewall-api &rarr; registry-write"},
-}};
-
-struct MockBaseline {
-    const char* id;
-    const char* name;
-    const char* scope;
-    const char* lifecycle;   // draft | deployed
-    int guards;
-    int agents;
-};
-
-constexpr std::array<MockBaseline, 3> kMockBaselines{{
-    {"cis-win-l1", "CIS Windows L1", "tag:production AND ostype:windows", "deployed", 24, 148},
-    {"linux-harden", "Linux Hardening", "ostype:linux", "deployed", 9, 30},
-    {"rdp-lockdown", "RDP Lockdown (draft)", "tag:workstations AND NOT tag:jump-hosts", "draft", 3, 0},
 }};
 
 // ── Display helpers ─────────────────────────────────────────────────────────
@@ -298,54 +289,75 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
         auto rules = store_->list_rules();
         if (!rules.empty()) {
             used_real = true;
+            // Precompute, per guard rule_id, the DEPLOYED Baselines that contain it
+            // (id + name) — one pass over deployed baselines rather than a query per
+            // guard — so each row can render "Deployed: <baseline links>".
+            std::unordered_map<std::string, std::vector<std::pair<std::string, std::string>>>
+                deployed_by_rule;
+            if (baseline_store_ && baseline_store_->is_open())
+                for (const auto& b : baseline_store_->list_deployed_baselines())
+                    for (const auto& mid : baseline_store_->get_members(b.baseline_id))
+                        deployed_by_rule[mid].emplace_back(b.baseline_id, b.name);
+
             for (const auto& r : rules) {
                 const std::string os = r.os_target.empty() ? "ALL"
                                        : (r.os_target == "windows" ? "W"
                                           : r.os_target == "linux"  ? "L"
                                           : r.os_target == "macos"  ? "M" : r.os_target);
                 const bool on = r.enabled;
-                // Empty/unknown renders as audit, NOT enforce: the agent arms
-                // enforce only on an exact "enforce" match, so showing ENFORCING
-                // for an empty mode would be a false-green (governance C1/B2).
-                const std::string mode = (r.enforcement_mode == "enforce") ? "enforce" : "audit";
-                const bool enforcing = (mode == "enforce");
-                const char* badge_color = on ? (enforcing ? "var(--green)" : "var(--yellow)")
-                                             : "var(--muted)";
-                const char* badge_text = on ? (enforcing ? "ENFORCING" : "audit-only") : "disabled";
+                // Mode is the guard's immutable posture: Observe (watch/audit — empty/
+                // unknown renders Observe, never a false-green Enforce; C1/B2) or
+                // Enforce. Coloured by posture (CSS .gi-mode.observe/.enforce).
+                const bool enforcing = (r.enforcement_mode == "enforce");
+                const std::string mode_label = enforcing ? "Enforce" : "Observe";
+                const char* mode_cls = enforcing ? "enforce" : "observe";
                 const std::string rid = html_escape(r.rule_id);
-                // Detail nav lives on the top row only, so the control buttons
-                // below (siblings, not children) never open the detail panel.
+
+                // Deployment line: the deployed Baselines that deliver this guard, as
+                // links to each baseline's view; otherwise an honest "not deployed".
+                std::string deploy_html;
+                if (auto dit = deployed_by_rule.find(r.rule_id);
+                    dit != deployed_by_rule.end() && !dit->second.empty()) {
+                    deploy_html = "<span class=\"gi-dep-on\">&#9679; Deployed:</span> ";
+                    bool first = true;
+                    for (const auto& [bid, bname] : dit->second) {
+                        if (!first) deploy_html += ", ";
+                        first = false;
+                        deploy_html += "<a class=\"gi-bl\" hx-get=\"/fragments/guardian/baseline/" +
+                                       html_escape(bid) +
+                                       "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
+                                       html_escape(bname) + "</a>";
+                    }
+                } else {
+                    deploy_html = "<span class=\"gi-dep-off\">&#9675; not deployed</span>";
+                }
+
+                // Left content column carries the detail-nav (clicking it opens the
+                // guard); the control button (gi-right) and baseline links (gi-deploy)
+                // are outside it, so they keep their own click behaviour.
                 html += "<div class=\"guard-item\">"
-                        "<div class=\"guard-item-top\" style=\"cursor:pointer\" "
+                        "<div class=\"gi-main\">"
+                        "<div class=\"gi-left\" style=\"cursor:pointer\" "
                         "hx-get=\"/fragments/guardian/guard/" + rid +
                         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">"
+                        "<div class=\"gi-row1\">"
                         "<span class=\"guard-name\">" + html_escape(r.name) + "</span>"
-                        "<span class=\"guard-os\">" + html_escape(os) + "</span>"
-                        "<span style=\"margin-left:auto;font-size:0.62rem;font-weight:700;color:" +
-                        std::string(badge_color) + "\">" + badge_text + "</span>"
-                        "</div>"
-                        "<div class=\"guard-meta\">"
+                        "<span class=\"gi-mode " + std::string(mode_cls) + "\">" + mode_label +
+                        "</span></div>"
+                        "<div class=\"gi-meta\">"
                         "<span>" + html_escape(r.severity.empty() ? "medium" : r.severity) + "</span>"
-                        "<span>mode: " + html_escape(on ? mode : "disabled") + "</span>"
-                        "<span class=\"" + std::string(on ? "health-ok" : "health-bad") +
-                        "\">&#9679; " + (on ? "armed" : "off") + "</span>"
-                        "</div>"
-                        // Live controls: enable/disable + audit↔enforce, auto-deployed.
-                        "<div class=\"guard-meta\" style=\"gap:0.4rem;margin-top:0.4rem\">"
-                        "<button class=\"btn btn-secondary\" "
-                        "style=\"padding:0.15rem 0.5rem;font-size:0.7rem\" "
+                        "<span class=\"guard-os\">" + html_escape(os) + "</span>"
+                        "</div></div>"
+                        "<div class=\"gi-right\">"
+                        "<span class=\"gi-state " + std::string(on ? "on" : "off") + "\">" +
+                        (on ? "ENABLED" : "DISABLED") + "</span>"
+                        "<button class=\"btn btn-secondary gi-act\" "
                         "hx-post=\"/fragments/guardian/guard/" + rid + "/enabled?value=" +
                         (on ? "0" : "1") +
                         "\" hx-target=\"#guardian-guards\" hx-swap=\"innerHTML\">" +
                         (on ? "Disable" : "Enable") + "</button>"
-                        "<button class=\"btn btn-secondary\" " +
-                        std::string(on ? "" : "disabled ") +
-                        "style=\"padding:0.15rem 0.5rem;font-size:0.7rem\" "
-                        "hx-post=\"/fragments/guardian/guard/" + rid + "/mode?value=" +
-                        (enforcing ? "audit" : "enforce") +
-                        "\" hx-target=\"#guardian-guards\" hx-swap=\"innerHTML\">" +
-                        (enforcing ? "Switch to Audit" : "Switch to Enforce") + "</button>"
-                        "</div>"
+                        "</div></div>"
+                        "<div class=\"gi-deploy\">" + deploy_html + "</div>"
                         "</div>";
             }
         }
@@ -386,8 +398,7 @@ std::string GuardianRoutes::render_guards_fragment(const std::string& status_fil
 }
 
 void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Response& res,
-                                        const std::string& rule_id, bool set_enabled, bool enabled,
-                                        bool set_mode, const std::string& mode) {
+                                        const std::string& rule_id, bool enabled) {
     // Error responses return 200 with an inline banner PREPENDED to the
     // re-rendered guard list. The dashboard's htmx config does not swap 4xx/5xx
     // bodies (responseHandling swap:false), so a 4xx/5xx error fragment would
@@ -408,88 +419,70 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
     if (!rule)
         return fail("No such guard: " + rule_id);
 
-    std::string detail;
-    if (set_enabled) {
-        rule->enabled = enabled;
-        detail = enabled ? "enabled=true" : "enabled=false";
-    }
-    if (set_mode) {
-        if (mode != "enforce" && mode != "audit")
-            return fail("Invalid mode (expected enforce or audit).");
-        rule->enforcement_mode = mode;
-        detail = "enforcement_mode=" + mode;
-    }
+    rule->enabled = enabled;
     if (auto r = store_->update_rule(*rule); !r)
         return fail("Update failed: " + r.error());
 
-    // Auto-deploy so the change reaches agents immediately. Scope the push to
-    // THIS rule's scope_expr (H1 / #1209, contract G10) instead of the whole
-    // fleet — a single toggle must not fan a full_sync out to every agent
-    // (toggle storm = self-inflicted DoS, and it violates the network-kindness
-    // NFR). full_sync stays true on purpose: the agent has no per-rule removal
-    // verb (apply_rules only tears guards down via the full_sync clear), so a
-    // disable can only propagate by having the in-scope agents rebuild from the
-    // new enabled set — which no longer contains this rule. An empty scope_expr
-    // means the rule targets the whole fleet, in which case the push lambda's
-    // send_to_all branch is the correct (and only) behaviour.
-    int pushed = -2;
-    if (push_fn_)
-        pushed = push_fn_(/*scope=*/rule->scope_expr, /*full_sync=*/true);
-    // Audit the mutation under its OWN verb (not guaranteed_state.push) so "who
-    // enabled enforcement / switched mode" is queryable, and so a push-transport
-    // failure is not logged as an authz denial of a change that already
-    // persisted (governance C2). The deploy outcome rides in the detail.
-    const std::string deploy = pushed >= 0 ? ("deployed agents=" + std::to_string(pushed))
-                                           : "deploy not wired/failed";
+    // STATE-ONLY (no push). A Guard's enabled flag is global state, not an
+    // individual deploy — Guards are not deployable on their own; only Baselines
+    // are (docs/guardian-baseline-model.md). The change persists now and takes
+    // effect on the next Baseline deploy or heartbeat reconcile, both of which
+    // re-push the union of *deployed* Baselines' enabled members. (Mode is set at
+    // creation and immutable — a different posture is a different Guard — so there
+    // is no mode change here.) Audited under its own rule.update verb so "who
+    // enabled / disabled this guard" stays queryable.
     audit_fn_(req, "guaranteed_state.rule.update", "success", "GuaranteedState", rule_id,
-              detail + " (" + deploy + ")");
+              std::string(enabled ? "enabled=true" : "enabled=false") +
+                  " (state-only; applies on next deploy/reconcile)");
     res.set_content(render_guards_fragment(""), "text/html; charset=utf-8");
 }
 
 void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib::Response& res) {
-    auto param = [&](const char* k) -> std::string {
+    auto get = [&](const std::string& k) -> std::string {
         return req.has_param(k) ? req.get_param_value(k) : std::string{};
     };
-    // Errors return 200 + an inline banner above a fresh form — htmx's swap:false
-    // on 4xx/5xx would otherwise drop the body and the operator would see nothing
-    // (same convention as apply_guard_change). Re-entry of values is a known wart
-    // (the form re-renders blank); the banner names exactly what to fix.
-    auto fail = [this, &res](const std::string& msg) {
+    // Errors return 200 + the form re-rendered with an inline banner at its top —
+    // htmx's swap:false on 4xx/5xx would otherwise drop the body and the operator
+    // would see nothing (same convention as apply_guard_change). Re-entry of values
+    // is a known wart (the form re-renders blank); the banner names what to fix.
+    auto fail = [&res](const std::string& msg) {
         res.status = 200;
-        res.set_content("<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
-                        "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
-                        "margin-bottom:0.5rem;font-size:0.78rem\">&#9888; " +
-                            html_escape(msg) + "</div>" + render_guard_form_fragment(),
-                        "text/html; charset=utf-8");
+        const std::string banner = "<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
+                                   "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
+                                   "margin-bottom:0.6rem;font-size:0.78rem\">&#9888; " +
+                                   html_escape(msg) + "</div>";
+        res.set_content(guardian::render_guard_form(banner), "text/html; charset=utf-8");
     };
 
     if (!store_ || !store_->is_open())
         return fail("Guardian store unavailable.");
 
-    const std::string name = param("name");
-    const std::string key = param("key");
-    const std::string value_type = param("value_type");
-    const std::string expected = param("expected");
-    const std::string enforcement_mode =
-        param("enforcement_mode").empty() ? "enforce" : param("enforcement_mode");
-    // Form-level required checks — clearer than a downstream empty-assertion guard.
-    if (name.empty() || key.empty() || value_type.empty() || expected.empty())
-        return fail("Name, key, value type and expected value are required.");
+    const std::string name = get("name");
+    if (name.empty())
+        return fail("Name is required.");
+    // One "Mode" control (Watch | Enforce) replaces the old enforcement-mode +
+    // remediation-action pair. Watch = observe & alert (no write-back); Enforce =
+    // auto-remediate. The dashboard speaks "Watch"; the stored enforcement_mode
+    // value stays "audit" for back-compat (the agent arms enforce only on an exact
+    // "enforce" match, so any non-enforce value behaves as observe).
+    const bool enforce_mode = get("mode") == "enforce";
+    const std::string enforcement_mode = enforce_mode ? "enforce" : "audit";
 
-    nlohmann::json assertion_params;
-    assertion_params["hive"] = param("hive").empty() ? "HKLM" : param("hive");
-    assertion_params["key"] = key;
-    assertion_params["value_name"] = param("value_name"); // "" = key default value
-    assertion_params["value_type"] = value_type;
-    assertion_params["expected"] = expected;
+    // Trigger type IS the assertion type; the schema-driven decoder reads exactly
+    // that type's params (namespaced field names), validates required, and derives
+    // the paired spark from the assertion family. Single source with render_guard_form.
+    const std::string trigger = get("trigger_type").empty() ? "registry-value-equals" : get("trigger_type");
+    auto sa = guardian::assemble_spark_assertion(trigger, get);
+    if (sa.error)
+        return fail(*sa.error);
 
     // Remediation params = the resilience policy. Only include fields the operator
     // actually set so blanks fall through to defaults rather than being rejected as
     // a non-numeric "" (lenient-in).
     nlohmann::json rem_params;
-    rem_params["mode"] = param("resilience_mode").empty() ? "persist" : param("resilience_mode");
+    rem_params["mode"] = get("resilience_mode").empty() ? "persist" : get("resilience_mode");
     auto add_num = [&](const char* k) {
-        const std::string v = param(k);
+        const std::string v = get(k);
         if (!v.empty()) rem_params[k] = v;
     };
     add_num("max_attempts");
@@ -499,12 +492,11 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
     add_num("backoff_max_ms");
     add_num("event_debounce_ms");
 
-    const std::string action =
-        param("remediation_action").empty() ? "alert-only" : param("remediation_action");
+    const std::string action = enforce_mode ? "enforce" : "alert-only";
 
     nlohmann::json body;
-    body["spark"] = {{"type", "registry-change"}, {"params", nlohmann::json::object()}};
-    body["assertion"] = {{"type", "registry-value-equals"}, {"params", std::move(assertion_params)}};
+    body["spark"] = std::move(sa.spark);
+    body["assertion"] = std::move(sa.assertion);
     body["remediation"] = {{"type", action}, {"params", std::move(rem_params)}};
 
     // Single source: the same derivation + resilience validation the REST create
@@ -522,9 +514,12 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
     row.version = 1;
     row.enabled = true;
     row.enforcement_mode = enforcement_mode;
-    row.severity = param("severity").empty() ? "medium" : param("severity");
-    row.os_target = "windows"; // registry guards are Windows-only today
-    row.scope_expr = "";        // unscoped draft — device targeting is set at the Baseline
+    row.severity = get("severity").empty() ? "medium" : get("severity");
+    // Every realtime spark today (registry-change RegNotifyChangeKeyValue,
+    // file-change ReadDirectoryChangesW) is Windows-only; os_target stamps that.
+    // Device targeting proper is set at the Baseline, not per-Guard.
+    row.os_target = "windows";
+    row.scope_expr = ""; // unscoped draft — device targeting is set at the Baseline
     const std::string now = format_iso_utc(now_epoch_seconds());
     row.created_at = now;
     row.updated_at = now;
@@ -537,29 +532,330 @@ void GuardianRoutes::create_guard_from_form(const httplib::Request& req, httplib
         return fail("Create failed: " + r.error());
 
     audit_fn_(req, "guaranteed_state.rule.create", "success", "GuaranteedState", row.rule_id,
-              row.name + " (mode=" + row.enforcement_mode + ", action=" + action + ")");
+              row.name + " (trigger=" + trigger + ", mode=" + row.enforcement_mode + ", action=" +
+                  action + ")");
 
-    // Success: a confirmation panel in the detail pane, an out-of-band refresh of
-    // the guards list, and a toast (the dashboard's HX-Trigger convention).
+    // Success: a confirmation card in the modal, an out-of-band refresh of the
+    // guards list, and a toast (the dashboard's HX-Trigger convention).
     res.set_header("HX-Trigger", R"({"showToast":{"message":"Guard created","level":"success"}})");
     std::string html =
-        "<div class=\"detail-panel\"><h3>Guard created</h3>"
-        "<div class=\"kv\"><div class=\"k\">Name</div><div>" +
+        "<div class=\"gs-modal-card\">"
+        "<div class=\"gs-modal-header\"><h3>Guard created</h3>"
+        "<button type=\"button\" class=\"gs-modal-close\" onclick=\"guardianCloseModal()\" "
+        "aria-label=\"Close\">&times;</button></div>"
+        "<div class=\"gs-modal-body\"><div class=\"kv\">"
+        "<div class=\"k\">Name</div><div>" +
         html_escape(row.name) +
         "</div>"
         "<div class=\"k\">ID</div><div style=\"font-family:var(--mono);font-size:0.75rem\">" +
         html_escape(row.rule_id) +
         "</div>"
+        "<div class=\"k\">Trigger</div><div>" +
+        html_escape(trigger) +
+        "</div>"
         "<div class=\"k\">Mode</div><div>" +
-        html_escape(row.enforcement_mode) + " / " + html_escape(action) +
-        "</div></div>"
+        std::string(enforce_mode ? "Enforce" : "Observe") + "</div></div>"
         "<div class=\"mock-note\">Created unscoped (draft). Add it to a Baseline to deploy it to "
-        "agents.</div>"
-        "<div class=\"form-actions\"><button class=\"btn btn-secondary\" "
-        "hx-get=\"/fragments/guardian/guard-form\" hx-target=\"#guardian-detail\" "
-        "hx-swap=\"innerHTML\">New Guard</button></div></div>"
+        "agents.</div></div>"
+        "<div class=\"gs-modal-footer\">"
+        "<button type=\"button\" class=\"btn btn-secondary\" "
+        "hx-get=\"/fragments/guardian/guard-form\" hx-target=\"#guardian-modal-content\" "
+        "hx-swap=\"innerHTML\">Create another</button>"
+        "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"guardianCloseModal()\">"
+        "Close</button></div></div>"
         "<div id=\"guardian-guards\" hx-swap-oob=\"innerHTML\">" +
         render_guards_fragment("") + "</div>";
+    res.set_content(html, "text/html; charset=utf-8");
+}
+
+void GuardianRoutes::create_baseline_from_form(const httplib::Request& req,
+                                               httplib::Response& res) {
+    // Errors return 200 + the form re-rendered with an inline banner (htmx's
+    // swap:false on 4xx would drop the body) — same convention as the guard form.
+    auto fail = [this, &res](const std::string& msg) {
+        std::vector<std::string> names;
+        if (store_ && store_->is_open())
+            for (const auto& r : store_->list_rules())
+                names.push_back(r.name);
+        const std::string banner = "<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
+                                   "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
+                                   "margin-bottom:0.6rem;font-size:0.78rem\">&#9888; " +
+                                   html_escape(msg) + "</div>";
+        res.status = 200;
+        // render_baseline_form has no error slot; prepend the banner to its body.
+        res.set_content(banner + guardian::render_baseline_form(names),
+                        "text/html; charset=utf-8");
+    };
+
+    if (!baseline_store_ || !baseline_store_->is_open())
+        return fail("Baseline store unavailable.");
+
+    auto get = [&](const std::string& k) -> std::string {
+        return req.has_param(k) ? req.get_param_value(k) : std::string{};
+    };
+    const std::string name = get("name");
+    if (name.empty())
+        return fail("Name is required.");
+
+    // The create form's member chips carry friendly guard NAMES; the store keys
+    // membership on rule_id, so resolve name → rule_id via the Guard store. An
+    // unknown name (free-typed, not from the datalist) is reported rather than
+    // silently dropped.
+    std::vector<std::string> member_ids;
+    if (store_ && store_->is_open()) {
+        std::unordered_map<std::string, std::string> name_to_id;
+        for (const auto& r : store_->list_rules())
+            name_to_id.emplace(r.name, r.rule_id);
+        std::string unknown;
+        const size_t n = req.get_param_value_count("guards");
+        for (size_t i = 0; i < n; ++i) {
+            const std::string gname = req.get_param_value("guards", i);
+            if (gname.empty())
+                continue;
+            if (auto it = name_to_id.find(gname); it != name_to_id.end())
+                member_ids.push_back(it->second);
+            else
+                unknown += (unknown.empty() ? "" : ", ") + gname;
+        }
+        if (!unknown.empty())
+            return fail("Unknown guard(s): " + unknown + ". Pick from the dropdown.");
+    }
+
+    Baseline b;
+    b.name = name;
+    b.description = get("description");
+    if (auto session = auth_fn_(req, res)) {
+        b.created_by = session->username;
+        b.updated_by = session->username;
+    }
+    auto created = baseline_store_->create_baseline(b);
+    if (!created)
+        return fail("Create failed: " + std::string(strip_conflict_prefix(created.error())));
+    const std::string id = *created;
+
+    if (!member_ids.empty())
+        if (auto r = baseline_store_->set_members(id, member_ids); !r)
+            return fail("Baseline created, but adding guards failed: " + r.error());
+
+    audit_fn_(req, "guaranteed_state.baseline.create", "success", "GuaranteedState", id,
+              name + " (members=" + std::to_string(member_ids.size()) + ", draft)");
+
+    // Success: confirmation card in the modal + out-of-band refresh of the
+    // baselines list + a toast (the dashboard's HX-Trigger convention).
+    res.set_header("HX-Trigger", R"({"showToast":{"message":"Baseline created","level":"success"}})");
+    std::string html =
+        "<div class=\"gs-modal-card\">"
+        "<div class=\"gs-modal-header\"><h3>Baseline created</h3>"
+        "<button type=\"button\" class=\"gs-modal-close\" onclick=\"guardianCloseModal()\" "
+        "aria-label=\"Close\">&times;</button></div>"
+        "<div class=\"gs-modal-body\"><div class=\"kv\">"
+        "<div class=\"k\">Name</div><div>" + html_escape(name) + "</div>"
+        "<div class=\"k\">Member guards</div><div>" + std::to_string(member_ids.size()) + "</div>"
+        "<div class=\"k\">Lifecycle</div><div>draft</div></div>"
+        "<div class=\"mock-note\">Created as a draft. Assign it to management groups and deploy it "
+        "from the baseline's detail panel.</div></div>"
+        "<div class=\"gs-modal-footer\">"
+        "<button type=\"button\" class=\"btn btn-secondary\" "
+        "hx-get=\"/fragments/guardian/baseline-form\" hx-target=\"#guardian-modal-content\" "
+        "hx-swap=\"innerHTML\">Create another</button>"
+        "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"guardianCloseModal()\">"
+        "Close</button></div></div>"
+        "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
+        render_baselines_fragment() + "</div>";
+    res.set_content(html, "text/html; charset=utf-8");
+}
+
+void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Response& res,
+                                     const std::string& baseline_id) {
+    auto panel = [](const std::string& msg) {
+        return "<div class=\"detail-panel\"><div class=\"empty-state\">" + msg + "</div></div>";
+    };
+    if (!baseline_store_ || !baseline_store_->is_open()) {
+        audit_fn_(req, "guaranteed_state.baseline.deploy", "denied", "GuaranteedState", baseline_id,
+                  "baseline store unavailable");
+        res.set_content(panel("Baseline store unavailable."), "text/html; charset=utf-8");
+        return;
+    }
+    auto b = baseline_store_->get_baseline(baseline_id);
+    if (!b) {
+        audit_fn_(req, "guaranteed_state.baseline.deploy", "denied", "GuaranteedState", baseline_id,
+                  "no such baseline");
+        res.set_content(panel("Baseline not found."), "text/html; charset=utf-8");
+        return;
+    }
+
+    // Mark deployed (lifecycle + deploy stamps). Re-deploy just refreshes them.
+    b->lifecycle = kBaselineDeployed;
+    b->deployed_at = now_epoch_seconds();
+    // Snapshot exactly the member set being deployed (sorted). The detail/list
+    // renderers compare live members against this to flag "members changed since
+    // last deploy — Re-deploy to apply" (baseline_members_drifted). Re-deploy
+    // refreshes it, clearing the flag.
+    b->deployed_snapshot = nlohmann::json(baseline_store_->get_members(baseline_id)).dump();
+    if (auto session = auth_fn_(req, res)) {
+        b->deployed_by = session->username;
+        b->updated_by = session->username;
+    }
+    if (auto r = baseline_store_->update_baseline(*b); !r) {
+        audit_fn_(req, "guaranteed_state.baseline.deploy", "failure", "GuaranteedState", baseline_id,
+                  "update failed: " + r.error());
+        res.set_content(panel("Deploy failed: " + html_escape(r.error())),
+                        "text/html; charset=utf-8");
+        return;
+    }
+
+    // Deploy changes the desired guard set WITHOUT mutating any rule, so bump the
+    // policy generation explicitly — otherwise the heartbeat reconcile (which keys
+    // off the generation to detect a stale agent) would never fire for a deploy.
+    if (store_)
+        store_->bump_policy_generation();
+
+    // Converge the fleet to the new deployed-Baseline union. Empty scope = all
+    // agents (management-group targeting deferred); full_sync so agents rebuild to
+    // exactly the deployed set — a Guard dropped from every deployed Baseline is
+    // thereby removed. The push reads the freshly-bumped generation.
+    int pushed = -2;
+    if (push_fn_)
+        pushed = push_fn_(/*scope=*/"", /*full_sync=*/true);
+
+    const std::string deploy = pushed >= 0 ? ("agents=" + std::to_string(pushed))
+                                           : "push not wired/failed";
+    audit_fn_(req, "guaranteed_state.baseline.deploy", "success", "GuaranteedState", baseline_id,
+              b->name + " deployed fleet-wide (" + deploy +
+                  ", members=" + std::to_string(baseline_store_->member_count(baseline_id)) + ")");
+
+    res.set_header("HX-Trigger",
+                   R"({"showToast":{"message":"Baseline deployed","level":"success"}})");
+    // Re-render the detail panel (Deploy → Re-deploy, shows last-deployed) plus an
+    // out-of-band refresh of the baselines list so its lifecycle badge updates too.
+    std::string html = render_baseline_detail_fragment(baseline_id) +
+                       "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
+                       render_baselines_fragment() + "</div>";
+    res.set_content(html, "text/html; charset=utf-8");
+}
+
+void GuardianRoutes::update_baseline_from_form(const httplib::Request& req, httplib::Response& res,
+                                               const std::string& baseline_id) {
+    // Re-render the edit form (pre-filled from the store's current state) with an
+    // inline banner on error — htmx won't swap a 4xx body.
+    auto fail = [this, &res, &baseline_id](const std::string& msg) {
+        const std::string banner = "<div class=\"gs-error-banner\" style=\"background:#3a1a1a;"
+                                   "color:var(--red);padding:0.5rem 0.75rem;border-radius:0.4rem;"
+                                   "margin-bottom:0.6rem;font-size:0.78rem\">&#9888; " +
+                                   html_escape(msg) + "</div>";
+        res.status = 200;
+        res.set_content(banner + render_baseline_edit_form_fragment(baseline_id),
+                        "text/html; charset=utf-8");
+    };
+
+    if (!baseline_store_ || !baseline_store_->is_open())
+        return fail("Baseline store unavailable.");
+    auto b = baseline_store_->get_baseline(baseline_id);
+    if (!b)
+        return fail("Baseline not found.");
+
+    auto get = [&](const std::string& k) -> std::string {
+        return req.has_param(k) ? req.get_param_value(k) : std::string{};
+    };
+    const std::string name = get("name");
+    if (name.empty())
+        return fail("Name is required.");
+
+    // Resolve posted member-guard NAMES → rule_ids (same as create).
+    std::vector<std::string> member_ids;
+    if (store_ && store_->is_open()) {
+        std::unordered_map<std::string, std::string> name_to_id;
+        for (const auto& r : store_->list_rules())
+            name_to_id.emplace(r.name, r.rule_id);
+        std::string unknown;
+        const size_t n = req.get_param_value_count("guards");
+        for (size_t i = 0; i < n; ++i) {
+            const std::string gname = req.get_param_value("guards", i);
+            if (gname.empty())
+                continue;
+            if (auto it = name_to_id.find(gname); it != name_to_id.end())
+                member_ids.push_back(it->second);
+            else
+                unknown += (unknown.empty() ? "" : ", ") + gname;
+        }
+        if (!unknown.empty())
+            return fail("Unknown guard(s): " + unknown + ". Pick from the dropdown.");
+    }
+
+    // Rename only — preserve lifecycle + deploy stamps + description (the form has
+    // no description field, so don't let an absent value wipe it).
+    b->name = name;
+    if (auto session = auth_fn_(req, res))
+        b->updated_by = session->username;
+    if (auto r = baseline_store_->update_baseline(*b); !r)
+        return fail("Save failed: " + std::string(strip_conflict_prefix(r.error())));
+    if (auto r = baseline_store_->set_members(baseline_id, member_ids); !r)
+        return fail("Saved name, but updating guards failed: " + r.error());
+
+    const bool deployed = b->lifecycle == kBaselineDeployed;
+    audit_fn_(req, "guaranteed_state.baseline.update", "success", "GuaranteedState", baseline_id,
+              name + " (members=" + std::to_string(member_ids.size()) + ")");
+
+    // Member edits to a DEPLOYED baseline only reach agents on the next Re-deploy
+    // (no generation bump here — the deferred Q-A behaviour). Nudge the operator.
+    const std::string toast = deployed
+                                  ? R"({"showToast":{"message":"Saved — Re-deploy to apply to agents","level":"warning"}})"
+                                  : R"({"showToast":{"message":"Baseline saved","level":"success"}})";
+    res.set_header("HX-Trigger", toast);
+    std::string html = render_baseline_detail_fragment(baseline_id) +
+                       "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
+                       render_baselines_fragment() + "</div>";
+    res.set_content(html, "text/html; charset=utf-8");
+}
+
+void GuardianRoutes::delete_baseline_action(const httplib::Request& req, httplib::Response& res,
+                                            const std::string& baseline_id) {
+    auto panel = [](const std::string& msg) {
+        return "<div class=\"detail-panel\"><div class=\"empty-state\">" + msg + "</div></div>";
+    };
+    if (!baseline_store_ || !baseline_store_->is_open()) {
+        audit_fn_(req, "guaranteed_state.baseline.delete", "denied", "GuaranteedState", baseline_id,
+                  "baseline store unavailable");
+        res.set_content(panel("Baseline store unavailable."), "text/html; charset=utf-8");
+        return;
+    }
+    auto b = baseline_store_->get_baseline(baseline_id);
+    if (!b) {
+        audit_fn_(req, "guaranteed_state.baseline.delete", "denied", "GuaranteedState", baseline_id,
+                  "no such baseline");
+        res.set_content(panel("Baseline not found."), "text/html; charset=utf-8");
+        return;
+    }
+    const bool was_deployed = b->lifecycle == kBaselineDeployed;
+    const std::string nm = b->name;
+    if (auto r = baseline_store_->delete_baseline(baseline_id); !r) {
+        audit_fn_(req, "guaranteed_state.baseline.delete", "failure", "GuaranteedState", baseline_id,
+                  "delete failed: " + r.error());
+        res.set_content(panel("Delete failed: " + html_escape(r.error())), "text/html; charset=utf-8");
+        return;
+    }
+
+    // If it was deployed, converge the fleet: bump generation + fleet-wide full_sync
+    // so its Guards are torn down where no other deployed Baseline still delivers
+    // them (the union recomputes without this Baseline's members).
+    int pushed = -2;
+    if (was_deployed) {
+        if (store_)
+            store_->bump_policy_generation();
+        if (push_fn_)
+            pushed = push_fn_(/*scope=*/"", /*full_sync=*/true);
+    }
+    const std::string detail =
+        nm + (was_deployed ? (" (was deployed; reconciled agents=" + std::to_string(pushed) + ")")
+                           : " (draft)");
+    audit_fn_(req, "guaranteed_state.baseline.delete", "success", "GuaranteedState", baseline_id,
+              detail);
+
+    res.set_header("HX-Trigger",
+                   R"({"showToast":{"message":"Baseline deleted","level":"success"}})");
+    std::string html = panel("Baseline deleted.") +
+                       "<div id=\"guardian-baselines\" hx-swap-oob=\"innerHTML\">" +
+                       render_baselines_fragment() + "</div>";
     res.set_content(html, "text/html; charset=utf-8");
 }
 
@@ -613,18 +909,39 @@ std::string GuardianRoutes::render_events_fragment(const std::string& type_filte
 
 std::string GuardianRoutes::render_guard_detail_fragment(const std::string& guard_id) const {
     // Header fields prefer a real rule lookup; the rest is mock.
-    std::string name = guard_id, severity = "high", mode = "enforce", os = "windows",
-                scope = "tag:production-workstations", yaml;
+    std::string name = guard_id, severity = "high", mode = "Enforce", os = "windows",
+                scope = "tag:production-workstations", yaml, spec_json;
     bool real_rule = false;
+    bool enabled = true;
     if (store_ && store_->is_open()) {
         if (auto r = store_->get_rule(guard_id)) {
             real_rule = true;
             name = r->name;
             severity = r->severity.empty() ? severity : r->severity;
-            mode = (r->enforcement_mode == "enforce") ? "enforce" : "audit"; // empty→audit (C1/B2)
+            // Observe (watch/audit — empty→Observe per C1/B2) or Enforce. Display word
+            // only; stored value unchanged.
+            mode = (r->enforcement_mode == "enforce") ? "Enforce" : "Observe";
+            enabled = r->enabled;
             os = r->os_target.empty() ? "all" : r->os_target;
             scope = r->scope_expr;
             yaml = r->yaml_source;
+            spec_json = r->spec_json;
+        }
+    }
+
+    // Composition line: read the real spark/assertion/remediation from spec_json so
+    // a file guard does not render as "registry-change". Falls back to the registry
+    // example only on the no-backend demo path (empty/unparseable spec).
+    std::string composition = "Spark (registry-change) &rarr; Assertion (registry-value-equals) "
+                              "&rarr; alert";
+    if (real_rule && !spec_json.empty()) {
+        if (auto j = nlohmann::json::parse(spec_json, nullptr, false); !j.is_discarded()) {
+            const std::string sp = j.value("spark", nlohmann::json::object()).value("type", "");
+            const std::string as = j.value("assertion", nlohmann::json::object()).value("type", "");
+            const std::string rem = j.value("remediation", nlohmann::json::object()).value("type", "");
+            if (!sp.empty() && !as.empty())
+                composition = "Spark (" + html_escape(sp) + ") &rarr; Assertion (" +
+                              html_escape(as) + ") &rarr; " + html_escape(rem.empty() ? "alert" : rem);
         }
     }
     if (yaml.empty())
@@ -647,11 +964,13 @@ std::string GuardianRoutes::render_guard_detail_fragment(const std::string& guar
     html += "<div class=\"kv\">"
             "<div class=\"k\">Severity</div><div>" + html_escape(severity) + "</div>"
             "<div class=\"k\">Mode</div><div>" + html_escape(mode) + "</div>"
+            "<div class=\"k\">Status</div><div style=\"color:" +
+            std::string(enabled ? "var(--green)" : "var(--muted)") + ";font-weight:600\">" +
+            (enabled ? "enabled" : "disabled") + "</div>"
             "<div class=\"k\">OS target</div><div>" + html_escape(os) + "</div>"
             "<div class=\"k\">Scope</div><div style=\"font-family:var(--mono);font-size:0.75rem\">" +
             html_escape(scope.empty() ? "(set at Baseline level)" : scope) + "</div>"
-            "<div class=\"k\">Composition</div><div>Spark (registry-change) &rarr; "
-            "Assertion (registry-value-equals) &rarr; alert</div>"
+            "<div class=\"k\">Composition</div><div>" + composition + "</div>"
             "</div>";
 
     html += demo_banner("example per-agent compliance");
@@ -670,28 +989,70 @@ std::string GuardianRoutes::render_guard_detail_fragment(const std::string& guar
     return html;
 }
 
+bool GuardianRoutes::baseline_members_drifted(const Baseline& b) const {
+    if (b.lifecycle != kBaselineDeployed || b.deployed_snapshot.empty() || !baseline_store_)
+        return false;
+    auto snap = nlohmann::json::parse(b.deployed_snapshot, nullptr, /*allow_exceptions=*/false);
+    if (!snap.is_array())
+        return false;
+    std::vector<std::string> deployed;
+    for (const auto& e : snap)
+        if (e.is_string())
+            deployed.push_back(e.get<std::string>());
+    std::sort(deployed.begin(), deployed.end());
+    auto current = baseline_store_->get_members(b.baseline_id);  // ORDER BY rule_id
+    std::sort(current.begin(), current.end());                   // defensive
+    return current != deployed;
+}
+
 std::string GuardianRoutes::render_baselines_fragment() const {
-    // TODO(guardian-backend): baselines store + deploy fan-out do not exist yet
-    // (contract §6/§7). The entire list is illustrative, so it leads with an
-    // unmistakable banner (M2 / #1209) — there is no live data to fall back to.
-    std::string html = demo_banner("example baselines — Baseline backend not yet implemented");
-    for (const auto& b : kMockBaselines) {
-        const bool deployed = std::string(b.lifecycle) == "deployed";
+    if (!baseline_store_ || !baseline_store_->is_open())
+        return empty_state("Baseline store unavailable",
+                           "The Baseline backend is not initialised. Check server /healthz.");
+
+    auto baselines = baseline_store_->list_baselines();
+    if (baselines.empty())
+        return empty_state("No baselines yet",
+                           "A Baseline is a deployable collection of Guards, targeted at "
+                           "management groups. Create one to start deploying Guards to your fleet.");
+
+    std::string html;
+    for (const auto& b : baselines) {
+        const bool deployed = b.lifecycle == kBaselineDeployed;
+        const bool drifted = baseline_members_drifted(b);
+        const std::size_t members = baseline_store_->member_count(b.baseline_id);
+        const auto assign = baseline_store_->get_assignment(b.baseline_id);
+        int inc = 0, exc = 0;
+        for (const auto& a : assign)
+            (a.disposition == kAssignInclude ? inc : exc)++;
+        const std::string rid = html_escape(b.baseline_id);
+        const std::string target =
+            assign.empty() ? std::string("No management groups assigned")
+                           : (std::to_string(inc) + " included &middot; " + std::to_string(exc) +
+                              " excluded group(s)");
+        // A deployed Baseline whose members changed since last deploy gets an amber
+        // "changes pending" marker beside the lifecycle badge.
+        const std::string pending =
+            drifted ? "<span title=\"Member guards changed since last deploy — Re-deploy to apply\" "
+                      "style=\"font-size:0.66rem;font-weight:600;color:var(--yellow);"
+                      "margin-left:0.4rem\">&#9888; changes pending</span>"
+                    : "";
         html += "<div class=\"baseline-card\">"
                 "<div class=\"baseline-top\">"
                 "<span class=\"baseline-name\" style=\"cursor:pointer\" "
-                "hx-get=\"/fragments/guardian/baseline/" + std::string(b.id) +
-                "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + std::string(b.name) + "</span>"
-                "<span class=\"lifecycle-" + std::string(b.lifecycle) + "\" style=\"font-size:0.72rem;font-weight:600\">" +
-                (deployed ? "&#9679; deployed" : "&#9675; draft") + "</span>"
+                "hx-get=\"/fragments/guardian/baseline/" + rid +
+                "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + html_escape(b.name) +
+                "</span>"
+                "<span class=\"lifecycle-" + std::string(deployed ? "deployed" : "draft") +
+                "\" style=\"font-size:0.72rem;font-weight:600\">" +
+                (deployed ? "&#9679; deployed" : "&#9675; draft") + "</span>" + pending +
                 "</div>"
-                "<div class=\"baseline-scope\">" + std::string(b.scope) + "</div>"
+                "<div class=\"baseline-scope\">" + target + "</div>"
                 "<div class=\"guard-meta\">"
-                "<span>" + std::to_string(b.guards) + " guards</span>"
-                "<span>" + std::to_string(b.agents) + " agents in scope</span>"
+                "<span>" + std::to_string(members) + " guards</span>"
                 "<span style=\"margin-left:auto\">"
                 "<button class=\"btn btn-secondary btn-sm\" "
-                "hx-post=\"/fragments/guardian/baseline/" + std::string(b.id) + "/deploy\" "
+                "hx-post=\"/fragments/guardian/baseline/" + rid + "/deploy\" "
                 "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
                 (deployed ? "Re-deploy" : "Deploy") + "</button></span>"
                 "</div></div>";
@@ -700,131 +1061,147 @@ std::string GuardianRoutes::render_baselines_fragment() const {
 }
 
 std::string GuardianRoutes::render_baseline_detail_fragment(const std::string& baseline_id) const {
-    const MockBaseline* b = nullptr;
-    for (const auto& mb : kMockBaselines)
-        if (baseline_id == mb.id) { b = &mb; break; }
-
     std::string html = "<div class=\"detail-panel\">";
+    if (!baseline_store_ || !baseline_store_->is_open()) {
+        html += "<div class=\"empty-state\">Baseline store unavailable.</div></div>";
+        return html;
+    }
+    auto b = baseline_store_->get_baseline(baseline_id);
     if (!b) {
         html += "<div class=\"empty-state\">Baseline not found.</div></div>";
         return html;
     }
-    const bool deployed = std::string(b->lifecycle) == "deployed";
-    html += demo_banner("example baseline — Baseline backend not yet implemented");
-    html += "<h3>" + std::string(b->name) + " <span class=\"lifecycle-" + std::string(b->lifecycle) +
-            "\" style=\"font-size:0.72rem\">" + std::string(b->lifecycle) + "</span></h3>";
+    const bool deployed = b->lifecycle == kBaselineDeployed;
+    const auto members = baseline_store_->get_members(baseline_id);
+    const auto assign = baseline_store_->get_assignment(baseline_id);
+
+    html += "<h3>" + html_escape(b->name) + " <span class=\"lifecycle-" +
+            std::string(deployed ? "deployed" : "draft") + "\" style=\"font-size:0.72rem\">" +
+            (deployed ? "deployed" : "draft") + "</span></h3>";
+    if (!b->description.empty())
+        html += "<div style=\"color:var(--muted);font-size:0.8rem;margin-bottom:0.5rem\">" +
+                html_escape(b->description) + "</div>";
+
+    // Persistent "needs re-deploy" warning: member edits to a deployed Baseline
+    // do not reach agents until Re-deploy. Shown until the live member set matches
+    // the deployed snapshot again.
+    if (baseline_members_drifted(*b))
+        html += "<div style=\"background:rgba(255,176,32,0.12);border:1px solid var(--yellow);"
+                "color:var(--yellow);padding:0.45rem 0.7rem;border-radius:0.4rem;"
+                "margin-bottom:0.6rem;font-size:0.74rem;font-weight:600\">&#9888; Member guards "
+                "changed since last deploy &mdash; <strong>Re-deploy</strong> to apply the change "
+                "to agents.</div>";
+
     html += "<div class=\"kv\">"
-            "<div class=\"k\">Scope</div><div style=\"font-family:var(--mono);font-size:0.75rem\">" +
-            std::string(b->scope) + "</div>"
-            "<div class=\"k\">Member guards</div><div>" + std::to_string(b->guards) + "</div>"
-            "<div class=\"k\">Agents in scope</div><div>" + std::to_string(b->agents) + "</div>"
+            "<div class=\"k\">Member guards</div><div>" + std::to_string(members.size()) + "</div>"
+            "<div class=\"k\">Assignment</div><div>" +
+            (assign.empty() ? std::string("(no management groups yet)")
+                            : std::to_string(assign.size()) + " group(s)") +
             "</div>";
-    html += "<div class=\"form-actions\">"
-            "<button class=\"btn btn-secondary\" hx-post=\"/fragments/guardian/baseline/" +
-            std::string(b->id) + "/deploy\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
-            (deployed ? "Re-deploy" : "Deploy") + "</button></div>";
+    if (deployed && b->deployed_at > 0)
+        html += "<div class=\"k\">Last deployed</div><div>" + html_escape(format_iso_utc(b->deployed_at)) +
+                (b->deployed_by.empty() ? "" : " by " + html_escape(b->deployed_by)) + "</div>";
+    html += "</div>";
+
+    // Member guards — resolve rule_id → human name via the Guard store (small N).
+    html += "<div style=\"font-size:0.75rem;font-weight:600;margin:0.6rem 0 0.3rem\">Member guards</div>";
+    if (members.empty()) {
+        html += empty_state("No guards in this baseline",
+                            "Add guards when creating or editing the baseline.");
+    } else {
+        html += "<ul class=\"bl-member-list\" style=\"margin:0;padding-left:1.1rem;font-size:0.8rem\">";
+        for (const auto& rid : members) {
+            std::string label = rid;
+            if (store_ && store_->is_open())
+                if (auto r = store_->get_rule(rid); r && !r->name.empty())
+                    label = r->name;
+            html += "<li>" + html_escape(label) + "</li>";
+        }
+        html += "</ul>";
+    }
+
+    // Assignment — included/excluded management groups. The picker is deferred
+    // until the global management-group feature lands; until then a Baseline has
+    // no device targeting and Deploy applies fleet-wide (see the hint below).
+    html += "<div style=\"font-size:0.75rem;font-weight:600;margin:0.6rem 0 0.3rem\">"
+            "Assignment <span style=\"font-weight:400;color:var(--muted)\">(management groups)</span></div>";
+    if (assign.empty()) {
+        html += empty_state("Targeting not available yet",
+                            "Management-group targeting (included / excluded groups) lands when the "
+                            "global management-group feature is ready.");
+    } else {
+        html += "<ul style=\"margin:0;padding-left:1.1rem;font-size:0.8rem\">";
+        for (const auto& a : assign)
+            html += "<li>" + html_escape(a.disposition) + ": <code>" + html_escape(a.group_id) +
+                    "</code></li>";
+        html += "</ul>";
+    }
+
+    html += "<div class=\"mock-note\" style=\"margin-top:0.5rem\">Deploy currently applies this "
+            "baseline's enabled guards <strong>fleet-wide</strong> (all agents, OS-filtered per "
+            "guard). Per-group targeting arrives with management groups.</div>";
+    const std::string bid = html_escape(b->baseline_id);
+    html += "<div class=\"form-actions\" style=\"margin-top:0.6rem;gap:0.4rem\">"
+            // Edit opens the modal with the pre-filled form (rename + add/remove guards).
+            "<button class=\"btn btn-secondary\" onclick=\"guardianOpenModal()\" "
+            "hx-get=\"/fragments/guardian/baseline/" + bid + "/edit\" "
+            "hx-target=\"#guardian-modal-content\" hx-swap=\"innerHTML\">Edit</button>"
+            "<button class=\"btn btn-secondary\" hx-post=\"/fragments/guardian/baseline/" + bid +
+            "/deploy\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
+            (deployed ? "Re-deploy" : "Deploy") + "</button>"
+            "<button class=\"btn btn-secondary\" style=\"color:var(--red)\" "
+            "hx-post=\"/fragments/guardian/baseline/" + bid + "/delete\" "
+            "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+            "hx-confirm=\"Delete this baseline? Guards it uniquely delivers will be removed from "
+            "agents on the next reconcile.\">Delete</button>"
+            "</div>";
     html += "</div>";
     return html;
 }
 
 std::string GuardianRoutes::render_guard_form_fragment() const {
-    // Structured create form for the Slice-A registry types (the only spark /
-    // assertion types the agent implements today). Field names map 1:1 to the
-    // structured Guard the POST handler builds and feeds to derive_rule_spec, so
-    // the dashboard and the REST API produce identical specs + validation. The
-    // resilience fieldset emits exactly the keys the agent reads / the /schemas
-    // registry publishes. A fuller schema-driven dynamic renderer (one consumer
-    // of GET /schemas) is a forward step once more types exist.
-    const char* fieldset =
-        "border:1px solid var(--border);border-radius:0.4rem;padding:0.6rem 0.75rem;margin:0.5rem 0";
-    const char* hint = "color:var(--muted);font-size:0.72rem;margin-bottom:0.4rem";
-    std::string html =
-        "<div class=\"detail-panel\"><h3>New Guard</h3>"
-        "<form class=\"gs-form\" hx-post=\"/fragments/guardian/guards\" "
-        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">"
-        "<label>Name</label><input name=\"name\" placeholder=\"block-smb-445\" required>"
-        "<div class=\"form-row\">"
-        "<div><label>Severity</label><select name=\"severity\">"
-        "<option>critical</option><option selected>high</option><option>medium</option><option>low</option>"
-        "</select></div>"
-        "<div><label>Enforcement mode</label><select name=\"enforcement_mode\">"
-        "<option value=\"enforce\" selected>enforce</option><option value=\"audit\">audit</option></select></div>"
-        "</div>"
-        "<fieldset style=\"";
-    html += fieldset;
-    html +=
-        "\"><legend>Assertion &mdash; registry-value-equals</legend>"
-        "<div class=\"form-row\">"
-        "<div><label>Hive</label><select name=\"hive\">"
-        "<option>HKLM</option><option>HKCU</option><option>HKCR</option><option>HKU</option><option>HKCC</option>"
-        "</select></div>"
-        "<div><label>Value type</label><select name=\"value_type\">"
-        "<option>REG_DWORD</option><option>REG_QWORD</option><option>REG_SZ</option>"
-        "<option>REG_EXPAND_SZ</option><option>REG_BINARY</option></select></div>"
-        "</div>"
-        "<label>Key</label><input name=\"key\" placeholder=\"SOFTWARE\\\\YuzuTest\" required>"
-        "<div class=\"form-row\">"
-        "<div><label>Value name</label><input name=\"value_name\" placeholder=\"Flag (blank = default value)\"></div>"
-        "<div><label>Expected</label><input name=\"expected\" placeholder=\"1\" required></div>"
-        "</div></fieldset>"
-        "<label>Remediation action</label><select name=\"remediation_action\">"
-        "<option value=\"alert-only\" selected>alert-only (detect &amp; report)</option>"
-        "<option value=\"enforce\">enforce (write the expected value back)</option></select>"
-        "<fieldset style=\"";
-    html += fieldset;
-    html += "\"><legend>Resilience policy</legend><div style=\"";
-    html += hint;
-    html +=
-        "\">Governs re-enforcement when a value keeps drifting (enforce only). Fields not "
-        "relevant to the chosen mode are ignored; blanks use the defaults.</div>"
-        "<label>Mode</label><select name=\"resilience_mode\">"
-        "<option value=\"persist\" selected>persist &mdash; fix on every drift, never give up</option>"
-        "<option value=\"backoff\">backoff &mdash; exponential delay, never give up</option>"
-        "<option value=\"bounded\">bounded &mdash; give up after N cycles</option></select>"
-        "<div class=\"form-row\">"
-        "<div><label>Max attempts (bounded)</label>"
-        "<input name=\"max_attempts\" type=\"number\" min=\"1\" placeholder=\"5\"></div>"
-        "<div><label>Quiet reset (s)</label>"
-        "<input name=\"quiet_reset_s\" type=\"number\" min=\"1\" placeholder=\"60\"></div>"
-        "</div>"
-        "<div class=\"form-row\">"
-        "<div><label>Resume after (s, bounded)</label>"
-        "<input name=\"resume_after_s\" type=\"number\" min=\"0\" placeholder=\"0 = stay given up\"></div>"
-        "<div><label>Event debounce (ms)</label>"
-        "<input name=\"event_debounce_ms\" type=\"number\" min=\"0\" placeholder=\"1000\"></div>"
-        "</div>"
-        "<div class=\"form-row\">"
-        "<div><label>Backoff initial (ms)</label>"
-        "<input name=\"backoff_initial_ms\" type=\"number\" min=\"1\" placeholder=\"1000\"></div>"
-        "<div><label>Backoff max (ms)</label>"
-        "<input name=\"backoff_max_ms\" type=\"number\" min=\"1\" placeholder=\"60000\"></div>"
-        "</div></fieldset>"
-        "<div class=\"form-actions\">"
-        "<button type=\"submit\" class=\"btn btn-secondary\">Create Guard</button></div>"
-        "</form>"
-        "<div class=\"mock-note\">A new Guard is created unscoped (draft); device targeting is set at "
-        "the Baseline, not per-Guard. Authoring schemas: "
-        "<code>GET /api/v1/guaranteed-state/schemas</code>.</div></div>";
-    return html;
+    // Schema-driven "New Guard" modal: the operator picks a trigger type and only
+    // that trigger's fields are shown, rendered from the compiled-in schema catalog
+    // (so a new trigger/assertion type appears here with no UI change). Field names
+    // map 1:1 to the structured Guard create_guard_from_form() decodes and feeds to
+    // derive_rule_spec — the dashboard and the REST API produce identical specs +
+    // validation. See guardian_form_render.{hpp,cpp}.
+    return guardian::render_guard_form();
 }
 
 std::string GuardianRoutes::render_baseline_form_fragment() const {
-    std::string html =
-        "<div class=\"detail-panel\"><h3>New Baseline</h3>"
-        "<form class=\"gs-form\" hx-post=\"/fragments/guardian/baselines\" "
-        "hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">"
-        "<label>Name</label><input name=\"name\" placeholder=\"CIS Windows L1\">"
-        "<label>Scope (Scope DSL &mdash; sets device targeting)</label>"
-        "<input name=\"scope\" placeholder=\"tag:production AND ostype:windows\">"
-        "<label>Member guards</label>"
-        "<textarea name=\"guards\" placeholder=\"one guard name per line&#10;block-smb-445&#10;edr-agent-running\"></textarea>"
-        "<div class=\"form-actions\">"
-        "<button type=\"submit\" class=\"btn btn-secondary\">Create Baseline (draft)</button></div>"
-        "</form>"
-        "<div class=\"mock-note\">Deploy is a separate, Baseline-level action. Membership is M:N to Guards; "
-        "the scope picker will reuse the existing Scope engine. Submission wires to the Baseline backend "
-        "when it lands.</div></div>";
-    return html;
+    // Seed the Member-guards datalist with existing guard names (live wherever the
+    // store has authored rules). The create itself is still a mock — the Baseline
+    // backend (store + M:N membership + deploy fan-out) is deferred (contract
+    // §6/§7). See guardian_form_render.cpp.
+    std::vector<std::string> names;
+    if (store_ && store_->is_open())
+        for (const auto& r : store_->list_rules())
+            names.push_back(r.name);
+    return guardian::render_baseline_form(names);
+}
+
+std::string GuardianRoutes::render_baseline_edit_form_fragment(const std::string& baseline_id) const {
+    std::vector<std::string> names;
+    if (store_ && store_->is_open())
+        for (const auto& r : store_->list_rules())
+            names.push_back(r.name);
+
+    guardian::BaselineFormEdit ec;
+    ec.baseline_id = baseline_id;
+    if (baseline_store_ && baseline_store_->is_open()) {
+        if (auto b = baseline_store_->get_baseline(baseline_id))
+            ec.name = b->name;
+        // Pre-chip current members by their human name (fall back to rule_id).
+        for (const auto& rid : baseline_store_->get_members(baseline_id)) {
+            std::string nm = rid;
+            if (store_ && store_->is_open())
+                if (auto r = store_->get_rule(rid); r && !r->name.empty())
+                    nm = r->name;
+            ec.selected.push_back(nm);
+        }
+    }
+    return guardian::render_baseline_form(names, ec);
 }
 
 // ── Route registration ───────────────────────────────────────────────────────
@@ -835,6 +1212,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
                                      AuditFn audit_fn,
                                      EmitEventFn emit_event_fn,
                                      GuaranteedStateStore* store,
+                                     BaselineStore* baseline_store,
                                      AgentsJsonFn agents_json_fn,
                                      PushFn push_fn) {
     auth_fn_ = std::move(auth_fn);
@@ -842,6 +1220,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
     audit_fn_ = std::move(audit_fn);
     emit_event_fn_ = std::move(emit_event_fn);
     store_ = store;
+    baseline_store_ = baseline_store;
     agents_json_fn_ = std::move(agents_json_fn);
     push_fn_ = std::move(push_fn);
 
@@ -923,6 +1302,13 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baseline_form_fragment(), "text/html; charset=utf-8");
             });
+    // Edit-Baseline modal form (pre-filled name + member chips).
+    svr.Get(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/edit)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
+                res.set_content(render_baseline_edit_form_fragment(req.matches[1].str()),
+                                "text/html; charset=utf-8");
+            });
 
     // -- Structured create (Guard) ----------------------------------------
     // Build a structured Guard from the create-form fields and persist it via
@@ -933,65 +1319,51 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
                  create_guard_from_form(req, res);
              });
 
-    // -- Live guard controls: enable/disable + audit↔enforce, auto-deploy --
-    // These act on a REAL authored rule and re-push so the change takes effect
-    // on the fleet immediately. Both Write (mutates the rule) and Push (deploys
-    // to agents) are required — the toggle does both.
+    // -- Live guard control: enable/disable (STATE-ONLY) ------------------
+    // Edits a Guard's global enabled flag; does NOT deploy (Guards are not
+    // individually deployable — only Baselines are). Write only — no Push — since
+    // the change propagates on the next Baseline deploy / heartbeat reconcile
+    // (docs/guardian-baseline-model.md). There is deliberately NO mode toggle:
+    // Watch/Enforce is fixed at creation (a different posture is a different Guard).
     svr.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/enabled)",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
-                 if (!perm_fn_(req, res, "GuaranteedState", "Push")) return;
                  const std::string id = req.matches[1].str();
                  const bool enable = req.has_param("value") && req.get_param_value("value") == "1";
-                 apply_guard_change(req, res, id, /*set_enabled=*/true, enable,
-                                    /*set_mode=*/false, "");
-             });
-    svr.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/mode)",
-             [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
-                 if (!perm_fn_(req, res, "GuaranteedState", "Push")) return;
-                 const std::string id = req.matches[1].str();
-                 const std::string mode =
-                     req.has_param("value") ? req.get_param_value("value") : "audit";
-                 apply_guard_change(req, res, id, /*set_enabled=*/false, false,
-                                    /*set_mode=*/true, mode);
+                 apply_guard_change(req, res, id, enable);
              });
 
-    // -- Mock create (Baseline) -------------------------------------------
+    // -- Structured create (Baseline) -------------------------------------
+    // Persist a draft Baseline (name + member guards) via BaselineStore. Device
+    // targeting (management-group assignment) + deploy are set afterwards.
     svr.Post("/fragments/guardian/baselines",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
-                 const std::string name =
-                     req.has_param("name") ? req.get_param_value("name") : "(unnamed)";
-                 audit_fn_(req, "guaranteed_state.baseline.create", "denied", "GuaranteedState", name,
-                           "dashboard mock - baseline backend not yet wired");
-                 res.set_content(
-                     "<div class=\"detail-panel\"><div class=\"empty-state\">Baseline authoring is not "
-                     "wired yet &mdash; the Baseline backend is being built on "
-                     "<code>feat/guardian-mvp</code>. Submitted draft: <strong>" +
-                         html_escape(name) + "</strong>.</div></div>",
-                     "text/html; charset=utf-8");
+                 create_baseline_from_form(req, res);
              });
 
-    // -- Mock deploy (Baseline-level) -------------------------------------
-    // NOTE: custom raw-string delimiter R"HX(...)HX" — the JSON payload
-    // contains "(mock)", and a default R"(...)" literal would terminate early
-    // at the ")" inside it. The HX delimiter avoids that.
+    // -- Deploy / Re-deploy (Baseline-level) ------------------------------
+    // Marks the Baseline deployed and converges the fleet to the union of all
+    // deployed Baselines' enabled members (fleet-wide for now — management-group
+    // targeting is deferred). Requires Push (it changes what agents enforce).
     svr.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/deploy)",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "GuaranteedState", "Push")) return;
-                 const std::string id = req.matches[1].str();
-                 audit_fn_(req, "guaranteed_state.push", "denied", "GuaranteedState", id,
-                           "dashboard mock - deploy fan-out not yet wired");
-                 res.set_header("HX-Trigger",
-                                R"HX({"showToast":{"message":"Deploy queued (mock)","level":"warning"}})HX");
-                 res.set_content(
-                     "<div class=\"detail-panel\"><div class=\"empty-state\">Deploy fan-out "
-                     "(scope &rarr; union-expand &rarr; push) is being built on "
-                     "<code>feat/guardian-mvp</code>; <code>/api/v1/guaranteed-state/push</code> is "
-                     "currently a stub. Baseline: <strong>" + html_escape(id) +
-                         "</strong>.</div></div>",
-                     "text/html; charset=utf-8");
+                 deploy_baseline(req, res, req.matches[1].str());
+             });
+
+    // -- Edit a Baseline (rename + add/remove member guards) --------------
+    // Note: this no-suffix POST is registered AFTER /deploy and /delete; the
+    // member regex excludes '/', so it never shadows the suffixed routes.
+    svr.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/delete)",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Delete")) return;
+                 delete_baseline_action(req, res, req.matches[1].str());
+             });
+    svr.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+))",
+             [this](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
+                 update_baseline_from_form(req, res, req.matches[1].str());
              });
 }
 

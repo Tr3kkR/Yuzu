@@ -49,6 +49,17 @@ void fill_block(::yuzu::guardian::v1::GuardianSpecBlock* blk, const nlohmann::js
 
 } // namespace
 
+std::vector<GuaranteedStateRuleRow>
+filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
+                        const std::unordered_set<std::string>& deployed_rule_ids) {
+    std::vector<GuaranteedStateRuleRow> out;
+    out.reserve(rules.size());
+    for (const auto& r : rules)
+        if (deployed_rule_ids.contains(r.rule_id))
+            out.push_back(r);
+    return out;
+}
+
 bool os_target_matches(std::string_view target, std::string_view agent_os) {
     if (target.empty())
         return true;  // rule applies to every OS
