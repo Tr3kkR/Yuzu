@@ -28,22 +28,22 @@ yuzu_http_requests_total{method="GET",status="200"} 1542
 yuzu_http_requests_total{method="POST",status="200"} 87
 yuzu_http_requests_total{method="GET",status="404"} 12
 
-# HELP yuzu_server_http_request_duration_seconds HTTP request latency
-# TYPE yuzu_server_http_request_duration_seconds histogram
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.005"} 920
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.01"} 1100
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.025"} 1350
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.05"} 1450
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.1"} 1500
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.25"} 1530
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.5"} 1540
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="1.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="2.5"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="5.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="10.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="+Inf"} 1542
-yuzu_server_http_request_duration_seconds_sum{method="GET"} 12.345
-yuzu_server_http_request_duration_seconds_count{method="GET"} 1542
+# HELP yuzu_command_duration_seconds Command execution latency in seconds
+# TYPE yuzu_command_duration_seconds histogram
+yuzu_command_duration_seconds_bucket{le="0.005"} 12
+yuzu_command_duration_seconds_bucket{le="0.01"} 47
+yuzu_command_duration_seconds_bucket{le="0.025"} 180
+yuzu_command_duration_seconds_bucket{le="0.05"} 540
+yuzu_command_duration_seconds_bucket{le="0.1"} 980
+yuzu_command_duration_seconds_bucket{le="0.25"} 1320
+yuzu_command_duration_seconds_bucket{le="0.5"} 1480
+yuzu_command_duration_seconds_bucket{le="1.0"} 1530
+yuzu_command_duration_seconds_bucket{le="2.5"} 1541
+yuzu_command_duration_seconds_bucket{le="5.0"} 1542
+yuzu_command_duration_seconds_bucket{le="10.0"} 1542
+yuzu_command_duration_seconds_bucket{le="+Inf"} 1542
+yuzu_command_duration_seconds_sum 198.74
+yuzu_command_duration_seconds_count 1542
 
 # HELP yuzu_agents_connected Number of currently connected agents
 # TYPE yuzu_agents_connected gauge
@@ -349,8 +349,10 @@ sum by (arch) (yuzu_fleet_agents_by_arch)
 # Request rate (per second, 5-minute window)
 rate(yuzu_http_requests_total[5m])
 
-# 95th percentile latency
-histogram_quantile(0.95, rate(yuzu_server_http_request_duration_seconds_bucket[5m]))
+# 95th percentile command-execution latency
+# (the server emits no general HTTP request-duration histogram; command duration
+#  is its primary latency SLI — see also auth-login and viz-topology histograms)
+histogram_quantile(0.95, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le))
 
 # Error rate (percentage of 5xx responses)
 sum(rate(yuzu_http_requests_total{status=~"5.."}[5m]))
@@ -360,8 +362,10 @@ sum(rate(yuzu_http_requests_total{status=~"5.."}[5m]))
 ### Agent health
 
 ```promql
-# Agents with heartbeat latency over 5 seconds
-yuzu_agent_heartbeat_latency_seconds > 5
+# Healthy agents reported via heartbeat status_tags.
+# (Agents have no Prometheus endpoint, so there is no per-agent heartbeat-latency
+#  series; the server re-exports fleet health as this gauge.)
+yuzu_fleet_agents_healthy
 
 # Plugin execution failure rate by plugin
 sum by (plugin) (rate(yuzu_agent_commands_executed_total{status="failure"}[5m]))
@@ -431,7 +435,7 @@ PromQL queries above. A typical Yuzu dashboard includes:
 | Connected agents | Stat / single value | `yuzu_agents_connected` |
 | Agents by OS | Pie chart | `sum by (os) (yuzu_fleet_agents_by_os)` |
 | Request rate | Time series | `rate(yuzu_http_requests_total[5m])` |
-| Request latency (p95) | Time series | `histogram_quantile(0.95, ...)` |
+| Command latency (p95) | Time series | `histogram_quantile(0.95, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le))` |
 | Error rate | Time series | `5xx / total * 100` |
 | Instruction throughput | Time series | `rate(yuzu_commands_completed_total[5m])` |
 
@@ -461,16 +465,14 @@ groups:
         annotations:
           summary: "Yuzu server error rate above 5%"
 
-      - alert: YuzuHighLatency
-        expr: >
-          histogram_quantile(0.95,
-            rate(yuzu_server_http_request_duration_seconds_bucket[5m])
-          ) > 2.0
-        for: 10m
+      - alert: YuzuHighCommandLatency
+        expr: |
+          histogram_quantile(0.99, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le)) > 10
+        for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Yuzu server p95 latency above 2 seconds"
+          summary: "Command p99 latency exceeds 10 seconds"
 ```
 
 ## Security considerations

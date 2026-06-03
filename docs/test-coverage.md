@@ -11,7 +11,7 @@ Last updated: 2026-03-26
 
 **Totals:** 48 test files. Test case count has grown significantly since the RC sprint added REST API tests, MCP tests, and store tests.
 
-Run all tests: `meson test -C builddir --print-errorlogs`
+Run all tests: `meson test -C build-linux --print-errorlogs`
 
 ---
 

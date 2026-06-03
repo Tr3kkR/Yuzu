@@ -63,8 +63,8 @@ Scraped from the gateway's Prometheus endpoint (default `:9568`). Duration histo
 | `yuzu_gw_stream_write_errors_total` | counter | Agent stream write errors |
 | `yuzu_gw_command_duration_ms` | histogram | Command dispatch duration in ms, labeled by `plugin`, `status` |
 | `yuzu_gw_agent_session_duration_ms` | histogram | Agent session duration in ms |
-| `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms, labeled by `rpc` |
-| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors, labeled by `rpc`, `code` |
+| `yuzu_gw_upstream_rpc_duration_ms` | histogram | Upstream (gateway→server) RPC latency in ms, labeled by `rpc_name` |
+| `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors, labeled by `rpc_name`, `code` |
 | `yuzu_gw_registration_replay_queue_depth` | gauge | Pending registration-replay entries, labeled by `node` |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and queue-length histograms, circuit-breaker and cluster counters) is registered in `gateway/apps/yuzu_gw/src/yuzu_gw_telemetry.erl`.

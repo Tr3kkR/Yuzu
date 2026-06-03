@@ -954,8 +954,8 @@ For bare-metal Linux deployments, systemd service files are provided for each co
 
 ```bash
 # Copy binaries
-sudo cp builddir/yuzu-server /usr/local/bin/
-sudo cp builddir/yuzu-agent /usr/local/bin/
+sudo cp build-linux/server/core/yuzu-server /usr/local/bin/
+sudo cp build-linux/agents/core/yuzu-agent /usr/local/bin/
 
 # Create service user
 sudo useradd --system --no-create-home yuzu
