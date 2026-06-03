@@ -36,6 +36,10 @@
     [yuzu, gw, upstream, circuit_state],
     [yuzu, gw, upstream, registration_replay],
 
+    %% Guardian side-channel forwarding (agent drift events -> control plane)
+    [yuzu, gw, guardian, forward_accepted],
+    [yuzu, gw, guardian, forward_dropped],
+
     %% Cluster
     [yuzu, gw, cluster, node_up],
     [yuzu, gw, cluster, node_down],
@@ -128,6 +132,18 @@ handle_event([yuzu, gw, upstream, registration_replay],
     prometheus_counter:inc(yuzu_gw_registration_replay_total, [], N),
     prometheus_gauge:set(yuzu_gw_registration_replay_queue_depth, [node()], Q);
 
+%% Guardian side-channel forwarding. `forward_accepted` is the denominator for a
+%% drop-rate SLO; `forward_dropped` is split by reason (circuit_open | at_capacity).
+%% yuzu_gw_upstream:forward_guardian_message/2 emits both — without these clauses
+%% the drop counters fire into an unregistered telemetry event and never reach
+%% Prometheus, leaving guardian drift loss invisible.
+handle_event([yuzu, gw, guardian, forward_accepted], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_guardian_forward_accepted_total, [], N);
+
+handle_event([yuzu, gw, guardian, forward_dropped], #{count := N}, Meta, _Config) ->
+    Reason = maps:get(reason, Meta, <<"unknown">>),
+    prometheus_counter:inc(yuzu_gw_guardian_forward_dropped_total, [Reason], N);
+
 handle_event([yuzu, gw, cluster, node_up], _Measurements, Meta, _Config) ->
     Node = maps:get(node, Meta, <<"unknown">>),
     prometheus_counter:inc(yuzu_gw_cluster_events_total, [<<"node_up">>, Node], 1);
@@ -204,6 +220,17 @@ declare_metrics() ->
         {name, yuzu_gw_registration_replay_total},
         {labels, []},
         {help, "Total agents re-proxied upstream by the registration-replay drip"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_guardian_forward_accepted_total},
+        {labels, []},
+        {help, "Guardian drift-event forwards accepted for upstream delivery "
+               "(denominator for the forward drop-rate)"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_guardian_forward_dropped_total},
+        {labels, [reason]},
+        {help, "Guardian drift-event forwards dropped before delivery "
+               "(reason: circuit_open | at_capacity). Best-effort; durable "
+               "buffering is Guardian A3."}]),
 
     %% Histograms
     Buckets = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 10000],

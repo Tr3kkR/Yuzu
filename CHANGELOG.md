@@ -37,6 +37,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian `file-change` spark — realtime file change/deletion detection (Change B).**
+  A new agent guard watches a target file via `ReadDirectoryChangesW` on its
+  parent directory — kernel-notified, no polling, so detection is realtime — and
+  is resilient like the registry guard (survives the parent directory and its
+  whole ancestor chain being deleted and recreated; reconciles from scratch).
+  Two assertions: **`file-exists`** drifts when the file's presence differs from
+  `expected` (`present` → fires on delete; `absent` → tripwire, fires on create),
+  and **`file-hash-equals`** drifts when content (size pre-filter + bounded
+  SHA-256) differs from a baseline (`expected_hash` supplied, or captured on arm)
+  — with a settle window before hashing (writes are not atomic), so a no-op
+  identical rewrite is not reported as drift, and absent/oversize/unreadable are
+  reported rather than silently treated as compliant. Detection-only (file-content
+  remediation deferred); Windows-only (Linux/macOS later). Internally: a new
+  `IGuard` interface lets the engine hold registry and file guards
+  polymorphically; `sha256_file()` gained a backward-compatible bounded-read
+  (`max_bytes`) to defend a hashing-DoS / TOCTOU-grow on an attacker-controlled
+  path. The `/api/v1/guaranteed-state/schemas` catalog now lists `file-change` /
+  `file-exists` / `file-hash-equals` (with an `expected_hash` hex-format check),
+  so the discovery surface and dashboard form know them.
+- **Guardian dashboard guard-create form is now functional (C3c).** The
+  `/guardian` "New Guard" form was a static stub that audited every submission
+  as `denied`. It now renders a structured create form for the Windows registry
+  types — name, severity, enforcement mode, the `registry-value-equals`
+  assertion fields, the remediation action, and a resilience-policy fieldset
+  (mode + tuning params) — and actually persists the Guard. The handler builds
+  the structured spec from the form fields and runs it through the **same
+  `derive_rule_spec` path the REST create uses** (single source: identical
+  validation + canonicalisation), so an invalid resilience policy is rejected
+  with an inline banner rather than silently accepted. Success returns a
+  confirmation panel plus an out-of-band guards-list refresh and a toast; the
+  Guard is created unscoped (draft — device targeting is set at the Baseline).
+  Audited under `guaranteed_state.rule.create`.
+- **Guardian resilience-policy validation + schema discovery (C3b).** The
+  structured Guard create/update path now validates and canonicalises the
+  per-rule resilience policy carried in `remediation.params` (`mode`
+  persist|backoff|bounded, `max_attempts`, `quiet_reset_s`, `resume_after_s`,
+  `backoff_initial_ms`, `backoff_max_ms`, `event_debounce_ms`). Validation is
+  lenient-in / canonical-out — only the chosen mode's load-bearing params are
+  range-checked (a `persist` rule carrying stray `backoff_*` is accepted),
+  values are stored canonical, and failures (e.g. Bounded `max_attempts: 0`,
+  `backoff_initial_ms` > `backoff_max_ms`, overflow-prone seconds) return the A4
+  error envelope. One param-spec table
+  (`server/core/src/guardian_resilience_schema.{hpp,cpp}`) drives both the
+  validator and the published JSON Schema, so the discovery surface and the
+  validator cannot disagree; a cross-check unit test binds the table's keys to
+  the agent's `resilience_keys`. New `GET /api/v1/guaranteed-state/schemas`
+  returns the static type catalog (spark/assertion/remediation + resilience
+  subschema + discriminated `registry-value-equals` encoding), cacheable via a
+  content-derived `ETag` / `If-None-Match` (`304`). A structured `PUT` now
+  re-authors the Guard (re-validating the policy) instead of silently dropping
+  the blocks; the guardian create/update handlers emit the A4 envelope uniformly.
 - **MFA step-up on 11 high-risk REST + Settings surfaces (PR 2 of the MFA
   ladder; SOC 2 CC6.6).** Closes the privileged-access control gap by
   re-prompting for fresh TOTP / recovery proof on session-cookie callers
@@ -264,6 +315,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Guardian (#1209): H1–H4 + M1–M8 backend hardening.** Dashboard toggle pushes
+  only the rule's own `scope_expr` (no whole-fleet toggle storm — H1). The
+  `__guard__` side-channel is classified by `plugin=__guard__` **and** empty
+  `command_id`, so solicited `push_rules` replies complete their gateway
+  round-trip instead of being dropped (H2). Per-guard event-sink collapse-with-
+  count debounce caps event-store flooding from a competing writer (H3). The
+  agent event-sink writes through a current-stream holder reset under lock, so a
+  guard firing during a reconnect teardown can't write to a cancelled stream
+  (H4). Dashboard data panels gated on `GuaranteedState:Read` (M1); honest
+  empty-state and an unmistakable DEMO banner — no fabricated "148/148 compliant"
+  rollup on a live console (M2). `enforcement_mode` reconciled to `enforce|audit`
+  + the `enabled` boolean (M3). Per-agent push filtering by `os_target` +
+  `scope_expr` (M4). Heartbeat-carried `policy_generation` drives a per-agent
+  rate-limited server reconcile so offline-at-push agents converge on reconnect
+  (M5), backed by a monotonic persisted generation counter (M6). The reconcile
+  re-push is metered (`yuzu_server_guardian_reconciles_total`,
+  `..._pushes_dispatched_total`, `..._policy_generation`) and audited
+  (`guaranteed_state.reconcile`).
+- **Guardian MVP pre-merge review hardening (PR #1220).** Three blocking review
+  findings fixed before merge: (H1) **enforce-mode registry writes are gated by a
+  dangerous-key denylist** — `derive_rule_spec` now refuses an
+  `enforcement_mode:"enforce"` rule whose key targets a high-blast-radius
+  persistence / privilege location (autorun `CurrentVersion\Run*`, Image File
+  Execution Options, Winlogon, `…\Services\…`, `…\Policies\…`, SafeBoot,
+  BootExecute), returning the A4 envelope (contract §6 gate; the SYSTEM-privileged
+  fleet-wide write path no longer ships ungated). (H2) **the published
+  `/schemas` enum, the dashboard form, and the validator now offer only the
+  registry hives/value-types the agent actually decodes** — `HKCC`, `REG_BINARY`
+  and `REG_MULTI_SZ` are removed (they produced perpetual false drift /
+  remediation-failed); a single server-side source drives the schema enum and the
+  validator, cross-checked against the agent's `registry_support` constants by a
+  unit test. (#3) **the schema catalog is now discoverable on the MCP plane** —
+  `get_guardian_schemas` tool + `yuzu://guardian/schemas` resource, gated
+  `GuaranteedState:Read`, returning the byte-identical REST catalog (contract §4
+  decision 3 / §9 G9; supersedes the #1210 deferral). Plus: server-side validation
+  of spark/assertion params (rejects `max_bytes:"0"`, non-numeric numerics, bad
+  hive/value_type/expected_hash); whole-string numeric parsing on the agent
+  (`"123abc"` no longer parses as `123`); overflow-safe backoff doubling and
+  seconds→ms conversion; and a corrected `guaranteed_state.proto` transport
+  comment (`payload` bytes, not `params`/`output`).
 - **Scope-walking PR-E follow-ups — policy `fromResultSet:` bypass + YAML scanner
   hardening (#1221).** Two robustness gaps from the #1215 review, both fail-closed
   before this change: (1) a **scalar** policy scope (`scope: from_result_set:rs_x`)

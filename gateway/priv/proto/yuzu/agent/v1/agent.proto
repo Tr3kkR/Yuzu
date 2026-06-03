@@ -144,6 +144,17 @@ message CommandRequest {
   // Agent waits (delay_seconds + random[0, stagger_seconds]) before executing.
   int32 stagger_seconds = 6;  // Max random delay in seconds (0 = no stagger)
   int32 delay_seconds   = 7;  // Fixed delay before execution (0 = immediate)
+
+  // Binary payload for commands carrying a serialized proto rather than text
+  // parameters — the Guardian push (plugin="__guard__", action="push_rules")
+  // puts a serialized GuaranteedStatePush here. proto3 string map values must
+  // be valid UTF-8, so binary proto bytes cannot ride in `parameters`.
+  // Mirrors the canonical proto/yuzu/agent/v1/agent.proto field 8. gpb DROPS
+  // any wire field absent from this proto, so both gateway copies
+  // (priv/proto/agent.proto and priv/proto/yuzu/agent/v1/agent.proto) must
+  // carry it. Half A, Guardian gateway fix. See docs/guardian-mvp-contract.md
+  // G2/G12.
+  bytes payload = 8;
 }
 
 message CommandResponse {
@@ -163,6 +174,22 @@ message CommandResponse {
 
   yuzu.common.v1.ErrorDetail error  = 5;
   yuzu.common.v1.Timestamp   sent_at = 6;
+
+  // Side-channel routing for unsolicited agent→server messages (Guardian
+  // events/status over the reserved "__guard__" plugin). The agent emits a
+  // CommandResponse with `plugin`/`action` set and a serialized proto in
+  // `payload`; the gateway forwards it upstream via
+  // GatewayUpstream.ForwardGuardianMessage. Mirrors the canonical
+  // proto/yuzu/agent/v1/agent.proto fields 7/8/9. gpb DROPS any wire field
+  // absent from this proto, so both gateway copies (priv/proto/agent.proto
+  // and priv/proto/yuzu/agent/v1/agent.proto) must carry them — and the
+  // gateway re-marshals this CommandResponse through gateway_pb when wrapping
+  // it in ForwardGuardianRequest, so gateway_pb's CommandResponse (via import)
+  // needs them too. Half B, Guardian gateway fix. See
+  // docs/guardian-mvp-contract.md G2.
+  string plugin  = 7;
+  string action  = 8;
+  bytes  payload = 9;
 }
 
 // ── Inventory ─────────────────────────────────────────────────────────────────

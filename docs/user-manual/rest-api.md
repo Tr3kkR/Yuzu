@@ -3098,7 +3098,7 @@ Receive file uploads from agents via the `content_dist` plugin's `upload_file` a
 
 ### Guaranteed State
 
-Operator-facing surface for the Guardian (Guaranteed State) policy engine. See [Guaranteed State](guaranteed-state.md) for the feature guide, YAML rule schema, and the PR-2 limitation that all rules report `errored` until the agent-side guards land in Guardian PR 3.
+Operator-facing surface for the Guardian (Guaranteed State) policy engine. See [Guaranteed State](guaranteed-state.md) for the feature guide and YAML rule schema. The Windows registry guard is live end-to-end (detect → enforce write-back → event ingest); per-guard fleet compliance aggregation on the `/status` endpoints lands in Guardian PR 4.
 
 **RBAC matrix:**
 
@@ -3127,11 +3127,16 @@ Create a rule.
 - **Permission:** `GuaranteedState:Write`
 - **Request body:**
 
+A rule may be authored **structured** (the agent-enforceable form) or **legacy** (`yaml_source` only, stored but not agent-enforced). Supply *either* a `spark`+`assertion` pair *or* a `yaml_source`.
+
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `rule_id` | string | Yes | Stable operator-chosen id. Must match `[A-Za-z0-9._-]+`. |
 | `name` | string | Yes | Human-readable name (unique per server). |
-| `yaml_source` | string | Yes | Full rule YAML (`kind: GuaranteedStateRule`). |
+| `spark` | object | Structured | `{type, params}` trigger block, e.g. `{"type":"registry-change"}` or `{"type":"file-change"}`. |
+| `assertion` | object | Structured | `{type, params}` desired-state block, e.g. `registry-value-equals`, `file-exists`, `file-hash-equals`. |
+| `remediation` | object | No | `{type, params}` — `alert-only` (default) or `enforce`. `params` carries the **resilience policy** (`mode`, `max_attempts`, `backoff_*`, …) and `event_debounce_ms`. |
+| `yaml_source` | string | Legacy | Full rule YAML; required only when no structured `spark`+`assertion` is given. The server generates `yaml_source` from the structured form otherwise. |
 | `version` | integer | No | Starting version (default `1`). |
 | `enabled` | boolean | No | Default `true`. |
 | `enforcement_mode` | string | No | `enforce` (default) or `audit`. |
@@ -3139,8 +3144,10 @@ Create a rule.
 | `os_target` | string | No | Empty (any) or `windows` / `linux` / `macos`. |
 | `scope_expr` | string | No | Scope DSL expression selecting target agents. |
 
+The catalog of valid `spark` / `assertion` / `remediation` types and their `params` (including the resilience-policy bounds) is discoverable at [`GET /api/v1/guaranteed-state/schemas`](#get-apiv1guaranteed-stateschemas).
+
 - **Response:** `201` with `data.rule_id`.
-- **4xx:** `400` missing required fields or invalid JSON; `409` on duplicate `rule_id` or duplicate `name`.
+- **4xx:** `400` missing required fields, invalid JSON, or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`.
 - **Audit:** `guaranteed_state.rule.create` (`success` / `denied`).
 
 #### `GET /api/v1/guaranteed-state/rules/{rule_id}`
@@ -3156,9 +3163,9 @@ Fetch a single rule.
 Update a rule. Version is incremented on every successful update regardless of whether any field changed.
 
 - **Permission:** `GuaranteedState:Write`
-- **Request body:** Any subset of the create-body fields (absent fields retain their current values).
+- **Request body:** Any subset of the create-body fields (absent fields retain their current values). A body carrying structured `spark`/`assertion`/`remediation` blocks **re-authors** the Guard (re-deriving the canonical spec and re-validating the resilience policy) rather than dropping them; a metadata-only body leaves the existing spec intact.
 - **Response:** `200` with `data.updated = true` and `data.version`.
-- **4xx:** `400` invalid JSON; `404` rule not found; `409` on name conflict.
+- **4xx:** `400` invalid JSON or an invalid resilience policy (A4 envelope); `404` rule not found; `409` on name conflict.
 - **Audit:** `guaranteed_state.rule.update`.
 
 #### `DELETE /api/v1/guaranteed-state/rules/{rule_id}`
@@ -3171,7 +3178,7 @@ Delete a rule.
 
 #### `POST /api/v1/guaranteed-state/push`
 
-Queue a push of the active rule set to scoped agents. Returns `202 Accepted` — agent delivery is asynchronous. In the PR-2 ship of Guardian the fan-out to agents is **not** wired; the endpoint accepts and audits the request so dashboards and SIEM pipelines can be exercised end-to-end. Fan-out lands in Guardian PR 3.
+Queue a push of the active rule set to scoped agents. Returns `202 Accepted` — agent delivery is asynchronous. The fan-out is live: the server resolves `scope` to the in-scope agents and delivers each a per-agent filtered rule set (only rules whose `os_target` and `scope_expr` match that agent).
 
 - **Permission:** `GuaranteedState:Push`
 - **Request body:**
@@ -3181,9 +3188,9 @@ Queue a push of the active rule set to scoped agents. Returns `202 Accepted` —
 | `scope` | string | No | Scope DSL selector. Empty = all agents. |
 | `full_sync` | boolean | No | If `true`, agents replace their rule set; otherwise they merge. |
 
-- **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.scope`.
+- **Response:** `202` with `data.queued = true`, `data.rules` (server-side rule count), `data.agents` (number of agents the push was dispatched to), `data.scope`.
 - **4xx:** `400` if the JSON body is present but not an object.
-- **Audit:** `guaranteed_state.push` (`success`, detail includes `fan_out_deferred_pr3=true` while PR 2 is in effect).
+- **Audit:** `guaranteed_state.push` (`success`). A server-initiated re-push to a lagging agent on heartbeat reconnect is audited separately under `guaranteed_state.reconcile` (principal `system`).
 
 #### `GET /api/v1/guaranteed-state/events`
 
@@ -3196,14 +3203,14 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 
 #### `GET /api/v1/guaranteed-state/status`
 
-Fleet-wide status rollup. PR 2 returns placeholder zeros; fleet aggregation lands in Guardian PR 4.
+Fleet-wide status rollup. Returns placeholder counts today; full fleet aggregation lands in Guardian PR 4.
 
 - **Permission:** `GuaranteedState:Read`
 - **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
 
 #### `GET /api/v1/guaranteed-state/status/{agent_id}`
 
-Per-agent status. PR 2 placeholder; per-agent aggregation lands in Guardian PR 4.
+Per-agent status. Returns placeholder counts today; per-agent aggregation lands in Guardian PR 4.
 
 - **Permission:** `GuaranteedState:Read`
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
@@ -3214,6 +3221,14 @@ Guaranteed State alerts (placeholder; alert aggregation lands in Guardian PR 11)
 
 - **Permission:** `GuaranteedState:Read`
 - **Response:** empty list in PR 2.
+
+#### `GET /api/v1/guaranteed-state/schemas`
+
+Guard authoring schema catalog — the static registry of `spark` / `assertion` / `remediation` types with per-type JSON Schemas. Driven by the same param-spec table the server-side validator uses, so the discovery surface and the validator cannot diverge. Drives dynamic authoring forms and agentic clients (the dashboard is one consumer).
+
+- **Permission:** `GuaranteedState:Read`
+- **Response:** `200` with `{version, schemas[]}`, each entry `{kind, type, json_schema}`. Includes the discriminated `registry-value-equals` encoding (per `value_type`) and the `file-hash-equals` `expected_hash` hex format.
+- **Caching:** carries a content-derived `ETag` and `Cache-Control: public, max-age=300`; a conditional request with `If-None-Match` returns `304 Not Modified`. The catalog is compiled-in, so this endpoint answers even when the rules store is unavailable.
 
 ---
 
