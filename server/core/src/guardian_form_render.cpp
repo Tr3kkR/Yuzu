@@ -276,11 +276,11 @@ std::string render_baseline_form(const std::vector<std::string>& guard_names,
         "<label>Name</label><input name=\"name\" placeholder=\"CIS Windows L1\"" + name_val +
         " required>"
         "<div class=\"gs-hint\">Device targeting (included / excluded management groups) and deploy "
-        "are set from the baseline's detail panel.</div>"
-        "<label>Member guards</label>"
+        "are set from the Baseline's detail panel.</div>"
+        "<label>Member Guards</label>"
         "<div class=\"bl-guard-picker\">"
         "<input id=\"bl-guard-input\" list=\"bl-guard-datalist\" autocomplete=\"off\" "
-        "placeholder=\"type to search guards&hellip;\" "
+        "placeholder=\"type to search Guards&hellip;\" "
         "onkeydown=\"if(event.key==='Enter'){event.preventDefault();guardianAddGuardChip();}\">"
         "<datalist id=\"bl-guard-datalist\">" + datalist + "</datalist>"
         "<button type=\"button\" class=\"btn btn-secondary\" onclick=\"guardianAddGuardChip()\">"
@@ -288,8 +288,8 @@ std::string render_baseline_form(const std::vector<std::string>& guard_names,
         "<div id=\"bl-selected-guards\" class=\"bl-chips\">" + chips + "</div>"
         "<div class=\"gs-hint\">" +
         std::string(guard_names.empty()
-                        ? "No guards defined yet &mdash; create guards first, then add them here."
-                        : "Pick from existing guards; the dropdown filters as you type.") +
+                        ? "No Guards defined yet &mdash; create Guards first, then add them here."
+                        : "Pick from existing Guards; the dropdown filters as you type.") +
         "</div>"
         "</div>"
         "<div class=\"gs-modal-footer\">"

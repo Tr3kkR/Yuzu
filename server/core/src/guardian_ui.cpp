@@ -400,12 +400,6 @@ extern const char* const kGuardianHtml =
           <button class="view-btn" hx-get="/fragments/guardian/status?view=guard"
                   hx-target="#guardian-status" hx-swap="innerHTML"
                   onclick="gsSetActive(this)">By Guard</button>
-          <button class="view-btn" hx-get="/fragments/guardian/status?view=agent"
-                  hx-target="#guardian-status" hx-swap="innerHTML"
-                  onclick="gsSetActive(this)">By Agent</button>
-          <button class="view-btn" hx-get="/fragments/guardian/status?view=mgroup"
-                  hx-target="#guardian-status" hx-swap="innerHTML"
-                  onclick="gsSetActive(this)">By Management Group</button>
           <button class="view-btn" hx-get="/fragments/guardian/status?view=baseline"
                   hx-target="#guardian-status" hx-swap="innerHTML"
                   onclick="gsSetActive(this)">By Baseline</button>

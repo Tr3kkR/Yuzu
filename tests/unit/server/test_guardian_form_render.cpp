@@ -183,5 +183,5 @@ TEST_CASE("render_baseline_form: guard datalist typeahead + deferred targeting n
     CHECK(html.find("management groups") != std::string::npos);
     CHECK(html.find("hx-post=\"/fragments/guardian/baselines\"") != std::string::npos);
     // Empty guard set still renders an honest hint, no crash.
-    CHECK(render_baseline_form({}).find("No guards defined yet") != std::string::npos);
+    CHECK(render_baseline_form({}).find("No Guards defined yet") != std::string::npos);
 }
