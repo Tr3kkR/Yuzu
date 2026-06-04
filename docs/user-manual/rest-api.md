@@ -860,8 +860,9 @@ Release a device from quarantine.
 
 ### Internal CA
 
-The server's built-in certificate authority (see `docs/pki-architecture.md`) is
-managed over REST. `root` and `crl` are **public** (clients and browsers need
+The server's built-in certificate authority (see `docs/pki-architecture.md`) can
+be managed via the **Settings → Internal CA** dashboard panel or the REST
+endpoints below. `root` and `crl` are **public** (clients and browsers need
 them to establish trust / check revocation before they have a session); the
 inventory and revoke endpoints are gated by the `Security` securable.
 

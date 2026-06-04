@@ -245,6 +245,24 @@ extern const char* const kSettingsHtml =
       </div>
     </div>
 
+    <!-- ── Internal Certificate Authority ─────────────────── -->
+    <div class="section">
+      <div class="section-header">Internal Certificate Authority</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+          The built-in CA that issues the default server certificates and per-agent
+          mTLS client certificates. Download the root to trust the dashboard, review
+          issued certificates, and revoke a compromised agent.
+        </p>
+        <div id="ca-section"
+             hx-get="/fragments/settings/ca"
+             hx-trigger="load"
+             hx-swap="innerHTML">
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+        </div>
+      </div>
+    </div>
+
     <!-- ── User Management ───────────────────────────────── -->
     <div class="section">
       <div class="section-header">User Management</div>

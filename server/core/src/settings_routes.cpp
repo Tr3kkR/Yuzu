@@ -2218,6 +2218,11 @@ void SettingsRoutes::register_routes(
     });
 
     // -- Settings HTMX fragment endpoints -------------------------------------
+    //
+    // NOTE: the Settings → Internal CA panel — `GET /fragments/settings/ca` and
+    // `POST /api/settings/ca/revoke` — is NOT here; it lives in `ca_routes.cpp`
+    // (PKI PR4b), which already owns the CaStore + CRL-publish callback. Look
+    // there for those two `/...settings/ca...` handlers.
 
     sink.Get("/fragments/settings/tls",
              [this](const httplib::Request& req, httplib::Response& res) {

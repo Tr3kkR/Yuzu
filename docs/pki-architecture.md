@@ -138,10 +138,12 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 - **Distribute the CA to agents:** pass `--ca-cert <default-ca.pem>` (PR5 ships a
   shared cert volume so this is automatic in container deployments).
 - **Inventory:** `GET /api/v1/ca/issued` (or the dashboard CA panel, PR4b).
-- **Revoke a compromised agent:** `POST /api/v1/ca/revoke {"serial_hex":"…"}` —
-  effective immediately server-side; the agent is refused on its next
-  Subscribe/Heartbeat/OTA call (Register re-auth + the data-plane gates consult
-  `ca.db` directly). NOTE: an agent holding an **already-open** Subscribe stream
+- **Revoke a compromised agent:** `POST /api/v1/ca/revoke {"serial_hex":"…"}`, or
+  use the **Settings → Internal CA** dashboard panel (find the agent's row in the
+  inventory and click **Revoke** — the panel refreshes in place with the new
+  status). Either way it is effective immediately server-side; the agent is
+  refused on its next Subscribe/Heartbeat/OTA call (Register re-auth + the
+  data-plane gates consult `ca.db` directly). NOTE: an agent holding an **already-open** Subscribe stream
   keeps it until that stream next reconnects — revocation does not actively tear
   down a live stream today (a follow-up). To force an immediate cutoff, restart
   the agent or wait for its reconnect; the revoked cert cannot re-establish.
@@ -161,7 +163,7 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 | PR2 | Default-cert bootstrap + server TLS wiring | shipped |
 | PR3 | Per-agent mTLS issuance at enrollment | shipped |
 | PR4 | CA REST surface + this doc | shipped |
-| PR4b | Dashboard CA panel (inventory, revoke, root/CRL download, rotation CTA) | planned |
+| PR4b | Dashboard CA panel (inventory, revoke, root/CRL download, rotation CTA) | shipped |
 | PR5 | Gateway TLS + distribution flip (drop `--no-tls`/`--no-https`); gateway `_pb.erl` regen for per-agent mTLS through the gateway | planned |
 | PR6 (M2) | Subordinate-CA (`--ca-mode subordinate`) + CSR export / offline signing | planned |
 

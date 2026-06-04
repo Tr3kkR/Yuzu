@@ -85,6 +85,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Settings → Internal CA dashboard panel (PKI PR4b).** The operator dashboard
+  now has a Certificate Authority panel (Settings page, HTMX, dark-theme): the CA
+  algorithm/fingerprint/expiry, one-click **Download CA certificate** + **Download
+  CRL**, the issued-certificate inventory (serial, subject, purpose, expiry,
+  status), and a per-certificate **Revoke** button that revokes + republishes the
+  CRL and refreshes the table in place. All agent-controlled fields are
+  HTML-escaped; the panel and its revoke action are gated by the `Security`
+  securable (`Read` / `Delete`), matching the REST surface. See
+  `docs/pki-architecture.md`.
+
 - **Internal-CA REST surface — `/api/v1/ca/*` (PKI PR4).** Operators and
   automation can now manage the built-in CA over REST:
   `GET /api/v1/ca/root` (CA certificate PEM, **public** — trust it in a browser
@@ -97,8 +107,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ca.crl.published`. The routed reference doc `docs/pki-architecture.md` lands
   with this change. (`POST /api/v1/ca/issue` for general operator-chosen-CN
   signing is intentionally deferred — it needs a non-agent namespace so an
-  operator-issued cert can't impersonate an agent; the dashboard CA panel is a
-  follow-up.) See `docs/pki-architecture.md` "CA REST surface".
+  operator-issued cert can't impersonate an agent; the dashboard CA panel ships
+  in PR4b above.) See `docs/pki-architecture.md` "CA REST surface".
 
 - **Per-agent mutual TLS, auto-issued at enrollment (PKI PR3).** When the
   server runs with its built-in CA (the default-cert bootstrap above) and an

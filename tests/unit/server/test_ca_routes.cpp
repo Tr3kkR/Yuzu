@@ -320,6 +320,67 @@ TEST_CASE("ca_routes: /ca/issued pagination params are accepted + clamped", "[ca
     }
 }
 
+TEST_CASE("ca_routes: dashboard fragment renders, gated, and HTML-escapes (PR4b)",
+          "[ca_routes][pki][security]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    // A cert whose subject carries an XSS payload — must be escaped in the table.
+    IssuedCertRecord evil = sample_issued("CAFE");
+    evil.subject = "<script>alert(1)</script>";
+    REQUIRE(h.store->record_issued(evil));
+    h.wire();
+
+    auto frag = h.sink.Get("/fragments/settings/ca");
+    REQUIRE(frag);
+    REQUIRE(frag->status == 200);
+    REQUIRE(frag->get_header_value("Content-Type").find("text/html") != std::string::npos);
+    // Root info + download links present.
+    REQUIRE(frag->body.find("/api/v1/ca/root") != std::string::npos);
+    REQUIRE(frag->body.find("/api/v1/ca/crl") != std::string::npos);
+    REQUIRE(frag->body.find(sample_root().fingerprint_sha256) != std::string::npos);
+    // XSS payload is escaped, not raw.
+    REQUIRE(frag->body.find("<script>alert(1)</script>") == std::string::npos);
+    REQUIRE(frag->body.find("&lt;script&gt;") != std::string::npos);
+    // A revoke control for the active cert is present.
+    REQUIRE(frag->body.find("/api/settings/ca/revoke") != std::string::npos);
+
+    // Gated on Security:Read.
+    h.perm_allow = false;
+    auto denied = h.sink.Get("/fragments/settings/ca");
+    REQUIRE(denied);
+    REQUIRE(denied->status == 403);
+}
+
+TEST_CASE("ca_routes: dashboard revoke wrapper revokes + re-renders (PR4b)",
+          "[ca_routes][pki][security]") {
+    Harness h;
+    REQUIRE(h.store->set_root(sample_root()));
+    REQUIRE(h.store->record_issued(sample_issued("DEAD")));
+    h.wire();
+
+    // Revoke via params (HTMX hx-vals → form body in production; the TestRouteSink
+    // only parses the query string into req.params, and the handler reads params
+    // via get_param_value either way, so pass them in the query here) → 200 HTML.
+    auto ok = h.sink.Post("/api/settings/ca/revoke?serial_hex=dead&reason=panel", "");
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);
+    REQUIRE(ok->get_header_value("Content-Type").find("text/html") != std::string::npos);
+    REQUIRE(h.store->is_revoked("DEAD")); // lowercase input normalised + matched
+    REQUIRE(ok->body.find("Revoked") != std::string::npos); // re-rendered with the new status
+    REQUIRE(h.crl_calls == 1);                              // republished via revoke_core
+
+    // Invalid serial → 400 HTML.
+    auto bad = h.sink.Post("/api/settings/ca/revoke?serial_hex=zz", "");
+    REQUIRE(bad);
+    REQUIRE(bad->status == 400);
+
+    // Gated on Security:Delete.
+    h.perm_allow = false;
+    auto denied = h.sink.Post("/api/settings/ca/revoke?serial_hex=DEAD", "");
+    REQUIRE(denied);
+    REQUIRE(denied->status == 403);
+}
+
 TEST_CASE("ca_routes: 503 when CA store unavailable", "[ca_routes][pki]") {
     Harness h;
     h.wire(/*null_store=*/true);
