@@ -11,10 +11,15 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <random>
 #include <system_error>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h> // gethostname
+#endif
 
 namespace yuzu::server {
 
@@ -154,6 +159,19 @@ bool looks_like_ip(const std::string& h) {
 
 } // namespace
 
+std::string detect_hostname() {
+#ifdef _WIN32
+    if (const char* c = std::getenv("COMPUTERNAME"); c && c[0])
+        return std::string(c);
+    return "localhost";
+#else
+    char buf[256] = {};
+    if (::gethostname(buf, sizeof(buf) - 1) == 0 && buf[0])
+        return std::string(buf);
+    return "localhost";
+#endif
+}
+
 bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaStore* ca_store,
                           DefaultCertSet& out) {
     fill_paths(dir, out);
@@ -170,13 +188,20 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
                 auto fp = pki::fingerprint_sha256(ca_pem);
                 if (fp && *fp == expected_fp && !expected_fp.empty()) {
                     // Beyond file-exists+size: confirm every leaf still chains to
-                    // this CA, so a corrupted or substituted leaf is caught and
-                    // forces a full regeneration rather than being served.
+                    // this CA (catches a corrupt/substituted leaf) AND that the CA
+                    // is CURRENTLY valid. The validity check self-heals a set minted
+                    // under a skewed clock — e.g. clock ahead at first boot yields a
+                    // not-yet-valid CA; once the clock is corrected the next boot
+                    // regenerates rather than serving an unusable (or expired) cert.
                     const bool leaves_ok =
                         pki::verify_chain(read_text_file(out.https_cert), ca_pem) &&
                         pki::verify_chain(read_text_file(out.server_cert), ca_pem) &&
                         pki::verify_chain(read_text_file(out.gateway_cert), ca_pem);
-                    if (leaves_ok) {
+                    auto ca_info = pki::parse_certificate(ca_pem);
+                    const auto now = std::chrono::system_clock::now();
+                    const bool ca_valid_now =
+                        ca_info && ca_info->not_before <= now && now < ca_info->not_after;
+                    if (leaves_ok && ca_valid_now) {
                         out.ca_fingerprint_sha256 = *fp;
                         out.ca_expires_at = from_epoch(j.value("expires_at", int64_t{0}));
                         out.freshly_generated = false;
@@ -184,8 +209,10 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
                                      out.ca_fingerprint_sha256);
                         return true;
                     }
-                    spdlog::warn("default_certs: a default leaf no longer chains to the CA — "
-                                 "regenerating");
+                    spdlog::warn("default_certs: existing default certs unusable ({}) — "
+                                 "regenerating",
+                                 !leaves_ok ? "a leaf no longer chains to the CA"
+                                            : "CA not currently valid (clock skew?)");
                 } else {
                     spdlog::warn("default_certs: marker/CA fingerprint mismatch — regenerating");
                 }

@@ -36,6 +36,9 @@ struct DefaultCertSet {
     bool freshly_generated{false}; ///< true only on the boot that created the set
 };
 
+/// Best-effort local hostname for the leaf SANs; falls back to "localhost".
+[[nodiscard]] std::string detect_hostname();
+
 /// Ensure a complete default cert set exists under `dir`.
 ///
 /// On first boot generates a per-install ECDSA P-384 root CA (10-year) and

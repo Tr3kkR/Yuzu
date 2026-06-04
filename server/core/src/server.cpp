@@ -22,6 +22,8 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "ca_store.hpp"
+#include "default_certs.hpp"
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
@@ -225,6 +227,9 @@ public:
           api_rate_limiter_(cfg_.rate_limit), login_rate_limiter_(cfg_.login_rate_limit) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_server_default_certs_active",
+                          "1 when running with built-in per-install default certificates, else 0",
+                          "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
                           "counter");
         metrics_.describe("yuzu_commands_dispatched_total",
@@ -936,6 +941,9 @@ public:
             if (audit_store_->is_open()) {
                 audit_store_->start_cleanup();
             }
+            // Internal-CA store (ca.db) — cert inventory + CRL versions. The CA
+            // root key itself is a 0600 file via default_certs, never in this DB.
+            ca_store_ = std::make_unique<CaStore>(cfg_.db_dir() / "ca.db");
             // PR 10 hardening — wire AuditStore into FleetTopologyStore
             // so push success (first-per-agent) and rejections emit
             // AuditEvents (F-1 / CC6.1 / CC7.3 evidence chain). Must
@@ -1567,22 +1575,127 @@ public:
     // policy-eval / health threads were spawned, or an exception during late
     // construction — would destroy a still-joinable std::thread and call
     // std::terminate, or free borrowed stores out from under a live thread.
+    // PKI: generate + wire per-install default certs on first boot when the
+    // operator supplied no certs (and --no-default-certs is unset). Fills the
+    // per-surface cfg_ paths, flips cfg_.using_default_certs, and emits the
+    // one-shot audit + startup banner + Prometheus gauge. Sets
+    // default_certs_failed_ when generation was required but failed, so run()
+    // can refuse to start rather than serve without the certs it expected.
+    void bootstrap_default_certs() {
+        // Always publish the gauge (0) so dashboards can alert on ==1 and clear
+        // on ==0 within one process lifetime; flipped to 1 below if defaults are
+        // actually active.
+        metrics_.gauge("yuzu_server_default_certs_active").set(0);
+        if (cfg_.no_default_certs)
+            return;
+        // A surface is "operator-supplied" only when BOTH its cert and key are
+        // present. Exactly one present is a misconfiguration — refuse rather than
+        // silently mix operator + generated material (otherwise a half-supplied
+        // --cert would be clobbered, or — worse — a strict operator agent
+        // listener would be downgraded to don't-require).
+        auto half_supplied = [](const std::filesystem::path& cert,
+                                const std::filesystem::path& key) {
+            return cert.empty() != key.empty();
+        };
+        if ((cfg_.https_enabled && half_supplied(cfg_.https_cert_path, cfg_.https_key_path)) ||
+            (cfg_.tls_enabled && half_supplied(cfg_.tls_server_cert, cfg_.tls_server_key))) {
+            spdlog::error("A TLS surface has a certificate without its key (or vice versa). "
+                          "Supply both, or neither (to use default certs). Refusing to start.");
+            default_certs_failed_ = true;
+            return;
+        }
+        const bool https_needs =
+            cfg_.https_enabled && cfg_.https_cert_path.empty() && cfg_.https_key_path.empty();
+        const bool agent_needs =
+            cfg_.tls_enabled && cfg_.tls_server_cert.empty() && cfg_.tls_server_key.empty();
+        if (!https_needs && !agent_needs)
+            return; // operator supplied certs for every active surface (or TLS/HTTPS off)
+
+        const std::filesystem::path dir =
+            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+        if (!ca_store_ || !ca_store_->is_open())
+            spdlog::warn("default_certs: ca.db is not open — cert-inventory recording will fail and "
+                         "generation will refuse (surfacing the DB-open failure)");
+        if (!ensure_default_certs(dir, detect_hostname(), ca_store_.get(), default_cert_set_)) {
+            spdlog::error("default certificates were required but generation failed");
+            default_certs_failed_ = true;
+            return;
+        }
+        cfg_.using_default_certs = true; // any surface on defaults — drives the notifications
+        // Per-surface fill — only where the operator left BOTH paths empty, so an
+        // explicit operator surface is never clobbered or downgraded.
+        if (https_needs) {
+            cfg_.https_cert_path = default_cert_set_.https_cert;
+            cfg_.https_key_path = default_cert_set_.https_key;
+        }
+        if (agent_needs) {
+            cfg_.tls_server_cert = default_cert_set_.server_cert;
+            cfg_.tls_server_key = default_cert_set_.server_key;
+            if (cfg_.tls_ca_cert.empty())
+                cfg_.tls_ca_cert = default_cert_set_.ca_cert;
+            // ONLY the agent surface being on default certs relaxes the agent
+            // listener to request-but-don't-require (per-agent mTLS is PR3). An
+            // operator-supplied agent surface keeps the strict REQUIRE posture.
+            cfg_.using_default_agent_certs = true;
+        }
+        metrics_.gauge("yuzu_server_default_certs_active").set(1);
+        if (default_cert_set_.freshly_generated && audit_store_ && audit_store_->is_open()) {
+            (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                     .principal = "system",
+                                     .principal_role = "system",
+                                     .action = "server.default_certs_generated",
+                                     .target_type = "server",
+                                     .target_id = default_cert_set_.ca_fingerprint_sha256,
+                                     .detail = "Generated per-install default CA + server leaves",
+                                     .result = "warning"});
+        }
+        const std::time_t exp =
+            std::chrono::system_clock::to_time_t(default_cert_set_.ca_expires_at);
+        std::string exp_str = std::ctime(&exp);
+        if (!exp_str.empty() && exp_str.back() == '\n')
+            exp_str.pop_back();
+        spdlog::error("**********************************************************************");
+        spdlog::error("*** Yuzu is running with BUILT-IN DEFAULT CERTIFICATES.");
+        spdlog::error("*** CA SHA-256 : {}", default_cert_set_.ca_fingerprint_sha256);
+        spdlog::error("*** CA key     : {} — anyone who reads it can MITM agent traffic",
+                      (dir / "default-ca.key").string());
+        spdlog::error("*** Expires    : {}", exp_str);
+        spdlog::error("*** Replace with --cert/--key/--https-cert (or via Settings) ASAP.");
+        spdlog::error("**********************************************************************");
+    }
+
     ~ServerImpl() override { stop(); }
+
+    [[nodiscard]] bool startup_failed() const override { return startup_failed_; }
 
     void run() override {
         spdlog::info("run(): entering");
+
+        // PKI: generate + wire per-install default certs before building TLS
+        // credentials (fills cfg_ cert paths + cfg_.using_default_certs).
+        bootstrap_default_certs();
+        if (default_certs_failed_) {
+            spdlog::error("Refusing to start: default certificates were required but could not be "
+                          "generated. Provide --cert/--key/--https-cert, or pass "
+                          "--no-default-certs to opt out.");
+            startup_failed_ = true;
+            return;
+        }
+
         grpc::EnableDefaultHealthCheckService(true);
 
         std::shared_ptr<grpc::ServerCredentials> agent_creds = grpc::InsecureServerCredentials();
         std::shared_ptr<grpc::ServerCredentials> mgmt_creds = grpc::InsecureServerCredentials();
         if (cfg_.tls_enabled) {
-            auto tls =
-                build_tls_credentials(cfg_.tls_server_cert, cfg_.tls_server_key, cfg_.tls_ca_cert,
-                                      cfg_.allow_one_way_tls, "agent listener");
+            auto tls = build_tls_credentials(cfg_.tls_server_cert, cfg_.tls_server_key,
+                                             cfg_.tls_ca_cert, cfg_.allow_one_way_tls,
+                                             /*require_client_cert=*/!cfg_.using_default_agent_certs,
+                                             "agent listener");
             if (tls) {
                 agent_creds = std::move(tls);
             } else {
                 spdlog::error("TLS is enabled but credentials are invalid; refusing to start");
+                startup_failed_ = true;
                 return;
             }
 
@@ -1597,9 +1710,10 @@ public:
                 // unauthenticated peer on the management plane.
                 auto mgmt_tls = build_tls_credentials(
                     cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key, cfg_.mgmt_tls_ca_cert,
-                    cfg_.allow_one_way_tls, "management listener");
+                    cfg_.allow_one_way_tls, /*require_client_cert=*/true, "management listener");
                 if (!mgmt_tls) {
                     spdlog::error("Management TLS credentials are invalid; refusing to start");
+                    startup_failed_ = true;
                     return;
                 }
                 mgmt_creds = std::move(mgmt_tls);
@@ -1632,6 +1746,7 @@ public:
         if (!agent_server_) {
             spdlog::error("Failed to start gRPC server -- check that ports {} and {} are available",
                           cfg_.listen_address, cfg_.management_address);
+            startup_failed_ = true;
             return;
         }
 
@@ -1800,9 +1915,20 @@ public:
         // log rotation or land in audit.db).
         const bool insecure_skip_verify_active = cfg_.tls_enabled && cfg_.allow_one_way_tls;
         const bool no_tls_active = !cfg_.tls_enabled;
-        if (insecure_skip_verify_active || no_tls_active) {
-            insecure_tls_reminder_thread_ =
-                std::thread([this, insecure_skip_verify_active, no_tls_active]() {
+        const bool default_certs_active = cfg_.using_default_certs;
+        if (insecure_skip_verify_active || no_tls_active || default_certs_active) {
+            // Compose the default-certs detail once (carries the CA fingerprint).
+            const std::string default_certs_detail =
+                default_certs_active
+                    ? "Running with built-in per-install default certificates (CA " +
+                          default_cert_set_.ca_fingerprint_sha256 +
+                          "). Anyone who can read the local CA key can MITM agent traffic. "
+                          "Replace with operator-provided certs (--cert/--https-cert) or via "
+                          "Settings as soon as possible."
+                    : std::string();
+            insecure_tls_reminder_thread_ = std::thread(
+                [this, insecure_skip_verify_active, no_tls_active, default_certs_active,
+                 default_certs_detail]() {
                     using namespace std::chrono_literals;
                     while (!stop_requested_.load(std::memory_order_acquire)) {
                         // Sleep in small increments for responsive shutdown (300s = 60 * 5s)
@@ -1812,28 +1938,36 @@ public:
                         }
                         if (stop_requested_.load(std::memory_order_acquire))
                             break;
-                        const char* posture =
-                            no_tls_active ? "--no-tls" : "--insecure-skip-client-verify";
-                        const char* detail =
-                            no_tls_active
-                                ? "TLS is fully disabled; both agent and management gRPC "
-                                  "listeners accept plaintext from any peer with no encryption "
-                                  "and no peer authentication. Restart with TLS certificates "
-                                  "to leave this posture."
-                                : "Agent / management listener still running without client "
-                                  "certificate verification. Re-enable mTLS by supplying "
-                                  "--ca-cert (and --management-ca-cert if applicable).";
-                        spdlog::error("[INSECURE-TLS] ({}) {}", posture, detail);
-                        if (audit_store_ && audit_store_->is_open()) {
-                            (void)audit_store_->log({.timestamp = std::time(nullptr),
-                                                     .principal = "system",
-                                                     .principal_role = "system",
-                                                     .action = "server.tls_degraded",
-                                                     .target_type = "server",
-                                                     .target_id = posture,
-                                                     .detail = detail,
-                                                     .result = "warning"});
-                        }
+                        auto emit = [this](const char* posture, const std::string& detail,
+                                           const char* action) {
+                            spdlog::error("[INSECURE-TLS] ({}) {}", posture, detail);
+                            if (audit_store_ && audit_store_->is_open()) {
+                                (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                                         .principal = "system",
+                                                         .principal_role = "system",
+                                                         .action = action,
+                                                         .target_type = "server",
+                                                         .target_id = posture,
+                                                         .detail = detail,
+                                                         .result = "warning"});
+                            }
+                        };
+                        if (no_tls_active)
+                            emit("--no-tls",
+                                 "TLS is fully disabled; both agent and management gRPC listeners "
+                                 "accept plaintext from any peer with no encryption and no peer "
+                                 "authentication. Restart with TLS certificates to leave this "
+                                 "posture.",
+                                 "server.tls_degraded");
+                        if (insecure_skip_verify_active)
+                            emit("--insecure-skip-client-verify",
+                                 "Agent / management listener still running without client "
+                                 "certificate verification. Re-enable mTLS by supplying --ca-cert "
+                                 "(and --management-ca-cert if applicable).",
+                                 "server.tls_degraded");
+                        if (default_certs_active)
+                            emit("default-certs", default_certs_detail,
+                                 "server.default_certs_in_use");
                     }
                 });
         }
@@ -1976,7 +2110,7 @@ private:
     build_tls_credentials(const std::filesystem::path& cert_path,
                           const std::filesystem::path& key_path,
                           const std::filesystem::path& ca_path, bool allow_one_way_tls,
-                          std::string_view listener_name) const {
+                          bool require_client_cert, std::string_view listener_name) const {
         if (cert_path.empty() || key_path.empty()) {
             spdlog::error("{} TLS requires certificate and key", listener_name);
             return nullptr;
@@ -2007,8 +2141,13 @@ private:
             }
 
             ssl_opts.pem_root_certs = std::move(ca);
+            // Under built-in default certs the agent has no client cert yet
+            // (per-agent issuance is PR3): REQUEST + VERIFY if presented, but do
+            // NOT REQUIRE — otherwise no agent could connect. Operator-provided
+            // certs keep the strict REQUIRE posture.
             ssl_opts.client_certificate_request =
-                GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY;
+                require_client_cert ? GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY
+                                    : GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
         } else {
             if (!allow_one_way_tls) {
                 spdlog::error("{} TLS requires --ca-cert (or enable "
@@ -2795,6 +2934,17 @@ private:
                 // tracks the actual build instead of a stale literal.
                 {"version", std::string(yuzu::kVersionString)}};
 
+            // TLS posture — intentionally UNAUTHENTICATED: operators and
+            // monitoring MUST be able to see when the install is on built-in
+            // default certs. The CA fingerprint is public.
+            health["tls"] = {
+                {"default_certs_active", cfg_.using_default_certs},
+                {"ca_fingerprint", default_cert_set_.ca_fingerprint_sha256},
+                {"ca_expires_at",
+                 cfg_.using_default_certs ? static_cast<int64_t>(std::chrono::system_clock::to_time_t(
+                                                default_cert_set_.ca_expires_at))
+                                          : int64_t{0}}};
+
             // Authenticated extension — heavier work, only run when the caller
             // has a session. Adds: agents.pending (SQLite scan), executions.*
             // (SQLite scan + 1h-window loop), system.* (process_health_sampler).
@@ -2931,6 +3081,12 @@ private:
                 // silently degrade every scoped dispatch to zero targets while
                 // /readyz reported "ready".
                 {"result_set_store", result_set_store_ && result_set_store_->is_open()},
+                // PKI PR2: ca.db is load-bearing only when the install is on
+                // built-in default certs (PR3+ make it load-bearing for mTLS
+                // issuance/revocation). When the operator brought their own certs
+                // it is not on the request path, so report ok.
+                {"ca_store", !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open())},
+                {"ca_root", !cfg_.using_default_certs || (ca_store_ && ca_store_->has_root())},
             };
 
             std::string failed_list;
@@ -7198,6 +7354,10 @@ private:
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
+    std::unique_ptr<CaStore> ca_store_;
+    DefaultCertSet default_cert_set_;
+    bool default_certs_failed_{false};
+    bool startup_failed_{false}; // run() refused to start — main() exits non-zero
     std::unique_ptr<AuthRoutes> auth_routes_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;

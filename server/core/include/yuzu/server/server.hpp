@@ -24,6 +24,17 @@ struct Config {
     std::filesystem::path tls_ca_cert;     // For mTLS agent verification
     bool allow_one_way_tls{false};         // Permit TLS without client cert verification
 
+    // PKI default certs (PR2). With no operator cert flags and without
+    // --no-default-certs, the server generates a per-install CA + server-side
+    // leaves on first boot (default_certs.hpp). `ca_dir` defaults to
+    // auth::default_cert_dir() when empty; `using_default_certs` is runtime state
+    // the bootstrap sets to drive the notification surfaces + the
+    // request-but-don't-require agent-listener posture (per-agent mTLS is PR3).
+    bool no_default_certs{false};
+    bool using_default_certs{false};       // any surface on default certs — drives notifications
+    bool using_default_agent_certs{false}; // agent listener on default certs (don't-require posture)
+    std::filesystem::path ca_dir;
+
     // Optional management listener TLS override.
     // If left empty, management reuses the agent listener credentials.
     std::filesystem::path mgmt_tls_server_cert;
@@ -195,6 +206,11 @@ public:
 
     /** Graceful shutdown. Thread-safe. */
     virtual void stop() noexcept = 0;
+
+    /** True when run() returned because startup failed (refuse-to-start), so the
+     *  caller can exit non-zero — systemd Restart=on-failure / k8s crashloop
+     *  detection need a non-zero code, not a silent clean exit. Default false. */
+    [[nodiscard]] virtual bool startup_failed() const { return false; }
 };
 
 } // namespace yuzu::server

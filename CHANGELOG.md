@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking Changes
 
+- **The server now generates per-install default TLS certificates on first
+  boot instead of refusing to start without operator-provided certs.** A fresh
+  install is encrypted and serves the HTTPS dashboard + agent/management gRPC
+  with an auto-generated per-install ECDSA CA (no `--no-tls`/`--no-https`
+  needed). Because the dashboard cert is signed by a per-install CA, browsers
+  show an untrusted-issuer warning until the operator trusts the CA
+  (`<cert-dir>/default-ca.pem`) or replaces the certs. The server warns loudly
+  on six surfaces (startup banner; one-shot audit `server.default_certs_generated`;
+  periodic audit `server.default_certs_in_use`; Prometheus
+  `yuzu_server_default_certs_active`; `/health` `tls.default_certs_active` +
+  `ca_fingerprint` + `ca_expires_at`; `/readyz` `ca_store`/`ca_root`). While on default certs the agent
+  listener runs encrypted but **requests-but-does-not-require** client certs
+  (per-agent mTLS lands in a follow-up); an operator-supplied agent surface
+  keeps strict mTLS, and the management plane is unaffected. **Opt out with
+  `--no-default-certs`** to restore the legacy refuse-to-start. New `--ca-dir`
+  relocates the CA/cert directory. A surface given a cert without its key (or
+  vice-versa) is now a hard startup error. See `docs/auth-architecture.md`
+  "Default certificates".
 - **`--mfa-enforcement=admin-only` and `--mfa-enforcement=required` now
   ENFORCE (previously a logged no-op).** PR 1/PR 2 accepted these values
   for forward-compatibility and documented them as no-ops (the server

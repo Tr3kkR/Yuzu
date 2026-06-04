@@ -148,6 +148,37 @@ direct-mode source arrives with the QUIC transport (#376) that owns its socket.
 - **CORS on all API endpoints** — CORS headers applied via `set_post_routing_handler` for all `/api/` paths.
 - **JSON error envelope** — All error responses use structured `{"error":{"code":N,"message":"..."},"meta":{"api_version":"v1"}}` envelope. Health probes (`/livez`, `/readyz`) use `{"status":"..."}` contract.
 
+## Default certificates (PKI PR2, v0.13.0+)
+
+A fresh install no longer refuses to start without operator certs. On first boot
+the server generates a per-install internal CA (ECDSA P-384, 10-year) and P-256
+leaves for the HTTPS, agent-gRPC, and management-gRPC listeners under the cert
+directory (`auth::default_cert_dir()`; override with `--ca-dir`), recorded in
+`ca.db`. Implementation: `default_certs.{hpp,cpp}` on the
+`x509_ca`/`key_provider`/`ca_store` engine. Behaviour:
+
+- **Per-surface, partial-override.** Defaults fill only the surfaces the
+  operator left empty; an explicit `--https-cert`/`--cert` still wins. A surface
+  with a cert but no key (or vice-versa) is a hard error (refuse to start) —
+  operator and generated material are never mixed.
+- **Agent-listener posture.** While the agent surface is on default certs the
+  agent (and the management listener when it reuses agent creds) runs
+  `REQUEST + VERIFY but NOT REQUIRE` client certs — encrypted +
+  server-authenticated, with per-agent client-cert mTLS arriving in a follow-up.
+  An operator-supplied agent surface keeps the strict `REQUEST_AND_REQUIRE`
+  posture (the relaxation is gated on `using_default_agent_certs`, never the
+  global `using_default_certs`).
+- **Loud, impossible-to-miss notification (six surfaces):** ERROR startup banner
+  with the CA SHA-256 + expiry; one-shot audit `server.default_certs_generated`;
+  a 300 s periodic reminder + audit `server.default_certs_in_use`; Prometheus
+  `yuzu_server_default_certs_active`; `/health` `tls.default_certs_active` +
+  `ca_fingerprint` + `ca_expires_at` (unauthenticated — the CA is already in the
+  TLS handshake); `/readyz` gains `ca_store`/`ca_root` checks (load-bearing only
+  while on default certs).
+- **Opt out** with `--no-default-certs` (legacy refuse-to-start). The CA root
+  key is a 0600 file (HSM seam in `key_provider`); the threat model is local-host
+  compromise — replace defaults with operator/HSM-backed certs for production.
+
 ## HTTP security response headers (SOC2-C1)
 
 All HTTP responses (dashboard, REST API, MCP, metrics, health probes) carry six headers: `Content-Security-Policy`, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy` (deny-all baseline for camera/mic/geo/usb/etc.), and `Strict-Transport-Security: max-age=31536000; includeSubDomains` (HTTPS only, per RFC 6797).
