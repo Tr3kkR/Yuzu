@@ -93,6 +93,26 @@ Run each component under its own system user:
 - `yuzu-agent` — agent process
 - `yuzu-gw` — gateway process
 
+## Gateway TLS (if you deploy the Erlang gateway)
+
+> **⚠ The gateway agent listener (`:50051`) is plaintext in the current release.**
+> The gateway is the command fan-out plane — a plaintext, untrusted-network-reachable
+> agent listener lets an on-path attacker inject commands (fleet RCE). grpcbox forces
+> client-cert-required on any TLS listener, which would break unenrolled-agent
+> bootstrap, so one-way TLS there is a tracked follow-up.
+
+If you deploy the gateway, you **must** protect the agent edge at the network layer:
+- **Terminate TLS in front** of the gateway (reverse proxy / L7 LB doing TLS on
+  `:50051`, forwarding only over loopback or a trusted segment), **or**
+- keep `:50051` on a **trusted network** (VPN / private subnet / service mesh) — never
+  directly internet-exposed.
+
+The gateway→server **upstream** hop supports mutual TLS (`gateway/config/sys.config.prod`
+`{https,...}`), and the gateway **fails closed** if that channel is configured `https`
+without `verify_peer`. Direct agent→server connections (no gateway) are already full
+mTLS over any network. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
+"TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
+
 ## Secret Management
 
 **Never pass secrets via CLI flags** — they are visible in `ps aux`.

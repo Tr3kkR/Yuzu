@@ -85,6 +85,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Gateway TLS — upstream mutual TLS + per-agent enrollment through the gateway
+  (PKI PR5).** The Erlang gateway can now speak mutual TLS to the server's
+  `GatewayUpstream` listener using the CA-issued `default-gateway` leaf
+  (`gateway/config/sys.config.prod` carries the canonical `{https,...}` upstream
+  channel; fixes a latent bug where the old config omitted grpcbox's required
+  `ssl => true` on the listener `transport_opts` and silently ran plaintext). The
+  gateway's vendored proto modules — `gateway_pb` (the `ProxyRegister` marshaller),
+  `management_pb`, and the agent-listener `agent_pb` — were all regenerated to
+  include `csr_pem`/`issued_certificate`/`issued_ca_chain`, so the gateway-proxied
+  `Register` path now **forwards** the agent CSR + issued cert verbatim — per-agent
+  mTLS auto-provisioning works for gateway-connected agents, not just direct-connect
+  (previously gpb's self-contained modules silently dropped the unknown fields in
+  transit; `gateway.proto:89` documents the trap). Startup now
+  logs the *actual* grpcbox TLS posture (`yuzu_gw_app:log_tls_state/0`), replacing
+  a dead/`case_clause`-prone check on the advisory `tls` env, and **fails closed**
+  if the upstream is TLS-but-unverified (`https` without `verify_peer` — encrypted
+  yet MITM-able; override `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` for dev/CI).
+  **Note: the upstream mTLS lives in the `sys.config.prod` *reference* config — it
+  is not yet the build default, so the shipped images/compose rigs still run
+  plaintext upstream until PR5b wires the prod profile + cert volumes.** The
+  **agent↔gateway
+  edge stays plaintext in M1** — grpcbox forces `fail_if_no_peer_cert` on any TLS
+  listener, which breaks unenrolled-agent bootstrap. **Do not expose the gateway
+  agent port (`:50051`) to an untrusted network** — it is the command fan-out
+  plane, so a MITM there is a fleet-RCE risk; front it with TLS termination or keep
+  it on a trusted segment (see the SECURITY callout in `docs/pki-architecture.md`).
+  Encrypting that hop natively is a tracked follow-up (grpcbox one-way-TLS / QUIC). Covered by a new EUnit suite
+  including a real EC mutual-TLS handshake. See `docs/pki-architecture.md`
+  "Gateway TLS". (The compose/Dockerfile distribution flip — encrypted-by-default
+  containers — is staged as PR5b; the server is already encrypted-by-default when
+  run without `--no-tls`/`--no-https`.)
+
 - **Settings → Internal CA dashboard panel (PKI PR4b).** The operator dashboard
   now has a Certificate Authority panel (Settings page, HTMX, dark-theme): the CA
   algorithm/fingerprint/expiry, one-click **Download CA certificate** + **Download

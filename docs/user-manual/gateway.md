@@ -226,7 +226,7 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 
     %% Upstream C++ server (GatewayUpstream service)
     {upstream_addr, "127.0.0.1"},
-    {upstream_port, 50051},
+    {upstream_port, 50055},
 
     %% Upstream connection pool size
     {upstream_pool_size, 16},
@@ -248,19 +248,37 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 ]}
 ```
 
-### TLS Configuration (Optional)
+### TLS posture (M1)
 
-To enable mTLS between agents and the gateway, add the `tls` key:
+> **⚠ SECURITY — do not expose the agent listener (`:50051`) to an untrusted
+> network.** The gateway is the command fan-out plane. A plaintext,
+> internet-reachable agent listener has **no confidentiality, no integrity, and no
+> gateway authentication** — an on-path attacker can inject commands → **remote
+> code execution across the fleet**. Until one-way TLS lands on the agent listener,
+> a gateway deployment **MUST** either (a) terminate TLS in front of the gateway (a
+> reverse proxy doing TLS on `:50051`, forwarding only over loopback / a trusted
+> segment), or (b) keep `:50051` on a trusted network (VPN / private subnet /
+> service mesh). Direct agent→server connections are already full mTLS (PR2/PR3) —
+> this gap is specific to the gateway edge.
 
-```erlang
-{tls, [
-    {certfile, "/etc/yuzu/gateway.crt"},
-    {keyfile,  "/etc/yuzu/gateway.key"},
-    {cacertfile, "/etc/yuzu/ca.crt"},
-    {verify, verify_peer},
-    {fail_if_no_peer_cert, true}
-]}
-```
+| Hop | M1 state | Notes |
+|---|---|---|
+| gateway → server upstream (`:50055`) | **mutual TLS** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. |
+| agent → gateway (`:50051`) | **plaintext** | grpcbox v0.17.1 hardcodes `fail_if_no_peer_cert=true` on any TLS listener — an unenrolled agent has no client cert yet, so TLS here would break bootstrap. Tracked follow-up (one-way TLS). |
+| operator → gateway mgmt (`:50063`) | **plaintext** | Same grpcbox constraint. |
+
+TLS is configured **entirely in the `grpcbox` block** (grpcbox reads its own
+config at boot — the old `{tls, [...]}` advisory key under `yuzu_gw` was removed
+in PKI PR5 and does **nothing**). To enable upstream mutual TLS, copy the
+`{grpcbox, [{client, ...}]}` `{https,...}` channel from
+`gateway/config/sys.config.prod`.
+
+To enable mTLS on the agent listener for a deployment where **every agent already
+holds a CA-issued client cert** (not the normal enrollment path), add a
+`transport_opts` map to each server entry — see the commented block in
+`sys.config.prod`. **`ssl => true` is mandatory**; omit it and grpcbox silently
+runs plaintext regardless of the other options. Full detail:
+`docs/pki-architecture.md` "Gateway TLS".
 
 ### Distribution Cookie (Required in Production)
 

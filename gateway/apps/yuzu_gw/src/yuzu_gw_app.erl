@@ -13,6 +13,8 @@
 
 -export([start/2, stop/1]).
 -export([apply_env_overrides/0, evaluate_cookie/3]).  %% exported for testing
+-export([client_has_https/1, client_tls_posture/1, servers_have_tls/1]). %% for testing
+-export([evaluate_upstream_posture/2]).                                  %% for testing
 
 %%--------------------------------------------------------------------
 %% application callbacks
@@ -31,29 +33,36 @@ do_start() ->
     %% Apply environment variable overrides (container deployment).
     apply_env_overrides(),
 
-    %% Log TLS state clearly at startup.
-    case application:get_env(yuzu_gw, tls_enabled, auto) of
-        false ->
-            logger:warning("TLS DISABLED — running plaintext (test/dev only)");
-        _ ->
-            case application:get_env(yuzu_gw, tls, undefined) of
-                undefined -> logger:info("TLS: not configured (plaintext)");
-                {ok, []}  -> logger:info("TLS: not configured (plaintext)");
-                {ok, _}   -> logger:info("TLS: enabled")
-            end
-    end,
+    %% Log the ACTUAL transport TLS posture. grpcbox reads its own
+    %% {grpcbox, client|servers} config at boot and is the source of truth; the
+    %% yuzu_gw `tls`/`tls_enabled` env is advisory only (nothing wires it into
+    %% grpcbox — see docs/pki-architecture.md "Gateway TLS"). The previous code
+    %% matched `{ok, _}` against application:get_env/3, which returns the bare
+    %% value (never `{ok, _}`), so it was dead — and a real `tls` proplist would
+    %% have crashed boot with a case_clause.
+    log_tls_state(),
 
-    %% Attach telemetry/prometheus handlers.
-    yuzu_gw_telemetry:setup(),
+    %% #PR5: fail CLOSED on a misconfigured-but-encrypted upstream (https without
+    %% verify_peer is MITM-able) — same fail-closed philosophy as the distribution
+    %% cookie guard, rather than booting with only a log warning. PLAINTEXT upstream
+    %% is still allowed (the legitimate UAT/dev posture); only the "TLS but
+    %% unauthenticated" footgun is refused.
+    case check_upstream_tls_posture() of
+        {error, Reason} ->
+            {error, Reason};
+        ok ->
+            %% Attach telemetry/prometheus handlers.
+            yuzu_gw_telemetry:setup(),
 
-    %% Start Prometheus HTTP exporter for /metrics endpoint.
-    Port = application:get_env(yuzu_gw, prometheus_port, 9568),
-    application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
-    {ok, _} = prometheus_httpd:start(),
-    logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
+            %% Start Prometheus HTTP exporter for /metrics endpoint.
+            Port = application:get_env(yuzu_gw, prometheus_port, 9568),
+            application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
+            {ok, _} = prometheus_httpd:start(),
+            logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
 
-    %% Start the supervision tree.
-    yuzu_gw_sup:start_link().
+            %% Start the supervision tree.
+            yuzu_gw_sup:start_link()
+    end.
 
 %%--------------------------------------------------------------------
 %% Distribution cookie guard (#659)
@@ -228,3 +237,152 @@ apply_tls_overrides() ->
             application:set_env(yuzu_gw, tls, TlsOpts2),
             logger:info("TLS config updated from environment variables")
     end.
+
+%%--------------------------------------------------------------------
+%% TLS posture reporting (PKI PR5)
+%%--------------------------------------------------------------------
+
+-type tls_posture() :: verified | unverified | plaintext.
+
+%% @private Report the real transport TLS posture from grpcbox's OWN config —
+%% the authoritative source (grpcbox reads {grpcbox, client|servers} at boot,
+%% not yuzu_gw's advisory `tls` env). Never crashes on unexpected shapes.
+-spec log_tls_state() -> ok.
+log_tls_state() ->
+    case application:get_env(yuzu_gw, tls_enabled, auto) of
+        false ->
+            logger:warning("YUZU_GW_TLS_ENABLED=false is advisory only — the actual "
+                           "transport is whatever the grpcbox config selects (below)");
+        _ -> ok
+    end,
+    Up = client_tls_posture(application:get_env(grpcbox, client, undefined)),
+    Listen = servers_have_tls(application:get_env(grpcbox, servers, undefined)),
+    %% This reflects the CONFIGURED grpcbox posture, not a live handshake — the
+    %% upstream channel connects lazily (and the server may not have generated
+    %% certs yet at boot), so a startup file/handshake probe would false-alarm.
+    logger:info("Gateway transport TLS (configured): upstream->server=~s, "
+                "listeners(agent/mgmt)=~s", [posture_word(Up), tls_word(Listen)]),
+    case Up of
+        plaintext ->
+            logger:warning("Gateway->server upstream is PLAINTEXT. For production point "
+                           "the grpcbox default_channel at {https,...} with the gateway "
+                           "leaf + CA (see config/sys.config.prod / deploy gateway-sys.config).");
+        unverified ->
+            %% https without {verify,verify_peer}: encrypted but NOT authenticated —
+            %% an active MITM can impersonate the server. Do not report this as "TLS".
+            logger:warning("Gateway->server upstream is ENCRYPTED but does NOT verify the "
+                           "server certificate ({verify,verify_peer} missing from the "
+                           "grpcbox default_channel SslOpts) — vulnerable to MITM. Add "
+                           "{verify,verify_peer} + {cacertfile,...}.");
+        verified -> ok
+    end,
+    %% Advisory-env footgun: an operator who set YUZU_GW_TLS_* populated only the
+    %% unconsumed yuzu_gw `tls` env; it does NOT configure grpcbox, REGARDLESS of
+    %% the actual upstream posture. Warn whenever it is set so the misconception is
+    %% always surfaced (not only when the upstream happens to be plaintext).
+    case application:get_env(yuzu_gw, tls, []) of
+        [] -> ok;
+        _ ->
+            logger:warning("yuzu_gw `tls` env is set (YUZU_GW_TLS_*) but those env vars are "
+                           "advisory and do NOT configure grpcbox (it reads its own config). "
+                           "Set TLS in the grpcbox block of sys.config. See "
+                           "docs/pki-architecture.md 'Gateway TLS'.")
+    end,
+    ok.
+
+%% @private Fail-closed guard: refuse to boot if the grpcbox upstream channel is
+%% TLS-but-unverified (https without {verify,verify_peer}) — encrypted yet
+%% MITM-able. PLAINTEXT upstream is permitted (the legitimate UAT/dev posture);
+%% only the dangerous "looks secure, isn't" middle state is refused. Mirrors the
+%% distribution-cookie guard's fail-closed posture. Dev/CI override:
+%% YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1.
+-spec check_upstream_tls_posture() -> ok | {error, unverified_upstream_tls}.
+check_upstream_tls_posture() ->
+    Posture = client_tls_posture(application:get_env(grpcbox, client, undefined)),
+    Allow = os:getenv("YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM") =:= "1",
+    case evaluate_upstream_posture(Posture, Allow) of
+        {error, unverified_upstream_tls} ->
+            logger:critical(
+                "Refusing to start: the grpcbox upstream channel uses TLS (https) WITHOUT "
+                "{verify,verify_peer} — encrypted but UNAUTHENTICATED (MITM-able). Add "
+                "{verify,verify_peer} + {cacertfile,...} to the default_channel SslOpts "
+                "(see config/sys.config.prod). Dev/CI may override with "
+                "YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1."),
+            {error, unverified_upstream_tls};
+        ok when Posture =:= unverified ->
+            logger:warning("Upstream TLS is unverified (no verify_peer) but "
+                           "YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1 — proceeding (dev/CI only)."),
+            ok;
+        ok ->
+            ok
+    end.
+
+%% @doc Pure upstream-posture policy decision — exported for testing. Only
+%% `unverified` (https without verify_peer) without an explicit override is
+%% refused; `verified` and `plaintext` boot.
+-spec evaluate_upstream_posture(tls_posture(), boolean()) ->
+          ok | {error, unverified_upstream_tls}.
+evaluate_upstream_posture(unverified, false) -> {error, unverified_upstream_tls};
+evaluate_upstream_posture(_Posture, _Allow)  -> ok.
+
+-spec tls_word(boolean()) -> string().
+tls_word(true)  -> "TLS";
+tls_word(false) -> "plaintext".
+
+-spec posture_word(tls_posture()) -> string().
+posture_word(verified)   -> "mutual-TLS";
+posture_word(unverified) -> "TLS(UNVERIFIED!)";
+posture_word(plaintext)  -> "plaintext".
+
+%% @doc Strongest TLS posture across grpcbox client channels: `verified` (an
+%% `https` endpoint with {verify,verify_peer}), `unverified` (https without it),
+%% else `plaintext`. Pure; exported for testing.
+-spec client_tls_posture(term()) -> tls_posture().
+client_tls_posture(#{channels := Channels}) when is_list(Channels) ->
+    lists:foldl(fun(Ch, Acc) -> strongest(channel_posture(Ch), Acc) end,
+                plaintext, Channels);
+client_tls_posture(_) ->
+    plaintext.
+
+%% @doc True if any grpcbox client channel has an `https` endpoint (verified or
+%% not). Pure; exported for testing.
+-spec client_has_https(term()) -> boolean().
+client_has_https(Client) -> client_tls_posture(Client) =/= plaintext.
+
+-spec channel_posture(term()) -> tls_posture().
+channel_posture({_Name, Endpoints, _Opts}) when is_list(Endpoints) ->
+    lists:foldl(fun(E, Acc) -> strongest(endpoint_posture(E), Acc) end,
+                plaintext, Endpoints);
+channel_posture(_) ->
+    plaintext.
+
+-spec endpoint_posture(term()) -> tls_posture().
+endpoint_posture(E) when is_tuple(E), tuple_size(E) >= 4, element(1, E) =:= https ->
+    SslOpts = element(4, E),
+    case is_list(SslOpts) andalso proplists:get_value(verify, SslOpts) =:= verify_peer of
+        true  -> verified;
+        false -> unverified
+    end;
+endpoint_posture(_) ->
+    plaintext.
+
+-spec strongest(tls_posture(), tls_posture()) -> tls_posture().
+strongest(verified, _)            -> verified;
+strongest(_, verified)            -> verified;
+strongest(unverified, _)          -> unverified;
+strongest(_, unverified)          -> unverified;
+strongest(plaintext, plaintext)   -> plaintext.
+
+%% @doc True if any grpcbox server (listener) carries TLS transport_opts
+%% (`ssl => true`). Pure; exported for testing.
+-spec servers_have_tls(term()) -> boolean().
+servers_have_tls(Servers) when is_list(Servers) ->
+    lists:any(fun(S) when is_map(S) ->
+                      case maps:get(transport_opts, S, #{}) of
+                          #{ssl := true} -> true;
+                          _ -> false
+                      end;
+                 (_) -> false
+              end, Servers);
+servers_have_tls(_) ->
+    false.

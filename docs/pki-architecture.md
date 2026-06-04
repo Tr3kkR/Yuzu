@@ -115,6 +115,130 @@ signing certs) is **deferred**: an operator-issued client leaf whose CN collides
 with an `agent_id` could impersonate that agent at the #1118 identity gate, so it
 needs a dedicated non-agent namespace + EKU policy. Tracked follow-up.
 
+## Gateway TLS (PR5)
+
+The Erlang gateway (`gateway/`) is an optional scale-out fan-out plane that sits
+between agents and the server. Its TLS posture is shaped by a hard property of
+the underlying transport library, **grpcbox v0.17.1**, verified against its
+source:
+
+- A grpcbox listener does TLS **only** when its `transport_opts` map carries
+  `ssl => true` **and** `keyfile`/`certfile`/`cacertfile` (all four). Omit
+  `ssl => true` and it silently runs plaintext (`grpcbox_pool.erl:18`). When TLS
+  is on, grpcbox **hardcodes** `fail_if_no_peer_cert=true` + `verify=verify_peer`
+  + TLS 1.2 + ALPN `h2` — i.e. every TLS listener is **mutual** TLS; there is no
+  request-but-don't-require mode.
+- A grpcbox client channel does TLS via `{https, Host, Port, SslOpts}`; grpcbox
+  prepends ALPN `h2` and passes `SslOpts` to `ssl:connect`, so the channel
+  honours `cacertfile`/`certfile`/`keyfile`/`verify`. **`{verify, verify_peer}`
+  is mandatory** — an ssl client does not verify the server otherwise — and OTP
+  enforces SNI hostname matching, so the server cert SAN must cover the dialled
+  host.
+
+### M1 posture — upstream mutual TLS
+
+| Hop | M1 TLS | Why |
+|---|---|---|
+| gateway → server upstream (`GatewayUpstream`, :50055) | **mutual TLS** | Both peers hold CA-issued certs (the gateway uses the `default-gateway` leaf, which has `serverAuth`+`clientAuth`). No bootstrap problem. |
+| agent → gateway (:50051) | **plaintext (M1)** | grpcbox forces `fail_if_no_peer_cert`, but an unenrolled agent has no client cert until it completes CSR enrollment — a TLS agent listener would make bootstrap impossible. Encrypting this edge needs grpcbox one-way-TLS support or the QUIC transport (#376). Agent identity across the gateway is carried at the app/proto layer (`gateway_observed_peer`, #1064), not the transport. |
+| operator → gateway mgmt (:50063) | plaintext (M1) | Same grpcbox constraint; tracked with the agent edge. |
+
+> **⚠ SECURITY — do not expose the plaintext gateway agent edge to an untrusted
+> network.** The gateway is the command fan-out plane: it pushes
+> `CommandRequest`s that agents execute. A plaintext, internet-or-LAN-reachable
+> agent listener (:50051) has **no confidentiality, no integrity, and no gateway
+> authentication** — an on-path attacker can read all inventory and, worse,
+> **inject commands → remote code execution across the fleet**, or impersonate the
+> gateway. This is potentially CRITICAL for an internet-facing gateway. It is a
+> *pre-existing* property (the gateway was fully plaintext before PR5; PR5 only
+> encrypts the gateway→server upstream hop), but it is NOT acceptable on an
+> exposed deployment. **Direct agent→server connections are already full mTLS
+> (PR2/PR3) over any network — the gap is specific to the gateway edge.**
+>
+> **Until one-way TLS lands on the agent listener, a gateway deployment MUST do one
+> of:** (a) terminate TLS in front of the gateway (a reverse proxy / L7 load
+> balancer doing TLS on :50051, forwarding plaintext only over loopback/a trusted
+> segment); or (b) keep the gateway agent port on a trusted network only (VPN /
+> private subnet / mTLS-enforcing service mesh), never directly internet-exposed.
+> The proper fix — server-authenticated (one-way) TLS on the agent listener, which
+> gives encryption + gateway authentication without requiring a client cert (so
+> unenrolled agents can still bootstrap) — requires a small grpcbox patch to make
+> `fail_if_no_peer_cert`/`verify` configurable (grpcbox v0.17.1 hardcodes them at
+> `grpcbox_pool.erl:26`), or the QUIC transport (#376). Tracked as a follow-up.
+
+The canonical correct gateway TLS config is `gateway/config/sys.config.prod`
+(upstream `{https,...}` + a documented optional listener-mTLS block for
+pre-provisioned-agent deployments). It is unit-tested in
+`gateway/apps/yuzu_gw/test/yuzu_gw_mtls_tests.erl` — a real EC mutual handshake
+(P-384 CA / P-256 leaf) proves the option shape and that a certless client is
+rejected. `yuzu_gw_app:log_tls_state/0` reports the *actual* grpcbox posture at
+startup (the older `tls_enabled`/`tls` env is advisory only — grpcbox reads its
+own config at boot).
+
+**Operational notes:**
+- **Fail-closed on misconfig** — the gateway refuses to boot if the upstream channel
+  is `https` *without* `{verify, verify_peer}` (encrypted but MITM-able);
+  `evaluate_upstream_posture/2`, override `YUZU_GW_ALLOW_UNVERIFIED_UPSTREAM=1` for
+  dev/CI. Plaintext upstream is still permitted (the UAT/dev posture).
+- **Cert SAN ↔ dial-name (checklist)** — OTP enforces SNI hostname verification under
+  `verify_peer`, so the server cert SAN must include the name the gateway dials. The
+  default certs carry `localhost` + `IP:127.0.0.1` + `IP:::1` + `gethostname()`; for
+  cross-container/host dialing, dial the server's hostname and set that service's
+  `hostname:` so its SAN matches (or add `--cert-san`, tracked).
+- **Leaf rotation** — grpcbox reads the cert/key/CA files at channel *connect* time
+  (lazy), so replacing `default-gateway.{pem,key}` on disk is picked up on the next
+  upstream reconnect; an *established* channel keeps the old cert until it drops, so a
+  `systemctl restart yuzu-gateway` is the deterministic way to force a rotation.
+- **Observability** — an upstream TLS-handshake failure currently surfaces only as the
+  generic circuit-breaker open state; a dedicated handshake-failure metric is a tracked
+  follow-up. See the consolidated residual-risk register + follow-ups in
+  `docs/security-reviews/pki-pr5-gateway-tls.md`.
+
+### Per-agent enrollment through the gateway (proto regen)
+
+The gateway vendors its own copies of the agent proto, and gpb emits
+**self-contained** `_pb` modules — so the `yuzu.agent.v1` Register messages are
+embedded in **three** generated modules: `agent_pb` (the agent-facing listener),
+`gateway_pb` (the **`ProxyRegister` marshaller** used by `yuzu_gw_upstream:do_rpc/3`
+— the load-bearing one for the gateway→server hop), and `management_pb`. Before
+PR5 all three lacked `csr_pem`/`issued_certificate`/`issued_ca_chain`, so gpb
+**dropped** them in transit and the gateway silently stripped the agent's CSR
+while proxying `Register` — per-agent mTLS auto-provisioning only worked
+direct-connect. PR5 regenerates **all three** modules (fields mirrored from the
+canonical proto, same field numbers 7/7/8), so the gateway now forwards the CSR
+and returns the issued cert verbatim. A field added to only one module is
+silently stripped on the hop that marshals via another (`gateway.proto:89`
+documents this trap); per-module roundtrip tests now assert `agent_pb`,
+`gateway_pb`, and `management_pb` — and a CI codegen-consistency guard is a
+tracked follow-up.
+
+### Distribution flip — staged as PR5b
+
+Making a fresh **containerised** install encrypted-by-default (dropping
+`--no-tls`/`--no-https` across the compose/Dockerfile surface + a shared cert
+volume) is staged separately because it carries container-integration steps that
+must be validated against a booted stack, and **no CI workflow currently boots
+the `deploy/docker/*.yml` composes** (the pre-release smoke writes its own inline
+plaintext compose; the UAT rigs are manual). The known requirements PR5b must
+satisfy:
+
+- **Cert-dir ownership** — the runtime image runs as `yuzu`, but `/etc/yuzu` is
+  root-owned; the cert dir must be writable by `yuzu` (chown, or a pre-created
+  `0700` volume) or first-boot cert generation fails.
+- **HTTPS healthcheck** — the compose healthchecks use a bash `/dev/tcp`
+  plaintext HTTP GET against `/readyz`, which cannot complete a TLS handshake;
+  switch to a TCP-connect liveness check or add `openssl s_client`.
+- **Cert SAN ↔ dial name** — every name a client dials (e.g. the gateway dialing
+  `server`) must be in the server cert SAN (gethostname-derived); set the
+  service `hostname:` to match.
+- **Cert-volume timing** — the gateway must read certs from the shared volume
+  *after* the server's first-boot generation; the gateway's plaintext listeners
+  + lazy upstream channel make this benign, but it must be confirmed.
+
+Until PR5b, the server is encrypted-and-mutually-authenticated by default when
+run **without** `--no-tls`/`--no-https` (PR2 generates the certs); the shipped
+compose rigs still pass those flags explicitly.
+
 ## Key custody + threat model
 
 The CA root key is a 0600 PEM in a 0700 directory via `FileKeyProvider`; it is
@@ -164,7 +288,8 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 | PR3 | Per-agent mTLS issuance at enrollment | shipped |
 | PR4 | CA REST surface + this doc | shipped |
 | PR4b | Dashboard CA panel (inventory, revoke, root/CRL download, rotation CTA) | shipped |
-| PR5 | Gateway TLS + distribution flip (drop `--no-tls`/`--no-https`); gateway `_pb.erl` regen for per-agent mTLS through the gateway | planned |
+| PR5 | Gateway TLS: upstream mutual TLS **reference config** (`sys.config.prod`) + `agent_pb`/`gateway_pb`/`management_pb` regen so per-agent mTLS enrollment forwards through the gateway + fail-closed-on-unverified startup guard + TLS-posture logging. (Shipped images/composes stay plaintext until PR5b wires it.) | shipped |
+| PR5b | Distribution flip — drop `--no-tls`/`--no-https` across compose/Dockerfile + shared cert volume (cert-dir ownership, HTTPS healthcheck, cert SAN, volume timing; needs a booted stack — no CI boots the deploy composes) | planned |
 | PR6 (M2) | Subordinate-CA (`--ca-mode subordinate`) + CSR export / offline signing | planned |
 
 Deferred follow-ups tracked across the ladder: `POST /api/v1/ca/issue` with
@@ -176,4 +301,28 @@ detail; a `yuzu_server_ca_cert_revoked_total` counter + `/readyz`
 `ca_crl_published` signal + a periodic CRL re-publish before `nextUpdate` (7-day)
 lapses; a dedicated public-CA rate-limit bucket; dropping expired entries from the
 CRL; `ca.db` expired-row pruning; `yuzu_server_ca_*_expiry_seconds` gauges +
-alerting; a `docs/security-reviews/` PKI record + risk-register entries; ACME (P3).
+alerting; a `docs/security-reviews/` PKI record + risk-register entries;
+**agent↔gateway edge encryption (one-way TLS) — SECURITY PRIORITY for any
+internet-/LAN-exposed gateway** (plaintext command fan-out = fleet RCE risk; see
+the ⚠ SECURITY callout under "Gateway TLS"). Concrete path: a small grpcbox patch
+making `fail_if_no_peer_cert`/`verify` configurable per listener (today hardcoded
+at `grpcbox_pool.erl:26`) so the agent listener can do server-authenticated TLS
+without requiring a client cert (bootstrap-safe), or the QUIC transport (#376).
+Interim mitigation is deployment-side (front with TLS termination / keep on a
+trusted network). Also **gateway listener mTLS for pre-provisioned-agent
+deployments**; an env-substituted `sys.config.src` so
+`YUZU_GW_TLS_*` actually drive the grpcbox cert paths (today they set an advisory
+`yuzu_gw` env that nothing consumes); a **CI guard that regenerates
+ALL gateway `_pb.erl` modules (`agent_pb`, `gateway_pb`, `management_pb`) and diffs
+them against the committed copies, plus asserts every message embedded in more than
+one module has an identical `{name, fnum, type}` field set and matches the canonical
+`proto/yuzu/agent/v1/*.proto`** — gpb generates self-contained modules, so a field
+added to one (e.g. the agent-listener `agent_pb`) but not the `ProxyRegister`
+marshaller `gateway_pb` is silently stripped in transit (the PR5 governance catch;
+`gateway.proto:89` warns of it). A per-module roundtrip test now covers it, but a CI
+guard is the structural fix; an admin-configurable **`--cert-san`
+flag** to inject extra DNS/IP SANs into the auto-generated default server leaves
+(today the SAN is fixed to `localhost` + `127.0.0.1` + `::1` + `gethostname()`,
+so a load-balancer name / VIP / cross-host service alias requires either setting
+the OS hostname or bringing your own certs — `ensure_default_certs` takes a single
+hostname, `server.cpp:1659`); needed for clean cross-host PR5b deployments; ACME (P3).
