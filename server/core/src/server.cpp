@@ -22,6 +22,7 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "ca_routes.hpp"
 #include "ca_store.hpp"
 #include "default_certs.hpp"
 #include "key_provider.hpp"
@@ -203,6 +204,15 @@ namespace yuzu::server {
 
 namespace detail {
 
+// RAII guard that zeroes a std::string's bytes on scope exit (incl. exception
+// unwind). Used wherever a private key is transiently materialised — the CA
+// signing + CRL paths — so the crown jewel is not left in freed heap. (DRYs the
+// formerly-duplicated local KeyZero structs — gov cpp-expert SHOULD.)
+struct ScopedKeyZero {
+    std::string& s;
+    ~ScopedKeyZero() { yuzu::secure_zero(s); }
+};
+
 // -- Platform-specific log path -----------------------------------------------
 
 [[nodiscard]] std::filesystem::path server_log_path() {
@@ -381,6 +391,15 @@ public:
         metrics_.describe("yuzu_server_ca_cert_issued_total",
                           "Per-agent client certificates issued by the internal CA at agent "
                           "enrollment (PKI PR3). Labelled purpose (agent)",
+                          "counter");
+        // PKI PR4 (gov sre/unhappy SHOULD): the CRL could not be (re)built/signed —
+        // the public CRL is stale relative to ca.db. Alert on >0 since a revocation,
+        // since server-side enforcement is live but external consumers are not
+        // seeing the revocation. The audit row (ca.crl.published failure) is the
+        // forensic pair; this counter is the real-time alert source.
+        metrics_.describe("yuzu_server_ca_crl_publish_failures_total",
+                          "Internal-CA CRL (re)publish failures (key load / build / record). A "
+                          "non-zero value since a revocation means the public CRL is stale (PKI PR4)",
                           "counter");
         // #1128: a peer-IP mismatch that was TOLERATED (not rejected) because a
         // NAT-aware accommodation applied. Paired with _peer_mismatch_total
@@ -1749,6 +1768,14 @@ public:
                          default_cert_set_.ca_fingerprint_sha256.empty()
                              ? std::string("operator-supplied")
                              : default_cert_set_.ca_fingerprint_sha256);
+            // Hermes M1: pre-publish the CRL at startup so the PUBLIC GET
+            // /api/v1/ca/crl serves a cached, already-signed CRL and never loads
+            // the CA key for an anonymous caller (the public handler is
+            // serve-or-503, it does NOT build). Best-effort: a failure just means
+            // /ca/crl returns 503 until the next revoke republishes.
+            if (!publish_crl())
+                spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
+                             "the next revocation republishes");
         }
 
         grpc::EnableDefaultHealthCheckService(true);
@@ -2356,10 +2383,7 @@ private:
             return std::nullopt;
         }
         // Zero the CA key on every exit path, including exception unwind.
-        struct KeyZero {
-            std::string& s;
-            ~KeyZero() { yuzu::secure_zero(s); }
-        } ca_key_zero{*ca_key};
+        detail::ScopedKeyZero ca_key_zero{*ca_key};
 
         // Leaf validity: ~1y (the agent auto-renews at 2/3 life), clamped so it
         // can never outlive the issuing CA (x509_ca rejects a leaf beyond the CA).
@@ -2426,7 +2450,10 @@ private:
                                      .target_type = "AgentCertificate",
                                      .target_id = issued->serial_hex,
                                      .detail = "purpose=agent cn=" + agent_id,
-                                     .result = "ok"});
+                                     // gov consistency: "success" (not "ok") so a
+                                     // SIEM filter on ca.% AND result=success
+                                     // catches issuance alongside revoke/publish.
+                                     .result = "success"});
         }
         return std::make_pair(issued->cert_pem, root->cert_pem);
     }
@@ -2443,6 +2470,60 @@ private:
         if (!details || details->serial_hex.empty())
             return false; // unparseable → not our cert; the identity gate handles it
         return ca_store_->is_revoked(details->serial_hex);
+    }
+
+    /// PKI PR4: build + record a new CRL version over the current revoked set,
+    /// signed by the CA, and return its DER. Backs GET /api/v1/ca/crl (served from
+    /// the recorded latest, DoS-safe) and is called by POST /api/v1/ca/revoke to
+    /// republish. Loads the CA key transiently + zeroes it (RAII). nullopt on no
+    /// CA / load / sign failure.
+    std::optional<std::vector<std::uint8_t>> publish_crl() {
+        // Serialise number-allocation + record so the crlNumber stays monotonic
+        // under concurrent publishers (gov architect SHOULD).
+        std::lock_guard<std::mutex> publish_lock(crl_publish_mu_);
+        if (!ca_store_ || !ca_store_->is_open())
+            return std::nullopt;
+        auto root = ca_store_->get_root();
+        if (!root)
+            return std::nullopt;
+        const std::filesystem::path dir =
+            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+        FileKeyProvider kp(dir);
+        auto ca_key = kp.load_key(root->key_ref);
+        if (!ca_key) {
+            spdlog::error("PKI: cannot load CA issuing key — CRL not published");
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
+        detail::ScopedKeyZero ca_key_zero{*ca_key};
+
+        std::vector<pki::CrlRevocation> revoked;
+        for (const auto& r : ca_store_->list_revoked()) {
+            revoked.push_back(
+                {r.serial_hex,
+                 std::chrono::system_clock::time_point{std::chrono::seconds{r.revoked_at}}});
+        }
+        const auto now = std::chrono::system_clock::now();
+        const pki::Validity validity{now, now + std::chrono::hours(24 * 7)}; // 7-day nextUpdate
+        const std::uint64_t number = ca_store_->next_crl_number();
+        auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
+        if (!der) {
+            spdlog::error("PKI: build_crl failed");
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
+        CrlVersionRecord rec;
+        rec.version = static_cast<int64_t>(number);
+        rec.der = *der;
+        rec.this_update =
+            std::chrono::duration_cast<std::chrono::seconds>(validity.not_before.time_since_epoch())
+                .count();
+        rec.next_update =
+            std::chrono::duration_cast<std::chrono::seconds>(validity.not_after.time_since_epoch())
+                .count();
+        if (!ca_store_->record_crl(rec))
+            spdlog::warn("PKI: failed to record CRL v{} (serving it regardless)", number);
+        return der;
     }
 
     // -- Web server -----------------------------------------------------------
@@ -3047,6 +3128,11 @@ private:
                 req.path == "/login/mfa/enroll" || req.path == "/health" ||
                 req.path == "/api/health" || req.path == "/auth/oidc/start" ||
                 req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
+                // PKI PR4: the CA root cert + CRL are public by design — clients
+                // and browsers need them to establish trust / check revocation
+                // before they have any session. Exact-match only; /api/v1/ca/issued
+                // and /api/v1/ca/revoke remain Security-gated below.
+                req.path == "/api/v1/ca/root" || req.path == "/api/v1/ca/crl" ||
                 req.path.starts_with("/static/")) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
@@ -7088,6 +7174,14 @@ private:
                                            directory_sync_.get(), patch_manager_.get(),
                                            deployment_store_.get(), discovery_store_.get());
 
+        // -- PKI PR4: internal-CA REST surface (/api/v1/ca/*) ---------------------
+        // The publish-CRL callback captures `this`; like the agent-cert signer it
+        // relies on the gRPC/web drain in stop() running before members destruct.
+        ca_routes_ = std::make_unique<CaRoutes>();
+        ca_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, audit_fn, ca_store_.get(),
+            [this]() -> std::optional<std::vector<std::uint8_t>> { return publish_crl(); });
+
         // -- Register REST API v1 routes (Phase 3) --------------------------------
 
         rest_api_v1_ = std::make_unique<RestApiV1>();
@@ -7641,6 +7735,11 @@ private:
     std::string agent_ca_cert_pem_;
     std::mutex csr_issue_mu_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> csr_issue_last_;
+    // Serialises publish_crl() so next_crl_number()+record_crl() are atomic across
+    // concurrent publishers (startup pre-publish vs a revoke, or two revokes) —
+    // otherwise both could read the same number and last-writer-wins overwrites,
+    // breaking RFC 5280 monotonic crlNumber (gov architect SHOULD).
+    std::mutex crl_publish_mu_;
     // Cache of is_yuzu_issued (immutable per cert) — avoids a per-heartbeat
     // verify_chain fleet-wide (gov UP-7). Keyed by full leaf PEM.
     std::mutex yuzu_issued_cache_mu_;
@@ -7674,6 +7773,7 @@ private:
     std::unique_ptr<WebhookRoutes> webhook_routes_;
     std::unique_ptr<OffloadRoutes> offload_routes_;
     std::unique_ptr<DiscoveryRoutes> discovery_routes_;
+    std::unique_ptr<CaRoutes> ca_routes_; // PKI PR4: /api/v1/ca/*
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     std::unique_ptr<FleetTopologyStore> fleet_topology_store_;

@@ -85,6 +85,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Internal-CA REST surface — `/api/v1/ca/*` (PKI PR4).** Operators and
+  automation can now manage the built-in CA over REST:
+  `GET /api/v1/ca/root` (CA certificate PEM, **public** — trust it in a browser
+  or hand it to agents), `GET /api/v1/ca/crl` (certificate revocation list, DER,
+  **public**), `GET /api/v1/ca/issued` (issued-cert inventory — serial, subject,
+  purpose, status, expiry; `Security:Read`), and `POST /api/v1/ca/revoke`
+  (`{"serial_hex","reason"}`; `Security:Delete` — revocation takes effect
+  server-side immediately and republishes the CRL). New metric
+  `yuzu_server_ca_cert_issued_total{purpose}`; audit actions `ca.cert.revoked` +
+  `ca.crl.published`. The routed reference doc `docs/pki-architecture.md` lands
+  with this change. (`POST /api/v1/ca/issue` for general operator-chosen-CN
+  signing is intentionally deferred — it needs a non-agent namespace so an
+  operator-issued cert can't impersonate an agent; the dashboard CA panel is a
+  follow-up.) See `docs/pki-architecture.md` "CA REST surface".
+
 - **Per-agent mutual TLS, auto-issued at enrollment (PKI PR3).** When the
   server runs with its built-in CA (the default-cert bootstrap above) and an
   agent connects without an operator-supplied client cert, the agent now

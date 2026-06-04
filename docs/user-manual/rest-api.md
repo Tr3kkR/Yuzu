@@ -49,6 +49,7 @@ Every API response (versioned and legacy) carries the standard Yuzu HTTP securit
   - [API Tokens](#api-tokens)
   - [Sessions](#sessions)
   - [Quarantine](#quarantine)
+  - [Internal CA](#internal-ca)
   - [RBAC](#rbac)
   - [Tags](#tags)
   - [Definitions](#definitions)
@@ -857,6 +858,92 @@ Release a device from quarantine.
 
 ---
 
+### Internal CA
+
+The server's built-in certificate authority (see `docs/pki-architecture.md`) is
+managed over REST. `root` and `crl` are **public** (clients and browsers need
+them to establish trust / check revocation before they have a session); the
+inventory and revoke endpoints are gated by the `Security` securable.
+
+> Note on `Security` operations: certificate **revocation** uses `Security:Delete`
+> (a destructive operation on an issued cert), while device **quarantine** uses
+> `Security:Execute`. A custom role scoped to security operations needs both.
+
+#### `GET /api/v1/ca/root`
+
+Download the CA root certificate (PEM) and add it to an OS/browser trust store.
+**Public** — no authentication. Returns `Content-Type: application/x-pem-file`,
+`Content-Disposition: attachment; filename="yuzu-ca.pem"`,
+`Cache-Control: public, max-age=86400`. `404` if no CA root exists.
+
+```bash
+curl https://yuzu.example.com/api/v1/ca/root -o yuzu-ca.pem
+openssl x509 -in yuzu-ca.pem -noout -fingerprint -sha256
+```
+
+#### `GET /api/v1/ca/crl`
+
+Download the current certificate revocation list (DER). **Public** — no
+authentication. Returns `Content-Type: application/pkix-crl`,
+`Cache-Control: no-cache, must-revalidate`. `503` if no CRL has been published
+yet (transient — the server pre-publishes at startup and republishes on each
+revocation).
+
+```bash
+curl https://yuzu.example.com/api/v1/ca/crl -o yuzu.crl
+openssl crl -inform DER -in yuzu.crl -noout -text
+```
+
+#### `GET /api/v1/ca/issued`
+
+List certificates issued by the internal CA. **Permission:** `Security:Read`.
+Query params `limit` (1–1000, default 200) and `offset`. The full certificate PEM
+and enrollment reference are intentionally omitted.
+
+```json
+{
+  "items": [
+    {
+      "serial_hex": "3A4B5C6D...",
+      "subject": "agent-prod-01",
+      "san": "URI:yuzu://<ca-fp>/agent/agent-prod-01",
+      "purpose": "agent",
+      "status": "active",
+      "not_after": 1780000000,
+      "issued_at": 1710849600,
+      "issued_by": "agent:agent-prod-01"
+    }
+  ],
+  "count": 1,
+  "meta": { "api_version": "v1" }
+}
+```
+
+#### `POST /api/v1/ca/revoke`
+
+Revoke a certificate by serial. **Permission:** `Security:Delete`. Revocation
+takes effect server-side **immediately** (the mTLS accept gate reads `ca.db`, not
+the CRL); the CRL is then republished. Request body (max 64 KB):
+
+```json
+{ "serial_hex": "3A4B5C6D...", "reason": "key compromise" }
+```
+
+`serial_hex` is required (1–64 hex digits, case-insensitive). Unknown JSON fields
+are rejected. Response:
+
+```json
+{ "revoked": true, "serial_hex": "3A4B5C6D...", "crl_republished": true, "meta": { "api_version": "v1" } }
+```
+
+`crl_republished: false` means the revocation stands (the agent is refused on its
+next gRPC call) but the public CRL could not be rebuilt — external CRL consumers
+will not see it until the next successful publish. Errors: `400` (missing/invalid
+serial, unknown field, bad JSON), `403` (missing `Security:Delete`), `404` (serial
+not found or already revoked), `413` (body too large), `503` (CA unavailable).
+
+---
+
 ### RBAC
 
 Role-Based Access Control endpoints for inspecting roles, permissions, and authorization decisions.
@@ -1367,6 +1454,9 @@ Query audit events.
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
+| `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
+| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`, or `result=failure` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial. |
+| `ca.crl.published` | CRL (re)published after a revocation. `target_type=Security`, `target_id=<serial that triggered it>`. `result=success`, or `result=failure` when the CRL could not be rebuilt/recorded (the revocation still stands; the public CRL is momentarily stale). |
 | `tag.set` | Tag created or updated |
 | `tag.delete` | Tag deleted |
 

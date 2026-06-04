@@ -226,6 +226,7 @@ if build_server
       'unit/server/test_cert_reloader.cpp',
       'unit/server/test_x509_ca.cpp',
       'unit/server/test_ca_store.cpp',
+      'unit/server/test_ca_routes.cpp',
       'unit/server/test_key_provider.cpp',
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',

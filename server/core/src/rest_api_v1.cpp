@@ -462,6 +462,18 @@ const std::string& openapi_spec() {
     "/tokens/{token_id}": {
       "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}}}
     },
+    "/ca/root": {
+      "get": {"summary": "Internal CA root certificate (PEM, public)", "tags": ["Security"], "responses": {"200": {"description": "PEM CA certificate", "content": {"application/x-pem-file": {}}}, "404": {"description": "No CA root"}}}
+    },
+    "/ca/crl": {
+      "get": {"summary": "Internal CA certificate revocation list (DER, public)", "tags": ["Security"], "responses": {"200": {"description": "DER-encoded CRL", "content": {"application/pkix-crl": {}}}, "503": {"description": "CRL unavailable"}}}
+    },
+    "/ca/issued": {
+      "get": {"summary": "List certificates issued by the internal CA", "tags": ["Security"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer"}}, {"name": "offset", "in": "query", "schema": {"type": "integer"}}], "responses": {"200": {"description": "Issued-certificate inventory"}, "403": {"description": "Requires Security:Read"}}}
+    },
+    "/ca/revoke": {
+      "post": {"summary": "Revoke a certificate by serial", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["serial_hex"], "properties": {"serial_hex": {"type": "string"}, "reason": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked; CRL republished"}, "403": {"description": "Requires Security:Delete"}, "404": {"description": "Serial not found or already revoked"}}}
+    },
     "/quarantine": {
       "get": {"summary": "List quarantined devices", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices"}}},
       "post": {"summary": "Quarantine a device", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}}}
