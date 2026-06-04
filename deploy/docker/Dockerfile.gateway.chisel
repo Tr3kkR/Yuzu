@@ -26,6 +26,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
 
 WORKDIR /src
 COPY gateway/rebar.config gateway/rebar.lock ./
+# Vendored+patched grpcbox (PKI PR5c) — present at deps-time so `--deps_only` uses
+# the checkout, not a git-fetched stock grpcbox. See _checkouts/grpcbox/YUZU_PATCH.md.
+COPY gateway/_checkouts ./_checkouts
 RUN --mount=type=cache,target=/root/.cache/rebar3 \
     rebar3 compile --deps_only
 

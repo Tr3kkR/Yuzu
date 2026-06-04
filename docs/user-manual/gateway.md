@@ -254,18 +254,21 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 > network.** The gateway is the command fan-out plane. A plaintext,
 > internet-reachable agent listener has **no confidentiality, no integrity, and no
 > gateway authentication** — an on-path attacker can inject commands → **remote
-> code execution across the fleet**. Until one-way TLS lands on the agent listener,
-> a gateway deployment **MUST** either (a) terminate TLS in front of the gateway (a
-> reverse proxy doing TLS on `:50051`, forwarding only over loopback / a trusted
-> segment), or (b) keep `:50051` on a trusted network (VPN / private subnet /
-> service mesh). Direct agent→server connections are already full mTLS (PR2/PR3) —
-> this gap is specific to the gateway edge.
+> code execution across the fleet**. **One-way (server-authenticated) TLS now
+> exists for the agent listener (PKI PR5c)** — enable it (see below) and distribute
+> the CA to agents. **Until your deployment turns it on (the shipped composes are
+> still plaintext pending PR5b), a gateway exposed to an untrusted network MUST**
+> either (a) terminate TLS in front of the gateway (a reverse proxy doing TLS on
+> `:50051`, forwarding only over loopback / a trusted segment), or (b) keep
+> `:50051` on a trusted network (VPN / private subnet / service mesh). Direct
+> agent→server connections are already full mTLS (PR2/PR3) — this gap is specific
+> to the gateway edge.
 
-| Hop | M1 state | Notes |
+| Hop | State | Notes |
 |---|---|---|
 | gateway → server upstream (`:50055`) | **mutual TLS** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. |
-| agent → gateway (`:50051`) | **plaintext** | grpcbox v0.17.1 hardcodes `fail_if_no_peer_cert=true` on any TLS listener — an unenrolled agent has no client cert yet, so TLS here would break bootstrap. Tracked follow-up (one-way TLS). |
-| operator → gateway mgmt (`:50063`) | **plaintext** | Same grpcbox constraint. |
+| agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` (needs the vendored `_checkouts/grpcbox`). Shipped composes are plaintext until PR5b wires it + ships the CA to agents. |
+| operator → gateway mgmt (`:50063`) | **plaintext / strict mTLS** | Do NOT one-way-TLS the privileged mgmt plane (would be unauthenticated). Keep on a trusted network, or require client certs via strict mTLS (omit `verify`/`fail_if_no_peer_cert`). |
 
 TLS is configured **entirely in the `grpcbox` block** (grpcbox reads its own
 config at boot — the old `{tls, [...]}` advisory key under `yuzu_gw` was removed

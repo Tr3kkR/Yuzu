@@ -140,8 +140,8 @@ source:
 | Hop | M1 TLS | Why |
 |---|---|---|
 | gateway → server upstream (`GatewayUpstream`, :50055) | **mutual TLS** | Both peers hold CA-issued certs (the gateway uses the `default-gateway` leaf, which has `serverAuth`+`clientAuth`). No bootstrap problem. |
-| agent → gateway (:50051) | **plaintext (M1)** | grpcbox forces `fail_if_no_peer_cert`, but an unenrolled agent has no client cert until it completes CSR enrollment — a TLS agent listener would make bootstrap impossible. Encrypting this edge needs grpcbox one-way-TLS support or the QUIC transport (#376). Agent identity across the gateway is carried at the app/proto layer (`gateway_observed_peer`, #1064), not the transport. |
-| operator → gateway mgmt (:50063) | plaintext (M1) | Same grpcbox constraint; tracked with the agent edge. |
+| agent → gateway (:50051) | **one-way TLS (PR5c; live-wired in PR5b)** | The vendored+patched grpcbox (`_checkouts/grpcbox`) lets the agent listener run **server-authenticated** TLS (`verify_none` + `fail_if_no_peer_cert=false`) — encrypted + gateway-authenticated, **no client cert required**, so an unenrolled agent still bootstraps. Enabled in `sys.config.prod`; distributing the CA to agents + the deployed-compose wiring land in PR5b (the shipped composes are still plaintext until then). Agent identity stays app-layer (`gateway_observed_peer`, #1064), not transport. |
+| operator → gateway mgmt (:50063) | **plaintext / strict mTLS** | The privileged operator/command plane. Do NOT one-way-TLS it (would be encrypted-but-unauthenticated). Keep on a trusted network, or require client certs via strict mTLS (the patched grpcbox's defaults — omit `verify`/`fail_if_no_peer_cert`); the server's command client presents a cert, so mTLS works here with no bootstrap problem. |
 
 > **⚠ SECURITY — do not expose the plaintext gateway agent edge to an untrusted
 > network.** The gateway is the command fan-out plane: it pushes
@@ -155,23 +155,25 @@ source:
 > exposed deployment. **Direct agent→server connections are already full mTLS
 > (PR2/PR3) over any network — the gap is specific to the gateway edge.**
 >
-> **Until one-way TLS lands on the agent listener, a gateway deployment MUST do one
-> of:** (a) terminate TLS in front of the gateway (a reverse proxy / L7 load
-> balancer doing TLS on :50051, forwarding plaintext only over loopback/a trusted
-> segment); or (b) keep the gateway agent port on a trusted network only (VPN /
-> private subnet / mTLS-enforcing service mesh), never directly internet-exposed.
-> The proper fix — server-authenticated (one-way) TLS on the agent listener, which
-> gives encryption + gateway authentication without requiring a client cert (so
-> unenrolled agents can still bootstrap) — requires a small grpcbox patch to make
-> `fail_if_no_peer_cert`/`verify` configurable (grpcbox v0.17.1 hardcodes them at
-> `grpcbox_pool.erl:26`), or the QUIC transport (#376). Tracked as a follow-up.
+> **One-way TLS now closes this (PR5c)** — the vendored+patched grpcbox
+> (`_checkouts/grpcbox`) makes `fail_if_no_peer_cert`/`verify` configurable, so the
+> agent listener can run server-authenticated TLS (`verify_none` +
+> `fail_if_no_peer_cert=false`): encrypted + gateway-authenticated, no client cert
+> required (bootstrap-safe). It is enabled in `sys.config.prod`. **But the deployed
+> composes are still plaintext until PR5b wires it in + distributes the CA to
+> agents.** So **until your deployment is on PR5b (or you enable one-way TLS + ship
+> the CA yourself), a gateway exposed to an untrusted network MUST still do one
+> of:** (a) terminate TLS in front of the gateway (reverse proxy on :50051,
+> forwarding plaintext only over loopback/a trusted segment); or (b) keep the agent
+> port on a trusted network (VPN / private subnet / service mesh). The QUIC
+> transport (#376) is the longer-term native path.
 
 The canonical correct gateway TLS config is `gateway/config/sys.config.prod`
-(upstream `{https,...}` + a documented optional listener-mTLS block for
-pre-provisioned-agent deployments). It is unit-tested in
-`gateway/apps/yuzu_gw/test/yuzu_gw_mtls_tests.erl` — a real EC mutual handshake
-(P-384 CA / P-256 leaf) proves the option shape and that a certless client is
-rejected. `yuzu_gw_app:log_tls_state/0` reports the *actual* grpcbox posture at
+(upstream `{https,...}` mutual TLS + **one-way TLS on the agent listener** (PR5c) +
+a documented optional strict-mTLS block for the privileged mgmt listener). It is
+unit-tested in `gateway/apps/yuzu_gw/test/yuzu_gw_mtls_tests.erl` — real EC
+handshakes (P-384 CA / P-256 leaf) prove both the mutual-TLS option shape (certless
+client rejected) **and** the one-way shape (certless client accepted, bootstrap-safe). `yuzu_gw_app:log_tls_state/0` reports the *actual* grpcbox posture at
 startup (the older `tls_enabled`/`tls` env is advisory only — grpcbox reads its
 own config at boot).
 
@@ -289,7 +291,8 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 | PR4 | CA REST surface + this doc | shipped |
 | PR4b | Dashboard CA panel (inventory, revoke, root/CRL download, rotation CTA) | shipped |
 | PR5 | Gateway TLS: upstream mutual TLS **reference config** (`sys.config.prod`) + `agent_pb`/`gateway_pb`/`management_pb` regen so per-agent mTLS enrollment forwards through the gateway + fail-closed-on-unverified startup guard + TLS-posture logging. (Shipped images/composes stay plaintext until PR5b wires it.) | shipped |
-| PR5b | Distribution flip — drop `--no-tls`/`--no-https` across compose/Dockerfile + shared cert volume (cert-dir ownership, HTTPS healthcheck, cert SAN, volume timing; needs a booted stack — no CI boots the deploy composes) | planned |
+| PR5c | One-way (server-authenticated) TLS on the agent listener — vendored+patched grpcbox (`_checkouts/grpcbox`) makes `verify`/`fail_if_no_peer_cert` configurable; agent listener enabled in `sys.config.prod`. Closes the plaintext agent↔gateway edge with no client cert required (bootstrap-safe). Live-wiring + CA distribution + boot-test land in PR5b. | shipped |
+| PR5b | Distribution flip — drop `--no-tls`/`--no-https` across compose/Dockerfile + shared cert volume + **wire PR5c one-way TLS live + distribute the CA to agents** (cert-dir ownership, HTTPS healthcheck, cert SAN, volume timing; needs a booted stack — no CI boots the deploy composes) | planned |
 | PR6 (M2) | Subordinate-CA (`--ca-mode subordinate`) + CSR export / offline signing | planned |
 
 Deferred follow-ups tracked across the ladder: `POST /api/v1/ca/issue` with
@@ -302,15 +305,16 @@ detail; a `yuzu_server_ca_cert_revoked_total` counter + `/readyz`
 lapses; a dedicated public-CA rate-limit bucket; dropping expired entries from the
 CRL; `ca.db` expired-row pruning; `yuzu_server_ca_*_expiry_seconds` gauges +
 alerting; a `docs/security-reviews/` PKI record + risk-register entries;
-**agent↔gateway edge encryption (one-way TLS) — SECURITY PRIORITY for any
-internet-/LAN-exposed gateway** (plaintext command fan-out = fleet RCE risk; see
-the ⚠ SECURITY callout under "Gateway TLS"). Concrete path: a small grpcbox patch
-making `fail_if_no_peer_cert`/`verify` configurable per listener (today hardcoded
-at `grpcbox_pool.erl:26`) so the agent listener can do server-authenticated TLS
-without requiring a client cert (bootstrap-safe), or the QUIC transport (#376).
-Interim mitigation is deployment-side (front with TLS termination / keep on a
-trusted network). Also **gateway listener mTLS for pre-provisioned-agent
-deployments**; an env-substituted `sys.config.src` so
+agent↔gateway edge encryption (one-way TLS) — **the grpcbox-patch capability
+SHIPPED in PR5c** (vendored `_checkouts/grpcbox` makes `fail_if_no_peer_cert`/
+`verify` configurable; agent listener enabled in `sys.config.prod`); what remains
+is the **live wiring + CA-to-agent distribution in PR5b** (and the deployment-side
+interim mitigation — TLS termination / trusted network — still applies to any
+not-yet-flipped exposed gateway). Upstreaming the patch to grpcbox (then drop the
+vendor) and the QUIC transport (#376) are the longer-term paths. Also **gateway
+mgmt-listener mTLS for the server command-forwarding client** (one-way TLS would
+leave the privileged mgmt plane unauthenticated — use strict mTLS there);
+an env-substituted `sys.config.src` so
 `YUZU_GW_TLS_*` actually drive the grpcbox cert paths (today they set an advisory
 `yuzu_gw` env that nothing consumes); a **CI guard that regenerates
 ALL gateway `_pb.erl` modules (`agent_pb`, `gateway_pb`, `management_pb`) and diffs

@@ -25,6 +25,10 @@ WORKDIR /src
 
 # Copy only dependency manifests — this layer caches until deps change
 COPY gateway/rebar.config gateway/rebar.lock ./
+# Vendored+patched grpcbox (PKI PR5c): present at deps-time so `--deps_only` uses
+# the checkout instead of git-fetching the stock unpatched grpcbox into a tree the
+# release would never use. See gateway/_checkouts/grpcbox/YUZU_PATCH.md.
+COPY gateway/_checkouts ./_checkouts
 
 # Fetch and compile deps (but not app code). The rebar3 global cache holds
 # downloaded Hex package tarballs; mounting it skips the network round-trip

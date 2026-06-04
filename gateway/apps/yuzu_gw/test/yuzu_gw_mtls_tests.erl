@@ -271,6 +271,75 @@ no_client_cert_rejected(Certs) ->
     BothOk = (element(1, ClientRes) =:= ok) andalso (element(1, ServerRes) =:= ok),
     ?assertNot(BothOk).
 
+%%%===================================================================
+%%% 4. One-way (server-authenticated) TLS — PR5c
+%%%   The vendored+patched grpcbox (_checkouts/grpcbox) lets a listener set
+%%%   verify_none + fail_if_no_peer_cert=false so an UNENROLLED agent (no client
+%%%   cert yet) can bootstrap over an ENCRYPTED, gateway-authenticated channel —
+%%%   closing the plaintext agent<->gateway edge without breaking enrollment.
+%%%===================================================================
+
+%% Patched grpcbox_pool reads verify/fail_if_no_peer_cert from transport_opts.
+oneway_transport_opts_selects_ssl_without_client_cert_test() ->
+    {Transport, SslOpts} = pool_transport(#{ssl => true, keyfile => "k", certfile => "c",
+                                            cacertfile => "ca", verify => verify_none,
+                                            fail_if_no_peer_cert => false}),
+    ?assertEqual(ssl, Transport),
+    ?assertEqual(verify_none, proplists:get_value(verify, SslOpts)),
+    ?assertEqual(false, proplists:get_value(fail_if_no_peer_cert, SslOpts)).
+
+%% Backward-compat: WITHOUT those keys the patch must preserve strict mTLS
+%% (the PR5 default) — a missing key must never silently weaken a listener.
+default_transport_opts_preserve_strict_mtls_test() ->
+    {ssl, SslOpts} = pool_transport(#{ssl => true, keyfile => "k", certfile => "c",
+                                      cacertfile => "ca"}),
+    ?assertEqual(verify_peer, proplists:get_value(verify, SslOpts)),
+    ?assertEqual(true, proplists:get_value(fail_if_no_peer_cert, SslOpts)).
+
+oneway_handshake_test_() ->
+    {setup, fun setup_certs/0, fun cleanup_certs/1,
+     fun(Certs) ->
+        case Certs of
+            {error, _} ->
+                [{"one-way handshake skipped (openssl unavailable)",
+                  fun() -> ?assert(true) end}];
+            #{} ->
+                [{"unenrolled client (NO cert) connects to a one-way-TLS server",
+                  fun() -> oneway_no_client_cert_ok(Certs) end}]
+        end
+     end}.
+
+%% Server == the grpcbox one-way listener shape (verify_none, no peer-cert required).
+oneway_server_ssl_opts(#{leaf := Leaf, key := Key, ca := Ca}) ->
+    [{certfile, Leaf}, {keyfile, Key}, {honor_cipher_order, false},
+     {cacertfile, Ca}, {fail_if_no_peer_cert, false}, {verify, verify_none},
+     {versions, ['tlsv1.2']}, {ciphers, prod_ciphers()},
+     {mode, binary}, {active, false}, {reuseaddr, true}].
+
+oneway_no_client_cert_ok(Certs) ->
+    {ok, _} = application:ensure_all_started(ssl),
+    {ok, LSock} = ssl:listen(0, oneway_server_ssl_opts(Certs)),
+    {ok, {_, Port}} = ssl:sockname(LSock),
+    Parent = self(),
+    _ = spawn_link(fun() ->
+        case ssl:transport_accept(LSock, 5000) of
+            {ok, TSock} -> Parent ! {server_result, ssl:handshake(TSock, 5000)};
+            Err -> Parent ! {server_result, Err}
+        end
+    end),
+    %% The unenrolled-agent bootstrap case: NO client cert, but the client still
+    %% verifies the gateway's server cert (one-way / server-authenticated TLS).
+    NoCert = [{cacertfile, maps:get(ca, Certs)}, {verify, verify_peer},
+              {versions, ['tlsv1.2']}, {ciphers, prod_ciphers()},
+              {server_name_indication, "localhost"}, {mode, binary}, {active, false}],
+    ClientRes = ssl:connect("localhost", Port, NoCert, 5000),
+    ServerRes = receive {server_result, R} -> R after 6000 -> {error, server_timeout} end,
+    catch ssl:close(LSock),
+    ?assertMatch({ok, _}, ClientRes),
+    ?assertMatch({ok, _}, ServerRes),
+    {ok, CSock} = ClientRes,
+    catch ssl:close(CSock).
+
 %%%-------------------------------------------------------------------
 %%% Cert generation (EC P-384 CA, EC P-256 leaf serverAuth+clientAuth)
 %%%-------------------------------------------------------------------

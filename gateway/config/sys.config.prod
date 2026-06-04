@@ -1,4 +1,5 @@
-%% Production configuration reference — gateway TLS posture (PKI PR5).
+%% Production configuration reference — gateway TLS posture
+%% (PKI PR5 upstream mutual TLS; PR5c agent-listener one-way TLS).
 %%
 %% NOT auto-selected by the build: `rebar3 as prod release` uses the base relx
 %% {sys_config, "config/sys.config"} unless the prod profile overrides it, and
@@ -97,33 +98,40 @@
             ]}], #{}}
         ]}},
 
-        %% ── Listeners: PLAINTEXT by default ─────────────────────────────────
-        %% ⚠ SECURITY: the agent listener (:50051) is the COMMAND fan-out plane.
-        %% Do NOT expose it plaintext to an untrusted network (internet/corp LAN):
-        %% an on-path attacker can inject commands -> fleet-wide RCE. Front it with
-        %% TLS termination, or keep it on a trusted segment, until one-way TLS lands
-        %% (see docs/pki-architecture.md "Gateway TLS" ⚠ SECURITY).
-        %%
-        %% grpcbox v0.17.1 hardcodes `fail_if_no_peer_cert=true` on ANY TLS
-        %% listener (grpcbox_pool.erl:26) — there is no request-but-don't-require
-        %% mode. An unenrolled agent has no client cert until it completes CSR
-        %% enrollment, so a TLS agent listener would make bootstrap impossible.
-        %% Encrypting the agent edge needs grpcbox one-way-TLS or QUIC (#376).
-        %%
-        %% To enable listener mTLS for a PRE-PROVISIONED-AGENT deployment (every
-        %% agent already holds a CA-issued client cert), add this transport_opts
-        %% map to each server map below. NOTE the mandatory `ssl => true` — WITHOUT
-        %% it grpcbox silently runs plaintext:
-        %%   transport_opts => #{ssl => true,
-        %%                       certfile   => "/etc/yuzu/certs/default-gateway.pem",
-        %%                       keyfile    => "/etc/yuzu/certs/default-gateway.key",
-        %%                       cacertfile => "/etc/yuzu/certs/default-ca.pem"}
+        %% ── Listeners ──────────────────────────────────────────────────────
+        %% Agent listener (:50051): ONE-WAY (server-authenticated) TLS — encrypts
+        %% the hop and authenticates the GATEWAY to agents, WITHOUT requiring a
+        %% client cert (verify_none + fail_if_no_peer_cert=false). This closes the
+        %% plaintext command-fan-out edge while still letting an UNENROLLED agent
+        %% bootstrap (it has no client cert until it completes CSR enrollment).
+        %% Requires the vendored+patched grpcbox (_checkouts/grpcbox) — stock
+        %% grpcbox v0.17.1 hardcodes fail_if_no_peer_cert=true. Agent identity is
+        %% app-layer (enrollment token / gateway_observed_peer), NOT transport.
+        %% `ssl => true` is mandatory; without it grpcbox silently runs plaintext.
         {servers, [
             #{grpc_opts => #{
                 service_protos => [agent_pb],
                 services => #{'yuzu.agent.v1.AgentService' => yuzu_gw_agent_service}
             },
-            listen_opts => #{port => 50051, ip => {0,0,0,0}}},
+            listen_opts => #{port => 50051, ip => {0,0,0,0}},
+            transport_opts => #{ssl => true,
+                                certfile   => "/etc/yuzu/certs/default-gateway.pem",
+                                keyfile    => "/etc/yuzu/certs/default-gateway.key",
+                                cacertfile => "/etc/yuzu/certs/default-ca.pem",
+                                verify => verify_none,
+                                fail_if_no_peer_cert => false}},
+            %% Mgmt listener (:50063): the PRIVILEGED operator/command plane. Do
+            %% NOT use one-way TLS here — that would encrypt but leave the plane
+            %% UNAUTHENTICATED (anyone trusting the gateway cert could push
+            %% commands). Keep it on a trusted network, OR require client certs with
+            %% STRICT mTLS (omit verify/fail_if_no_peer_cert so the patched grpcbox
+            %% falls back to its verify_peer + fail_if_no_peer_cert=true defaults) —
+            %% the server's command-forwarding client presents a cert, so mTLS works
+            %% here without a bootstrap problem:
+            %%   transport_opts => #{ssl => true,
+            %%                       certfile   => "/etc/yuzu/certs/default-gateway.pem",
+            %%                       keyfile    => "/etc/yuzu/certs/default-gateway.key",
+            %%                       cacertfile => "/etc/yuzu/certs/default-ca.pem"}
             #{grpc_opts => #{
                 service_protos => [management_pb],
                 services => #{'yuzu.server.v1.ManagementService' => yuzu_gw_mgmt_service}

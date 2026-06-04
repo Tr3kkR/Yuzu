@@ -95,13 +95,16 @@ Run each component under its own system user:
 
 ## Gateway TLS (if you deploy the Erlang gateway)
 
-> **⚠ The gateway agent listener (`:50051`) is plaintext in the current release.**
+> **⚠ The gateway agent listener (`:50051`) is plaintext in the *shipped* composes.**
 > The gateway is the command fan-out plane — a plaintext, untrusted-network-reachable
-> agent listener lets an on-path attacker inject commands (fleet RCE). grpcbox forces
-> client-cert-required on any TLS listener, which would break unenrolled-agent
-> bootstrap, so one-way TLS there is a tracked follow-up.
+> agent listener lets an on-path attacker inject commands (fleet RCE).
+> **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
+> the agent listener (`transport_opts` with `verify => verify_none`,
+> `fail_if_no_peer_cert => false`; see `gateway/config/sys.config.prod`) and ship the
+> CA to your agents. It is not on by default in the deployed composes until PR5b.
 
-If you deploy the gateway, you **must** protect the agent edge at the network layer:
+If you deploy the gateway, you **must** protect the agent edge — either enable the
+PR5c one-way TLS above (and distribute the CA), **or** at the network layer:
 - **Terminate TLS in front** of the gateway (reverse proxy / L7 LB doing TLS on
   `:50051`, forwarding only over loopback or a trusted segment), **or**
 - keep `:50051` on a **trusted network** (VPN / private subnet / service mesh) — never

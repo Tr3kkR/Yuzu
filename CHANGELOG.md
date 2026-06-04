@@ -85,6 +85,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Gateway agent-edge one-way TLS — closes the plaintext command-fan-out hop
+  (PKI PR5c).** The Erlang gateway's agent listener (`:50051`) can now run
+  **server-authenticated (one-way) TLS** — encrypted + gateway-authenticated, with
+  **no client cert required**, so an unenrolled agent still bootstraps (CSR
+  enrollment then upgrades identity at the app layer). This closes the
+  fleet-RCE-risk plaintext agent↔gateway edge that PR5 had to leave open. It needed
+  a 2-line patch to grpcbox v0.17.1 (which hardcodes `fail_if_no_peer_cert=true` /
+  `verify=verify_peer` on every TLS listener), carried as a **vendored copy in
+  `gateway/_checkouts/grpcbox`** that makes both options read from `transport_opts`
+  (defaults preserve stock strict mTLS — fully backward-compatible). Enabled on the
+  agent listener in `gateway/config/sys.config.prod`; the privileged mgmt listener
+  deliberately does **not** use one-way TLS (it would be unauthenticated). Covered
+  by a real EC one-way-TLS handshake test (certless client accepted) alongside the
+  existing mTLS test (certless client rejected). 200 eunit pass; dialyzer clean.
+  *(The deployed composes + the agent `--ca-cert` / CA-distribution wiring that
+  turns this on live land in PR5b; see `docs/pki-architecture.md` "Gateway TLS".)*
+
 - **Gateway TLS — upstream mutual TLS + per-agent enrollment through the gateway
   (PKI PR5).** The Erlang gateway can now speak mutual TLS to the server's
   `GatewayUpstream` listener using the CA-issued `default-gateway` leaf
@@ -111,7 +128,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent port (`:50051`) to an untrusted network** — it is the command fan-out
   plane, so a MITM there is a fleet-RCE risk; front it with TLS termination or keep
   it on a trusted segment (see the SECURITY callout in `docs/pki-architecture.md`).
-  Encrypting that hop natively is a tracked follow-up (grpcbox one-way-TLS / QUIC). Covered by a new EUnit suite
+  Encrypting that hop natively is **resolved in PKI PR5c above** (one-way TLS on the
+  agent listener). Covered by a new EUnit suite
   including a real EC mutual-TLS handshake. See `docs/pki-architecture.md`
   "Gateway TLS". (The compose/Dockerfile distribution flip — encrypted-by-default
   containers — is staged as PR5b; the server is already encrypted-by-default when
