@@ -39,6 +39,20 @@ std::string format_conflict(std::string_view detail) {
     return std::string(kConflictPrefix) + " " + std::string(detail);
 }
 
+// Map a Guardian event_type to the compliance state it implies for the per-(agent,
+// rule) status table, or nullptr if the event carries no compliance signal (e.g.
+// guard.armed is a lifecycle marker, not a verdict). guard.compliant (Slice B) and a
+// successful drift.remediated both mean the watched state is now at expected.
+const char* event_state_from_type(const std::string& t) {
+    if (t == "guard.compliant" || t == "drift.remediated")
+        return "compliant";
+    if (t == "drift.detected")
+        return "drifted";
+    if (t == "remediation.failed" || t == "guard.unhealthy")
+        return "errored";
+    return nullptr; // guard.armed, resilience.escalated, … — no census change
+}
+
 } // namespace
 
 GuaranteedStateStore::GuaranteedStateStore(const std::filesystem::path& db_path,
@@ -179,6 +193,24 @@ void GuaranteedStateStore::create_tables() {
             -- dependent and MVP-deferred. See docs/guardian-baseline-model.md.
             ALTER TABLE guaranteed_state_rules
                 ADD COLUMN prerequisites TEXT NOT NULL DEFAULT '';
+        )"},
+        {5, R"(
+            -- Per-(agent, rule) current compliance state (Slice B census). One row
+            -- per pair, upserted from the agent's on-change status feed. Deliberately
+            -- NOT under the event reaper's TTL: the event log is an append-only audit
+            -- stream that ages out, but the latest compliance state must survive so a
+            -- long-quiet compliant guard does not silently revert to "unknown". Bounded
+            -- by fleet_size x rule_count, so it stays small without reaping.
+            CREATE TABLE IF NOT EXISTS guardian_agent_rule_status (
+                agent_id   TEXT NOT NULL,
+                rule_id    TEXT NOT NULL,
+                state      TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (agent_id, rule_id)
+            );
+            -- The PK covers per-agent drill-down; this index covers per-rule census.
+            CREATE INDEX IF NOT EXISTS idx_gars_rule
+                ON guardian_agent_rule_status(rule_id);
         )"},
     };
     if (!MigrationRunner::run(db_, "guaranteed_state_store", kMigrations)) {
@@ -347,6 +379,20 @@ GuaranteedStateStore::delete_rule(const std::string& rule_id) {
     sqlite3_finalize(stmt);
     if (changed == 0)
         return std::unexpected("not found: rule_id '" + rule_id + "'");
+    // Drop the rule's CURRENT compliance states. Unlike the event log (an immutable
+    // audit stream intentionally kept past rule deletion), guardian_agent_rule_status
+    // holds live state — a deleted guard has none, and leaving rows would inflate the
+    // fleet census for a guard that no longer appears in the By-Guard table (which
+    // iterates live rules). Same lock; no sqlite3_changes() read.
+    {
+        sqlite3_stmt* ds = nullptr;
+        if (sqlite3_prepare_v2(db_, "DELETE FROM guardian_agent_rule_status WHERE rule_id = ?", -1,
+                               &ds, nullptr) == SQLITE_OK) {
+            sqlite3_bind_text(ds, 1, rule_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(ds);
+            sqlite3_finalize(ds);
+        }
+    }
     bump_policy_generation_locked();  // rule set changed → new generation
     return {};
 }
@@ -519,6 +565,10 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
     }
     sqlite3_finalize(stmt);
     events_written_.fetch_add(1, std::memory_order_relaxed);
+    // Maintain the per-(agent, rule) compliance census in lock-step with the event
+    // (Slice B). Same lock; idempotent for non-compliance event_types (skipped).
+    if (const char* state = event_state_from_type(row.event_type))
+        upsert_rule_status_locked(row.agent_id, row.rule_id, state, row.timestamp);
     return {};
 }
 
@@ -587,6 +637,10 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
             }
             return std::unexpected("insert failed: " + err);
         }
+        // Census upsert inside the same transaction (Slice B) — rolled back with the
+        // batch on any later failure, so events and status never diverge.
+        if (const char* state = event_state_from_type(row.event_type))
+            upsert_rule_status_locked(row.agent_id, row.rule_id, state, row.timestamp);
     }
 
     sqlite3_finalize(stmt);
@@ -679,6 +733,128 @@ GuaranteedStateStore::query_events(const GuaranteedStateEventQuery& q) const {
     }
     sqlite3_finalize(stmt);
     return rows;
+}
+
+std::vector<GuardianRuleActivity>
+GuaranteedStateStore::rule_activity(const std::string& since) const {
+    std::shared_lock lock(mtx_);
+    std::vector<GuardianRuleActivity> out;
+    if (!db_)
+        return out;
+    // Conditional SUMs: `event_type = 'x'` is 1/0 in SQLite, so SUM is the count.
+    // ?1 = ISO cutoff ('' = all). One GROUP BY pass, no row materialisation.
+    const char* sql = R"(
+        SELECT rule_id,
+               SUM(event_type = 'drift.detected'),
+               SUM(event_type = 'drift.remediated'),
+               SUM(event_type = 'remediation.failed'),
+               SUM(event_type = 'guard.unhealthy'),
+               COUNT(DISTINCT agent_id),
+               MAX(timestamp)
+        FROM guaranteed_state_events
+        WHERE (?1 = '' OR timestamp >= ?1)
+        GROUP BY rule_id
+    )";
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &s, nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(s, 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        GuardianRuleActivity a;
+        a.rule_id = col_text(s, 0);
+        a.detected = sqlite3_column_int64(s, 1);
+        a.remediated = sqlite3_column_int64(s, 2);
+        a.failed = sqlite3_column_int64(s, 3);
+        a.unhealthy = sqlite3_column_int64(s, 4);
+        a.distinct_agents = sqlite3_column_int64(s, 5);
+        a.last_activity = col_text(s, 6);
+        out.push_back(std::move(a));
+    }
+    sqlite3_finalize(s);
+    return out;
+}
+
+void GuaranteedStateStore::upsert_rule_status_locked(const std::string& agent_id,
+                                                     const std::string& rule_id,
+                                                     const char* state,
+                                                     const std::string& updated_at) {
+    // Caller holds the unique_lock (insert_event / insert_events). Defensive skip on
+    // empty keys so a malformed event never inserts a junk (",") status row.
+    if (!db_ || agent_id.empty() || rule_id.empty())
+        return;
+    static const char* sql = R"(
+        INSERT INTO guardian_agent_rule_status (agent_id, rule_id, state, updated_at)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(agent_id, rule_id) DO UPDATE SET
+            state = excluded.state, updated_at = excluded.updated_at
+        WHERE excluded.updated_at >= guardian_agent_rule_status.updated_at
+    )";
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &s, nullptr) != SQLITE_OK)
+        return;
+    sqlite3_bind_text(s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, rule_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 3, state, -1, SQLITE_STATIC); // points at a string literal
+    sqlite3_bind_text(s, 4, updated_at.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(s); // ignore result: a skipped older-event update is the intended no-op
+    sqlite3_finalize(s);
+}
+
+std::vector<GuardianAgentRuleStatus>
+GuaranteedStateStore::agent_rule_statuses(const std::string& rule_id) const {
+    std::shared_lock lock(mtx_);
+    std::vector<GuardianAgentRuleStatus> out;
+    if (!db_)
+        return out;
+    std::string sql = "SELECT agent_id, rule_id, state, updated_at FROM guardian_agent_rule_status";
+    if (!rule_id.empty())
+        sql += " WHERE rule_id = ?1"; // idx_gars_rule covers this for the drill-down
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK)
+        return out;
+    if (!rule_id.empty())
+        sqlite3_bind_text(s, 1, rule_id.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        GuardianAgentRuleStatus r;
+        r.agent_id = col_text(s, 0);
+        r.rule_id = col_text(s, 1);
+        r.state = col_text(s, 2);
+        r.updated_at = col_text(s, 3);
+        out.push_back(std::move(r));
+    }
+    sqlite3_finalize(s);
+    return out;
+}
+
+std::vector<GuardianDayCount>
+GuaranteedStateStore::daily_remediations(const std::string& since) const {
+    std::shared_lock lock(mtx_);
+    std::vector<GuardianDayCount> out;
+    if (!db_)
+        return out;
+    const char* sql = R"(
+        SELECT substr(timestamp, 1, 10) AS day,
+               SUM(event_type = 'drift.remediated'),
+               SUM(event_type = 'remediation.failed')
+        FROM guaranteed_state_events
+        WHERE (?1 = '' OR timestamp >= ?1)
+          AND event_type IN ('drift.remediated', 'remediation.failed')
+        GROUP BY day
+        ORDER BY day
+    )";
+    sqlite3_stmt* s = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &s, nullptr) != SQLITE_OK)
+        return out;
+    sqlite3_bind_text(s, 1, since.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        GuardianDayCount d;
+        d.day = col_text(s, 0);
+        d.remediated = sqlite3_column_int64(s, 1);
+        d.failed = sqlite3_column_int64(s, 2);
+        out.push_back(std::move(d));
+    }
+    sqlite3_finalize(s);
+    return out;
 }
 
 std::size_t GuaranteedStateStore::rule_count() const {
