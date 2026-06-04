@@ -103,6 +103,9 @@ public:
     [[nodiscard]] bool revoke(const std::string& serial_hex, const std::string& reason);
     [[nodiscard]] bool is_revoked(const std::string& serial_hex);
     [[nodiscard]] std::vector<IssuedCertRecord> list_revoked();
+    /// Delete all issued-cert rows with the given issued_by — used to purge stale
+    /// default-cert inventory on regeneration so ca.db reflects only the live set.
+    bool delete_issued_by(const std::string& issued_by);
 
     // ── CRL versions ────────────────────────────────────────────────────────────
     [[nodiscard]] uint64_t next_crl_number();

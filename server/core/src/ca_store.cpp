@@ -376,6 +376,22 @@ std::vector<IssuedCertRecord> CaStore::list_revoked() {
     return out;
 }
 
+bool CaStore::delete_issued_by(const std::string& issued_by) {
+    std::lock_guard lk(mu_);
+    if (!db_)
+        return false;
+    sqlite3_stmt* st = nullptr;
+    if (sqlite3_prepare_v2(db_, "DELETE FROM ca_issued WHERE issued_by = ?;", -1, &st, nullptr) !=
+        SQLITE_OK) {
+        spdlog::error("CaStore: prepare delete_issued_by failed: {}", sqlite3_errmsg(db_));
+        return false;
+    }
+    bind_text(st, 1, issued_by);
+    const bool ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return ok;
+}
+
 // ── CRL versions ────────────────────────────────────────────────────────────────
 
 uint64_t CaStore::next_crl_number() {

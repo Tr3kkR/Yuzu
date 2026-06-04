@@ -352,6 +352,7 @@ yuzu_server_core_lib = static_library(
     'src/x509_ca.cpp',
     'src/key_provider.cpp',
     'src/ca_store.cpp',
+    'src/default_certs.cpp',
     'src/security_headers.cpp',
   )],
   include_directories: ['include'],
