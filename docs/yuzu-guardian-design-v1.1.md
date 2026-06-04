@@ -1611,7 +1611,7 @@ If `post_remediation` is not specified, the agent enforces file content only. Th
 ```
 agents/core/src/agent.cpp              Add GuardianEngine two-phase init
 agents/core/meson.build                Add new sources
-proto/yuzu/agent/v1/                   Add guaranteed_state.proto
+proto/yuzu/guardian/v1/                Add guaranteed_state.proto
 proto/meson.build                      Add to codegen
 server/core/src/rest_api_v1.cpp/.hpp   Add endpoints
 server/core/src/server.cpp             Add store init + dashboard routes

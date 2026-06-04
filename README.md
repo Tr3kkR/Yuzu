@@ -145,7 +145,7 @@ Yuzu/
 
 Prebuilt artifacts are published with every tagged release. If you just want to run Yuzu, start here — you do not need to build from source.
 
-- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/Tr3kkR/Yuzu/releases). Latest stable is v0.10.0; v0.11.0-rc1 is the most recent pre-release.
+- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/Tr3kkR/Yuzu/releases). Latest stable is v0.12.0.
 - **Container images** (published to GHCR on every tag):
   - `ghcr.io/tr3kkr/yuzu-server:<version>`
   - `ghcr.io/tr3kkr/yuzu-agent:<version>`
@@ -155,7 +155,7 @@ Prebuilt artifacts are published with every tagged release. If you just want to 
 ```bash
 # Pull and run the latest stable release via compose
 curl -fsSL https://raw.githubusercontent.com/Tr3kkR/Yuzu/main/deploy/docker/docker-compose.yml -o docker-compose.yml
-YUZU_VERSION=0.10.0 docker compose up -d
+YUZU_VERSION=0.12.0 docker compose up -d
 ```
 
 Open `http://localhost:8080` and sign in with the credentials set during first-run provisioning.
@@ -185,15 +185,15 @@ Open `http://localhost:8080` and sign in with the credentials set during first-r
 
 ```bash
 vcpkg install --triplet x64-linux --x-manifest-root=.
-meson setup builddir --buildtype=debug -Dcmake_prefix_path=$VCPKG_ROOT/installed/x64-linux
-meson compile -C builddir
+meson setup build-linux --buildtype=debug -Dcmake_prefix_path=$VCPKG_ROOT/installed/x64-linux
+meson compile -C build-linux
 ```
 
 ### Windows (MSYS2 bash)
 
 ```bash
 source ./setup_msvc_env.sh
-meson compile -C builddir
+meson compile -C build-windows
 ```
 
 ### Build Options
@@ -228,10 +228,10 @@ YUZU_PLUGIN_EXPORT(MyPlugin)
 
 ```bash
 # Start the server
-./builddir/server/core/yuzu-server --listen 0.0.0.0:50051 --web-port 8080
+./build-linux/server/core/yuzu-server --listen 0.0.0.0:50051 --web-port 8080
 
 # Start an agent (connects to server)
-./builddir/agents/core/yuzu-agent --server localhost:50051 --plugin-dir ./builddir/agents/plugins
+./build-linux/agents/core/yuzu-agent --server localhost:50051 --plugin-dir ./build-linux/agents/plugins
 ```
 
 Open `http://localhost:8080` for the web dashboard.
@@ -265,4 +265,4 @@ Yuzu is dual-licensed:
 
 Contributions require a signed [Contributor License Agreement](CLA.md); see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Releases tagged before the AGPL transition (≤ v0.11.x) remain available under their original Apache-2.0 grant to everyone who received them. Only releases cut after the transition are governed by AGPL.
+Releases tagged before the AGPL transition (≤ v0.11.0-rc2) remain available under their original Apache-2.0 grant to everyone who received them. Only releases cut after the transition are governed by AGPL.
