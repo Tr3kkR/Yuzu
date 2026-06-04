@@ -227,11 +227,59 @@ TEST_CASE("RegistryGuard audit: observes drift but does NOT write back",
     cleanup();
 }
 
+TEST_CASE("RegistryGuard compliant edge: emits guard.compliant on arm + on drift-clear (Slice B)",
+          "[guardian][guard][registry][compliant]") {
+    // The compliance census (Slice B) needs the agent to report a Guard reaching /
+    // returning to compliant, not just drifting. Observe mode so the signal is the
+    // guard's own edge, not a self-write's re-read. event_debounce_ms=0 keeps the
+    // edges deterministic.
+    res_cleanup();
+    res_make_parent();
+    res_set_flag(1); // compliant on arm (expected 1)
+
+    RegistryGuard::Config cfg;
+    cfg.rule_id = "compliant-edge";
+    cfg.rule_name = "compliant edge";
+    cfg.hive = "HKCU";
+    cfg.key = kResKeyA;
+    cfg.value_name = "Flag";
+    cfg.value_type = "REG_DWORD";
+    cfg.expected = "1";
+    cfg.enforce = false; // observe
+    cfg.event_debounce_ms = 0;
+
+    DriftCollector col;
+    RegistryGuard guard(std::move(cfg), [&col](const RegistryDrift& d) { col(d); });
+    REQUIRE(guard.start());
+    using namespace std::chrono_literals;
+
+    // (a) arm compliant → exactly one guard.compliant edge (detected == expected).
+    REQUIRE(col.wait_size(1, 5s));
+    CHECK(col.at(0).compliant);
+    CHECK(col.at(0).detected_value == "1");
+
+    // (b) drift → a NON-compliant drift report.
+    res_set_flag(0);
+    REQUIRE(col.wait_detected_after(1, "0", 5s));
+    CHECK_FALSE(col.find_detected("0").compliant);
+    const auto after_drift = col.size();
+
+    // (c) clear the drift (a manual fix in observe mode) → a fresh compliant edge.
+    // This is the observe-staleness self-heal: a manual fix fires a change notify
+    // → reconcile → compliant, so the server learns the rule went green again.
+    res_set_flag(1);
+    REQUIRE(col.wait_detected_after(after_drift, "1", 5s));
+    CHECK(col.find_detected("1").compliant);
+
+    guard.stop();
+    res_cleanup();
+}
+
 TEST_CASE("RegistryGuard resilience: survives key deletion and re-detects after recreate",
           "[guardian][guard][registry][resilience]") {
     res_cleanup();        // clean slate
     res_make_parent();    // quiet ancestor that survives the leaf's delete/recreate
-    res_set_flag(1);      // compliant (expected 1) — arming emits nothing
+    res_set_flag(1);      // compliant on arm — emits a guard.compliant edge, no drift
 
     RegistryGuard::Config cfg;
     cfg.rule_id = "resilience-test";
@@ -265,7 +313,7 @@ TEST_CASE("RegistryGuard resilience: survives key deletion and re-detects after 
     // again. ONLY a guard that SURVIVED the deletion and re-armed can report this
     // post-recreate drift — the C1 proof. (Re-detecting via a clean value change on
     // the re-armed key sidesteps the create-then-set race of recreate-with-drift.)
-    res_set_flag(1);                     // recreate K, compliant (re-arm, ~no emit)
+    res_set_flag(1);                     // recreate K, compliant (re-arm; compliant edge, no drift)
     std::this_thread::sleep_for(1200ms); // let the re-arm settle + clear debounce
     res_set_flag(0);                     // clean value drift on the re-armed key
     REQUIRE(col.wait_detected_after(n2, "0", 5s));

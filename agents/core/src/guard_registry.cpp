@@ -283,6 +283,12 @@ void RegistryGuard::run() try {
     std::uint64_t suppressed = 0;
     bool ro_fallback_warned = false; // UP-2 read-only fallback warned once
 
+    // Compliance-edge state (Slice B). nullopt until the first reconcile, then tracks
+    // the last-reported compliant/drifted state so a guard.compliant event fires ONCE
+    // on the compliant↔drift edge — steady compliant state stays silent (NFR). Only
+    // this run() thread touches it.
+    std::optional<bool> last_compliant;
+
     // C3: per-rule retry policy. Consulted ONLY in enforce mode and ONLY to gate the
     // remediation write/create — detection + event emission happen regardless, so a
     // backed-off / given-up guard still reports drift. `next_wake_ms` carries a
@@ -314,7 +320,25 @@ void RegistryGuard::run() try {
     };
 
     auto emit = [&](const std::string& detected, std::uint64_t latency_us) {
-        if (detected == cfg_.expected) return; // compliant
+        if (detected == cfg_.expected) {
+            // Compliant. Emit guard.compliant ONCE on the edge into compliant (incl.
+            // the first reconcile, last_compliant == nullopt); steady compliant is
+            // silent. Bypasses the drift-debounce collapse below — a compliant edge is
+            // the end of a drift, not another drift to fold.
+            if (last_compliant != true) {
+                last_compliant = true;
+                RegistryDrift c;
+                c.rule_id = cfg_.rule_id;
+                c.rule_name = cfg_.rule_name;
+                c.detected_value = cfg_.expected;
+                c.expected_value = cfg_.expected;
+                c.detection_latency_us = latency_us;
+                c.compliant = true;
+                if (sink_) sink_(c);
+            }
+            return;
+        }
+        last_compliant = false; // drifted (reported below, possibly collapsed)
         RegistryDrift d;
         d.rule_id = cfg_.rule_id;
         d.rule_name = cfg_.rule_name;
@@ -371,6 +395,13 @@ void RegistryGuard::run() try {
                              dec.gave_up ? "given up (alert)" : "backing off");
             }
         }
+        // A successful write-back restored `expected`: the self-write's notify will
+        // re-reconcile and read compliant. drift.remediated already carries that
+        // "now compliant" meaning, so pre-set the edge to avoid a redundant
+        // guard.compliant chasing every remediation (Slice B).
+        if (d.remediation_attempted && d.remediation_success)
+            last_compliant = true;
+
         // Collapse-with-count debounce: emit the first drift immediately, fold
         // subsequent drifts within the window into `suppressed`, attach that count
         // to the next post-window emission. Bounds the SINK only.
