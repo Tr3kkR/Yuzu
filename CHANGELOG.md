@@ -20,9 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   periodic audit `server.default_certs_in_use`; Prometheus
   `yuzu_server_default_certs_active`; `/health` `tls.default_certs_active` +
   `ca_fingerprint` + `ca_expires_at`; `/readyz` `ca_store`/`ca_root`). While on default certs the agent
-  listener runs encrypted but **requests-but-does-not-require** client certs
-  (per-agent mTLS lands in a follow-up); an operator-supplied agent surface
-  keeps strict mTLS, and the management plane is unaffected. **Opt out with
+  listener runs encrypted but **requests-but-does-not-require** client certs so
+  a first-boot agent can bootstrap; agents then auto-enroll for a per-agent
+  client certificate and upgrade to full mutual TLS (see "Per-agent mutual TLS"
+  under Added). An operator-supplied agent surface keeps strict mTLS, and the
+  management plane is unaffected. **Opt out with
   `--no-default-certs`** to restore the legacy refuse-to-start. New `--ca-dir`
   relocates the CA/cert directory. A surface given a cert without its key (or
   vice-versa) is now a hard startup error. See `docs/auth-architecture.md`
@@ -82,6 +84,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior must update.
 
 ### Added
+
+- **Per-agent mutual TLS, auto-issued at enrollment (PKI PR3).** When the
+  server runs with its built-in CA (the default-cert bootstrap above) and an
+  agent connects without an operator-supplied client cert, the agent now
+  generates its own EC P-256 keypair + PKCS#10 CSR, sends the CSR in
+  `Register` (new `RegisterRequest.csr_pem`), and the server signs a per-agent
+  client leaf — `CN=<agent_id>` plus an install-scoped URI SAN
+  (`yuzu://<ca-fingerprint>/agent/<agent_id>`) — returning it in
+  `RegisterResponse.issued_certificate` + `issued_ca_chain`. The agent
+  persists the leaf + key (key `0600`) under `--cert-dir` (default
+  `<data-dir>/certs`) and reconnects presenting it, so the data plane runs as
+  full mutual TLS with a cryptographic identity bound to `agent_id`. The CSR's
+  own subject/SAN are ignored — identity is set by the server from the
+  authenticated enrollment, never from CSR fields. The server's agent listener
+  stays *request-but-don't-require* on default certs so a first-boot agent can
+  bootstrap. Enforcement is **gradual** (non-breaking rollout): a provisioned
+  agent must present its leaf on the data plane, while a not-yet-provisioned or
+  pre-PR3 agent keeps connecting on the prior session + peer-IP binding rather
+  than being rejected. Revoked agent leaves are refused at `Subscribe`,
+  `Heartbeat`, and `DownloadUpdate` (new `yuzu_grpc_revoked_cert_total{rpc}`);
+  issuance is counted (`yuzu_server_ca_cert_issued_total`) and audited
+  (`ca.cert.issued`). New agent flags **`--cert-dir`** and
+  **`--no-auto-provision-cert`** (env `YUZU_CERT_DIR`); leaves auto-renew at
+  2/3 of their lifetime (evaluated at agent start). Built entirely on OpenSSL
+  3.x — no new cryptographic primitives. **Upgrade:** no special order is
+  required thanks to gradual enforcement; once a fleet is fully provisioned, a
+  future `--require-agent-identity` flag will be able to harden the data plane to
+  reject any agent without a per-agent cert. See `docs/auth-architecture.md`
+  "Per-agent mTLS".
 
 - **MFA enrollment QR code (#1232).** Both MFA enrollment surfaces — the
   Settings panel and the login-time enrollment-bootstrap form — now render

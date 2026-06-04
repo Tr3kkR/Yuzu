@@ -7,6 +7,7 @@
  */
 
 #include "ca_store.hpp"
+#include "x509_ca.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -202,4 +203,62 @@ TEST_CASE("CaStore: an unopenable path yields !is_open", "[ca_store][db][negativ
     }
     std::error_code ec;
     std::filesystem::remove_all(dir, ec);
+}
+
+// PR3 governance (quality-engineer BLOCKING): exercise the EXACT chain the server's
+// is_peer_cert_revoked() uses against a REAL issued leaf — issue → parse_certificate
+// to recover the serial → record_issued → revoke → is_revoked(parsed serial). This
+// is the regression net for revocation enforcement at the Subscribe/Heartbeat gates
+// (the private ServerImpl method is thin glue over these primitives). It also pins
+// the serial-format round-trip (sign side and parse side both BN_bn2hex → identical).
+TEST_CASE("CaStore: revocation round-trip against a real issued leaf", "[ca_store][pki][security]") {
+    using namespace yuzu::server::pki;
+
+    // Build a CA + a per-agent client leaf the way sign_agent_csr does.
+    auto ca_key = generate_private_key(KeyAlgo::EcP384);
+    REQUIRE(ca_key);
+    CaParams cp;
+    cp.subject = {"Yuzu Test CA", "Yuzu"};
+    cp.validity = validity_years_from_now(10);
+    auto ca_cert = self_sign_ca(*ca_key, cp);
+    REQUIRE(ca_cert);
+
+    auto leaf_key = generate_private_key(KeyAlgo::EcP256);
+    REQUIRE(leaf_key);
+    CsrParams csrp;
+    csrp.subject = {"agent-rt", "Yuzu"};
+    auto csr = make_csr(*leaf_key, csrp);
+    REQUIRE(csr);
+    LeafParams lp;
+    lp.subject = {"agent-rt", "Yuzu"};
+    lp.validity = validity_days_from_now(365);
+    lp.usage.client_auth = true;
+    auto issued = sign_csr(*csr, *ca_cert, *ca_key, lp);
+    REQUIRE(issued);
+
+    // The serial recovered from the issued PEM must equal the one returned at
+    // issuance (both canonical BN_bn2hex) — otherwise the revocation lookup misses.
+    auto parsed = parse_certificate(issued->cert_pem);
+    REQUIRE(parsed);
+    REQUIRE(parsed->serial_hex == issued->serial_hex);
+
+    yuzu::test::TempDbFile db{std::string_view{"ca-store-rt-"}};
+    CaStore store(db.path);
+    REQUIRE(store.is_open());
+
+    IssuedCertRecord rec;
+    rec.serial_hex = issued->serial_hex;
+    rec.subject = "agent-rt";
+    rec.purpose = "agent";
+    rec.not_after = now_s() + 365 * 86400;
+    rec.cert_pem = issued->cert_pem;
+    REQUIRE(store.record_issued(rec));
+
+    // Before revocation: the parsed-serial lookup says not-revoked.
+    REQUIRE_FALSE(store.is_revoked(parsed->serial_hex));
+    // Revoke, then the SAME parsed-serial lookup the server gate performs is true.
+    REQUIRE(store.revoke(issued->serial_hex, "compromised"));
+    REQUIRE(store.is_revoked(parsed->serial_hex));
+    // Idempotent: a second revoke of an already-revoked serial returns false.
+    REQUIRE_FALSE(store.revoke(issued->serial_hex, "again"));
 }

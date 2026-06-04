@@ -254,14 +254,28 @@ The full set of agent command-line flags:
 |---|---|---|
 | `--server` | Server address (`host:port`) | `localhost:50051` |
 | `--enrollment-token` | Pre-shared token for Tier 2 enrollment | (none) |
-| `--tls-ca` | Path to CA certificate PEM file | (auto-discover) |
-| `--tls-cert` | Path to client certificate PEM file | (auto-discover) |
-| `--tls-key` | Path to client private key PEM file | (auto-discover) |
+| `--ca-cert` | Path to CA certificate PEM file (verifies the server) | (auto-discover) |
+| `--client-cert` | Path to client certificate PEM file (mTLS) | (auto-discover) |
+| `--client-key` | Path to client private key PEM file (mTLS) | (auto-discover) |
 | `--cert-store` | Windows certificate store name (e.g. `MY`) | (none) |
 | `--cert-subject` | Subject CN match for cert store lookup | (none) |
 | `--cert-thumbprint` | SHA-1 thumbprint for cert store lookup (hex) | (none) |
+| `--cert-dir` | Directory for the auto-provisioned per-agent mTLS credential (env `YUZU_CERT_DIR`) | `<data-dir>/certs` |
+| `--no-auto-provision-cert` | Disable PKI auto-provisioning (do not request a per-agent client certificate at enrollment) | (enabled) |
 | `--plugin-dir` | Directory containing plugin shared libraries | `./plugins` |
 | `--log-level` | Logging verbosity (`trace`, `debug`, `info`, `warn`, `error`) | `info` |
+
+### Per-agent mTLS auto-provisioning (PKI)
+
+When the server runs with its built-in CA and the agent has no operator-supplied
+client certificate (`--client-cert`/`--cert-store`) but does have the server CA
+(`--ca-cert`), the agent automatically obtains its own client certificate at
+enrollment: it generates an EC P-256 keypair + CSR, the server signs a per-agent
+leaf (`CN=<agent-id>`) and returns it, and the agent persists the leaf + key
+(mode `0600`) + issuing chain under `--cert-dir`, then reconnects with mutual TLS.
+The leaf auto-renews once two-thirds of its lifetime has elapsed (checked at agent
+start). Pass `--no-auto-provision-cert` to opt out (e.g. when you supply your own
+client certificate). See `docs/auth-architecture.md` "Per-agent mTLS".
 
 ### Windows Certificate Store Integration
 

@@ -24,6 +24,8 @@
 #include "audit_store.hpp"
 #include "ca_store.hpp"
 #include "default_certs.hpp"
+#include "key_provider.hpp"
+#include "x509_ca.hpp"
 #include "compliance_eval.hpp"
 #include "custom_properties_store.hpp"
 #include "data_export.hpp"
@@ -143,10 +145,12 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <ranges>
 #include <set>
 #include <string>
+#include <utility>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
@@ -360,6 +364,23 @@ public:
                           "Subscribe RPC rejected because the mTLS client identity does not "
                           "match the identity bound at Register time (stolen-session signal, "
                           "#1118). Labelled event=security (SIEM-routing tag)",
+                          "counter");
+        // PKI PR3: an agent-initiated RPC rejected because the presented client
+        // leaf's serial is on the internal CA's revocation list (ca.db). A revoked
+        // agent that keeps calling is a decommissioned/compromised-credential
+        // signal. Labelled by rpc (subscribe|heartbeat|download_update) so an
+        // operator can see a revoked agent trying every surface, not just the
+        // command channel.
+        metrics_.describe("yuzu_grpc_revoked_cert_total",
+                          "Agent RPC rejected because the presented client certificate has been "
+                          "revoked against the internal CA (PKI PR3). Labelled event=security "
+                          "(SIEM-routing tag) and rpc (subscribe|heartbeat|download_update)",
+                          "counter");
+        // PKI PR3: per-agent client certificates signed at enrollment. A spike is
+        // an enrollment storm (mass deploy) or, if sustained, a CSR-flood signal.
+        metrics_.describe("yuzu_server_ca_cert_issued_total",
+                          "Per-agent client certificates issued by the internal CA at agent "
+                          "enrollment (PKI PR3). Labelled purpose (agent)",
                           "counter");
         // #1128: a peer-IP mismatch that was TOLERATED (not rejected) because a
         // NAT-aware accommodation applied. Paired with _peer_mismatch_total
@@ -1682,6 +1703,54 @@ public:
             return;
         }
 
+        // PKI PR3: per-agent mTLS issuance + enforcement, wired AFTER the
+        // bootstrap so it sees the live CA. require_client_identity_ was baked at
+        // ctor from cfg_.tls_ca_cert (empty pre-bootstrap when relying on
+        // defaults) — recompute it now from the post-bootstrap config so the app
+        // layer enforces mTLS identity whenever a CA bundle is in play (default
+        // OR operator-supplied). Register stays bootstrap-exempt (it issues the
+        // first cert); every other RPC requires a verified, non-revoked identity.
+        agent_service_.set_require_client_identity(cfg_.tls_enabled && !cfg_.tls_ca_cert.empty());
+        // Only an install with our OWN issuing CA (built-in defaults today,
+        // subordinate in PR6) signs agent CSRs. When the operator brought their
+        // own certs there is no root in ca.db → no signer, and agents must carry
+        // operator-minted client certs (the pre-PKI contract). The revocation
+        // checker is wired whenever a CA root exists so a revoked leaf is refused
+        // even on an operator-supplied-cert install that still uses our CA.
+        if (ca_store_ && ca_store_->is_open() && ca_store_->has_root()) {
+            // LIFETIME: these [this]-capturing lambdas are invoked from gRPC worker
+            // threads and dereference ca_store_/agent_ca_cert_pem_/csr_issue_*. That
+            // is safe only because stop() (run from ~ServerImpl) calls
+            // agent_server_->Shutdown(deadline) — draining/cancelling all in-flight
+            // RPCs — BEFORE any member is destroyed, even though ca_store_ is
+            // declared after agent_service_/agent_server_ (destructs first). Same
+            // shutdown-before-destruct contract as execution_tracker_. agent_ca_cert_pem_
+            // is written ONCE here, before BuildAndStart accepts traffic (publish-
+            // before-start), so the worker-thread reads are race-free; do not re-wire
+            // the CA at runtime without adding synchronisation.
+            // Cache the issuing-CA cert PEM so is_yuzu_issued() can signature-verify
+            // a presented client leaf against OUR CA specifically (Hermes CRITICAL-1
+            // / LOW-5 — a foreign cert in a multi-CA trust bundle must not be
+            // mistaken for a Yuzu agent identity or a revoked Yuzu serial).
+            if (auto r = ca_store_->get_root())
+                agent_ca_cert_pem_ = r->cert_pem;
+            agent_service_.set_agent_cert_signer(
+                [this](const std::string& csr_pem, const std::string& agent_id)
+                    -> std::optional<std::pair<std::string, std::string>> {
+                    return sign_agent_csr(csr_pem, agent_id);
+                });
+            agent_service_.set_revocation_checker(
+                [this](const std::string& peer_cert_pem) { return is_peer_cert_revoked(peer_cert_pem); });
+            // Recognizer: lets the Register re-auth gate treat ONLY Yuzu-issued
+            // certs as agent identities (foreign certs fall through to bootstrap).
+            agent_service_.set_peer_cert_recognizer(
+                [this](const std::string& peer_cert_pem) { return is_yuzu_issued(peer_cert_pem); });
+            spdlog::info("PKI: per-agent mTLS issuance active (CA {})",
+                         default_cert_set_.ca_fingerprint_sha256.empty()
+                             ? std::string("operator-supplied")
+                             : default_cert_set_.ca_fingerprint_sha256);
+        }
+
         grpc::EnableDefaultHealthCheckService(true);
 
         std::shared_ptr<grpc::ServerCredentials> agent_creds = grpc::InsecureServerCredentials();
@@ -2165,6 +2234,215 @@ private:
             yuzu::secure_zero(kc.private_key);
         }
         return creds;
+    }
+
+    // -- PKI PR3: per-agent client-cert issuance + revocation ------------------
+
+    /// Percent-encode a single URI path segment per RFC 3986 (Hermes LOW-6).
+    /// agent_id arrives from protobuf with only length validation, so it may carry
+    /// characters that are invalid raw in a URI (spaces, `/`, `%`, control bytes);
+    /// the issued leaf's URI SAN must stay well-formed for downstream parsers.
+    static std::string uri_encode_segment(std::string_view s) {
+        static constexpr char kHex[] = "0123456789ABCDEF";
+        std::string out;
+        out.reserve(s.size());
+        for (unsigned char c : s) {
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                c == '-' || c == '.' || c == '_' || c == '~') {
+                out.push_back(static_cast<char>(c));
+            } else {
+                out.push_back('%');
+                out.push_back(kHex[c >> 4]);
+                out.push_back(kHex[c & 0x0F]);
+            }
+        }
+        return out;
+    }
+
+    /// True iff `peer_cert_pem` chains to OUR issuing CA (signature-verified, not a
+    /// mere issuer-DN string match). In a multi-CA trust bundle this is what
+    /// distinguishes a Yuzu-issued agent leaf from a foreign (e.g. corporate-CA)
+    /// client cert that merely carries a matching CN — so a foreign cert is never
+    /// conflated with a Yuzu agent identity (Hermes CRITICAL-1) nor with a revoked
+    /// Yuzu serial (Hermes LOW-5). `agent_ca_cert_pem_` is cached at wiring time.
+    /// NOTE: verify_chain is validity-sensitive — a genuine-but-EXPIRED Yuzu leaf
+    /// returns false here. Benign on the call paths today (gRPC rejects an expired
+    /// client cert at the TLS handshake, so it never reaches these gates, and
+    /// Register then falls through to a clean re-enrollment). A future caller that
+    /// inspects a cert OFF the handshake-validated path must not read false as
+    /// "not ours".
+    bool is_yuzu_issued(const std::string& peer_cert_pem) {
+        if (peer_cert_pem.empty() || agent_ca_cert_pem_.empty())
+            return false;
+        // gov UP-7 / sre: cache the verify_chain result so the per-heartbeat
+        // revocation gate doesn't pay an ECDSA chain verify on every call
+        // fleet-wide. The result is immutable for a given (cert, CA) pair — a cert
+        // either chains to our CA or never will — and agent_ca_cert_pem_ is set
+        // once before traffic, so no TTL is needed (re-wiring the CA at runtime,
+        // a PR6 concern, must clear this cache). Keyed by the full PEM so there is
+        // no hash-collision trust risk.
+        {
+            std::lock_guard<std::mutex> lk(yuzu_issued_cache_mu_);
+            auto it = yuzu_issued_cache_.find(peer_cert_pem);
+            if (it != yuzu_issued_cache_.end())
+                return it->second;
+        }
+        const bool ok = pki::verify_chain(peer_cert_pem, agent_ca_cert_pem_);
+        {
+            std::lock_guard<std::mutex> lk(yuzu_issued_cache_mu_);
+            if (yuzu_issued_cache_.size() > 16384)
+                yuzu_issued_cache_.clear(); // crude bound; certs are stable → low churn
+            yuzu_issued_cache_[peer_cert_pem] = ok;
+        }
+        return ok;
+    }
+
+    /// Sign a per-agent client leaf from the agent's CSR, bound to agent_id.
+    /// Returns {leaf_pem, ca_chain_pem} or nullopt on any failure (the Register
+    /// handler treats nullopt as "stay on the bootstrap posture, retry later").
+    ///
+    /// SECURITY: the CSR contributes ONLY its public key (proof-of-possession is
+    /// verified inside pki::sign_csr). Identity is set HERE from the authenticated
+    /// agent_id — CN=agent_id (matched by the #1118 peer-identity gate) plus an
+    /// install-scoped URI SAN — never from CSR-controlled fields. The CA private
+    /// key is loaded transiently and zeroed before return (incl. exception
+    /// unwind) so the crown jewel is not resident for the process lifetime.
+    std::optional<std::pair<std::string, std::string>>
+    sign_agent_csr(const std::string& csr_pem, const std::string& agent_id) {
+        if (!ca_store_ || !ca_store_->is_open())
+            return std::nullopt;
+        auto root = ca_store_->get_root();
+        if (!root) {
+            spdlog::warn("PKI: agent CSR signing requested but ca.db has no root");
+            return std::nullopt;
+        }
+        // Hermes MEDIUM-4: per-agent issuance rate-limit. A holder of a valid
+        // enrollment credential could otherwise spam Register-with-CSR, each call
+        // burning an ECDSA sign + a ca.db row. A legitimate agent issues once per
+        // provisioning (it then re-Registers WITHOUT a CSR) and again only at the
+        // ~8-month renewal, so this floor never affects the happy path; it also
+        // bounds the ca.db rows a bounded agent retry (Hermes HIGH-2) can create.
+        {
+            // gov UP-1: CHECK only here; the timestamp is recorded AFTER a
+            // successful issuance (below), so a transient server-side failure
+            // (key-load glitch, record_issued contention) does NOT throttle the
+            // agent's legitimate retry for 30s. A successful issuance still blocks
+            // a re-issue for the window.
+            constexpr auto kCsrIssueMinInterval = std::chrono::seconds(30);
+            std::lock_guard<std::mutex> rl(csr_issue_mu_);
+            const auto now_s = std::chrono::steady_clock::now();
+            // Opportunistic prune so the map can't grow unbounded over uptime.
+            if (csr_issue_last_.size() > 4096) {
+                for (auto it = csr_issue_last_.begin(); it != csr_issue_last_.end();) {
+                    if (now_s - it->second > kCsrIssueMinInterval)
+                        it = csr_issue_last_.erase(it);
+                    else
+                        ++it;
+                }
+            }
+            auto it = csr_issue_last_.find(agent_id);
+            if (it != csr_issue_last_.end() && now_s - it->second < kCsrIssueMinInterval) {
+                spdlog::warn("PKI: throttling agent CSR for {} (one issuance per {}s)", agent_id,
+                             kCsrIssueMinInterval.count());
+                return std::nullopt;
+            }
+        }
+        const std::filesystem::path dir =
+            cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
+        FileKeyProvider kp(dir);
+        auto ca_key = kp.load_key(root->key_ref);
+        if (!ca_key) {
+            spdlog::error("PKI: cannot load CA issuing key — agent cert not issued");
+            return std::nullopt;
+        }
+        // Zero the CA key on every exit path, including exception unwind.
+        struct KeyZero {
+            std::string& s;
+            ~KeyZero() { yuzu::secure_zero(s); }
+        } ca_key_zero{*ca_key};
+
+        // Leaf validity: ~1y (the agent auto-renews at 2/3 life), clamped so it
+        // can never outlive the issuing CA (x509_ca rejects a leaf beyond the CA).
+        const auto now = std::chrono::system_clock::now();
+        auto not_after = now + std::chrono::hours(24 * 365);
+        const auto ca_not_after =
+            std::chrono::system_clock::time_point{std::chrono::seconds{root->not_after}};
+        if (not_after > ca_not_after)
+            not_after = ca_not_after;
+
+        pki::LeafParams lp;
+        lp.subject = {agent_id, "Yuzu"}; // CN=agent_id → #1118 identity match
+        lp.validity = {now, not_after};
+        lp.usage = pki::LeafUsage{.client_auth = true};
+        // Install-scoped URI SAN (defence in depth + forensic identity). The CA
+        // fingerprint (colon-stripped → a valid URI authority) is the per-install
+        // id; fall back to the ca.db root fingerprint on an operator-supplied set.
+        std::string install = default_cert_set_.ca_fingerprint_sha256.empty()
+                                  ? root->fingerprint_sha256
+                                  : default_cert_set_.ca_fingerprint_sha256;
+        std::erase(install, ':');
+        if (!install.empty())
+            lp.san.uris.push_back("yuzu://" + install + "/agent/" + uri_encode_segment(agent_id));
+
+        auto issued = pki::sign_csr(csr_pem, root->cert_pem, *ca_key, lp);
+        if (!issued) {
+            spdlog::warn("PKI: sign_csr failed for agent {}", agent_id);
+            return std::nullopt;
+        }
+
+        // Record the issued leaf so it can be revoked / inventoried (ca.db).
+        IssuedCertRecord rec;
+        rec.serial_hex = issued->serial_hex;
+        rec.subject = agent_id;
+        rec.san = lp.san.uris.empty() ? std::string{} : lp.san.uris.front();
+        rec.purpose = "agent";
+        rec.not_after =
+            std::chrono::duration_cast<std::chrono::seconds>(not_after.time_since_epoch()).count();
+        rec.cert_pem = issued->cert_pem;
+        rec.issued_by = "agent:" + agent_id;
+        rec.enrollment_request_id = agent_id;
+        if (!ca_store_->record_issued(rec)) {
+            // Fail closed: an unrecorded cert can't be revoked, so don't hand it
+            // out — the agent stays on the bootstrap posture and retries.
+            spdlog::error("PKI: failed to record issued agent cert for {} — not issuing", agent_id);
+            return std::nullopt;
+        }
+
+        // gov UP-1: record the rate-limit timestamp only now (issuance succeeded),
+        // so a failed attempt above never throttles a legitimate retry.
+        {
+            std::lock_guard<std::mutex> rl(csr_issue_mu_);
+            csr_issue_last_[agent_id] = std::chrono::steady_clock::now();
+        }
+        // gov (sre SHOULD): real-time issuance signal for alerting on enrollment
+        // storms / CSR floods (the audit row below is the forensic record).
+        metrics_.counter("yuzu_server_ca_cert_issued_total", {{"purpose", "agent"}}).increment();
+
+        if (audit_store_ && audit_store_->is_open()) {
+            (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                     .principal = "agent:" + agent_id,
+                                     .principal_role = "agent",
+                                     .action = "ca.cert.issued",
+                                     .target_type = "AgentCertificate",
+                                     .target_id = issued->serial_hex,
+                                     .detail = "purpose=agent cn=" + agent_id,
+                                     .result = "ok"});
+        }
+        return std::make_pair(issued->cert_pem, root->cert_pem);
+    }
+
+    /// True iff the presented client leaf is one of OURS and its serial is revoked
+    /// in ca.db. Issuer-scoped (is_yuzu_issued) so a foreign cert whose serial
+    /// happens to collide with a revoked Yuzu serial is not falsely rejected
+    /// (Hermes LOW-5). Reads only the CA store (its own mutex) — safe off the
+    /// agent-plane lock.
+    bool is_peer_cert_revoked(const std::string& peer_cert_pem) {
+        if (!ca_store_ || !ca_store_->is_open() || !is_yuzu_issued(peer_cert_pem))
+            return false;
+        auto details = pki::parse_certificate(peer_cert_pem);
+        if (!details || details->serial_hex.empty())
+            return false; // unparseable → not our cert; the identity gate handles it
+        return ca_store_->is_revoked(details->serial_hex);
     }
 
     // -- Web server -----------------------------------------------------------
@@ -7358,6 +7636,15 @@ private:
     DefaultCertSet default_cert_set_;
     bool default_certs_failed_{false};
     bool startup_failed_{false}; // run() refused to start — main() exits non-zero
+    // PKI PR3: cached issuing-CA cert PEM (for is_yuzu_issued's verify_chain) +
+    // per-agent CSR-issuance rate-limit state (sign_agent_csr). Set at wiring time.
+    std::string agent_ca_cert_pem_;
+    std::mutex csr_issue_mu_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> csr_issue_last_;
+    // Cache of is_yuzu_issued (immutable per cert) — avoids a per-heartbeat
+    // verify_chain fleet-wide (gov UP-7). Keyed by full leaf PEM.
+    std::mutex yuzu_issued_cache_mu_;
+    std::unordered_map<std::string, bool> yuzu_issued_cache_;
     std::unique_ptr<AuthRoutes> auth_routes_;
     std::unique_ptr<RestApiV1> rest_api_v1_;
     std::unique_ptr<SettingsRoutes> settings_routes_;

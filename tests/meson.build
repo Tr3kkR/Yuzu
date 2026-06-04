@@ -116,6 +116,7 @@ agent_test_exe = executable(
     'unit/test_guard_file.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_new_plugins.cpp',
+    'unit/test_agent_csr.cpp',
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp

@@ -164,10 +164,10 @@ directory (`auth::default_cert_dir()`; override with `--ca-dir`), recorded in
 - **Agent-listener posture.** While the agent surface is on default certs the
   agent (and the management listener when it reuses agent creds) runs
   `REQUEST + VERIFY but NOT REQUIRE` client certs — encrypted +
-  server-authenticated, with per-agent client-cert mTLS arriving in a follow-up.
-  An operator-supplied agent surface keeps the strict `REQUEST_AND_REQUIRE`
-  posture (the relaxation is gated on `using_default_agent_certs`, never the
-  global `using_default_certs`).
+  server-authenticated, so a first-boot agent with no client cert can connect
+  and bootstrap one (per-agent mTLS, below). An operator-supplied agent surface
+  keeps the strict `REQUEST_AND_REQUIRE` posture (the relaxation is gated on
+  `using_default_agent_certs`, never the global `using_default_certs`).
 - **Loud, impossible-to-miss notification (six surfaces):** ERROR startup banner
   with the CA SHA-256 + expiry; one-shot audit `server.default_certs_generated`;
   a 300 s periodic reminder + audit `server.default_certs_in_use`; Prometheus
@@ -178,6 +178,108 @@ directory (`auth::default_cert_dir()`; override with `--ca-dir`), recorded in
 - **Opt out** with `--no-default-certs` (legacy refuse-to-start). The CA root
   key is a 0600 file (HSM seam in `key_provider`); the threat model is local-host
   compromise — replace defaults with operator/HSM-backed certs for production.
+
+## Per-agent mTLS (PKI PR3, v0.13.0+)
+
+When the server runs with its built-in CA, agents are issued their own client
+certificate at enrollment, so the agent↔server data plane is full mutual TLS with
+a cryptographic identity bound to `agent_id`. This makes the existing
+peer-identity binding (`#1118`) cryptographic with no new binding mechanism — the
+issued leaf's `CN` *is* the `agent_id` the server already checks.
+
+**Bootstrap (chicken-and-egg) — resolved on one port.** The agent has no client
+cert on first boot, but the data plane requires one. Resolution:
+
+1. The agent connects server-authenticated TLS (verifies the server leaf against
+   the CA cert it was given via `--ca-cert`), presenting **no** client cert.
+2. The agent generates an EC P-256 keypair + a PKCS#10 CSR and sends the CSR in
+   `Register` (`RegisterRequest.csr_pem`). The agent's private key never leaves
+   the host.
+3. When enrollment is approved (token / attestation / admin-approve — unchanged)
+   **and** the built-in CA is active, the server verifies the CSR's
+   proof-of-possession, signs a client leaf — `CN=<agent_id>` + URI SAN
+   `yuzu://<ca-fingerprint>/agent/<agent_id>` — sized to ≤ the CA's `notAfter`,
+   records it in `ca.db` (`purpose=agent`), and returns it in
+   `RegisterResponse.issued_certificate` + `issued_ca_chain`. **The CSR's own
+   subject/SAN are ignored** — identity is set by the server from the
+   authenticated enrollment, never from attacker-controlled CSR fields (this is
+   what stops an enrolling agent requesting another agent's identity).
+4. The agent persists the leaf + key (`0600`) + chain under `--cert-dir`
+   (default `<data-dir>/certs`), rebuilds its channel, and **re-Registers
+   presenting the leaf** — a fresh session whose bound identity is the leaf's
+   `CN`. (The first, no-cert session bound an empty identity, so the data plane
+   would reject it; re-registering binds `CN=<agent_id>`.)
+
+**App-layer enforcement.** `Register` is the only RPC permitted without a verified
+client identity (it is how an agent obtains one). Enforcement is **gradual**, so
+per-agent mTLS rolls out without breaking a heterogeneous or mid-upgrade fleet:
+
+- `Register` is bootstrap-exempt but, if a client cert *is* presented (re-auth /
+  renewal) and it is one of **ours** (issuer-scoped via `is_yuzu_issued`), it must
+  match `agent_id` and must not be revoked. A foreign cert (multi-CA bundle) falls
+  through to bootstrap.
+- `Subscribe` rejects a presented leaf whose serial is on the CRL before taking
+  the agent-plane lock (`yuzu_grpc_revoked_cert_total{rpc=subscribe}`), then
+  enforces the `#1118` identity overlap **only when the session bound a client
+  identity at Register** (i.e. the agent presented a cert). A provisioned agent
+  therefore MUST present its leaf on `Subscribe` (a no-cert `Subscribe` against a
+  cert-bound session fails the overlap → reject, so the stolen-session guard
+  holds); a not-yet-provisioned or legacy (pre-PR3) agent has no bound identity
+  and continues on the prior posture (session + `#826` peer-IP binding) rather
+  than being hard-rejected.
+- `Heartbeat` and `DownloadUpdate` reject a presented **revoked** leaf
+  (`yuzu_grpc_revoked_cert_total{rpc=heartbeat|download_update}`) so a revoked
+  agent is denied liveness + OTA, not just the command channel. `DownloadUpdate`
+  also emits an audit row (`session.cert_revoked`); `Heartbeat` is metric-only
+  (high-frequency). `is_yuzu_issued` results are cached (immutable per cert) so
+  the per-heartbeat check is not an ECDSA chain verify fleet-wide.
+- `require_client_identity_` is recomputed *after* the default-cert bootstrap
+  (`tls_enabled && !tls_ca_cert.empty()`), since it is baked at construction
+  before the CA exists.
+
+**Rollout / upgrade.** Because enforcement is gradual, upgrading a fleet to PR3 is
+non-breaking: agents that have not yet auto-provisioned (or run
+`--no-auto-provision-cert`, or a pre-PR3 binary) keep connecting on session +
+peer-IP binding, while provisioned agents get strict mTLS. Once a fleet is fully
+provisioned, a future `--require-agent-identity` flag (tracked follow-up) can
+harden this to require a bound identity for *every* agent and reject the
+unprovisioned fallback. Folding revocation + identity into a single gRPC
+interceptor so every identity-requiring RPC enforces them uniformly is the related
+follow-up (today they are enforced at `Register`, `Subscribe`, `Heartbeat`,
+`DownloadUpdate`).
+
+**Custody & renewal.** The CA issuing key is loaded transiently per signature via
+`FileKeyProvider` and zeroed (RAII) so the crown jewel is not resident for the
+process lifetime. Server issuance is fail-closed: a cert that cannot be recorded
+in `ca.db` (so it could never be revoked) is not handed out, and per-agent
+issuance is rate-limited (one signature per `agent_id` per 30 s) so a holder of a
+valid enrollment credential cannot spam the signer. Agent leaves are ~1-year and
+auto-renew once two-thirds of their lifetime has elapsed (evaluated at agent
+start; a fresh CSR rides the next `Register`). Issuance is audited
+(`ca.cert.issued`). On the agent, the leaf key is written `0600` via an atomic
+`O_EXCL` stage-and-rename on POSIX; **on Windows the key falls back to
+`std::ofstream` + a best-effort permissions tightening — an explicit owner-only
+ACL (`SetNamedSecurityInfoW`) is a tracked follow-up shared with the server's
+`FileKeyProvider`, so on Windows run the agent under a dedicated service account
+with no inherited group-read on the cert directory until then.**
+
+**Trust scoping.** Presented client certs are accepted as agent identities only
+when they signature-verify to *our* issuing CA (`verify_chain`), so in a
+multi-CA trust bundle a foreign cert carrying a matching `CN` is not mistaken for
+a Yuzu agent (nor conflated with a revoked Yuzu serial). If the server signs but
+the agent never receives the cert (an active MITM stripping the field, or a
+persistent signer outage), the agent bounds its retries and gives up
+auto-provisioning for that run rather than looping.
+
+**Operator surface.** Server: `--ca-dir` (shared with the default-cert
+bootstrap). Agent: `--cert-dir` / env `YUZU_CERT_DIR` (where the provisioned
+credential lives) and `--no-auto-provision-cert` (disable the CSR-at-enrollment
+flow — e.g. when supplying an operator-minted client cert via `--client-cert` /
+`--client-key`, or an OS-store cert). Implementation: server signer in
+`server.cpp` (`sign_agent_csr` / `is_peer_cert_revoked`) on the
+`x509_ca`/`key_provider`/`ca_store` engine; agent provisioning in
+`agents/core/src/agent_csr.{hpp,cpp}` (self-contained OpenSSL) wired into the
+`agent.cpp` connect/register loop.
 
 ## HTTP security response headers (SOC2-C1)
 
