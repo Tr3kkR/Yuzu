@@ -537,6 +537,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Agents enrolling *through the gateway* now receive a per-agent client
+  certificate (PKI PR5d).** Previously only direct-connect enrollment issued the
+  per-agent mTLS leaf — `GatewayUpstreamServiceImpl::ProxyRegister` registered the
+  agent but never signed its CSR, so a gateway-routed agent retried then ran on
+  the bootstrap (one-way TLS) posture without an identity cert. `ProxyRegister`
+  now signs the CSR through the same `sign_agent_csr` chokepoint as the direct
+  path (same CA, per-agent rate-limit, `ca_issued` inventory, and a new shared
+  16 KiB CSR-size cap), and the gateway relays the issued cert to the agent
+  unchanged. Note: revoking a certificate is serial-scoped (it invalidates a
+  presented leaf) — to stop an agent re-enrolling/re-issuing, **deny** the agent.
+
 - **Server container can generate its default certs on first boot (PKI PR5b).**
   `deploy/docker/Dockerfile.server` now pre-creates `/etc/yuzu/certs` and
   `chown -R`s `/etc/yuzu` to the unprivileged `yuzu` runtime user. Previously

@@ -1754,11 +1754,35 @@ public:
             // mistaken for a Yuzu agent identity or a revoked Yuzu serial).
             if (auto r = ca_store_->get_root())
                 agent_ca_cert_pem_ = r->cert_pem;
-            agent_service_.set_agent_cert_signer(
-                [this](const std::string& csr_pem, const std::string& agent_id)
-                    -> std::optional<std::pair<std::string, std::string>> {
+            // ONE guarded signer, shared by the direct (AgentServiceImpl) and
+            // gateway-proxied (GatewayUpstreamServiceImpl::ProxyRegister, PR5d)
+            // Register paths — so an agent enrolling through the gateway receives a
+            // per-agent client cert too, with the SAME CA / rate-limit / ca_issued
+            // recording / CSR-size cap (one chokepoint, cannot drift). The
+            // try/catch enforces sign_agent_csr's documented "nullopt on any
+            // failure" contract even if it throws (e.g. bad_alloc) — an uncaught
+            // exception out of a sync gRPC handler on the exposed one-way-TLS agent
+            // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
+            std::function<std::optional<std::pair<std::string, std::string>>(
+                const std::string&, const std::string&)>
+                cert_signer = [this](const std::string& csr_pem,
+                                     const std::string& agent_id)
+                -> std::optional<std::pair<std::string, std::string>> {
+                try {
                     return sign_agent_csr(csr_pem, agent_id);
-                });
+                } catch (const std::exception& e) {
+                    spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
+                                  agent_id);
+                    return std::nullopt;
+                } catch (...) {
+                    spdlog::error("PKI: agent CSR signing threw (unknown) for {} — non-fatal",
+                                  agent_id);
+                    return std::nullopt;
+                }
+            };
+            agent_service_.set_agent_cert_signer(cert_signer);
+            if (gateway_service_)
+                gateway_service_->set_agent_cert_signer(cert_signer);
             agent_service_.set_revocation_checker(
                 [this](const std::string& peer_cert_pem) { return is_peer_cert_revoked(peer_cert_pem); });
             // Recognizer: lets the Register re-auth gate treat ONLY Yuzu-issued
@@ -2342,6 +2366,19 @@ private:
         auto root = ca_store_->get_root();
         if (!root) {
             spdlog::warn("PKI: agent CSR signing requested but ca.db has no root");
+            return std::nullopt;
+        }
+        // PR5d / Hermes LOW: bound the attacker-supplied CSR before any parse or
+        // sign. A PEM CSR is well under 2 KiB (EC P-256 ~0.6 KiB, RSA-4096
+        // ~1.7 KiB); 16 KiB is generous slack. This is the SINGLE chokepoint for
+        // BOTH the direct Register and the gateway ProxyRegister signing paths, so
+        // the now-gateway-reachable signer cannot be fed a multi-MB blob (gRPC's
+        // 4 MiB message cap is the outer bound — this is defence-in-depth on the
+        // exposed one-way-TLS agent edge).
+        constexpr std::size_t kMaxCsrPemBytes = 16 * 1024;
+        if (csr_pem.size() > kMaxCsrPemBytes) {
+            spdlog::warn("PKI: rejecting oversize CSR ({} bytes > {}) for agent {}",
+                         csr_pem.size(), kMaxCsrPemBytes, agent_id);
             return std::nullopt;
         }
         // Hermes MEDIUM-4: per-agent issuance rate-limit. A holder of a valid

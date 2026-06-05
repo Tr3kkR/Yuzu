@@ -868,6 +868,128 @@ TEST_CASE("ProxyRegister: rejects oversize agent_id with INVALID_ARGUMENT (W1.4 
     CHECK(h.registry.trusted_gateway_peer_count() == 0);
 }
 
+// ── PR5d — ProxyRegister issues a per-agent cert through the gateway ────────
+//
+// The boot-test gap: a gateway-enrolled agent registered fine but never got a
+// per-agent client cert (only the direct AgentServiceImpl::Register signed the
+// CSR). ProxyRegister now mirrors the direct path — when a CSR is present and a
+// signer is wired, it returns issued_certificate/issued_ca_chain on the same
+// verbatim-relayed RegisterResponse. These pin the four branches.
+
+namespace {
+// Drive a successful gateway enrollment (valid token) so ProxyRegister reaches
+// the gw_enrolled issuance block, with `agent_id` carried.
+apb::RegisterRequest make_gw_register(yuzu::server::auth::AuthManager& auth_mgr,
+                                      const std::string& agent_id, const std::string& csr_pem) {
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(agent_id);
+    req.mutable_info()->set_hostname("gw-host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.set_enrollment_token(auth_mgr.create_enrollment_token("test", 0, std::chrono::hours(1)));
+    if (!csr_pem.empty())
+        req.set_csr_pem(csr_pem);
+    return req;
+}
+} // namespace
+
+TEST_CASE("ProxyRegister: a wired signer issues a per-agent cert for a gateway-enrolled agent",
+          "[agent_service][register][gateway][pki][pr5d]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    int calls = 0;
+    std::string seen_csr, seen_id;
+    gateway_svc.set_agent_cert_signer(
+        [&](const std::string& csr, const std::string& id)
+            -> std::optional<std::pair<std::string, std::string>> {
+            ++calls;
+            seen_csr = csr;
+            seen_id = id;
+            return std::make_pair("LEAF-PEM-for-" + id, "CHAIN-PEM");
+        });
+
+    auto req = make_gw_register(h.auth_mgr, "agent-gw-1", "FAKE-CSR");
+    apb::RegisterResponse resp;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+
+    REQUIRE(status.ok());
+    CHECK(resp.accepted());
+    CHECK(resp.enrollment_status() == "enrolled");
+    CHECK(calls == 1);
+    CHECK(seen_csr == "FAKE-CSR");          // the agent's CSR reached the signer
+    CHECK(seen_id == "agent-gw-1");          // bound to the registering agent_id
+    CHECK(resp.issued_certificate() == "LEAF-PEM-for-agent-gw-1");
+    CHECK(resp.issued_ca_chain() == "CHAIN-PEM");
+}
+
+TEST_CASE("ProxyRegister: no signer wired → enrolls but issues no cert (graceful degrade)",
+          "[agent_service][register][gateway][pki][pr5d]") {
+    // The pre-PR5d behavior, now the explicit fallback: a CSR with no signer
+    // (CA inactive) must still enroll the agent, just without a cert.
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    auto req = make_gw_register(h.auth_mgr, "agent-gw-2", "FAKE-CSR");
+    apb::RegisterResponse resp;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+
+    REQUIRE(status.ok());
+    CHECK(resp.accepted());
+    CHECK(resp.issued_certificate().empty());
+    CHECK(resp.issued_ca_chain().empty());
+}
+
+TEST_CASE("ProxyRegister: signer wired but no CSR → signer not called, no cert",
+          "[agent_service][register][gateway][pki][pr5d]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    int calls = 0;
+    gateway_svc.set_agent_cert_signer(
+        [&](const std::string&, const std::string&)
+            -> std::optional<std::pair<std::string, std::string>> {
+            ++calls;
+            return std::make_pair("X", "Y");
+        });
+
+    auto req = make_gw_register(h.auth_mgr, "agent-gw-3", /*csr_pem=*/"");
+    apb::RegisterResponse resp;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+
+    REQUIRE(status.ok());
+    CHECK(resp.accepted());
+    CHECK(calls == 0); // no CSR → signer never invoked
+    CHECK(resp.issued_certificate().empty());
+}
+
+TEST_CASE("ProxyRegister: signing failure is non-fatal (agent still enrolled)",
+          "[agent_service][register][gateway][pki][pr5d]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    GatewayResponseHarness h;
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    gateway_svc.set_agent_cert_signer(
+        [&](const std::string&, const std::string&)
+            -> std::optional<std::pair<std::string, std::string>> { return std::nullopt; });
+
+    auto req = make_gw_register(h.auth_mgr, "agent-gw-4", "FAKE-CSR");
+    apb::RegisterResponse resp;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
+
+    REQUIRE(status.ok());
+    CHECK(resp.accepted()); // enrollment succeeds even though signing failed
+    CHECK(resp.enrollment_status() == "enrolled");
+    CHECK(resp.issued_certificate().empty());
+}
+
 // ── #872 — notify_exec_tracker wiring through to ExecutionTracker ──────────
 //
 // Bare GatewayResponseHarness leaves execution_tracker_ at nullptr, so the

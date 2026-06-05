@@ -377,6 +377,38 @@ gw_enrolled:
     response->set_accepted(true);
     response->set_enrollment_status("enrolled");
 
+    // PR5d: mirror the direct Register path — if the agent sent a CSR and the
+    // signer is wired (CA active), sign a per-agent client leaf bound to agent_id
+    // and return it. Before this, a gateway-enrolled agent registered fine but
+    // never received a per-agent cert (only the direct AgentServiceImpl::Register
+    // signed), so it retried then degraded to one-way TLS. The agent↔gateway hop
+    // is one-way TLS in M1 (PR5c) — the leaf is presented to a non-verifying
+    // listener for now — but issuing it completes per-agent-mTLS-day-one (D4),
+    // records the cert in ca_issued for inventory/revocation, and future-proofs
+    // gateway mTLS. The Erlang gateway relays the RegisterResponse verbatim
+    // (yuzu_gw_agent_service:register/2), so issued_certificate flows to the agent
+    // (gateway_pb/agent_pb carry the fields since PR5). Signing failure is
+    // non-fatal — the agent stays on the bootstrap posture and retries.
+    //
+    // Gate parity with the direct path (intentional): we only reach gw_enrolled
+    // after enrollment succeeded (denied/pending agents returned early above; the
+    // re-register fast-path reaches here only for an already-APPROVED agent). Like
+    // the direct path, issuance is NOT gated on cert revocation — revoke is
+    // serial-scoped (it invalidates a presented leaf); DENYING the agent is what
+    // stops re-enrollment/re-issuance (checked above). The shared signer
+    // (sign_agent_csr) carries the per-agent rate-limit + CSR-size cap, so both
+    // paths share one issuance chokepoint and cannot drift.
+    if (!request->csr_pem().empty() && agent_cert_signer_) {
+        if (auto issued = agent_cert_signer_(request->csr_pem(), info.agent_id())) {
+            response->set_issued_certificate(issued->first);
+            response->set_issued_ca_chain(issued->second);
+            spdlog::info("[gateway] Issued per-agent client cert for {}", info.agent_id());
+        } else {
+            spdlog::warn("[gateway] ProxyRegister: client-cert signing failed for agent {}",
+                         info.agent_id());
+        }
+    }
+
     // Store session_id on the AgentSession so session-aware cleanup works.
     // Without this, remove_agent_if_session would always no-op for gateway agents.
     registry_.map_session(session_id, info.agent_id());

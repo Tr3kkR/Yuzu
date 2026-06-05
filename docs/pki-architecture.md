@@ -224,6 +224,25 @@ documents this trap); per-module roundtrip tests now assert `agent_pb`,
 `gateway_pb`, and `management_pb` — and a CI codegen-consistency guard is a
 tracked follow-up.
 
+**PR5d — the server actually issues on the proxied path.** PR5 made the *wire*
+carry the fields, but `GatewayUpstreamServiceImpl::ProxyRegister` still never
+called the signer, so a gateway-enrolled agent got no per-agent cert (it retried
+then degraded to one-way TLS — surfaced by the PR5b boot-test). PR5d signs the
+CSR in `ProxyRegister`, mirroring the direct `AgentServiceImpl::Register`: both
+paths share **one** signer (`sign_agent_csr`) wired in `server.cpp`, so CA,
+per-agent rate-limit, `ca_issued` recording, and the 16 KiB CSR-size cap are
+identical and cannot drift. The Erlang gateway relays the `RegisterResponse`
+verbatim (`yuzu_gw_agent_service:register/2`), so the issued cert reaches the
+agent with no gateway change. **Revocation semantics:** issuance is *not* gated on
+cert revocation on either path — revoke is serial-scoped (it invalidates a
+presented leaf); **denying** the agent is what stops re-enrollment/re-issuance
+(both paths reject a denied agent before signing). **M1 caveat:** the
+agent↔gateway hop is one-way TLS (PR5c), so the issued leaf is presented to a
+non-verifying listener for now — issuing it completes per-agent-mTLS day-one
+(records the cert for inventory/revocation, future-proofs gateway mTLS), but
+*cryptographic* through-gateway identity binding remains the QUIC-era follow-up
+(agent identity across the gateway is still the app-layer `gateway_observed_peer`).
+
 ### Distribution flip — staged as PR5b
 
 Making a fresh **containerised** install encrypted-by-default (dropping
