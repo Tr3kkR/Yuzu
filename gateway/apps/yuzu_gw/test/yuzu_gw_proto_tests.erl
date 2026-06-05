@@ -124,6 +124,15 @@ encode_command_request_normalizes_test() ->
     ?assertEqual(<<"a">>,  maps:get(action, Encoded)),
     ?assertEqual(#{<<"k">> => <<"v">>}, maps:get(parameters, Encoded)).
 
+%% M8 / #1209: the normaliser must preserve the Guardian push `payload` (bytes,
+%% binary-safe incl. embedded NUL) so it can never become a silent strip point.
+encode_command_request_preserves_payload_test() ->
+    Payload = <<"guardian-push", 0, 255>>,
+    Input = #{plugin => <<"__guard__">>, action => <<"push_rules">>,
+              command_id => <<"g1">>, payload => Payload},
+    Encoded = yuzu_gw_proto:encode_command_request(Input),
+    ?assertEqual(Payload, maps:get(payload, Encoded)).
+
 encode_command_response_fills_defaults_test() ->
     Input = #{command_id => <<"c1">>, status => 'SUCCESS'},
     Encoded = yuzu_gw_proto:encode_command_response(Input),

@@ -1,18 +1,23 @@
 groups:
   - name: yuzu-fleet
     rules:
+      # Agents are not scraped individually, so there is no per-agent
+      # last-heartbeat timestamp series. Detect stale agents at the fleet level
+      # using the server-side gauges: connected agents minus those with a recent
+      # heartbeat (yuzu_fleet_agents_healthy).
       - alert: YuzuAgentDisconnected
         expr: |
-          (time() - yuzu_agents_last_heartbeat_timestamp_seconds) > 120
-        for: 1m
+          (yuzu_agents_connected - yuzu_fleet_agents_healthy) > 0
+        for: 2m
         labels:
           severity: warning
         annotations:
-          summary: "Agent {{ $labels.agent_id }} has not sent a heartbeat"
+          summary: "Connected agents are not heartbeating"
           description: >-
-            Agent {{ $labels.agent_id }} ({{ $labels.hostname }}) has not sent
-            a heartbeat for more than 2 minutes. The agent may be offline,
-            network-partitioned, or experiencing a hang.
+            One or more agents are connected but have not produced a recent
+            heartbeat for more than 2 minutes (connected minus healthy > 0).
+            The affected agents may be hung or network-partitioned. Per-agent
+            detail is available in the dashboard device view.
           runbook_url: "https://docs.yuzu.io/runbooks/agent-disconnected"
 
       - alert: YuzuAgentFleetDrop
@@ -49,7 +54,7 @@ groups:
 
       - alert: YuzuHighCommandLatency
         expr: |
-          histogram_quantile(0.99, sum(rate(yuzu_commands_duration_seconds_bucket[5m])) by (le)) > 10
+          histogram_quantile(0.99, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le)) > 10
         for: 5m
         labels:
           severity: warning
@@ -64,9 +69,9 @@ groups:
     rules:
       - alert: YuzuGatewayConnectionDrops
         expr: |
-          rate(yuzu_gw_agent_connections_total[5m]) > 0
+          rate(yuzu_gw_agents_connected_total[5m]) > 0
           and
-          yuzu_gw_agent_connections_active < (yuzu_gw_agent_connections_active offset 5m) * 0.7
+          yuzu_gw_agents_current < (yuzu_gw_agents_current offset 5m) * 0.7
         for: 2m
         labels:
           severity: warning
@@ -79,7 +84,7 @@ groups:
 
       - alert: YuzuGatewayBackpressure
         expr: |
-          rate(yuzu_gw_backpressure_events_total[5m]) > 0.5
+          rate(yuzu_gw_commands_dropped_backpressure_total[5m]) > 0.5
         for: 3m
         labels:
           severity: warning
@@ -92,35 +97,37 @@ groups:
 
   - name: yuzu-tls
     rules:
-      - alert: YuzuCertificateExpiringSoon
-        expr: |
-          yuzu_server_cert_expiry_timestamp_seconds - time() < 604800
-        for: 1h
-        labels:
-          severity: warning
-        annotations:
-          summary: "Yuzu server TLS certificate expires in less than 7 days"
-          description: >-
-            The HTTPS certificate expires in {{ $value | humanizeDuration }}.
-            Renew the certificate and place the new PEM files at the configured
-            path. If certificate hot-reload is enabled, the server will pick up
-            the new files automatically.
+      # DISABLED: certificate-expiry alerting requires a
+      # `yuzu_server_cert_expiry_timestamp_seconds` gauge that the server does
+      # not currently export. Re-enable the two rules below once that metric is
+      # emitted (it should be set to the leaf certificate's notAfter, in epoch
+      # seconds).
+      #
+      # - alert: YuzuCertificateExpiringSoon
+      #   expr: |
+      #     yuzu_server_cert_expiry_timestamp_seconds - time() < 604800
+      #   for: 1h
+      #   labels:
+      #     severity: warning
+      #   annotations:
+      #     summary: "Yuzu server TLS certificate expires in less than 7 days"
+      #     description: "The HTTPS certificate expires soon; renew the PEM files."
+      #
+      # - alert: YuzuCertificateExpiryCritical
+      #   expr: |
+      #     yuzu_server_cert_expiry_timestamp_seconds - time() < 86400
+      #   for: 10m
+      #   labels:
+      #     severity: critical
+      #   annotations:
+      #     summary: "Yuzu server TLS certificate expires in less than 24 hours"
 
-      - alert: YuzuCertificateExpiryCritical
-        expr: |
-          yuzu_server_cert_expiry_timestamp_seconds - time() < 86400
-        for: 10m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Yuzu server TLS certificate expires in less than 24 hours"
-          description: >-
-            The HTTPS certificate expires in {{ $value | humanizeDuration }}.
-            Immediate action required to prevent service disruption.
-
+      # yuzu_server_cert_reload_failures_total is a gauge holding the running
+      # count of failed hot-reloads, so use delta() (not rate()) to detect a
+      # new failure within the window.
       - alert: YuzuCertReloadFailures
         expr: |
-          rate(yuzu_server_cert_reload_failures_total[5m]) > 0
+          delta(yuzu_server_cert_reload_failures_total[5m]) > 0
         for: 5m
         labels:
           severity: warning
@@ -132,35 +139,32 @@ groups:
             Check that the new PEM files are valid, the cert and key match,
             and file permissions are correct (chmod 600 on Unix).
 
-  - name: yuzu-storage
-    rules:
-      - alert: YuzuResponseStoreWriteFailures
-        expr: |
-          rate(yuzu_server_response_store_write_failures_total[5m]) > 0
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Response store write failures detected"
-          description: >-
-            The response store (SQLite) is failing to write command results.
-            This means instruction responses are being lost. Check disk space,
-            filesystem permissions, and SQLite WAL file health. The database
-            file may be locked or corrupted.
-
-      - alert: YuzuResponseStoreWriteFailureRate
-        expr: |
-          (
-            rate(yuzu_server_response_store_write_failures_total[5m])
-            /
-            rate(yuzu_server_response_store_writes_total[5m])
-          ) > 0.01
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Response store write failure rate exceeds 1%"
-          description: >-
-            More than 1% of response store writes are failing. Current failure
-            rate: {{ $value | humanizePercentage }}. Investigate disk health
-            and SQLite database integrity.
+  # DISABLED: response-store write-health alerting requires
+  # `yuzu_server_response_store_writes_total` and
+  # `yuzu_server_response_store_write_failures_total` counters that the server
+  # does not currently export. Re-enable this group once those metrics are
+  # emitted by the response store.
+  #
+  # - name: yuzu-storage
+  #   rules:
+  #     - alert: YuzuResponseStoreWriteFailures
+  #       expr: |
+  #         rate(yuzu_server_response_store_write_failures_total[5m]) > 0
+  #       for: 2m
+  #       labels:
+  #         severity: critical
+  #       annotations:
+  #         summary: "Response store write failures detected"
+  #
+  #     - alert: YuzuResponseStoreWriteFailureRate
+  #       expr: |
+  #         (
+  #           rate(yuzu_server_response_store_write_failures_total[5m])
+  #           /
+  #           rate(yuzu_server_response_store_writes_total[5m])
+  #         ) > 0.01
+  #       for: 5m
+  #       labels:
+  #         severity: warning
+  #       annotations:
+  #         summary: "Response store write failure rate exceeds 1%"

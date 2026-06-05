@@ -168,6 +168,27 @@ int main(int argc, char* argv[]) {
         ->default_val(10)
         ->envname("YUZU_LOGIN_RATE_LIMIT");
 
+    // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
+    app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
+                   "MFA enforcement (default: optional). \"optional\" = self-service "
+                   "enrollment, login never requires it. \"admin-only\" = admins must "
+                   "enrol before login completes. \"required\" = every role must enrol. "
+                   "Under admin-only/required an un-enrolled login is redirected through "
+                   "TOTP enrollment (POST /login/mfa/enroll) before a session is minted.")
+        ->default_val("optional")
+        ->check(CLI::IsMember({"optional", "admin-only", "required"}))
+        ->envname("YUZU_MFA_ENFORCEMENT");
+    app.add_option("--mfa-step-up-window-secs", cfg.mfa_step_up_window_secs,
+                   "Seconds after a TOTP proof that high-risk endpoints accept the session as "
+                   "stepped-up (default: 300)")
+        ->default_val(300)
+        ->envname("YUZU_MFA_STEP_UP_WINDOW_SECS");
+    app.add_option("--mfa-login-pending-secs", cfg.mfa_login_pending_secs,
+                   "Seconds the intermediate mfa-pending token is valid between password "
+                   "success and TOTP submission (default: 120)")
+        ->default_val(120)
+        ->envname("YUZU_MFA_LOGIN_PENDING_SECS");
+
     // Metrics auth
     app.add_flag("--metrics-no-auth", "Allow unauthenticated /metrics access from any source")
         ->each([&cfg](const std::string&) { cfg.metrics_require_auth = false; })
@@ -336,6 +357,33 @@ int main(int argc, char* argv[]) {
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
 
     CLI11_PARSE(app, argc, argv);
+
+    // ── MFA enforcement mode advisory ──
+    // Surface the active enforcement mode once at startup so an auditor
+    // reading the boot log can confirm the deployment's posture (SOC 2
+    // CC6.6 evidence). `admin-only` and `required` redirect an un-enrolled
+    // login through TOTP enrollment before a session is minted; `optional`
+    // (default) leaves enrollment self-service.
+    if (cfg.mfa_enforcement != "optional") {
+        spdlog::info("MFA enforcement active: mode={} — un-enrolled {} must complete TOTP "
+                     "enrollment at login before a session is issued.",
+                     cfg.mfa_enforcement,
+                     cfg.mfa_enforcement == "required" ? "users" : "admins");
+    }
+    // PR2 governance Gate 2 sec-M6: the step-up gate honours
+    // window_secs <= 0 as an "escape hatch" that lets every request
+    // through without re-prompting. The helper itself doesn't log on
+    // every skip (too noisy), so we surface it once at startup so the
+    // operator sees the disabled state in journald and an auditor
+    // reading the boot log can spot a misconfigured deployment.
+    if (cfg.mfa_step_up_window_secs <= 0) {
+        spdlog::warn(
+            "--mfa-step-up-window-secs={} disables the MFA step-up gate entirely. High-risk "
+            "REST + Settings endpoints will NOT re-prompt for MFA proof. SOC 2 CC6.6 evidence "
+            "rows (`mfa.step_up.required`) will not be emitted. Set to a positive value "
+            "(default 300) to re-enable.",
+            cfg.mfa_step_up_window_secs);
+    }
 
     // ── Validate operator-supplied CSP extras (SOC2-C1, gov UP-1/UP-2) ──
     // Done immediately after CLI parse so operators see a clear startup

@@ -220,9 +220,151 @@ restart.
   symmetric. If your backup encryption key is lost, the backup is not
   recoverable.
 
+## Emergency MFA disable (break-glass)
+
+**When to use.** An operator (typically an admin) has lost both their
+authenticator device AND every recovery code they were issued. They
+cannot log in. The Settings → Multi-Factor Authentication panel is
+gated behind login so the dashboard path is unreachable. PR1 of the MFA
+ladder does not include an admin "force-disable for user X" REST route;
+that ships in a follow-up.
+
+**Authorisation.** Direct DB write — must run on the server host as the
+service account that owns `auth.db` (typically `_yuzu` / `yuzu` /
+`NT SERVICE\YuzuAgent`; see `docs/agent-privilege-model.md`). Every
+emergency disable should be logged in your change-management system
+with the operator name, time, and reason — the audit chain in
+`audit.db` will NOT contain a row for this disable (it bypasses the
+audit-emitting code path).
+
+**Procedure (Unix).**
+
+```bash
+# 1. Stop the server so SQLite is not contended (optional but safer).
+sudo systemctl stop yuzu-server
+
+# 2. Backup auth.db BEFORE the surgery.
+sudo cp /var/lib/yuzu/auth.db /var/lib/yuzu/auth.db.before-mfa-rescue.$(date +%s)
+
+# 3. Clear the MFA state for the locked-out user.
+sudo -u _yuzu sqlite3 /var/lib/yuzu/auth.db <<'SQL'
+UPDATE users
+   SET mfa_totp_secret = NULL,
+       mfa_enrolled_at = NULL,
+       mfa_disabled_at = CURRENT_TIMESTAMP,
+       mfa_last_counter = 0
+ WHERE username = 'alice';
+DELETE FROM mfa_recovery_codes WHERE username = 'alice';
+SELECT changes();
+SQL
+
+# 4. Restart the server.
+sudo systemctl start yuzu-server
+```
+
+The operator can now log in with their password alone and (optionally)
+re-enroll via Settings → Multi-Factor Authentication.
+
+**Procedure (Windows).** Same SQL, run from an elevated PowerShell as
+the service account against `C:\ProgramData\Yuzu\auth.db`. Stop the
+`YuzuServer` service first; restart with `Start-Service YuzuServer`.
+
+**Audit trail.** Because this bypasses the audit-emitting code path,
+manually record:
+
+- Operator name who performed the disable
+- Target username
+- Timestamp
+- Reason (lost device, locked out, etc.)
+- Approval reference (change ticket, on-call paging record)
+
+Per SOC 2 CC6.6 the break-glass procedure is itself an auditable event
+and the manual record is the evidence chain.
+
+## Locked out by MFA enforcement misconfiguration (PR 3)
+
+`--mfa-enforcement=admin-only|required` (PR 3) can lock operators out in
+two ways that are NOT "lost device" — they are policy/IdP
+misconfigurations. The recovery is the same first move: **bring the server
+back up in `optional` mode**, fix the underlying state, then re-enable.
+
+**Symptom A — SSO users can't reach high-risk endpoints.** Your IdP does
+not assert an `amr` claim containing a recognized MFA method, so OIDC
+sessions are never seeded with an MFA proof. (Note: such sessions still
+*pass* the step-up gate — they are not blocked from normal operation — so
+this only bites if you expected SSO step-up to enforce MFA.) Fix the IdP's
+authorization-server policy to emit `amr` (Entra: `mfa`; others: `otp` /
+`hwk` / etc.), then re-test. No server surgery needed.
+
+**Symptom B — the sole admin can't complete login-time enrollment.** A
+fresh single-admin deployment was started straight into `required`, and
+the admin's enrollment-pending token expired (default
+`--mfa-login-pending-secs=120`) before they scanned the QR, OR
+`mfa_init_enrollment` failed transiently. No session was minted and the
+dashboard is unreachable.
+
+**Recovery procedure.**
+
+```bash
+# 1. Restart the server with enforcement relaxed. This re-seeds the
+#    in-memory config from the flag/env; auth.db is untouched.
+sudo systemctl stop yuzu-server
+sudo systemctl set-environment YUZU_MFA_ENFORCEMENT=optional   # or edit the unit's flag
+sudo systemctl start yuzu-server
+
+# 2. Log in with password alone, enroll via Settings → Multi-Factor
+#    Authentication (this issues a fresh secret + recovery codes), and
+#    SAVE the recovery codes.
+
+# 3. Once the required accounts are enrolled, restore enforcement and
+#    restart.
+sudo systemctl unset-environment YUZU_MFA_ENFORCEMENT          # back to the unit default
+sudo systemctl restart yuzu-server
+```
+
+On Windows, edit the service's `YUZU_MFA_ENFORCEMENT` environment variable
+(or the `--mfa-enforcement` argument in the service definition), then
+`Restart-Service YuzuServer`.
+
+**Prevention.** Enroll the admin under `optional` *before* switching to
+`required`, and validate your IdP's `amr` assertion before relying on
+enforcement for SSO users. See `docs/user-manual/upgrading.md` §
+"⚠️ Breaking: `--mfa-enforcement` now enforces".
+
+## Post-restore migration check
+
+If you restore `auth.db` from a backup taken before the v2 schema
+migration (the MFA migration), the binary will boot but every MFA
+column will be absent. The MigrationRunner runs the v2 migration on the
+first AuthDB open after the restore so the columns are added back, but
+any user who had MFA enrolled BEFORE the backup was taken loses their
+TOTP enrollment silently — the columns are re-created empty. After
+restoring a pre-v2 backup:
+
+```bash
+sudo -u _yuzu sqlite3 /var/lib/yuzu/auth.db \
+  "SELECT username FROM users WHERE mfa_enrolled_at IS NOT NULL;"
+```
+
+If the result is empty AND your pre-incident state had enrolled users,
+notify them to re-enroll. Document the data-loss event in the change
+record.
+
+## Backup encryption requirement
+
+`auth.db` contains the raw TOTP secret bytes (PR1 ships plaintext-at-
+rest with the 0600 file mode as the only compensating control;
+encryption-at-rest via AES-256-GCM is a planned follow-up). Backups MUST
+be encrypted at rest if the backup store has any threat model that
+includes exfiltration — restic, BorgBackup, or `gpg --symmetric` all
+satisfy this. SOC 2 CC6.1 audit will flag unencrypted backups of
+`auth.db` as a finding even though the file itself is 0600 on the live
+host.
+
 ## Cross-references
 
 - File location convention: `docs/user-manual/server-admin.md` §
   Configuration Files.
 - AuthDB schema and migration policy: `docs/auth-architecture.md` § AuthDB.
+- MFA design: `docs/auth-mfa-design.md`.
 - systemd unit definition: `deploy/systemd/yuzu-server.service`.

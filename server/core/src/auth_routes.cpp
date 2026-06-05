@@ -1,12 +1,24 @@
 #include "auth_routes.hpp"
 
+#include <yuzu/metrics.hpp>
+#include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/server.hpp>
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <chrono>
 #include <shared_mutex>
 
+#include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
+#include "mfa_qr.hpp"
+#include "mfa_step_up.hpp"
+#include "rest_a4_envelope.hpp"
+
+#include <ctime>
+
+#include <nlohmann/json.hpp>
 
 // Login page HTML (defined in login_ui.cpp)
 extern const char* const kLoginHtml;
@@ -446,6 +458,11 @@ AuditEvent AuthRoutes::make_audit_event(const httplib::Request& req, const std::
     return event;
 }
 
+void AuthRoutes::reap_mfa_pending_locked() {
+    auto now = std::chrono::steady_clock::now();
+    std::erase_if(mfa_pending_, [&](const auto& p) { return now > p.second.expires_at; });
+}
+
 bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& action,
                            const std::string& result, const std::string& target_type,
                            const std::string& target_id, const std::string& detail) {
@@ -455,7 +472,45 @@ bool AuthRoutes::audit_log(const httplib::Request& req, const std::string& actio
     event.target_type = target_type;
     event.target_id = target_id;
     event.detail = detail;
-    return audit_store_->log(event);
+    auto ok = audit_store_->log(event);
+    if (!ok) {
+        // SOC 2 CC7.2 — surface audit-write failures via spdlog so on-call
+        // has a signal short of the row-count metric. The wrapper still
+        // returns false so the caller can decide whether to abort the
+        // surrounding operation; most call sites legitimately fire-and-
+        // forget the return value (matches the historical contract).
+        spdlog::warn("audit_log: AuditStore::log failed for action='{}' target_type='{}' "
+                     "target_id='{}'",
+                     action, target_type, target_id);
+    }
+    return ok;
+}
+
+bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std::string& action,
+                                         const std::string& result, const std::string& principal,
+                                         const std::string& principal_role,
+                                         const std::string& target_type,
+                                         const std::string& target_id,
+                                         const std::string& detail) {
+    if (!audit_store_)
+        return true;
+    AuditEvent event;
+    event.action = action;
+    event.result = result;
+    event.source_ip = req.remote_addr;
+    event.user_agent = req.get_header_value("User-Agent");
+    event.principal = principal;
+    event.principal_role = principal_role;
+    event.target_type = target_type;
+    event.target_id = target_id;
+    event.detail = detail;
+    auto ok = audit_store_->log(event);
+    if (!ok) {
+        spdlog::warn("audit_log_for_principal: AuditStore::log failed for action='{}' "
+                     "principal='{}' target_id='{}'",
+                     action, principal, target_id);
+    }
+    return ok;
 }
 
 void AuthRoutes::emit_event(const std::string& event_type, const httplib::Request& req,
@@ -482,8 +537,17 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
 // ---------------------------------------------------------------------------
 
 void AuthRoutes::register_routes(httplib::Server& svr) {
+    // Production shim — wrap the real server in an HttplibRouteSink and
+    // delegate to the sink-based overload. Same handlers, same lambdas,
+    // same observable behaviour. Test code calls the sink overload
+    // directly with a TestRouteSink.
+    HttplibRouteSink sink(svr);
+    register_routes(sink);
+}
+
+void AuthRoutes::register_routes(HttpRouteSink& sink) {
     // -- Login page -----------------------------------------------------------
-    svr.Get("/login", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/login", [this](const httplib::Request& req, httplib::Response& res) {
         std::string html(kLoginHtml);
         // Inject OIDC enablement flag into the page
         std::shared_lock oidc_lock(oidc_mu_);
@@ -495,33 +559,725 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
         res.set_content(html, "text/html; charset=utf-8");
     });
 
-    svr.Post("/login", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/login", [this](const httplib::Request& req, httplib::Response& res) {
         auto username = extract_form_value(req.body, "username");
         auto password = extract_form_value(req.body, "password");
 
-        auto token = auth_mgr_.authenticate(username, password);
-        if (!token) {
+        auto role_opt = auth_mgr_.verify_password(username, password);
+        if (!role_opt) {
             res.status = 401;
             res.set_content(
                 R"({"error":{"code":401,"message":"Invalid username or password"},"meta":{"api_version":"v1"}})",
                 "application/json");
-            audit_log(req, "auth.login_failed", "failure", "user", username);
+            audit_log(req, "auth.login_failed", "error", "User", username);
             emit_event("auth.login_failed", req,
                        {{"source_ip", req.remote_addr}, {"username", username}}, {},
                        Severity::kWarn);
             return;
         }
 
-        res.set_header("Set-Cookie", "yuzu_session=" + *token + session_cookie_attrs());
+        // Decide whether this user must complete a TOTP challenge before
+        // we mint a real session. The AuthDB lookup is fail-open relative
+        // to MFA: if AuthDB is not configured (legacy config-file-only
+        // deployments) or the row read fails, we treat the user as
+        // not-enrolled. Enforcement modes (`admin-only`, `required`)
+        // tighten this in a follow-up PR.
+        bool mfa_enrolled = false;
+        if (auto* db = auth_mgr_.auth_db_ptr()) {
+            auto status = db->mfa_status(username);
+            if (status && status->enrolled) {
+                mfa_enrolled = true;
+            }
+        }
+
+        // PR3 enforcement (SOC 2 CC6.6). Under `required` (every role) or
+        // `admin-only` (admins only), a user without MFA must enrol before
+        // a session is minted. Reuse PR1's pending-token machinery: issue
+        // a provisional TOTP secret + an enrollment-pending token and let
+        // POST /login/mfa/enroll confirm the first code and complete the
+        // login. No new session concept; an un-enrolled enforced user
+        // never holds a cookie until they finish enrolling.
+        const bool mfa_enforced = mfa_enforcement_protects(cfg_.mfa_enforcement, *role_opt);
+        if (!mfa_enrolled && mfa_enforced) {
+            auto* db = auth_mgr_.auth_db_ptr();
+            if (!db) {
+                // Enforcement is configured but the store that holds TOTP
+                // secrets is unavailable, so MFA can be neither enrolled
+                // nor verified. Fail CLOSED — minting an unprotected
+                // session here would silently defeat the control the
+                // operator explicitly enabled.
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                audit_log_for_principal(req, "mfa.enroll.required", "error", username,
+                                        auth::role_to_string(*role_opt), "User", username,
+                                        "auth_db unavailable (fail-closed)");
+                spdlog::error(
+                    "MFA enforcement={} but auth_db unavailable — refusing login for '{}'",
+                    cfg_.mfa_enforcement, username);
+                return;
+            }
+            auto init = db->mfa_init_enrollment(username, "Yuzu");
+            if (!init) {
+                res.status = 500;
+                res.set_content(
+                    R"({"error":{"code":500,"message":"Could not initiate MFA enrollment"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                audit_log_for_principal(req, "mfa.enroll.required", "error", username,
+                                        auth::role_to_string(*role_opt), "User", username,
+                                        "mfa_init_enrollment failed");
+                return;
+            }
+            auto pending_token =
+                auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(32));
+            bool at_capacity = false;
+            {
+                std::lock_guard lock(mfa_pending_mu_);
+                reap_mfa_pending_locked();
+                if (mfa_pending_.size() >= mfa_pending_cap_) {
+                    at_capacity = true; // load-shed (Hermes H-2)
+                } else {
+                    MfaPending entry;
+                    entry.username = username;
+                    entry.role = *role_opt;
+                    entry.kind = PendingKind::enrollment;
+                    entry.expires_at = std::chrono::steady_clock::now() +
+                                       std::chrono::seconds(cfg_.mfa_login_pending_secs);
+                    mfa_pending_[pending_token] = std::move(entry);
+                }
+            }
+            if (at_capacity) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"too many pending authentications, retry shortly"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                // Observable load-shed (governance sec-MED / UP-D3): a
+                // counter for alerting + a (per-event, not audit) warn.
+                // Deliberately NOT an audit row — a flood would amplify
+                // audit writes; the counter is the aggregated signal.
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_mfa_pending_load_shed_total", {{"kind", "enrollment"}})
+                        .increment();
+                }
+                spdlog::warn("MFA pending-token map at capacity ({}) — shedding enrollment "
+                             "challenge for source {}",
+                             mfa_pending_cap_, req.remote_addr);
+                return;
+            }
+            res.status = 202;
+            // The provisional secret is revealed exactly once here — the
+            // caller already proved the password, the same trust level as
+            // the Settings-page enrollment reveal. POST /login/mfa/enroll
+            // never re-reveals it on a failed confirm.
+            nlohmann::json body = {{"status", "mfa_enrollment_required"},
+                                   {"mfa_pending_token", pending_token},
+                                   {"otpauth_uri", init->otpauth_uri},
+                                   {"secret_base32", init->secret_base32},
+                                   // Server-rendered inline SVG QR (#1232). May be
+                                   // "" on encode failure → the form falls back to
+                                   // the textual secret.
+                                   {"qr_svg", otpauth_qr_svg(init->otpauth_uri)},
+                                   {"expires_in", cfg_.mfa_login_pending_secs}};
+            res.set_content(body.dump(), "application/json");
+            audit_log_for_principal(req, "mfa.enroll.required", "ok", username,
+                                    auth::role_to_string(*role_opt), "User", username,
+                                    "enforcement=" + cfg_.mfa_enforcement);
+            emit_event("mfa.enroll.required", req,
+                       {{"source_ip", req.remote_addr}, {"username", username}});
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_mfa_challenges_issued_total").increment();
+                std::lock_guard lock(mfa_pending_mu_);
+                m->gauge("yuzu_auth_mfa_pending_tokens")
+                    .set(static_cast<double>(mfa_pending_.size()));
+            }
+            return;
+        }
+
+        if (!mfa_enrolled) {
+            auto token = auth_mgr_.create_local_session(username, *role_opt, false);
+            res.set_header("Set-Cookie", "yuzu_session=" + token + session_cookie_attrs());
+            res.set_content(R"({"status":"ok"})", "application/json");
+            // Mint-time audit row uses the explicit-principal helper —
+            // request has no session cookie yet so the default
+            // resolve_session-based path would leave `principal` empty
+            // (consistency B3). target_type follows the
+            // observability-conventions.md PascalCase convention; result
+            // uses the spec's "ok"/"error" vocabulary.
+            audit_log_for_principal(req, "auth.login", "ok", username,
+                                    auth::role_to_string(*role_opt), "User", username);
+            emit_event("auth.login", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", username},
+                        {"auth_method", "password"},
+                        {"user_agent", req.get_header_value("User-Agent")}});
+            return;
+        }
+
+        // User has TOTP enrolled — issue an opaque short-lived pending
+        // token and require POST /login/mfa to complete.
+        auto pending_token =
+            auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(32));
+        bool challenge_at_capacity = false;
+        {
+            std::lock_guard lock(mfa_pending_mu_);
+            reap_mfa_pending_locked();
+            if (mfa_pending_.size() >= mfa_pending_cap_) {
+                challenge_at_capacity = true; // load-shed (Hermes H-2)
+            } else {
+                MfaPending entry;
+                entry.username = username;
+                entry.role = *role_opt;
+                entry.expires_at = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(cfg_.mfa_login_pending_secs);
+                mfa_pending_[pending_token] = std::move(entry);
+            }
+        }
+        if (challenge_at_capacity) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"too many pending authentications, retry shortly"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_mfa_pending_load_shed_total", {{"kind", "challenge"}})
+                    .increment();
+            }
+            spdlog::warn("MFA pending-token map at capacity ({}) — shedding login challenge for "
+                         "source {}",
+                         mfa_pending_cap_, req.remote_addr);
+            return;
+        }
+        res.status = 202;
+        nlohmann::json body = {{"status", "mfa_required"},
+                               {"mfa_pending_token", pending_token},
+                               {"expires_in", cfg_.mfa_login_pending_secs}};
+        res.set_content(body.dump(), "application/json");
+        audit_log_for_principal(req, "mfa.login.required", "ok", username,
+                                auth::role_to_string(*role_opt), "User", username);
+        emit_event("mfa.login.required", req,
+                   {{"source_ip", req.remote_addr}, {"username", username}});
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_auth_mfa_challenges_issued_total").increment();
+            std::lock_guard lock(mfa_pending_mu_);
+            m->gauge("yuzu_auth_mfa_pending_tokens")
+                .set(static_cast<double>(mfa_pending_.size()));
+        }
+    });
+
+    sink.Post("/login/mfa", [this](const httplib::Request& req, httplib::Response& res) {
+        // Single error message regardless of failure mode (token-invalid
+        // vs code-rejected vs attempts-exhausted) — distinguishing them
+        // on the wire gives an attacker a token-validity oracle. The
+        // discriminator lives in the audit `detail` column only
+        // (Gate 4 consistency N1 + security oracle).
+        static constexpr const char* kFailureBody =
+            R"({"error":{"code":401,"message":"Invalid verification code"},"meta":{"api_version":"v1"}})";
+
+        auto pending = extract_form_value(req.body, "mfa_pending_token");
+        auto code = extract_form_value(req.body, "code");
+
+        // Look up + atomically take ownership of the entry under the
+        // lock — without the move, two concurrent submits with the same
+        // pending token + same valid code would both succeed and mint
+        // two sessions (Gate 4 happy-path B2). We extract the entry
+        // here, work without the lock, and on terminal failure we
+        // re-insert with the attempts counter bumped.
+        MfaPending entry;
+        bool found = false;
+        {
+            std::lock_guard lock(mfa_pending_mu_);
+            reap_mfa_pending_locked();
+            auto it = mfa_pending_.find(pending);
+            if (it != mfa_pending_.end()) {
+                entry = std::move(it->second);
+                mfa_pending_.erase(it);
+                found = true;
+            }
+        }
+        if (!found) {
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log(req, "mfa.login.failed", "error", "User", "",
+                      "pending token invalid or expired");
+            emit_event("mfa.login.failed", req,
+                       {{"source_ip", req.remote_addr}, {"reason", "pending_invalid"}}, {},
+                       Severity::kWarn);
+            return;
+        }
+
+        // Reject an enrollment-bootstrap token replayed here. The user is
+        // still provisional so mfa_verify_login_code would fail regardless,
+        // but an explicit guard keeps the failure audit unambiguous and
+        // closes the wrong-endpoint path deterministically. The entry was
+        // already consumed at lookup time, so this is terminal.
+        if (entry.kind == PendingKind::enrollment) {
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "enrollment token used at login-challenge endpoint");
+            return;
+        }
+
+        auto* db = auth_mgr_.auth_db_ptr();
+        if (!db) {
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "auth_db unavailable");
+            return;
+        }
+
+        bool matched = false;
+        bool used_recovery = false;
+        // Strict shape gate (Gate 4 consistency N2 + unhappy UP-14/UP-20):
+        //   - TOTP: exactly 6 ASCII digits
+        //   - Recovery: any other shape goes through normalisation +
+        //     base32 alphabet check at the store layer
+        // Pre-PR1's heuristic admitted 7-digit numeric noise into the
+        // recovery PBKDF2 scan (~10 ms CPU each) which compounded UP-11
+        // into a sustained DoS vector.
+        bool is_totp = code.size() == 6;
+        if (is_totp) {
+            for (char c : code) {
+                if (c < '0' || c > '9') {
+                    is_totp = false;
+                    break;
+                }
+            }
+        }
+        if (is_totp) {
+            auto r = db->mfa_verify_login_code(entry.username, code);
+            if (r && *r) {
+                matched = true;
+            }
+        } else {
+            auto r = db->mfa_consume_recovery_code(entry.username, code);
+            if (r && *r) {
+                matched = true;
+                used_recovery = true;
+            }
+        }
+
+        if (!matched) {
+            // Bump attempts counter and re-insert if still under the cap.
+            // Once exhausted the entry stays erased and the operator must
+            // start over from /login (rate-limit gap closure for H1+UP-11).
+            // Capture identity BEFORE the move-back — reading entry.username
+            // after `std::move(entry)` would emit a CC6.6 audit row with an
+            // empty principal (governance safety-B1).
+            const std::string uname = entry.username;
+            const auto urole = entry.role;
+            entry.attempts += 1;
+            bool exhausted = entry.attempts >= kMfaMaxAttemptsPerPending;
+            // Only re-insert if the entry is under the cap AND still within
+            // its TTL — re-inserting an already-expired entry would
+            // resurrect a token past its deadline for one more attempt
+            // window until the next reap (governance UP-13).
+            const bool reinsert =
+                !exhausted && std::chrono::steady_clock::now() < entry.expires_at;
+            std::size_t pending_size = 0;
+            {
+                std::lock_guard lock(mfa_pending_mu_);
+                if (reinsert) {
+                    mfa_pending_[pending] = std::move(entry);
+                }
+                pending_size = mfa_pending_.size();
+            }
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "mfa.login.failed", "error", uname,
+                                    auth::role_to_string(urole), "User", uname,
+                                    exhausted ? "attempts exhausted"
+                                              : (is_totp ? "totp code rejected"
+                                                         : "recovery code rejected"));
+            emit_event("mfa.login.failed", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", uname},
+                        {"method", is_totp ? "totp" : "recovery"},
+                        {"attempts_exhausted", exhausted}},
+                       {}, Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_mfa_logins_total",
+                           {{"method", is_totp ? "totp" : "recovery"},
+                            {"result", exhausted ? "exhausted" : "failure"}})
+                    .increment();
+                m->gauge("yuzu_auth_mfa_pending_tokens")
+                    .set(static_cast<double>(pending_size));
+            }
+            return;
+        }
+
+        // Terminal success — entry was already erased atomically at
+        // lookup time. Mint the real session marked as MFA-verified.
+        auto token = auth_mgr_.create_local_session(entry.username, entry.role, true);
+        res.set_header("Set-Cookie", "yuzu_session=" + token + session_cookie_attrs());
         res.set_content(R"({"status":"ok"})", "application/json");
-        audit_log(req, "auth.login", "success", "user", username);
-        emit_event(
-            "auth.login", req,
-            {{"source_ip", req.remote_addr}, {"user_agent", req.get_header_value("User-Agent")}});
+        // Audit chain — emit BOTH the method-specific verb AND the
+        // canonical auth.login row so SIEM queries that key on
+        // `auth.login` for session-creation parity across password,
+        // OIDC, and MFA paths stay correct (Gate 4 architect S2 +
+        // happy-path S1 + S2).
+        if (used_recovery) {
+            audit_log_for_principal(req, "mfa.recovery_code.used", "ok", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "method=recovery");
+        } else {
+            audit_log_for_principal(req, "mfa.login.verified", "ok", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username);
+        }
+        audit_log_for_principal(req, "auth.login", "ok", entry.username,
+                                auth::role_to_string(entry.role), "User", entry.username,
+                                used_recovery ? "method=password+recovery"
+                                              : "method=password+totp");
+        emit_event(used_recovery ? "mfa.recovery_code.used" : "mfa.login.verified", req,
+                   {{"source_ip", req.remote_addr},
+                    {"username", entry.username},
+                    {"auth_method", used_recovery ? "password+recovery" : "password+totp"}});
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_auth_mfa_logins_total",
+                       {{"method", used_recovery ? "recovery" : "totp"},
+                        {"result", "success"}})
+                .increment();
+            std::lock_guard lock(mfa_pending_mu_);
+            m->gauge("yuzu_auth_mfa_pending_tokens")
+                .set(static_cast<double>(mfa_pending_.size()));
+        }
+    });
+
+    // -- MFA enrollment bootstrap (PR3) ---------------------------------------
+    //
+    // POST /login/mfa/enroll — completes a login that /login blocked
+    // because `mfa_enforcement` required MFA and the user had none. /login
+    // issued a provisional TOTP secret + an enrollment-pending token; this
+    // endpoint confirms the first code against that provisional secret,
+    // promotes it to enrolled, mints the (MFA-verified) session, and
+    // returns the one-time recovery codes for the browser to display.
+    //
+    // Only a 6-digit TOTP code is accepted — recovery codes don't exist
+    // until enrollment completes, and the strict shape gate keeps the
+    // PBKDF2 DoS surface closed (same posture as /login/mfa). Shares the
+    // `is_login` rate-limit predicate so the provisional secret can't be
+    // brute-forced. Uniform 401 body on every failure mode.
+    sink.Post("/login/mfa/enroll", [this](const httplib::Request& req, httplib::Response& res) {
+        static constexpr const char* kFailureBody =
+            R"({"error":{"code":401,"message":"Invalid verification code"},"meta":{"api_version":"v1"}})";
+
+        auto pending = extract_form_value(req.body, "mfa_pending_token");
+        auto code = extract_form_value(req.body, "code");
+
+        // Atomically take ownership of the entry (see /login/mfa rationale —
+        // without the move two concurrent confirms could both mint).
+        MfaPending entry;
+        bool found = false;
+        {
+            std::lock_guard lock(mfa_pending_mu_);
+            reap_mfa_pending_locked();
+            auto it = mfa_pending_.find(pending);
+            if (it != mfa_pending_.end()) {
+                entry = std::move(it->second);
+                mfa_pending_.erase(it);
+                found = true;
+            }
+        }
+        if (!found) {
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log(req, "mfa.enroll.failed", "error", "User", "",
+                      "pending token invalid or expired");
+            return;
+        }
+
+        // Reject a login-challenge token replayed at the enrollment
+        // endpoint — the inverse of the guard in /login/mfa.
+        if (entry.kind != PendingKind::enrollment) {
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "login-challenge token used at enrollment endpoint");
+            return;
+        }
+
+        auto* db = auth_mgr_.auth_db_ptr();
+        if (!db) {
+            // Uniform 401 (NOT 503) on db-null: matches the /login/mfa
+            // sibling and avoids leaking "this pending token is valid" via
+            // a distinct status during a store outage (Hermes L-1). The
+            // real reason is in the audit detail only.
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "auth_db unavailable");
+            return;
+        }
+
+        // Strict shape gate: exactly 6 ASCII digits.
+        bool is_totp = code.size() == 6;
+        if (is_totp) {
+            for (char c : code) {
+                if (c < '0' || c > '9') {
+                    is_totp = false;
+                    break;
+                }
+            }
+        }
+
+        std::vector<std::string> recovery_codes;
+        bool verified = false;
+        if (is_totp) {
+            auto r = db->mfa_verify_enrollment(entry.username, code);
+            if (r) {
+                recovery_codes = std::move(*r);
+                verified = true;
+            }
+        }
+
+        if (!verified) {
+            // Bump attempts; re-insert if still under the cap. The
+            // provisional secret persists in the DB across retries (it is
+            // NOT re-revealed) so the operator keeps the QR they already
+            // scanned; only the next 30s code is needed.
+            //
+            // Capture identity BEFORE the move-back — reading entry.username
+            // after `std::move(entry)` would emit a CC6.6 audit row with an
+            // empty principal (governance safety-B1). Snapshot the pending
+            // count under the same lock and publish metrics OUTSIDE it, so
+            // mfa_pending_mu_ is never held across the metrics-registry lock
+            // (lock-discipline parity with /login/mfa; cpp-safety SHOULD).
+            const std::string uname = entry.username;
+            const auto urole = entry.role;
+            entry.attempts += 1;
+            bool exhausted = entry.attempts >= kMfaMaxAttemptsPerPending;
+            // Re-insert only if under the cap AND still within TTL (UP-13).
+            const bool reinsert =
+                !exhausted && std::chrono::steady_clock::now() < entry.expires_at;
+            std::size_t pending_size = 0;
+            {
+                std::lock_guard lock(mfa_pending_mu_);
+                if (reinsert) {
+                    mfa_pending_[pending] = std::move(entry);
+                }
+                pending_size = mfa_pending_.size();
+            }
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(
+                req, "mfa.enroll.failed", "error", uname, auth::role_to_string(urole), "User",
+                uname,
+                exhausted ? "attempts exhausted"
+                          : (is_totp ? "totp code rejected" : "malformed code"));
+            emit_event("mfa.enroll.failed", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", uname},
+                        {"method", "enroll"},
+                        {"attempts_exhausted", exhausted}},
+                       {}, Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                // Failure-counter parity with /login/mfa so enrollment
+                // brute-force / storm is alertable (cons-S2 / sre).
+                m->counter("yuzu_auth_mfa_logins_total",
+                           {{"method", "enroll"},
+                            {"result", exhausted ? "exhausted" : "failure"}})
+                    .increment();
+                m->gauge("yuzu_auth_mfa_pending_tokens")
+                    .set(static_cast<double>(pending_size));
+            }
+            return;
+        }
+
+        // Enrollment confirmed — mint the MFA-verified session and return
+        // the recovery codes for the one-time reveal. Emit the enrollment
+        // verb, the canonical recovery-codes-generated verb, and the
+        // canonical auth.login row (session-creation parity with the
+        // password / OIDC / login-challenge paths).
+        auto token = auth_mgr_.create_local_session(entry.username, entry.role, true);
+        res.set_header("Set-Cookie", "yuzu_session=" + token + session_cookie_attrs());
+        nlohmann::json body = {{"status", "ok"}, {"recovery_codes", recovery_codes}};
+        res.set_content(body.dump(), "application/json");
+        audit_log_for_principal(req, "mfa.enroll.verified", "ok", entry.username,
+                                auth::role_to_string(entry.role), "User", entry.username,
+                                "enforcement bootstrap");
+        audit_log_for_principal(req, "mfa.recovery_codes.generated", "ok", entry.username,
+                                auth::role_to_string(entry.role), "User", entry.username);
+        audit_log_for_principal(req, "auth.login", "ok", entry.username,
+                                auth::role_to_string(entry.role), "User", entry.username,
+                                "method=password+totp-enroll");
+        emit_event("mfa.enroll.verified", req,
+                   {{"source_ip", req.remote_addr}, {"username", entry.username}});
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_auth_mfa_logins_total", {{"method", "enroll"}, {"result", "success"}})
+                .increment();
+            std::lock_guard lock(mfa_pending_mu_);
+            m->gauge("yuzu_auth_mfa_pending_tokens")
+                .set(static_cast<double>(mfa_pending_.size()));
+        }
+    });
+
+    // -- MFA step-up (PR2) ----------------------------------------------------
+    //
+    // POST /login/mfa/stepup — re-prove MFA for an existing session so the
+    // session's mfa_verified_at refreshes and the high-risk REST/Settings
+    // gate at `mfa_step_up.hpp` lets the next mutation through. The endpoint
+    // is rate-limited at the server pre-routing layer (`is_login`
+    // predicate widened to include this path) so a malicious operator with
+    // a valid session cannot pound the TOTP space to brute-force the secret.
+    //
+    // Failure-mode taxonomy mirrors POST /login/mfa: uniform 401 body
+    // regardless of whether the session was missing/stale, the code shape
+    // was wrong, or the code mismatched. Discriminator lives in the audit
+    // detail only (token-validity oracle defence). API-token principals
+    // hit this endpoint with auth_source != "local"/"oidc" — they get a
+    // 400 (session step-up is the wrong tool for token rotation).
+    sink.Post("/login/mfa/stepup", [this](const httplib::Request& req, httplib::Response& res) {
+        static constexpr const char* kFailureBody =
+            R"({"error":{"code":401,"message":"MFA step-up failed"},"meta":{"api_version":"v1"}})";
+
+        auto session = require_auth(req, res);
+        if (!session)
+            return;
+
+        // Only LOCAL sessions can step up here: this endpoint verifies a
+        // TOTP / recovery code against a local `users` row. Two other
+        // principal kinds reach this code and must be rejected with a
+        // precise remediation rather than a misleading 401:
+        //   - bearer (api_token/mcp_token): no session to step up; re-issue
+        //     the token.
+        //   - OIDC: no local secret exists (create_oidc_session never
+        //     writes a users row), so mfa_verify_login_code would always
+        //     fail. The step-up gate already routes OIDC callers to
+        //     /auth/oidc/start; this 400 keeps the endpoint contract honest
+        //     instead of silently dead-ending them on a 401 (governance
+        //     cons-B1). Audit + correlation_id keep both branches traceable.
+        if (session->auth_source != "local") {
+            const bool is_oidc = session->auth_source == "oidc";
+            const auto cid = detail::make_correlation_id();
+            res.status = 400;
+            nlohmann::json envelope = {
+                {"error",
+                 {{"code", 400},
+                  {"message",
+                   is_oidc ? "OIDC sessions re-prove MFA by re-authenticating with the "
+                             "identity provider — start a new SSO sign-in at /auth/oidc/start, "
+                             "not local step-up"
+                           : "step-up is for session-cookie callers only — re-issue the API "
+                             "token to refresh MFA proof"},
+                  {"correlation_id", cid}}},
+                {"meta", {{"api_version", "v1"}}}};
+            res.set_content(envelope.dump(), "application/json");
+            audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
+                                    auth::role_to_string(session->role), "User",
+                                    session->username,
+                                    (is_oidc ? "oidc session cannot local step up (re-SSO)"
+                                             : "bearer credential cannot step up") +
+                                        std::string(" (auth_source=") + session->auth_source +
+                                        ")");
+            return;
+        }
+
+        auto* db = auth_mgr_.auth_db_ptr();
+        if (!db) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"auth_db unavailable"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+
+        auto code = extract_form_value(req.body, "code");
+        if (code.empty()) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"missing code"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
+                                    auth::role_to_string(session->role), "User",
+                                    session->username, "missing code");
+            return;
+        }
+
+        // Strict shape gate (same as /login/mfa): 6 ASCII digits → TOTP,
+        // anything else → recovery code path. Defeats the CPU-DoS shape
+        // oracle that a 7-digit numeric noise would otherwise trip.
+        bool is_totp = code.size() == 6;
+        if (is_totp) {
+            for (char c : code) {
+                if (c < '0' || c > '9') {
+                    is_totp = false;
+                    break;
+                }
+            }
+        }
+        bool matched = false;
+        bool used_recovery = false;
+        if (is_totp) {
+            auto r = db->mfa_verify_login_code(session->username, code);
+            if (r && *r)
+                matched = true;
+        } else {
+            auto r = db->mfa_consume_recovery_code(session->username, code);
+            if (r && *r) {
+                matched = true;
+                used_recovery = true;
+            }
+        }
+
+        if (!matched) {
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
+                                    auth::role_to_string(session->role), "User",
+                                    session->username,
+                                    is_totp ? "totp code rejected" : "recovery code rejected");
+            emit_event("mfa.step_up.failed", req,
+                       {{"source_ip", req.remote_addr},
+                        {"username", session->username},
+                        {"method", is_totp ? "totp" : "recovery"}},
+                       {}, Severity::kWarn);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_mfa_step_up_total",
+                           {{"method", is_totp ? "totp" : "recovery"}, {"result", "failure"}})
+                    .increment();
+            }
+            return;
+        }
+
+        // Success — stamp `mfa_verified_at = steady_clock::now()` on the
+        // existing session row. The cookie itself does NOT rotate — the
+        // step-up refreshes a session attribute, it does not mint a new
+        // session (which would break in-flight HTMX requests from the
+        // same browser tab).
+        auto token = extract_session_cookie(req);
+        if (!auth_mgr_.mark_session_mfa_verified(token)) {
+            // Defensive — require_auth succeeded so the token resolves to
+            // a session; if mark_session_mfa_verified can't find it, the
+            // session was concurrently invalidated. Fail closed.
+            res.status = 401;
+            res.set_content(kFailureBody, "application/json");
+            audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
+                                    auth::role_to_string(session->role), "User",
+                                    session->username, "session vanished during step-up");
+            return;
+        }
+        res.set_content(R"({"status":"ok"})", "application/json");
+        audit_log_for_principal(req, "mfa.step_up.passed", "ok", session->username,
+                                auth::role_to_string(session->role), "User", session->username,
+                                used_recovery ? "method=recovery" : "method=totp");
+        emit_event("mfa.step_up.passed", req,
+                   {{"source_ip", req.remote_addr},
+                    {"username", session->username},
+                    {"method", used_recovery ? "recovery" : "totp"}});
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_auth_mfa_step_up_total",
+                       {{"method", used_recovery ? "recovery" : "totp"}, {"result", "success"}})
+                .increment();
+        }
     });
 
     // -- Logout ---------------------------------------------------------------
-    svr.Post("/logout", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/logout", [this](const httplib::Request& req, httplib::Response& res) {
         audit_log(req, "auth.logout", "success");
         emit_event("auth.logout", req);
         auto token = extract_session_cookie(req);
@@ -539,7 +1295,7 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
     });
 
     // -- OIDC SSO endpoints ---------------------------------------------------
-    svr.Get("/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/auth/oidc/start", [this](const httplib::Request& req, httplib::Response& res) {
         std::shared_lock oidc_lock(oidc_mu_);
         if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
             res.status = 404;
@@ -562,7 +1318,7 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
         res.set_redirect(auth_url);
     });
 
-    svr.Get("/auth/callback", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/auth/callback", [this](const httplib::Request& req, httplib::Response& res) {
         std::shared_lock oidc_lock(oidc_mu_);
         if (!oidc_provider_) {
             res.status = 404;
@@ -602,8 +1358,46 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
         auto email = claims.email.empty() ? claims.preferred_username : claims.email;
         auto display = claims.name.empty() ? email : claims.name;
         auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
-        auto session_token =
-            auth_mgr_.create_oidc_session(display, email, claims.sub, claims.groups, admin_gid);
+
+        // PR3 / SOC 2 CC6.6 — seed the session's MFA-verified timestamp
+        // when the IdP `amr` claim attests a multi-factor login. The
+        // step-up gate (mfa_step_up.cpp) consumes this so an MFA'd SSO
+        // session clears high-risk endpoints without a redundant local
+        // prompt, while a single-factor SSO login is gated. Anchor the
+        // steady-clock timestamp to the IdP-asserted `iat` so a stale
+        // assertion still re-prompts: a token issued `age` ago is treated
+        // as proven `age` ago. `iat` is wall-clock; convert the age into
+        // the steady-clock domain (never store `iat` directly — an NTP
+        // step must not be able to extend the step-up window, hard
+        // invariant #5). Negative ages (IdP clock ahead of ours) clamp to
+        // "just now".
+        const bool amr_mfa_asserted = amr_asserts_mfa(claims.amr);
+        std::chrono::steady_clock::time_point mfa_at{};
+        if (amr_mfa_asserted && claims.iat > 0) {
+            // Anchor the steady-clock proof to the IdP-asserted `iat` so a
+            // stale assertion still re-prompts: a token issued `age` ago is
+            // treated as proven `age` ago. Clamp the system-clock domain
+            // BEFORE the cast to steady_clock::duration (a future editor
+            // casting first then clamping against steady_clock::zero risks
+            // truncation skew; cpp-expert SHOULD). Negative age (IdP clock
+            // ahead of ours) clamps to "just now"; it can only ever shorten
+            // the window, never extend it. `iat<=0` (missing/0) is NOT
+            // seeded — fabricating a fresh window from a timestampless
+            // assertion would let a replayed amr-without-iat token look
+            // fresh (governance UP-9). An un-seeded OIDC session simply
+            // passes the step-up gate like any non-MFA SSO identity.
+            auto asserted =
+                std::chrono::system_clock::from_time_t(static_cast<std::time_t>(claims.iat));
+            auto age = std::chrono::system_clock::now() - asserted;
+            if (age < std::chrono::system_clock::duration::zero()) {
+                age = std::chrono::system_clock::duration::zero();
+            }
+            mfa_at = std::chrono::steady_clock::now() -
+                     std::chrono::duration_cast<std::chrono::steady_clock::duration>(age);
+        }
+
+        auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub,
+                                                           claims.groups, admin_gid, mfa_at);
 
         // Sync Entra groups into the RBAC store so that group-scoped role
         // assignments (e.g. ApiTokenManager on an Entra group) take effect.
@@ -620,9 +1414,32 @@ void AuthRoutes::register_routes(httplib::Server& svr) {
 
         res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
 
-        audit_log(req, "auth.oidc_login", "success", "user", display);
+        // Explicit-principal audit row — request lands at /auth/callback
+        // with no session cookie yet, so the default resolve_session
+        // path would leave principal empty (Gate 4 consistency B3). Use
+        // the validated `display` from the IdP as the canonical
+        // principal name. Role is resolved from the freshly-minted
+        // session — for the audit row we re-validate to capture the
+        // role the user actually holds (group-mapping may have made
+        // them admin).
+        auto effective_role = auth_mgr_.validate_session(session_token)
+                                  .transform([](const auth::Session& s) {
+                                      return auth::role_to_string(s.role);
+                                  })
+                                  .value_or(std::string{"user"});
+        // Record whether the IdP attested MFA (the `amr` decision) in the
+        // audit detail so the CC6.6 "was this privileged SSO login MFA-
+        // verified" question is answerable from Yuzu's own chain without
+        // cross-referencing IdP logs (governance compliance-S2).
+        audit_log_for_principal(req, "auth.oidc_login", "ok", display, effective_role, "User",
+                                display,
+                                std::string("amr_mfa_asserted=") +
+                                    (amr_mfa_asserted ? "true" : "false"));
         emit_event("auth.oidc_login", req,
                    {{"source_ip", req.remote_addr},
+                    {"username", display},
+                    {"auth_method", "oidc"},
+                    {"amr_mfa_asserted", amr_mfa_asserted},
                     {"oidc_sub", claims.sub},
                     {"email", email},
                     {"name", claims.name}});

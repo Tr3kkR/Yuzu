@@ -42,10 +42,15 @@ namespace yuzu::server {
 struct GuaranteedStateRuleRow {
     std::string rule_id;           // UUID
     std::string name;              // unique, human-authored
-    std::string yaml_source;       // verbatim YAML, authoritative
+    std::string yaml_source;       // human-readable rendering (generated; see spec_json)
+    // Canonical structured JSON of the Guard (spark/assertion/remediation) — the
+    // AUTHORITATIVE form the agent enforces from and that the push proto is built
+    // from. yaml_source is rendered one-way from this. See
+    // docs/guardian-mvp-contract.md decisions 1-2. Empty for pre-migration rows.
+    std::string spec_json;
     int64_t version{1};
     bool enabled{true};
-    std::string enforcement_mode;  // "enforce" | "audit" | "disabled"
+    std::string enforcement_mode;  // "enforce" | "audit" (validated at the REST boundary; `enabled` controls disable)
     std::string severity;          // "critical" | "high" | "medium" | "low"
     std::string os_target;         // "windows" | "linux" | "macos" | ""=all
     std::string scope_expr;        // server-side scope expression
@@ -136,6 +141,17 @@ public:
     std::size_t rule_count() const;
     std::size_t event_count() const;
 
+    // Monotonic policy generation — the version stamp of the rule SET, bumped
+    // atomically on every create/update/delete (see bump_policy_generation_locked).
+    // The Guardian push proto carries this so an agent can tell a newer push from
+    // a stale one; the heartbeat reconcile (M5) compares an agent's applied
+    // generation against this value to decide whether it has fallen behind.
+    // Persisted (survives restart) and strictly increasing — unlike the prior
+    // wall-clock seconds, which could repeat or step backwards (M6 / #1209).
+    // A *reconcile* re-push reads this value WITHOUT bumping it, so catching one
+    // lagging agent up never makes the rest of the fleet look stale.
+    uint64_t current_policy_generation() const;
+
     // Observability — lock-free cumulative counters for Prometheus scraping.
     // Cover the counts that a Prometheus alert on ingest health wants (bytes
     // or rows written, reaper activity) without forcing the collector to
@@ -168,6 +184,12 @@ private:
 #else
     void run_cleanup();
 #endif
+
+    // Increment the persisted policy generation. Caller MUST hold mtx_ as a
+    // unique_lock (called from within the rule-mutation methods, which already
+    // hold it). Single fixed UPDATE — no sqlite3_changes() read, so it does not
+    // add a #1033 race site.
+    void bump_policy_generation_locked();
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;
     // retention_days <= 0 means "never expire" (returns 0, the sentinel the
