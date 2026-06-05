@@ -766,6 +766,23 @@ std::optional<std::string> fingerprint_sha256(std::string_view cert_pem) {
     return out;
 }
 
+bool is_valid_ip_literal(const std::string& s) {
+    if (s.empty())
+        return false;
+    // Exactly the parser the SAN builder uses (push_ip / a2i_IPADDRESS), so an
+    // accepted value can never be rejected downstream by issue_leaf.
+    ASN1_OCTET_STRING* ip = a2i_IPADDRESS(s.c_str());
+    if (!ip) {
+        // a2i_IPADDRESS can push onto the OpenSSL error stack on an internal
+        // alloc failure; this is a speculative classification check, so clear it
+        // rather than let a stale error pollute a later issue_leaf log.
+        ERR_clear_error();
+        return false;
+    }
+    ASN1_OCTET_STRING_free(ip);
+    return true;
+}
+
 namespace {
 
 DistinguishedName name_to_dn(X509_NAME* nm) {

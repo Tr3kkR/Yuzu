@@ -279,3 +279,21 @@ TEST_CASE("x509_ca: fingerprint/parse reject non-cert input", "[pki][negative]")
     REQUIRE_FALSE(parse_certificate("garbage"));
     REQUIRE_FALSE(fingerprint_sha256("")); // empty rejected by the size guard
 }
+
+TEST_CASE("x509_ca: is_valid_ip_literal matches the SAN-builder parser", "[pki][security]") {
+    // Accepts canonical IPv4 / IPv6.
+    REQUIRE(is_valid_ip_literal("127.0.0.1"));
+    REQUIRE(is_valid_ip_literal("10.20.30.40"));
+    REQUIRE(is_valid_ip_literal("::1"));
+    REQUIRE(is_valid_ip_literal("fe80::1"));
+    REQUIRE(is_valid_ip_literal("2001:db8::dead:beef"));
+    // Rejects the loose-heuristic false positives that would hard-fail issue_leaf
+    // (the whole reason this gate exists for --cert-san classification).
+    REQUIRE_FALSE(is_valid_ip_literal("1.2.3.4.5"));   // 5 octets
+    REQUIRE_FALSE(is_valid_ip_literal("127.1"));       // short form rejected by a2i
+    REQUIRE_FALSE(is_valid_ip_literal("999.1.1.1"));   // octet out of range
+    REQUIRE_FALSE(is_valid_ip_literal("not-an-ip"));
+    REQUIRE_FALSE(is_valid_ip_literal("12:00:00"));    // colon ≠ valid IPv6
+    REQUIRE_FALSE(is_valid_ip_literal("gateway"));
+    REQUIRE_FALSE(is_valid_ip_literal(""));
+}

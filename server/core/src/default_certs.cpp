@@ -8,12 +8,15 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <random>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -144,17 +147,205 @@ struct KeyZeroGuard {
     KeyZeroGuard& operator=(const KeyZeroGuard&) = delete;
 };
 
-// Heuristic: does `h` look like an IP literal? IP literals belong in the
-// iPAddress SAN, never dNSName (strict TLS stacks reject an IP in a DNS SAN).
-bool looks_like_ip(const std::string& h) {
-    if (h.find(':') != std::string::npos)
-        return true; // IPv6
-    if (h.empty())
+// case-insensitive ASCII prefix test (no locale, no <cctype> surprises).
+bool ci_prefix(std::string_view s, std::string_view pfx) {
+    if (s.size() < pfx.size())
         return false;
-    for (char c : h)
-        if (!((c >= '0' && c <= '9') || c == '.'))
+    for (std::size_t i = 0; i < pfx.size(); ++i) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+        if (c != pfx[i])
             return false;
-    return h.find('.') != std::string::npos; // dotted-decimal IPv4
+    }
+    return true;
+}
+
+std::string_view trim_ws(std::string_view s) {
+    auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    while (!s.empty() && ws(s.front()))
+        s.remove_prefix(1);
+    while (!s.empty() && ws(s.back()))
+        s.remove_suffix(1);
+    return s;
+}
+
+bool has_control_char(std::string_view s) {
+    for (unsigned char c : s)
+        if (c < 0x20 || c == 0x7f)
+            return true;
+    return false;
+}
+
+// Bounds on operator --cert-san input so a malformed/huge value (CLI or the
+// YUZU_CERT_SAN env, which a deployment may template from a less-trusted source)
+// cannot hang or balloon boot, and so each DNS name stays within RFC 1035 limits.
+constexpr std::size_t kMaxExtraSans = 64;     // total accepted extra names
+constexpr std::size_t kMaxRawEntryLen = 1024; // per raw --cert-san entry
+constexpr std::size_t kMaxDnsNameLen = 253;   // RFC 1035 total
+constexpr std::size_t kMaxDnsLabelLen = 63;   // RFC 1035 label
+
+// Validate a dNSName SAN: non-empty, <=253 bytes, every dot-separated label
+// non-empty and <=63 bytes, no leading/trailing dot, and a host-name charset
+// (letters/digits/hyphen/underscore, plus '*' for a wildcard). The charset keeps
+// genuine config mistakes (path-like '/', zone-id '%', whitespace, ':') out of
+// the certificate rather than baking a never-matching SAN; IDNs are punycode
+// (xn--…) so they remain ASCII-LDH. Wildcards are warned on by the caller.
+bool valid_dns_name(std::string_view s) {
+    if (s.empty() || s.size() > kMaxDnsNameLen)
+        return false;
+    std::size_t label = 0;
+    for (char c : s) {
+        if (c == '.') {
+            if (label == 0)
+                return false; // empty label (leading dot or "a..b")
+            label = 0;
+            continue;
+        }
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '*';
+        if (!ok)
+            return false;
+        if (++label > kMaxDnsLabelLen)
+            return false;
+    }
+    return label != 0; // reject a trailing dot
+}
+
+// Parse operator --cert-san values into a validated, de-duplicated SAN set.
+// Each raw entry may be comma-separated; each piece is "dns:<name>", "ip:<addr>",
+// or a bare value classified IP-vs-DNS by pki::is_valid_ip_literal — the EXACT
+// parser issue_leaf uses, so a value accepted here can never hard-fail cert
+// generation (a typo'd IP is dropped, not boot-fatal). Invalid / over-bound /
+// control-char / non-IP-"ip:" pieces are dropped with a warning; the total is
+// capped. Returns only the extras (the base SAN set is merged separately).
+pki::SubjectAltNames parse_extra_sans(const std::vector<std::string>& extra) {
+    pki::SubjectAltNames out;
+    std::size_t total = 0;
+    auto push_unique = [](std::vector<std::string>& v, std::string val) -> bool {
+        if (val.empty() || std::find(v.begin(), v.end(), val) != v.end())
+            return false;
+        v.push_back(std::move(val));
+        return true;
+    };
+    auto add_dns = [&](std::string_view name) {
+        std::string n(name);
+        if (!valid_dns_name(n)) {
+            spdlog::warn("default_certs: ignoring --cert-san DNS '{}' (empty/over-length/malformed)",
+                         n);
+            return;
+        }
+        if (n.find('*') != std::string::npos)
+            spdlog::warn("default_certs: --cert-san DNS '{}' has a wildcard — broadens cert validity",
+                         n);
+        if (push_unique(out.dns, std::move(n)))
+            ++total;
+    };
+    auto add_ip = [&](std::string_view addr) {
+        std::string a(addr);
+        if (!pki::is_valid_ip_literal(a)) {
+            spdlog::warn("default_certs: ignoring --cert-san IP '{}' (not a valid IP literal)", a);
+            return;
+        }
+        if (push_unique(out.ips, std::move(a)))
+            ++total;
+    };
+    auto classify = [&](std::string_view piece) {
+        piece = trim_ws(piece);
+        if (piece.empty())
+            return;
+        if (has_control_char(piece)) {
+            spdlog::warn("default_certs: ignoring --cert-san entry containing control characters");
+            return;
+        }
+        if (ci_prefix(piece, "dns:")) {
+            const std::string_view v = trim_ws(piece.substr(4));
+            if (pki::is_valid_ip_literal(std::string(v)))
+                spdlog::warn("default_certs: --cert-san 'dns:{}' is an IP literal — keeping it as a "
+                             "DNS-type SAN as written; use 'ip:' for an iPAddress SAN",
+                             std::string(v));
+            add_dns(v);
+        } else if (ci_prefix(piece, "ip:")) {
+            add_ip(trim_ws(piece.substr(3)));
+        } else if (pki::is_valid_ip_literal(std::string(piece))) {
+            add_ip(piece);
+        } else {
+            add_dns(piece);
+        }
+    };
+    for (const auto& raw : extra) {
+        if (total >= kMaxExtraSans) {
+            spdlog::warn("default_certs: --cert-san capped at {} extra names — ignoring the rest",
+                         kMaxExtraSans);
+            break;
+        }
+        if (raw.size() > kMaxRawEntryLen) {
+            spdlog::warn("default_certs: ignoring oversize --cert-san entry ({} bytes)", raw.size());
+            continue;
+        }
+        std::string_view rv{raw};
+        std::size_t start = 0;
+        for (;;) {
+            const std::size_t comma = rv.find(',', start);
+            classify(rv.substr(
+                start, comma == std::string_view::npos ? std::string_view::npos : comma - start));
+            if (comma == std::string_view::npos || total >= kMaxExtraSans)
+                break;
+            start = comma + 1;
+        }
+    }
+    return out;
+}
+
+// Merge validated extras into the base SAN set, de-duping against it.
+void merge_sans(pki::SubjectAltNames& base, const pki::SubjectAltNames& extra) {
+    for (const auto& d : extra.dns)
+        if (std::find(base.dns.begin(), base.dns.end(), d) == base.dns.end())
+            base.dns.push_back(d);
+    for (const auto& i : extra.ips)
+        if (std::find(base.ips.begin(), base.ips.end(), i) == base.ips.end())
+            base.ips.push_back(i);
+}
+
+// Best-effort operator-footgun guard for the idempotent fast path: if --cert-san
+// asks for names the EXISTING cert set does not carry, warn. Changing --cert-san
+// deliberately does NOT auto-rotate (that would mint a new CA and break every
+// enrolled agent's trust) — the operator must clear the dir to apply. DNS + IPv4
+// only; IPv6 is skipped because the parsed-back form is uncompressed
+// (e.g. "0:0:0:0:0:0:0:1"), so a literal compare would false-positive.
+void warn_on_san_drift(const fs::path& representative_leaf,
+                       const std::vector<std::string>& extra_sans) {
+    const pki::SubjectAltNames want = parse_extra_sans(extra_sans);
+    if (want.dns.empty() && want.ips.empty())
+        return;
+    const auto cert = pki::parse_certificate(read_text_file(representative_leaf));
+    if (!cert)
+        return;
+    auto missing = [](const std::vector<std::string>& w, const std::vector<std::string>& have,
+                      bool skip_ipv6) {
+        std::vector<std::string> m;
+        for (const auto& e : w) {
+            if (skip_ipv6 && e.find(':') != std::string::npos)
+                continue;
+            if (std::find(have.begin(), have.end(), e) == have.end())
+                m.push_back(e);
+        }
+        return m;
+    };
+    std::vector<std::string> miss = missing(want.dns, cert->san.dns, false);
+    const std::vector<std::string> miss_ip = missing(want.ips, cert->san.ips, true);
+    miss.insert(miss.end(), miss_ip.begin(), miss_ip.end());
+    if (miss.empty())
+        return;
+    std::string joined;
+    for (const auto& m : miss) {
+        if (!joined.empty())
+            joined += ", ";
+        joined += m;
+    }
+    spdlog::warn("default_certs: --cert-san requests [{}] not present in the existing default certs "
+                 "(they predate these SANs). Clear the cert directory to regenerate with them.",
+                 joined);
 }
 
 } // namespace
@@ -173,7 +364,7 @@ std::string detect_hostname() {
 }
 
 bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaStore* ca_store,
-                          DefaultCertSet& out) {
+                          DefaultCertSet& out, const std::vector<std::string>& extra_sans) {
     fill_paths(dir, out);
     const fs::path marker = dir / "default-marker.json";
 
@@ -207,6 +398,9 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
                         out.freshly_generated = false;
                         spdlog::info("default_certs: existing default cert set is intact (CA {})",
                                      out.ca_fingerprint_sha256);
+                        // Tell the operator if --cert-san now asks for names the
+                        // existing certs don't carry (we never auto-rotate).
+                        warn_on_san_drift(out.gateway_cert, extra_sans);
                         return true;
                     }
                     spdlog::warn("default_certs: existing default certs unusable ({}) — "
@@ -267,11 +461,26 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     pki::SubjectAltNames san;
     san.dns = {"localhost"};
     san.ips = {"127.0.0.1", "::1"};
-    // An IP-literal hostname must go in the iPAddress SAN, not dNSName.
-    if (looks_like_ip(hostname))
+    // An IP-literal hostname must go in the iPAddress SAN, not dNSName. The
+    // detected hostname is gated through the SAME validation as operator extras
+    // (a container gethostname() can return non-hostname bytes) — if it is
+    // neither a valid IP nor a valid DNS name it is omitted with a warning rather
+    // than baking a malformed SAN; localhost/loopback still cover local access.
+    if (pki::is_valid_ip_literal(hostname))
         san.ips.push_back(hostname);
-    else if (!hostname.empty())
+    else if (valid_dns_name(hostname))
         san.dns.push_back(hostname);
+    else if (!hostname.empty())
+        spdlog::warn("default_certs: host name '{}' is not a valid DNS name — omitting from the "
+                     "default-cert SAN (use --cert-san to add a reachable name)",
+                     hostname);
+    // Operator --cert-san extend the SAME set on every default leaf. This mirrors
+    // the base set above — localhost/loopback/hostname is itself identical across
+    // all three leaves — so an extra grants nothing a stolen leaf key couldn't
+    // already do (impersonation needs the 0600 key = host compromise; all three
+    // are co-located, same-operator, same-CA server infra). Per-leaf scoping is a
+    // possible future refinement, not a day-one need.
+    merge_sans(san, parse_extra_sans(extra_sans));
 
     const std::array<LeafSpec, 3> leaves = {{
         {"default-https", "default-https.pem", "https", pki::LeafUsage{.server_auth = true}},

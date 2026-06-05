@@ -186,6 +186,13 @@ struct CrlRevocation {
 /// "which CA / cert is this" identifier surfaced in banners, /health, and audit.
 [[nodiscard]] std::optional<std::string> fingerprint_sha256(std::string_view cert_pem);
 
+/// True iff `s` is a syntactically valid IPv4 or IPv6 literal, judged by the
+/// exact parser the SAN builder uses for an iPAddress entry (OpenSSL
+/// `a2i_IPADDRESS`). Callers classifying a SAN as IP-vs-DNS should gate on this
+/// so a value they accept as an IP cannot later be rejected by `issue_leaf`
+/// (an accept-then-reject mismatch would hard-fail certificate generation).
+[[nodiscard]] bool is_valid_ip_literal(const std::string& s);
+
 struct CertDetails {
     DistinguishedName subject;
     DistinguishedName issuer;

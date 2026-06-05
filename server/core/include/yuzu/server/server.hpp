@@ -34,6 +34,14 @@ struct Config {
     bool using_default_certs{false};       // any surface on default certs — drives notifications
     bool using_default_agent_certs{false}; // agent listener on default certs (don't-require posture)
     std::filesystem::path ca_dir;
+    // Extra Subject Alternative Names to inject into the auto-generated default
+    // leaves (--cert-san, repeatable). Each value is "dns:<name>", "ip:<addr>",
+    // or a bare value auto-classified by IP-literal shape; a single value may be
+    // comma-separated. Applied to every default leaf (https/server/gateway) so an
+    // operator can make the built-in certs valid for a deployment hostname or IP
+    // (e.g. "dns:gateway" so an agent verifying a gateway reached by that name
+    // succeeds). Ignored when operator certs are supplied or --no-default-certs.
+    std::vector<std::string> cert_sans;
 
     // Optional management listener TLS override.
     // If left empty, management reuses the agent listener credentials.

@@ -19,6 +19,7 @@
 #include <chrono>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -61,16 +62,32 @@ struct DefaultCertSet {
 /// the caller should refuse to start rather than serve without the certs it
 /// expected.
 ///
+/// `extra_sans` (operator `--cert-san`) are injected into EVERY default leaf in
+/// addition to the localhost/loopback/hostname base set. Each entry is
+/// "dns:<name>", "ip:<addr>", or a bare value classified IP-vs-DNS by the exact
+/// OpenSSL parser the SAN builder uses; a single entry may be comma-separated.
+/// This lets an operator make the built-in certs valid for a deployment name
+/// (e.g. "dns:gateway" so an agent reaching the gateway by that name passes
+/// hostname verification) without standing up external PKI. Input is validated
+/// and bounded — invalid IP literals, malformed/over-RFC-length DNS names,
+/// control characters, and entries beyond a fixed cap are each dropped with a
+/// warning, NEVER aborting the boot; an explicit "dns:"-prefixed IP literal is
+/// honoured as a DNS-type SAN (warned) and wildcards are warned on. Extras apply
+/// identically to all three leaves, exactly as the base SAN set already does.
+///
 /// NOTES: default-marker.json is crash-recovery idempotency, NOT tamper evidence
 /// (an attacker who can write the 0700 cert dir is already past the boundary; the
-/// fast path still chain-verifies the leaves as a corruption check). Leaf SANs
-/// cover localhost / loopback IPs / the detected hostname only — access by a LAN
-/// IP or a non-hostname FQDN needs operator-provided certs or DNS. Leaves are
-/// sized to the CA notAfter (10y) by design: there is no server-leaf
-/// auto-renewal, so a short life would be a guaranteed future outage, and the
-/// operator is loudly told to replace defaults.
+/// fast path still chain-verifies the leaves as a corruption check). Beyond the
+/// localhost / loopback IPs / detected hostname (+ any `extra_sans`), access by
+/// another LAN IP or FQDN needs operator-provided certs or DNS. Leaves are sized
+/// to the CA notAfter (10y) by design: there is no server-leaf auto-renewal, so a
+/// short life would be a guaranteed future outage, and the operator is loudly
+/// told to replace defaults. NOTE: adding/removing `extra_sans` does NOT
+/// regenerate an existing set — the marker fast path returns the prior certs
+/// unchanged; rotate (clear the dir or replace certs) for new SANs to take.
 [[nodiscard]] bool ensure_default_certs(const std::filesystem::path& dir,
                                         const std::string& hostname, CaStore* ca_store,
-                                        DefaultCertSet& out);
+                                        DefaultCertSet& out,
+                                        const std::vector<std::string>& extra_sans = {});
 
 } // namespace yuzu::server

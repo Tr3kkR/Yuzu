@@ -85,6 +85,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--cert-san` — extra Subject Alternative Names for the built-in default
+  certs (PKI PR5b).** New repeatable server flag (env `YUZU_CERT_SAN`) that
+  injects additional SANs into **every** auto-generated default leaf
+  (`default-https` / `default-server` / `default-gateway`) on top of the base
+  `localhost` / `127.0.0.1` / `::1` / `<hostname>` set. Each value is
+  `dns:<name>`, `ip:<addr>`, or a bare value auto-classified by IP-literal shape;
+  a single value may be comma-separated (so one `YUZU_CERT_SAN=dns:gateway,dns:server`
+  works as well as repeated flags). An `ip:`-tagged value that is not an IP literal
+  is dropped with a warning rather than failing the boot. This is the supported way
+  to make the built-in certs valid for a deployment name a client actually dials —
+  e.g. `--cert-san dns:gateway` so an agent reaching the gateway by that service
+  name passes SNI hostname verification (the `default-gateway` leaf does not
+  otherwise carry `DNS:gateway`). Ignored when operator certs are supplied or
+  `--no-default-certs` is set; changing it does not rotate an existing cert set
+  (clear the cert dir or replace the certs). See `docs/pki-architecture.md`.
+
 - **Gateway agent-edge one-way TLS — closes the plaintext command-fan-out hop
   (PKI PR5c).** The Erlang gateway's agent listener (`:50051`) can now run
   **server-authenticated (one-way) TLS** — encrypted + gateway-authenticated, with

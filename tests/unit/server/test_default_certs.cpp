@@ -17,6 +17,7 @@
 #include "../test_helpers.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -46,6 +47,10 @@ std::string read_file(const std::filesystem::path& p) {
 
 bool contains(const std::vector<std::string>& v, const std::string& s) {
     return std::find(v.begin(), v.end(), s) != v.end();
+}
+
+std::size_t count_of(const std::vector<std::string>& v, const std::string& s) {
+    return static_cast<std::size_t>(std::count(v.begin(), v.end(), s));
 }
 
 } // namespace
@@ -82,6 +87,123 @@ TEST_CASE("default_certs: first boot generates a full, chained set", "[default_c
 
     // Leaf notAfter must equal the CA notAfter (sized to the issuer).
     REQUIRE(https->not_after == ca_info->not_after);
+}
+
+TEST_CASE("default_certs: --cert-san extra SANs land on every default leaf", "[default_certs]") {
+    TempDir dir;
+    DefaultCertSet set;
+    // Exercise every form: dns:-prefixed, ip:-prefixed, a bare DNS value, a bare
+    // IP value (auto-classified), a comma-joined value (single-env-var case), a
+    // duplicate of the hostname (dedupe), and a bogus ip: (dropped with a warn).
+    const std::vector<std::string> extra = {
+        "dns:gateway", "ip:10.1.2.3",          "edge.example.com", "192.0.2.7",
+        "dns:a.example,ip:198.51.100.9",       "dns:test-host",    "ip:not-an-ip",
+    };
+    REQUIRE(ensure_default_certs(dir.path, "test-host", nullptr, set, extra));
+
+    for (const auto& leaf : {set.https_cert, set.server_cert, set.gateway_cert}) {
+        auto c = pki::parse_certificate(read_file(leaf));
+        REQUIRE(c);
+        // Base SANs still present.
+        REQUIRE(contains(c->san.dns, "localhost"));
+        REQUIRE(contains(c->san.ips, "127.0.0.1"));
+        // Extra DNS names (prefixed, bare, and comma-split).
+        REQUIRE(contains(c->san.dns, "gateway"));
+        REQUIRE(contains(c->san.dns, "edge.example.com"));
+        REQUIRE(contains(c->san.dns, "a.example"));
+        // Extra IPs (prefixed, bare, and comma-split) — never in the DNS set.
+        REQUIRE(contains(c->san.ips, "10.1.2.3"));
+        REQUIRE(contains(c->san.ips, "192.0.2.7"));
+        REQUIRE(contains(c->san.ips, "198.51.100.9"));
+        REQUIRE_FALSE(contains(c->san.dns, "10.1.2.3"));
+        // The bogus "ip:not-an-ip" was dropped (neither set).
+        REQUIRE_FALSE(contains(c->san.ips, "not-an-ip"));
+        REQUIRE_FALSE(contains(c->san.dns, "not-an-ip"));
+        // Hostname duplicate collapsed — appears exactly once.
+        REQUIRE(count_of(c->san.dns, "test-host") == 1);
+    }
+}
+
+TEST_CASE("default_certs: --cert-san input validation is robust (no boot-fail on bad input)",
+          "[default_certs]") {
+    TempDir dir;
+    DefaultCertSet set;
+    const std::string overlong_label(300, 'a'); // > 63-byte label → rejected
+    const std::vector<std::string> extra = {
+        "dns:10.0.0.1",        // explicit dns: of an IP literal → kept as DNS, NOT ip
+        "1.2.3.4.5",           // bare, IPv4-shaped but invalid → must NOT boot-fail
+        "9.9.9.9",             // bare, valid IPv4 → ip
+        "with space",          // bad charset (space) → dropped, no crash
+        "foo/bar.example",     // bad charset (slash, a templating mistake) → dropped
+        std::string("ctl\twith\ttabs"), // control chars → dropped
+        overlong_label,        // over-length DNS → dropped
+        "*.corp.example",      // wildcard → accepted (with warning)
+        "",                    // empty → skipped
+        "   ",                 // whitespace-only → skipped
+    };
+    // The whole point: a typo-laden extra set must still produce a valid cert set.
+    REQUIRE(ensure_default_certs(dir.path, "h", nullptr, set, extra));
+    REQUIRE(set.freshly_generated);
+
+    auto c = pki::parse_certificate(read_file(set.gateway_cert));
+    REQUIRE(c);
+    // dns:<ip> stays a DNS-type SAN (Finding 8) — present in dns, absent from ips.
+    REQUIRE(contains(c->san.dns, "10.0.0.1"));
+    REQUIRE_FALSE(contains(c->san.ips, "10.0.0.1"));
+    // Invalid IPv4 literal was NOT shunted to ips (would have hard-failed issue_leaf).
+    REQUIRE_FALSE(contains(c->san.ips, "1.2.3.4.5"));
+    // Valid bare IPv4 landed in ips.
+    REQUIRE(contains(c->san.ips, "9.9.9.9"));
+    // Wildcard accepted.
+    REQUIRE(contains(c->san.dns, "*.corp.example"));
+    // Over-length label and bad-charset values dropped from both sets.
+    REQUIRE_FALSE(contains(c->san.dns, overlong_label));
+    REQUIRE_FALSE(contains(c->san.dns, "with space"));
+    REQUIRE_FALSE(contains(c->san.dns, "foo/bar.example"));
+    // Control-char entry dropped (the mid-string tabs make it invalid input).
+    for (const auto& d : c->san.dns)
+        REQUIRE(d.find('\t') == std::string::npos);
+}
+
+TEST_CASE("default_certs: a malformed gethostname() is omitted from the SAN, not baked in",
+          "[default_certs]") {
+    TempDir dir;
+    DefaultCertSet set;
+    // Container orchestration can set a hostname containing non-DNS bytes.
+    REQUIRE(ensure_default_certs(dir.path, "bad/host name", nullptr, set));
+    REQUIRE(set.freshly_generated);
+    auto c = pki::parse_certificate(read_file(set.https_cert));
+    REQUIRE(c);
+    REQUIRE(contains(c->san.dns, "localhost"));        // base coverage intact
+    REQUIRE(contains(c->san.ips, "127.0.0.1"));
+    REQUIRE_FALSE(contains(c->san.dns, "bad/host name")); // malformed host name not baked in
+}
+
+TEST_CASE("default_certs: --cert-san total count is capped", "[default_certs]") {
+    TempDir dir;
+    DefaultCertSet set;
+    std::vector<std::string> extra;
+    for (int i = 0; i < 200; ++i)
+        extra.push_back("dns:host" + std::to_string(i) + ".example");
+    REQUIRE(ensure_default_certs(dir.path, "h", nullptr, set, extra));
+    auto c = pki::parse_certificate(read_file(set.gateway_cert));
+    REQUIRE(c);
+    // base (localhost + h) + at most 64 extras; nowhere near 200.
+    REQUIRE(c->san.dns.size() <= 2 + 64);
+    REQUIRE(c->san.dns.size() > 2); // but some extras did land
+}
+
+TEST_CASE("default_certs: no --cert-san leaves the base SAN set unchanged", "[default_certs]") {
+    TempDir dir;
+    DefaultCertSet set;
+    REQUIRE(ensure_default_certs(dir.path, "plain-host", nullptr, set)); // 4-arg / default {}
+    auto c = pki::parse_certificate(read_file(set.gateway_cert));
+    REQUIRE(c);
+    REQUIRE(contains(c->san.dns, "localhost"));
+    REQUIRE(contains(c->san.dns, "plain-host"));
+    REQUIRE(contains(c->san.ips, "127.0.0.1"));
+    REQUIRE(c->san.ips.size() == 2); // 127.0.0.1 + ::1 (parsed uncompressed), nothing extra
+    REQUIRE(c->san.dns.size() == 2); // localhost + hostname, nothing extra
 }
 
 #ifndef _WIN32

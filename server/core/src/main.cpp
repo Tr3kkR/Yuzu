@@ -113,6 +113,14 @@ int main(int argc, char* argv[]) {
     app.add_option("--ca-dir", cfg.ca_dir,
                    "Directory for the built-in CA + default certs (default: platform cert dir)")
         ->envname("YUZU_CA_DIR");
+    app.add_option("--cert-san", cfg.cert_sans,
+                   "Extra Subject Alternative Name for the auto-generated default certs "
+                   "(repeatable). Forms: 'dns:<name>', 'ip:<addr>', or a bare value "
+                   "(auto-classified); a single value may be comma-separated. Added to the "
+                   "https/agent/gateway default leaves so they validate for a deployment "
+                   "hostname or IP (e.g. 'dns:gateway'). Ignored when operator certs are "
+                   "supplied or --no-default-certs is set.")
+        ->envname("YUZU_CERT_SAN");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
     bool deprecated_allow_one_way_tls_flag = false;

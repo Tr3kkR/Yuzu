@@ -28,6 +28,15 @@ life; see "Default certificates" below). **Every install generates its own root
 | `default-gateway` | Gateway listener + upstream client (PR5) | EC P-256 | sized to CA notAfter | same |
 | per-agent leaf | Agent gRPC **client** cert (mTLS identity) | EC P-256 (agent-generated) | ~1y, auto-renew at 2/3 | `CN=<agent_id>`, URI SAN `yuzu://<ca-fingerprint>/agent/<agent_id>` |
 
+The three server-side leaves share one SAN set: the base `localhost` / `127.0.0.1` /
+`::1` / `<hostname>` plus any operator `--cert-san` extras (`dns:<name>`, `ip:<addr>`,
+or a bare value auto-classified by IP-literal shape; repeatable, and a single value
+may be comma-separated). `--cert-san` is the supported way to make the built-in certs
+valid for a deployment name a client actually dials — e.g. `--cert-san dns:gateway` so
+an agent reaching the gateway by that service name passes SNI hostname verification.
+Changing `--cert-san` does **not** rotate an existing set (the marker fast path returns
+the prior certs); clear the cert dir or replace the certs for new SANs to take effect.
+
 Server-side leaves are long-lived because the threat model is "operator forgets to
 rotate"; agent leaves are short-lived because they auto-renew over the existing
 channel. The agent leaf's `CN` *is* the `agent_id`, so the existing #1118
@@ -185,8 +194,9 @@ own config at boot).
 - **Cert SAN ↔ dial-name (checklist)** — OTP enforces SNI hostname verification under
   `verify_peer`, so the server cert SAN must include the name the gateway dials. The
   default certs carry `localhost` + `IP:127.0.0.1` + `IP:::1` + `gethostname()`; for
-  cross-container/host dialing, dial the server's hostname and set that service's
-  `hostname:` so its SAN matches (or add `--cert-san`, tracked).
+  cross-container/host dialing, either dial the server's hostname and set that service's
+  `hostname:` so its SAN matches, or add the dialled name with `--cert-san dns:<name>`
+  (shipped — extends every default leaf's SAN).
 - **Leaf rotation** — grpcbox reads the cert/key/CA files at channel *connect* time
   (lazy), so replacing `default-gateway.{pem,key}` on disk is picked up on the next
   upstream reconnect; an *established* channel keeps the old cert until it drops, so a
@@ -231,8 +241,12 @@ satisfy:
   plaintext HTTP GET against `/readyz`, which cannot complete a TLS handshake;
   switch to a TCP-connect liveness check or add `openssl s_client`.
 - **Cert SAN ↔ dial name** — every name a client dials (e.g. the gateway dialing
-  `server`) must be in the server cert SAN (gethostname-derived); set the
-  service `hostname:` to match.
+  `server`, or an agent dialing `gateway`) must be in the dialled server's cert SAN.
+  The default SAN is `localhost`/loopback/`gethostname()`; set the service `hostname:`
+  to match, or add the dialled name(s) with `--cert-san dns:<name>` (e.g.
+  `--cert-san dns:gateway --cert-san dns:server` so the cross-container service names
+  validate). This is the per-agent-through-gateway enabler — the `default-gateway`
+  leaf does not otherwise carry `DNS:gateway`.
 - **Cert-volume timing** — the gateway must read certs from the shared volume
   *after* the server's first-boot generation; the gateway's plaintext listeners
   + lazy upstream channel make this benign, but it must be confirmed.
@@ -324,9 +338,8 @@ one module has an identical `{name, fnum, type}` field set and matches the canon
 added to one (e.g. the agent-listener `agent_pb`) but not the `ProxyRegister`
 marshaller `gateway_pb` is silently stripped in transit (the PR5 governance catch;
 `gateway.proto:89` warns of it). A per-module roundtrip test now covers it, but a CI
-guard is the structural fix; an admin-configurable **`--cert-san`
-flag** to inject extra DNS/IP SANs into the auto-generated default server leaves
-(today the SAN is fixed to `localhost` + `127.0.0.1` + `::1` + `gethostname()`,
-so a load-balancer name / VIP / cross-host service alias requires either setting
-the OS hostname or bringing your own certs — `ensure_default_certs` takes a single
-hostname, `server.cpp:1659`); needed for clean cross-host PR5b deployments; ACME (P3).
+guard is the structural fix. ACME (P3). (The admin-configurable **`--cert-san`** flag —
+inject extra DNS/IP SANs into every auto-generated default leaf, for a load-balancer
+name / VIP / cross-host service alias such as `dns:gateway` — **SHIPPED in PR5b**;
+`apply_extra_sans` in `default_certs.cpp`, threaded from `cfg_.cert_sans` at
+`server.cpp:1659`.)
