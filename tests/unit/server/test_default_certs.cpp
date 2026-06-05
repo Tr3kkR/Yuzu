@@ -202,6 +202,9 @@ TEST_CASE("default_certs: no --cert-san leaves the base SAN set unchanged", "[de
     REQUIRE(contains(c->san.dns, "localhost"));
     REQUIRE(contains(c->san.dns, "plain-host"));
     REQUIRE(contains(c->san.ips, "127.0.0.1"));
+    // ::1 parses back UNCOMPRESSED — warn_on_san_drift's deliberate IPv6 skip
+    // depends on this form, so pin it (a future OpenSSL change would fail here).
+    REQUIRE(contains(c->san.ips, "0:0:0:0:0:0:0:1"));
     REQUIRE(c->san.ips.size() == 2); // 127.0.0.1 + ::1 (parsed uncompressed), nothing extra
     REQUIRE(c->san.dns.size() == 2); // localhost + hostname, nothing extra
 }

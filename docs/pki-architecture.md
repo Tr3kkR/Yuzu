@@ -306,7 +306,7 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
 | PR4b | Dashboard CA panel (inventory, revoke, root/CRL download, rotation CTA) | shipped |
 | PR5 | Gateway TLS: upstream mutual TLS **reference config** (`sys.config.prod`) + `agent_pb`/`gateway_pb`/`management_pb` regen so per-agent mTLS enrollment forwards through the gateway + fail-closed-on-unverified startup guard + TLS-posture logging. (Shipped images/composes stay plaintext until PR5b wires it.) | shipped |
 | PR5c | One-way (server-authenticated) TLS on the agent listener — vendored+patched grpcbox (`_checkouts/grpcbox`) makes `verify`/`fail_if_no_peer_cert` configurable; agent listener enabled in `sys.config.prod`. Closes the plaintext agent↔gateway edge with no client cert required (bootstrap-safe). Live-wiring + CA distribution + boot-test land in PR5b. | shipped |
-| PR5b | Distribution flip — drop `--no-tls`/`--no-https` across compose/Dockerfile + shared cert volume + **wire PR5c one-way TLS live + distribute the CA to agents** (cert-dir ownership, HTTPS healthcheck, cert SAN, volume timing; needs a booted stack — no CI boots the deploy composes) | planned |
+| PR5b | Distribution flip — drop `--no-tls`/`--no-https` across compose/Dockerfile + shared cert volume + **wire PR5c one-way TLS live + distribute the CA to agents** (HTTPS healthcheck, volume timing; needs a booted stack — no CI boots the deploy composes). **Partial — shipped:** `--cert-san` + Dockerfile.server cert-dir ownership (boot-test-validated). | in progress |
 | PR6 (M2) | Subordinate-CA (`--ca-mode subordinate`) + CSR export / offline signing | planned |
 
 Deferred follow-ups tracked across the ladder: `POST /api/v1/ca/issue` with
@@ -341,5 +341,5 @@ marshaller `gateway_pb` is silently stripped in transit (the PR5 governance catc
 guard is the structural fix. ACME (P3). (The admin-configurable **`--cert-san`** flag —
 inject extra DNS/IP SANs into every auto-generated default leaf, for a load-balancer
 name / VIP / cross-host service alias such as `dns:gateway` — **SHIPPED in PR5b**;
-`apply_extra_sans` in `default_certs.cpp`, threaded from `cfg_.cert_sans` at
-`server.cpp:1659`.)
+`parse_extra_sans` + `merge_sans` in `default_certs.cpp` (IP validated via
+`pki::is_valid_ip_literal`), threaded from `cfg_.cert_sans` at `server.cpp:1659`.)

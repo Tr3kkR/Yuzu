@@ -97,6 +97,9 @@ FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b
 # because the server runs as the unprivileged `yuzu` user and generates the
 # per-install CA + default certs into this dir on first boot — a root-owned
 # /etc/yuzu makes that first-boot write fail (PKI PR5b boot-test finding).
+# (The deb/rpm/systemd paths instead make /etc/yuzu itself service-owned, so the
+# server's runtime mkdir of certs/ succeeds there without this eager pre-create;
+# the container needs it because the base image's /etc/yuzu is root-owned.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3 libsqlite3-0 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \
