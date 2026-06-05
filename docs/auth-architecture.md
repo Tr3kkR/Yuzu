@@ -26,9 +26,43 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
   - Prometheus counter `yuzu_auth_sessions_revoked_total{caller, result, scope}` for CC7.2 anomaly detection.
   - Self-target guard distinction (DO NOT CONFLATE WITH `#397/#403`): the existing `#397/#403` self-target guard on `DELETE /api/settings/users/<self>` and role demotion is a hard 403 to prevent admin-role self-lockout (an unrecoverable state). Session revocation self-target is recoverable (re-auth) and is permitted but audited as `.self`. Future refactors must not "fix" the session-revocation self-target into a hard 403.
 
+## MFA / TOTP (v0.12+, SOC 2 CC6.6)
+
+Full design: `docs/auth-mfa-design.md`. Summary:
+
+- **RFC 6238 TOTP** (HMAC-SHA1, 30 s step, 6 digits, ±1 step skew with
+  replay protection). 10 single-use base32 recovery codes per
+  enrollment, PBKDF2-SHA256 hashed.
+- **Self-service enrollment** via Settings → Multi-Factor Authentication.
+  One-time `otpauth://` reveal in the same `<div class="token-reveal">`
+  pattern as API-token issuance.
+- **Login challenge** — `POST /login` returns HTTP 202 +
+  `mfa_pending_token` (opaque, in-process, `cfg.mfa_login_pending_secs`
+  TTL) when the user has TOTP enrolled; browser swaps to a TOTP form
+  and posts to `POST /login/mfa`. Recovery codes share the same
+  endpoint.
+- **Storage** — TOTP secret as raw 20-byte BLOB in `users.mfa_totp_secret`,
+  protected by the same 0600 file mode that backs `password_hash`.
+  Encryption-at-rest (AES-256-GCM with key in `auth_kv`) is a follow-up;
+  the `auth_kv` table is provisioned empty.
+- **CLI flags / Config** — `--mfa-enforcement <optional|admin-only|required>`
+  (PR 1 honours `optional` only), `--mfa-step-up-window-secs` (default
+  300), `--mfa-login-pending-secs` (default 120).
+- **Step-up on high-risk surfaces** — `cfg.mfa_step_up_window_secs` (300 s
+  default) controls how long after a TOTP proof high-risk endpoints
+  accept the session as "stepped up." PR 2 wires the 11 step-up sites
+  (user delete, role change, token create/revoke, session revoke,
+  Guardian rule write / push, software-package write, software-deploy
+  execute, file-retrieval upload) and the `/login/mfa/stepup` route.
+- **OIDC `amr` short-circuit** (PR 3) — `IdTokenClaims.amr` parsing so
+  IdP-asserted MFA skips the local TOTP step.
+
+Hard invariants live in §"Hard invariants" of `docs/auth-mfa-design.md` —
+do not regress them when shipping PR 2 / PR 3.
+
 ## Granular RBAC (Phase 3)
 
-- 6 roles, 14 securable types, per-operation permissions, deny-override logic.
+- 6 roles, 19 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
@@ -155,4 +189,4 @@ The hard invariants for AuthDB-touching changes (file-mode, migration
 pattern, lifetime, config-as-seed-only, role-field ignored, gate-level audit,
 cleanup cadence, snapshot-and-release publishing) live in
 `.claude/agents/authdb.md` — the AuthDB review agent loads them on any
-change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` / `auth_manager.cpp`.
+change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` / `auth.{hpp,cpp}`.

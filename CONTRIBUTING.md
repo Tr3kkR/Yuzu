@@ -43,14 +43,14 @@ maintainer at nathan.dornbrook@gmail.com.
 > directly. **CMake is not an alternative build system** here — it is pulled in
 > only as a Meson dependency-resolution method, never invoked to build. Without
 > Meson + Ninja you cannot build, test, or run any of the tooling, so install
-> them first (Meson 1.9.2; a recent Ninja) before following the steps below.
+> them first (Meson 1.11.1; a recent Ninja) before following the steps below.
 
-1. **Prerequisites**: Meson 1.9.2, Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
+1. **Prerequisites**: Meson 1.11.1, Ninja, CMake, a C++23 compiler, and vcpkg. See [CLAUDE.md](CLAUDE.md) for full build instructions.
 2. **Clone and build**:
    ```bash
    git clone https://github.com/Tr3kkR/Yuzu.git && cd Yuzu
    ./scripts/setup.sh
-   meson compile -C builddir
+   meson compile -C build-linux
    ```
 
 ## Architecture
@@ -129,7 +129,7 @@ See the existing plugins for patterns.
 
 ```bash
 ./scripts/setup.sh --tests
-meson test -C builddir --print-errorlogs
+meson test -C build-linux --print-errorlogs
 ```
 
 Tests use [Catch2](https://github.com/catchorg/Catch2) and live in `tests/unit/`.

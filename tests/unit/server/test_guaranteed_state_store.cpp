@@ -19,6 +19,7 @@
 
 #include "guaranteed_state_store.hpp"
 #include "store_errors.hpp"
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -74,23 +75,10 @@ GuaranteedStateEventRow make_event(std::string event_id, std::string rule_id,
 // RAII guard for a per-test temp database file. Constructed FIRST so the
 // destructor fires even if downstream construction throws (prior governance
 // memory qe-B1 — partial-construction leaks when RAII wraps come later).
-struct TempDbFile {
-    std::filesystem::path path;
-    TempDbFile() {
-        auto tmp = std::filesystem::temp_directory_path();
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        path = tmp / ("yuzu-gs-test-" + std::to_string(gen()) + ".db");
-    }
-    ~TempDbFile() noexcept {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        std::filesystem::remove(path.string() + "-wal", ec);
-        std::filesystem::remove(path.string() + "-shm", ec);
-    }
-    TempDbFile(const TempDbFile&) = delete;
-    TempDbFile& operator=(const TempDbFile&) = delete;
-};
+// Use the shared fixture (unique_temp_path + -wal/-shm cleanup) rather than a
+// local random_device variant — matches the CLAUDE.md test-helper mandate and
+// avoids the flake-#473 salt pitfalls (qa-S4 / #1209).
+using yuzu::test::TempDbFile;
 
 } // namespace
 
@@ -102,6 +90,44 @@ TEST_CASE("GuaranteedStateStore: opens in-memory and runs migrations",
     REQUIRE(store.is_open());
     CHECK(store.rule_count() == 0);
     CHECK(store.event_count() == 0);
+}
+
+// ── M6 / #1209: monotonic policy generation ─────────────────────────────────
+
+TEST_CASE("GuaranteedStateStore: policy_generation bumps monotonically on mutations",
+          "[guaranteed_state_store][generation]") {
+    GuaranteedStateStore store(":memory:");
+    CHECK(store.current_policy_generation() == 0);  // seeded at 0
+
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    CHECK(store.current_policy_generation() == 1);  // create bumped
+
+    auto r = make_rule("r1", "guard-one");
+    r.enabled = false;
+    REQUIRE(store.update_rule(r));
+    CHECK(store.current_policy_generation() == 2);  // update bumped
+
+    REQUIRE(store.delete_rule("r1"));
+    CHECK(store.current_policy_generation() == 3);  // delete bumped
+
+    // A failed mutation (unknown rule) must NOT advance the generation —
+    // otherwise a reconcile would chase a phantom version.
+    CHECK_FALSE(store.update_rule(make_rule("nope", "missing")));
+    CHECK(store.current_policy_generation() == 3);
+}
+
+TEST_CASE("GuaranteedStateStore: policy_generation persists across reopen",
+          "[guaranteed_state_store][generation]") {
+    TempDbFile tmp;
+    {
+        GuaranteedStateStore store(tmp.path);
+        REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+        CHECK(store.current_policy_generation() == 1);
+    }
+    // Reopen: the counter is persisted, not reset — an agent that applied
+    // generation 1 before a server restart must not look stale afterwards.
+    GuaranteedStateStore reopened(tmp.path);
+    CHECK(reopened.current_policy_generation() == 1);
 }
 
 // ── Rule CRUD ──────────────────────────────────────────────────────────────

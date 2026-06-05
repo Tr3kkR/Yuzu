@@ -1244,7 +1244,53 @@ agent_version >= "0.9.0"
 | `len()` | `len(tag:name) > 5` | String length for validation |
 | `startswith()` | `startswith(hostname, "web-")` | Prefix check (more readable than LIKE) |
 
-### 9.3 CEL (Common Expression Language)
+Note: `EXISTS`, `MATCHES`, `len()`, and `startswith()` are implemented in the scope engine today (the "planned" label predates them). Tag presence lowers to `EXISTS tag:<name>` — see §9.3.
+
+### 9.3 Scope walking — composable scope (`fromResultSet:`)
+
+Scope walking (capability §30, `docs/scope-walking-design.md`) lets a scope target the members of a previously-saved **result set** — Yuzu's composable-scope primitive. A result set is a per-operator, TTL-bounded, lineage-tracked set of device ids built from an earlier query.
+
+**Scope atom.** The scope engine accepts a bare atom `from_result_set:<id-or-alias>` (implemented, `scope_engine.cpp`). It resolves to the members of the referenced set and composes with attribute predicates via `AND` / `OR` / `NOT`. Membership is owner-checked at evaluation: a set the dispatching operator does not own resolves to zero devices (no cross-operator targeting). Offline / stale members drop silently.
+
+```
+from_result_set:rs_01HXYZ AND ostype == "windows"
+```
+
+**YAML authoring form.** Where a `spec.scope:` block is accepted, the mapping form may carry `fromResultSet:` (a canonical `rs_` id or a per-operator alias), optionally refined by a `selector:` composed with `AND`:
+
+```yaml
+spec:
+  scope:
+    fromResultSet: "windows-chrome-suspects"   # id or per-operator alias
+    selector:                                    # optional refinement (AND-ed)
+      platform: windows
+      tags:
+        - production
+  assignment:
+    mode: static
+```
+
+This lowers to the scope-engine string `from_result_set:windows-chrome-suspects AND ostype == "windows" AND EXISTS tag:production` — `selector.platform` → `ostype == "<value>"` (lower-cased); each `selector.tags` entry → `EXISTS tag:<name>` (a presence check, since Yuzu tags are key=value).
+
+**Validation (at YAML load):**
+
+1. `fromResultSet` may not be combined with `assignment.managementGroups` — a result set already defines a fixed device set; layering management-group filtering on top is rejected.
+2. When `fromResultSet` is present, `assignment.mode` must be `static` (an omitted mode defaults to static). `dynamic` is rejected — the point of a result set is a fixed target.
+3. References resolve at **invocation** time, not load time. An `InstructionDefinition` carrying a `fromResultSet:` that has since expired is still valid YAML; an invocation-time resolution failure (the set is absent, expired, or not owned) is recorded as an `instruction.scope_resolution_failed` audit row (`INSTRUCTION_SCOPE_RESOLUTION_FAILED`) carrying the result-set id and reason, and the dispatch targets zero of that set's devices.
+4. `fromResultSet` (id or alias), `selector.platform`, and each `selector.tags` entry must contain only letters, digits, and `_ . : * -` (the scope-ident charset). A space, quote, or operator character is rejected at load — these values are lowered into a scope-engine token, so anything else would produce an unparseable or ambiguous expression. **Choose result-set aliases (`name`) from this charset**; an alias with a space cannot be referenced from a scope.
+5. The `scope:` block must use **block form** (`scope:` on its own line, children indented beneath). Inline flow-mapping (`scope: {fromResultSet: x}`) is rejected — the runtime YAML scanner reads only the block form.
+
+> Tag presence (`EXISTS tag:<name>`) requires the tag to have a **non-empty value**; a device carrying a tag with an empty value is treated as not having it.
+
+**Current support (this release):**
+
+- **Aliases** in a `from_result_set:` ref are resolved at the dispatch layer against the dispatching operator's owned sets (a canonical `rs_` id is used verbatim). The `/api/scope/estimate` preview resolves them too.
+- **Instruction definitions** validate a `spec.scope` block at import; the operator still supplies the `from_result_set:` scope at dispatch time. (A definition-embedded scope that auto-applies at dispatch is a follow-up.)
+- **Policies** do **not** yet support `fromResultSet:` — a policy is evaluated continuously while a result set is TTL-bounded; `create_policy` rejects it with a clear error. (Tracked for a follow-up that adds a policy owner + pinned-set semantics.)
+
+See `docs/scope-walking-design.md` §7 and the Chrome-IR walkthrough (§10).
+
+### 9.4 CEL (Common Expression Language)
 
 Yuzu implements a CEL-compatible expression evaluator (`server/core/src/cel_eval.cpp`) for typed policy evaluation expressions. CEL is not used for device targeting (the scope DSL is simpler and sufficient for that purpose).
 

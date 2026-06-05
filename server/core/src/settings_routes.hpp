@@ -11,6 +11,7 @@
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
 #include "management_group_store.hpp"
+#include "mfa_step_up.hpp"
 #include "oidc_provider.hpp"
 #include "runtime_config_store.hpp"
 #include "tag_store.hpp"
@@ -24,6 +25,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -66,11 +68,16 @@ public:
                          GatewaySessionCountFn gateway_session_count_fn,
                          AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
                          std::unique_ptr<oidc::OidcProvider>& oidc_provider,
-                         yuzu::MetricsRegistry* metrics_registry = nullptr);
+                         yuzu::MetricsRegistry* metrics_registry = nullptr,
+                         StepUpFn step_up_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink and dispatch synthesized requests directly,
     /// avoiding httplib::Server's TSan-hostile acceptor thread (#438).
+    ///
+    /// `step_up_fn` (PR2, optional) — when present, the 2 user-management
+    /// Settings mutations (DELETE user, POST user role) gate behind it
+    /// after admin_fn passes. Empty functor disables the gate entirely.
     void register_routes(class HttpRouteSink& sink, AuthFn auth_fn, AdminFn admin_fn,
                          PermFn perm_fn, AuditFn audit_fn, Config& cfg, auth::AuthManager& auth_mgr,
                          auth::AutoApproveEngine& auto_approve, ApiTokenStore* api_token_store,
@@ -80,7 +87,8 @@ public:
                          GatewaySessionCountFn gateway_session_count_fn,
                          AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
                          std::unique_ptr<oidc::OidcProvider>& oidc_provider,
-                         yuzu::MetricsRegistry* metrics_registry = nullptr);
+                         yuzu::MetricsRegistry* metrics_registry = nullptr,
+                         StepUpFn step_up_fn = {});
 
 private:
     // -- Fragment renderers (called by route handlers) -------------------------
@@ -111,6 +119,19 @@ private:
     ///                         (governance Gate 4 finding C1).
     std::string render_api_tokens_fragment(const std::string& new_raw_token = {},
                                            const std::string& filter_principal = {});
+    /// Render the per-user MFA / TOTP self-service panel. Shows current
+    /// status (enrolled / not enrolled / disabled), recovery-codes-remaining,
+    /// and the operative buttons (enroll / disable / regenerate codes).
+    /// Optional `otpauth_uri` / `secret_b32` / `recovery_codes` are populated
+    /// by the POST handlers for the one-time reveal after enroll / verify /
+    /// regenerate. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
+    std::string render_mfa_fragment(const std::string& username,
+                                    const std::string& new_otpauth_uri = {},
+                                    const std::string& new_secret_b32 = {},
+                                    const std::vector<std::string>& new_recovery_codes = {},
+                                    const std::string& enrollment_pending_for_verify = {},
+                                    const std::string& error_msg = {});
+
     std::string render_pending_fragment();
     std::string render_auto_approve_fragment();
     std::string render_tag_compliance_fragment();
@@ -153,6 +174,7 @@ private:
     std::shared_mutex* oidc_mu_{};
     std::unique_ptr<oidc::OidcProvider>* oidc_provider_{};
     yuzu::MetricsRegistry* metrics_registry_{};
+    StepUpFn step_up_fn_;
 };
 
 } // namespace yuzu::server

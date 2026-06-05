@@ -158,6 +158,7 @@ extern const char* const kVizFleetPageHtml = R"HTM(<!DOCTYPE html>
     <a href="/" class="nav-link">Dashboard</a>
     <a href="/instructions" class="nav-link">Instructions</a>
     <a href="/compliance" class="nav-link">Compliance</a>
+    <a href="/guardian" class="nav-link">Guardian</a>
     <a href="/tar" class="nav-link">TAR</a>
     <a href="/viz/fleet" class="nav-link active">Fleet Viz</a>
     <a href="/result-sets" class="nav-link">Result Sets</a>

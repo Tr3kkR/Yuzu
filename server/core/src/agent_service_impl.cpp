@@ -3,6 +3,7 @@
 #include <grpc/grpc_security_constants.h>
 
 #include <chrono>
+#include <ctime>
 
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
@@ -11,6 +12,9 @@
 #include "execution_tracker.hpp"
 #include "fleet_topology_store.hpp"
 #include "grpc_audit_signal.hpp"
+#include "guaranteed_state.pb.h"
+#include "guaranteed_state_store.hpp"
+#include "guardian_ingest.hpp"
 #include "heartbeat_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
@@ -31,6 +35,7 @@ namespace yuzu::server::detail {
 
 // Bring html_escape into scope for the HTML rendering methods.
 using yuzu::server::html_escape;
+
 
 // -- Constructor --------------------------------------------------------------
 
@@ -895,6 +900,39 @@ grpc::Status AgentServiceImpl::Subscribe(
     pb::CommandResponse resp;
     while (stream->Read(&resp)) {
         registry_.touch_activity(agent_id);
+
+        // Guardian side-channel (contract G2 / step 5): UNSOLICITED agent→server
+        // messages over the reserved "__guard__" plugin (drift events). Routed at
+        // the TOP of the loop body — BEFORE the RUNNING/terminal status split — so
+        // they never enter the response store / executions drawer. Status-agnostic:
+        // Guardian events arrive as SUCCESS, so mirroring the in-RUNNING __timing__
+        // intercept would miss them. agent_id is server-stamped from the cert-bound
+        // session, never self-reported.
+        //
+        // The empty-command_id guard is load-bearing (H2 / #1209): only a
+        // command_id-LESS __guard__ message is an unsolicited drift event to
+        // ingest. A __guard__ message that DOES carry a command_id is a SOLICITED
+        // reply (push_rules / get_status) and must NOT be ingested as an event.
+        if (resp.plugin() == "__guard__" && resp.command_id().empty()) {
+            // Guardian side-channel — route through the shared ingest so the
+            // direct and gateway-proxied (GatewayUpstreamServiceImpl::
+            // ForwardGuardianMessage) paths cannot diverge. agent_id is
+            // cert-bound from this Subscribe session. Always skip the
+            // response-store / executions path.
+            if (guaranteed_state_store_)
+                ingest_guardian_response(*guaranteed_state_store_, agent_id, resp);
+            continue;
+        }
+        // Solicited __guard__ replies (push_rules / reconcile carry a command_id)
+        // are fire-and-forget on this DIRECT Subscribe loop — no server caller
+        // blocks on a __guard__ command_id, so drop them rather than persist a
+        // row-per-agent-per-push in the response store / executions drawer (hp-F1 /
+        // #1209). (For gateway-connected agents the reply is correlated and its
+        // pending entry cleared on the gateway by yuzu_gw_guardian's passthrough,
+        // not here.)
+        if (resp.plugin() == "__guard__")
+            continue;
+
         if (resp.status() == pb::CommandResponse::RUNNING) {
             // Intercept __timing__ metadata
             if (resp.output().starts_with("__timing__|")) {

@@ -6,6 +6,7 @@
 
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
+#include "mfa_qr.hpp"
 #include "plugin_signing_helpers.hpp"
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
@@ -775,6 +776,160 @@ std::string SettingsRoutes::render_api_tokens_fragment(const std::string& new_ra
                 "</div>";
     }
 
+    return html;
+}
+
+std::string SettingsRoutes::render_mfa_fragment(const std::string& username,
+                                                const std::string& new_otpauth_uri,
+                                                const std::string& new_secret_b32,
+                                                const std::vector<std::string>& new_recovery_codes,
+                                                const std::string& enrollment_pending_for_verify,
+                                                const std::string& error_msg) {
+    // The fragment renders one of three lifecycle states:
+    //   1. Not enrolled — "Enable MFA" button
+    //   2. Provisional (enrollment initiated, code not yet verified) —
+    //      secret/URI shown, "Enter code to verify" form
+    //   3. Enrolled — status + "Regenerate recovery codes" + "Disable" buttons
+    auto* auth_db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+    if (!auth_db) {
+        return "<span style=\"color:#484f58\">MFA store unavailable (no AuthDB configured).</span>";
+    }
+
+    std::string html;
+    if (!error_msg.empty()) {
+        html += "<div class=\"error-msg\" role=\"alert\" style=\"color: var(--red); "
+                "font-size: 0.8rem; margin-bottom: 0.75rem;\">" +
+                html_escape(error_msg) + "</div>";
+    }
+
+    // Provisional verification panel. Two shapes:
+    //   (a) First reveal post-init — `new_otpauth_uri` and
+    //       `new_secret_b32` are non-empty, render the QR/URI + verify
+    //       form (one-time reveal).
+    //   (b) Retry after a failed verify — empty new_otpauth_uri /
+    //       new_secret_b32 but `enrollment_pending_for_verify` is set:
+    //       render only the verify form with a hint to wait for the
+    //       next 30s window. We DO NOT re-reveal the secret here —
+    //       repeatedly re-emitting it on every failed verify would
+    //       defeat the one-time-reveal property (Gate 4 happy-path B3
+    //       + security defence-in-depth: an attacker triggering verify
+    //       failures should not fish the secret back).
+    if (!enrollment_pending_for_verify.empty()) {
+        if (!new_otpauth_uri.empty()) {
+            // Server-rendered QR (issue #1232). The SVG is from the trusted
+            // qrcodegen encoder over our own otpauth URI — not operator input —
+            // so it is injected raw (it must not be html_escaped or it won't
+            // render). Empty on encode failure → text fallback still shows.
+            const std::string qr_svg = otpauth_qr_svg(new_otpauth_uri);
+            html += "<div class=\"token-reveal\">"
+                    "  <div class=\"token-reveal-header\">"
+                    "    SCAN THIS WITH YOUR AUTHENTICATOR APP — secret shown only once"
+                    "  </div>";
+            if (!qr_svg.empty()) {
+                html += "  <div style=\"display:flex;justify-content:center;margin:0.75rem 0\">"
+                        "    <div style=\"background:#fff;padding:8px;border-radius:6px;"
+                        "line-height:0\">" +
+                        qr_svg +
+                        "</div>"
+                        "  </div>"
+                        "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
+                        "text-align:center\">Can't scan? Enter the secret below manually.</div>";
+            }
+            html += "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
+                    "margin-top:0.5rem\">Base32 secret (manual entry):</div>"
+                    "  <code>" +
+                    html_escape(new_secret_b32) +
+                    "</code>"
+                    "  <div style=\"font-size:0.7rem;color:var(--mds-color-theme-text-tertiary);"
+                    "margin-top:0.5rem\">otpauth URI:</div>"
+                    "  <code style=\"display:block;word-break:break-all\">" +
+                    html_escape(new_otpauth_uri) +
+                    "</code>"
+                    "</div>";
+        } else {
+            html += "<div style=\"font-size:0.8rem;color:var(--mds-color-theme-text-tertiary);"
+                    "margin-bottom:0.75rem\">"
+                    "Codes refresh every 30 seconds — wait for the next code shown by your "
+                    "authenticator and try again. If you have lost the original QR code, "
+                    "press <strong>Disable MFA</strong> below and restart enrollment."
+                    "</div>";
+        }
+        html += "<form hx-post=\"/api/settings/mfa/verify\""
+                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
+                "      style=\"margin-top:1rem\">"
+                "  <div class=\"mini-field\">"
+                "    <label>Verification code from your app</label>"
+                "    <input type=\"text\" name=\"code\" inputmode=\"numeric\" "
+                "autocomplete=\"one-time-code\" autocapitalize=\"none\" autocorrect=\"off\" "
+                "spellcheck=\"false\" required style=\"width:120px\">"
+                "  </div>"
+                "  <button class=\"btn btn-primary\" type=\"submit\">Confirm</button>"
+                "  <button class=\"btn btn-secondary\" type=\"submit\""
+                "          hx-post=\"/api/settings/mfa/disable\""
+                "          hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
+                "          formnovalidate"
+                "          style=\"margin-left:0.5rem\">Disable MFA</button>"
+                "</form>";
+        return html;
+    }
+
+    auto status_res = auth_db->mfa_status(username);
+    if (!status_res) {
+        return html + "<span style=\"color:#484f58\">User not found for MFA status.</span>";
+    }
+    const auto& status = *status_res;
+
+    if (!new_recovery_codes.empty()) {
+        html += "<div class=\"token-reveal\">"
+                "  <div class=\"token-reveal-header\">"
+                "    STORE THESE RECOVERY CODES NOW — each can be used once to bypass MFA"
+                "  </div>"
+                "  <ul style=\"font-family:var(--mono);margin:0.5rem 0;padding-left:1.25rem\">";
+        for (const auto& code : new_recovery_codes) {
+            html += "<li><code>" + html_escape(code) + "</code></li>";
+        }
+        html += "</ul></div>";
+    }
+
+    html += "<div style=\"display:flex;align-items:center;gap:1rem;margin-bottom:1rem\">";
+    if (status.enrolled) {
+        html += "<span class=\"yb\">Enabled</span>"
+                "<span style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+                "Enrolled " +
+                html_escape(status.enrolled_at) + " UTC</span>";
+    } else if (!status.disabled_at.empty()) {
+        html += "<span class=\"yn\">Disabled</span>"
+                "<span style=\"font-size:0.75rem;color:var(--mds-color-theme-text-tertiary)\">"
+                "Last disabled " +
+                html_escape(status.disabled_at) + " UTC</span>";
+    } else {
+        html += "<span class=\"yn\">Not enrolled</span>";
+    }
+    html += "</div>";
+
+    if (status.enrolled) {
+        html += "<div style=\"font-size:0.8rem;margin-bottom:0.75rem\">"
+                "Recovery codes remaining: <strong>" +
+                std::to_string(status.recovery_codes_remaining) +
+                "</strong></div>"
+                "<form hx-post=\"/api/settings/mfa/recovery-codes\""
+                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
+                "      style=\"display:inline-block;margin-right:0.5rem\">"
+                "  <button class=\"btn btn-secondary\" type=\"submit\">Regenerate recovery codes</button>"
+                "</form>"
+                "<form hx-post=\"/api/settings/mfa/disable\""
+                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\""
+                "      hx-confirm=\"Disable MFA for your account? Step-up authentication will no "
+                "longer be required.\""
+                "      style=\"display:inline-block\">"
+                "  <button class=\"btn btn-danger\" type=\"submit\">Disable MFA</button>"
+                "</form>";
+    } else {
+        html += "<form hx-post=\"/api/settings/mfa/init\""
+                "      hx-target=\"#mfa-section\" hx-swap=\"innerHTML\">"
+                "  <button class=\"btn btn-primary\" type=\"submit\">Enable MFA</button>"
+                "</form>";
+    }
     return html;
 }
 
@@ -2012,13 +2167,14 @@ void SettingsRoutes::register_routes(
     UpdateRegistry* update_registry, RuntimeConfigStore* runtime_config_store,
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
-    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry) {
+    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry,
+    StepUpFn step_up_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(admin_fn), std::move(perm_fn),
                     std::move(audit_fn), cfg, auth_mgr, auto_approve, api_token_store,
                     mgmt_group_store, tag_store, update_registry, runtime_config_store, audit_store,
                     gateway_enabled, std::move(gateway_session_count_fn), std::move(agents_json_fn),
-                    oidc_mu, oidc_provider, metrics_registry);
+                    oidc_mu, oidc_provider, metrics_registry, std::move(step_up_fn));
 }
 
 void SettingsRoutes::register_routes(
@@ -2028,7 +2184,8 @@ void SettingsRoutes::register_routes(
     UpdateRegistry* update_registry, RuntimeConfigStore* runtime_config_store,
     AuditStore* audit_store, bool gateway_enabled, GatewaySessionCountFn gateway_session_count_fn,
     AgentsJsonFn agents_json_fn, std::shared_mutex& oidc_mu,
-    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry) {
+    std::unique_ptr<oidc::OidcProvider>& oidc_provider, yuzu::MetricsRegistry* metrics_registry,
+    StepUpFn step_up_fn) {
     // Store dependency pointers
     auth_fn_ = std::move(auth_fn);
     admin_fn_ = std::move(admin_fn);
@@ -2049,6 +2206,7 @@ void SettingsRoutes::register_routes(
     oidc_mu_ = &oidc_mu;
     oidc_provider_ = &oidc_provider;
     metrics_registry_ = metrics_registry;
+    step_up_fn_ = std::move(step_up_fn);
 
     // -- Settings page (admin only) -------------------------------------------
     sink.Get("/settings", [this](const httplib::Request& req, httplib::Response& res) {
@@ -2967,6 +3125,12 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // PR2 — MFA step-up gate. Deleting a user destroys a principal;
+        // require fresh MFA proof. Sits after admin_fn (no point step-
+        // upping a non-admin) but before any state mutation.
+        if (step_up_fn_ &&
+            !step_up_fn_(req, res, *session, "DELETE /api/settings/users/{username}"))
+            return;
         if (session->username.empty()) {
             // Defense-in-depth: an empty session->username would let
             // a hand-crafted DELETE against an empty-username row
@@ -3050,6 +3214,11 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        // PR2 — MFA step-up gate. Role changes promote/demote a
+        // principal's authority; require fresh MFA proof.
+        if (step_up_fn_ &&
+            !step_up_fn_(req, res, *session, "POST /api/settings/users/{username}/role"))
+            return;
         if (session->username.empty()) {
             spdlog::error("POST /api/settings/users/:username/role: session has empty username");
             res.status = 500;
@@ -3857,6 +4026,324 @@ void SettingsRoutes::register_routes(
                   }
 
                   res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+              });
+
+    // ── MFA / TOTP self-service (`/auth-and-authz` P0 #1, SOC 2 CC6.6) ──────
+    //
+    // Admin-only for PR1 — non-admin operator UX is a follow-up. Each
+    // mutation re-renders the panel via the same `#mfa-section` target so
+    // the new state (or one-time reveal) lands without a full page reload.
+    //
+    // Audit verbs use `target_type="User"` (PascalCase per
+    // observability-conventions.md spec) and `result ∈ {ok, error}`
+    // (spec vocabulary), distinct from the historical lowercase
+    // `target_type="user"` + `success/failure` used elsewhere in
+    // auth_routes — Gate 4 consistency B1+B2 picks the spec lane.
+    //
+    // `Cache-Control: no-store, private` is set on every response that
+    // contains a one-time secret (init's otpauth URI / base32 secret,
+    // verify's recovery codes, recovery-codes regenerate) so the
+    // browser/proxy/CDN cannot retain the material past the response
+    // lifetime (Gate 4 unhappy-path UP-9).
+    auto set_no_store = [](httplib::Response& res) {
+        res.set_header("Cache-Control", "no-store, private");
+        res.set_header("Pragma", "no-cache");
+        res.set_header("Referrer-Policy", "no-referrer");
+    };
+
+    // Origin/Referer CSRF gate — Hermes Agent red-team finding MEDIUM #2
+    // (2026-05-29). Every Settings MFA POST mutates per-user MFA state
+    // using session-cookie auth alone; SameSite=Lax is not strict enough
+    // to stop a cross-site form POST from disabling MFA on a victim
+    // session. We require Origin (or Referer as fallback) to carry the
+    // same host as the request's Host header; absence means a non-
+    // browser caller (curl, automation) which is explicitly allowed
+    // because programmatic admin clients post without an Origin header.
+    // Mismatched host → 403, audited as csrf.denied for SIEM correlation.
+    //
+    // Hardenings from the re-review round of the Hermes fixes:
+    //  - audit detail is sanitised (Gate 2 MEDIUM) — operator-controlled
+    //    header bytes go through a control-char-stripping helper capped
+    //    at 128 bytes per field so they cannot poison the audit row;
+    //  - default ports are normalised (Gate 2 LOW) so a reverse proxy
+    //    that strips `:443` / `:80` from `Host` does not false-deny
+    //    legitimate same-origin POSTs;
+    //  - userinfo / fragment / query chars are rejected (Gate 2 LOW) —
+    //    RFC 6454 forbids userinfo in `Origin` and httplib does not
+    //    validate URL shape, so anything containing `@`, `?`, or `#`
+    //    is treated as a fail-closed mismatch.
+    //
+    // Scoping note (Gate 4 SHOULD S2 — known follow-up): origin_safe is
+    // wired into the 4 mutating MFA POSTs only. 11 sibling state-
+    // changing Settings POSTs (/api/settings/users/*, plugin-signing,
+    // OIDC, cert, enrollment-tokens, tls) remain CSRF-unprotected
+    // pending a follow-up PR that wraps every admin HTMX mutation. The
+    // asymmetric defence is documented in CHANGELOG and is NOT a
+    // regression introduced by this PR — those sites were unprotected
+    // before PR1 too.
+    auto sanitise = [](std::string_view in, std::size_t max_len = 128) -> std::string {
+        std::string out;
+        out.reserve(std::min(in.size(), max_len));
+        for (char c : in) {
+            if (out.size() >= max_len)
+                break;
+            unsigned char u = static_cast<unsigned char>(c);
+            // Strip C0 controls, DEL, and high-bit bytes — exact policy
+            // from fleet_topology_store.cpp::sanitise_for_audit.
+            if (u < 0x20 || u == 0x7f || u >= 0x80) {
+                out.push_back(' ');
+            } else {
+                out.push_back(static_cast<char>(u));
+            }
+        }
+        return out;
+    };
+    auto origin_safe = [this, sanitise](const httplib::Request& req, httplib::Response& res,
+                                        const std::string& action_for_audit) -> bool {
+        auto host = req.get_header_value("Host");
+        auto origin = req.get_header_value("Origin");
+        auto referer = req.get_header_value("Referer");
+
+        auto strip_default_port = [](std::string h) -> std::string {
+            // For comparison purposes only — `host:443` and `host` from
+            // the same HTTPS origin are equivalent. Strip well-known
+            // default ports so a TLS-terminating reverse proxy that
+            // rewrites `Host` to the port-less form does not break.
+            auto colon = h.rfind(':');
+            if (colon == std::string::npos)
+                return h;
+            auto port = h.substr(colon + 1);
+            if (port == "443" || port == "80") {
+                h.erase(colon);
+            }
+            return h;
+        };
+        auto extract_host = [&strip_default_port](std::string url) -> std::optional<std::string> {
+            // Strip scheme (`scheme://`).
+            auto p = url.find("://");
+            if (p != std::string::npos)
+                url.erase(0, p + 3);
+            // Strip path / query / fragment.
+            for (char delim : {'/', '?', '#'}) {
+                auto idx = url.find(delim);
+                if (idx != std::string::npos) {
+                    url.erase(idx);
+                }
+            }
+            // Reject userinfo — RFC 6454 forbids it in `Origin`, and a
+            // browser will never emit a Referer with userinfo against a
+            // dashboard. Any `@` is treated as malformed and fails the
+            // CSRF check.
+            if (url.find('@') != std::string::npos) {
+                return std::nullopt;
+            }
+            return strip_default_port(std::move(url));
+        };
+
+        if (origin.empty() && referer.empty()) {
+            // Non-browser client (curl / automation) — pass. Browsers
+            // always emit either Origin or Referer on cross-origin POSTs.
+            return true;
+        }
+        auto extracted = origin.empty() ? extract_host(referer) : extract_host(origin);
+        auto host_norm = strip_default_port(host);
+        if (extracted && *extracted == host_norm) {
+            return true;
+        }
+        res.status = 403;
+        res.set_content(
+            R"({"error":{"code":403,"message":"cross-origin POST refused"},"meta":{"api_version":"v1"}})",
+            "application/json");
+        audit_fn_(req, "csrf.denied", "error", "Endpoint", action_for_audit,
+                  "Origin/Referer host mismatch (Origin=" + sanitise(origin) +
+                      " Referer=" + sanitise(referer) + " Host=" + sanitise(host) + ")");
+        return false;
+    };
+
+    sink.Get("/fragments/settings/mfa", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!admin_fn_(req, res))
+            return;
+        auto session = auth_fn_(req, res);
+        if (!session || session->username.empty()) {
+            res.status = 401;
+            return;
+        }
+        res.set_content(render_mfa_fragment(session->username), "text/html; charset=utf-8");
+    });
+
+    sink.Post("/api/settings/mfa/init", [this, set_no_store, origin_safe](
+                                            const httplib::Request& req, httplib::Response& res) {
+        if (!origin_safe(req, res, "/api/settings/mfa/init"))
+            return;
+        if (!admin_fn_(req, res))
+            return;
+        auto session = auth_fn_(req, res);
+        if (!session || session->username.empty()) {
+            res.status = 401;
+            return;
+        }
+        auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+        if (!db) {
+            audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username,
+                      "auth_db unavailable");
+            res.set_content(
+                render_mfa_fragment(session->username, {}, {}, {}, {}, "MFA backend unavailable"),
+                "text/html; charset=utf-8");
+            return;
+        }
+        auto init = db->mfa_init_enrollment(session->username, "Yuzu");
+        if (!init) {
+            const char* msg = "Enrollment failed";
+            if (init.error() == AuthDBError::MfaAlreadyEnrolled) {
+                msg = "MFA is already enabled — disable it first to re-enroll";
+            }
+            audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username, msg);
+            res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {}, msg),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        audit_fn_(req, "mfa.enroll.initiated", "ok", "User", session->username, "");
+        set_no_store(res);
+        res.set_content(render_mfa_fragment(session->username, init->otpauth_uri,
+                                            init->secret_base32, {}, session->username),
+                        "text/html; charset=utf-8");
+    });
+
+    sink.Post("/api/settings/mfa/verify",
+              [this, set_no_store, origin_safe](const httplib::Request& req,
+                                                httplib::Response& res) {
+                  if (!origin_safe(req, res, "/api/settings/mfa/verify"))
+                      return;
+                  if (!admin_fn_(req, res))
+                      return;
+                  auto session = auth_fn_(req, res);
+                  if (!session || session->username.empty()) {
+                      res.status = 401;
+                      return;
+                  }
+                  auto code = extract_form_value(req.body, "code");
+                  auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+                  if (!db) {
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                          "MFA backend unavailable"),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
+                  auto codes_res = db->mfa_verify_enrollment(session->username, code);
+                  if (!codes_res) {
+                      // Re-render the verify form (no QR re-reveal — the
+                      // provisional row survives so the operator's
+                      // authenticator app still works at the next 30s
+                      // step). Setting `enrollment_pending_for_verify`
+                      // routes the renderer to the retry shape; leaving
+                      // `new_otpauth_uri` empty suppresses the
+                      // one-time secret reveal (Gate 4 happy-path B3).
+                      audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
+                                "code rejected");
+                      const char* msg = "Code rejected. Try the next code shown by your "
+                                        "authenticator (codes refresh every 30 seconds).";
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {},
+                                                          session->username, msg),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
+                  audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username, "");
+                  audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
+                            session->username, "10 codes issued");
+                  set_no_store(res);
+                  res.set_content(render_mfa_fragment(session->username, {}, {}, *codes_res),
+                                  "text/html; charset=utf-8");
+              });
+
+    sink.Post("/api/settings/mfa/recovery-codes",
+              [this, set_no_store, origin_safe](const httplib::Request& req,
+                                                httplib::Response& res) {
+                  if (!origin_safe(req, res, "/api/settings/mfa/recovery-codes"))
+                      return;
+                  if (!admin_fn_(req, res))
+                      return;
+                  auto session = auth_fn_(req, res);
+                  if (!session || session->username.empty()) {
+                      res.status = 401;
+                      return;
+                  }
+                  auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+                  if (!db) {
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                          "MFA backend unavailable"),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
+                  auto codes = db->mfa_regenerate_recovery_codes(session->username);
+                  if (!codes) {
+                      audit_fn_(req, "mfa.recovery_codes.generated", "error", "User",
+                                session->username, "regeneration failed");
+                      res.set_content(
+                          render_mfa_fragment(session->username, {}, {}, {}, {},
+                                              "Could not regenerate codes"),
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
+                            session->username, "10 codes issued (rotation)");
+                  set_no_store(res);
+                  res.set_content(render_mfa_fragment(session->username, {}, {}, *codes),
+                                  "text/html; charset=utf-8");
+              });
+
+    sink.Post("/api/settings/mfa/disable",
+              [this, origin_safe](const httplib::Request& req, httplib::Response& res) {
+                  if (!origin_safe(req, res, "/api/settings/mfa/disable"))
+                      return;
+                  if (!admin_fn_(req, res))
+                      return;
+                  auto session = auth_fn_(req, res);
+                  if (!session || session->username.empty()) {
+                      res.status = 401;
+                      return;
+                  }
+                  auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
+                  if (!db) {
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                          "MFA backend unavailable"),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
+                  // Self-target guard (PR3 / docs-mfa invariant #7). Under an
+                  // active enforcement mode an operator may not strip MFA
+                  // from their own account: it would force re-enrollment at
+                  // their next login and leave the current privileged
+                  // session unable to clear the step-up gate. `required`
+                  // protects every role; `admin-only` protects admins. The
+                  // block is audited and surfaced inline (matching the
+                  // handler's other error paths — fragment + message, no
+                  // status override, so the HTMX swap still renders).
+                  const std::string mfa_mode = cfg_ ? cfg_->mfa_enforcement : "optional";
+                  const bool enforcement_protects_self =
+                      mfa_enforcement_protects(mfa_mode, session->role);
+                  if (enforcement_protects_self) {
+                      audit_fn_(req, "mfa.disabled", "error", "User", session->username,
+                                "blocked: mfa_enforcement=" + mfa_mode);
+                      res.set_content(
+                          render_mfa_fragment(
+                              session->username, {}, {}, {}, {},
+                              "MFA is required by policy (enforcement=" + mfa_mode +
+                                  ") and cannot be disabled for your account."),
+                          "text/html; charset=utf-8");
+                      return;
+                  }
+                  auto r = db->mfa_disable(session->username);
+                  if (!r) {
+                      audit_fn_(req, "mfa.disabled", "error", "User", session->username,
+                                "disable failed");
+                      res.set_content(render_mfa_fragment(session->username, {}, {}, {}, {},
+                                                          "Could not disable MFA"),
+                                      "text/html; charset=utf-8");
+                      return;
+                  }
+                  audit_fn_(req, "mfa.disabled", "ok", "User", session->username, "");
+                  res.set_content(render_mfa_fragment(session->username),
+                                  "text/html; charset=utf-8");
               });
 }
 

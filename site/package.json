@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "astro dev",
     "check:diagrams": "node scripts/check-diagrams.mjs",
+    "test:lint": "node --test scripts/check-diagrams.test.mjs",
     "build": "npm run check:diagrams && astro build && pagefind --site dist",
     "preview": "astro preview",
     "astro": "astro"

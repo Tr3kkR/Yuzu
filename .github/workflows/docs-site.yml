@@ -43,6 +43,9 @@ jobs:
       - name: Install dependencies
         working-directory: site
         run: npm ci
+      - name: Self-test the diagram linter
+        working-directory: site
+        run: npm run test:lint
       - name: Build (diagram-alignment linter gates the build)
         working-directory: site
         run: npm run build

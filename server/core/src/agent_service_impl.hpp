@@ -39,6 +39,7 @@ class UpdateRegistry;
 class ExecutionTracker;
 class FleetTopologyStore;
 class HeartbeatIngestion;
+class GuaranteedStateStore;
 struct UpdatePackage;
 struct StoredResponse;
 struct AnalyticsEvent;
@@ -84,6 +85,13 @@ public:
     void set_webhook_store(WebhookStore* store) { webhook_store_ = store; }
     void set_offload_target_store(OffloadTargetStore* store) { offload_target_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
+    /// Guardian (Guaranteed State) store — receives drift/remediation events
+    /// ingested from the agent `__guard__` side-channel on the Subscribe stream
+    /// (contract G2/step 5). nullptr disables ingest — used by tests that don't
+    /// build a Guardian store.
+    void set_guaranteed_state_store(GuaranteedStateStore* store) {
+        guaranteed_state_store_ = store;
+    }
 
     /// UAT 2026-05-12: after a fresh agent registers, the next
     /// `/api/v1/viz/fleet/topology` call must not return a snapshot
@@ -272,6 +280,7 @@ private:
     WebhookStore* webhook_store_{nullptr};
     OffloadTargetStore* offload_target_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
+    GuaranteedStateStore* guaranteed_state_store_{nullptr};
     FleetTopologyStore* fleet_topology_store_{nullptr};
     HeartbeatIngestion* heartbeat_ingestion_{nullptr};
     /// Atomic — see `set_execution_tracker` doc for why detached

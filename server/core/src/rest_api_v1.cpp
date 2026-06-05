@@ -1,6 +1,8 @@
 #include "rest_api_v1.hpp"
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
+#include "guardian_rule_spec.hpp"
+#include "guardian_schema_registry.hpp"
 #include "http_route_sink.hpp"
 #include "inventory_eval.hpp"
 #include "rest_a4_envelope.hpp"
@@ -536,7 +538,10 @@ const std::string& openapi_spec() {
         R"json(,
     "/guaranteed-state/rules": {
       "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "503": {"description": "service unavailable"}}},
-      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields or invalid JSON"}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
+      "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+. Structured authoring: pass spark/assertion/remediation {type, params} blocks; remediation.params resilience policy is validated (mode persist|backoff|bounded + bounds). Validation failures use the A4 error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields, invalid JSON, or invalid resilience params"}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
+    },
+    "/guaranteed-state/schemas": {
+      "get": {"summary": "Guard authoring schema registry", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Static catalog of spark/assertion/remediation types with per-type JSON Schemas (discriminated subschemas for value-dependent formats; resilience policy subschema for remediation). Cacheable via ETag/If-None-Match (304).", "responses": {"200": {"description": "Schema catalog"}, "304": {"description": "Not modified (ETag matched)"}}}
     },
     "/guaranteed-state/rules/{rule_id}": {
       "get": {"summary": "Get a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "404": {"description": "Rule not found"}}},
@@ -544,7 +549,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Delete a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Delete.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule deleted"}, "404": {"description": "Rule not found"}}}
     },
     "/guaranteed-state/push": {
-      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous and fan-out is not wired in PR 2 (landed in PR 3).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "503": {"description": "service unavailable"}}}
+      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous. The server resolves the scope and delivers each in-scope agent a per-agent filtered rule set (os_target + scope_expr).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "503": {"description": "service unavailable"}}}
     },
     "/guaranteed-state/events": {
       "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit or offset"}}}
@@ -745,7 +750,8 @@ void RestApiV1::register_routes(
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
-    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn) {
+    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
+    GuardianPushFn guardian_push_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -753,7 +759,8 @@ void RestApiV1::register_routes(
                     std::move(service_group_fn), std::move(tag_push_fn), inventory_store,
                     product_pack_store, sw_deploy_store, device_token_store, license_store,
                     guaranteed_state_store, metrics_registry, std::move(session_revoke_fn),
-                    execution_event_bus, result_set_store, std::move(command_dispatch_fn));
+                    execution_event_bus, result_set_store, std::move(command_dispatch_fn),
+                    std::move(step_up_fn), std::move(guardian_push_fn));
 }
 
 void RestApiV1::register_routes(
@@ -767,7 +774,8 @@ void RestApiV1::register_routes(
     DeviceTokenStore* device_token_store, LicenseStore* license_store,
     GuaranteedStateStore* guaranteed_state_store, yuzu::MetricsRegistry* metrics_registry,
     SessionRevokeFn session_revoke_fn, ExecutionEventBus* execution_event_bus,
-    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn) {
+    ResultSetStore* result_set_store, CommandDispatchFn command_dispatch_fn, StepUpFn step_up_fn,
+    GuardianPushFn guardian_push_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1241,9 +1249,9 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    sink.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, token_store, rbac_store, mgmt_store,
-                                 tag_store, metrics_registry](const httplib::Request& req,
-                                                              httplib::Response& res) {
+    sink.Post("/api/v1/tokens", [auth_fn, perm_fn, audit_fn, step_up_fn, token_store, rbac_store,
+                                 mgmt_store, tag_store, metrics_registry](
+                                    const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Write"))
             return;
         if (!token_store) {
@@ -1254,6 +1262,11 @@ void RestApiV1::register_routes(
 
         auto session = auth_fn(req, res);
         if (!session)
+            return;
+        // PR2 — MFA step-up gate. Token issuance is high-risk
+        // (creates a long-lived bearer credential); require fresh MFA
+        // proof so a hijacked session cannot mint replacement creds.
+        if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/tokens"))
             return;
 
         auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -1390,7 +1403,7 @@ void RestApiV1::register_routes(
         res.set_content(ok_json(resp.str()), "application/json");
     });
 
-    sink.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, token_store](
+    sink.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, step_up_fn, token_store](
                                               const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ApiToken", "Delete"))
             return;
@@ -1402,6 +1415,10 @@ void RestApiV1::register_routes(
 
         auto session = auth_fn(req, res);
         if (!session)
+            return;
+        // PR2 — MFA step-up gate. Token revocation can kill an
+        // operator's automation; require fresh MFA proof.
+        if (step_up_fn && !step_up_fn(req, res, *session, "DELETE /api/v1/tokens/{id}"))
             return;
 
         auto token_id = req.matches[1].str();
@@ -1564,13 +1581,17 @@ void RestApiV1::register_routes(
     // parameter is required AND validated with `is_valid_username` so a
     // NUL byte in the input cannot truncate the SQL bind in a way that
     // diverges from the in-memory `==` comparison (sec-H1 / UP-8).
-    sink.Delete("/api/v1/sessions", [auth_fn, perm_fn, audit_fn, session_revoke_fn](
+    sink.Delete("/api/v1/sessions", [auth_fn, perm_fn, audit_fn, step_up_fn, session_revoke_fn](
                                         const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "UserManagement", "Write"))
             return;
         auto session = auth_fn(req, res);
         if (!session)
             return;
+        // PR2 Gate 2 sec-M2: empty-username defensive check runs FIRST
+        // (sec-M1 invariant) — never emit an audit row carrying an
+        // empty principal, even from the step-up gate. Step-up runs
+        // immediately after, before any state mutation.
         if (session->username.empty()) {
             // sec-M1: empty caller username would mis-attribute the
             // self-vs-cross-user audit action selection below.
@@ -1578,6 +1599,10 @@ void RestApiV1::register_routes(
             res.set_content(error_json("session has empty username", 500), "application/json");
             return;
         }
+        // PR2 — MFA step-up gate. Admin force-logout of another user
+        // is high-risk; require fresh MFA proof.
+        if (step_up_fn && !step_up_fn(req, res, *session, "DELETE /api/v1/sessions"))
+            return;
         if (!session_revoke_fn) {
             res.status = 503;
             res.set_content(error_json("service unavailable", 503), "application/json");
@@ -3711,13 +3736,18 @@ void RestApiV1::register_routes(
                                      "application/json");
                  });
 
-        sink.Post("/api/v1/software-packages", [auth_fn, perm_fn, audit_fn,
+        sink.Post("/api/v1/software-packages", [auth_fn, perm_fn, audit_fn, step_up_fn,
                                                 sw_deploy_store](const httplib::Request& req,
                                                                  httplib::Response& res) {
             auto session = auth_fn(req, res);
             if (!session)
                 return;
             if (!perm_fn(req, res, "SoftwareDeployment", "Write"))
+                return;
+            // PR2 — MFA step-up gate. Uploading a software package
+            // introduces executable content into the fleet; require
+            // fresh MFA proof.
+            if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/software-packages"))
                 return;
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded()) {
@@ -3880,12 +3910,17 @@ void RestApiV1::register_routes(
 
         sink.Post(
             R"(/api/v1/software-deployments/([a-f0-9]+)/start)",
-            [auth_fn, perm_fn, audit_fn, sw_deploy_store](const httplib::Request& req,
-                                                          httplib::Response& res) {
+            [auth_fn, perm_fn, audit_fn, step_up_fn, sw_deploy_store](
+                const httplib::Request& req, httplib::Response& res) {
                 auto session = auth_fn(req, res);
                 if (!session)
                     return;
                 if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
+                    return;
+                // PR2 — MFA step-up gate. Starting a deployment pushes
+                // packages onto live endpoints; require fresh MFA proof.
+                if (step_up_fn &&
+                    !step_up_fn(req, res, *session, "POST /api/v1/software-deployments/{id}/start"))
                     return;
                 auto id = req.matches[1].str();
                 if (sw_deploy_store->start_deployment(id)) {
@@ -4136,6 +4171,7 @@ void RestApiV1::register_routes(
         o.add("rule_id", r.rule_id)
             .add("name", r.name)
             .add("yaml_source", r.yaml_source)
+            .add("spec_json", r.spec_json)
             .add("version", static_cast<int64_t>(r.version))
             .add("enabled", r.enabled)
             .add("enforcement_mode", r.enforcement_mode)
@@ -4167,43 +4203,128 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    sink.Post("/api/v1/guaranteed-state/rules", [auth_fn, perm_fn, audit_fn, guaranteed_state_store,
+    // Schema-registry discovery surface (contract G9 / decision 3): the static
+    // catalog of Guard spark/assertion/remediation types + per-type JSON Schemas
+    // (discriminated subschemas for value-dependent formats). Agentic-first
+    // (A1/A2) — drives the dashboard's create/edit form (C3c) and any agentic
+    // author. Cacheable: a content-derived ETag lets a client fetch-once and
+    // revalidate cheaply (NFR-kind). Does NOT require the store — the catalog is
+    // compiled-in, so it answers even when the rules DB is unavailable.
+    sink.Get("/api/v1/guaranteed-state/schemas",
+             [perm_fn](const httplib::Request& req, httplib::Response& res) {
+                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                     return;
+                 const auto& catalog = guardian::guardian_schema_catalog();
+                 res.set_header("ETag", catalog.etag);
+                 res.set_header("Cache-Control", "public, max-age=300");
+                 if (req.get_header_value("If-None-Match") == catalog.etag) {
+                     res.status = 304; // not modified — client's cached copy is current
+                     return;
+                 }
+                 res.set_content(catalog.json, "application/json");
+             });
+
+    sink.Post("/api/v1/guaranteed-state/rules", [auth_fn, perm_fn, audit_fn, step_up_fn,
+                                                 guaranteed_state_store,
                                                  iso_now](const httplib::Request& req,
                                                           httplib::Response& res) {
+        // PR2 governance Gate 4 consistency-B2: order is
+        // auth_fn → perm_fn → step_up_fn → store-null guard. Resolving
+        // the session up front means a single map lookup and avoids the
+        // re-resolve race that the prior order opened up. (The
+        // token/session handlers run perm_fn before auth_fn; both
+        // orderings are safe because step_up_fn always runs last, after
+        // auth_fn has populated `session` — PR #1199 review LOW.)
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
         if (!perm_fn(req, res, "GuaranteedState", "Write"))
             return;
+        if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/rules"))
+            return;
+        // Authoring errors return the A4 structured envelope (contract decision 3)
+        // so an agentic author self-corrects; the whole create handler speaks A4
+        // uniformly (not a mix of A4 + plain error_json across sibling branches).
+        const auto cid = detail::make_correlation_id();
         if (!guaranteed_state_store) {
             res.status = 503;
-            res.set_content(error_json("service unavailable", 503), "application/json");
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
             return;
         }
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.is_object()) {
             res.status = 400;
-            res.set_content(error_json("invalid JSON"), "application/json");
+            res.set_content(detail::error_json_a4(400, "invalid JSON", cid,
+                                                  "send a JSON object request body"),
+                            "application/json");
             return;
         }
         GuaranteedStateRuleRow row;
         row.rule_id = body.value("rule_id", "");
         row.name = body.value("name", "");
-        row.yaml_source = body.value("yaml_source", "");
         row.version = body.value("version", int64_t{1});
         row.enabled = body.value("enabled", true);
         row.enforcement_mode = body.value("enforcement_mode", std::string{"enforce"});
         row.severity = body.value("severity", std::string{"medium"});
         row.os_target = body.value("os_target", std::string{""});
-        row.scope_expr = body.value("scope_expr", std::string{""});
-        if (row.rule_id.empty() || row.name.empty() || row.yaml_source.empty()) {
+        row.scope_expr = body.value("scope_expr", body.value("scope", std::string{""}));
+
+        // enforcement_mode decides whether the agent WRITES to the endpoint, so
+        // reject anything but enforce|audit. An empty/garbage value would render
+        // as ENFORCING in the dashboard while the agent silently arms audit
+        // (governance C1/B2). Disabling a guard is the `enabled` flag, not a mode.
+        if (row.enforcement_mode != "enforce" && row.enforcement_mode != "audit") {
             res.status = 400;
-            res.set_content(error_json("rule_id, name, and yaml_source are required"),
+            res.set_content(detail::error_json_a4(400, "enforcement_mode must be 'enforce' or 'audit'",
+                                                  cid, "set enforcement_mode to 'enforce' or 'audit'"),
                             "application/json");
+            // Audit the reject (sibling-parity with the update handler + the
+            // invalid-JSON branch — leave a SIEM trail for a malformed/probe body).
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+                     "invalid enforcement_mode");
             return;
         }
-        auto session = auth_fn(req, res);
-        if (session) {
-            row.created_by = session->username;
-            row.updated_by = session->username;
+
+        // Guardian Guards are authored STRUCTURED (contract decisions 1-3): typed
+        // spark/assertion/remediation blocks, each {type, map params}. derive_rule_spec
+        // builds the authoritative canonical spec_json + a human-readable yaml_source
+        // rendering and validates the remediation.params resilience policy (C3b). A
+        // legacy yaml_source-only body is still accepted (structured=false; stored but
+        // not agent-enforceable) so pre-structured callers and tests keep working.
+        auto spec = guardian::derive_rule_spec(body, row.name, row.version, row.enabled,
+                                               row.enforcement_mode);
+        if (spec.error) {
+            res.status = 400;
+            res.set_content(
+                detail::error_json_a4(400, spec.error->message, cid, spec.error->remediation),
+                "application/json");
+            audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
+                     spec.error->message);
+            return;
         }
+        if (spec.structured) {
+            row.spec_json = std::move(spec.spec_json);
+            row.yaml_source = std::move(spec.yaml_source);
+        } else {
+            // Legacy path: yaml_source supplied directly, no structured spec.
+            row.yaml_source = body.value("yaml_source", std::string{});
+        }
+
+        if (row.rule_id.empty() || row.name.empty() ||
+            (!spec.structured && row.yaml_source.empty())) {
+            res.status = 400;
+            res.set_content(
+                detail::error_json_a4(
+                    400,
+                    "rule_id and name are required, plus either a structured "
+                    "spark+assertion or a yaml_source",
+                    cid, "provide rule_id, name and a spark+assertion (or yaml_source)"),
+                "application/json");
+            return;
+        }
+        row.created_by = session->username;
+        row.updated_by = session->username;
         row.created_at = iso_now();
         row.updated_at = row.created_at;
 
@@ -4211,11 +4332,12 @@ void RestApiV1::register_routes(
         if (!result) {
             if (is_conflict_error(result.error())) {
                 res.status = 409;
-                res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                res.set_content(detail::error_json_a4(409, strip_conflict_prefix(result.error()), cid,
+                                                      "choose a unique rule_id and name"),
                                 "application/json");
             } else {
                 res.status = 400;
-                res.set_content(error_json(result.error()), "application/json");
+                res.set_content(detail::error_json_a4(400, result.error(), cid), "application/json");
             }
             audit_fn(req, "guaranteed_state.rule.create", "denied", "GuaranteedState", row.rule_id,
                      result.error());
@@ -4248,26 +4370,40 @@ void RestApiV1::register_routes(
              });
 
     sink.Put(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
-             [auth_fn, perm_fn, audit_fn, guaranteed_state_store,
+             [auth_fn, perm_fn, audit_fn, step_up_fn, guaranteed_state_store,
               iso_now](const httplib::Request& req, httplib::Response& res) {
+                 auto session = auth_fn(req, res);
+                 if (!session)
+                     return;
                  if (!perm_fn(req, res, "GuaranteedState", "Write"))
                      return;
+                 if (step_up_fn &&
+                     !step_up_fn(req, res, *session,
+                                 "PUT /api/v1/guaranteed-state/rules/{id}"))
+                     return;
+                 // A4 envelope across the whole update handler (contract decision 3),
+                 // uniform with the create handler.
+                 const auto cid = detail::make_correlation_id();
                  if (!guaranteed_state_store) {
                      res.status = 503;
-                     res.set_content(error_json("service unavailable", 503), "application/json");
+                     res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                     "application/json");
                      return;
                  }
                  auto id = req.matches[1].str();
                  auto existing = guaranteed_state_store->get_rule(id);
                  if (!existing) {
                      res.status = 404;
-                     res.set_content(error_json("rule not found"), "application/json");
+                     res.set_content(detail::error_json_a4(404, "rule not found", cid),
+                                     "application/json");
                      return;
                  }
                  auto body = nlohmann::json::parse(req.body, nullptr, false);
                  if (body.is_discarded() || !body.is_object()) {
                      res.status = 400;
-                     res.set_content(error_json("invalid JSON"), "application/json");
+                     res.set_content(detail::error_json_a4(400, "invalid JSON", cid,
+                                                           "send a JSON object request body"),
+                                     "application/json");
                      // Mirror the /push handler's invalid-body audit (BL-6): a
                      // mutating REST path that rejects a malformed body should
                      // leave a denied audit trail so SIEM sees the probe/fuzz
@@ -4288,28 +4424,90 @@ void RestApiV1::register_routes(
                  // request-shape mistake into a server-error alertable event.
                  // Mirrors the POST handler's body.value(...) pattern.
                  updated.name = body.value("name", updated.name);
-                 updated.yaml_source = body.value("yaml_source", updated.yaml_source);
                  updated.enabled = body.value("enabled", updated.enabled);
                  updated.enforcement_mode =
                      body.value("enforcement_mode", updated.enforcement_mode);
+                 // Same enforce|audit guard as create (governance C1/B2), but only
+                 // when the client actually sets the field — so a legacy rule with
+                 // a stale mode can still be updated in its other fields.
+                 if (body.contains("enforcement_mode") && updated.enforcement_mode != "enforce" &&
+                     updated.enforcement_mode != "audit") {
+                     res.status = 400;
+                     res.set_content(detail::error_json_a4(400,
+                                                           "enforcement_mode must be 'enforce' or 'audit'",
+                                                           cid, "set enforcement_mode to 'enforce' or 'audit'"),
+                                     "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              "invalid enforcement_mode");
+                     return;
+                 }
                  updated.severity = body.value("severity", updated.severity);
                  updated.os_target = body.value("os_target", updated.os_target);
                  updated.scope_expr = body.value("scope_expr", updated.scope_expr);
                  updated.version = existing->version + 1;
+
+                 // A structured body re-authors the Guard (contract §8): re-derive the
+                 // canonical spec + yaml_source and re-validate the resilience policy
+                 // (C3b) rather than the pre-C3b behaviour of silently dropping the
+                 // blocks on a 200. A metadata-only body (no spark/assertion/remediation)
+                 // keeps the existing spec_json and just applies any yaml_source
+                 // override. derive_rule_spec sees the bumped version so the embedded
+                 // spec.version matches the row.
+                 auto spec = guardian::derive_rule_spec(body, updated.name, updated.version,
+                                                        updated.enabled, updated.enforcement_mode);
+                 if (spec.error) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, spec.error->message, cid, spec.error->remediation),
+                         "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              spec.error->message);
+                     return;
+                 }
+                 if (spec.structured) {
+                     updated.spec_json = std::move(spec.spec_json);
+                     updated.yaml_source = std::move(spec.yaml_source);
+                 } else {
+                     updated.yaml_source = body.value("yaml_source", updated.yaml_source);
+                     // Metadata-only update keeps the existing spec_json, so
+                     // derive_rule_spec's assertion validator did NOT run. If this
+                     // update flips the rule into enforce mode, re-check the STORED
+                     // assertion against the dangerous-key denylist — otherwise an
+                     // audit guard on a protected key can be promoted to a
+                     // SYSTEM-write past the H1 gate (contract §6).
+                     if (updated.enforcement_mode == "enforce") {
+                         if (std::string why =
+                                 guardian::dangerous_enforce_key_in_spec(updated.spec_json);
+                             !why.empty()) {
+                             res.status = 400;
+                             res.set_content(
+                                 detail::error_json_a4(
+                                     400, "enforce mode not permitted: this guard targets " + why,
+                                     cid,
+                                     "keep this guard in audit mode, or re-author it against a key "
+                                     "outside the protected persistence/privilege set"),
+                                 "application/json");
+                             audit_fn(req, "guaranteed_state.rule.update", "denied",
+                                      "GuaranteedState", id, "enforce on denylisted key");
+                             return;
+                         }
+                     }
+                 }
+
                  updated.updated_at = iso_now();
-                 auto session = auth_fn(req, res);
-                 if (session)
-                     updated.updated_by = session->username;
+                 updated.updated_by = session->username;
 
                  auto result = guaranteed_state_store->update_rule(updated);
                  if (!result) {
                      if (is_conflict_error(result.error())) {
                          res.status = 409;
-                         res.set_content(error_json(strip_conflict_prefix(result.error()), 409),
+                         res.set_content(detail::error_json_a4(409, strip_conflict_prefix(result.error()),
+                                                               cid, "choose a unique name"),
                                          "application/json");
                      } else {
                          res.status = 400;
-                         res.set_content(error_json(result.error()), "application/json");
+                         res.set_content(detail::error_json_a4(400, result.error(), cid),
+                                         "application/json");
                      }
                      audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
                               result.error());
@@ -4325,9 +4523,21 @@ void RestApiV1::register_routes(
              });
 
     sink.Delete(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
-                [perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
-                                                            httplib::Response& res) {
+                [auth_fn, perm_fn, audit_fn, step_up_fn,
+                 guaranteed_state_store](const httplib::Request& req,
+                                         httplib::Response& res) {
+                    // PR2 Gate 4 consistency-B1: Guardian rule DELETE is
+                    // equally destructive to UPDATE — gating both keeps
+                    // a hijacked session from removing auto-remediation
+                    // policy.
+                    auto session = auth_fn(req, res);
+                    if (!session)
+                        return;
                     if (!perm_fn(req, res, "GuaranteedState", "Delete"))
+                        return;
+                    if (step_up_fn &&
+                        !step_up_fn(req, res, *session,
+                                    "DELETE /api/v1/guaranteed-state/rules/{id}"))
                         return;
                     if (!guaranteed_state_store) {
                         res.status = 503;
@@ -4351,10 +4561,16 @@ void RestApiV1::register_routes(
     // POST /push — fan-out is wired in PR 3 (agent-side dispatch + scope
     // expansion). PR 2 acks the request and audits the operator action so
     // dashboards and audit-trail tooling can be exercised end-to-end now.
-    sink.Post("/api/v1/guaranteed-state/push", [perm_fn, audit_fn,
-                                                guaranteed_state_store](const httplib::Request& req,
-                                                                        httplib::Response& res) {
+    sink.Post("/api/v1/guaranteed-state/push", [auth_fn, perm_fn, audit_fn, step_up_fn,
+                                                guaranteed_state_store,
+                                                guardian_push_fn](const httplib::Request& req,
+                                                                  httplib::Response& res) {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
         if (!perm_fn(req, res, "GuaranteedState", "Push"))
+            return;
+        if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/guaranteed-state/push"))
             return;
         if (!guaranteed_state_store) {
             res.status = 503;
@@ -4404,22 +4620,33 @@ void RestApiV1::register_routes(
             }
             return out;
         };
-        // target_id is reserved for a concrete entity id across every other
-        // audit emission in this file (rule_id, agent_id, group_id, token_id).
-        // The push scope expression is a fleet-level selector, not an entity
-        // id, so emit it in `detail` and leave target_id empty to preserve
-        // the SIEM join semantics. Result vocabulary stays "success" (202 is
-        // still a success); the PR-2 fan-out-deferral is surfaced in detail.
+        // Step 3 fan-out: resolve scope → in-scope agents, build the GuaranteedStatePush
+        // from the store, deliver via the agent dispatch path. The callback is injected
+        // from server.cpp (registry + scope engine live there). A null callback means
+        // dispatch isn't wired (tests) — degrade to ack-only with agents=0. target_id is
+        // left empty: the scope is a fleet-level selector, not an entity id, so it goes
+        // in `detail` to preserve the SIEM join semantics.
+        int pushed = 0;
+        if (guardian_push_fn) {
+            pushed = guardian_push_fn(scope, full_sync);
+            if (pushed < 0) {
+                res.status = 400;
+                res.set_content(error_json("invalid scope expression"), "application/json");
+                audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
+                         "invalid scope=\"" + sanitize_audit_string(scope) + "\"");
+                return;
+            }
+        }
         audit_fn(req, "guaranteed_state.push", "success", "GuaranteedState", "",
-                 "rules=" + std::to_string(rule_count) +
-                     " full_sync=" + (full_sync ? "true" : "false") + " scope=\"" +
-                     sanitize_audit_string(scope) + "\"" + " fan_out_deferred_pr3=true");
+                 "rules=" + std::to_string(rule_count) + " full_sync=" +
+                     (full_sync ? "true" : "false") + " scope=\"" + sanitize_audit_string(scope) +
+                     "\" agents=" + std::to_string(pushed));
         res.status = 202;
         res.set_content(ok_json(JObj()
                                     .add("queued", true)
                                     .add("rules", static_cast<int64_t>(rule_count))
+                                    .add("agents", static_cast<int64_t>(pushed))
                                     .add("scope", scope)
-                                    .add("note", "push accepted; agent delivery is asynchronous")
                                     .str()),
                         "application/json");
     });

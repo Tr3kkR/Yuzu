@@ -40,6 +40,8 @@
 #include "nvd_db.hpp"
 #include "policy_store.hpp"
 #include "guaranteed_state_store.hpp"
+#include "guardian_push_builder.hpp"
+#include "guaranteed_state.pb.h"
 #include "product_pack_store.hpp"
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
@@ -47,11 +49,13 @@
 #include "result_set_matcher.hpp"
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
+#include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
 #include "compliance_routes.hpp"
+#include "guardian_routes.hpp"
 #include "policy_evaluator.hpp"
 #include "dashboard_routes.hpp"
 #include "discovery_routes.hpp"
@@ -264,6 +268,14 @@ public:
                           "gauge");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
+        // gov PR-E OBS-2: a from_result_set: scope ref resolved to an
+        // absent/expired/not-owned set at dispatch. Audit rows are not
+        // Prometheus-alertable; this counter makes the failure mode (silent
+        // under-scope to zero targets) visible to an on-call SRE.
+        metrics_.describe("yuzu_scope_resolution_failed_total",
+                          "from_result_set: scope references that failed owner-checked "
+                          "resolution at dispatch (set absent, expired, or not owned)",
+                          "counter");
         // Audit-pipeline observability (governance PR4 OBS-4). Increments when
         // audit_store->add_event()'s SQLite step does not return DONE — pages
         // operators that the audit chain itself is degraded.
@@ -1028,6 +1040,123 @@ public:
             agent_service_.set_heartbeat_ingestion(heartbeat_ingestion_.get());
             if (gateway_service_)
                 gateway_service_->set_heartbeat_ingestion(heartbeat_ingestion_.get());
+
+            // Guardian heartbeat reconcile (M5 / #1209). The agent reports its
+            // applied policy generation on every heartbeat; if it trails the
+            // current generation it missed a push (was offline when the push fired,
+            // or has just reconnected — sync_with_server is a no-op pull), so
+            // re-push its applicable rules. Reads the generation, never bumps it, so
+            // catching one lagging agent up does not make the rest of the fleet look
+            // stale (the cascade M6's monotonic counter is designed to avoid).
+            heartbeat_ingestion_->set_guardian_reconcile_fn(
+                [this](std::string_view agent_id_sv, std::uint64_t agent_gen) {
+                    if (!guaranteed_state_store_)
+                        return;
+                    const std::uint64_t current =
+                        guaranteed_state_store_->current_policy_generation();
+                    if (agent_gen >= current)
+                        return;  // agent already at or ahead of current policy
+                    const std::string agent_id(agent_id_sv);
+
+                    // Per-agent rate limit (#1209 hardening: sec-MED1/perf-S1/S2).
+                    // Claim the slot under the lock BEFORE any work so concurrent
+                    // heartbeats from the same agent can't both reconcile, and a
+                    // stuck/hostile agent can't turn every heartbeat into a registry
+                    // scan. Wall-clock based so it self-heals a re-registered/wiped
+                    // agent after the interval (no generation-keyed dedupe hole).
+                    constexpr auto kGuardianReconcileMinInterval = std::chrono::seconds(25);
+                    const auto reconcile_now = std::chrono::steady_clock::now();
+                    {
+                        std::lock_guard lk(guardian_reconcile_mu_);
+                        auto last = guardian_last_reconcile_.find(agent_id);
+                        if (last != guardian_last_reconcile_.end() &&
+                            (reconcile_now - last->second) < kGuardianReconcileMinInterval) {
+                            metrics_
+                                .counter("yuzu_server_guardian_reconciles_total",
+                                         {{"result", "rate_limited"}})
+                                .increment();
+                            return;
+                        }
+                        guardian_last_reconcile_[agent_id] = reconcile_now;  // claim
+                    }
+
+                    auto sess = registry_.get_session(agent_id);
+                    if (!sess) {
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "no_session"}})
+                            .increment();
+                        return;
+                    }
+                    // Per-agent filtering as the fan-out (M4): only rules that target
+                    // this agent's OS and name it in scope. Cache scope membership
+                    // across rules sharing a scope_expr within this one reconcile.
+                    const auto rules = guaranteed_state_store_->list_rules();
+                    std::unordered_map<std::string, bool> scope_member;
+                    auto push = guardian::build_agent_push(
+                        rules, sess->os,
+                        [&](const std::string& expr) {
+                            auto cached = scope_member.find(expr);
+                            if (cached != scope_member.end())
+                                return cached->second;
+                            bool member = false;
+                            if (auto parsed = yuzu::scope::parse(expr)) {
+                                for (const auto& id : registry_.evaluate_scope(
+                                         *parsed, tag_store_.get(),
+                                         custom_properties_store_.get()))
+                                    if (id == agent_id) {
+                                        member = true;
+                                        break;
+                                    }
+                            }
+                            scope_member.emplace(expr, member);
+                            return member;
+                        },
+                        /*full_sync=*/true, current);
+                    ::yuzu::agent::v1::CommandRequest cmd;
+                    // Unique per re-push (random suffix) so a same-generation reconcile
+                    // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
+                    cmd.set_command_id(
+                        "__guard__-reconcile-" + std::to_string(current) + "-" +
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
+                    cmd.set_plugin("__guard__");
+                    cmd.set_action("push_rules");
+                    cmd.set_payload(push.SerializeAsString());
+                    if (registry_.send_to(agent_id, cmd)) {
+                        forward_gateway_pending();
+                        metrics_
+                            .counter("yuzu_server_guardian_reconciles_total",
+                                     {{"result", "sent"}})
+                            .increment();
+                        metrics_
+                            .counter("yuzu_server_guardian_pushes_dispatched_total",
+                                     {{"reason", "reconcile"}})
+                            .increment();
+                        metrics_.gauge("yuzu_server_guardian_policy_generation")
+                            .set(static_cast<double>(current));
+                        // Durable audit of a system-initiated enforcement re-deploy
+                        // (SOC2 CC7.2/CC7.4 — comp-F1). Deduped above → at most one
+                        // row per agent per interval, not per heartbeat.
+                        if (audit_store_ && audit_store_->is_open()) {
+                            AuditEvent ev;
+                            ev.timestamp =
+                                std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            ev.principal = "system";
+                            ev.action = "guaranteed_state.reconcile";
+                            ev.target_type = "GuaranteedState";
+                            ev.target_id = agent_id;
+                            ev.detail = "heartbeat reconcile re-push (generation " +
+                                        std::to_string(agent_gen) + " -> " +
+                                        std::to_string(current) + ")";
+                            ev.result = "success";
+                            (void)audit_store_->log(ev);
+                        }
+                        spdlog::info("Guardian: reconciled agent {} (generation {} -> {})",
+                                     agent_id, agent_gen, current);
+                    }
+                });
         }
 
         // Initialize tag store
@@ -1309,6 +1438,15 @@ public:
                 guaranteed_state_store_->start_cleanup();
                 spdlog::info("GuaranteedStateStore initialized at {} (retention={}d)",
                              gs_db.string(), cfg_.guardian_event_retention_days);
+                // Step 5: ingest agent `__guard__` events arriving on the Subscribe
+                // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
+                agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
+                // Guardian Half B: gateway-connected agents' drift events arrive
+                // via GatewayUpstream.ForwardGuardianMessage, not the direct
+                // Subscribe loop — wire the same store so they ingest through the
+                // shared path. Gateway service exists only in gateway mode.
+                if (gateway_service_)
+                    gateway_service_->set_guaranteed_state_store(guaranteed_state_store_.get());
             }
         }
 
@@ -2284,6 +2422,40 @@ private:
         return auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
     }
 
+    // PR-E: emit the invocation-time scope-resolution-failure audit row (design
+    // §7 rule 3) when a from_result_set: ref resolves to an absent/expired or
+    // not-owned set. Req-less so every dispatch path (REST, tracked, MCP) emits
+    // uniformly. Carries the dispatch/instruction correlation id (command_id),
+    // the result-set ref, principal + role, and reason — the forensic chain the
+    // design §10 walkthrough requires (gov C-B1/F1). Also increments a
+    // Prometheus counter so the failure is alertable rather than buried in
+    // audit.db (gov OBS-2), and logs at warn so a signal survives even when the
+    // audit write itself fails (gov OBS-3 / F3 / UP-2).
+    void audit_scope_resolution_failed(const std::string& principal,
+                                       const std::string& principal_role,
+                                       const std::string& command_id, const std::string& ref) {
+        metrics_.counter("yuzu_scope_resolution_failed_total").increment();
+        spdlog::warn("scope resolution failed: command={} principal={} ref={} "
+                     "(result set absent, expired, or not owned)",
+                     command_id, principal.empty() ? "unknown" : principal, ref);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "instruction.scope_resolution_failed";
+        ev.target_type = "result_set";
+        ev.target_id = ref;
+        ev.detail = "INSTRUCTION_SCOPE_RESOLUTION_FAILED command=" + command_id + " ref=" + ref +
+                    " reason=result set not found, expired, or not owned by principal";
+        ev.result = "failure";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: instruction.scope_resolution_failed "
+                          "(command={} ref={})",
+                          command_id, ref);
+    }
+
     // Apply stored runtime config overrides on startup
     void apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
@@ -2403,8 +2575,27 @@ private:
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
-            // Rate limiting — check before auth to protect against brute force
-            bool is_login = (req.path == "/login" && req.method == "POST");
+            // Rate limiting — check before auth to protect against brute force.
+            // Both /login and /login/mfa share the tighter login-rate bucket;
+            // the MFA challenge is part of the same per-IP credential-brute
+            // surface and must not fall through to the looser api_rate_limiter_
+            // (Hermes Agent red-team finding LOW #6, 2026-05-29). The per-
+            // pending-token 5-attempt cap on /login/mfa is the second layer of
+            // this defence and remains in place at AuthRoutes::POST /login/mfa.
+            // `/login/mfa/stepup` joins this bucket (PR2): the endpoint
+            // accepts the same TOTP / recovery code space as `/login/mfa`
+            // so a malicious operator with a stolen valid session could
+            // pound the space to brute-force the secret. Step-up has no
+            // per-pending-token attempts cap (the session IS the
+            // credential), so the per-IP rate limit is the only brake.
+            // `/login/mfa/enroll` joins it too (PR3): it confirms the first
+            // code against a provisional TOTP secret during enforced
+            // enrollment, so it is the same online-guessing surface and
+            // must not fall through to the looser bucket.
+            bool is_login = (req.path == "/login" || req.path == "/login/mfa" ||
+                             req.path == "/login/mfa/stepup" ||
+                             req.path == "/login/mfa/enroll") &&
+                            req.method == "POST";
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
                 res.status = 429;
@@ -2415,7 +2606,7 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
-            // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec.
+            // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
             // /health and /api/health are ALSO covered by the early-return
             // exemption at the top of this lambda (which additionally skips
             // rate limiting). They are kept in this list as defense-in-depth
@@ -2423,9 +2614,23 @@ private:
             // /livez|/readyz alone would silently start requiring auth on
             // /health without this lower entry. Governance Gate 7, security
             // re-review LOW. Do not remove either site without updating both.
-            if (req.path == "/login" || req.path == "/health" || req.path == "/api/health" ||
-                req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
-                req.path == "/api/v1/openapi.json" || req.path.starts_with("/static/")) {
+            //
+            // `/login/mfa` MUST be unauthenticated for the same reason `/login`
+            // is: the MFA challenge completes the login. The pending token is
+            // the only credential the caller has at this point — they have no
+            // session cookie yet. Hermes Agent's red-team review (2026-05-29)
+            // caught the omission; without it, MFA-enrolled users are locked
+            // out because every POST /login/mfa redirects to /login before the
+            // route handler runs.
+            // `/login/mfa/enroll` (PR3) is also pre-session: it completes
+            // an enforced login for an un-enrolled user who has only the
+            // enrollment-pending token, not a cookie. (`/login/mfa/stepup`
+            // is deliberately NOT here — it requires an existing session.)
+            if (req.path == "/login" || req.path == "/login/mfa" ||
+                req.path == "/login/mfa/enroll" || req.path == "/health" ||
+                req.path == "/api/health" || req.path == "/auth/oidc/start" ||
+                req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
+                req.path.starts_with("/static/")) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
@@ -2719,6 +2924,13 @@ private:
                 // dashboard would not detect the half-state. Pairs with the
                 // workflow_routes.cpp install handler's `is_open()` guard.
                 {"product_pack_store", product_pack_store_ && product_pack_store_->is_open()},
+                // gov PR-E OBS-1: ResultSetStore became load-bearing — every
+                // scoped command dispatch and the /api/scope/estimate preview
+                // resolve from_result_set: aliases and owner-check membership
+                // against it. A failed migration / corrupt result_sets.db would
+                // silently degrade every scoped dispatch to zero targets while
+                // /readyz reported "ready".
+                {"result_set_store", result_set_store_ && result_set_store_->is_open()},
             };
 
             std::string failed_list;
@@ -3335,6 +3547,29 @@ private:
             res.set_content(kDashboardIndexHtml, "text/html; charset=utf-8");
         });
 
+        // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
+        // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
+        // register_routes sites; DRY'd up here so a future change updates
+        // both surfaces atomically). Hoisted to the top of start_web_server
+        // because SettingsRoutes::register_routes (called just below) and
+        // RestApiV1::register_routes (called later in this same function)
+        // both consume it. The closure captures cfg_ + auth_mgr_ + audit_log
+        // and dispatches into `require_mfa_step_up`. `std::function` copies
+        // it into each call site.
+        StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const auth::Session& session,
+                                     const std::string& action_label) -> bool {
+            if (!auth_mgr_.auth_db_ptr())
+                return true; // defensive — auth_db is always non-null in production
+            return require_mfa_step_up(
+                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
+                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
+                       const std::string& tt, const std::string& ti, const std::string& d) {
+                    return audit_log(r, a, rs, tt, ti, d);
+                },
+                action_label, cfg_.mfa_enforcement);
+        };
+
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
         settings_routes_ = std::make_unique<SettingsRoutes>();
         settings_routes_->register_routes(
@@ -3362,7 +3597,7 @@ private:
             })
                              : SettingsRoutes::GatewaySessionCountFn{},
             [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
-            /*metrics_registry=*/&metrics_);
+            /*metrics_registry=*/&metrics_, step_up_fn);
 
         // Legacy routes — redirect to dashboard
         web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
@@ -3619,8 +3854,25 @@ private:
                     }
                 }
             } else if (!scope_expr.empty()) {
-                // Scope expression dispatch
-                auto parsed = yuzu::scope::parse(scope_expr);
+                // Scope expression dispatch.
+                // Owner principal for from_result_set: resolution (review B1).
+                // This raw path is untracked (no execution row), so read the
+                // session directly; auth already passed require_permission above.
+                std::string principal, principal_role;
+                if (auto s = require_auth(req, res)) {
+                    principal = s->username;
+                    principal_role = auth::role_to_string(s->role);
+                }
+                // Resolve from_result_set: aliases against the operator's owned
+                // sets before parsing (PR-E): the scope resolver does not.
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                // Forensic row when a referenced set is absent/expired/unowned
+                // (design §7 rule 3); does not abort dispatch.
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, principal_role, command_id, ref);
+                auto parsed = yuzu::scope::parse(resolved_scope);
                 if (!parsed) {
                     res.status = 400;
                     res.set_content(
@@ -3628,12 +3880,6 @@ private:
                         "application/json");
                     return;
                 }
-                // Owner principal for from_result_set: resolution (review B1).
-                // This raw path is untracked (no execution row), so read the
-                // session directly; auth already passed require_permission above.
-                std::string principal;
-                if (auto s = require_auth(req, res))
-                    principal = s->username;
                 auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get(),
                                                             custom_properties_store_.get(),
                                                             result_set_store_.get(), principal);
@@ -6006,20 +6252,29 @@ private:
                             ++sent;
                 }
             } else if (!scope_expr.empty()) {
-                auto parsed = yuzu::scope::parse(scope_expr);
+                // from_result_set: is owner-scoped; recover the dispatching
+                // operator from the execution row (run_async / workflow /
+                // scheduled all create it with dispatched_by before dispatch).
+                // This is how owner-checked result-set resolution reaches the
+                // tracked dispatch paths without threading a param through the
+                // shared CommandDispatchFn (review finding B1).
+                std::string principal;
+                if (scope_expr.find("from_result_set:") != std::string::npos &&
+                    !execution_id.empty() && execution_tracker_) {
+                    if (auto ex = execution_tracker_->get_execution(execution_id))
+                        principal = ex->dispatched_by;
+                }
+                // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                // Role is not available on the tracked path (principal recovered
+                // from the execution row, no live session); principal + command
+                // id still identify the actor for the forensic chain.
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                auto parsed = yuzu::scope::parse(resolved_scope);
                 if (parsed) {
-                    // from_result_set: is owner-scoped; recover the dispatching
-                    // operator from the execution row (run_async / workflow /
-                    // scheduled all create it with dispatched_by before dispatch).
-                    // This is how owner-checked result-set resolution reaches the
-                    // tracked dispatch paths without threading a param through the
-                    // shared CommandDispatchFn (review finding B1).
-                    std::string principal;
-                    if (scope_expr.find("from_result_set:") != std::string::npos &&
-                        !execution_id.empty() && execution_tracker_) {
-                        if (auto ex = execution_tracker_->get_execution(execution_id))
-                            principal = ex->dispatched_by;
-                    }
                     auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
                                                             custom_properties_store_.get(),
                                                             result_set_store_.get(), principal);
@@ -6187,6 +6442,28 @@ private:
             policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
             policy_evaluator_.get());
 
+        // GuardianRoutes — /guardian + /fragments/guardian/* (Guaranteed State
+        // dashboard; docs/guardian-mvp-contract.md §8). Fragment renderers are
+        // mock-backed (contract-shaped) until the parallel backend on
+        // feat/guardian-mvp lands; live data is used where it already exists
+        // (rule CRUD + event query on GuaranteedStateStore).
+        guardian_routes_ = std::make_unique<GuardianRoutes>();
+        guardian_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, audit_fn,
+            [this](const std::string& event_type, const httplib::Request& req,
+                   const nlohmann::json& attrs, const nlohmann::json& payload_data) {
+                emit_event(event_type, req, attrs, payload_data);
+            },
+            guaranteed_state_store_.get(),
+            [this]() -> std::string { return registry_.to_json(); },
+            // Dashboard enforcement toggle deploys via the same push fan-out the
+            // REST endpoint uses. guardian_push_fn_ is assigned just below during
+            // REST wiring; this lambda reads it at toggle-time (runtime), never at
+            // registration time, so the ordering is fine.
+            [this](const std::string& scope, bool full_sync) -> int {
+                return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
+            });
+
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
         viz_routes_ = std::make_unique<VizRoutes>();
@@ -6327,7 +6604,9 @@ private:
         wf_deps.scope_fn =
             [this](const std::string& expression,
                    const std::string& principal) -> std::pair<std::size_t, std::size_t> {
-            auto parsed = yuzu::scope::parse(expression);
+            // Resolve from_result_set: aliases for the estimate too (PR-E).
+            auto resolved = resolve_scope_aliases(expression, principal, result_set_store_.get());
+            auto parsed = yuzu::scope::parse(resolved);
             if (!parsed)
                 return {0, registry_.agent_count()};
             auto matched =
@@ -6461,7 +6740,116 @@ private:
             // so the async result-set producers (from-tar-query /
             // from-instruction-result / re-eval) drive the exact dispatch path
             // (PR-D). Empty closure would 503 those routes.
-            command_dispatch_fn);
+            command_dispatch_fn,
+            // PR2 MFA step-up gate for the high-risk REST handlers; empty
+            // closure disables the gate (preserves pre-PR2 behaviour).
+            step_up_fn,
+            // Step 3 — Guardian push fan-out. Resolve scope → in-scope agents, build the
+            // GuaranteedStatePush from the store's enabled rules (typed
+            // spark/assertion/remediation from spec_json) and deliver as a
+            // `__guard__`/push_rules CommandRequest via the agent dispatch path (reuses
+            // the instruction-dispatch scope→send_to idiom). Returns the agent count, or
+            // -1 on an unparseable scope. See docs/guardian-mvp-contract.md (step 3/G12).
+            // Also stored into guardian_push_fn_ (member) so the dashboard enforcement
+            // toggle deploys via this exact fan-out. The parenthesised assignment yields
+            // the assigned std::function, which is what gets passed here by value.
+            (guardian_push_fn_ = [this](const std::string& scope, bool full_sync) -> int {
+                if (!guaranteed_state_store_)
+                    return 0;
+                const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count();
+                // Read (never bump) the monotonic generation: a reconcile re-push
+                // (M5) must carry the SAME generation as the policy-change push that
+                // minted it, otherwise catching one lagging agent up would make the
+                // rest of the fleet look stale and trigger a reconcile storm. The
+                // store bumps the counter on rule mutations; we only read it here.
+                // Replaces wall-clock seconds, which could repeat or step backwards
+                // and wedge the heartbeat reconcile. (M6 / #1209.)
+                const std::uint64_t generation =
+                    guaranteed_state_store_->current_policy_generation();
+                const auto rules = guaranteed_state_store_->list_rules();
+
+                // Resolve the agent set this push is ADDRESSED to. H1 scopes a single
+                // toggle to the affected rule's scope_expr (was the whole fleet); an
+                // empty scope still means fleet-wide.
+                std::vector<std::string> targets;
+                if (scope.empty()) {
+                    targets = registry_.all_ids();
+                } else if (scope.starts_with("group:") && mgmt_group_store_) {
+                    for (const auto& m : mgmt_group_store_->get_members(scope.substr(6)))
+                        targets.push_back(m.agent_id);
+                } else {
+                    auto parsed = yuzu::scope::parse(scope);
+                    if (!parsed)
+                        return -1;
+                    targets = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                       custom_properties_store_.get());
+                }
+
+                // Per-rule scope membership, evaluated once per distinct scope_expr
+                // and cached, so the fan-out is O(agents + distinct_scopes) rather
+                // than O(agents × rules).
+                std::unordered_map<std::string, std::unordered_set<std::string>> scope_cache;
+                auto agent_in_scope = [&](const std::string& aid,
+                                          const std::string& expr) -> bool {
+                    auto it = scope_cache.find(expr);
+                    if (it == scope_cache.end()) {
+                        std::unordered_set<std::string> ids;
+                        if (auto parsed = yuzu::scope::parse(expr)) {
+                            auto v = registry_.evaluate_scope(*parsed, tag_store_.get(),
+                                                              custom_properties_store_.get());
+                            ids.insert(v.begin(), v.end());
+                        }
+                        it = scope_cache.emplace(expr, std::move(ids)).first;
+                    }
+                    return it->second.contains(aid);
+                };
+
+                // Build and send a per-agent FILTERED push (M4 / #1209): each agent
+                // receives only the enabled rules that target its OS and name it in
+                // scope, so a Linux box is no longer handed Windows registry guards.
+                int sent = 0;
+                for (const auto& aid : targets) {
+                    auto sess = registry_.get_session(aid);
+                    const std::string agent_os = sess ? sess->os : std::string{};
+                    auto push = guardian::build_agent_push(
+                        rules, agent_os,
+                        [&](const std::string& expr) { return agent_in_scope(aid, expr); },
+                        full_sync, generation);
+
+                    ::yuzu::agent::v1::CommandRequest cmd;
+                    // Unique per push (random suffix) so two pushes in the same second
+                    // can't collide on the agent's replay-dedup set (hp-F2/cons-S1).
+                    cmd.set_command_id(
+                        "__guard__-push-" + std::to_string(now_s) + "-" +
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
+                    cmd.set_plugin("__guard__");
+                    cmd.set_action("push_rules");
+                    // Binary serialized proto rides in the `payload` bytes field, not the
+                    // `parameters` string map: proto3 string values must be valid UTF-8, and
+                    // raw GuaranteedStatePush bytes are not. See agent.proto CommandRequest.payload.
+                    cmd.set_payload(push.SerializeAsString());
+                    if (registry_.send_to(aid, cmd)) {
+                        ++sent;
+                        metrics_
+                            .counter("yuzu_server_guardian_pushes_dispatched_total",
+                                     {{"reason", "policy_change"}})
+                            .increment();
+                    }
+                }
+                metrics_.gauge("yuzu_server_guardian_policy_generation")
+                    .set(static_cast<double>(generation));
+                // Drain gw_pending_ so the push reaches gateway-connected agents.
+                // send_to only QUEUES for a gateway agent (it has no local Subscribe
+                // stream — the gateway holds it); direct agents already got the inline
+                // write. Every other dispatch site drains here; the Guardian push
+                // omitted it, so over a gateway the push silently never arrived and no
+                // guard armed (works in direct mode, breaks via gateway). See
+                // forward_gateway_pending() and docs/guardian-mvp-contract.md G12.
+                forward_gateway_pending();
+                return sent;
+            }));
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -6528,16 +6916,25 @@ private:
                                     ++sent;
                         }
                     } else if (!scope_expr.empty() && scope_expr != "__all__") {
-                        auto parsed = yuzu::scope::parse(scope_expr);
+                        // Owner-scoped from_result_set: recover the principal
+                        // from the MCP-created execution row (review B1).
+                        std::string principal;
+                        if (scope_expr.find("from_result_set:") != std::string::npos &&
+                            !execution_id.empty() && execution_tracker_) {
+                            if (auto ex = execution_tracker_->get_execution(execution_id))
+                                principal = ex->dispatched_by;
+                        }
+                        // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                        auto resolved_scope = resolve_scope_aliases(scope_expr, principal,
+                                                                    result_set_store_.get());
+                        // Role unavailable on the MCP path (principal recovered
+                        // from the MCP-created execution row); principal + command
+                        // id identify the actor for the forensic chain.
+                        for (const auto& ref : scope_refs_failing_owner_check(
+                                 resolved_scope, principal, result_set_store_.get()))
+                            audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                        auto parsed = yuzu::scope::parse(resolved_scope);
                         if (parsed) {
-                            // Owner-scoped from_result_set: recover the principal
-                            // from the MCP-created execution row (review B1).
-                            std::string principal;
-                            if (scope_expr.find("from_result_set:") != std::string::npos &&
-                                !execution_id.empty() && execution_tracker_) {
-                                if (auto ex = execution_tracker_->get_execution(execution_id))
-                                    principal = ex->dispatched_by;
-                            }
                             for (const auto& aid : registry_.evaluate_scope(
                                      *parsed, tag_store_.get(), custom_properties_store_.get(),
                                      result_set_store_.get(), principal))
@@ -6655,6 +7052,11 @@ private:
         }
         res.set_content("{\"status\":\"sent\"}", "application/json");
     }
+
+    // Scope-walking dispatch helpers (resolve_scope_aliases /
+    // scope_refs_failing_owner_check) live in scope_yaml.{hpp,cpp} as free
+    // functions in yuzu::server, so the dispatch call sites below bind to them
+    // unqualified and they are unit-testable.
 
     // -- JSON parsing helpers (using nlohmann/json) --------------------------
 
@@ -6801,6 +7203,24 @@ private:
     std::unique_ptr<SettingsRoutes> settings_routes_;
     std::unique_ptr<mcp::McpServer> mcp_server_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
+    std::unique_ptr<GuardianRoutes> guardian_routes_;
+    // Guardian push fan-out, shared by the REST /push endpoint and the dashboard
+    // enforcement toggle. Assigned during REST wiring (the `(guardian_push_fn_ =
+    // ...)` site); GuardianRoutes captures `this` and reads it at toggle-time, by
+    // which point it is set.
+    std::function<int(const std::string&, bool)> guardian_push_fn_;
+
+    // Guardian heartbeat-reconcile per-agent rate limit (#1209 hardening:
+    // sec-MED1 / perf-S1 / perf-S2). Without it, a lagging — or hostile, tight-
+    // looping — agent turns EVERY heartbeat into a full reconcile (list_rules +
+    // per-rule registry-mutex scope scan), an asymmetric CPU amplifier. We allow
+    // at most one reconcile re-push per agent per kGuardianReconcileMinInterval;
+    // a genuinely-once-lagging agent still converges on its first heartbeat. Map
+    // is agent_id -> last reconcile time, guarded by its own mutex.
+    std::mutex guardian_reconcile_mu_;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        guardian_last_reconcile_;
+
     std::unique_ptr<DashboardRoutes> dashboard_routes_;
     std::unique_ptr<WorkflowRoutes> workflow_routes_;
     std::unique_ptr<NotificationRoutes> notification_routes_;
