@@ -1,0 +1,25 @@
+---
+import { getCollection, render } from 'astro:content';
+import Manual from '../../layouts/Manual.astro';
+import { ENTRIES } from '../../nav.mjs';
+
+export async function getStaticPaths() {
+  const all = await getCollection('manual');
+  const find = (e) =>
+    all.find((d) => (d.filePath || '').replace(/\\/g, '/').endsWith(`docs/${e.file}.md`)) ||
+    all.find((d) => d.id === e.file);
+
+  return ENTRIES
+    .map((e) => {
+      const entry = find(e);
+      return entry ? { params: { slug: e.slug }, props: { entry, meta: e } } : null;
+    })
+    .filter(Boolean);
+}
+
+const { entry, meta } = Astro.props;
+const { Content } = await render(entry);
+---
+<Manual title={meta.title} slug={meta.slug}>
+  <Content />
+</Manual>
