@@ -53,6 +53,8 @@ export const NAV = [
     entries: [
       { file: 'user-manual/authentication', slug: 'authentication', title: 'Authentication' },
       { file: 'user-manual/rbac', slug: 'rbac', title: 'RBAC' },
+      { file: 'auth-architecture', slug: 'auth-architecture', title: 'Auth Architecture' },
+      { file: 'user-manual/security-hardening', slug: 'security-hardening', title: 'Security Hardening' },
     ],
   },
   {
@@ -60,6 +62,37 @@ export const NAV = [
     entries: [
       { file: 'user-manual/rest-api', slug: 'rest-api', title: 'REST API' },
       { file: 'user-manual/mcp', slug: 'mcp', title: 'MCP' },
+    ],
+  },
+  {
+    heading: 'Data & Observability',
+    entries: [
+      { file: 'user-manual/response-store', slug: 'response-store', title: 'Response Store' },
+      { file: 'user-manual/audit-log', slug: 'audit-log', title: 'Audit Log' },
+      { file: 'user-manual/metrics', slug: 'metrics', title: 'Metrics' },
+      { file: 'observability-conventions', slug: 'observability-conventions', title: 'Observability Conventions' },
+      { file: 'analytics-events', slug: 'analytics-events', title: 'Analytics Events' },
+    ],
+  },
+  {
+    heading: 'Operating Yuzu',
+    entries: [
+      { file: 'user-manual/server-admin', slug: 'server-admin', title: 'Server Administration' },
+      { file: 'user-manual/gateway', slug: 'gateway', title: 'Gateway' },
+      { file: 'user-manual/upgrading', slug: 'upgrading', title: 'Upgrading' },
+      { file: 'user-manual/release-verification', slug: 'release-verification', title: 'Release Verification' },
+      { file: 'operations/capacity-planning', slug: 'capacity-planning', title: 'Capacity Planning' },
+      { file: 'operations/certificate-renewal', slug: 'certificate-renewal', title: 'Certificate Renewal' },
+      { file: 'operations/disaster-recovery', slug: 'disaster-recovery', title: 'Disaster Recovery' },
+      { file: 'operations/troubleshooting', slug: 'troubleshooting', title: 'Troubleshooting' },
+    ],
+  },
+  {
+    heading: 'Extending & Concepts',
+    entries: [
+      { file: 'data-architecture', slug: 'data-architecture', title: 'Data Architecture' },
+      { file: 'enterprise-edition', slug: 'enterprise-edition', title: 'Enterprise Edition' },
+      { file: 'enterprise-readiness-soc2-first-customer', slug: 'enterprise-readiness', title: 'Enterprise Readiness (SOC 2)' },
     ],
   },
 ];
