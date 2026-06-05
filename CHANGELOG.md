@@ -537,6 +537,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Server container can generate its default certs on first boot (PKI PR5b).**
+  `deploy/docker/Dockerfile.server` now pre-creates `/etc/yuzu/certs` and
+  `chown -R`s `/etc/yuzu` to the unprivileged `yuzu` runtime user. Previously
+  `/etc/yuzu` was root-owned, so the secure-by-default first-boot CA + default
+  cert generation (which runs as `yuzu`) failed with a permission error in the
+  container. Surfaced by the live two-host gateway boot-test.
+
 - **Login inputs no longer auto-capitalise on iOS (#1233).** The username,
   MFA-code, and enrollment-code fields on the login page — and the MFA
   verify-code field in Settings — now carry `autocapitalize="none"`,
