@@ -1,0 +1,6 @@
+# Yuzu docs-site — only SOURCE is committed; the HTML is a build artifact.
+node_modules/
+dist/
+.astro/
+*.log
+.DS_Store

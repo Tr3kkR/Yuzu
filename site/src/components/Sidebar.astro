@@ -1,0 +1,16 @@
+---
+import { NAV } from '../nav.mjs';
+const { active } = Astro.props;
+const base = import.meta.env.BASE_URL; // ends with '/'
+---
+<nav class="sidebar">
+  <a class="brand" href={base}>yuzu</a>
+  {NAV.map((sec) => (
+    <div class="nav-grp">
+      <div class="gh">{sec.heading}</div>
+      {sec.entries.map((e) => (
+        <a href={`${base}manual/${e.slug}/`} class={e.slug === active ? 'on' : ''}>{e.title}</a>
+      ))}
+    </div>
+  ))}
+</nav>
