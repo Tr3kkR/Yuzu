@@ -990,6 +990,43 @@ TEST_CASE("ProxyRegister: signing failure is non-fatal (agent still enrolled)",
     CHECK(resp.issued_certificate().empty());
 }
 
+TEST_CASE("Register (direct): a wired signer issues a per-agent cert — parity with ProxyRegister",
+          "[agent_service][register][pki][pr5d]") {
+    // Locks the direct-path issuance block (agent_service_impl.cpp:539) that
+    // ProxyRegister mirrors. Without this, a future edit to the direct block
+    // would silently break the parity PR5d depends on (consistency Gate-4 SHOULD).
+    GatewayResponseHarness h;
+    int calls = 0;
+    std::string seen_csr, seen_id;
+    h.svc.set_agent_cert_signer(
+        [&](const std::string& csr, const std::string& id)
+            -> std::optional<std::pair<std::string, std::string>> {
+            ++calls;
+            seen_csr = csr;
+            seen_id = id;
+            return std::make_pair("LEAF-PEM-for-" + id, "CHAIN-PEM");
+        });
+
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("agent-direct-1");
+    req.mutable_info()->set_hostname("h");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.set_enrollment_token(h.auth_mgr.create_enrollment_token("test", 0, std::chrono::hours(1)));
+    req.set_csr_pem("FAKE-CSR");
+
+    apb::RegisterResponse resp;
+    auto status = h.svc.Register(/*context=*/nullptr, &req, &resp);
+
+    REQUIRE(status.ok());
+    CHECK(resp.accepted());
+    CHECK(calls == 1);
+    CHECK(seen_csr == "FAKE-CSR");
+    CHECK(seen_id == "agent-direct-1");
+    CHECK(resp.issued_certificate() == "LEAF-PEM-for-agent-direct-1");
+    CHECK(resp.issued_ca_chain() == "CHAIN-PEM");
+}
+
 // ── #872 — notify_exec_tracker wiring through to ExecutionTracker ──────────
 //
 // Bare GatewayResponseHarness leaves execution_tracker_ at nullptr, so the

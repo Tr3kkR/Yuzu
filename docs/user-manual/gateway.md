@@ -130,6 +130,19 @@ server handles enrollment logic (token validation, pending approval queue)
 and returns a `RegisterResponse` with a session ID. The gateway relays the
 response to the agent and starts an agent process.
 
+When the server's built-in CA is active, that `RegisterResponse` now also carries
+a signed **per-agent client certificate** — the same certificate an agent would
+receive on the direct-connect path (PKI PR5d). The gateway relays the full
+response verbatim, so the certificate reaches the agent with no gateway
+configuration change. **Revocation note:** revoking a certificate invalidates the
+presented leaf but does **not** prevent re-enrollment; to stop an agent from
+re-enrolling and re-obtaining a certificate, **deny** the agent (dashboard
+Devices → deny). Both the direct and gateway paths reject a denied agent before
+signing. (In M1 the agent↔gateway hop is one-way TLS, so the agent's client cert
+is not yet verified at the gateway transport — through-gateway identity remains
+the app-layer `gateway_observed_peer`; the issued cert is for inventory,
+revocation, and the future gateway-mTLS cutover.)
+
 ### Heartbeat Batching
 
 Individual agent heartbeats are not forwarded one-by-one. Instead,

@@ -187,6 +187,12 @@ a cryptographic identity bound to `agent_id`. This makes the existing
 peer-identity binding (`#1118`) cryptographic with no new binding mechanism — the
 issued leaf's `CN` *is* the `agent_id` the server already checks.
 
+Issuance happens on **both** the direct `Register` and the gateway-proxied
+`ProxyRegister` paths (PKI PR5d — both share one `sign_agent_csr` chokepoint); see
+`docs/pki-architecture.md` "Per-agent enrollment through the gateway" for the
+gateway specifics (the agent↔gateway hop is one-way TLS in M1, so through-gateway
+identity stays the app-layer `gateway_observed_peer` until gateway mTLS lands).
+
 **Bootstrap (chicken-and-egg) — resolved on one port.** The agent has no client
 cert on first boot, but the data plane requires one. Resolution:
 

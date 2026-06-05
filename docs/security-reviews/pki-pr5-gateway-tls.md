@@ -4,6 +4,7 @@
 - **Change:** `feat/pki-pr5` (gateway upstream mutual TLS reference config, `agent_pb`/`gateway_pb`/`management_pb` regen so per-agent enrollment forwards through the gateway, fail-closed-on-unverified startup guard, accurate TLS-posture logging)
 - **Reviewers:** Hermes ×2 (adversarial + Anthropic cybersecurity skill-pack); `/governance` Gates 2–6 (security-guardian, docs-writer, gateway-erlang, architect, happy/unhappy/consistency, compliance/sre/enterprise-readiness)
 - **SOC 2 controls:** CC6.1, CC6.6, CC6.7 (transmission encryption), CC6.8 (key/crypto management), CC3.2 (risk identification), CC7.2 (change management)
+- **Addendum (PR5d, 2026-06-05):** the PR5 regen made the *wire* carry the per-agent cert fields, but `GatewayUpstreamServiceImpl::ProxyRegister` still never signed the CSR — PR5d closes that (signs via the shared `sign_agent_csr` chokepoint; Hermes ×2 + `/governance`, no CRITICAL/HIGH). It also adds a 16 KiB CSR-size cap that **partially closes F-2 below**. The PR5 baseline analysis below is unchanged; PR5b/5c/5d deltas are tracked in the follow-ups + CHANGELOG.
 
 ## Scope
 
@@ -45,7 +46,7 @@ R-1) and does **not** flip the shipped images/composes to TLS-by-default (that i
 ## Tracked follow-ups
 
 - **F-1** — `yuzu_gw_upstream_tls_handshake_failures_total` counter (classify `tls_alert`/`handshake_failure` in `do_rpc`) + a runtime TLS-posture gauge (R-3, sre).
-- **F-2** — message-size cap (`max_recv_message_length`) on the gateway listener so an oversized `csr_pem`/any field can't pressure memory (pre-existing for all fields).
+- **F-2** — message-size cap (`max_recv_message_length`) on the gateway listener so an oversized `csr_pem`/any field can't pressure memory (pre-existing for all fields). *(PR5d: a 16 KiB CSR-size cap is now enforced at the shared `sign_agent_csr` chokepoint, applying to both the direct and gateway paths — so the `csr_pem` sub-concern is closed. A broader listener-level cap for all other fields remains open.)*
 - **F-3** — CI guard: regenerate all gateway `_pb.erl` from the vendored protos + diff against committed, and assert every multi-module-embedded message has an identical `{name,fnum,type}` set matching canonical (would convert R-of-drift into a hard CI failure).
 - **F-4** — `via=gateway_proxy` in the server's `ca.cert.issued` audit `detail` when signing arrives via `ProxyRegister` (direct vs proxied issuance traceability).
 - **F-5** — CAIQ/security-questionnaire answer for "is all agent traffic encrypted in transit?" (see "Customer assurance" below).

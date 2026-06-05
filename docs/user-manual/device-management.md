@@ -277,6 +277,13 @@ The leaf auto-renews once two-thirds of its lifetime has elapsed (checked at age
 start). Pass `--no-auto-provision-cert` to opt out (e.g. when you supply your own
 client certificate). See `docs/auth-architecture.md` "Per-agent mTLS".
 
+This applies equally to agents enrolling **through the Erlang gateway** — the
+gateway relays the `RegisterResponse` verbatim, so the per-agent leaf reaches the
+agent on both the direct and gateway paths (PKI PR5d). **To stop an agent from
+re-enrolling and re-obtaining a certificate, deny the agent** — certificate
+revocation is serial-scoped (it invalidates the presented leaf) and does not block
+re-issuance at a future `Register`.
+
 ### Windows Certificate Store Integration
 
 On Windows, agents can read their mTLS client certificate and private key directly from the Windows certificate store instead of PEM files on disk. This uses CryptoAPI/CNG (`CertOpenStore`, `CertFindCertificateInStore`, `NCryptExportKey`) and searches the Local Machine store first, falling back to Current User.
