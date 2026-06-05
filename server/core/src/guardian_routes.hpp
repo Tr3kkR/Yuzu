@@ -33,6 +33,7 @@ namespace yuzu::server {
 
 class GuaranteedStateStore;
 class BaselineStore;
+class HttpRouteSink;
 struct Baseline;
 
 /// Guardian routes — /guardian (page) + /fragments/guardian/* (HTMX fragments).
@@ -67,6 +68,20 @@ public:
     /// `store` may be null (degrades to fully-mock rendering). `baseline_store`
     /// may also be null (Baseline fragments degrade to the mock/empty state).
     void register_routes(httplib::Server& svr,
+                         AuthFn auth_fn,
+                         PermFn perm_fn,
+                         AuditFn audit_fn,
+                         EmitEventFn emit_event_fn,
+                         GuaranteedStateStore* store,
+                         BaselineStore* baseline_store,
+                         AgentsJsonFn agents_json_fn,
+                         PushFn push_fn);
+
+    /// HttpRouteSink overload — same registration, against the polymorphic
+    /// route-sink seam so the handlers can be dispatched in-process by an
+    /// in-process TestRouteSink (no httplib threaded acceptor; the #438 TSan
+    /// trap). The httplib::Server& overload above wraps + delegates here.
+    void register_routes(HttpRouteSink& sink,
                          AuthFn auth_fn,
                          PermFn perm_fn,
                          AuditFn audit_fn,

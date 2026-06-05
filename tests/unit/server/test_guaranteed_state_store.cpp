@@ -484,6 +484,15 @@ TEST_CASE("GuaranteedStateStore: batch insert with duplicate rolls back whole ba
     // None of the batch's new IDs should have landed.
     CHECK(store.event_count() == 1);
     CHECK(store.events_written_total() == 1);
+
+    // Regression guard for the B1 transaction-safety fix: a rolled-back batch must
+    // NOT leave the connection wedged in an open transaction. A subsequent batch
+    // (which issues its own BEGIN) must succeed — before the SqliteTxn RAII owner,
+    // a failure/exception between BEGIN and COMMIT could strand the transaction and
+    // make the next BEGIN fail (and a still-open stmt make sqlite3_close BUSY-leak).
+    auto after = store.insert_events({make_event("evt-after-rollback", "rule-1", "agent-A")});
+    REQUIRE(after.has_value());
+    CHECK(store.event_count() == 2);
 }
 
 TEST_CASE("GuaranteedStateStore: batch insert of empty vector is a no-op",

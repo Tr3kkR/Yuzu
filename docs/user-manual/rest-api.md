@@ -3138,7 +3138,7 @@ A rule may be authored **structured** (the agent-enforceable form) or **legacy**
 | `yaml_source` | string | Legacy | Full rule YAML; required only when no structured `spark`+`assertion` is given. The server generates `yaml_source` from the structured form otherwise. |
 | `version` | integer | No | Starting version (default `1`). |
 | `enabled` | boolean | No | Default `true`. |
-| `enforcement_mode` | string | No | `enforce` (default) or `audit`. |
+| `enforcement_mode` | string | No | `enforce` (default) or `audit`. **Set once at creation — immutable on update** (see PUT below). |
 | `severity` | string | No | `low` / `medium` (default) / `high` / `critical`. |
 | `os_target` | string | No | Empty (any) or `windows` / `linux` / `macos`. |
 | `scope_expr` | string | No | Scope DSL expression selecting target agents. |
@@ -3162,9 +3162,10 @@ Fetch a single rule.
 Update a rule. Version is incremented on every successful update regardless of whether any field changed.
 
 - **Permission:** `GuaranteedState:Write`
-- **Request body:** Any subset of the create-body fields (absent fields retain their current values). A body carrying structured `spark`/`assertion`/`remediation` blocks **re-authors** the Guard (re-deriving the canonical spec and re-validating the resilience policy) rather than dropping them; a metadata-only body leaves the existing spec intact.
+- **Request body:** Any subset of the create-body fields *except* `enforcement_mode` (absent fields retain their current values). A body carrying structured `spark`/`assertion`/`remediation` blocks **re-authors** the Guard (re-deriving the canonical spec and re-validating the resilience policy) rather than dropping them; a metadata-only body leaves the existing spec intact.
+- **`enforcement_mode` is immutable.** A body whose `enforcement_mode` differs from the stored value is rejected with `400` (`enforcement_mode is immutable — create a new Guard for a different posture (Watch vs Enforce)`); a different posture is a different Guard. A no-op echo of the current value is accepted.
 - **Response:** `200` with `data.updated = true` and `data.version`.
-- **4xx:** `400` invalid JSON or an invalid resilience policy (A4 envelope); `404` rule not found; `409` on name conflict.
+- **4xx:** `400` invalid JSON, an invalid resilience policy (A4 envelope), or an `enforcement_mode` change; `404` rule not found; `409` on name conflict.
 - **Audit:** `guaranteed_state.rule.update`.
 
 #### `DELETE /api/v1/guaranteed-state/rules/{rule_id}`

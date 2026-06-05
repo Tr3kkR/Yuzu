@@ -78,8 +78,11 @@ and Jamf.
    fork). "Policy" deliberately avoided (collides with the existing Yuzu Policy
    subsystem); collection is the **Baseline**.
 2. **Global Guard attributes** — `enabled` + `mode` live on the Guard; *different
-   posture ⇒ different Guard*. The per-Guard Enable/Disable + Watch↔Enforce toggles
-   edit the Guard fleet-wide.
+   posture ⇒ different Guard*. The per-Guard **Enable/Disable** toggle edits the
+   Guard fleet-wide (state-only; it propagates on the next Baseline deploy /
+   reconcile). **Mode is fixed at creation and immutable** — there is no
+   Watch↔Enforce toggle (it was never shipped); a different mode requires
+   authoring a new Guard.
 3. **Baseline = only deployable unit**; Deploy = **per-device reconciliation**
    (converge to the device's total policy, Puppet/DSC/GPO-style — removing a Guard
    from a Baseline and re-deploying actually removes it where no other deployed

@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian Baselines — the deployable unit, with baseline-gated deploy.**
+  A **Baseline** is a named collection of Guards and is now the *only* deployable
+  unit: a Guard reaches an agent exclusively as a member of a **deployed**
+  Baseline. New `BaselineStore` (`guardian-baselines.db`): M:N member Guards, an
+  included/excluded management-group assignment (reserved — targeting is deferred,
+  so deploy is fleet-wide for now), and a draft → deployed lifecycle. Dashboard
+  surface only (no REST API yet): create / edit / deploy / re-deploy / delete. The
+  push fan-out and heartbeat reconcile source their rule set from the union of
+  member Guards of deployed Baselines, taken from each Baseline's **deployed
+  snapshot** (what was deployed) — so editing a deployed Baseline's members is a
+  staged change that reaches agents only on a Push-gated re-deploy. New `baselines`
+  row in `/healthz` + `/readyz` and a `yuzu_server_guardian_baselines_total`
+  metric. Audited under `guaranteed_state.baseline.{create,update,deploy,delete}`.
+- **Guardian compliance overview + per-(agent, rule) census.** A new
+  `guard.compliant` event (emitted once on the transition into compliant, then
+  silent) drives a pruning-immune per-(agent, rule) status table
+  (`guardian_agent_rule_status`). The dashboard overview reports live fleet
+  compliance — Fleet / By Guard / By Baseline coverage, a compliant/drifted/error/
+  unknown proportion, a 7-day enforcement-effectiveness trend, and per-device
+  drill-down — from one liveness-folded rollup (offline agents fold to unknown).
+  The REST `/status` endpoint still returns placeholder zeros; the census is
+  dashboard-only for now.
+- Per-Guard `prerequisites` column reserved on the Guard store (stored, not yet
+  evaluated — engine-side evaluation is deferred).
 - **Guardian `file-change` spark — realtime file change/deletion detection (Change B).**
   A new agent guard watches a target file via `ReadDirectoryChangesW` on its
   parent directory — kernel-notified, no polling, so detection is realtime — and
@@ -87,6 +111,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`~ServerImpl` now calls `stop()`); caller-supplied `remediate` agent lists are
   intersected with the policy's own scope; new `yuzu_server_policy_verdicts_total`
   / `yuzu_server_policy_eval_errors_total` metrics.
+
+### Changed
+
+- **Breaking — Guardian `enforcement_mode` is immutable after creation.**
+  `PUT /api/v1/guaranteed-state/rules/{id}` with an `enforcement_mode` that
+  differs from the stored value now returns `400` (`enforcement_mode is immutable
+  — create a new Guard for a different mode`); a different posture (enforce vs
+  audit) is a different Guard. The dashboard's per-Guard **Switch to Audit /
+  Switch to Enforce** toggle is **removed**; the remaining enable/disable toggle
+  is state-only (`Write`, no auto-push) and propagates on the next
+  deploy/reconcile.
+- **Breaking — Guards reach agents only via a deployed Baseline.** After
+  upgrading from a pre-Baseline Guardian build, a Guard not in a deployed Baseline
+  is silently omitted from every agent push and stops enforcing. Create a Baseline
+  containing your active Guards and deploy it — see the upgrade note in
+  `docs/user-manual/guaranteed-state.md`.
 
 ### Fixed
 

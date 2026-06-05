@@ -1,5 +1,6 @@
 #include "guaranteed_state_store.hpp"
 #include "migration_runner.hpp"
+#include "sqlite_raii.hpp"
 #include "store_errors.hpp"
 
 #include <spdlog/spdlog.h>
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <shared_mutex>
 #include <string_view>
 
@@ -96,7 +98,9 @@ GuaranteedStateStore::~GuaranteedStateStore() {
     // unwritten coordination between the web server and store lifetimes.
     std::unique_lock lock(mtx_);
     if (db_) {
-        sqlite3_close(db_);
+        // close_v2: defers the close if any statement somehow outlived its RAII
+        // owner, rather than returning BUSY and leaking the handle.
+        sqlite3_close_v2(db_);
         db_ = nullptr;
     }
 }
@@ -532,38 +536,37 @@ GuaranteedStateStore::insert_event(const GuaranteedStateEventRow& row) {
              ttl_expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql, -1, stmt.addr(), nullptr) != SQLITE_OK)
         return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
 
-    sqlite3_bind_text(stmt, 1, row.event_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, row.rule_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, row.agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 4, row.event_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 5, row.severity.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 6, row.guard_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 7, row.guard_category.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 8, row.detected_value.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 9, row.expected_value.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 10, row.remediation_action.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 11, row.remediation_success ? 1 : 0);
-    sqlite3_bind_int64(stmt, 12, row.detection_latency_us);
-    sqlite3_bind_int64(stmt, 13, row.remediation_latency_us);
-    sqlite3_bind_text(stmt, 14, row.timestamp.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 15, compute_ttl_epoch());
+    sqlite3_bind_text(stmt.get(), 1, row.event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, row.rule_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, row.agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, row.event_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, row.severity.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 6, row.guard_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 7, row.guard_category.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 8, row.detected_value.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 9, row.expected_value.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 10, row.remediation_action.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt.get(), 11, row.remediation_success ? 1 : 0);
+    sqlite3_bind_int64(stmt.get(), 12, row.detection_latency_us);
+    sqlite3_bind_int64(stmt.get(), 13, row.remediation_latency_us);
+    sqlite3_bind_text(stmt.get(), 14, row.timestamp.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 15, compute_ttl_epoch());
 
-    const int step = sqlite3_step(stmt);
+    const int step = sqlite3_step(stmt.get());
     if (step != SQLITE_DONE) {
         const int ext = sqlite3_extended_errcode(db_);
         const std::string err = sqlite3_errmsg(db_);
-        sqlite3_finalize(stmt);
         if (is_sqlite_uniqueness_violation(ext)) {
             return std::unexpected(
                 format_conflict("event_id '" + row.event_id + "' already exists"));
         }
         return std::unexpected("insert failed: " + err);
     }
-    sqlite3_finalize(stmt);
+    stmt.reset(); // finalize before the separate (auto-commit) census upsert below
     events_written_.fetch_add(1, std::memory_order_relaxed);
     // Maintain the per-(agent, rule) compliance census in lock-step with the event
     // (Slice B). Same lock; idempotent for non-compliance event_types (skipped).
@@ -586,6 +589,12 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
     if (sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
         return std::unexpected(std::string("BEGIN failed: ") + sqlite3_errmsg(db_));
     }
+    // Rolls back on any early return OR exception (e.g. bad_alloc building an
+    // error string, or inside the per-row census upsert) until commit() succeeds.
+    // Without this an escaping throw left the connection wedged in an open
+    // transaction on this shared handle — the ingest path the whole feature funnels
+    // through. The SqliteStmt below finalizes first (reverse destruction order).
+    SqliteTxn txn(db_);
 
     const char* sql = R"(
         INSERT INTO guaranteed_state_events
@@ -596,41 +605,37 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
              ttl_expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
-        const std::string err = sqlite3_errmsg(db_);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return std::unexpected("prepare failed: " + err);
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql, -1, stmt.addr(), nullptr) != SQLITE_OK) {
+        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
     }
 
     const int64_t ttl = compute_ttl_epoch();
 
     for (const auto& row : rows) {
-        sqlite3_reset(stmt);
-        sqlite3_clear_bindings(stmt);
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
 
-        sqlite3_bind_text(stmt, 1, row.event_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, row.rule_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 3, row.agent_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 4, row.event_type.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 5, row.severity.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 6, row.guard_type.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 7, row.guard_category.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 8, row.detected_value.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 9, row.expected_value.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 10, row.remediation_action.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(stmt, 11, row.remediation_success ? 1 : 0);
-        sqlite3_bind_int64(stmt, 12, row.detection_latency_us);
-        sqlite3_bind_int64(stmt, 13, row.remediation_latency_us);
-        sqlite3_bind_text(stmt, 14, row.timestamp.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt, 15, ttl);
+        sqlite3_bind_text(stmt.get(), 1, row.event_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 2, row.rule_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 3, row.agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 4, row.event_type.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 5, row.severity.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 6, row.guard_type.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 7, row.guard_category.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 8, row.detected_value.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 9, row.expected_value.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 10, row.remediation_action.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt.get(), 11, row.remediation_success ? 1 : 0);
+        sqlite3_bind_int64(stmt.get(), 12, row.detection_latency_us);
+        sqlite3_bind_int64(stmt.get(), 13, row.remediation_latency_us);
+        sqlite3_bind_text(stmt.get(), 14, row.timestamp.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt.get(), 15, ttl);
 
-        const int step = sqlite3_step(stmt);
+        const int step = sqlite3_step(stmt.get());
         if (step != SQLITE_DONE) {
             const int ext = sqlite3_extended_errcode(db_);
             const std::string err = sqlite3_errmsg(db_);
-            sqlite3_finalize(stmt);
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
             if (is_sqlite_uniqueness_violation(ext)) {
                 return std::unexpected(
                     format_conflict("event_id '" + row.event_id + "' already exists"));
@@ -643,12 +648,9 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
             upsert_rule_status_locked(row.agent_id, row.rule_id, state, row.timestamp);
     }
 
-    sqlite3_finalize(stmt);
-
-    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        const std::string err = sqlite3_errmsg(db_);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return std::unexpected("COMMIT failed: " + err);
+    stmt.reset(); // finalize before COMMIT
+    if (txn.commit() != SQLITE_OK) {
+        return std::unexpected(std::string("COMMIT failed: ") + sqlite3_errmsg(db_));
     }
     events_written_.fetch_add(rows.size(), std::memory_order_relaxed);
     return rows.size();
@@ -789,15 +791,15 @@ void GuaranteedStateStore::upsert_rule_status_locked(const std::string& agent_id
             state = excluded.state, updated_at = excluded.updated_at
         WHERE excluded.updated_at >= guardian_agent_rule_status.updated_at
     )";
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &s, nullptr) != SQLITE_OK)
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_, sql, -1, s.addr(), nullptr) != SQLITE_OK)
         return;
-    sqlite3_bind_text(s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, rule_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, state, -1, SQLITE_STATIC); // points at a string literal
-    sqlite3_bind_text(s, 4, updated_at.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s); // ignore result: a skipped older-event update is the intended no-op
-    sqlite3_finalize(s);
+    sqlite3_bind_text(s.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s.get(), 2, rule_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s.get(), 3, state, -1, SQLITE_STATIC); // points at a string literal
+    sqlite3_bind_text(s.get(), 4, updated_at.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(s.get()); // ignore result: a skipped older-event update is the intended no-op
+    // finalized by SqliteStmt dtor (also on the throw path inside insert_events' txn)
 }
 
 std::vector<GuardianAgentRuleStatus>

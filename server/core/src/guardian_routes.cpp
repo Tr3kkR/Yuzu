@@ -6,6 +6,7 @@
 
 #include "guaranteed_state_store.hpp"
 #include "baseline_store.hpp"
+#include "http_route_sink.hpp"
 #include "guardian_form_render.hpp"
 #include "guardian_rule_spec.hpp"
 #include "secure_random.hpp"
@@ -996,10 +997,14 @@ void GuardianRoutes::deploy_baseline(const httplib::Request& req, httplib::Respo
     // Mark deployed (lifecycle + deploy stamps). Re-deploy just refreshes them.
     b->lifecycle = kBaselineDeployed;
     b->deployed_at = now_epoch_seconds();
-    // Snapshot exactly the member set being deployed (sorted). The detail/list
-    // renderers compare live members against this to flag "members changed since
-    // last deploy — Re-deploy to apply" (baseline_members_drifted). Re-deploy
-    // refreshes it, clearing the flag.
+    // Snapshot exactly the member set being deployed. This is now the AUTHORITATIVE
+    // enforced set: BaselineStore::deployed_member_rule_ids() (the push/reconcile
+    // gate) reads this snapshot, NOT the live member set — so deploying is the only
+    // act (Push-gated) that changes what the fleet enforces. The detail/list
+    // renderers diff live members against this to flag "members changed since last
+    // deploy — Re-deploy to apply" (baseline_members_drifted); re-deploy refreshes
+    // it, clearing the flag and converging the fleet to the new set. Format: a JSON
+    // array of rule_id strings (parsed back in baseline_store.cpp).
     b->deployed_snapshot = nlohmann::json(baseline_store_->get_members(baseline_id)).dump();
     if (auto session = auth_fn_(req, res)) {
         b->deployed_by = session->username;
@@ -1697,6 +1702,25 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
                                      BaselineStore* baseline_store,
                                      AgentsJsonFn agents_json_fn,
                                      PushFn push_fn) {
+    // Production adapter: wrap the httplib server in the route-sink seam and
+    // delegate to the testable overload below (mirrors RestApiV1 / SettingsRoutes;
+    // see http_route_sink.hpp). Lets the handlers be unit-tested in-process via
+    // TestRouteSink without httplib's threaded acceptor (the #438 TSan trap).
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    std::move(emit_event_fn), store, baseline_store, std::move(agents_json_fn),
+                    std::move(push_fn));
+}
+
+void GuardianRoutes::register_routes(HttpRouteSink& sink,
+                                     AuthFn auth_fn,
+                                     PermFn perm_fn,
+                                     AuditFn audit_fn,
+                                     EmitEventFn emit_event_fn,
+                                     GuaranteedStateStore* store,
+                                     BaselineStore* baseline_store,
+                                     AgentsJsonFn agents_json_fn,
+                                     PushFn push_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     audit_fn_ = std::move(audit_fn);
@@ -1707,7 +1731,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
     push_fn_ = std::move(push_fn);
 
     // -- Guardian dashboard page ------------------------------------------
-    svr.Get("/guardian", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/guardian", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_(req, res);
         if (!session) {
             res.set_redirect("/login");
@@ -1726,7 +1750,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
     // fragment return 403.
 
     // -- Status rollup (view = fleet|guard|agent|mgroup|baseline) ----------
-    svr.Get("/fragments/guardian/status",
+    sink.Get("/fragments/guardian/status",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 const std::string view = req.has_param("view") ? req.get_param_value("view") : "fleet";
@@ -1734,7 +1758,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
             });
 
     // -- Guards list (optional ?status= filter) ----------------------------
-    svr.Get("/fragments/guardian/guards",
+    sink.Get("/fragments/guardian/guards",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 const std::string sf = req.has_param("status") ? req.get_param_value("status") : "";
@@ -1742,7 +1766,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
             });
 
     // -- Event timeline (optional ?type= / ?severity= filters) -------------
-    svr.Get("/fragments/guardian/events",
+    sink.Get("/fragments/guardian/events",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 const std::string tf = req.has_param("type") ? req.get_param_value("type") : "";
@@ -1751,7 +1775,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
             });
 
     // -- Per-guard detail --------------------------------------------------
-    svr.Get(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+))",
+    sink.Get(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+))",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_guard_detail_fragment(req.matches[1].str()),
@@ -1759,14 +1783,14 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
             });
 
     // -- Baselines list ----------------------------------------------------
-    svr.Get("/fragments/guardian/baselines",
+    sink.Get("/fragments/guardian/baselines",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baselines_fragment(), "text/html; charset=utf-8");
             });
 
     // -- Per-baseline detail ----------------------------------------------
-    svr.Get(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+))",
+    sink.Get(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+))",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baseline_detail_fragment(req.matches[1].str()),
@@ -1774,18 +1798,18 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
             });
 
     // -- Create forms ------------------------------------------------------
-    svr.Get("/fragments/guardian/guard-form",
+    sink.Get("/fragments/guardian/guard-form",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_guard_form_fragment(), "text/html; charset=utf-8");
             });
-    svr.Get("/fragments/guardian/baseline-form",
+    sink.Get("/fragments/guardian/baseline-form",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baseline_form_fragment(), "text/html; charset=utf-8");
             });
     // Edit-Baseline modal form (pre-filled name + member chips).
-    svr.Get(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/edit)",
+    sink.Get(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/edit)",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baseline_edit_form_fragment(req.matches[1].str()),
@@ -1795,7 +1819,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
     // -- Structured create (Guard) ----------------------------------------
     // Build a structured Guard from the create-form fields and persist it via
     // the shared derive_rule_spec path (single source with the REST create).
-    svr.Post("/fragments/guardian/guards",
+    sink.Post("/fragments/guardian/guards",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  create_guard_from_form(req, res);
@@ -1807,7 +1831,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
     // the change propagates on the next Baseline deploy / heartbeat reconcile
     // (docs/guardian-baseline-model.md). There is deliberately NO mode toggle:
     // Watch/Enforce is fixed at creation (a different posture is a different Guard).
-    svr.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/enabled)",
+    sink.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/enabled)",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  const std::string id = req.matches[1].str();
@@ -1818,7 +1842,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
     // -- Structured create (Baseline) -------------------------------------
     // Persist a draft Baseline (name + member guards) via BaselineStore. Device
     // targeting (management-group assignment) + deploy are set afterwards.
-    svr.Post("/fragments/guardian/baselines",
+    sink.Post("/fragments/guardian/baselines",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  create_baseline_from_form(req, res);
@@ -1828,7 +1852,7 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
     // Marks the Baseline deployed and converges the fleet to the union of all
     // deployed Baselines' enabled members (fleet-wide for now — management-group
     // targeting is deferred). Requires Push (it changes what agents enforce).
-    svr.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/deploy)",
+    sink.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/deploy)",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "GuaranteedState", "Push")) return;
                  deploy_baseline(req, res, req.matches[1].str());
@@ -1837,12 +1861,12 @@ void GuardianRoutes::register_routes(httplib::Server& svr,
     // -- Edit a Baseline (rename + add/remove member guards) --------------
     // Note: this no-suffix POST is registered AFTER /deploy and /delete; the
     // member regex excludes '/', so it never shadows the suffixed routes.
-    svr.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/delete)",
+    sink.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/delete)",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "GuaranteedState", "Delete")) return;
                  delete_baseline_action(req, res, req.matches[1].str());
              });
-    svr.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+))",
+    sink.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+))",
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  update_baseline_from_form(req, res, req.matches[1].str());

@@ -1,11 +1,14 @@
 #include "baseline_store.hpp"
 
 #include "migration_runner.hpp"
+#include "sqlite_raii.hpp"
 #include "store_errors.hpp"
 
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <mutex>
 #include <random>
 #include <unordered_map>
 #include <unordered_set>
@@ -86,8 +89,10 @@ BaselineStore::BaselineStore(const std::filesystem::path& db_path) {
 }
 
 BaselineStore::~BaselineStore() {
+    // close_v2 (not close): if a statement ever outlived its RAII owner, close_v2
+    // schedules a deferred close instead of returning BUSY and leaking the handle.
     if (db_)
-        sqlite3_close(db_);
+        sqlite3_close_v2(db_);
 }
 
 bool BaselineStore::is_open() const {
@@ -104,8 +109,10 @@ void BaselineStore::create_tables() {
                 name              TEXT NOT NULL UNIQUE,
                 description       TEXT NOT NULL DEFAULT '',
                 lifecycle         TEXT NOT NULL DEFAULT 'draft',
-                -- RESERVED for the deploy slice (draft-vs-deployed diffing). The
-                -- store never interprets it; see baseline_store.hpp.
+                -- Members captured at the last deploy (JSON array of rule_ids).
+                -- This is the ENFORCED set: deployed_member_rule_ids() reads it,
+                -- and the detail renderer diffs it against live members. See
+                -- baseline_store.hpp.
                 deployed_snapshot TEXT NOT NULL DEFAULT '',
                 created_by        TEXT NOT NULL DEFAULT '',
                 updated_by        TEXT NOT NULL DEFAULT '',
@@ -339,62 +346,56 @@ BaselineStore::set_members(const std::string& baseline_id,
     // set inserts nothing, so a clear() against a bogus baseline_id would
     // silently "succeed". Verify here for a crisp, consistent error either way.
     {
-        sqlite3_stmt* chk = nullptr;
+        SqliteStmt chk;
         if (sqlite3_prepare_v2(db_,
                                "SELECT 1 FROM guaranteed_state_baselines WHERE baseline_id = ?;",
-                               -1, &chk, nullptr) != SQLITE_OK)
+                               -1, chk.addr(), nullptr) != SQLITE_OK)
             return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        sqlite3_bind_text(chk, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-        const bool exists = sqlite3_step(chk) == SQLITE_ROW;
-        sqlite3_finalize(chk);
-        if (!exists)
+        sqlite3_bind_text(chk.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(chk.get()) != SQLITE_ROW)
             return std::unexpected("not found: baseline_id '" + baseline_id + "'");
     }
 
     if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK)
         return std::unexpected(std::string("begin failed: ") + sqlite3_errmsg(db_));
-
-    auto rollback = [&](const std::string& msg) -> std::expected<void, std::string> {
-        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-        return std::unexpected(msg);
-    };
+    // Rolls back on every early return (and on an exception, e.g. bad_alloc while
+    // building an error string or growing `seen`) until commit() succeeds. The
+    // SqliteStmt owners below finalize first (reverse destruction order) so the
+    // rollback runs against a connection with no live statements.
+    SqliteTxn txn(db_);
 
     {
-        sqlite3_stmt* del = nullptr;
+        SqliteStmt del;
         if (sqlite3_prepare_v2(db_,
                                "DELETE FROM guaranteed_state_baseline_rules WHERE baseline_id = ?;",
-                               -1, &del, nullptr) != SQLITE_OK)
-            return rollback(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        sqlite3_bind_text(del, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-        const int rc = sqlite3_step(del);
-        sqlite3_finalize(del);
-        if (rc != SQLITE_DONE)
-            return rollback(std::string("delete failed: ") + sqlite3_errmsg(db_));
+                               -1, del.addr(), nullptr) != SQLITE_OK)
+            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+        sqlite3_bind_text(del.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(del.get()) != SQLITE_DONE)
+            return std::unexpected(std::string("delete failed: ") + sqlite3_errmsg(db_));
     }
 
-    std::unordered_set<std::string> seen;
-    sqlite3_stmt* ins = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "INSERT INTO guaranteed_state_baseline_rules (baseline_id, rule_id) "
-                           "VALUES (?, ?);",
-                           -1, &ins, nullptr) != SQLITE_OK)
-        return rollback(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-    for (const auto& rule_id : rule_ids) {
-        if (rule_id.empty() || !seen.insert(rule_id).second)
-            continue; // skip blanks + de-dup
-        sqlite3_reset(ins);
-        sqlite3_bind_text(ins, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(ins, 2, rule_id.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(ins) != SQLITE_DONE) {
-            const std::string err = sqlite3_errmsg(db_);
-            sqlite3_finalize(ins);
-            return rollback("insert member failed: " + err);
+    {
+        std::unordered_set<std::string> seen;
+        SqliteStmt ins;
+        if (sqlite3_prepare_v2(db_,
+                               "INSERT INTO guaranteed_state_baseline_rules (baseline_id, rule_id) "
+                               "VALUES (?, ?);",
+                               -1, ins.addr(), nullptr) != SQLITE_OK)
+            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+        for (const auto& rule_id : rule_ids) {
+            if (rule_id.empty() || !seen.insert(rule_id).second)
+                continue; // skip blanks + de-dup
+            sqlite3_reset(ins.get());
+            sqlite3_bind_text(ins.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins.get(), 2, rule_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(ins.get()) != SQLITE_DONE)
+                return std::unexpected(std::string("insert member failed: ") + sqlite3_errmsg(db_));
         }
     }
-    sqlite3_finalize(ins);
 
-    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK)
-        return rollback(std::string("commit failed: ") + sqlite3_errmsg(db_));
+    if (txn.commit() != SQLITE_OK)
+        return std::unexpected(std::string("commit failed: ") + sqlite3_errmsg(db_));
     return {};
 }
 
@@ -476,60 +477,53 @@ BaselineStore::set_assignment(const std::string& baseline_id,
     }
 
     {
-        sqlite3_stmt* chk = nullptr;
+        SqliteStmt chk;
         if (sqlite3_prepare_v2(db_,
                                "SELECT 1 FROM guaranteed_state_baselines WHERE baseline_id = ?;",
-                               -1, &chk, nullptr) != SQLITE_OK)
+                               -1, chk.addr(), nullptr) != SQLITE_OK)
             return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        sqlite3_bind_text(chk, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-        const bool exists = sqlite3_step(chk) == SQLITE_ROW;
-        sqlite3_finalize(chk);
-        if (!exists)
+        sqlite3_bind_text(chk.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(chk.get()) != SQLITE_ROW)
             return std::unexpected("not found: baseline_id '" + baseline_id + "'");
     }
 
     if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK)
         return std::unexpected(std::string("begin failed: ") + sqlite3_errmsg(db_));
-
-    auto rollback = [&](const std::string& msg) -> std::expected<void, std::string> {
-        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-        return std::unexpected(msg);
-    };
+    // Rolls back on every early return / exception until commit() succeeds; the
+    // SqliteStmt owners finalize first (reverse destruction order).
+    SqliteTxn txn(db_);
 
     {
-        sqlite3_stmt* del = nullptr;
+        SqliteStmt del;
         if (sqlite3_prepare_v2(db_,
                                "DELETE FROM guaranteed_state_baseline_groups WHERE baseline_id = ?;",
-                               -1, &del, nullptr) != SQLITE_OK)
-            return rollback(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        sqlite3_bind_text(del, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-        const int rc = sqlite3_step(del);
-        sqlite3_finalize(del);
-        if (rc != SQLITE_DONE)
-            return rollback(std::string("delete failed: ") + sqlite3_errmsg(db_));
+                               -1, del.addr(), nullptr) != SQLITE_OK)
+            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+        sqlite3_bind_text(del.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(del.get()) != SQLITE_DONE)
+            return std::unexpected(std::string("delete failed: ") + sqlite3_errmsg(db_));
     }
 
-    sqlite3_stmt* ins = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "INSERT INTO guaranteed_state_baseline_groups "
-                           "(baseline_id, group_id, disposition) VALUES (?, ?, ?);",
-                           -1, &ins, nullptr) != SQLITE_OK)
-        return rollback(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-    for (const auto& [group_id, disposition] : resolved) {
-        sqlite3_reset(ins);
-        sqlite3_bind_text(ins, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(ins, 2, group_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(ins, 3, disposition.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(ins) != SQLITE_DONE) {
-            const std::string err = sqlite3_errmsg(db_);
-            sqlite3_finalize(ins);
-            return rollback("insert assignment failed: " + err);
+    {
+        SqliteStmt ins;
+        if (sqlite3_prepare_v2(db_,
+                               "INSERT INTO guaranteed_state_baseline_groups "
+                               "(baseline_id, group_id, disposition) VALUES (?, ?, ?);",
+                               -1, ins.addr(), nullptr) != SQLITE_OK)
+            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+        for (const auto& [group_id, disposition] : resolved) {
+            sqlite3_reset(ins.get());
+            sqlite3_bind_text(ins.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins.get(), 2, group_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins.get(), 3, disposition.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(ins.get()) != SQLITE_DONE)
+                return std::unexpected(std::string("insert assignment failed: ") +
+                                       sqlite3_errmsg(db_));
         }
     }
-    sqlite3_finalize(ins);
 
-    if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK)
-        return rollback(std::string("commit failed: ") + sqlite3_errmsg(db_));
+    if (txn.commit() != SQLITE_OK)
+        return std::unexpected(std::string("commit failed: ") + sqlite3_errmsg(db_));
     return {};
 }
 
@@ -592,6 +586,36 @@ std::vector<Baseline> BaselineStore::list_deployed_baselines() const {
         out.push_back(read_baseline_row(s));
     sqlite3_finalize(s);
     return out;
+}
+
+std::unordered_set<std::string> BaselineStore::deployed_member_rule_ids() const {
+    std::shared_lock lock(mtx_);
+    std::unordered_set<std::string> ids;
+    if (!db_)
+        return ids;
+    // Read only the snapshot column of every deployed Baseline in one pass (one
+    // lock, no per-Baseline get_members round-trip). The snapshot is what was
+    // deployed; see the deployed_snapshot field doc + deploy_baseline().
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db_,
+                           "SELECT deployed_snapshot FROM guaranteed_state_baselines "
+                           "WHERE lifecycle = ?;",
+                           -1, s.addr(), nullptr) != SQLITE_OK)
+        return ids;
+    sqlite3_bind_text(s.get(), 1, kBaselineDeployed, -1, SQLITE_STATIC);
+    while (sqlite3_step(s.get()) == SQLITE_ROW) {
+        const char* snap = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
+        if (!snap || !*snap)
+            continue; // never-deployed / empty snapshot contributes nothing (fail-closed)
+        // allow_exceptions=false: a malformed snapshot is skipped, not thrown on.
+        const auto parsed = nlohmann::json::parse(snap, nullptr, /*allow_exceptions=*/false);
+        if (!parsed.is_array())
+            continue;
+        for (const auto& rid : parsed)
+            if (rid.is_string())
+                ids.insert(rid.get<std::string>());
+    }
+    return ids;
 }
 
 std::size_t BaselineStore::baseline_count() const {

@@ -9,6 +9,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server {
@@ -27,9 +28,10 @@ namespace yuzu::server {
 //     deployed on their own (same shape as a GPO / Intune baseline / Jamf
 //     Configuration Profile). Deploy is a separate, later slice; this store is
 //     pure control-plane config with no engine dependency.
-//   - Lifecycle is draft ↔ deployed (MVP). `deployed_snapshot` is RESERVED for
-//     the deploy slice's draft-vs-deployed diffing (Q-A, MVP-deferred): this
-//     store stores the column but never interprets it.
+//   - Lifecycle is draft ↔ deployed (MVP). `deployed_snapshot` holds the member
+//     set captured at the last deploy and is the ENFORCED set — the push/reconcile
+//     gate reads it via deployed_member_rule_ids(), and the detail renderer diffs
+//     it against live members for the "re-deploy to apply" flag.
 //
 // Cross-store references (deliberate, no in-DB foreign key):
 //   - A member row's `rule_id` points at a Guard in `guaranteed-state.db`, and an
@@ -63,9 +65,13 @@ struct Baseline {
     std::string name;              // unique, human-authored
     std::string description;
     std::string lifecycle{kBaselineDraft}; // "draft" | "deployed"
-    // RESERVED for the deploy slice. Canonical JSON snapshot of the members +
-    // assignment captured at last deploy, used to compute "drifted from deployed"
-    // (draft ≠ deployed). Empty until first deploy. Never interpreted here.
+    // JSON array of member rule_ids captured at the last deploy — the set the
+    // fleet ACTUALLY enforces (see deployed_member_rule_ids()), distinct from the
+    // live member set which may have been edited since (those draft edits enforce
+    // only after a Push-gated re-deploy rewrites this). Written by deploy_baseline
+    // (guardian_routes.cpp) as nlohmann::json(get_members()).dump(); the detail
+    // renderer diffs it against live members to flag "members changed — re-deploy
+    // to apply" (baseline_members_drifted). Empty until first deploy.
     std::string deployed_snapshot;
     std::string created_by;
     std::string updated_by;
@@ -143,6 +149,17 @@ public:
     // All Baselines currently in "deployed" lifecycle — the set the per-device
     // reconciliation deploy unions over.
     std::vector<Baseline> list_deployed_baselines() const;
+
+    // The Baseline gate's input: the union of member rule_ids across every
+    // *deployed* Baseline, sourced from each one's deployed_snapshot — i.e. the
+    // set that was deployed, NOT the live member set. Editing a deployed
+    // Baseline's members is a draft change that reaches agents only after a
+    // Push-gated re-deploy rewrites the snapshot; sourcing live members here would
+    // let a Write-without-Push principal change fleet enforcement and would
+    // diverge from the dashboard's "re-deploy to apply" flag. A malformed or
+    // empty snapshot contributes nothing (fail-closed). Computed under one shared
+    // lock (no per-Baseline round-trip).
+    std::unordered_set<std::string> deployed_member_rule_ids() const;
 
     // ── Counting (metrics / UI) ─────────────────────────────────────────────
     std::size_t baseline_count() const;

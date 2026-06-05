@@ -202,6 +202,7 @@ if build_server
       'unit/server/test_baseline_store.cpp',
       'unit/server/test_guardian_push_builder.cpp',
       'unit/server/test_guardian_resilience_schema.cpp',
+      'unit/server/test_guardian_routes.cpp',
       'unit/server/test_guardian_form_render.cpp',
       'unit/server/test_heartbeat_ingestion.cpp',
       'unit/server/test_compliance_eval.cpp',

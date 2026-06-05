@@ -6736,20 +6736,20 @@ private:
     std::unordered_map<std::string, std::chrono::steady_clock::time_point>
         guardian_last_reconcile_;
 
-    // The Baseline gate's input: union of member-Guard rule_ids across all
-    // *deployed* Baselines. A Guard reaches an agent only as a member of a
-    // deployed Baseline (docs/guardian-baseline-model.md), so the push fan-out
-    // and the heartbeat reconcile filter their rule source through this via
+    // The Baseline gate's input: the union of member-Guard rule_ids across all
+    // *deployed* Baselines, sourced from each Baseline's deployed_snapshot (what
+    // was deployed) — NOT its live member set. A Guard reaches an agent only as a
+    // member of a deployed Baseline (docs/guardian-baseline-model.md), so the push
+    // fan-out and the heartbeat reconcile filter their rule source through this via
     // guardian::filter_deployed_members. Empty when nothing is deployed — a
     // full_sync push then converges agents to zero guards (correct by model).
+    // Delegates to BaselineStore (one shared lock; the store owns the snapshot
+    // format) so an edit to a deployed Baseline's members does not change what the
+    // fleet enforces until a Push-gated re-deploy rewrites the snapshot.
     std::unordered_set<std::string> deployed_member_rule_ids() const {
-        std::unordered_set<std::string> ids;
         if (!baseline_store_)
-            return ids;
-        for (const auto& b : baseline_store_->list_deployed_baselines())
-            for (const auto& rid : baseline_store_->get_members(b.baseline_id))
-                ids.insert(rid);
-        return ids;
+            return {};
+        return baseline_store_->deployed_member_rule_ids();
     }
 
     std::unique_ptr<DashboardRoutes> dashboard_routes_;
