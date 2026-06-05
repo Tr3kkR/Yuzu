@@ -41,6 +41,14 @@ export const NAV = [
     ],
   },
   {
+    heading: 'Policy & Guardian',
+    entries: [
+      { file: 'user-manual/policy-engine', slug: 'policy-engine', title: 'Policy Engine' },
+      { file: 'user-manual/guaranteed-state', slug: 'guaranteed-state', title: 'Guaranteed State' },
+      { file: 'yuzu-guardian-design-v1.1', slug: 'guardian-design', title: 'Guardian Design' },
+    ],
+  },
+  {
     heading: 'Identity & Access',
     entries: [
       { file: 'user-manual/authentication', slug: 'authentication', title: 'Authentication' },
