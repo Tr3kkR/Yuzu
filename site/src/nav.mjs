@@ -34,6 +34,10 @@ export const NAV = [
     heading: 'Targeting',
     entries: [
       { file: 'user-manual/scope-engine', slug: 'scope-engine', title: 'Scope Engine' },
+      { file: 'scope-walking-design', slug: 'scope-walking', title: 'Scope Walking' },
+      { file: 'asset-tagging-guide', slug: 'asset-tagging', title: 'Asset Tagging' },
+      { file: 'user-manual/management-groups', slug: 'management-groups', title: 'Management Groups' },
+      { file: 'user-manual/device-management', slug: 'device-management', title: 'Device Management' },
     ],
   },
   {

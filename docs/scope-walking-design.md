@@ -225,7 +225,7 @@ Persistent left-rail panel showing the current operator's result sets, ranked by
 ```
 [★] windows-chrome-suspects     2,798 devices  17m  pinned
 [ ] all-windows-fleet           4,011 devices   2h
-[ ] tar-chrome-procs           ▶ tar query     8m
+[ ] tar-chrome-procs           (tar query)     8m
 ```
 
 Each chip has:
@@ -237,7 +237,7 @@ Each chip has:
 Above every query frame, a horizontal breadcrumb of the active result set's lineage:
 
 ```
-__all__ ─▶ all-windows-fleet ─▶ windows-chrome ─▶ windows-chrome-suspects
+__all__ ─→ all-windows-fleet ─→ windows-chrome ─→ windows-chrome-suspects
                                                               ▲
                                               (active scope — refines next query)
 ```
