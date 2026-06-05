@@ -23,6 +23,14 @@ export const NAV = [
     ],
   },
   {
+    heading: 'Instructions & DSL',
+    entries: [
+      { file: 'Instruction-Engine', slug: 'instruction-engine', title: 'Instruction Engine' },
+      { file: 'user-manual/instructions', slug: 'instructions', title: 'Instructions' },
+      { file: 'yaml-dsl-spec', slug: 'yaml-dsl', title: 'YAML DSL' },
+    ],
+  },
+  {
     heading: 'Targeting',
     entries: [
       { file: 'user-manual/scope-engine', slug: 'scope-engine', title: 'Scope Engine' },
