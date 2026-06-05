@@ -1,0 +1,87 @@
+---
+/**
+ * HeroStrata — Operators -> Server -> Agent as three luminous strata joined by
+ * straight mTLS conduits. A bespoke, alien take on the topology. Static seams;
+ * the only motion is the Server stratum's gentle glow (stilled by reduced-motion).
+ */
+const conduitX = [264, 384, 504];
+const seg = { top: 132, bot: 188 };   // operators -> server
+const seg2 = { top: 290, bot: 346 };  // server -> agent
+---
+<div class="hero-art strata">
+  <svg viewBox="0 0 768 448" role="img" aria-label="Three luminous strata — Operators, Server, Agent — joined by flowing mTLS conduits.">
+    <defs>
+      <linearGradient id="s-ops" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="rgba(36,53,83,.95)" />
+        <stop offset="100%" stop-color="rgba(20,34,59,.95)" />
+      </linearGradient>
+      <linearGradient id="s-srv" x1="0" y1="0" x2="768" y2="0" gradientUnits="userSpaceOnUse">
+        <stop offset="0%"  stop-color="rgba(0,158,196,.30)" />
+        <stop offset="50%" stop-color="rgba(30,207,255,.42)" />
+        <stop offset="100%" stop-color="rgba(138,99,196,.34)" />
+      </linearGradient>
+      <linearGradient id="s-agt" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="rgba(26,41,64,.95)" />
+        <stop offset="100%" stop-color="rgba(14,26,45,.95)" />
+      </linearGradient>
+    </defs>
+
+    <!-- conduits behind the slabs -->
+    <g class="conduits">
+      {conduitX.map((x) => (
+        <>
+          <path d={`M${x} ${seg.top} L${x} ${seg.bot}`} class="conduit" />
+          <path d={`M${x} ${seg2.top} L${x} ${seg2.bot}`} class="conduit" />
+        </>
+      ))}
+    </g>
+
+    <!-- OPERATORS -->
+    <g class="slab">
+      <rect x="128" y="72" width="512" height="60" rx="8" fill="url(#s-ops)" stroke="var(--line-2)" />
+      <text x="384" y="100" class="lbl">OPERATORS</text>
+      <text x="384" y="118" class="sub">agentic workers · humans · REST · automation</text>
+    </g>
+
+    <!-- SERVER (the bright stratum) -->
+    <g class="slab srv">
+      <rect x="96" y="188" width="576" height="102" rx="10" fill="url(#s-srv)" stroke="var(--cyan)" class="srv-rect" />
+      <text x="384" y="222" class="lbl on">YUZU SERVER</text>
+      <text x="384" y="244" class="sub">instruction · policy · scope · rbac · mcp</text>
+      <text x="384" y="266" class="sub dim">reasons · targets · dispatches</text>
+    </g>
+
+    <!-- AGENT -->
+    <g class="slab">
+      <rect x="160" y="346" width="448" height="60" rx="8" fill="url(#s-agt)" stroke="var(--line-2)" />
+      <text x="384" y="374" class="lbl">YUZU AGENT</text>
+      <text x="384" y="392" class="sub">plugin host · triggers · kv · content dist</text>
+    </g>
+
+    <!-- conduit labels -->
+    <text x="558" y="164" class="seam">HTTPS · MCP · REST</text>
+    <text x="566" y="322" class="seam">gRPC · mTLS</text>
+  </svg>
+</div>
+
+<style>
+  .hero-art{ width:100%; }
+  .hero-art svg{ width:100%; height:auto; display:block; overflow:visible; }
+
+  .conduit{ fill:none; stroke:var(--line-2); stroke-width:2; opacity:.5; }
+
+  text{ font-family:var(--font-mono); text-anchor:middle; }
+  .lbl{ fill:var(--ink-2); font-size:15px; letter-spacing:.16em; font-weight:600; }
+  .lbl.on{ fill:#eafaff; }
+  .sub{ fill:var(--ink-3); font-size:10.5px; letter-spacing:.06em; }
+  .sub.dim{ fill:var(--ink-4); }
+  .seam{ fill:var(--cyan); font-size:9.5px; letter-spacing:.12em; text-anchor:end; opacity:.8; }
+
+  .srv-rect{ filter:drop-shadow(0 0 16px rgba(0,188,235,.28)); animation:glow 6s ease-in-out infinite; }
+  @keyframes glow{ 0%,100%{ filter:drop-shadow(0 0 12px rgba(0,188,235,.2)); }
+                   50%{ filter:drop-shadow(0 0 22px rgba(0,188,235,.4)); } }
+
+  @media (prefers-reduced-motion: reduce){
+    .srv-rect{ animation:none; }
+  }
+</style>
