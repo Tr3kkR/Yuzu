@@ -52,6 +52,11 @@ export const NAV = [
     entries: [
       { file: 'user-manual/rest-api', slug: 'rest-api', title: 'REST API' },
       { file: 'user-manual/mcp', slug: 'mcp', title: 'MCP' },
+      { file: 'mcp-server', slug: 'mcp-server', title: 'MCP Server' },
+      { file: 'user-manual/agent-plugins', slug: 'agent-plugins', title: 'Agent Plugins' },
+      { file: 'user-manual/tar', slug: 'tar', title: 'TAR' },
+      { file: 'tar-dashboard', slug: 'tar-dashboard', title: 'TAR Dashboard' },
+      { file: 'fleet-viz-invariants', slug: 'fleet-viz', title: 'Fleet Visualization' },
     ],
   },
 ];
