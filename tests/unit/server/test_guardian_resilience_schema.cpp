@@ -12,8 +12,10 @@
  */
 
 #include "guardian_resilience_schema.hpp"
+#include "guardian_rule_spec.hpp" // derive_rule_spec + dangerous-key denylist (H1)
 #include "guardian_schema_registry.hpp"
 
+#include <yuzu/agent/guard_registry.hpp>      // registry_support::kHives / kValueTypes (cross-check)
 #include <yuzu/agent/resilience_strategy.hpp> // resilience_keys (cross-check)
 
 #include <catch2/catch_test_macros.hpp>
@@ -213,4 +215,148 @@ TEST_CASE("CROSS-CHECK: server param-spec keys == agent resilience_keys (G9 drif
     // (server) before merging.
     CHECK(server_keys.size() == agent_keys.size());
     CHECK(std::vector<std::string_view>(server_keys.begin(), server_keys.end()) == agent_keys);
+}
+
+namespace {
+// Pull the `enum` array of a registry-value-equals param out of the published
+// catalog, as sorted std::strings.
+std::vector<std::string> schema_registry_enum(const char* param) {
+    auto j = json::parse(guardian_schema_catalog().json);
+    std::vector<std::string> out;
+    for (const auto& e : j["schemas"]) {
+        if (e["type"] == "registry-value-equals") {
+            const auto& p = e["json_schema"]["properties"]["params"]["properties"][param]["enum"];
+            for (const auto& v : p)
+                out.push_back(v.get<std::string>());
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+std::vector<std::string> sorted_strings(const std::vector<std::string_view>& in) {
+    std::vector<std::string> out;
+    for (auto sv : in)
+        out.emplace_back(sv);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+template <std::size_t N>
+std::vector<std::string> sorted_strings(const std::string_view (&in)[N]) {
+    std::vector<std::string> out;
+    for (auto sv : in)
+        out.emplace_back(sv);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+} // namespace
+
+TEST_CASE("CROSS-CHECK: registry hive/value_type schema == server set == agent set (H2 drift guard)",
+          "[guardian][registry][crosscheck]") {
+    using namespace yuzu::agent;
+
+    // If any of these fail, the menu we publish (and the dashboard form, and the
+    // derive_rule_spec validator — all driven from the server accessors) offers a
+    // registry hive or value type the agent's RegistryGuard can't read/write. A
+    // guard authored against it reports perpetual false drift (audit) or perpetual
+    // remediation.failed (enforce). Re-sync registry_support::kHives / kValueTypes
+    // (agent) and kRegistryHives / kRegistryValueTypes (server) before merging.
+    SECTION("hives") {
+        auto schema = schema_registry_enum("hive");
+        auto server = sorted_strings(supported_registry_hives());
+        auto agent = sorted_strings(registry_support::kHives);
+        CHECK(schema == server);
+        CHECK(server == agent);
+        // The unsupported hive that previously leaked through must be gone.
+        CHECK(std::find(agent.begin(), agent.end(), "HKCC") == agent.end());
+    }
+    SECTION("value types") {
+        auto schema = schema_registry_enum("value_type");
+        auto server = sorted_strings(supported_registry_value_types());
+        auto agent = sorted_strings(registry_support::kValueTypes);
+        CHECK(schema == server);
+        CHECK(server == agent);
+        CHECK(std::find(agent.begin(), agent.end(), "REG_BINARY") == agent.end());
+        CHECK(std::find(agent.begin(), agent.end(), "REG_MULTI_SZ") == agent.end());
+    }
+}
+
+namespace {
+// Build a registry-value-equals rule body for derive_rule_spec.
+json reg_rule_body(const std::string& key, const std::string& remediation_type) {
+    return json{
+        {"spark", {{"type", "registry-change"}, {"params", json::object()}}},
+        {"assertion",
+         {{"type", "registry-value-equals"},
+          {"params",
+           {{"hive", "HKLM"}, {"key", key}, {"value_name", "Flag"}, {"value_type", "REG_SZ"},
+            {"expected", "1"}}}}},
+        {"remediation", {{"type", remediation_type}, {"params", json::object()}}},
+    };
+}
+} // namespace
+
+TEST_CASE("H1: enforce-mode write to a denylisted key is rejected (contract §6)",
+          "[guardian][denylist][h1]") {
+    // Every named §6 class is refused when the rule is in enforce mode.
+    const std::vector<std::string> denied = {
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\sethc.exe",
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+        "SYSTEM\\CurrentControlSet\\Services\\YuzuFake",
+        "SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+    };
+    for (const auto& key : denied) {
+        INFO("denied key=" << key);
+        auto r = derive_rule_spec(reg_rule_body(key, "enforce"), "g", 1, true, "enforce");
+        CHECK(r.error.has_value());
+    }
+    // The SAME key is permitted in AUDIT mode — detection must still observe it.
+    auto audit = derive_rule_spec(
+        reg_rule_body("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "alert-only"), "g", 1,
+        true, "audit");
+    CHECK_FALSE(audit.error.has_value());
+    CHECK(audit.structured);
+    // A benign key in enforce mode is allowed.
+    auto benign =
+        derive_rule_spec(reg_rule_body("SOFTWARE\\YuzuTest\\Flag", "enforce"), "g", 1, true, "enforce");
+    CHECK_FALSE(benign.error.has_value());
+}
+
+TEST_CASE("H1: denylist normalisation resists separator/case evasion",
+          "[guardian][denylist][h1]") {
+    // doubled backslash, forward slashes, leading separator, mixed case all canonicalise.
+    CHECK_FALSE(dangerous_enforce_registry_key(
+                    "software\\microsoft\\windows\\currentversion\\\\run")
+                    .empty());
+    CHECK_FALSE(dangerous_enforce_registry_key("SOFTWARE/Microsoft/Windows/CurrentVersion/Run")
+                    .empty());
+    CHECK_FALSE(
+        dangerous_enforce_registry_key("\\SYSTEM\\CurrentControlSet\\Services\\Foo").empty());
+    CHECK_FALSE(dangerous_enforce_registry_key("system\\currentcontrolset\\services\\bar").empty());
+    // benign keys are not over-matched: 'run' as a non-autorun substring is fine.
+    CHECK(dangerous_enforce_registry_key("software\\acme\\running_total").empty());
+    CHECK(dangerous_enforce_registry_key("software\\acme\\services_list").empty());
+    CHECK(dangerous_enforce_registry_key("software\\yuzutest\\flag").empty());
+}
+
+TEST_CASE("H1: dangerous_enforce_key_in_spec inspects the stored spec_json",
+          "[guardian][denylist][h1]") {
+    // The audit→enforce bypass guard relies on detecting a denylisted key in a
+    // stored (already-created, audit-mode) spec.
+    auto clean = derive_rule_spec(reg_rule_body("SOFTWARE\\YuzuTest\\Flag", "alert-only"), "g", 1,
+                                  true, "audit");
+    REQUIRE(clean.structured);
+    CHECK(dangerous_enforce_key_in_spec(clean.spec_json).empty());
+
+    auto stored = derive_rule_spec(
+        reg_rule_body("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", "alert-only"), "g", 1,
+        true, "audit");
+    REQUIRE(stored.structured);
+    CHECK_FALSE(dangerous_enforce_key_in_spec(stored.spec_json).empty());
+
+    // Robust to junk.
+    CHECK(dangerous_enforce_key_in_spec("").empty());
+    CHECK(dangerous_enforce_key_in_spec("not json").empty());
+    CHECK(dangerous_enforce_key_in_spec("{}").empty());
 }

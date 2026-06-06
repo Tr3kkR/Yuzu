@@ -2,6 +2,8 @@
 #include "mcp_jsonrpc.hpp"
 #include "mcp_policy.hpp"
 
+#include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -156,7 +158,7 @@ struct ToolDef {
     const char* input_schema_json; // Pre-serialized JSON Schema
 };
 
-// All 22 Phase 1 read-only tools.
+// All 23 Phase 1 read-only tools.
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
      R"({"type":"object","properties":{}})"},
@@ -228,6 +230,12 @@ static const ToolDef kTools[] = {
     {"list_pending_approvals", "List pending approval requests.",
      R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})"},
 
+    {"get_guardian_schemas",
+     "Get the Guardian (Guaranteed State) Guard authoring schema catalog — the "
+     "spark/assertion/remediation types and their JSON Schemas. Use this to discover how to "
+     "author a Guard. Identical to the REST GET /api/v1/guaranteed-state/schemas catalog.",
+     R"({"type":"object","properties":{}})"},
+
     // Phase 2 write tool
     {"execute_instruction",
      "Execute a plugin action on one or more agents. Returns command_id, execution_id, "
@@ -290,6 +298,7 @@ static const std::unordered_map<std::string, ToolSecurity> kToolSecurity = {
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     {"list_pending_approvals", {"Approval", "Read"}},
+    {"get_guardian_schemas", {"GuaranteedState", "Read"}},
     // Implemented write tools
     {"set_tag", {"Tag", "Write"}},
     {"delete_tag", {"Tag", "Delete"}},
@@ -314,6 +323,8 @@ static const ResourceDef kResources[] = {
     {"yuzu://compliance/fleet", "Fleet Compliance", "Fleet-wide compliance overview",
      "application/json"},
     {"yuzu://audit/recent", "Recent Audit", "Last 50 audit events", "application/json"},
+    {"yuzu://guardian/schemas", "Guardian Schemas",
+     "Guardian (Guaranteed State) Guard authoring schema catalog", "application/json"},
 };
 
 static constexpr int kResourceCount = sizeof(kResources) / sizeof(kResources[0]);
@@ -578,6 +589,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                  .add("uri", uri)
                                  .add("mimeType", "application/json")
                                  .add("text", arr.str()));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            if (uri == "yuzu://guardian/schemas") {
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                // Same compiled-in catalog the REST GET /api/v1/guaranteed-state/schemas
+                // serves — one source (guardian_schema_catalog), so a Guardian author on
+                // the MCP plane discovers the identical Guard schemas as on REST (contract
+                // §4 decision 3 / §9 G9: discovery surface on every plane).
+                const auto& catalog = ::yuzu::server::guardian::guardian_schema_catalog();
+                JArr contents;
+                contents.add(JObj()
+                                 .add("uri", uri)
+                                 .add("mimeType", "application/json")
+                                 .add("text", catalog.json));
                 res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
                                 "application/json");
                 return;
@@ -1552,6 +1580,31 @@ McpServer::HandlerFn McpServer::build_handler(
                     JObj()
                         .raw("content",
                              JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
+                        .str();
+                mcp_audit("success");
+                res.set_content(success_response(id, result), "application/json");
+                return;
+            }
+
+            // ── get_guardian_schemas ──────────────────────────────────────
+            if (tool_name == "get_guardian_schemas") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        error_response(id, kTierDenied, "MCP tier does not allow this operation"),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                // Same compiled-in catalog the REST GET /api/v1/guaranteed-state/schemas
+                // endpoint serves — single source (guardian_schema_catalog), so an MCP
+                // client and a REST client discover the IDENTICAL Guard authoring schemas
+                // (contract §4 decision 3 / §9 G9: discovery on every plane, not REST-only).
+                const auto& catalog = ::yuzu::server::guardian::guardian_schema_catalog();
+                auto result =
+                    JObj()
+                        .raw("content",
+                             JArr().add(JObj().add("type", "text").add("text", catalog.json)).str())
                         .str();
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");

@@ -20,9 +20,31 @@ namespace yuzu::server::guardian {
 // `agent_os` (unknown OS — e.g. a disconnect race or partial registration) also
 // returns true: fail OPEN so a guard is never silently dropped, matching the
 // pre-M4 send-all posture (the agent marks an inapplicable guard errored). Match
-// is otherwise case-insensitive and substring, so a verbose agent platform string
-// ("Windows 11 Pro") still matches the normalized target token ("windows").
+// is otherwise by canonical OS token: BOTH sides are normalised (`normalize_os` —
+// lowercased and mapped to a canonical token such as "windows"/"linux"/"macos")
+// and then compared for EQUALITY, so a verbose agent platform string ("Windows 11
+// Pro") still matches the target "windows" without the false positives a raw
+// substring test would admit (e.g. "win" inside "darwin").
 bool os_target_matches(std::string_view target, std::string_view agent_os);
+
+// True iff the agent-side Guardian engine actually ARMS guards on `agent_os`.
+// Today that is Windows only: RegistryGuard::start() / FileGuard::start() are
+// compiled no-ops on macOS and Linux (agents/core/src/guard_registry.cpp,
+// guard_file.cpp), so a guard "deployed" to a Mac/Linux box enforces nothing.
+// The server must therefore report those agents as "not yet implemented" rather
+// than letting them fold into the offline "unknown" bucket and read as armed —
+// an operator must never mistake a no-op platform for a protected one. `agent_os`
+// is the RAW token the agent reports (kAgentOs: "windows" | "linux" | "darwin");
+// it is normalised before comparison. An empty `agent_os` (unknown — disconnect
+// race / partial registration) returns true so we never mislabel it unimplemented.
+// THIS is the single switch to flip as Linux/macOS guard support lands.
+bool guardian_enforced_on_platform(std::string_view agent_os);
+
+// Human-facing label for a raw agent platform token, for dashboard copy:
+// "darwin" -> "macOS", "windows" -> "Windows", "linux" -> "Linux"; an
+// unknown/empty token -> "unknown". (The canonical wire/author token stays
+// "macos" per #1209; this only governs display.)
+std::string platform_display_name(std::string_view agent_os);
 
 // The Baseline gate. Returns the subset of `rules` whose rule_id is in
 // `deployed_rule_ids` — the union of member Guards across all *deployed*

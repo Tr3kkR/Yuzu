@@ -181,6 +181,7 @@ extern const char* const kSettingsHtml =
     <a href="/guardian" class="nav-link">Guardian</a>
     <a href="/tar" class="nav-link">TAR</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
+    <a href="/result-sets" class="nav-link">Result Sets</a>
     <a href="/settings" class="nav-link active" id="nav-settings-link">Settings</a>
     <span class="nav-spacer"></span>
     <span class="nav-user" id="nav-user"></span>
@@ -257,6 +258,24 @@ extern const char* const kSettingsHtml =
       </div>
     </div>
 
+    <!-- ── Multi-Factor Authentication (MFA / TOTP) ─────── -->
+    <div class="section">
+      <div class="section-header">Multi-Factor Authentication</div>
+      <div class="section-body">
+        <p style="font-size:0.75rem;color: var(--mds-color-theme-text-tertiary);margin-bottom:0.75rem">
+          Add a TOTP-based second factor to your account (Google Authenticator, 1Password,
+          Authy, Microsoft Authenticator). Recovery codes let you sign in if you lose your
+          authenticator device.
+        </p>
+        <div id="mfa-section"
+             hx-get="/fragments/settings/mfa"
+             hx-trigger="load, refreshMfa from:body"
+             hx-swap="innerHTML">
+          <span style="color: var(--mds-color-theme-outline-secondary)">Loading...</span>
+        </div>
+      </div>
+    </div>
+
     <!-- ── Enrollment Tokens ────────────────────────────── -->
     <div class="section">
       <div class="section-header">Enrollment Tokens</div>
@@ -293,6 +312,8 @@ extern const char* const kSettingsHtml =
       </div>
     </div>
 
+)HTM"
+    R"HTM(
     <!-- ── Auto-Approve Policies ─────────────────────────── -->
     <div class="section">
       <div class="section-header">Auto-Approve Policies</div>

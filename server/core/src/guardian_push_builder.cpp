@@ -1,9 +1,12 @@
 #include "guardian_push_builder.hpp"
 
+#include "guardian_rule_spec.hpp" // dangerous_enforce_key_in_spec (H1 push backstop)
+
 #include <algorithm>
 #include <cctype>
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 namespace yuzu::server::guardian {
 
@@ -72,6 +75,26 @@ bool os_target_matches(std::string_view target, std::string_view agent_os) {
     return normalize_os(target) == normalize_os(agent_os);
 }
 
+bool guardian_enforced_on_platform(std::string_view agent_os) {
+    if (agent_os.empty())
+        return true;  // unknown OS — never mislabel it "not implemented"
+    // Guards arm on Windows only today (guard_registry.cpp / guard_file.cpp start()
+    // return false on every other platform). normalize_os folds darwin->macos and
+    // lower-cases, so a verbose "Windows 11 Pro" still resolves to "windows".
+    return normalize_os(agent_os) == "windows";
+}
+
+std::string platform_display_name(std::string_view agent_os) {
+    const std::string v = normalize_os(agent_os);  // darwin->macos, lower-cased
+    if (v == "windows")
+        return "Windows";
+    if (v == "macos")
+        return "macOS";
+    if (v == "linux")
+        return "Linux";
+    return agent_os.empty() ? std::string{"unknown"} : std::string{agent_os};
+}
+
 ::yuzu::guardian::v1::GuaranteedStatePush
 build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_view agent_os,
                  const std::function<bool(const std::string& scope_expr)>& in_scope,
@@ -92,7 +115,25 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
         r->set_name(row.name);
         r->set_version(static_cast<std::uint64_t>(row.version));
         r->set_enabled(row.enabled);
-        r->set_enforcement_mode(row.enforcement_mode);
+
+        // Enforce-write denylist backstop (H1): a rule can reach enforce mode via
+        // create, the REST metadata-only update, OR the dashboard mode toggle — the
+        // create-time validator only covers the first. This is the ONE chokepoint
+        // every push funnels through, so neutralise a denylisted enforce-write here
+        // regardless of how it got into the store: downgrade to audit so the guard
+        // still DETECTS drift but never writes to the protected key. Authoring-time
+        // rejects give the operator a clear 400; this catches legacy rows and any
+        // future authoring path. See docs/guardian-mvp-contract.md §6.
+        std::string mode = row.enforcement_mode;
+        if (mode == "enforce") {
+            if (std::string why = dangerous_enforce_key_in_spec(row.spec_json); !why.empty()) {
+                spdlog::warn("Guardian push: rule {} ('{}') requests enforce on {} — downgrading to "
+                             "audit (dangerous-key denylist, contract §6/H1)",
+                             row.rule_id, row.name, why);
+                mode = "audit";
+            }
+        }
+        r->set_enforcement_mode(mode);
 
         if (row.spec_json.empty())
             continue;  // legacy yaml_source-only rule — header only, not enforceable

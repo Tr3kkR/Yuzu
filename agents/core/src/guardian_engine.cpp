@@ -514,7 +514,9 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                 return dflt;
             std::uint64_t out = dflt;
             auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), out);
-            return ec == std::errc{} ? out : dflt;
+            // Whole-string only: "123abc" → default, not 123 (M1 — symmetric with the
+            // server validator and resilience_strategy::to_u64).
+            return (ec == std::errc{} && p == v.data() + v.size()) ? out : dflt;
         };
         FileGuard::Config fcfg;
         fcfg.rule_id = rule.rule_id();
@@ -529,7 +531,14 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
             for (auto& c : fcfg.expected_hash) // normalise to the lowercase hex sha256_file emits
                 if (c >= 'A' && c <= 'Z')
                     c = static_cast<char>(c - 'A' + 'a');
-            fcfg.max_hash_bytes = aparam_u64("max_bytes", fcfg.max_hash_bytes);
+            const std::uint64_t default_max_bytes = fcfg.max_hash_bytes;
+            fcfg.max_hash_bytes = aparam_u64("max_bytes", default_max_bytes);
+            // A 0 cap would report every covered file as <oversize> (never hashed,
+            // perpetual false "compliant"/"drift") — treat 0 as unset and keep the
+            // default cap. The server rejects max_bytes:"0" at authoring; this is the
+            // agent-side backstop (M1).
+            if (fcfg.max_hash_bytes == 0)
+                fcfg.max_hash_bytes = default_max_bytes;
             fcfg.settle_ms = aparam_u64("settle_ms", fcfg.settle_ms);
         } else {
             // file-exists: "absent" → drift when the file EXISTS; anything else

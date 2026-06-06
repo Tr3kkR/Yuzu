@@ -151,3 +151,73 @@ TEST_CASE("guardian::filter_deployed_members — the Baseline gate", "[guardian_
         CHECK(out[0].rule_id == "a");
     }
 }
+
+TEST_CASE("build_agent_push: enforce on a denylisted key is downgraded to audit (H1 backstop)",
+          "[guardian_push_builder][denylist][h1]") {
+    // A rule can reach enforce mode via the dashboard toggle / metadata-only
+    // update without re-running the create-time validator; the push boundary is
+    // the chokepoint that must neutralise a denylisted enforce-write regardless of
+    // how it got into the store. Downgrade-to-audit preserves detection.
+    GuaranteedStateRuleRow danger;
+    danger.rule_id = "danger";
+    danger.name = "danger";
+    danger.enabled = true;
+    danger.enforcement_mode = "enforce";
+    danger.spec_json =
+        R"({"spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM",)"
+        R"("key":"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",)"
+        R"("value_name":"Evil","value_type":"REG_SZ","expected":"C:\\x.exe"}},)"
+        R"("remediation":{"type":"enforce"}})";
+
+    GuaranteedStateRuleRow safe;
+    safe.rule_id = "safe";
+    safe.name = "safe";
+    safe.enabled = true;
+    safe.enforcement_mode = "enforce";
+    safe.spec_json =
+        R"({"spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM",)"
+        R"("key":"SOFTWARE\\YuzuTest\\Flag","value_name":"X","value_type":"REG_SZ","expected":"1"}},)"
+        R"("remediation":{"type":"enforce"}})";
+
+    auto push = guardian::build_agent_push({danger, safe}, "windows", always_in_scope, true, 1);
+    std::string danger_mode, safe_mode;
+    for (const auto& r : push.rules()) {
+        if (r.rule_id() == "danger")
+            danger_mode = r.enforcement_mode();
+        if (r.rule_id() == "safe")
+            safe_mode = r.enforcement_mode();
+    }
+    CHECK(danger_mode == "audit");  // downgraded — guard still detects, never writes
+    CHECK(safe_mode == "enforce");  // benign key keeps enforce
+    // The assertion is still marshalled (detection preserved), just not enforced.
+    for (const auto& r : push.rules())
+        if (r.rule_id() == "danger")
+            CHECK(r.assertion().type() == "registry-value-equals");
+}
+
+TEST_CASE("guardian_enforced_on_platform — Windows only today; unknown is open",
+          "[guardian_push_builder][platform]") {
+    using guardian::guardian_enforced_on_platform;
+    // Guards arm only on Windows (RegistryGuard/FileGuard::start() are no-ops
+    // elsewhere) — so darwin/linux must read as NOT enforced and never armed.
+    CHECK(guardian_enforced_on_platform("windows"));
+    CHECK(guardian_enforced_on_platform("Windows"));  // normalize_os lower-cases (exact token)
+    CHECK_FALSE(guardian_enforced_on_platform("darwin"));
+    CHECK_FALSE(guardian_enforced_on_platform("macos"));  // author/alias token too
+    CHECK_FALSE(guardian_enforced_on_platform("linux"));
+    // Unknown OS (disconnect race / partial registration) must NOT be mislabelled
+    // "not implemented" — fail open, same posture as os_target_matches.
+    CHECK(guardian_enforced_on_platform(""));
+}
+
+TEST_CASE("platform_display_name — raw agent token to operator-facing label",
+          "[guardian_push_builder][platform]") {
+    using guardian::platform_display_name;
+    CHECK(platform_display_name("darwin") == "macOS");  // the case that matters
+    CHECK(platform_display_name("windows") == "Windows");
+    CHECK(platform_display_name("linux") == "Linux");
+    CHECK(platform_display_name("macos") == "macOS");  // alias normalises too
+    CHECK(platform_display_name("") == "unknown");
+}

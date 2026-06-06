@@ -5,7 +5,7 @@ This document describes how to run the end-to-end integration tests for the Yuzu
 ## Prerequisites
 
 ### Required
-- Built C++ server and agent: `meson compile -C builddir`
+- Built C++ server and agent: `meson compile -C build-linux`
 - Erlang/OTP 26+ with rebar3
 - curl, nc (netcat)
 
@@ -65,7 +65,7 @@ Test suites:
 ### 4. C++ Unit Tests
 
 ```bash
-meson test -C builddir --print-errorlogs
+meson test -C build-linux --print-errorlogs
 ```
 
 ## Test Architecture
@@ -201,7 +201,7 @@ integration-test:
     - name: Build C++ components
       run: |
         ./scripts/setup.sh --tests
-        meson compile -C builddir
+        meson compile -C build-linux
     - name: Build Erlang gateway
       run: cd gateway && rebar3 compile
     - name: Run integration tests

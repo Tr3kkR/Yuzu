@@ -217,6 +217,21 @@ content_embed = custom_target(
   build_always_stale: true,  # always re-scan content/ for edits
 )
 
+# Vendored Nayuki QR-Code-generator (MIT, pinned v1.8.0; see
+# server/core/vendor/qrcodegen/qrcodegen-NOTICE.txt). Built as its own
+# static lib with warnings off so third-party source does not trip our
+# warning_level=3 — same isolation the vcpkg deps get via include_type:'system'.
+qrcodegen_lib = static_library(
+  'qrcodegen',
+  files('vendor/qrcodegen/qrcodegen.cpp'),
+  include_directories: include_directories('vendor/qrcodegen'),
+  override_options: ['warning_level=0', 'werror=false'],
+)
+qrcodegen_dep = declare_dependency(
+  link_with: qrcodegen_lib,
+  include_directories: include_directories('vendor/qrcodegen'),
+)
+
 yuzu_server_core_lib = static_library(
   'yuzu_server_core',
   [echarts_embed, three_embed, three_orbit_embed, yuzu_viz_js_embed,
@@ -230,6 +245,9 @@ yuzu_server_core_lib = static_library(
     'src/auth.cpp',
     'src/auth_db.cpp',
     'src/auth_routes.cpp',
+    'src/mfa_step_up.cpp',
+    'src/mfa_qr.cpp',
+    'src/totp.cpp',
     'src/auto_approve.cpp',
     'src/cidr_match.cpp',
     'src/dashboard_ui.cpp',
@@ -247,6 +265,8 @@ yuzu_server_core_lib = static_library(
     'src/audit_store.cpp',
     'src/tag_store.cpp',
     'src/scope_engine.cpp',
+    'src/yaml_scan.cpp',
+    'src/scope_yaml.cpp',
     'src/analytics_event_store.cpp',
     'src/analytics_sinks.cpp',
     'src/data_export.cpp',
@@ -261,6 +281,7 @@ yuzu_server_core_lib = static_library(
     'src/help_ui.cpp',
     'src/instruction_ui.cpp',
     'src/tar_page_ui.cpp',
+    'src/result_sets_ui.cpp',
     'src/rbac_store.cpp',
     'src/oidc_provider.cpp',
     'src/error_codes.cpp',
@@ -271,6 +292,8 @@ yuzu_server_core_lib = static_library(
     'src/api_token_store.cpp',
     'src/secure_random.cpp',
     'src/quarantine_store.cpp',
+    'src/result_set_store.cpp',
+    'src/result_set_matcher.cpp',
     'src/policy_store.cpp',
     'src/policy_evaluator.cpp',
     'src/guaranteed_state_store.cpp',
@@ -334,14 +357,14 @@ yuzu_server_core_lib = static_library(
   include_directories: ['include'],
   cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
-                 sqlite3_dep, nlohmann_json_dep, re2_dep] + auth_crypto_deps + https_deps,
+                 sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep] + auth_crypto_deps + https_deps,
 )
 
 yuzu_server_core_dep = declare_dependency(
   link_with: yuzu_server_core_lib,
   include_directories: include_directories('include'),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
-                 sqlite3_dep, nlohmann_json_dep, re2_dep] + auth_crypto_deps + https_deps,
+                 sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep] + auth_crypto_deps + https_deps,
 )
 
 executable(

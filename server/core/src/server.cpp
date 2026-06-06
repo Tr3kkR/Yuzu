@@ -47,6 +47,10 @@
 #include "nvd_sync.hpp"
 #include "oidc_provider.hpp"
 #include "quarantine_store.hpp"
+#include "result_set_matcher.hpp"
+#include "result_set_store.hpp"
+#include "result_sets_ui.hpp"
+#include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "mcp_jsonrpc.hpp"
@@ -265,6 +269,14 @@ public:
                           "gauge");
         metrics_.describe("yuzu_server_audit_events_total",
                           "Audit events written, bucketed by result", "counter");
+        // gov PR-E OBS-2: a from_result_set: scope ref resolved to an
+        // absent/expired/not-owned set at dispatch. Audit rows are not
+        // Prometheus-alertable; this counter makes the failure mode (silent
+        // under-scope to zero targets) visible to an on-call SRE.
+        metrics_.describe("yuzu_scope_resolution_failed_total",
+                          "from_result_set: scope references that failed owner-checked "
+                          "resolution at dispatch (set absent, expired, or not owned)",
+                          "counter");
         // Audit-pipeline observability (governance PR4 OBS-4). Increments when
         // audit_store->add_event()'s SQLite step does not return DONE — pages
         // operators that the audit chain itself is degraded.
@@ -1404,6 +1416,13 @@ public:
             auto quar_db = cfg_.db_dir() / "quarantine.db";
             quarantine_store_ = std::make_unique<QuarantineStore>(quar_db);
         }
+        {
+            // Scope-walking result sets (capability §30).
+            auto rs_db = cfg_.db_dir() / "result_sets.db";
+            result_set_store_ = std::make_unique<ResultSetStore>(rs_db);
+            if (result_set_store_ && result_set_store_->is_open())
+                spdlog::info("ResultSetStore initialized at {}", rs_db.string());
+        }
 
         // Phase 5: Policy Engine
         {
@@ -1878,6 +1897,12 @@ public:
         // so it must stop before any of them are torn down)
         if (policy_eval_thread_.joinable()) {
             policy_eval_thread_.join();
+        }
+
+        // Join the result-set maintenance thread (borrows result_set_store_,
+        // execution_tracker_, response_store_ — must stop before teardown)
+        if (result_set_maint_thread_.joinable()) {
+            result_set_maint_thread_.join();
         }
 
         // Join the insecure-TLS reminder thread (issue #79)
@@ -2418,6 +2443,40 @@ private:
         return auth_routes_->audit_log(req, action, result, target_type, target_id, detail);
     }
 
+    // PR-E: emit the invocation-time scope-resolution-failure audit row (design
+    // §7 rule 3) when a from_result_set: ref resolves to an absent/expired or
+    // not-owned set. Req-less so every dispatch path (REST, tracked, MCP) emits
+    // uniformly. Carries the dispatch/instruction correlation id (command_id),
+    // the result-set ref, principal + role, and reason — the forensic chain the
+    // design §10 walkthrough requires (gov C-B1/F1). Also increments a
+    // Prometheus counter so the failure is alertable rather than buried in
+    // audit.db (gov OBS-2), and logs at warn so a signal survives even when the
+    // audit write itself fails (gov OBS-3 / F3 / UP-2).
+    void audit_scope_resolution_failed(const std::string& principal,
+                                       const std::string& principal_role,
+                                       const std::string& command_id, const std::string& ref) {
+        metrics_.counter("yuzu_scope_resolution_failed_total").increment();
+        spdlog::warn("scope resolution failed: command={} principal={} ref={} "
+                     "(result set absent, expired, or not owned)",
+                     command_id, principal.empty() ? "unknown" : principal, ref);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "instruction.scope_resolution_failed";
+        ev.target_type = "result_set";
+        ev.target_id = ref;
+        ev.detail = "INSTRUCTION_SCOPE_RESOLUTION_FAILED command=" + command_id + " ref=" + ref +
+                    " reason=result set not found, expired, or not owned by principal";
+        ev.result = "failure";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: instruction.scope_resolution_failed "
+                          "(command={} ref={})",
+                          command_id, ref);
+    }
+
     // Apply stored runtime config overrides on startup
     void apply_runtime_config_overrides() {
         if (!runtime_config_store_ || !runtime_config_store_->is_open())
@@ -2537,8 +2596,27 @@ private:
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
-            // Rate limiting — check before auth to protect against brute force
-            bool is_login = (req.path == "/login" && req.method == "POST");
+            // Rate limiting — check before auth to protect against brute force.
+            // Both /login and /login/mfa share the tighter login-rate bucket;
+            // the MFA challenge is part of the same per-IP credential-brute
+            // surface and must not fall through to the looser api_rate_limiter_
+            // (Hermes Agent red-team finding LOW #6, 2026-05-29). The per-
+            // pending-token 5-attempt cap on /login/mfa is the second layer of
+            // this defence and remains in place at AuthRoutes::POST /login/mfa.
+            // `/login/mfa/stepup` joins this bucket (PR2): the endpoint
+            // accepts the same TOTP / recovery code space as `/login/mfa`
+            // so a malicious operator with a stolen valid session could
+            // pound the space to brute-force the secret. Step-up has no
+            // per-pending-token attempts cap (the session IS the
+            // credential), so the per-IP rate limit is the only brake.
+            // `/login/mfa/enroll` joins it too (PR3): it confirms the first
+            // code against a provisional TOTP secret during enforced
+            // enrollment, so it is the same online-guessing surface and
+            // must not fall through to the looser bucket.
+            bool is_login = (req.path == "/login" || req.path == "/login/mfa" ||
+                             req.path == "/login/mfa/stepup" ||
+                             req.path == "/login/mfa/enroll") &&
+                            req.method == "POST";
             auto& limiter = is_login ? login_rate_limiter_ : api_rate_limiter_;
             if (!limiter.allow(req.remote_addr)) {
                 res.status = 429;
@@ -2549,7 +2627,7 @@ private:
                 return httplib::Server::HandlerResponse::Handled;
             }
 
-            // Allow unauthenticated access to login page, health, OIDC flow, and OpenAPI spec.
+            // Allow unauthenticated access to login pages, health, OIDC flow, and OpenAPI spec.
             // /health and /api/health are ALSO covered by the early-return
             // exemption at the top of this lambda (which additionally skips
             // rate limiting). They are kept in this list as defense-in-depth
@@ -2557,9 +2635,23 @@ private:
             // /livez|/readyz alone would silently start requiring auth on
             // /health without this lower entry. Governance Gate 7, security
             // re-review LOW. Do not remove either site without updating both.
-            if (req.path == "/login" || req.path == "/health" || req.path == "/api/health" ||
-                req.path == "/auth/oidc/start" || req.path == "/auth/callback" ||
-                req.path == "/api/v1/openapi.json" || req.path.starts_with("/static/")) {
+            //
+            // `/login/mfa` MUST be unauthenticated for the same reason `/login`
+            // is: the MFA challenge completes the login. The pending token is
+            // the only credential the caller has at this point — they have no
+            // session cookie yet. Hermes Agent's red-team review (2026-05-29)
+            // caught the omission; without it, MFA-enrolled users are locked
+            // out because every POST /login/mfa redirects to /login before the
+            // route handler runs.
+            // `/login/mfa/enroll` (PR3) is also pre-session: it completes
+            // an enforced login for an un-enrolled user who has only the
+            // enrollment-pending token, not a cookie. (`/login/mfa/stepup`
+            // is deliberately NOT here — it requires an existing session.)
+            if (req.path == "/login" || req.path == "/login/mfa" ||
+                req.path == "/login/mfa/enroll" || req.path == "/health" ||
+                req.path == "/api/health" || req.path == "/auth/oidc/start" ||
+                req.path == "/auth/callback" || req.path == "/api/v1/openapi.json" ||
+                req.path.starts_with("/static/")) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
 
@@ -2858,6 +2950,13 @@ private:
                 // dashboard would not detect the half-state. Pairs with the
                 // workflow_routes.cpp install handler's `is_open()` guard.
                 {"product_pack_store", product_pack_store_ && product_pack_store_->is_open()},
+                // gov PR-E OBS-1: ResultSetStore became load-bearing — every
+                // scoped command dispatch and the /api/scope/estimate preview
+                // resolve from_result_set: aliases and owner-check membership
+                // against it. A failed migration / corrupt result_sets.db would
+                // silently degrade every scoped dispatch to zero targets while
+                // /readyz reported "ready".
+                {"result_set_store", result_set_store_ && result_set_store_->is_open()},
             };
 
             std::string failed_list;
@@ -3475,6 +3574,29 @@ private:
             res.set_content(kDashboardIndexHtml, "text/html; charset=utf-8");
         });
 
+        // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
+        // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
+        // register_routes sites; DRY'd up here so a future change updates
+        // both surfaces atomically). Hoisted to the top of start_web_server
+        // because SettingsRoutes::register_routes (called just below) and
+        // RestApiV1::register_routes (called later in this same function)
+        // both consume it. The closure captures cfg_ + auth_mgr_ + audit_log
+        // and dispatches into `require_mfa_step_up`. `std::function` copies
+        // it into each call site.
+        StepUpFn step_up_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const auth::Session& session,
+                                     const std::string& action_label) -> bool {
+            if (!auth_mgr_.auth_db_ptr())
+                return true; // defensive — auth_db is always non-null in production
+            return require_mfa_step_up(
+                req, res, session, *auth_mgr_.auth_db_ptr(), cfg_.mfa_step_up_window_secs,
+                [this](const httplib::Request& r, const std::string& a, const std::string& rs,
+                       const std::string& tt, const std::string& ti, const std::string& d) {
+                    return audit_log(r, a, rs, tt, ti, d);
+                },
+                action_label, cfg_.mfa_enforcement);
+        };
+
         // -- Settings routes (extracted to settings_routes.cpp) ---------------
         settings_routes_ = std::make_unique<SettingsRoutes>();
         settings_routes_->register_routes(
@@ -3502,7 +3624,7 @@ private:
             })
                              : SettingsRoutes::GatewaySessionCountFn{},
             [this]() -> std::string { return registry_.to_json(); }, oidc_mu_, oidc_provider_,
-            /*metrics_registry=*/&metrics_);
+            /*metrics_registry=*/&metrics_, step_up_fn);
 
         // Legacy routes — redirect to dashboard
         web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
@@ -3759,8 +3881,25 @@ private:
                     }
                 }
             } else if (!scope_expr.empty()) {
-                // Scope expression dispatch
-                auto parsed = yuzu::scope::parse(scope_expr);
+                // Scope expression dispatch.
+                // Owner principal for from_result_set: resolution (review B1).
+                // This raw path is untracked (no execution row), so read the
+                // session directly; auth already passed require_permission above.
+                std::string principal, principal_role;
+                if (auto s = require_auth(req, res)) {
+                    principal = s->username;
+                    principal_role = auth::role_to_string(s->role);
+                }
+                // Resolve from_result_set: aliases against the operator's owned
+                // sets before parsing (PR-E): the scope resolver does not.
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                // Forensic row when a referenced set is absent/expired/unowned
+                // (design §7 rule 3); does not abort dispatch.
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, principal_role, command_id, ref);
+                auto parsed = yuzu::scope::parse(resolved_scope);
                 if (!parsed) {
                     res.status = 400;
                     res.set_content(
@@ -3769,7 +3908,8 @@ private:
                     return;
                 }
                 auto matched_ids = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                            custom_properties_store_.get());
+                                                            custom_properties_store_.get(),
+                                                            result_set_store_.get(), principal);
                 for (const auto& aid : matched_ids) {
                     if (registry_.send_to(aid, cmd)) {
                         ++sent;
@@ -4300,6 +4440,225 @@ private:
             }
             res.set_content(kTarPageHtml, "text/html; charset=utf-8");
         });
+
+        // ── Result Sets (scope walking — capability §30) ─────────────────
+        // Page shell + HTML fragment routes. Per-operator, owner-scoped: every
+        // fragment authenticates and filters/loads by the session principal.
+        // Rendering lives in result_sets_ui.cpp; store I/O happens here.
+        web_server_->Get("/result-sets",
+                         [this](const httplib::Request& req, httplib::Response& res) {
+                             auto session = require_auth(req, res);
+                             if (!session) {
+                                 res.set_redirect("/login");
+                                 return;
+                             }
+                             res.set_content(kResultSetsPageHtml, "text/html; charset=utf-8");
+                         });
+
+        // Owner-scoped sidebar list.
+        web_server_->Get(
+            "/fragments/result-sets/sidebar",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session)
+                    return;
+                if (!result_set_store_) {
+                    res.set_content("", "text/html; charset=utf-8");
+                    return;
+                }
+                std::string next;
+                std::string selected =
+                    req.has_param("selected") ? req.get_param_value("selected") : "";
+                auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                res.set_content(render_result_sets_sidebar(sets, selected),
+                                "text/html; charset=utf-8");
+            });
+
+        // Detail pane for one set (owner-checked).
+        web_server_->Get(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/detail)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_ ? result_set_store_->get(id) : std::nullopt;
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                auto chain = result_set_store_->lineage(id, session->username);
+                res.set_content(render_result_set_detail(*row, chain),
+                                "text/html; charset=utf-8");
+            });
+
+        // Pin / unpin — return the refreshed detail and trigger a sidebar reload.
+        auto rs_detail_after = [this](const std::string& id, const std::string& owner,
+                                      httplib::Response& res) {
+            auto row = result_set_store_->get(id);
+            if (!row || row->owner_principal != owner) {
+                res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                return;
+            }
+            auto chain = result_set_store_->lineage(id, owner);
+            res.set_header("HX-Trigger", "resultSetsChanged");
+            res.set_content(render_result_set_detail(*row, chain), "text/html; charset=utf-8");
+        };
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",
+            [this, rs_detail_after](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                auto pinned = result_set_store_->pin(id);
+                if (!pinned) {
+                    // Don't audit a success that didn't happen, and tell the
+                    // operator why (review merged_bug_009). PinLimit is the
+                    // 50-pin cap; otherwise a transient store error.
+                    audit_log(req, "result_set.pin",
+                              pinned.error() == ResultSetError::PinLimit ? "denied" : "failure",
+                              "ResultSet", id, to_string(pinned.error()));
+                    res.set_header(
+                        "HX-Trigger",
+                        nlohmann::json{{"showToast",
+                                        {{"level", "error"}, {"message", to_string(pinned.error())}}}}
+                            .dump());
+                    auto chain = result_set_store_->lineage(id, session->username);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.pin", "success", "ResultSet", id, "");
+                rs_detail_after(id, session->username, res);
+            });
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",
+            [this, rs_detail_after](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                auto unpinned = result_set_store_->unpin(id);
+                if (!unpinned) {
+                    audit_log(req, "result_set.unpin", "failure", "ResultSet", id,
+                              to_string(unpinned.error()));
+                    res.set_header("HX-Trigger",
+                                   nlohmann::json{{"showToast",
+                                                   {{"level", "error"},
+                                                    {"message", to_string(unpinned.error())}}}}
+                                       .dump());
+                    auto chain = result_set_store_->lineage(id, session->username);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.unpin", "success", "ResultSet", id, "");
+                rs_detail_after(id, session->username, res);
+            });
+
+        web_server_->Post(
+            R"(/fragments/result-sets/(rs_[0-9a-f]+)/delete)",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                auto id = req.matches[1].str();
+                auto row = result_set_store_->get(id);
+                if (!row || row->owner_principal != session->username) {
+                    res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+                    return;
+                }
+                auto del = result_set_store_->delete_set(id);
+                if (!del) {
+                    // Pinned sets must be unpinned first — re-render the detail
+                    // so the operator sees why nothing was deleted.
+                    auto chain = result_set_store_->lineage(id, session->username);
+                    res.set_content(render_result_set_detail(*row, chain),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.delete", "success", "ResultSet", id, "");
+                res.set_header("HX-Trigger", "resultSetsChanged");
+                res.set_content(render_result_set_detail_empty(), "text/html; charset=utf-8");
+            });
+
+        // Create from pasted device IDs (CSV import) — returns refreshed sidebar.
+        web_server_->Post(
+            "/fragments/result-sets/create",
+            [this](const httplib::Request& req, httplib::Response& res) {
+                auto session = require_auth(req, res);
+                if (!session || !result_set_store_)
+                    return;
+                CreateRequest cr;
+                cr.owner_principal = session->username;
+                cr.name = req.has_param("name") ? req.get_param_value("name") : "";
+                cr.source_kind = std::string(source_kind::kManualCurate);
+                cr.source_payload = R"({"note":"dashboard CSV import"})";
+
+                std::vector<std::string> members;
+                if (req.has_param("device_ids")) {
+                    std::string raw = req.get_param_value("device_ids");
+                    std::string cur;
+                    auto flush = [&]() {
+                        // trim whitespace
+                        std::size_t a = cur.find_first_not_of(" \t\r\n");
+                        std::size_t b = cur.find_last_not_of(" \t\r\n");
+                        if (a != std::string::npos)
+                            members.push_back(cur.substr(a, b - a + 1));
+                        cur.clear();
+                    };
+                    for (char c : raw) {
+                        if (c == '\n' || c == ',')
+                            flush();
+                        else
+                            cur += c;
+                    }
+                    flush();
+                }
+                auto created = result_set_store_->create_materialized(cr, members);
+                if (!created) {
+                    // Surface quota / too-many-members / store errors instead of
+                    // silently re-rendering as if the create succeeded (review
+                    // merged_bug_009). The store enforces kMaxMembersPerSet, so an
+                    // oversized pasted CSV lands here as TooManyMembers (B4).
+                    if (created.error() == ResultSetError::QuotaExceeded ||
+                        created.error() == ResultSetError::TooManyMembers)
+                        metrics_.counter("yuzu_result_set_quota_rejected").increment();
+                    audit_log(req, "result_set.create", "denied", "ResultSet", "",
+                              to_string(created.error()));
+                    res.set_header("HX-Trigger",
+                                   nlohmann::json{{"showToast",
+                                                   {{"level", "error"},
+                                                    {"message", to_string(created.error())}}}}
+                                       .dump());
+                    std::string next;
+                    auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                    res.set_content(render_result_sets_sidebar(sets, ""),
+                                    "text/html; charset=utf-8");
+                    return;
+                }
+                audit_log(req, "result_set.create", "success", "ResultSet", created->id,
+                          cr.source_kind);
+                std::string next;
+                auto sets = result_set_store_->list_by_owner(session->username, "", 200, next);
+                res.set_header("HX-Trigger", "resultSetsChanged");
+                res.set_content(render_result_sets_sidebar(sets, created->id),
+                                "text/html; charset=utf-8");
+            });
 
         // PR 5 of feat/viz-engine: Fleet visualization page. Auth-gated
         // (same posture as /tar) but the per-request RBAC check happens
@@ -5920,10 +6279,32 @@ private:
                             ++sent;
                 }
             } else if (!scope_expr.empty()) {
-                auto parsed = yuzu::scope::parse(scope_expr);
+                // from_result_set: is owner-scoped; recover the dispatching
+                // operator from the execution row (run_async / workflow /
+                // scheduled all create it with dispatched_by before dispatch).
+                // This is how owner-checked result-set resolution reaches the
+                // tracked dispatch paths without threading a param through the
+                // shared CommandDispatchFn (review finding B1).
+                std::string principal;
+                if (scope_expr.find("from_result_set:") != std::string::npos &&
+                    !execution_id.empty() && execution_tracker_) {
+                    if (auto ex = execution_tracker_->get_execution(execution_id))
+                        principal = ex->dispatched_by;
+                }
+                // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                auto resolved_scope =
+                    resolve_scope_aliases(scope_expr, principal, result_set_store_.get());
+                // Role is not available on the tracked path (principal recovered
+                // from the execution row, no live session); principal + command
+                // id still identify the actor for the forensic chain.
+                for (const auto& ref : scope_refs_failing_owner_check(
+                         resolved_scope, principal, result_set_store_.get()))
+                    audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                auto parsed = yuzu::scope::parse(resolved_scope);
                 if (parsed) {
                     auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                            custom_properties_store_.get());
+                                                            custom_properties_store_.get(),
+                                                            result_set_store_.get(), principal);
                     for (const auto& aid : matched)
                         if (registry_.send_to(aid, cmd))
                             ++sent;
@@ -5978,6 +6359,103 @@ private:
                 }
             }
         });
+
+        // Result-set maintenance thread (capability §30) — materialises pending
+        // result sets once their producing execution reaches a terminal state,
+        // runs the GC sweep on a ~5-minute cadence, and refreshes the alive
+        // gauges. Borrows result_set_store_, execution_tracker_, response_store_
+        // and metrics_, so it MUST be joined before any of them are torn down
+        // (join sits next to the policy-eval join in stop()).
+        if (result_set_store_ && result_set_store_->is_open()) {
+            result_set_maint_thread_ = std::thread([this]() {
+                spdlog::info("Result-set maintenance thread started (cadence=2s, GC=5m)");
+                constexpr int kGcEveryNTicks = 150;            // ~5 minutes at 2s/tick
+                constexpr int64_t kPendingTimeoutSeconds = 300; // give up waiting after 5m
+                int tick = 0;
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        std::this_thread::sleep_for(std::chrono::seconds{1});
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    try {
+                        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                .count();
+
+                        // 1) Materialise terminal pending sets.
+                        for (const auto& p : result_set_store_->list_pending()) {
+                            if (p.source_execution_id.empty())
+                                continue;
+                            bool terminal = false;
+                            if (execution_tracker_) {
+                                auto sum = execution_tracker_->get_summary(p.source_execution_id);
+                                terminal = sum.agents_targeted > 0 &&
+                                           sum.agents_responded >= sum.agents_targeted;
+                            }
+                            const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
+                            if (!terminal && !timed_out)
+                                continue;
+
+                            // Membership: every responder whose (status,
+                            // output) satisfies the pending row's matcher.
+                            // rs_matcher centralises the per-producer rule —
+                            // empty matcher = SUCCESS responders; tar_rows_ge
+                            // = SUCCESS with ≥N rows; column/op/value = a
+                            // matching output row (PR-D, design §3.3).
+                            std::vector<std::string> members;
+                            std::unordered_set<std::string> seen;
+                            if (response_store_) {
+                                for (const auto& r :
+                                     response_store_->query_by_execution(p.source_execution_id)) {
+                                    if (!rs_matcher::response_matches(p.matcher, r.status, r.output))
+                                        continue;
+                                    if (seen.insert(r.agent_id).second)
+                                        members.push_back(r.agent_id);
+                                }
+                            }
+                            if (result_set_store_->materialize(p.id, members)) {
+                                metrics_
+                                    .counter("yuzu_result_sets_total",
+                                             {{"source_kind", p.source_kind},
+                                              {"result", "materialized"}})
+                                    .increment();
+                            } else {
+                                // Don't count a materialization that didn't happen
+                                // (review finding bug_008); surface the failure so
+                                // SRE can alert on a stuck pending row.
+                                metrics_
+                                    .counter("yuzu_result_sets_total",
+                                             {{"source_kind", p.source_kind},
+                                              {"result", "materialize_failed"}})
+                                    .increment();
+                            }
+                        }
+
+                        // 2) GC sweep on the slow cadence.
+                        if (++tick % kGcEveryNTicks == 0) {
+                            int swept = result_set_store_->gc_sweep();
+                            if (swept > 0) {
+                                metrics_.counter("yuzu_result_set_gc_total")
+                                    .increment(static_cast<double>(swept));
+                                spdlog::info("result-set GC swept {} expired set(s)", swept);
+                            }
+                        }
+
+                        // 3) Refresh alive gauges.
+                        auto c = result_set_store_->counts();
+                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "true"}})
+                            .set(static_cast<double>(c.pinned));
+                        metrics_.gauge("yuzu_result_sets_alive", {{"pinned", "false"}})
+                            .set(static_cast<double>(c.total - c.pinned));
+                    } catch (const std::exception& e) {
+                        spdlog::error("result_set_maint: tick threw ({}) — thread continuing",
+                                      e.what());
+                    } catch (...) {
+                        spdlog::error("result_set_maint: tick threw unknown — thread continuing");
+                    }
+                }
+            });
+        }
 
         // ComplianceRoutes — /compliance, /fragments/compliance/*, /api/policies/*,
         // /api/compliance/*
@@ -6066,7 +6544,8 @@ private:
                     auto parsed = yuzu::scope::parse(scope_expr);
                     if (parsed) {
                         auto matched = registry_.evaluate_scope(*parsed, tag_store_.get(),
-                                                                custom_properties_store_.get());
+                                                                custom_properties_store_.get(),
+                                                                result_set_store_.get());
                         for (const auto& aid : matched) {
                             if (registry_.send_to(aid, cmd))
                                 ++sent;
@@ -6151,12 +6630,16 @@ private:
             emit_event(event_type, req);
         };
         wf_deps.scope_fn =
-            [this](const std::string& expression) -> std::pair<std::size_t, std::size_t> {
-            auto parsed = yuzu::scope::parse(expression);
+            [this](const std::string& expression,
+                   const std::string& principal) -> std::pair<std::size_t, std::size_t> {
+            // Resolve from_result_set: aliases for the estimate too (PR-E).
+            auto resolved = resolve_scope_aliases(expression, principal, result_set_store_.get());
+            auto parsed = yuzu::scope::parse(resolved);
             if (!parsed)
                 return {0, registry_.agent_count()};
             auto matched =
-                registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get());
+                registry_.evaluate_scope(*parsed, tag_store_.get(), custom_properties_store_.get(),
+                                         result_set_store_.get(), principal);
             return {matched.size(), registry_.agent_count()};
         };
         wf_deps.workflow_engine = workflow_engine_.get();
@@ -6278,6 +6761,17 @@ private:
             // dashboard SSE handler uses; nullptr leaves the new
             // route registered but returning 503.
             execution_event_bus_.get(),
+            // Scope-walking result-set store (capability §30). nullptr leaves
+            // the /api/v1/result-sets routes unregistered.
+            result_set_store_.get(),
+            // Same hoisted dispatch closure the workflow + policy engines use,
+            // so the async result-set producers (from-tar-query /
+            // from-instruction-result / re-eval) drive the exact dispatch path
+            // (PR-D). Empty closure would 503 those routes.
+            command_dispatch_fn,
+            // PR2 MFA step-up gate for the high-risk REST handlers; empty
+            // closure disables the gate (preserves pre-PR2 behaviour).
+            step_up_fn,
             // Step 3 — Guardian push fan-out. Resolve scope → in-scope agents, build the
             // GuaranteedStatePush from the store's enabled rules (typed
             // spark/assertion/remediation from spec_json) and deliver as a
@@ -6454,10 +6948,28 @@ private:
                                     ++sent;
                         }
                     } else if (!scope_expr.empty() && scope_expr != "__all__") {
-                        auto parsed = yuzu::scope::parse(scope_expr);
+                        // Owner-scoped from_result_set: recover the principal
+                        // from the MCP-created execution row (review B1).
+                        std::string principal;
+                        if (scope_expr.find("from_result_set:") != std::string::npos &&
+                            !execution_id.empty() && execution_tracker_) {
+                            if (auto ex = execution_tracker_->get_execution(execution_id))
+                                principal = ex->dispatched_by;
+                        }
+                        // Resolve from_result_set: aliases at the dispatch layer (PR-E).
+                        auto resolved_scope = resolve_scope_aliases(scope_expr, principal,
+                                                                    result_set_store_.get());
+                        // Role unavailable on the MCP path (principal recovered
+                        // from the MCP-created execution row); principal + command
+                        // id identify the actor for the forensic chain.
+                        for (const auto& ref : scope_refs_failing_owner_check(
+                                 resolved_scope, principal, result_set_store_.get()))
+                            audit_scope_resolution_failed(principal, /*role=*/"", command_id, ref);
+                        auto parsed = yuzu::scope::parse(resolved_scope);
                         if (parsed) {
                             for (const auto& aid : registry_.evaluate_scope(
-                                     *parsed, tag_store_.get(), custom_properties_store_.get()))
+                                     *parsed, tag_store_.get(), custom_properties_store_.get(),
+                                     result_set_store_.get(), principal))
                                 if (registry_.send_to(aid, cmd))
                                     ++sent;
                         }
@@ -6572,6 +7084,11 @@ private:
         }
         res.set_content("{\"status\":\"sent\"}", "application/json");
     }
+
+    // Scope-walking dispatch helpers (resolve_scope_aliases /
+    // scope_refs_failing_owner_check) live in scope_yaml.{hpp,cpp} as free
+    // functions in yuzu::server, so the dispatch call sites below bind to them
+    // unqualified and they are unit-testable.
 
     // -- JSON parsing helpers (using nlohmann/json) --------------------------
 
@@ -6709,6 +7226,7 @@ private:
     std::unique_ptr<ManagementGroupStore> mgmt_group_store_;
     std::unique_ptr<ApiTokenStore> api_token_store_;
     std::unique_ptr<QuarantineStore> quarantine_store_;
+    std::unique_ptr<ResultSetStore> result_set_store_;
     std::unique_ptr<PolicyStore> policy_store_;
     std::unique_ptr<PolicyEvaluator> policy_evaluator_;
     std::unique_ptr<GuaranteedStateStore> guaranteed_state_store_;
@@ -6799,6 +7317,7 @@ private:
     detail::AgentHealthStore health_store_;
     std::thread health_recompute_thread_;
     std::thread policy_eval_thread_;
+    std::thread result_set_maint_thread_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;

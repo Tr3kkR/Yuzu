@@ -62,6 +62,10 @@ namespace {
 // healthy absent state never uses this — it stays fully event-driven (no poll).
 constexpr std::uint64_t kArmFailRetryMs = 30000;
 
+// The hive tokens here are the canonical agent-supported set, declared once as
+// registry_support::kHives (guard_registry.hpp) and cross-checked against the
+// published /schemas enum by a server unit test (H2). Add a hive here AND there,
+// or neither — never publish one the agent can't map.
 HKEY parse_hive(const std::string& hive) {
     if (hive == "HKLM") return HKEY_LOCAL_MACHINE;
     if (hive == "HKCU") return HKEY_CURRENT_USER;
