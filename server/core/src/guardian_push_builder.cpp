@@ -1,6 +1,6 @@
 #include "guardian_push_builder.hpp"
 
-#include "guardian_rule_spec.hpp" // dangerous_enforce_key_in_spec (H1 push backstop)
+#include "guardian_rule_spec.hpp" // dangerous_enforce_in_spec (H1 push backstop)
 
 #include <algorithm>
 #include <cctype>
@@ -95,9 +95,9 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
         // future authoring path. See docs/guardian-mvp-contract.md §6.
         std::string mode = row.enforcement_mode;
         if (mode == "enforce") {
-            if (std::string why = dangerous_enforce_key_in_spec(row.spec_json); !why.empty()) {
+            if (std::string why = dangerous_enforce_in_spec(row.spec_json); !why.empty()) {
                 spdlog::warn("Guardian push: rule {} ('{}') requests enforce on {} — downgrading to "
-                             "audit (dangerous-key denylist, contract §6/H1)",
+                             "audit (enforce-safety denylist, contract §6/H1)",
                              row.rule_id, row.name, why);
                 mode = "audit";
             }

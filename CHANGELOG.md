@@ -65,6 +65,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Guardian service guards — real-time Windows service run-state enforcement
+  (PR5).** A new `service-status-change` spark with `service-running` /
+  `service-stopped` assertions watches one Windows service via
+  `NotifyServiceStatusChange` (kernel-notified by the SCM, ~0 ms, no polling)
+  and, in `enforce` mode, drives it back to the desired state via the
+  service-control API (`StartService` / `ControlService` — never `sc.exe`),
+  gated by the same per-rule resilience policy as registry guards. Pending
+  service states are held as transitional (no spurious drift / control loop
+  during start-up); the watch is resilient to the service being deleted and
+  recreated. Off-Windows the guard is a no-op (never reads as armed). The
+  schema catalog (`GET /api/v1/guaranteed-state/schemas`) and the
+  `derive_rule_spec` authoring validator publish the new types, bound to the
+  agent's `service_support::kStates` by a schema↔handler cross-check (H2/G9).
+  `service-disabled` (start-type config, which fires no SCM notification) is
+  deliberately **not** published yet — express it as a registry guard on
+  `…\Services\<name>\Start` = `4` meanwhile. Service guards are authored via
+  REST / the seed rig today (like file guards); a dashboard form follows.
 - **Break-glass MFA reset CLI (#1226).** `yuzu-server --mfa-reset <username>`
   clears a user's MFA enrollment and exits without starting the server —
   the documented recovery from MFA-enforcement lockout (lost device, IdP

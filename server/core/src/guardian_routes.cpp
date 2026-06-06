@@ -416,17 +416,18 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
     if (set_mode) {
         if (mode != "enforce" && mode != "audit")
             return fail("Invalid mode (expected enforce or audit).");
-        // Enforce-write denylist (H1): the create-time validator never runs on a
+        // Enforce-safety denylist (H1): the create-time validator never runs on a
         // mode toggle, so re-check the STORED assertion here before promoting an
-        // audit guard to a SYSTEM-write. Without this, an operator can create a
-        // guard in audit mode on a protected key and flip it to enforce past the
-        // gate (contract §6).
+        // audit guard to a SYSTEM-write (protected registry key) or a security-control
+        // stop (protected service). Without this, an operator can create a guard in
+        // audit mode on a protected target and flip it to enforce past the gate
+        // (contract §6).
         if (mode == "enforce") {
-            if (std::string why = guardian::dangerous_enforce_key_in_spec(rule->spec_json);
+            if (std::string why = guardian::dangerous_enforce_in_spec(rule->spec_json);
                 !why.empty())
                 return fail("Cannot enable enforce mode: this guard targets " + why +
-                            ". Keep it in audit mode, or re-author it against a key outside the "
-                            "protected persistence/privilege set.");
+                            ". Keep it in audit mode, or re-author it against a non-protected "
+                            "target.");
         }
         rule->enforcement_mode = mode;
         detail = "enforcement_mode=" + mode;

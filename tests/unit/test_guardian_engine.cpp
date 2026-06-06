@@ -114,6 +114,20 @@ struct GuardianFixture {
         (*a->mutable_params())["expected"] = "1";
         return r;
     }
+
+    // A rule that arms a ServiceGuard on Windows (service-status-change spark +
+    // service-running assertion). The service need not exist — the guard watches the
+    // SCM for it; get_status is fail-closed regardless (no self-test verdict yet).
+    static gpb::GuaranteedStateRule make_service_rule(const std::string& id,
+                                                      const std::string& mode) {
+        gpb::GuaranteedStateRule r = make_rule(id, id);
+        r.set_enforcement_mode(mode);
+        r.mutable_spark()->set_type("service-status-change");
+        auto* a = r.mutable_assertion();
+        a->set_type("service-running");
+        (*a->mutable_params())["service_name"] = "Spooler";
+        return r;
+    }
 };
 
 } // namespace
@@ -283,6 +297,27 @@ TEST_CASE("GuardianEngine: get_status is fail-closed — an armed guard is never
     REQUIRE(status.rules_size() == 1);
     // The B1/UP-1/F4 false-green fix: armed (or dead-but-armed) does NOT prove
     // compliance or health. guard_healthy is a reserved field, default false.
+    CHECK_FALSE(status.rules(0).guard_healthy());
+    CHECK(status.rules(0).status() == "errored");
+    CHECK(status.compliant_rules() == 0);
+    CHECK(status.errored_rules() == 1);
+}
+
+TEST_CASE("GuardianEngine: a service-status-change rule dispatches and is fail-closed",
+          "[guardian][engine][service][status]") {
+    GuardianFixture f;
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    // audit mode: on Windows this arms a real ServiceGuard whose worker watches the
+    // SCM for the named service; off-Windows no guard arms. Either way the rule is
+    // persisted and status is fail-closed (no self-test verdict yet → "errored",
+    // never healthy/compliant) — the same B1/UP-1/F4 invariant as the registry case.
+    *p.add_rules() = GuardianFixture::make_service_rule("svc-1", "audit");
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    auto status = f.engine->get_status();
+    REQUIRE(status.rules_size() == 1);
     CHECK_FALSE(status.rules(0).guard_healthy());
     CHECK(status.rules(0).status() == "errored");
     CHECK(status.compliant_rules() == 0);

@@ -11,7 +11,7 @@ Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rul
 | Term | Meaning |
 |---|---|
 | **Rule** | A YAML document describing a desired state, a detection strategy, and an optional remediation. Stored server-side with `yaml_source` as the authoritative form. |
-| **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. The Windows `registry` guard is live; service/ETW and non-Windows guards are on the roadmap. |
+| **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. The Windows `registry`, `file`, and `service` (run-state) guards are live; service start-type, ETW, and non-Windows guards are on the roadmap. |
 | **Event** | A record of detected drift, attempted remediation, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. Live `event_type` values from the registry guard: `drift.detected` (drift observed in **audit** mode — no write-back), `drift.remediated` (enforce write-back restored the expected value), `remediation.failed` (enforce attempted but the write was denied — e.g. a read-only-fallback key). |
 | **Push** | An operator-initiated distribution of the active rule set to a scope of agents. Separates deploy authority (`Push`) from authoring authority (`Write`). |
 | **Enforcement mode** | `enforce` (remediate on drift) or `audit` (log drift, do not remediate). |
@@ -61,7 +61,7 @@ spec:
     value_type: REG_DWORD
 ```
 
-Two Windows guard types ship today: the **registry** guard (above) and the **file** guard (below). Linux (inotify/netlink/D-Bus) and macOS (Endpoint Security / FSEvents) guards are on the roadmap.
+Three Windows guard types ship today: the **registry** guard (above), the **file** guard (below), and the **service** guard (below). Linux (inotify/netlink/D-Bus) and macOS (Endpoint Security / FSEvents) guards are on the roadmap.
 
 ## File guards — detect a file changed or deleted, in realtime
 
@@ -88,6 +88,32 @@ curl -X POST https://yuzu.example.com/api/v1/guaranteed-state/rules \
 ```
 
 The full type catalog — including these file types and the `expected_hash` format — is discoverable at `GET /api/v1/guaranteed-state/schemas` (see [Schema discovery](#schema-discovery)).
+
+## Service guards — keep a Windows service running (or stopped), in realtime
+
+A `service-status-change` spark watches one Windows service via `NotifyServiceStatusChange` — kernel-notified by the Service Control Manager, **no polling**, so a stop or start is detected in ~0 ms. The watch is resilient: it survives the service being deleted and recreated, and re-arms automatically. The assertion *type* encodes the desired run state; the only param is the service (key) name:
+
+| Assertion | Drift when | Key params |
+|---|---|---|
+| `service-running` | the service is not Running (stopped, paused, or absent) | `service_name` (required) — the SCM **key** name, e.g. `Spooler`, not the display name |
+| `service-stopped` | the service is Running or paused | `service_name` (required) |
+
+In **enforce** mode the guard drives the service back to its desired state via the Windows service-control API (`StartService` / `ControlService` — never `sc.exe` or `net start`), gated by the same per-rule resilience policy as registry guards. In **audit** mode it only detects and reports. This is the canonical way to keep a security service alive — *Microsoft Defender must always be running; restart it if it stops* — or held down — *the Print Spooler must stay stopped*.
+
+```bash
+# Keep the Print Spooler stopped (PrintNightmare hardening), enforcing.
+curl -X POST https://yuzu.example.com/api/v1/guaranteed-state/rules \
+  -H "Authorization: Bearer $YUZU_TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "rule_id": "spooler-stopped", "name": "Print Spooler held stopped",
+    "enforcement_mode": "enforce",
+    "spark":      {"type": "service-status-change", "params": {}},
+    "assertion":  {"type": "service-stopped", "params": {"service_name": "Spooler"}},
+    "remediation":{"type": "enforce", "params": {}}
+  }'
+```
+
+> **`service-disabled` (start-type)** is not yet a native assertion — a service's *startup type* fires no SCM notification. Until a dedicated start-type guard lands, express "service must be disabled" as a **registry** guard on `HKLM\SYSTEM\CurrentControlSet\Services\<name>\Start` = `4` (`REG_DWORD`). Like file guards, service guards are authored via the REST API or the seed rig today; a dashboard authoring form follows.
 
 ## Workflow
 
