@@ -1,0 +1,294 @@
+/* Yuzu docs-site — global styles (extracted from the approved design-system proof). */
+/* ============================================================================
+   TOKENS — harmonised-and-intensified from the product dashboard palette
+   ========================================================================== */
+
+
+/* ============================================================================
+   RESET / BASE
+   ========================================================================== */
+*{ box-sizing:border-box; }
+html{ -webkit-text-size-adjust:100%; }
+body{
+  margin:0;
+  background:var(--void);
+  color:var(--ink-2);
+  font-family:var(--font-body);
+  font-size:16px;
+  line-height:1.7;
+  letter-spacing:.005em;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+  overflow-x:hidden;
+}
+a{ color:var(--cyan-bright); text-decoration:none; }
+::selection{ background:rgba(0,188,235,.24); color:#fff; }
+
+/* ============================================================================
+   THE ETHER-FIELD — a slow, breathing aurora substrate. CSS-only.
+   Three blurred frequency-blobs drift on offset loops; faint grain + vignette.
+   ========================================================================== */
+.ether{ position:fixed; inset:0; z-index:-2; overflow:hidden; background:var(--void); }
+.ether::after{ /* vignette pulling the eye inward */
+  content:""; position:absolute; inset:0;
+  background:radial-gradient(120% 90% at 50% 18%, transparent 40%, rgba(3,7,15,.7) 100%);
+}
+.blob{ position:absolute; border-radius:50%; filter:blur(70px); opacity:.42; mix-blend-mode:screen;
+       will-change:transform; }
+.blob.a{ width:62vw; height:62vw; left:-12vw; top:-18vw;
+         background:radial-gradient(circle at 30% 30%, rgba(0,188,235,.85), transparent 62%);
+         animation:drift-a 53s ease-in-out infinite; }
+.blob.b{ width:54vw; height:54vw; right:-14vw; top:6vh;
+         background:radial-gradient(circle at 60% 40%, rgba(183,147,230,.7), transparent 60%);
+         animation:drift-b 67s ease-in-out infinite; }
+.blob.c{ width:48vw; height:48vw; left:24vw; bottom:-22vw;
+         background:radial-gradient(circle at 50% 50%, rgba(47,217,195,.45), transparent 60%);
+         animation:drift-c 79s ease-in-out infinite; }
+@keyframes drift-a{ 0%,100%{ transform:translate3d(0,0,0) scale(1); }
+                    50%{ transform:translate3d(6vw,4vh,0) scale(1.12); } }
+@keyframes drift-b{ 0%,100%{ transform:translate3d(0,0,0) scale(1.05); }
+                    50%{ transform:translate3d(-5vw,6vh,0) scale(.92); } }
+@keyframes drift-c{ 0%,100%{ transform:translate3d(0,0,0) scale(1); }
+                    50%{ transform:translate3d(4vw,-5vh,0) scale(1.15); } }
+
+/* aurora curtains — filamentary vertical rays drifting over the blobs */
+.aurora{ position:absolute; inset:0; mix-blend-mode:screen; pointer-events:none; }
+.curtain{ position:absolute; top:-25%; height:150%; filter:blur(24px); transform-origin:50% 50%;
+  -webkit-mask-image:radial-gradient(56% 72% at 50% 42%, #000 20%, transparent 78%);
+          mask-image:radial-gradient(56% 72% at 50% 42%, #000 20%, transparent 78%); }
+.curtain.c1{ left:5vw; width:42vw;
+  background:
+    repeating-linear-gradient(86deg, transparent 0 7px, rgba(214,245,255,.05) 7px 8px),
+    linear-gradient(178deg, transparent 0%, rgba(0,188,235,.24) 38%, rgba(183,147,230,.15) 66%, transparent 100%);
+  animation:sway1 49s ease-in-out infinite; }
+.curtain.c2{ left:39vw; width:34vw;
+  background:
+    repeating-linear-gradient(95deg, transparent 0 6px, rgba(228,224,255,.045) 6px 7px),
+    linear-gradient(183deg, transparent, rgba(183,147,230,.22) 42%, rgba(47,217,195,.12) 72%, transparent);
+  animation:sway2 63s ease-in-out infinite; }
+.curtain.c3{ right:3vw; width:30vw;
+  background:
+    repeating-linear-gradient(88deg, transparent 0 9px, rgba(214,245,255,.04) 9px 10px),
+    linear-gradient(176deg, transparent, rgba(0,188,235,.18) 45%, transparent);
+  animation:sway3 75s ease-in-out infinite; }
+@keyframes sway1{ 0%,100%{ transform:translateX(0) skewX(-10deg) scaleY(1);    opacity:.55; }
+                  50%{      transform:translateX(5vw) skewX(-16deg) scaleY(1.08); opacity:.85; } }
+@keyframes sway2{ 0%,100%{ transform:translateX(0) skewX(8deg) scaleY(1.05);   opacity:.45; }
+                  50%{      transform:translateX(-4vw) skewX(14deg) scaleY(.95); opacity:.78; } }
+@keyframes sway3{ 0%,100%{ transform:translateX(0) skewX(-6deg);  opacity:.4; }
+                  50%{      transform:translateX(3vw) skewX(-12deg); opacity:.68; } }
+
+.grain{ position:fixed; inset:0; z-index:-1; pointer-events:none; opacity:.05;
+        background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+
+@media (prefers-reduced-motion: reduce){
+  .blob, .curtain{ animation:none !important; }
+}
+
+/* ============================================================================
+   LAYOUT
+   ========================================================================== */
+.wrap{ max-width:var(--maxw); margin:0 auto; padding:0 28px; }
+section{ padding:84px 0; border-top:1px solid rgba(45,64,104,.5); }
+section:first-of-type{ border-top:0; }
+
+/* transmission eyebrow — Iosevka, machine-emitted */
+.eyebrow{
+  font-family:var(--font-mono); font-size:12px; font-weight:500;
+  letter-spacing:.34em; text-transform:uppercase; color:var(--cyan);
+  display:inline-flex; align-items:center; gap:.7em; margin:0 0 22px;
+}
+.eyebrow::before{ content:"//"; color:var(--violet); opacity:.8; }
+.caret{ width:.5em; height:1em; background:var(--cyan); display:inline-block;
+        box-shadow:var(--glow-cyan); animation:blink 1.3s steps(1) infinite; }
+@keyframes blink{ 50%{ opacity:0; } }
+@media (prefers-reduced-motion: reduce){ .caret{ animation:none; } }
+
+h2.kicker{ font-family:var(--font-display); font-weight:700; font-size:clamp(28px,4vw,40px);
+           color:var(--ink); margin:0 0 8px; letter-spacing:-.02em; }
+.section-sub{ color:var(--ink-3); max-width:62ch; margin:0 0 40px; }
+
+/* ============================================================================
+   HERO — front of house, full alien treatment
+   ========================================================================== */
+.hero{ position:relative; padding:128px 0 96px; }
+.hero h1{
+  font-family:var(--font-display); font-weight:800;
+  font-size:clamp(52px, 9vw, 124px); line-height:.92; letter-spacing:-.045em;
+  margin:0 0 24px; color:var(--ink);
+}
+.hero h1 .iris{
+  background:var(--iris); -webkit-background-clip:text; background-clip:text;
+  -webkit-text-fill-color:transparent; color:transparent;
+  /* whisper of iridescence: hue creeps as you scroll, where supported */
+  animation:hue 18s linear infinite;
+}
+@supports (animation-timeline: scroll()){
+  .hero h1 .iris{ animation:hue-scroll linear; animation-timeline:scroll(root); }
+}
+@keyframes hue{ to{ filter:hue-rotate(20deg); } }
+@keyframes hue-scroll{ to{ filter:hue-rotate(34deg); } }
+@media (prefers-reduced-motion: reduce){ .hero h1 .iris{ animation:none; } }
+
+.lede{ font-size:clamp(19px,2.1vw,23px); line-height:1.55; color:var(--ink-2);
+       max-width:46ch; margin:0 0 40px; }
+.lede strong{ color:var(--ink); font-weight:600; }
+
+.cta-row{ display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+.btn{ font-family:var(--font-body); font-weight:600; font-size:15px;
+      padding:13px 24px; border-radius:var(--rad); border:1px solid transparent;
+      cursor:pointer; transition:.18s ease; letter-spacing:.01em; }
+.btn-primary{ background:var(--cyan); color:#04121c; box-shadow:var(--glow-cyan); }
+.btn-primary:hover{ background:var(--cyan-bright); transform:translateY(-1px); }
+.btn-ghost{ background:transparent; color:var(--ink-2); border-color:var(--line-2); }
+.btn-ghost:hover{ border-color:var(--cyan); color:var(--ink); box-shadow:var(--glow-cyan); }
+
+/* ============================================================================
+   THEMED ASCII DIAGRAM — glowing terminal. Alignment is sacred.
+   ========================================================================== */
+.diagram-frame{
+  position:relative; margin:8px 0;
+  background:linear-gradient(180deg, rgba(10,18,33,.92), rgba(7,13,24,.96));
+  border:1px solid var(--line-1); border-radius:6px;
+  box-shadow:0 24px 80px -40px rgba(0,0,0,.9), inset 0 1px 0 rgba(143,163,189,.06);
+  overflow:hidden;
+}
+.diagram-frame::before{ /* transmission header bar */
+  content:"yuzu · topology — Operators → Server → Agent";
+  display:block; font-family:var(--font-mono); font-size:11px; letter-spacing:.18em;
+  text-transform:uppercase; color:var(--ink-3);
+  padding:11px 16px; border-bottom:1px solid var(--line-1);
+  background:rgba(20,34,59,.5);
+}
+.diagram-frame::after{ /* faint scanline ether */
+  content:""; position:absolute; inset:38px 0 0; pointer-events:none; opacity:.5;
+  background:repeating-linear-gradient(0deg, transparent 0 3px, rgba(0,188,235,.025) 3px 4px);
+}
+pre.diagram{
+  margin:0; padding:26px 20px; overflow-x:auto;
+  font-family:var(--font-diagram);
+  font-size:13px; line-height:1.34;
+  white-space:pre;            /* never wrap   */
+  font-variant-ligatures:none;/* no ligatures */
+  letter-spacing:0;           /* no tracking  */
+  tab-size:4;
+  color:#9fdcf2;
+  text-shadow:0 0 9px rgba(0,188,235,.35);
+}
+pre.diagram b{ /* node labels lifted to full ink + cyan glow */
+  color:#eafaff; font-weight:400; text-shadow:0 0 12px rgba(0,188,235,.6); }
+pre.diagram i{ /* the violet, rarer frequency */
+  color:var(--violet); font-style:normal; text-shadow:var(--glow-violet); }
+
+/* ============================================================================
+   SWATCHES
+   ========================================================================== */
+.swatches{ display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:12px; }
+.sw{ border:1px solid var(--line-1); border-radius:var(--rad); overflow:hidden; background:var(--panel-1); }
+.sw .chip{ height:74px; }
+.sw .meta{ padding:9px 11px; font-family:var(--font-mono); font-size:11px; color:var(--ink-3); }
+.sw .meta b{ color:var(--ink-2); font-weight:500; display:block; font-family:var(--font-body); font-size:12px; }
+
+/* ============================================================================
+   TYPE SPECIMEN
+   ========================================================================== */
+.specimen > div{ padding:14px 0; border-bottom:1px dashed rgba(45,64,104,.45); }
+.specimen .label{ font-family:var(--font-mono); font-size:11px; color:var(--ink-4);
+                  letter-spacing:.1em; text-transform:uppercase; }
+.t-display{ font-family:var(--font-display); font-weight:700; font-size:46px; color:var(--ink); letter-spacing:-.03em; line-height:1; }
+.t-h{ font-family:var(--font-display); font-weight:600; font-size:26px; color:var(--ink); letter-spacing:-.01em; }
+.t-body{ font-size:17px; color:var(--ink-2); max-width:64ch; }
+.t-mono{ font-family:var(--font-mono); font-size:15px; color:var(--cyan-bright); }
+
+/* ============================================================================
+   PROSE / READING ROOM
+   ========================================================================== */
+.prose{ max-width:68ch; }
+.prose p{ margin:0 0 18px; color:var(--ink-2); }
+.prose h3{ font-family:var(--font-display); font-weight:600; color:var(--ink);
+           font-size:22px; margin:34px 0 12px; letter-spacing:-.01em; }
+.prose a{ background:linear-gradient(var(--cyan),var(--cyan)) bottom/100% 1px no-repeat;
+          padding-bottom:1px; transition:.18s; }
+.prose a:hover{ background:var(--iris) bottom/100% 2px no-repeat; color:#fff; }
+.prose code{ font-family:var(--font-mono); font-size:.88em; color:var(--violet);
+             background:rgba(183,147,230,.1); padding:.1em .4em; border-radius:3px;
+             border:1px solid rgba(183,147,230,.2); }
+.prose ul{ padding-left:1.1em; }
+.prose li{ margin:.3em 0; }
+.prose li::marker{ color:var(--cyan); }
+
+/* code block (Shiki-style, hand-themed for the proof) */
+.codeblock{ background:#0a1322; border:1px solid var(--line-1); border-radius:6px;
+            font-family:var(--font-mono); font-size:13.5px; line-height:1.65;
+            overflow-x:auto; margin:0 0 18px; }
+.codeblock .cb-head{ padding:8px 14px; border-bottom:1px solid var(--line-1);
+            font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--ink-4); }
+.codeblock pre{ margin:0; padding:16px 18px; white-space:pre; }
+.tok-key{ color:var(--violet); } .tok-str{ color:var(--ok); }
+.tok-fn{ color:var(--cyan-bright); } .tok-com{ color:var(--ink-4); font-style:italic; }
+.tok-num{ color:var(--warn); }
+
+/* tables */
+table{ border-collapse:collapse; width:100%; font-size:14.5px; }
+th,td{ text-align:left; padding:11px 14px; border-bottom:1px solid var(--line-1); }
+thead th{ font-family:var(--font-mono); font-size:11px; letter-spacing:.1em;
+          text-transform:uppercase; color:var(--cyan); border-bottom-color:var(--line-2); }
+tbody tr:hover{ background:rgba(0,188,235,.05); }
+td code{ font-family:var(--font-mono); font-size:.85em; color:var(--ink-2); }
+
+/* callouts / admonitions */
+.callout{ display:grid; grid-template-columns:auto 1fr; gap:14px; align-items:start;
+          padding:16px 18px; border-radius:var(--rad); border:1px solid var(--line-1);
+          border-left-width:3px; margin:0 0 14px; background:var(--panel-1); }
+.callout .ico{ font-family:var(--font-mono); font-weight:700; font-size:13px; padding-top:1px; }
+.callout .ct b{ display:block; font-family:var(--font-mono); font-size:11px; letter-spacing:.12em;
+                text-transform:uppercase; margin-bottom:3px; }
+.callout p{ margin:0; font-size:14.5px; color:var(--ink-2); }
+.c-note{ border-left-color:var(--cyan); } .c-note .ico,.c-note b{ color:var(--cyan); }
+.c-warn{ border-left-color:var(--warn); } .c-warn .ico,.c-warn b{ color:var(--warn); }
+.c-bad{ border-left-color:var(--bad); }   .c-bad .ico,.c-bad b{ color:var(--bad); }
+.c-special{ border-left-color:var(--violet); } .c-special .ico,.c-special b{ color:var(--violet); }
+
+/* sidebar / reading-room chrome mock */
+.chrome{ display:grid; grid-template-columns:230px 1fr; gap:30px; border:1px solid var(--line-1);
+         border-radius:8px; overflow:hidden; background:rgba(14,26,45,.6); }
+.sidebar{ background:rgba(10,18,33,.7); border-right:1px solid var(--line-1); padding:22px 0; }
+.nav-grp{ padding:0 18px; margin-bottom:18px; }
+.nav-grp .gh{ font-family:var(--font-mono); font-size:10.5px; letter-spacing:.16em;
+              text-transform:uppercase; color:var(--ink-4); margin-bottom:8px; }
+.nav-grp a{ display:block; padding:5px 10px; margin:0 -10px; border-radius:4px;
+            color:var(--ink-3); font-size:14px; }
+.nav-grp a:hover{ color:var(--ink); background:rgba(0,188,235,.06); }
+.nav-grp a.on{ color:var(--ink); background:rgba(0,188,235,.1);
+               box-shadow:inset 2px 0 0 var(--cyan); }
+.chrome .body{ padding:26px 26px 26px 0; }
+
+footer{ padding:60px 0; color:var(--ink-4); font-family:var(--font-mono); font-size:12px;
+        letter-spacing:.04em; border-top:1px solid var(--line-1); }
+
+/* ============================================================================
+   READING-ROOM SHELL — Manual layout (sidebar + prose), appended for the site
+   ========================================================================== */
+.manual-shell{ display:grid; grid-template-columns:240px 1fr; gap:48px; align-items:start;
+               padding:36px 0 96px; }
+.manual-shell .sidebar{ position:sticky; top:24px; background:transparent; border:0; padding:0;
+               max-height:calc(100vh - 48px); overflow:auto; }
+.manual-shell .sidebar .brand{ display:block; font-family:var(--font-display); font-weight:800;
+               font-size:20px; color:var(--ink); letter-spacing:-.02em; margin:0 18px 20px; }
+.manual-shell .prose{ min-width:0; max-width:76ch; }
+.manual-shell .prose > h1{ font-family:var(--font-display); font-weight:700;
+               font-size:clamp(30px,4vw,42px); color:var(--ink); letter-spacing:-.022em;
+               line-height:1.05; margin:0 0 26px; }
+.manual-shell .prose h2{ font-family:var(--font-display); font-weight:600; color:var(--ink);
+               font-size:25px; letter-spacing:-.01em; margin:40px 0 12px;
+               padding-bottom:8px; border-bottom:1px solid var(--line-1); }
+.manual-shell .prose pre{ border:1px solid var(--line-1); border-radius:6px; padding:15px 18px;
+               overflow-x:auto; font-family:var(--font-mono); font-size:13.5px; line-height:1.6;
+               margin:0 0 18px; }
+.manual-shell .prose pre code{ background:none; border:0; padding:0; color:inherit; font-size:inherit; }
+.manual-shell .prose blockquote{ margin:0 0 18px; padding:2px 18px; border-left:3px solid var(--cyan);
+               background:rgba(0,188,235,.05); color:var(--ink-2); border-radius:0 4px 4px 0; }
+@media (max-width:860px){
+  .manual-shell{ grid-template-columns:1fr; gap:24px; }
+  .manual-shell .sidebar{ position:static; max-height:none; }
+}

@@ -8,11 +8,34 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <iterator>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace yuzu::server::guardian {
 namespace {
 
 using nlohmann::json;
+
+// Single source for the registry hive / value-type enums (H2). These MUST mirror
+// exactly what the agent's RegistryGuard parses (`registry_support::kHives` /
+// `kValueTypes` in guard_registry.hpp): parse_hive() maps these four hives, and
+// read_value()/write_value() decode these four value types. HKCC, REG_BINARY and
+// REG_MULTI_SZ were previously advertised here but the agent decodes none of them
+// — a guard authored against one read back as "<unsupported-type>" forever
+// (perpetual false drift / remediation.failed). Drives the published enum, the
+// authoring validator, and the cross-check test (contract G9 drift guard).
+constexpr std::string_view kRegistryHives[] = {"HKLM", "HKCU", "HKCR", "HKU"};
+constexpr std::string_view kRegistryValueTypes[] = {"REG_DWORD", "REG_QWORD", "REG_SZ",
+                                                    "REG_EXPAND_SZ"};
+
+json string_view_enum(const std::string_view* first, const std::string_view* last) {
+    json arr = json::array();
+    for (const std::string_view* it = first; it != last; ++it)
+        arr.push_back(std::string(*it));
+    return arr;
+}
 
 // A complete spec-block schema: {type: {const}, params: <params schema>}.
 json block_schema(const char* type, const char* title, json params, bool params_required) {
@@ -39,21 +62,20 @@ json registry_value_equals_params() {
     json props = {
         {"hive",
          {{"type", "string"},
-          {"enum", json::array({"HKLM", "HKCU", "HKCR", "HKU", "HKCC"})},
+          {"enum", string_view_enum(std::begin(kRegistryHives), std::end(kRegistryHives))},
           {"description", "Registry hive."}}},
         {"key", {{"type", "string"}, {"description", "Key path under the hive, e.g. SOFTWARE\\\\YuzuTest."}}},
         {"value_name",
          {{"type", "string"}, {"description", "Value name; \"\" means the key's default value."}}},
         {"value_type",
          {{"type", "string"},
-          {"enum", json::array({"REG_DWORD", "REG_QWORD", "REG_SZ", "REG_EXPAND_SZ", "REG_BINARY",
-                                "REG_MULTI_SZ"})},
+          {"enum",
+           string_view_enum(std::begin(kRegistryValueTypes), std::end(kRegistryValueTypes))},
           {"description", "Registry value type; the comparison is type-aware (a type mismatch is drift)."}}},
         {"expected",
          {{"type", "string"},
           {"description", "Desired value, string-encoded per value_type: DWORD/QWORD decimal "
-                          "(0x… accepted, canonical decimal); SZ/EXPAND_SZ literal; BINARY "
-                          "lowercase even-length hex; MULTI_SZ JSON-array-string (deferred)."}}},
+                          "(0x… accepted, canonical decimal); SZ/EXPAND_SZ literal."}}},
     };
     // Discriminated subschemas keyed on value_type (decision 3). Built explicitly
     // (not via nested brace-init) so the object/array shape is unambiguous.
@@ -72,11 +94,6 @@ json registry_value_equals_params() {
         json enum_match = json::object();
         enum_match["enum"] = json::array({"REG_DWORD", "REG_QWORD"});
         discriminators.push_back(discriminator(std::move(enum_match), "^(0x[0-9a-fA-F]+|[0-9]+)$"));
-    }
-    {
-        json const_match = json::object();
-        const_match["const"] = "REG_BINARY";
-        discriminators.push_back(discriminator(std::move(const_match), "^([0-9a-f]{2})*$"));
     }
     return json{
         {"type", "object"},
@@ -238,6 +255,18 @@ const SchemaCatalog& guardian_schema_catalog() {
         return c;
     }();
     return catalog;
+}
+
+const std::vector<std::string_view>& supported_registry_hives() {
+    static const std::vector<std::string_view> v(std::begin(kRegistryHives),
+                                                  std::end(kRegistryHives));
+    return v;
+}
+
+const std::vector<std::string_view>& supported_registry_value_types() {
+    static const std::vector<std::string_view> v(std::begin(kRegistryValueTypes),
+                                                  std::end(kRegistryValueTypes));
+    return v;
 }
 
 } // namespace yuzu::server::guardian

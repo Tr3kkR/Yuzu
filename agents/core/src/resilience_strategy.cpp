@@ -9,6 +9,7 @@
 #include <algorithm> // std::min
 #include <cctype>    // std::tolower
 #include <charconv>  // std::from_chars
+#include <limits>    // std::numeric_limits
 #include <string>
 
 namespace yuzu::agent {
@@ -17,7 +18,18 @@ std::uint64_t to_u64(const std::string& v, std::uint64_t dflt) {
     if (v.empty()) return dflt;
     std::uint64_t out = dflt;
     auto [p, ec] = std::from_chars(v.data(), v.data() + v.size(), out);
-    return ec == std::errc{} ? out : dflt; // unknown/garbage → default
+    // Whole-string match only — "123abc" / "1.5" / "12 " are garbage → default,
+    // not a silent 123/1/12. The server validates numeric params the same way, so
+    // the two boundaries agree on what a number is (M1).
+    return (ec == std::errc{} && p == v.data() + v.size()) ? out : dflt;
+}
+
+// Authored-seconds → milliseconds, saturating instead of wrapping u64 when the
+// seconds value is absurd. The server already range-checks seconds, but the agent
+// must never let `* 1000` wrap into a tiny window (defence-in-depth; MEDIUM).
+std::uint64_t seconds_to_ms(std::uint64_t secs) {
+    constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max() / 1000;
+    return secs > kMax ? std::numeric_limits<std::uint64_t>::max() : secs * 1000;
 }
 } // namespace
 
@@ -27,8 +39,8 @@ ResilienceConfig parse_resilience_params(const std::function<std::string(std::st
     ResilienceConfig c;
     c.mode = parse_resilience_mode(get(kMode));
     c.max_attempts = static_cast<std::uint32_t>(to_u64(get(kMaxAttempts), 5));
-    c.quiet_reset_ms = to_u64(get(kQuietResetS), 60) * 1000;  // authored in seconds
-    c.resume_after_ms = to_u64(get(kResumeAfterS), 0) * 1000; // authored in seconds
+    c.quiet_reset_ms = seconds_to_ms(to_u64(get(kQuietResetS), 60));  // authored in seconds
+    c.resume_after_ms = seconds_to_ms(to_u64(get(kResumeAfterS), 0)); // authored in seconds
     c.backoff_initial_ms = to_u64(get(kBackoffInitialMs), 1000);
     c.backoff_max_ms = to_u64(get(kBackoffMaxMs), 60000);
     event_debounce_ms_out = to_u64(get(kEventDebounceMs), 1000);
@@ -69,10 +81,14 @@ ResilienceDecision ResilienceStrategy::decide(std::uint64_t now_ms) {
         if (past) {
             last_remediation_ms_ = now_ms;
             have_last_remediation_ = true;
-            // Grow for next time: initial, then double up to the cap.
-            backoff_cur_ms_ = (backoff_cur_ms_ == 0)
-                                  ? cfg_.backoff_initial_ms
-                                  : std::min(backoff_cur_ms_ * 2, cfg_.backoff_max_ms);
+            // Grow for next time: initial, then double up to the cap. Clamp BEFORE
+            // doubling — `backoff_cur_ms_ * 2` evaluated first would wrap u64 for an
+            // absurd backoff_max_ms and make std::min pick the tiny wrapped value, a
+            // far-shorter-than-intended window. If doubling would exceed the cap, just
+            // take the cap (overflow-safe; MEDIUM).
+            backoff_cur_ms_ = (backoff_cur_ms_ == 0)        ? cfg_.backoff_initial_ms
+                              : (backoff_cur_ms_ > cfg_.backoff_max_ms / 2) ? cfg_.backoff_max_ms
+                                                                           : backoff_cur_ms_ * 2;
             return {true, std::nullopt, false};
         }
         // Inside the backoff window: skip the fix (still detect/emit), and wake when

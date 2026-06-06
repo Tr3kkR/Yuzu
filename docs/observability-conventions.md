@@ -57,6 +57,6 @@ All instruction response data must be **typed** for downstream consumption (Clic
 
 ## Where to find dashboards
 
-- Grafana dashboard templates: `docs/grafana/`
-- Prometheus scrape config examples: `docs/prometheus/`
+- Grafana dashboards: `deploy/grafana/*.json` (operational set, auto-provisioned into the UAT/full-UAT Grafana — Prometheus-backed `yuzu-{dashboard,fleet,gateway}` plus the ClickHouse-backed `yuzu-analytics`); `docs/grafana/yuzu-overview.json` (standalone Prometheus import template). See `docs/grafana/README.md`.
+- Prometheus alert rules: `docs/prometheus/yuzu-alerts.yml`; scrape-config example: `docs/grafana/README.md`
 - ClickHouse ingest setup: `docs/clickhouse-setup.md`

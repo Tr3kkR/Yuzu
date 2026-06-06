@@ -218,23 +218,49 @@ std::expected<IdTokenClaims, std::string> OidcProvider::parse_id_token(const std
         return std::unexpected(std::string("JWT payload parse error: ") + e.what());
     }
 
+    // Every claim is read through a type guard. A signature-valid token
+    // (attacker-controlled or merely non-conformant IdP) whose `sub` is a
+    // number, or whose `iat` is a JSON string/float, must NOT throw an
+    // uncaught nlohmann type_error out of parse_id_token — PR3 makes `iat`
+    // load-bearing (it seeds the MFA step-up window), elevating a former
+    // "noise" throw into a /auth/callback 500 (governance sec-M1 +
+    // happy-path). Numeric claims are read via get<double>() + cast so a
+    // float-encoded `iat`/`exp` (some IdPs emit `1700000000.0`) survives.
     IdTokenClaims claims;
-    if (j.contains("sub"))
+    if (j.contains("sub") && j["sub"].is_string())
         claims.sub = j["sub"].get<std::string>();
-    if (j.contains("email"))
+    if (j.contains("email") && j["email"].is_string())
         claims.email = j["email"].get<std::string>();
-    if (j.contains("preferred_username"))
+    if (j.contains("preferred_username") && j["preferred_username"].is_string())
         claims.preferred_username = j["preferred_username"].get<std::string>();
-    if (j.contains("name"))
+    if (j.contains("name") && j["name"].is_string())
         claims.name = j["name"].get<std::string>();
-    if (j.contains("iss"))
+    if (j.contains("iss") && j["iss"].is_string())
         claims.iss = j["iss"].get<std::string>();
-    if (j.contains("nonce"))
+    if (j.contains("nonce") && j["nonce"].is_string())
         claims.nonce = j["nonce"].get<std::string>();
-    if (j.contains("exp"))
-        claims.exp = j["exp"].get<int64_t>();
-    if (j.contains("iat"))
-        claims.iat = j["iat"].get<int64_t>();
+    // Clamp before the double→int64 cast: an out-of-range float (a
+    // misconfigured/hostile IdP emitting `1e300`) would be UB on the cast.
+    // In-range positive values only; anything else leaves the field at 0
+    // (treated as missing — for `iat` that means "not seeded", for `exp`
+    // it falls to the existing missing-exp path). Practically unreachable
+    // on a signature-valid token; defense-in-depth (Gate 8 INFO).
+    constexpr double kMaxEpoch = 9.0e18; // < int64 max (~9.22e18)
+    if (j.contains("exp") && j["exp"].is_number()) {
+        double v = j["exp"].get<double>();
+        if (v > 0.0 && v < kMaxEpoch)
+            claims.exp = static_cast<int64_t>(v);
+    }
+    if (j.contains("iat") && j["iat"].is_number()) {
+        double v = j["iat"].get<double>();
+        if (v > 0.0 && v < kMaxEpoch)
+            claims.iat = static_cast<int64_t>(v);
+    }
+    if (j.contains("nbf") && j["nbf"].is_number()) {
+        double v = j["nbf"].get<double>();
+        if (v > 0.0 && v < kMaxEpoch)
+            claims.nbf = static_cast<int64_t>(v);
+    }
 
     // aud can be a string or array
     if (j.contains("aud")) {
@@ -250,6 +276,20 @@ std::expected<IdTokenClaims, std::string> OidcProvider::parse_id_token(const std
         for (auto& g : j["groups"])
             if (g.is_string())
                 claims.groups.push_back(g.get<std::string>());
+    }
+
+    // amr claim: RFC 8176 authentication-method references. Array of
+    // strings per the spec; tolerate a lone string for non-conformant
+    // IdPs. Consumed by /auth/callback to decide whether the IdP attested
+    // a multi-factor login (see docs/auth-mfa-design.md "OIDC interop").
+    if (j.contains("amr")) {
+        if (j["amr"].is_array()) {
+            for (auto& a : j["amr"])
+                if (a.is_string())
+                    claims.amr.push_back(a.get<std::string>());
+        } else if (j["amr"].is_string()) {
+            claims.amr.push_back(j["amr"].get<std::string>());
+        }
     }
 
     return claims;
@@ -270,8 +310,32 @@ OidcProvider::validate_claims(const IdTokenClaims& claims,
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();
     constexpr int64_t kClockSkew = 60;
-    if (claims.exp > 0 && claims.exp + kClockSkew < now)
+    // OIDC Core 1.0 §2 requires `exp`. A token with no (or non-positive)
+    // exp must be rejected, not silently treated as never-expiring — the
+    // prior `exp > 0 &&` guard let a missing/malformed exp skip the
+    // expiry check entirely (governance Gate 8). `parse_id_token` leaves
+    // `exp` at 0 when the claim is absent or not a positive number.
+    if (claims.exp <= 0)
+        return std::unexpected("missing or invalid exp claim");
+    if (claims.exp + kClockSkew < now)
         return std::unexpected("token expired");
+    // Reject a future-dated `iat` (Hermes A1/L-2). PR3 seeds the MFA
+    // step-up window from `iat`; a grossly future-dated token is an
+    // IdP-key-compromise lever. Use a GENEROUS future skew (not the tight
+    // 60 s `exp` skew) — real IdP↔server NTP drift routinely exceeds 60 s,
+    // and Okta/Entra default their own `iat`/`nbf` tolerance to ~300 s.
+    // Rejecting at 60 s turned ordinary clock drift into a total SSO outage
+    // (governance UP-D4). Within the window the future `iat` is clamped to
+    // "now" during seeding anyway (auth_routes.cpp), so a generous bound
+    // costs no freshness — it only rejects the clearly-forged case.
+    constexpr int64_t kFutureSkew = 300;
+    if (claims.iat > 0 && claims.iat > now + kFutureSkew)
+        return std::unexpected("iat is in the future");
+    // Honour `nbf` (RFC 7519 §4.1.5) if present — a pre-issued token must
+    // not be accepted before its validity window (Hermes A3) — with the
+    // same generous skew so NTP drift does not reject legitimate tokens.
+    if (claims.nbf > 0 && claims.nbf > now + kFutureSkew)
+        return std::unexpected("token not yet valid (nbf)");
 
     if (claims.nonce != expected_nonce)
         return std::unexpected("nonce mismatch");

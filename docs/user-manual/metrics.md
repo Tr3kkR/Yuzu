@@ -22,32 +22,32 @@ curl -s 'http://localhost:8080/metrics'
 **Example response (excerpt):**
 
 ```
-# HELP yuzu_server_http_requests_total Total HTTP requests handled
-# TYPE yuzu_server_http_requests_total counter
-yuzu_server_http_requests_total{method="GET",status="200"} 1542
-yuzu_server_http_requests_total{method="POST",status="200"} 87
-yuzu_server_http_requests_total{method="GET",status="404"} 12
+# HELP yuzu_http_requests_total Total HTTP requests handled
+# TYPE yuzu_http_requests_total counter
+yuzu_http_requests_total{method="GET",status="200"} 1542
+yuzu_http_requests_total{method="POST",status="200"} 87
+yuzu_http_requests_total{method="GET",status="404"} 12
 
-# HELP yuzu_server_http_request_duration_seconds HTTP request latency
-# TYPE yuzu_server_http_request_duration_seconds histogram
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.005"} 920
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.01"} 1100
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.025"} 1350
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.05"} 1450
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.1"} 1500
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.25"} 1530
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="0.5"} 1540
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="1.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="2.5"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="5.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="10.0"} 1542
-yuzu_server_http_request_duration_seconds_bucket{method="GET",le="+Inf"} 1542
-yuzu_server_http_request_duration_seconds_sum{method="GET"} 12.345
-yuzu_server_http_request_duration_seconds_count{method="GET"} 1542
+# HELP yuzu_command_duration_seconds Command execution latency in seconds
+# TYPE yuzu_command_duration_seconds histogram
+yuzu_command_duration_seconds_bucket{le="0.005"} 12
+yuzu_command_duration_seconds_bucket{le="0.01"} 47
+yuzu_command_duration_seconds_bucket{le="0.025"} 180
+yuzu_command_duration_seconds_bucket{le="0.05"} 540
+yuzu_command_duration_seconds_bucket{le="0.1"} 980
+yuzu_command_duration_seconds_bucket{le="0.25"} 1320
+yuzu_command_duration_seconds_bucket{le="0.5"} 1480
+yuzu_command_duration_seconds_bucket{le="1.0"} 1530
+yuzu_command_duration_seconds_bucket{le="2.5"} 1541
+yuzu_command_duration_seconds_bucket{le="5.0"} 1542
+yuzu_command_duration_seconds_bucket{le="10.0"} 1542
+yuzu_command_duration_seconds_bucket{le="+Inf"} 1542
+yuzu_command_duration_seconds_sum 198.74
+yuzu_command_duration_seconds_count 1542
 
-# HELP yuzu_server_connected_agents Number of currently connected agents
-# TYPE yuzu_server_connected_agents gauge
-yuzu_server_connected_agents 47
+# HELP yuzu_agents_connected Number of currently connected agents
+# TYPE yuzu_agents_connected gauge
+yuzu_agents_connected 47
 ```
 
 ## Naming conventions
@@ -56,9 +56,9 @@ All Yuzu metrics follow a consistent naming scheme.
 
 | Prefix | Source | Examples |
 |---|---|---|
-| `yuzu_server_` | Server process | `yuzu_server_http_requests_total`, `yuzu_server_connected_agents` |
+| `yuzu_server_` | Server process | `yuzu_server_uptime_seconds`, `yuzu_server_open_connections` |
 | `yuzu_server_cert_` | Certificate reload | `yuzu_server_cert_reloads_total`, `yuzu_server_cert_reload_failures_total` |
-| `yuzu_agent_` | Agent process | `yuzu_agent_plugin_executions_total`, `yuzu_agent_heartbeat_latency_seconds` |
+| `yuzu_agent_` | Agent process | `yuzu_agent_commands_executed_total`, `yuzu_agent_uptime_seconds` |
 | `yuzu_viz_` | Fleet visualization (`/api/v1/viz/fleet/topology` + heartbeat push ingestion) | `yuzu_viz_topology_request_seconds`, `yuzu_viz_topology_pushed_total`, `yuzu_viz_topology_push_rejected_total`, `yuzu_viz_pushed_cap_evictions_total`, `yuzu_viz_pushed_map_size` |
 
 ## Fleet visualization metrics
@@ -241,7 +241,7 @@ successfully:
 curl -s 'http://localhost:9090/api/v1/targets' | jq '.data.activeTargets[] | select(.labels.job == "yuzu-server")'
 
 # Query a metric
-curl -s 'http://localhost:9090/api/v1/query?query=yuzu_server_connected_agents' | jq .
+curl -s 'http://localhost:9090/api/v1/query?query=yuzu_agents_connected' | jq .
 ```
 
 ## Real-time event stream
@@ -342,38 +342,42 @@ yuzu_server_management_groups_total == 0
 
 ```promql
 # Total connected agents
-yuzu_server_connected_agents
+yuzu_agents_connected
 
 # Connected agents by OS
-count by (os) (yuzu_agent_info)
+sum by (os) (yuzu_fleet_agents_by_os)
 
 # Connected agents by architecture
-count by (arch) (yuzu_agent_info)
+sum by (arch) (yuzu_fleet_agents_by_arch)
 ```
 
 ### Request performance
 
 ```promql
 # Request rate (per second, 5-minute window)
-rate(yuzu_server_http_requests_total[5m])
+rate(yuzu_http_requests_total[5m])
 
-# 95th percentile latency
-histogram_quantile(0.95, rate(yuzu_server_http_request_duration_seconds_bucket[5m]))
+# 95th percentile command-execution latency
+# (the server emits no general HTTP request-duration histogram; command duration
+#  is its primary latency SLI — see also auth-login and viz-topology histograms)
+histogram_quantile(0.95, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le))
 
 # Error rate (percentage of 5xx responses)
-sum(rate(yuzu_server_http_requests_total{status=~"5.."}[5m]))
-/ sum(rate(yuzu_server_http_requests_total[5m])) * 100
+sum(rate(yuzu_http_requests_total{status=~"5.."}[5m]))
+/ sum(rate(yuzu_http_requests_total[5m])) * 100
 ```
 
 ### Agent health
 
 ```promql
-# Agents with heartbeat latency over 5 seconds
-yuzu_agent_heartbeat_latency_seconds > 5
+# Healthy agents reported via heartbeat status_tags.
+# (Agents have no Prometheus endpoint, so there is no per-agent heartbeat-latency
+#  series; the server re-exports fleet health as this gauge.)
+yuzu_fleet_agents_healthy
 
 # Plugin execution failure rate by plugin
-sum by (plugin) (rate(yuzu_agent_plugin_executions_total{status="failure"}[5m]))
-/ sum by (plugin) (rate(yuzu_agent_plugin_executions_total[5m])) * 100
+sum by (plugin) (rate(yuzu_agent_commands_executed_total{status="failure"}[5m]))
+/ sum by (plugin) (rate(yuzu_agent_commands_executed_total[5m])) * 100
 ```
 
 ### Plugin load + signing rejections (`yuzu_agent_plugin_rejected_total`)
@@ -414,26 +418,34 @@ increase(yuzu_agent_plugin_rejected_total{reason="reserved_name"}[5m]) > 0
 
 ```promql
 # Instructions completed per minute
-rate(yuzu_server_instructions_completed_total[5m]) * 60
+rate(yuzu_commands_completed_total[5m]) * 60
 
 # Average instruction duration
-rate(yuzu_server_instruction_duration_seconds_sum[5m])
-/ rate(yuzu_server_instruction_duration_seconds_count[5m])
+rate(yuzu_command_duration_seconds_sum[5m])
+/ rate(yuzu_command_duration_seconds_count[5m])
 ```
 
 ## Grafana integration
 
-Import the Prometheus data source into Grafana and use the PromQL queries
-above to build dashboards. A typical Yuzu dashboard includes:
+Yuzu ships pre-built Grafana dashboards. The operational set lives in
+`deploy/grafana/` (`yuzu-dashboard`, `yuzu-fleet-dashboard`, and
+`yuzu-gateway-dashboard` over Prometheus, plus `yuzu-analytics-dashboard` over
+ClickHouse) and is auto-provisioned by the UAT / full-UAT rigs; a standalone
+Prometheus import template is at `docs/grafana/yuzu-overview.json`. See
+[`docs/grafana/README.md`](../grafana/README.md) for the full list and import
+instructions.
+
+To build your own, import the Prometheus data source into Grafana and use the
+PromQL queries above. A typical Yuzu dashboard includes:
 
 | Panel | Visualization | Query |
 |---|---|---|
-| Connected agents | Stat / single value | `yuzu_server_connected_agents` |
-| Agents by OS | Pie chart | `count by (os) (yuzu_agent_info)` |
-| Request rate | Time series | `rate(yuzu_server_http_requests_total[5m])` |
-| Request latency (p95) | Time series | `histogram_quantile(0.95, ...)` |
+| Connected agents | Stat / single value | `yuzu_agents_connected` |
+| Agents by OS | Pie chart | `sum by (os) (yuzu_fleet_agents_by_os)` |
+| Request rate | Time series | `rate(yuzu_http_requests_total[5m])` |
+| Command latency (p95) | Time series | `histogram_quantile(0.95, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le))` |
 | Error rate | Time series | `5xx / total * 100` |
-| Instruction throughput | Time series | `rate(yuzu_server_instructions_completed_total[5m])` |
+| Instruction throughput | Time series | `rate(yuzu_commands_completed_total[5m])` |
 
 ### Alerting rules
 
@@ -444,7 +456,7 @@ groups:
   - name: yuzu
     rules:
       - alert: YuzuNoAgentsConnected
-        expr: yuzu_server_connected_agents == 0
+        expr: yuzu_agents_connected == 0
         for: 5m
         labels:
           severity: critical
@@ -453,24 +465,22 @@ groups:
 
       - alert: YuzuHighErrorRate
         expr: >
-          sum(rate(yuzu_server_http_requests_total{status=~"5.."}[5m]))
-          / sum(rate(yuzu_server_http_requests_total[5m])) > 0.05
+          sum(rate(yuzu_http_requests_total{status=~"5.."}[5m]))
+          / sum(rate(yuzu_http_requests_total[5m])) > 0.05
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Yuzu server error rate above 5%"
 
-      - alert: YuzuHighLatency
-        expr: >
-          histogram_quantile(0.95,
-            rate(yuzu_server_http_request_duration_seconds_bucket[5m])
-          ) > 2.0
-        for: 10m
+      - alert: YuzuHighCommandLatency
+        expr: |
+          histogram_quantile(0.99, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le)) > 10
+        for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "Yuzu server p95 latency above 2 seconds"
+          summary: "Command p99 latency exceeds 10 seconds"
 ```
 
 ## Security considerations
@@ -502,4 +512,3 @@ This data reveals your fleet's attack surface to anyone who can reach the metric
 |---|---|---|
 | System health dashboard | Phase 7, Issue 7.2 | Server CPU, memory, connection counts, queue depths |
 | Topology map | Phase 7 | Visual map of server nodes, gateways, and agent counts |
-| Grafana dashboard templates | Planned | Pre-built JSON dashboard files in `docs/grafana/` |

@@ -50,4 +50,24 @@ RuleSpecResult derive_rule_spec(const nlohmann::json& body, const std::string& n
                                 std::int64_t version, bool enabled,
                                 const std::string& enforcement_mode);
 
+/// Non-empty human-readable class name iff an ENFORCE-mode registry write at
+/// `key` would land on a high-blast-radius persistence / privilege key (contract
+/// §6 denylist, H1); empty = allowed. The key is canonicalised first (lowercased,
+/// `/`→`\`, repeated separators collapsed, and a single leading `\` prepended so
+/// the separator-anchored tokens match at string start) so a case/separator/
+/// doubled-separator variant cannot dodge the substring match.
+///
+/// Exposed because a rule can reach enforce mode via THREE paths — structured
+/// create/update, the REST metadata-only update, and the dashboard mode toggle —
+/// and the create-time validator covers only the first. Every path that promotes
+/// a rule to enforce (and the push boundary itself) must share this one check, or
+/// the create-only gate is trivially bypassed.
+std::string dangerous_enforce_registry_key(std::string_view key);
+
+/// Parse a canonical `spec_json` and, iff it carries a `registry-value-equals`
+/// assertion whose key is denylisted, return the class name; else "". For callers
+/// that hold only the stored spec (the toggle, the metadata-only update, and the
+/// push builder), not a fresh request body.
+std::string dangerous_enforce_key_in_spec(const std::string& spec_json);
+
 } // namespace yuzu::server::guardian

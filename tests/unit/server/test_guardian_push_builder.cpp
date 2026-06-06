@@ -151,3 +151,48 @@ TEST_CASE("guardian::filter_deployed_members — the Baseline gate", "[guardian_
         CHECK(out[0].rule_id == "a");
     }
 }
+
+TEST_CASE("build_agent_push: enforce on a denylisted key is downgraded to audit (H1 backstop)",
+          "[guardian_push_builder][denylist][h1]") {
+    // A rule can reach enforce mode via the dashboard toggle / metadata-only
+    // update without re-running the create-time validator; the push boundary is
+    // the chokepoint that must neutralise a denylisted enforce-write regardless of
+    // how it got into the store. Downgrade-to-audit preserves detection.
+    GuaranteedStateRuleRow danger;
+    danger.rule_id = "danger";
+    danger.name = "danger";
+    danger.enabled = true;
+    danger.enforcement_mode = "enforce";
+    danger.spec_json =
+        R"({"spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM",)"
+        R"("key":"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",)"
+        R"("value_name":"Evil","value_type":"REG_SZ","expected":"C:\\x.exe"}},)"
+        R"("remediation":{"type":"enforce"}})";
+
+    GuaranteedStateRuleRow safe;
+    safe.rule_id = "safe";
+    safe.name = "safe";
+    safe.enabled = true;
+    safe.enforcement_mode = "enforce";
+    safe.spec_json =
+        R"({"spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM",)"
+        R"("key":"SOFTWARE\\YuzuTest\\Flag","value_name":"X","value_type":"REG_SZ","expected":"1"}},)"
+        R"("remediation":{"type":"enforce"}})";
+
+    auto push = guardian::build_agent_push({danger, safe}, "windows", always_in_scope, true, 1);
+    std::string danger_mode, safe_mode;
+    for (const auto& r : push.rules()) {
+        if (r.rule_id() == "danger")
+            danger_mode = r.enforcement_mode();
+        if (r.rule_id() == "safe")
+            safe_mode = r.enforcement_mode();
+    }
+    CHECK(danger_mode == "audit");  // downgraded — guard still detects, never writes
+    CHECK(safe_mode == "enforce");  // benign key keeps enforce
+    // The assertion is still marshalled (detection preserved), just not enforced.
+    for (const auto& r : push.rules())
+        if (r.rule_id() == "danger")
+            CHECK(r.assertion().type() == "registry-value-equals");
+}
