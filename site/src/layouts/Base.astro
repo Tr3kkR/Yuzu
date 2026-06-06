@@ -1,0 +1,58 @@
+---
+import '../styles/tokens.css';
+import '../styles/global.css';
+import Ether from '../components/Ether.astro';
+
+const {
+  title = 'Yuzu — agentic colleagues for the fleet',
+  description = 'Yuzu places agentic colleagues inside your endpoint estate — reasoning over Windows, Linux, and macOS in real time.',
+} = Astro.props;
+const base = import.meta.env.BASE_URL; // ends with '/'
+---
+<!DOCTYPE html>
+<html lang="en" data-theme="void">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
+  <meta name="description" content={description} />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700;12..96,800&family=Hanken+Grotesk:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
+</head>
+<body>
+  <Ether />
+  <header class="topnav">
+    <a class="tn-brand" href={base}>yuzu</a>
+    <nav>
+      <a href={`${base}vision/`}>Vision</a>
+      <a href={`${base}architecture/`}>Architecture</a>
+      <a href={`${base}manual/getting-started/`}>Manual</a>
+      <a class="ext" href="https://github.com/Tr3kkR/Yuzu">GitHub ↗</a>
+    </nav>
+  </header>
+  <slot />
+
+  <style>
+    .topnav{
+      position:relative; z-index:5;
+      display:flex; align-items:center; justify-content:space-between;
+      max-width:var(--maxw); margin:0 auto; padding:18px 28px;
+    }
+    .tn-brand{
+      font-family:var(--font-display); font-weight:800; font-size:20px;
+      color:var(--ink); letter-spacing:-.02em;
+    }
+    .topnav nav{ display:flex; gap:22px; align-items:center; }
+    .topnav nav a{
+      font-family:var(--font-mono); font-size:12px; letter-spacing:.08em;
+      text-transform:uppercase; color:var(--ink-3); transition:.18s;
+    }
+    .topnav nav a:hover{ color:var(--cyan-bright); }
+    .topnav nav a.ext{ color:var(--ink-4); }
+  </style>
+</body>
+</html>

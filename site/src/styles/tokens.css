@@ -1,0 +1,48 @@
+/* Yuzu docs-site — design tokens. Source of truth for the palette/type. */
+:root{
+  /* base / void */
+  --void:      #070d18;   /* darker-than-product void — front of house            */
+  --bg:        #0e1a2d;   /* product canvas — the reading room rises to here      */
+  --panel-1:   #14223b;
+  --panel-2:   #1a2940;
+  --panel-3:   #243553;
+  --line-1:    #2d4068;
+  --line-2:    #3f5680;
+
+  /* ink */
+  --ink:       #ffffff;
+  --ink-2:     #cfdbe8;
+  --ink-3:     #8fa3bd;
+  --ink-4:     #5b6e8a;
+
+  /* accents — the living signal */
+  --cyan:        #00bceb;
+  --cyan-bright: #1ecfff;
+  --cyan-deep:   #009ec4;
+  --violet:      #b793e6;
+  --violet-deep: #8a63c4;
+  --wrong:       #2fd9c3;   /* almost-cyan, a few degrees off — the seed of unease */
+
+  /* semantic (from product) */
+  --ok:   #4ed27e;
+  --warn: #ffcc00;
+  --bad:  #ff5765;
+
+  /* iridescent gradient — cyan ↔ violet */
+  --iris: linear-gradient(104deg, var(--cyan) 0%, #5cc7ec 38%, var(--violet) 100%);
+
+  /* glow */
+  --glow-cyan:   0 0 0.4em rgba(0,188,235,.45), 0 0 1.6em rgba(0,188,235,.18);
+  --glow-violet: 0 0 0.4em rgba(183,147,230,.40), 0 0 1.6em rgba(183,147,230,.16);
+
+  /* type */
+  --font-display: "Bricolage Grotesque", "Hanken Grotesk", ui-sans-serif, sans-serif;
+  --font-body:    "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono:    "Iosevka Web", "Iosevka", ui-monospace, "SF Mono", "Menlo", "Cascadia Code", monospace;
+  /* DIAGRAM ONLY: lead with guaranteed-1-cell box-drawing fonts so no per-glyph
+     fallback can ever split a line's width. Alignment is sacred. */
+  --font-diagram: "SF Mono", "Menlo", "Iosevka Web", "Cascadia Mono", ui-monospace, monospace;
+
+  --maxw: 1180px;
+  --rad: 4px;
+}
