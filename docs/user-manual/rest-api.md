@@ -3227,7 +3227,7 @@ Guaranteed State alerts (placeholder; alert aggregation lands in Guardian PR 11)
 Guard authoring schema catalog — the static registry of `spark` / `assertion` / `remediation` types with per-type JSON Schemas. Driven by the same param-spec table the server-side validator uses, so the discovery surface and the validator cannot diverge. Drives dynamic authoring forms and agentic clients (the dashboard is one consumer).
 
 - **Permission:** `GuaranteedState:Read`
-- **Response:** `200` with `{version, schemas[]}`, each entry `{kind, type, json_schema}`. Includes the discriminated `registry-value-equals` encoding (per `value_type`) and the `file-hash-equals` `expected_hash` hex format.
+- **Response:** `200` with `{version, schemas[]}`, each entry `{kind, type, json_schema}`. Includes the discriminated `registry-value-equals` encoding (per `value_type`), the `file-hash-equals` `expected_hash` hex format, and the `service-running` / `service-stopped` assertion schemas (with `service_name` pattern validation mirroring the agent's accepted service-name charset). The catalog is the source of truth for which spark/assertion/remediation types the agent actually implements — author against what it lists.
 - **Caching:** carries a content-derived `ETag` and `Cache-Control: public, max-age=300`; a conditional request with `If-None-Match` returns `304 Not Modified`. The catalog is compiled-in, so this endpoint answers even when the rules store is unavailable.
 
 ---

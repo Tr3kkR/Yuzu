@@ -26,7 +26,7 @@ namespace yuzu::agent {
 /// only to enforce-capable guards (registry write-back); a detection-only guard
 /// (file) leaves them at their defaults.
 struct GuardDrift {
-    std::string guard_type{"registry"}; ///< "registry" | "file" — the Spark that produced this
+    std::string guard_type{"registry"}; ///< "registry" | "file" | "service" — the Spark that produced this
     std::string rule_id;
     std::string rule_name;
     std::string detected_value; ///< string-encoded live value / state, or "<absent>"

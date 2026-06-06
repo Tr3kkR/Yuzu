@@ -232,12 +232,19 @@ std::string dangerous_enforce_service_stop(std::string_view service_name) {
         std::string_view why;
     };
     static constexpr Denied kDenied[] = {
+        // Security controls — enforce-stopping these disables endpoint protection.
         {"windefend", "the Microsoft Defender Antivirus service"},
         {"wdnissvc", "the Microsoft Defender Network Inspection service"},
         {"sense", "the Microsoft Defender for Endpoint sensor"},
         {"wscsvc", "the Windows Security Center service"},
         {"mpssvc", "the Windows Defender Firewall service"},
         {"eventlog", "the Windows Event Log service"},
+        // Critical infrastructure — enforce-stopping these strands the agent itself
+        // and breaks the host's ability to launch/recover services (self-inflicted
+        // outage, not a security-control bypass, but equally catastrophic).
+        {"rpcss", "the RPC subsystem (stopping it strands the agent and most Windows services)"},
+        {"dcomlaunch", "the DCOM Server Process Launcher (stopping it breaks service launch/recovery)"},
+        // The agent's own service — enforce-stop would be self-destruct / flap.
         {"yuzuagent", "the Yuzu agent's own service"},
     };
     for (const auto& d : kDenied)

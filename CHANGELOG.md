@@ -78,6 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema catalog (`GET /api/v1/guaranteed-state/schemas`) and the
   `derive_rule_spec` authoring validator publish the new types, bound to the
   agent's `service_support::kStates` by a schema↔handler cross-check (H2/G9).
+  Enforce-*stop* is denied (and downgraded at push) for security services
+  (Defender/Firewall/Security Center/Event Log), critical infrastructure
+  (`RpcSs`/`DcomLaunch`), and the agent's own service, so Guardian cannot be
+  turned into a security-control disabler or strand itself; enforce-*run* is
+  always allowed.
   `service-disabled` (start-type config, which fires no SCM notification) is
   deliberately **not** published yet — express it as a registry guard on
   `…\Services\<name>\Start` = `4` meanwhile. Service guards are authored via

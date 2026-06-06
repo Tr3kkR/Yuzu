@@ -424,10 +424,17 @@ void GuardianRoutes::apply_guard_change(const httplib::Request& req, httplib::Re
         // (contract §6).
         if (mode == "enforce") {
             if (std::string why = guardian::dangerous_enforce_in_spec(rule->spec_json);
-                !why.empty())
+                !why.empty()) {
+                // Audit the blocked enforce-promotion so a denied attempt to (e.g.)
+                // enforce-stop a security service leaves SOC 2 CC7.2 evidence — the
+                // metadata-update path (rest_api_v1) already audits this; the toggle
+                // path must too (governance Gate 6 compliance F1).
+                audit_fn_(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", rule_id,
+                          "enforce on denylisted target: " + why);
                 return fail("Cannot enable enforce mode: this guard targets " + why +
                             ". Keep it in audit mode, or re-author it against a non-protected "
                             "target.");
+            }
         }
         rule->enforcement_mode = mode;
         detail = "enforcement_mode=" + mode;
@@ -627,7 +634,7 @@ std::string GuardianRoutes::render_events_fragment(const std::string& type_filte
 std::string GuardianRoutes::render_guard_detail_fragment(const std::string& guard_id) const {
     // Header fields prefer a real rule lookup; the rest is mock.
     std::string name = guard_id, severity = "high", mode = "enforce", os = "windows",
-                scope = "tag:production-workstations", yaml;
+                scope = "tag:production-workstations", yaml, composition;
     bool real_rule = false;
     if (store_ && store_->is_open()) {
         if (auto r = store_->get_rule(guard_id)) {
@@ -638,8 +645,31 @@ std::string GuardianRoutes::render_guard_detail_fragment(const std::string& guar
             os = r->os_target.empty() ? "all" : r->os_target;
             scope = r->scope_expr;
             yaml = r->yaml_source;
+            // Derive the Composition row from the stored spec so a service/file guard
+            // doesn't show a hardcoded registry label that contradicts the YAML below
+            // (HP-1). Falls back to the demo string for a legacy/unparseable spec.
+            if (auto spec = nlohmann::json::parse(r->spec_json, nullptr, /*exc=*/false);
+                spec.is_object()) {
+                auto block_type = [&](const char* k) -> std::string {
+                    // Guard is_string() explicitly: nlohmann value(key,default) returns the
+                    // default only when the key is ABSENT — a present-but-non-string `type`
+                    // would make it throw type_error.302 out of this render fragment.
+                    if (spec.contains(k) && spec[k].is_object() && spec[k].contains("type") &&
+                        spec[k]["type"].is_string())
+                        return spec[k]["type"].get<std::string>();
+                    return std::string{};
+                };
+                const std::string sp = block_type("spark"), as = block_type("assertion"),
+                                  rm = block_type("remediation");
+                if (!sp.empty() && !as.empty())
+                    composition = "Spark (" + html_escape(sp) + ") &rarr; Assertion (" +
+                                  html_escape(as) + ")" +
+                                  (rm.empty() ? "" : " &rarr; " + html_escape(rm));
+            }
         }
     }
+    if (composition.empty())
+        composition = "Spark (registry-change) &rarr; Assertion (registry-value-equals) &rarr; alert";
     if (yaml.empty())
         yaml = "apiVersion: yuzu.io/v1alpha1\nkind: GuaranteedStateRule\nmetadata:\n  name: " +
                name + "\nspec:\n  spark:\n    type: registry-change\n  assertion:\n    "
@@ -663,8 +693,7 @@ std::string GuardianRoutes::render_guard_detail_fragment(const std::string& guar
             "<div class=\"k\">OS target</div><div>" + html_escape(os) + "</div>"
             "<div class=\"k\">Scope</div><div style=\"font-family:var(--mono);font-size:0.75rem\">" +
             html_escape(scope.empty() ? "(set at Baseline level)" : scope) + "</div>"
-            "<div class=\"k\">Composition</div><div>Spark (registry-change) &rarr; "
-            "Assertion (registry-value-equals) &rarr; alert</div>"
+            "<div class=\"k\">Composition</div><div>" + composition + "</div>"
             "</div>";
 
     html += demo_banner("example per-agent compliance");

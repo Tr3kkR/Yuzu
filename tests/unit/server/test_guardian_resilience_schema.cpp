@@ -459,6 +459,8 @@ TEST_CASE("PR5: enforce service-stopped on a security service is denied at every
         CHECK_FALSE(dangerous_enforce_service_stop("windefend").empty()); // case-insensitive
         CHECK_FALSE(dangerous_enforce_service_stop("Sense").empty());
         CHECK_FALSE(dangerous_enforce_service_stop("wscsvc").empty());
+        CHECK_FALSE(dangerous_enforce_service_stop("RpcSs").empty());      // critical infra
+        CHECK_FALSE(dangerous_enforce_service_stop("dcomlaunch").empty()); // critical infra
         CHECK_FALSE(dangerous_enforce_service_stop("YuzuAgent").empty()); // self-destruct
         CHECK(dangerous_enforce_service_stop("Spooler").empty());         // ordinary service
         CHECK(dangerous_enforce_service_stop("").empty());

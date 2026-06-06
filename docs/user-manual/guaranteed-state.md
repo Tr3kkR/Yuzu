@@ -12,7 +12,7 @@ Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rul
 |---|---|
 | **Rule** | A YAML document describing a desired state, a detection strategy, and an optional remediation. Stored server-side with `yaml_source` as the authoritative form. |
 | **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. The Windows `registry`, `file`, and `service` (run-state) guards are live; service start-type, ETW, and non-Windows guards are on the roadmap. |
-| **Event** | A record of detected drift, attempted remediation, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. Live `event_type` values from the registry guard: `drift.detected` (drift observed in **audit** mode — no write-back), `drift.remediated` (enforce write-back restored the expected value), `remediation.failed` (enforce attempted but the write was denied — e.g. a read-only-fallback key). |
+| **Event** | A record of detected drift, attempted remediation, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. Live `event_type` values (all guard types — registry, file, service): `drift.detected` (drift observed in **audit** mode — no remediation), `drift.remediated` (enforce restored the expected state — a registry write-back, or a service start/stop), `remediation.failed` (enforce attempted but the action was denied — e.g. a read-only-fallback registry key or a service-control access denial). |
 | **Push** | An operator-initiated distribution of the active rule set to a scope of agents. Separates deploy authority (`Push`) from authoring authority (`Write`). |
 | **Enforcement mode** | `enforce` (remediate on drift) or `audit` (log drift, do not remediate). |
 | **Scope expression** | A Scope DSL expression (same engine as Instructions) selecting which agents a rule applies to. |
@@ -98,7 +98,7 @@ A `service-status-change` spark watches one Windows service via `NotifyServiceSt
 | `service-running` | the service is not Running (stopped, paused, or absent) | `service_name` (required) — the SCM **key** name, e.g. `Spooler`, not the display name |
 | `service-stopped` | the service is Running or paused | `service_name` (required) |
 
-In **enforce** mode the guard drives the service back to its desired state via the Windows service-control API (`StartService` / `ControlService` — never `sc.exe` or `net start`), gated by the same per-rule resilience policy as registry guards. In **audit** mode it only detects and reports. This is the canonical way to keep a security service alive — *Microsoft Defender must always be running; restart it if it stops* — or held down — *the Print Spooler must stay stopped*.
+In **enforce** mode the guard drives the service back to its desired state via the Windows service-control API (`StartService` / `ControlService` — never `sc.exe` or `net start`), gated by the same per-rule resilience policy as registry guards. In **audit** mode it only detects and reports. This is the canonical way to keep a security service alive — *Microsoft Defender must always be running; restart it if it stops* — or held down — *the Print Spooler must stay stopped*. Transitional SCM states (`START_PENDING`, `STOP_PENDING`, …) are held: drift is reported only once the service settles into a terminal state, so a normal restart doesn't trigger a spurious enforce loop.
 
 ```bash
 # Keep the Print Spooler stopped (PrintNightmare hardening), enforcing.
@@ -113,7 +113,9 @@ curl -X POST https://yuzu.example.com/api/v1/guaranteed-state/rules \
   }'
 ```
 
-> **`service-disabled` (start-type)** is not yet a native assertion — a service's *startup type* fires no SCM notification. Until a dedicated start-type guard lands, express "service must be disabled" as a **registry** guard on `HKLM\SYSTEM\CurrentControlSet\Services\<name>\Start` = `4` (`REG_DWORD`). Like file guards, service guards are authored via the REST API or the seed rig today; a dashboard authoring form follows.
+> **Enforce-stop is denied for protected services.** So that Guardian — a security-enforcement tool — cannot be turned into a security-control *disabler* (or be made to stop itself), the server **rejects** an `enforce` + `service-stopped` rule (HTTP 400, A4 error envelope) targeting these SCM key names, and the push backstop downgrades any that slip through to `audit`: `WinDefend`, `WdNisSvc`, `Sense`, `wscsvc`, `mpssvc`, `EventLog` (security controls); `RpcSs`, `DcomLaunch` (critical infrastructure — stopping them strands the agent and the host); and `YuzuAgent` (the agent's own service). These services can still be **observed** in `audit` mode. `service-running` enforce (keeping a service *up*) is always allowed. The set covers Windows built-in services + the agent — it does **not** cover third-party EDR/AV; protecting those is on the roadmap (an operator-extensible denylist).
+
+> **`service-disabled` (start-type) has no enforce path yet.** A service's *startup type* fires no SCM notification, so it is not a native assertion. You can **detect** start-type drift with a **registry guard in `audit` mode** on `HKLM\SYSTEM\CurrentControlSet\Services\<name>\Start` (`4` = disabled), but you **cannot enforce** it that way — `…\Services\…` is on the registry enforce denylist (it is a privilege/persistence key), so an `enforce` registry write there is rejected by design. To *set* a service's start type, use Group Policy or your MDM; pair it with a `service-stopped` audit guard to alert if the service runs. Like file guards, service guards are authored via the REST API or the seed rig today; a dashboard authoring form follows.
 
 ## Workflow
 

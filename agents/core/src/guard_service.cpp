@@ -159,7 +159,9 @@ bool is_compliant(ServiceGuard::Desired want, Det got) {
 
 // Same-thread state the APC callback fills and the loop drains. No synchronisation
 // needed: the callback runs as an APC on the watch thread DURING its alertable
-// wait, never concurrently with the loop body.
+// wait, never concurrently with the loop body. PRECONDITION: the drift sink must
+// not itself enter an alertable wait — if it did, a queued APC could re-enter and
+// mutate ctx mid-processing. The gRPC sink does not alertable-wait, so this holds.
 struct WatchCtx {
     DWORD notify_status = ERROR_SUCCESS; ///< SERVICE_NOTIFY.dwNotificationStatus
     DWORD current_state = SERVICE_STOPPED;
@@ -419,10 +421,15 @@ void ServiceGuard::run() try {
                 reconcile();
             continue;
         }
-        // Terminal state: compare / emit / enforce, then re-arm for the next change.
+        // Terminal state: compare / emit / enforce, then ALWAYS re-arm the one-shot.
+        // Unlike RegNotifyChangeKeyValue (which stays armed until it fires), the SCM
+        // notify is CONSUMED on delivery — so even when the resilience strategy scheduled
+        // a timed enforce retry (next_wake_ms set, Backoff/Bounded), we must re-register
+        // now, or the watch goes event-blind for the whole backoff window (up to 60s) and
+        // a real transition is missed until the timer wakes (UP-1). The scheduled
+        // next_wake_ms still drives the timed enforce retry via WAIT_TIMEOUT in parallel;
+        // a transition during the window is now detected in real time and re-evaluated.
         emit(det_from_state(ctx.current_state), 0);
-        if (next_wake_ms)
-            continue; // strategy scheduled a timed retry; don't also re-arm now
         if (NotifyServiceStatusChangeW(svc.get(), kNotifyMask, &notify) != ERROR_SUCCESS)
             reconcile();
     }
