@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="void">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yuzu — Design System · transmission</title>
+
+<!-- Display: Bricolage Grotesque (characterful, faintly uncanny). Body: Hanken Grotesk (readable, not-Inter). -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700;12..96,800&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- Mono: Iosevka in production (full box-drawing build, self-hosted). This OFFLINE PROOF prioritises a
+     guaranteed-1-cell system mono on the diagram so alignment is bulletproof on first eyeball. -->
+
+<style>
+/* ============================================================================
+   TOKENS — harmonised-and-intensified from the product dashboard palette
+   ========================================================================== */
+:root{
+  /* base / void */
+  --void:      #070d18;   /* darker-than-product void — front of house            */
+  --bg:        #0e1a2d;   /* product canvas — the reading room rises to here      */
+  --panel-1:   #14223b;
+  --panel-2:   #1a2940;
+  --panel-3:   #243553;
+  --line-1:    #2d4068;
+  --line-2:    #3f5680;
+
+  /* ink */
+  --ink:       #ffffff;
+  --ink-2:     #cfdbe8;
+  --ink-3:     #8fa3bd;
+  --ink-4:     #5b6e8a;
+
+  /* accents — the living signal */
+  --cyan:        #00bceb;
+  --cyan-bright: #1ecfff;
+  --cyan-deep:   #009ec4;
+  --violet:      #b793e6;
+  --violet-deep: #8a63c4;
+  --wrong:       #2fd9c3;   /* almost-cyan, a few degrees off — the seed of unease */
+
+  /* semantic (from product) */
+  --ok:   #4ed27e;
+  --warn: #ffcc00;
+  --bad:  #ff5765;
+
+  /* iridescent gradient — cyan ↔ violet */
+  --iris: linear-gradient(104deg, var(--cyan) 0%, #5cc7ec 38%, var(--violet) 100%);
+
+  /* glow */
+  --glow-cyan:   0 0 0.4em rgba(0,188,235,.45), 0 0 1.6em rgba(0,188,235,.18);
+  --glow-violet: 0 0 0.4em rgba(183,147,230,.40), 0 0 1.6em rgba(183,147,230,.16);
+
+  /* type */
+  --font-display: "Bricolage Grotesque", "Hanken Grotesk", ui-sans-serif, sans-serif;
+  --font-body:    "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono:    "Iosevka Web", "Iosevka", ui-monospace, "SF Mono", "Menlo", "Cascadia Code", monospace;
+  /* DIAGRAM ONLY: lead with guaranteed-1-cell box-drawing fonts so no per-glyph
+     fallback can ever split a line's width. Alignment is sacred. */
+  --font-diagram: "SF Mono", "Menlo", "Iosevka Web", "Cascadia Mono", ui-monospace, monospace;
+
+  --maxw: 1180px;
+  --rad: 4px;
+}
+
+/* ============================================================================
+   RESET / BASE
+   ========================================================================== */
+*{ box-sizing:border-box; }
+html{ -webkit-text-size-adjust:100%; }
+body{
+  margin:0;
+  background:var(--void);
+  color:var(--ink-2);
+  font-family:var(--font-body);
+  font-size:16px;
+  line-height:1.7;
+  letter-spacing:.005em;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+  overflow-x:hidden;
+}
+a{ color:var(--cyan-bright); text-decoration:none; }
+::selection{ background:rgba(0,188,235,.24); color:#fff; }
+
+/* ============================================================================
+   THE ETHER-FIELD — a slow, breathing aurora substrate. CSS-only.
+   Three blurred frequency-blobs drift on offset loops; faint grain + vignette.
+   ========================================================================== */
+.ether{ position:fixed; inset:0; z-index:-2; overflow:hidden; background:var(--void); }
+.ether::after{ /* vignette pulling the eye inward */
+  content:""; position:absolute; inset:0;
+  background:radial-gradient(120% 90% at 50% 18%, transparent 40%, rgba(3,7,15,.7) 100%);
+}
+.blob{ position:absolute; border-radius:50%; filter:blur(70px); opacity:.42; mix-blend-mode:screen;
+       will-change:transform; }
+.blob.a{ width:62vw; height:62vw; left:-12vw; top:-18vw;
+         background:radial-gradient(circle at 30% 30%, rgba(0,188,235,.85), transparent 62%);
+         animation:drift-a 53s ease-in-out infinite; }
+.blob.b{ width:54vw; height:54vw; right:-14vw; top:6vh;
+         background:radial-gradient(circle at 60% 40%, rgba(183,147,230,.7), transparent 60%);
+         animation:drift-b 67s ease-in-out infinite; }
+.blob.c{ width:48vw; height:48vw; left:24vw; bottom:-22vw;
+         background:radial-gradient(circle at 50% 50%, rgba(47,217,195,.45), transparent 60%);
+         animation:drift-c 79s ease-in-out infinite; }
+@keyframes drift-a{ 0%,100%{ transform:translate3d(0,0,0) scale(1); }
+                    50%{ transform:translate3d(6vw,4vh,0) scale(1.12); } }
+@keyframes drift-b{ 0%,100%{ transform:translate3d(0,0,0) scale(1.05); }
+                    50%{ transform:translate3d(-5vw,6vh,0) scale(.92); } }
+@keyframes drift-c{ 0%,100%{ transform:translate3d(0,0,0) scale(1); }
+                    50%{ transform:translate3d(4vw,-5vh,0) scale(1.15); } }
+
+/* aurora curtains — filamentary vertical rays drifting over the blobs */
+.aurora{ position:absolute; inset:0; mix-blend-mode:screen; pointer-events:none; }
+.curtain{ position:absolute; top:-25%; height:150%; filter:blur(24px); transform-origin:50% 50%;
+  -webkit-mask-image:radial-gradient(56% 72% at 50% 42%, #000 20%, transparent 78%);
+          mask-image:radial-gradient(56% 72% at 50% 42%, #000 20%, transparent 78%); }
+.curtain.c1{ left:5vw; width:42vw;
+  background:
+    repeating-linear-gradient(86deg, transparent 0 7px, rgba(214,245,255,.05) 7px 8px),
+    linear-gradient(178deg, transparent 0%, rgba(0,188,235,.24) 38%, rgba(183,147,230,.15) 66%, transparent 100%);
+  animation:sway1 49s ease-in-out infinite; }
+.curtain.c2{ left:39vw; width:34vw;
+  background:
+    repeating-linear-gradient(95deg, transparent 0 6px, rgba(228,224,255,.045) 6px 7px),
+    linear-gradient(183deg, transparent, rgba(183,147,230,.22) 42%, rgba(47,217,195,.12) 72%, transparent);
+  animation:sway2 63s ease-in-out infinite; }
+.curtain.c3{ right:3vw; width:30vw;
+  background:
+    repeating-linear-gradient(88deg, transparent 0 9px, rgba(214,245,255,.04) 9px 10px),
+    linear-gradient(176deg, transparent, rgba(0,188,235,.18) 45%, transparent);
+  animation:sway3 75s ease-in-out infinite; }
+@keyframes sway1{ 0%,100%{ transform:translateX(0) skewX(-10deg) scaleY(1);    opacity:.55; }
+                  50%{      transform:translateX(5vw) skewX(-16deg) scaleY(1.08); opacity:.85; } }
+@keyframes sway2{ 0%,100%{ transform:translateX(0) skewX(8deg) scaleY(1.05);   opacity:.45; }
+                  50%{      transform:translateX(-4vw) skewX(14deg) scaleY(.95); opacity:.78; } }
+@keyframes sway3{ 0%,100%{ transform:translateX(0) skewX(-6deg);  opacity:.4; }
+                  50%{      transform:translateX(3vw) skewX(-12deg); opacity:.68; } }
+
+.grain{ position:fixed; inset:0; z-index:-1; pointer-events:none; opacity:.05;
+        background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+
+@media (prefers-reduced-motion: reduce){
+  .blob, .curtain{ animation:none !important; }
+}
+
+/* ============================================================================
+   LAYOUT
+   ========================================================================== */
+.wrap{ max-width:var(--maxw); margin:0 auto; padding:0 28px; }
+section{ padding:84px 0; border-top:1px solid rgba(45,64,104,.5); }
+section:first-of-type{ border-top:0; }
+
+/* transmission eyebrow — Iosevka, machine-emitted */
+.eyebrow{
+  font-family:var(--font-mono); font-size:12px; font-weight:500;
+  letter-spacing:.34em; text-transform:uppercase; color:var(--cyan);
+  display:inline-flex; align-items:center; gap:.7em; margin:0 0 22px;
+}
+.eyebrow::before{ content:"//"; color:var(--violet); opacity:.8; }
+.caret{ width:.5em; height:1em; background:var(--cyan); display:inline-block;
+        box-shadow:var(--glow-cyan); animation:blink 1.3s steps(1) infinite; }
+@keyframes blink{ 50%{ opacity:0; } }
+@media (prefers-reduced-motion: reduce){ .caret{ animation:none; } }
+
+h2.kicker{ font-family:var(--font-display); font-weight:700; font-size:clamp(28px,4vw,40px);
+           color:var(--ink); margin:0 0 8px; letter-spacing:-.02em; }
+.section-sub{ color:var(--ink-3); max-width:62ch; margin:0 0 40px; }
+
+/* ============================================================================
+   HERO — front of house, full alien treatment
+   ========================================================================== */
+.hero{ position:relative; padding:128px 0 96px; }
+.hero h1{
+  font-family:var(--font-display); font-weight:800;
+  font-size:clamp(52px, 9vw, 124px); line-height:.92; letter-spacing:-.045em;
+  margin:0 0 24px; color:var(--ink);
+}
+.hero h1 .iris{
+  background:var(--iris); -webkit-background-clip:text; background-clip:text;
+  -webkit-text-fill-color:transparent; color:transparent;
+  /* whisper of iridescence: hue creeps as you scroll, where supported */
+  animation:hue 18s linear infinite;
+}
+@supports (animation-timeline: scroll()){
+  .hero h1 .iris{ animation:hue-scroll linear; animation-timeline:scroll(root); }
+}
+@keyframes hue{ to{ filter:hue-rotate(20deg); } }
+@keyframes hue-scroll{ to{ filter:hue-rotate(34deg); } }
+@media (prefers-reduced-motion: reduce){ .hero h1 .iris{ animation:none; } }
+
+.lede{ font-size:clamp(19px,2.1vw,23px); line-height:1.55; color:var(--ink-2);
+       max-width:46ch; margin:0 0 40px; }
+.lede strong{ color:var(--ink); font-weight:600; }
+
+.cta-row{ display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+.btn{ font-family:var(--font-body); font-weight:600; font-size:15px;
+      padding:13px 24px; border-radius:var(--rad); border:1px solid transparent;
+      cursor:pointer; transition:.18s ease; letter-spacing:.01em; }
+.btn-primary{ background:var(--cyan); color:#04121c; box-shadow:var(--glow-cyan); }
+.btn-primary:hover{ background:var(--cyan-bright); transform:translateY(-1px); }
+.btn-ghost{ background:transparent; color:var(--ink-2); border-color:var(--line-2); }
+.btn-ghost:hover{ border-color:var(--cyan); color:var(--ink); box-shadow:var(--glow-cyan); }
+
+/* ============================================================================
+   THEMED ASCII DIAGRAM — glowing terminal. Alignment is sacred.
+   ========================================================================== */
+.diagram-frame{
+  position:relative; margin:8px 0;
+  background:linear-gradient(180deg, rgba(10,18,33,.92), rgba(7,13,24,.96));
+  border:1px solid var(--line-1); border-radius:6px;
+  box-shadow:0 24px 80px -40px rgba(0,0,0,.9), inset 0 1px 0 rgba(143,163,189,.06);
+  overflow:hidden;
+}
+.diagram-frame::before{ /* transmission header bar */
+  content:"yuzu · topology — Operators → Server → Agent";
+  display:block; font-family:var(--font-mono); font-size:11px; letter-spacing:.18em;
+  text-transform:uppercase; color:var(--ink-3);
+  padding:11px 16px; border-bottom:1px solid var(--line-1);
+  background:rgba(20,34,59,.5);
+}
+.diagram-frame::after{ /* faint scanline ether */
+  content:""; position:absolute; inset:38px 0 0; pointer-events:none; opacity:.5;
+  background:repeating-linear-gradient(0deg, transparent 0 3px, rgba(0,188,235,.025) 3px 4px);
+}
+pre.diagram{
+  margin:0; padding:26px 20px; overflow-x:auto;
+  font-family:var(--font-diagram);
+  font-size:13px; line-height:1.34;
+  white-space:pre;            /* never wrap   */
+  font-variant-ligatures:none;/* no ligatures */
+  letter-spacing:0;           /* no tracking  */
+  tab-size:4;
+  color:#9fdcf2;
+  text-shadow:0 0 9px rgba(0,188,235,.35);
+}
+pre.diagram b{ /* node labels lifted to full ink + cyan glow */
+  color:#eafaff; font-weight:400; text-shadow:0 0 12px rgba(0,188,235,.6); }
+pre.diagram i{ /* the violet, rarer frequency */
+  color:var(--violet); font-style:normal; text-shadow:var(--glow-violet); }
+
+/* ============================================================================
+   SWATCHES
+   ========================================================================== */
+.swatches{ display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:12px; }
+.sw{ border:1px solid var(--line-1); border-radius:var(--rad); overflow:hidden; background:var(--panel-1); }
+.sw .chip{ height:74px; }
+.sw .meta{ padding:9px 11px; font-family:var(--font-mono); font-size:11px; color:var(--ink-3); }
+.sw .meta b{ color:var(--ink-2); font-weight:500; display:block; font-family:var(--font-body); font-size:12px; }
+
+/* ============================================================================
+   TYPE SPECIMEN
+   ========================================================================== */
+.specimen > div{ padding:14px 0; border-bottom:1px dashed rgba(45,64,104,.45); }
+.specimen .label{ font-family:var(--font-mono); font-size:11px; color:var(--ink-4);
+                  letter-spacing:.1em; text-transform:uppercase; }
+.t-display{ font-family:var(--font-display); font-weight:700; font-size:46px; color:var(--ink); letter-spacing:-.03em; line-height:1; }
+.t-h{ font-family:var(--font-display); font-weight:600; font-size:26px; color:var(--ink); letter-spacing:-.01em; }
+.t-body{ font-size:17px; color:var(--ink-2); max-width:64ch; }
+.t-mono{ font-family:var(--font-mono); font-size:15px; color:var(--cyan-bright); }
+
+/* ============================================================================
+   PROSE / READING ROOM
+   ========================================================================== */
+.prose{ max-width:68ch; }
+.prose p{ margin:0 0 18px; color:var(--ink-2); }
+.prose h3{ font-family:var(--font-display); font-weight:600; color:var(--ink);
+           font-size:22px; margin:34px 0 12px; letter-spacing:-.01em; }
+.prose a{ background:linear-gradient(var(--cyan),var(--cyan)) bottom/100% 1px no-repeat;
+          padding-bottom:1px; transition:.18s; }
+.prose a:hover{ background:var(--iris) bottom/100% 2px no-repeat; color:#fff; }
+.prose code{ font-family:var(--font-mono); font-size:.88em; color:var(--violet);
+             background:rgba(183,147,230,.1); padding:.1em .4em; border-radius:3px;
+             border:1px solid rgba(183,147,230,.2); }
+.prose ul{ padding-left:1.1em; }
+.prose li{ margin:.3em 0; }
+.prose li::marker{ color:var(--cyan); }
+
+/* code block (Shiki-style, hand-themed for the proof) */
+.codeblock{ background:#0a1322; border:1px solid var(--line-1); border-radius:6px;
+            font-family:var(--font-mono); font-size:13.5px; line-height:1.65;
+            overflow-x:auto; margin:0 0 18px; }
+.codeblock .cb-head{ padding:8px 14px; border-bottom:1px solid var(--line-1);
+            font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--ink-4); }
+.codeblock pre{ margin:0; padding:16px 18px; white-space:pre; }
+.tok-key{ color:var(--violet); } .tok-str{ color:var(--ok); }
+.tok-fn{ color:var(--cyan-bright); } .tok-com{ color:var(--ink-4); font-style:italic; }
+.tok-num{ color:var(--warn); }
+
+/* tables */
+table{ border-collapse:collapse; width:100%; font-size:14.5px; }
+th,td{ text-align:left; padding:11px 14px; border-bottom:1px solid var(--line-1); }
+thead th{ font-family:var(--font-mono); font-size:11px; letter-spacing:.1em;
+          text-transform:uppercase; color:var(--cyan); border-bottom-color:var(--line-2); }
+tbody tr:hover{ background:rgba(0,188,235,.05); }
+td code{ font-family:var(--font-mono); font-size:.85em; color:var(--ink-2); }
+
+/* callouts / admonitions */
+.callout{ display:grid; grid-template-columns:auto 1fr; gap:14px; align-items:start;
+          padding:16px 18px; border-radius:var(--rad); border:1px solid var(--line-1);
+          border-left-width:3px; margin:0 0 14px; background:var(--panel-1); }
+.callout .ico{ font-family:var(--font-mono); font-weight:700; font-size:13px; padding-top:1px; }
+.callout .ct b{ display:block; font-family:var(--font-mono); font-size:11px; letter-spacing:.12em;
+                text-transform:uppercase; margin-bottom:3px; }
+.callout p{ margin:0; font-size:14.5px; color:var(--ink-2); }
+.c-note{ border-left-color:var(--cyan); } .c-note .ico,.c-note b{ color:var(--cyan); }
+.c-warn{ border-left-color:var(--warn); } .c-warn .ico,.c-warn b{ color:var(--warn); }
+.c-bad{ border-left-color:var(--bad); }   .c-bad .ico,.c-bad b{ color:var(--bad); }
+.c-special{ border-left-color:var(--violet); } .c-special .ico,.c-special b{ color:var(--violet); }
+
+/* sidebar / reading-room chrome mock */
+.chrome{ display:grid; grid-template-columns:230px 1fr; gap:30px; border:1px solid var(--line-1);
+         border-radius:8px; overflow:hidden; background:rgba(14,26,45,.6); }
+.sidebar{ background:rgba(10,18,33,.7); border-right:1px solid var(--line-1); padding:22px 0; }
+.nav-grp{ padding:0 18px; margin-bottom:18px; }
+.nav-grp .gh{ font-family:var(--font-mono); font-size:10.5px; letter-spacing:.16em;
+              text-transform:uppercase; color:var(--ink-4); margin-bottom:8px; }
+.nav-grp a{ display:block; padding:5px 10px; margin:0 -10px; border-radius:4px;
+            color:var(--ink-3); font-size:14px; }
+.nav-grp a:hover{ color:var(--ink); background:rgba(0,188,235,.06); }
+.nav-grp a.on{ color:var(--ink); background:rgba(0,188,235,.1);
+               box-shadow:inset 2px 0 0 var(--cyan); }
+.chrome .body{ padding:26px 26px 26px 0; }
+
+footer{ padding:60px 0; color:var(--ink-4); font-family:var(--font-mono); font-size:12px;
+        letter-spacing:.04em; border-top:1px solid var(--line-1); }
+</style>
+</head>
+<body>
+
+<!-- ETHER-FIELD SUBSTRATE -->
+<div class="ether" aria-hidden="true">
+  <div class="blob a"></div>
+  <div class="blob b"></div>
+  <div class="blob c"></div>
+  <div class="aurora">
+    <span class="curtain c1"></span>
+    <span class="curtain c2"></span>
+    <span class="curtain c3"></span>
+  </div>
+</div>
+<div class="grain" aria-hidden="true"></div>
+
+<!-- ════════════════════════════ HERO ════════════════════════════ -->
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow">agentic colleagues for the fleet <span class="caret"></span></span>
+    <h1>The fleet now has<br><span class="iris">a colleague.</span></h1>
+    <p class="lede">Yuzu places <strong>agentic colleagues</strong> inside your endpoint estate —
+       reasoning over Windows, Linux, and macOS in real time. Not a console. Not a script runner.
+       <strong>Something that was not here before.</strong></p>
+    <div class="cta-row">
+      <button class="btn btn-primary">Enter the architecture</button>
+      <button class="btn btn-ghost">Read the manual</button>
+    </div>
+  </div>
+</header>
+
+<!-- ════════════════════ ARCHITECTURE (showcase) ════════════════════ -->
+<section>
+  <div class="wrap">
+    <span class="eyebrow">the shape of it</span>
+    <h2 class="kicker">One control plane. Three layers.</h2>
+    <p class="section-sub">Operators speak to the Server. The Server reasons, targets, and dispatches.
+       The Agent executes on the endpoint over mTLS. Every edge below is exactly one cell wide —
+       and the build refuses to ship if it isn't.</p>
+
+    <div class="diagram-frame">
+<pre class="diagram" id="arch">┌────────────────────────────────────────────────────────────────┐
+│                           <b>OPERATORS</b>                            │
+│      agentic workers · humans · REST · automation scripts      │
+└────────────────────────────────┴───────────────────────────────┘
+                                 │  HTTPS · MCP · REST
+                                 <i>▼</i>
+┌────────────────────────────────────────────────────────────────┐
+│                          <b>YUZU SERVER</b>                           │
+│                                                                │
+│   ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐   │
+│   │Instruction│  │  Policy   │  │   Scope   │  │   RBAC    │   │
+│   │  Engine   │  │  Engine   │  │  Engine   │  │  + Audit  │   │
+│   └───────────┘  └───────────┘  └───────────┘  └───────────┘   │
+│   ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐   │
+│   │ Response  │  │  Metrics  │  │Management │  │    MCP    │   │
+│   │   Store   │  │ /metrics  │  │  Groups   │  │  Server   │   │
+│   └───────────┘  └───────────┘  └───────────┘  └───────────┘   │
+└────────────────────────────────┬───────────────────────────────┘
+                                 │  gRPC · Protobuf · mTLS
+                                 <i>▼</i>
+┌────────────────────────────────────────────────────────────────┐
+│                           <b>YUZU AGENT</b>                           │
+│     plugin host · trigger engine · KV store · content dist     │
+└────────────────────────────────────────────────────────────────┘</pre>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════ PALETTE ════════════════════════ -->
+<section>
+  <div class="wrap">
+    <span class="eyebrow">the signal</span>
+    <h2 class="kicker">Palette</h2>
+    <p class="section-sub">Inherited from the product, pushed colder. Cyan is the living signal;
+       violet the rarer, stranger frequency; <code style="color:var(--wrong)">#2fd9c3</code> is
+       almost-cyan but a few degrees wrong — the seed of unease, used sparingly.</p>
+    <div class="swatches">
+      <div class="sw"><div class="chip" style="background:#070d18"></div><div class="meta"><b>Void</b>#070d18</div></div>
+      <div class="sw"><div class="chip" style="background:#0e1a2d"></div><div class="meta"><b>Canvas</b>#0e1a2d</div></div>
+      <div class="sw"><div class="chip" style="background:#243553"></div><div class="meta"><b>Panel</b>#243553</div></div>
+      <div class="sw"><div class="chip" style="background:#00bceb"></div><div class="meta"><b>Cyan · signal</b>#00bceb</div></div>
+      <div class="sw"><div class="chip" style="background:#b793e6"></div><div class="meta"><b>Violet · rare</b>#b793e6</div></div>
+      <div class="sw"><div class="chip" style="background:#2fd9c3"></div><div class="meta"><b>Wrong · unease</b>#2fd9c3</div></div>
+      <div class="sw"><div class="chip" style="background:#4ed27e"></div><div class="meta"><b>OK</b>#4ed27e</div></div>
+      <div class="sw"><div class="chip" style="background:#ffcc00"></div><div class="meta"><b>Warn</b>#ffcc00</div></div>
+      <div class="sw"><div class="chip" style="background:#ff5765"></div><div class="meta"><b>Bad</b>#ff5765</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════ TYPE ════════════════════════ -->
+<section>
+  <div class="wrap">
+    <span class="eyebrow">the voice</span>
+    <h2 class="kicker">Typography</h2>
+    <p class="section-sub">Bricolage Grotesque for display — characterful, faintly uncanny.
+       Hanken Grotesk for prose — readable, never Inter. Iosevka for machine text.</p>
+    <div class="specimen">
+      <div><span class="label">Display · Bricolage Grotesque 800</span><div class="t-display">Agentic colleagues</div></div>
+      <div><span class="label">Heading · Bricolage Grotesque 600</span><div class="t-h">A single control plane for the estate</div></div>
+      <div><span class="label">Body · Hanken Grotesk 400</span><div class="t-body">The Server reasons over the whole fleet at once — targeting devices by an expression tree of tags, OS, groups, and the results of earlier queries — then dispatches instructions an agent executes locally and streams back.</div></div>
+      <div><span class="label">Mono · Iosevka</span><div class="t-mono">yuzu scope walk --from result_set:7d3a --where "os:windows"</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════ COMPONENTS ════════════════════════ -->
+<section>
+  <div class="wrap">
+    <span class="eyebrow">reading room</span>
+    <h2 class="kicker">Components</h2>
+    <p class="section-sub">The same DNA, dialled down for reading. Prose, code, tables, callouts —
+       calm enough to copy a flag at 2am.</p>
+
+    <div class="prose">
+      <h3>Scope walking</h3>
+      <p>Yuzu's differentiator: a query's <em>result set</em> becomes a first-class targeting
+         primitive. You <a href="#">walk</a> from one answer into the next —
+         <code>from_result_set:&lt;id&gt;</code> composes with tags and OS filters, and every hop is
+         recorded in the audit chain.</p>
+
+      <div class="codeblock">
+        <div class="cb-head">instruction · yaml</div>
+<pre><span class="tok-com"># target every host that failed last night's patch sweep</span>
+<span class="tok-key">scope</span>:
+  <span class="tok-key">from_result_set</span>: <span class="tok-str">"patch-sweep-2026-06-04"</span>
+  <span class="tok-key">where</span>: <span class="tok-str">"os:windows AND NOT tag:quarantined"</span>
+<span class="tok-key">instruction</span>: <span class="tok-fn">software.patch.apply</span>
+  <span class="tok-key">timeout</span>: <span class="tok-num">3600</span></pre>
+      </div>
+
+      <table>
+        <thead><tr><th>Layer</th><th>Surface</th><th>Transport</th></tr></thead>
+        <tbody>
+          <tr><td>Operators</td><td>REST · MCP · dashboard</td><td><code>HTTPS</code></td></tr>
+          <tr><td>Server → Agent</td><td>command dispatch</td><td><code>gRPC · mTLS</code></td></tr>
+          <tr><td>Agent → plugins</td><td>stable C ABI</td><td><code>.so / .dll</code></td></tr>
+        </tbody>
+      </table>
+
+      <div style="margin-top:28px">
+        <div class="callout c-note"><span class="ico">i</span><div class="ct"><b>Note</b><p>The reading room rises from the void to the product canvas — you've entered the machine.</p></div></div>
+        <div class="callout c-special"><span class="ico">✦</span><div class="ct"><b>Agentic</b><p>Every surface here is reachable by an agentic colleague over MCP, not just by a human with a browser.</p></div></div>
+        <div class="callout c-warn"><span class="ico">!</span><div class="ct"><b>Caution</b><p>Untrusted operator SQL must go through the read-only sandbox, never the trusted connection.</p></div></div>
+        <div class="callout c-bad"><span class="ico">×</span><div class="ct"><b>Danger</b><p>Removing an insecure default is a breaking deploy change — packaging, systemd, compose, and docs all move together.</p></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════ NAV CHROME ════════════════════════ -->
+<section>
+  <div class="wrap">
+    <span class="eyebrow">navigation</span>
+    <h2 class="kicker">The manual, by subsystem</h2>
+    <p class="section-sub">A strong Getting Started on-ramp at the top; fast subsystem lookup below.</p>
+    <div class="chrome">
+      <nav class="sidebar">
+        <div class="nav-grp"><div class="gh">Start</div><a href="#">Getting Started</a><a href="#">Concepts</a></div>
+        <div class="nav-grp"><div class="gh">Instructions</div><a href="#">Instruction Engine</a><a href="#">YAML DSL</a></div>
+        <div class="nav-grp"><div class="gh">Targeting</div><a href="#" class="on">Scope Engine</a><a href="#">Scope Walking</a><a href="#">Asset Tagging</a></div>
+        <div class="nav-grp"><div class="gh">Policy</div><a href="#">Guaranteed State</a><a href="#">Guardian</a></div>
+        <div class="nav-grp"><div class="gh">Interfaces</div><a href="#">REST API</a><a href="#">MCP</a><a href="#">Plugins</a></div>
+      </nav>
+      <div class="body prose">
+        <h3 style="margin-top:0">Scope Engine</h3>
+        <p>The Scope Engine resolves an expression tree — <code>AND</code> / <code>OR</code> /
+           <code>NOT</code> over tags, OS, hostname, arch, agent version, and management groups —
+           into the concrete set of devices an instruction targets.</p>
+        <p>Active link gets a cyan spine and a lifted ink; hover is a 6%-cyan wash. Quiet, legible,
+           unmistakably the same world as the hero.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">yuzu · design-system proof · transmission v0 — navy void · cyan signal · violet rare · iosevka-locked diagrams</div>
+</footer>
+
+</body>
+</html>

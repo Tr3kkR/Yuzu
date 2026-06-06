@@ -62,7 +62,7 @@ do not regress them when shipping PR 2 / PR 3.
 
 ## Granular RBAC (Phase 3)
 
-- 6 roles, 14 securable types, per-operation permissions, deny-override logic.
+- 6 roles, 19 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
 
@@ -189,4 +189,4 @@ The hard invariants for AuthDB-touching changes (file-mode, migration
 pattern, lifetime, config-as-seed-only, role-field ignored, gate-level audit,
 cleanup cadence, snapshot-and-release publishing) live in
 `.claude/agents/authdb.md` — the AuthDB review agent loads them on any
-change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` / `auth_manager.cpp`.
+change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` / `auth.{hpp,cpp}`.

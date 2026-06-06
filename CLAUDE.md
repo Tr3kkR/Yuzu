@@ -89,7 +89,7 @@ Roadmap: `docs/roadmap.md`. Capability map: `docs/capability-map.md`. Headline p
 Meson is the sole build system. **Every time you add, remove, or rename a source file, update `meson.build` in the affected directory** and verify the build compiles.
 
 ### Prerequisites
-- Meson 1.9.2, Ninja
+- Meson 1.11.1, Ninja
 - CMake (required by Meson's cmake dependency method — not used as a build system)
 - C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
 - vcpkg (set `VCPKG_ROOT`)
@@ -218,7 +218,7 @@ The `release:` job in `.github/workflows/release.yml` runs `scripts/check-compos
 **Before tagging a release**, bump the `${YUZU_VERSION:-X.Y.Z}` default in every tracked compose file to the new version and verify locally:
 
 ```bash
-bash scripts/check-compose-versions.sh 0.10.0
+bash scripts/check-compose-versions.sh 0.12.0
 ```
 
 The release job will otherwise fail after all build matrix jobs have run, wasting ~30–60 min of runner time without publishing anything. When adding a new compose file to the repo, also add it to the `FILES` array at the top of `scripts/check-compose-versions.sh` — auto-discovery is deliberately off so opt-in is explicit.
@@ -228,7 +228,7 @@ The release job will otherwise fail after all build matrix jobs have run, wastin
 | Concern | Doc | Loaded by |
 |---|---|---|
 | Authentication, RBAC, headers, tokens, self-target principal-destruction guard (#397/#403) | `docs/auth-architecture.md` | `security-guardian` on auth/RBAC/crypto/header/token change |
-| AuthDB invariants — `auth.db` mode, migration, lifetime, seed-vs-live, role-field-ignored, gate audit, cleanup cadence, snapshot-and-release | `.claude/agents/authdb.md` | `authdb` agent on `auth_db.{hpp,cpp}` / `auth_routes.*` / `auth_manager.cpp` change |
+| AuthDB invariants — `auth.db` mode, migration, lifetime, seed-vs-live, role-field-ignored, gate audit, cleanup cadence, snapshot-and-release | `.claude/agents/authdb.md` | `authdb` agent on `auth_db.{hpp,cpp}` / `auth_routes.*` / `auth.{hpp,cpp}` change |
 | Enterprise A&A roadmap — RBAC, OIDC, SAML, SCIM, MFA, AD/Entra, API tokens, session lifecycle, audit | `.claude/skills/auth-and-authz/SKILL.md` | invoke `/auth-and-authz` for any A&A planning, audit, or implementation work |
 | MCP server architecture, tier-before-RBAC ordering, kill switches, audit pattern | `docs/mcp-server.md` | `security-guardian` on `/mcp/v1/`, `mcp_server.{hpp,cpp}`, `mcp_jsonrpc.hpp`, `mcp_policy.hpp` change |
 | Executions-history ladder — `command_id → execution_id` map, partial-index planner contract, SSE event bus, drawer data-attribute binding, two-consumer / one-bus / one-taxonomy invariant (sprint W5.1 second consumer `/api/v1/events`), `api.v1.events.subscribe` audit verb split, MCP `execute_instruction` as a tracked-execution producer (#1088) | `docs/executions-history-ladder.md` | any change to `agent_service_impl.cpp` `cmd_execution_ids_`, `response_store` execution queries, `execution_event_bus.*`, `execution_tracker.*`, `rest_a4_envelope.{hpp,cpp}`, the `/api/v1/events` handler in `rest_api_v1.cpp`, the `execute_instruction` handler in `mcp_server.cpp`, or executions-drawer markup |
@@ -263,7 +263,7 @@ For server tests that need a live `ExecutionTracker` wired into `AgentServiceImp
 
 ## Agent skills
 
-Per-repo configuration for the Matt Pocock engineering skills (`to-issues`, `triage`, `to-prd`, `qa`, `improve-codebase-architecture`, `diagnose`, `tdd`, `zoom-out`, `grill-with-docs`). Re-run `/setup-matt-pocock-skills` to change.
+Per-repo configuration for the Matt Pocock engineering skills (`to-issues`, `triage`, `to-prd`, `improve-codebase-architecture`, `diagnose`, `tdd`, `zoom-out`, `grill-with-docs`). These are installed **user-global** (`~/.claude/skills/` → `~/.agents/skills/`), not committed to the repo, so they follow the operator rather than collaborators. Re-run `/setup-matt-pocock-skills` to change.
 
 ### Plugin scope — `frontend-design` is marketing-only
 

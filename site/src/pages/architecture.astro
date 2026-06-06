@@ -1,0 +1,40 @@
+---
+import Base from '../layouts/Base.astro';
+---
+<Base title="Architecture — Yuzu">
+  <section class="wrap" style="padding-top:24px">
+    <span class="eyebrow">the shape of it</span>
+    <h2 class="kicker">One control plane. Three layers.</h2>
+    <p class="section-sub">
+      Operators speak to the Server. The Server reasons, targets, and dispatches.
+      The Agent executes on the endpoint over mTLS. Every edge below is exactly one
+      cell wide — and the build refuses to ship if it isn't.
+    </p>
+    <div class="diagram-frame">
+<pre class="diagram" id="arch">┌────────────────────────────────────────────────────────────────┐
+│                           <b>OPERATORS</b>                            │
+│      agentic workers · humans · REST · automation scripts      │
+└────────────────────────────────┴───────────────────────────────┘
+                                 │  HTTPS · MCP · REST
+                                 <i>▼</i>
+┌────────────────────────────────────────────────────────────────┐
+│                          <b>YUZU SERVER</b>                           │
+│                                                                │
+│   ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐   │
+│   │Instruction│  │  Policy   │  │   Scope   │  │   RBAC    │   │
+│   │  Engine   │  │  Engine   │  │  Engine   │  │  + Audit  │   │
+│   └───────────┘  └───────────┘  └───────────┘  └───────────┘   │
+│   ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐   │
+│   │ Response  │  │  Metrics  │  │Management │  │    MCP    │   │
+│   │   Store   │  │ /metrics  │  │  Groups   │  │  Server   │   │
+│   └───────────┘  └───────────┘  └───────────┘  └───────────┘   │
+└────────────────────────────────┬───────────────────────────────┘
+                                 │  gRPC · Protobuf · mTLS
+                                 <i>▼</i>
+┌────────────────────────────────────────────────────────────────┐
+│                           <b>YUZU AGENT</b>                           │
+│     plugin host · trigger engine · KV store · content dist     │
+└────────────────────────────────────────────────────────────────┘</pre>
+    </div>
+  </section>
+</Base>

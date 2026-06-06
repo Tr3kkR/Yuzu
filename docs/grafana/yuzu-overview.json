@@ -139,14 +139,14 @@
     },
     {
       "id": 3,
-      "title": "Commands In Flight",
+      "title": "Command Queue Depth",
       "type": "stat",
       "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         {
-          "expr": "yuzu_commands_in_flight",
-          "legendFormat": "In Flight",
+          "expr": "yuzu_server_command_queue_depth",
+          "legendFormat": "Queue Depth",
           "refId": "A"
         }
       ],
@@ -186,7 +186,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         {
-          "expr": "sum(rate(yuzu_agents_heartbeats_received_total[5m])) * 60",
+          "expr": "sum(rate(yuzu_heartbeats_received_total[5m])) * 60",
           "legendFormat": "Heartbeats/min",
           "refId": "A"
         }
@@ -294,17 +294,17 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum(rate(yuzu_commands_duration_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.50, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le))",
           "legendFormat": "p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.90, sum(rate(yuzu_commands_duration_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.90, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le))",
           "legendFormat": "p90",
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, sum(rate(yuzu_commands_duration_seconds_bucket[5m])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(yuzu_command_duration_seconds_bucket[5m])) by (le))",
           "legendFormat": "p99",
           "refId": "C"
         }
@@ -338,7 +338,7 @@
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "targets": [
         {
-          "expr": "sum(rate(yuzu_agents_heartbeats_received_total[5m])) * 60",
+          "expr": "sum(rate(yuzu_heartbeats_received_total[5m])) * 60",
           "legendFormat": "Heartbeats/min",
           "refId": "A"
         }
