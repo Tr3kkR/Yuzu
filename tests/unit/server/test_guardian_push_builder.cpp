@@ -196,3 +196,28 @@ TEST_CASE("build_agent_push: enforce on a denylisted key is downgraded to audit 
         if (r.rule_id() == "danger")
             CHECK(r.assertion().type() == "registry-value-equals");
 }
+
+TEST_CASE("guardian_enforced_on_platform — Windows only today; unknown is open",
+          "[guardian_push_builder][platform]") {
+    using guardian::guardian_enforced_on_platform;
+    // Guards arm only on Windows (RegistryGuard/FileGuard::start() are no-ops
+    // elsewhere) — so darwin/linux must read as NOT enforced and never armed.
+    CHECK(guardian_enforced_on_platform("windows"));
+    CHECK(guardian_enforced_on_platform("Windows"));  // normalize_os lower-cases (exact token)
+    CHECK_FALSE(guardian_enforced_on_platform("darwin"));
+    CHECK_FALSE(guardian_enforced_on_platform("macos"));  // author/alias token too
+    CHECK_FALSE(guardian_enforced_on_platform("linux"));
+    // Unknown OS (disconnect race / partial registration) must NOT be mislabelled
+    // "not implemented" — fail open, same posture as os_target_matches.
+    CHECK(guardian_enforced_on_platform(""));
+}
+
+TEST_CASE("platform_display_name — raw agent token to operator-facing label",
+          "[guardian_push_builder][platform]") {
+    using guardian::platform_display_name;
+    CHECK(platform_display_name("darwin") == "macOS");  // the case that matters
+    CHECK(platform_display_name("windows") == "Windows");
+    CHECK(platform_display_name("linux") == "Linux");
+    CHECK(platform_display_name("macos") == "macOS");  // alias normalises too
+    CHECK(platform_display_name("") == "unknown");
+}

@@ -75,6 +75,26 @@ bool os_target_matches(std::string_view target, std::string_view agent_os) {
     return normalize_os(target) == normalize_os(agent_os);
 }
 
+bool guardian_enforced_on_platform(std::string_view agent_os) {
+    if (agent_os.empty())
+        return true;  // unknown OS — never mislabel it "not implemented"
+    // Guards arm on Windows only today (guard_registry.cpp / guard_file.cpp start()
+    // return false on every other platform). normalize_os folds darwin->macos and
+    // lower-cases, so a verbose "Windows 11 Pro" still resolves to "windows".
+    return normalize_os(agent_os) == "windows";
+}
+
+std::string platform_display_name(std::string_view agent_os) {
+    const std::string v = normalize_os(agent_os);  // darwin->macos, lower-cased
+    if (v == "windows")
+        return "Windows";
+    if (v == "macos")
+        return "macOS";
+    if (v == "linux")
+        return "Linux";
+    return agent_os.empty() ? std::string{"unknown"} : std::string{agent_os};
+}
+
 ::yuzu::guardian::v1::GuaranteedStatePush
 build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_view agent_os,
                  const std::function<bool(const std::string& scope_expr)>& in_scope,

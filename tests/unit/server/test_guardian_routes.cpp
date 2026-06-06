@@ -99,6 +99,10 @@ struct Harness {
     // "Securable:Operation" entries the perm_fn should DENY (default: grant all).
     std::set<std::string> denied;
 
+    // Registry JSON the agents_json_fn returns — tests set this to inject connected
+    // agents (with "os") so the platform "not implemented" fold can be exercised.
+    std::string agents_json{"[]"};
+
     std::vector<AuditRecord> audit_log;
     std::vector<PushCall> pushes;
 
@@ -135,7 +139,7 @@ struct Harness {
         };
         auto emit_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
                           const nlohmann::json&) {};
-        auto agents_json_fn = []() -> std::string { return "[]"; };
+        auto agents_json_fn = [this]() -> std::string { return agents_json; };
         auto push_fn = [this](const std::string& scope, bool full_sync) -> int {
             pushes.push_back({scope, full_sync});
             return 1;
@@ -377,4 +381,58 @@ TEST_CASE("create_baseline_from_form rejects an unknown member Guard name",
     CHECK(res->body.find("Unknown Guard") != std::string::npos);
     // The unknown name is rejected before the Baseline is created — nothing persists.
     CHECK(h.baselines->list_baselines().empty());
+}
+
+// ── Platform honesty: macOS/Linux agents are no-ops, never "armed" ──────────────
+// The agent-side Guardian arms guards on Windows only today; an operator must never
+// read a connected Mac as compliant/protected when it enforces nothing.
+
+TEST_CASE("overview reports macOS agents as not-implemented, never compliant",
+          "[guardian_routes][platform][notimpl]") {
+    Harness h;
+    // A Guard that targets ALL OSes (empty os_target) so it also targets the Mac.
+    auto rule = make_rule("g1", "GuardOne");
+    rule.os_target = "";
+    REQUIRE(h.store->create_rule(rule));
+    // One connected macOS agent (the agent reports os="darwin"); no Windows agents.
+    h.agents_json = R"([{"agent_id":"mac-1","hostname":"macbook","os":"darwin"}])";
+
+    SECTION("fleet overview shows the honesty banner + a not-implemented census class") {
+        auto res = h.sink.Get("/fragments/guardian/status?view=fleet");
+        REQUIRE(res != nullptr);
+        const std::string& body = res->body;
+        CHECK(body.find("Windows only") != std::string::npos);     // honesty banner
+        CHECK(body.find("macOS 1") != std::string::npos);          // per-platform count
+        CHECK(body.find("Not implemented") != std::string::npos);  // census legend entry
+        // The lone agent is an unenforceable Mac — there is no compliant device-guard
+        // cell, so the green "compliant" census segment is never emitted.
+        CHECK(body.find("% compliant") == std::string::npos);
+    }
+
+    SECTION("per-device drill-down lists the Mac as 'not yet implemented'") {
+        auto res = h.sink.Get("/fragments/guardian/guard/g1");
+        REQUIRE(res != nullptr);
+        const std::string& body = res->body;
+        CHECK(body.find("not yet implemented") != std::string::npos);
+        CHECK(body.find("macbook") != std::string::npos);
+        CHECK(body.find("no-op on macOS") != std::string::npos);
+        // It must NEVER render the Mac as compliant.
+        CHECK(body.find("&#9679; compliant") == std::string::npos);
+    }
+}
+
+TEST_CASE("a Windows-only Guard does not list connected macOS agents at all",
+          "[guardian_routes][platform][notimpl]") {
+    Harness h;
+    auto rule = make_rule("g1", "WinGuard");  // make_rule sets os_target = "windows"
+    REQUIRE(h.store->create_rule(rule));
+    h.agents_json = R"([{"agent_id":"mac-1","hostname":"macbook","os":"darwin"}])";
+
+    // The guard targets Windows only, so the Mac is out of scope — it is neither
+    // listed as a device nor flagged not-implemented (it isn't a deployed-but-unarmed
+    // pair; the guard was never meant for it).
+    auto res = h.sink.Get("/fragments/guardian/guard/g1");
+    REQUIRE(res != nullptr);
+    CHECK(res->body.find("not yet implemented") == std::string::npos);
+    CHECK(res->body.find("macbook") == std::string::npos);
 }

@@ -155,8 +155,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compliance — Fleet / By Guard / By Baseline coverage, a compliant/drifted/error/
   unknown proportion, a 7-day enforcement-effectiveness trend, and per-device
   drill-down — from one liveness-folded rollup (offline agents fold to unknown).
-  The REST `/status` endpoint still returns placeholder zeros; the census is
-  dashboard-only for now.
+  **Platform honesty:** Guardian arms guards on Windows only today (the registry /
+  file guards are agent-side no-ops on macOS and Linux), but deploy is fleet-wide,
+  so connected macOS/Linux agents are reported as a distinct **"not implemented"**
+  class — a fleet banner with per-platform counts, a separate census segment (in the
+  compliant-share denominator, so the headline % drops when targeted Macs can't be
+  enforced), and explicit per-device rows — never folded into compliant or into the
+  offline "unknown" bucket. An operator can never mistake a no-op platform for an
+  armed one. The REST `/status` endpoint still returns placeholder zeros; the census
+  is dashboard-only for now.
 - Per-Guard `prerequisites` column reserved on the Guard store (stored, not yet
   evaluated — engine-side evaluation is deferred).
 - **Guardian `file-change` spark — realtime file change/deletion detection (Change B).**
