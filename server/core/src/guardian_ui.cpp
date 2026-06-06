@@ -138,6 +138,31 @@ extern const char* const kGuardianHtml =
     .guard-meta { font-size: 0.72rem; color: var(--muted); margin-top: 0.3rem;
                   display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
 
+    /* ── Guard item: left content column + right control column ─ */
+    .gi-main { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+    .gi-left { min-width: 0; }
+    .gi-row1 { display: flex; align-items: center; gap: 0.6rem; }
+    .gi-meta { font-size: 0.72rem; color: var(--muted); margin-top: 0.45rem;
+               display: flex; gap: 0.85rem; align-items: center; flex-wrap: wrap; }
+    .gi-mode { font-weight: 700; font-size: 0.86rem; }
+    .gi-mode.observe { color: #a5d6ff; }       /* very light blue */
+    .gi-mode.enforce { color: var(--yellow); } /* dashboard gold */
+    .gi-right { display: flex; flex-direction: column; align-items: flex-end;
+                gap: 0.4rem; flex: none; }
+    .gi-state { font-size: 0.62rem; font-weight: 700; letter-spacing: 0.03em; }
+    .gi-state.on  { color: var(--green); }
+    .gi-state.off { color: var(--muted); }
+    .gi-act { width: 74px; text-align: center; padding: 0.12rem 0; font-size: 0.72rem; }
+    .gi-deploy { margin-top: 0.65rem; font-size: 0.74rem; }
+    .gi-dep-on  { color: #7be3a3; font-weight: 600; } /* lighter green */
+    .gi-dep-off { color: var(--muted); }
+    .gi-bl { color: #ffffff; text-decoration: underline; cursor: pointer; }
+    .gi-bl:hover { color: var(--accent); }
+)HTM"
+    // Split point 0 (MSVC C2026 — string too big): the <style> block crossed 16 KB
+    // after the guard-item CSS grew. Adjacent string literals concatenate at compile
+    // time, so this is purely a source-level cut (no stray whitespace enters the HTML).
+    R"HTM(
     /* ── Event timeline ────────────────────────────────────── */
     .event-list { display: flex; flex-direction: column; }
     .event-item {
@@ -183,6 +208,8 @@ extern const char* const kGuardianHtml =
     .kv { display: grid; grid-template-columns: 130px 1fr; gap: 0.3rem 1rem;
           font-size: 0.78rem; margin-bottom: 0.75rem; }
     .kv .k { color: var(--muted); }
+    /* let long unbreakable values (registry key paths) wrap instead of clipping */
+    .kv > div { min-width: 0; overflow-wrap: anywhere; }
     .detail-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
     .detail-table th {
       text-align: left; padding: 0.35rem 0.5rem;
@@ -228,6 +255,77 @@ extern const char* const kGuardianHtml =
 
     .htmx-indicator { display: none; color: var(--muted); font-size: 0.75rem; }
     .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { display: inline; }
+
+    /* ── New Guard modal ───────────────────────────────────── */
+    .gs-modal-overlay {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.62);
+      display: none; align-items: flex-start; justify-content: center;
+      z-index: 1000; padding: 3rem 1rem; overflow-y: auto;
+    }
+    .gs-modal-overlay.open { display: flex; }
+    .gs-modal-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 0.6rem; width: 100%; max-width: 560px;
+      display: flex; flex-direction: column; overflow: hidden;
+      box-shadow: 0 12px 48px rgba(0,0,0,0.55);
+      /* No height cap: the card grows to its content and the overlay
+         (overflow-y:auto, top-aligned) scrolls the whole modal when tall — so
+         the surface always covers every field and nothing is clipped. */
+    }
+    .gs-modal-header, .gs-modal-footer {
+      display: flex; align-items: center; padding: 0.8rem 1.1rem; flex: none;
+    }
+    .gs-modal-header { justify-content: space-between; border-bottom: 1px solid var(--border); }
+    .gs-modal-header h3 { font-size: 0.95rem; font-weight: 700; }
+    .gs-modal-footer { justify-content: flex-end; gap: 0.5rem; border-top: 1px solid var(--border); }
+    .gs-modal-body { padding: 1.1rem; }
+    .gs-modal-close {
+      background: none; border: none; color: var(--muted);
+      font-size: 1.4rem; line-height: 1; cursor: pointer; padding: 0 0.2rem;
+    }
+    .gs-modal-close:hover { color: var(--fg); }
+
+    /* Schema-driven form helpers */
+    .gs-field { margin-bottom: 0.6rem; }
+    .gs-hint { color: var(--subtle); font-size: 0.68rem; margin-top: 0.2rem; line-height: 1.35; }
+    .gs-trigger-fields {
+      border: 1px solid var(--border); border-radius: 0.4rem;
+      padding: 0.7rem 0.8rem; margin: 0.5rem 0;
+    }
+    .gs-trigger-fields[hidden], .gs-res-field[hidden] { display: none; }
+    .gs-advanced { margin: 0.6rem 0; }
+    .gs-advanced > summary {
+      cursor: pointer; font-size: 0.74rem; color: var(--muted);
+      padding: 0.3rem 0; user-select: none; list-style: none;
+    }
+    .gs-advanced > summary::-webkit-details-marker { display: none; }
+    .gs-advanced > summary::before { content: "\25B8\00a0"; }
+    .gs-advanced[open] > summary::before { content: "\25BE\00a0"; }
+    .gs-advanced[open] > summary { color: var(--fg); }
+    .gs-radio-row { display: flex; gap: 1.2rem; margin: 0.3rem 0 0.2rem; }
+    .gs-radio {
+      display: flex; align-items: center; gap: 0.35rem; margin: 0;
+      font-size: 0.82rem; cursor: pointer; text-transform: none; letter-spacing: normal;
+      color: var(--fg);
+    }
+    .gs-radio input { width: auto; }
+
+    /* New Baseline — member-guards typeahead + chips */
+    .bl-guard-picker { display: flex; gap: 0.5rem; align-items: center; }
+    .bl-guard-picker input { flex: 1 1 auto; width: auto; min-width: 0; }
+    .bl-guard-picker .btn { flex: none; }
+    .bl-chips { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.5rem; }
+    .bl-chip {
+      display: inline-flex; align-items: center; gap: 0.3rem;
+      background: var(--mds-color-state-selected); color: var(--fg);
+      border: 1px solid var(--border); border-radius: 1rem;
+      padding: 0.15rem 0.3rem 0.15rem 0.6rem; font-size: 0.75rem;
+    }
+    .bl-chip-x {
+      background: none; border: none; color: var(--muted);
+      cursor: pointer; font-size: 0.95rem; line-height: 1; padding: 0 0.2rem;
+    }
+    .bl-chip-x:hover { color: var(--red); }
   </style>
 )HTM"
     // Split point 1 (MSVC C2026 — see file header). Adjacent literals concat.
@@ -267,13 +365,15 @@ extern const char* const kGuardianHtml =
       </div>
       <div class="header-actions">
         <button class="btn btn-secondary"
+                onclick="guardianOpenModal()"
                 hx-get="/fragments/guardian/guard-form"
-                hx-target="#guardian-detail" hx-swap="innerHTML">
+                hx-target="#guardian-modal-content" hx-swap="innerHTML">
           + New Guard
         </button>
         <button class="btn btn-secondary"
+                onclick="guardianOpenModal()"
                 hx-get="/fragments/guardian/baseline-form"
-                hx-target="#guardian-detail" hx-swap="innerHTML">
+                hx-target="#guardian-modal-content" hx-swap="innerHTML">
           + New Baseline
         </button>
         <button class="btn btn-secondary"
@@ -300,12 +400,6 @@ extern const char* const kGuardianHtml =
           <button class="view-btn" hx-get="/fragments/guardian/status?view=guard"
                   hx-target="#guardian-status" hx-swap="innerHTML"
                   onclick="gsSetActive(this)">By Guard</button>
-          <button class="view-btn" hx-get="/fragments/guardian/status?view=agent"
-                  hx-target="#guardian-status" hx-swap="innerHTML"
-                  onclick="gsSetActive(this)">By Agent</button>
-          <button class="view-btn" hx-get="/fragments/guardian/status?view=mgroup"
-                  hx-target="#guardian-status" hx-swap="innerHTML"
-                  onclick="gsSetActive(this)">By Management Group</button>
           <button class="view-btn" hx-get="/fragments/guardian/status?view=baseline"
                   hx-target="#guardian-status" hx-swap="innerHTML"
                   onclick="gsSetActive(this)">By Baseline</button>
@@ -369,21 +463,16 @@ extern const char* const kGuardianHtml =
     </div>
 
     <!-- ── Detail drill-in (guard / baseline / forms) ───────── -->
-    <div class="section">
-      <div class="section-header">
-        <svg class="icon"><use href="/static/icons.svg#info"></use></svg>
-        Detail
-      </div>
-      <div class="section-body">
-        <div id="guardian-detail">
-          <div class="empty-state">
-            Select a Guard or Baseline above, or use <strong>+ New Guard</strong> /
-            <strong>+ New Baseline</strong> to compose one.
-          </div>
-        </div>
-      </div>
-    </div>
+    <!-- Guard / Baseline detail opens in the modal (#guardian-modal-content),
+         like New Guard — no inline detail panel at the bottom of the page. -->
 
+  </div>
+
+  <!-- New Guard authoring modal — the form fragment swaps into #guardian-modal-content.
+       Clicking the dimmed backdrop (but not the card) closes it. -->
+  <div class="gs-modal-overlay" id="guardian-modal"
+       onclick="if(event.target===this)guardianCloseModal()">
+    <div id="guardian-modal-content"></div>
   </div>
 
   <div id="toast-container" class="toast-container"></div>
@@ -396,6 +485,76 @@ extern const char* const kGuardianHtml =
       var btns = btn.parentNode.querySelectorAll('.view-btn');
       for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
       btn.classList.add('active');
+    }
+
+    /* ── New Guard modal ───────────────────────────────────── */
+    function guardianOpenModal() {
+      var m = document.getElementById('guardian-modal');
+      if (m) m.classList.add('open');
+    }
+    function guardianCloseModal() {
+      var m = document.getElementById('guardian-modal');
+      if (m) m.classList.remove('open');
+      var c = document.getElementById('guardian-modal-content');
+      if (c) c.innerHTML = '';
+    }
+    /* Trigger-type picker: reveal + enable only the chosen trigger's fieldset.
+       Disabled fieldsets are skipped by HTML5 validation and (belt-and-braces with
+       the namespaced field names) cannot shadow the active type's params on submit. */
+    function guardianPickTrigger(sel) {
+      var form = sel.closest('form');
+      if (!form) return;
+      var sets = form.querySelectorAll('fieldset[data-trigger]');
+      for (var i = 0; i < sets.length; i++) {
+        var on = sets[i].getAttribute('data-trigger') === sel.value;
+        sets[i].hidden = !on;
+        sets[i].disabled = !on;
+      }
+    }
+    /* New Baseline — add the typed/picked guard as a removable chip with a hidden
+       "guards" input so it submits. De-dupes; Enter or the Add button calls this. */
+    function guardianAddGuardChip() {
+      var input = document.getElementById('bl-guard-input');
+      var box = document.getElementById('bl-selected-guards');
+      if (!input || !box) return;
+      var val = (input.value || '').trim();
+      if (!val) return;
+      var existing = box.querySelectorAll('input[name="guards"]');
+      for (var i = 0; i < existing.length; i++) {
+        if (existing[i].value === val) { input.value = ''; return; }
+      }
+      var chip = document.createElement('span');
+      chip.className = 'bl-chip';
+      var hid = document.createElement('input');
+      hid.type = 'hidden'; hid.name = 'guards'; hid.value = val;
+      chip.appendChild(hid);
+      chip.appendChild(document.createTextNode(val + ' '));
+      var x = document.createElement('button');
+      x.type = 'button'; x.className = 'bl-chip-x'; x.textContent = '×';
+      x.onclick = function() { chip.remove(); };
+      chip.appendChild(x);
+      box.appendChild(chip);
+      input.value = '';
+      input.focus();
+    }
+
+    /* Mode picker: remediation/resilience options apply only in Enforce mode. */
+    function guardianPickMode(sel) {
+      var form = sel.closest('form');
+      if (!form) return;
+      var blocks = form.querySelectorAll('.gs-enforce-only');
+      var on = sel.value === 'enforce';
+      for (var i = 0; i < blocks.length; i++) blocks[i].hidden = !on;
+    }
+    /* Resilience: show only the numeric knobs load-bearing for the chosen mode. */
+    function guardianPickResilienceMode(sel) {
+      var box = sel.closest('.gs-resilience');
+      if (!box) return;
+      var fields = box.querySelectorAll('[data-modes]');
+      for (var i = 0; i < fields.length; i++) {
+        var modes = (fields[i].getAttribute('data-modes') || '').split(' ');
+        fields[i].hidden = modes.indexOf(sel.value) === -1;
+      }
     }
 
     /* ── Toast notification system ─────────────────────────── */
@@ -421,6 +580,11 @@ extern const char* const kGuardianHtml =
       var d = e.detail || {};
       showToast(d.message || 'Done', d.level || 'success');
     });
+    /* Close the detail modal in response to an HX-Trigger (used after a Baseline
+       delete, where the modal's subject no longer exists). */
+    document.body.addEventListener('guardianModalClose', function() {
+      guardianCloseModal();
+    });
 
     /* ── Populate nav bar + context bar ─────────────────────── */
     fetch('/api/me').then(function(r){return r.json()}).then(function(d){
@@ -439,6 +603,10 @@ extern const char* const kGuardianHtml =
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
         e.preventDefault();
         window.location.href = '/?palette=1';
+      }
+      if (e.key === 'Escape') {
+        var m = document.getElementById('guardian-modal');
+        if (m && m.classList.contains('open')) guardianCloseModal();
       }
     });
   </script>
