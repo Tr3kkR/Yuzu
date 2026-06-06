@@ -223,21 +223,84 @@ restart.
 ## Emergency MFA disable (break-glass)
 
 **When to use.** An operator (typically an admin) has lost both their
-authenticator device AND every recovery code they were issued. They
-cannot log in. The Settings → Multi-Factor Authentication panel is
-gated behind login so the dashboard path is unreachable. PR1 of the MFA
-ladder does not include an admin "force-disable for user X" REST route;
-that ships in a follow-up.
+authenticator device AND every recovery code they were issued — or has
+been locked out by MFA enforcement (the IdP not asserting `amr`, a sole
+admin who could not enroll). They cannot log in, and the Settings →
+Multi-Factor Authentication panel is gated behind login so the dashboard
+path is unreachable.
 
-**Authorisation.** Direct DB write — must run on the server host as the
-service account that owns `auth.db` (typically `_yuzu` / `yuzu` /
-`NT SERVICE\YuzuAgent`; see `docs/agent-privilege-model.md`). Every
-emergency disable should be logged in your change-management system
-with the operator name, time, and reason — the audit chain in
-`audit.db` will NOT contain a row for this disable (it bypasses the
-audit-emitting code path).
+### Preferred: the `--mfa-reset` CLI (audited, #1226)
 
-**Procedure (Unix).**
+`yuzu-server --mfa-reset <username>` clears the user's MFA enrollment and
+exits **without starting the server**. Unlike the manual SQL below it
+**writes an audit row** (`mfa.reset.breakglass`, principal = the OS
+account that ran it) — so the break-glass is captured in `audit.db`, not
+just your change-management system.
+
+**Authorisation — read the threat model.** `--mfa-reset` is a deliberate
+break-glass primitive: it strips a user's second factor with **no MFA,
+admin-password, or token check of its own**. The *only* enforced control
+is OS-level access — anyone who can execute a `yuzu-server` binary with
+**read access to `data-dir/auth.db`** can downgrade **any** user
+(including the sole admin) to password-only auth. It does not verify it is
+*actually* running as the service account; "run as the service account" is
+the operational expectation, not a code-enforced gate. Treat host access
+to `auth.db` as equivalent to MFA-reset authority for every account, and
+protect it accordingly:
+
+- Run on the server host as the service account that owns `auth.db`
+  (typically `_yuzu` / `yuzu` / `NT SERVICE\YuzuAgent`; see
+  `docs/agent-privilege-model.md`).
+- Keep `data-dir` (and `auth.db`) `0700`/`0600`, owned by the service
+  account, so unprivileged local users cannot read it and thus cannot
+  wield the primitive.
+- Gate the invocation behind a narrow `sudoers` entry (a dedicated
+  break-glass group, ideally with a separate approver) rather than broad
+  `sudo` — the audit principal is the real OS identity (`getpwuid` /
+  `GetUserNameA`, **not** the forgeable `$USER`/`$USERNAME` env var), so a
+  tight sudoers entry gives you trustworthy attribution.
+
+**Detective control — alert on the audit action.** Because the CLI exits
+without starting the server, it emits **no Prometheus metric** — the
+`audit.db` row is the detective signal. Configure your SIEM/log pipeline
+to raise a high-severity alert whenever an `mfa.reset.breakglass` action
+appears in `audit_events`; an unexpected one is an authentication-downgrade
+event and should page on-call.
+
+No TLS/HTTPS flags are required (the command never serves).
+
+**Audit is mandatory and fail-closed (#1226 hardening).** The CLI opens
+and verifies `audit.db` is **writable before** it clears any MFA; if the
+audit store is unavailable (disk full, permissions, corruption) it
+**refuses to proceed and exits non-zero** rather than silently clearing a
+second factor with no evidence. If the audit write fails *after* the clear
+(e.g. disk fills mid-operation) it also exits non-zero with a loud
+"record this reset manually NOW" message. A `{"status":"ok",...}` line on
+stdout with exit code 0 therefore means an audit row **did** persist.
+
+```bash
+sudo -u _yuzu yuzu-server \
+  --config /etc/yuzu/yuzu-server.cfg \
+  --data-dir /var/lib/yuzu \
+  --mfa-reset alice
+# {"status":"ok","user":"alice","action":"mfa.reset.breakglass"}
+```
+
+It is safe to run while the server is up: the CLI opens its **own**
+`auth.db` connection (it does not talk to the running server process), and
+the clear is a single atomic transaction — SQLite's WAL + FULLMUTEX
+serialise it against the server's concurrent reads/writes. The user can now
+sign in with their password alone;
+under MFA enforcement they will be walked through enrollment at next
+login. Still record the action (operator, time, reason) in your
+change-management system — the `audit.db` row plus that record form the
+SOC 2 CC6.6 break-glass evidence chain.
+
+### Fallback: direct SQL (no built binary available)
+
+If a `yuzu-server` binary is not available on the host, the equivalent
+DB surgery is below. **This path does NOT write an audit row** — record
+it manually.
 
 ```bash
 # 1. Stop the server so SQLite is not contended (optional but safer).

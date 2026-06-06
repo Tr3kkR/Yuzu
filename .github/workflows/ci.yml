@@ -316,6 +316,14 @@ jobs:
       - name: Test
         run: meson test -C build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} --print-errorlogs
 
+      # Break-glass MFA-reset CLI contract (#1226) — exit codes + JSON output of
+      # `yuzu-server --mfa-reset` are not exercisable by the Catch2 suite (which
+      # does not drive main()), so cover them here against the just-built binary.
+      - name: Break-glass CLI test
+        env:
+          YUZU_SERVER_BIN: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/server/core/yuzu-server
+        run: bash tests/shell/test_mfa_reset.sh
+
       # Mirror the windows job's upload step so a Linux test failure is
       # diagnosable. meson `--print-errorlogs` truncates per-test output to
       # the last 100 lines, which is enough for a Catch2 failure but loses

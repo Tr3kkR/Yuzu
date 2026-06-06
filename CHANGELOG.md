@@ -65,6 +65,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Break-glass MFA reset CLI (#1226).** `yuzu-server --mfa-reset <username>`
+  clears a user's MFA enrollment and exits without starting the server —
+  the documented recovery from MFA-enforcement lockout (lost device, IdP
+  not asserting `amr`, sole admin who could not enroll). Unlike the manual
+  SQL break-glass it replaces, it **writes an audit row**
+  (`mfa.reset.breakglass`), closing the SOC 2 CC6.6 evidence gap. Requires
+  no TLS/HTTPS flags. Security hardening (adversarial + cybersecurity
+  review): the audit row is **mandatory and fail-closed** — `audit.db` is
+  opened and verified writable *before* any MFA is cleared, and the command
+  exits non-zero rather than silently clearing a second factor with no
+  evidence; the audit principal is the **real OS identity**
+  (`getpwuid`/`GetUserNameA`), not the forgeable `$USER`/`$USERNAME` env
+  var; and the JSON status line is output-escaped. See
+  `docs/ops-runbooks/auth-db-recovery.md` for the threat model and the
+  `mfa.reset.breakglass` alerting hook.
+
 - **MFA enrollment QR code (#1232).** Both MFA enrollment surfaces — the
   Settings panel and the login-time enrollment-bootstrap form — now render
   a scannable QR code (server-side inline SVG via the vendored Nayuki
@@ -396,6 +412,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     AuthDB enroll → verify → login → recovery → disable).
 
 ### Fixed
+
+- **MFA enrollment no longer rotates the provisional secret on re-init
+  (#1227).** `mfa_init_enrollment` on a not-yet-confirmed (provisional)
+  row now **reuses** the existing secret instead of minting a fresh one,
+  so a second browser tab, a retried `/login` enrollment bootstrap, or a
+  re-opened Settings panel no longer invalidates the QR the operator
+  already scanned. The provisional secret is still reaped if abandoned;
+  once enrollment is confirmed, the secret is never re-revealed. The reuse
+  path carries a TOCTOU guard (adversarial + cybersecurity review): it
+  re-checks the freshly-loaded row's `enrolled` flag — read in the same
+  SELECT as the secret, so it is a consistent snapshot — and refuses to
+  re-reveal (`MfaAlreadyEnrolled`) if a concurrent `mfa_verify_enrollment`
+  confirmed the secret between the status-check and the reuse-load on the
+  shared FULLMUTEX connection.
 
 - **Login inputs no longer auto-capitalise on iOS (#1233).** The username,
   MFA-code, and enrollment-code fields on the login page — and the MFA
