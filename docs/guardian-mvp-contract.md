@@ -114,12 +114,9 @@ used as-is — they aren't renames, so they create no split-brain.
 
 4. **Event reporting — push enforces / reports observe / server enriches.**
    - `event_type` is an **open string** over a **frozen v1 taxonomy**:
-     `drift.detected`, `guard.armed`, `guard.compliant`, `guard.unhealthy` (MVP);
-     `drift.remediated`, `remediation.failed` (remediate); `resilience.escalated`,
+     `drift.detected`, `guard.armed`, `guard.unhealthy` (MVP); `drift.remediated`,
+     `remediation.failed` (remediate); `resilience.escalated`,
      `reconciliation.swept` (later). Unknown types render generic, not broken.
-     `guard.compliant` is the agent's **on-change** signal that a watched value is at /
-     returned to expected (emitted on the compliant↔drift edge only, never in steady
-     state); it drives the server-side compliance census (`guardian_agent_rule_status`).
    - The agent reports **observation-only** fields (`rule_id`/guard id, `event_type`,
      `guard_type`, `guard_category`, `detected_value`, `expected_value`,
      `detection_latency_us`, agent-stamped `timestamp`; + `remediation_*` on remediate
@@ -463,14 +460,10 @@ use the `frontend-design` plugin** (product UI, not marketing). Page pattern:
   `policy_generation`; edit-while-deployed→re-expand + **re-push to affected agents only**;
   undeploy→recompute affected agents' union (of *other* deployed Baselines) + push the
   reduced set; delete only from draft. **NFR:** never a fleet-wide re-push on one Baseline
-  edit — only agents in the affected scope (current ∪ previous). Targeting —
-  **SUPERSEDED (2026-06-03) by `docs/guardian-baseline-model.md`.** This contract resolved
-  targeting as *one Scope-DSL expression per Baseline*; the baseline-model doc revises it to
-  an **assignment of included − excluded management groups** (exclude wins — the Intune/Jamf
-  model), with the Scope DSL relocating *inside* dynamic management groups (Smart Groups) and
-  a per-Guard **Prerequisites** gate added on top. The lifecycle (`draft ↔ deployed`) and the
-  affected-agents-only re-push NFR above are unchanged. Deferred: archived state,
-  versioning/rollback.
+  edit — only agents in the affected scope (current ∪ previous). Scope = **one Scope-DSL
+  expression per Baseline** (AND/OR/NOT already covers include/exclude — reuse the existing
+  engine, decision 7). Deferred: archived state, versioning/rollback, Intune-style multiple
+  named assignments (UX sugar, no added targeting power).
 - **G11 — forward-compat on unknown types (RESOLVED *for now — may revisit*).** Same trap
   as silently-deaf: the wrong answer is confidently-wrong. Agent **applies known Guards,
   never fails the whole push**, and marks any Guard with an unknown

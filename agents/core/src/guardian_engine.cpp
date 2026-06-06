@@ -448,13 +448,7 @@ void GuardianEngine::emit_guard_event(const GuardDrift& d) {
     ev.set_detected_value(d.detected_value);
     ev.set_expected_value(d.expected_value);
     ev.set_detection_latency_us(d.detection_latency_us);
-    if (d.compliant) {
-        // Compliant transition (Slice B): the watched state is at / returned to
-        // expected. No remediation fields — a compliant edge is never a write-back.
-        // The server buckets guard.compliant + drift.remediated → compliant; the
-        // guard only emits this on the edge, so steady state adds zero traffic.
-        ev.set_event_type("guard.compliant");
-    } else if (d.remediation_attempted) {
+    if (d.remediation_attempted) {
         ev.set_remediation_action(d.remediation_action);
         ev.set_remediation_success(d.remediation_success);
         ev.set_remediation_latency_us(d.remediation_latency_us);

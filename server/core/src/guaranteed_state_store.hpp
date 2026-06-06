@@ -48,13 +48,6 @@ struct GuaranteedStateRuleRow {
     // from. yaml_source is rendered one-way from this. See
     // docs/guardian-mvp-contract.md decisions 1-2. Empty for pre-migration rows.
     std::string spec_json;
-    // RESERVED (stored, not yet evaluated): the Guard's Prerequisites — a Scope
-    // expression over device facts that must hold for the Guard to apply on a
-    // device, finer than a Baseline's management-group assignment. Authoring +
-    // live agent-side evaluation are engine-dependent and MVP-deferred (the
-    // scope engine must become a shared server+agent lib first); see
-    // docs/guardian-baseline-model.md. Empty for rules with no Prerequisites.
-    std::string prerequisites;
     int64_t version{1};
     bool enabled{true};
     std::string enforcement_mode;  // "enforce" | "audit" (validated at the REST boundary; `enabled` controls disable)
@@ -95,38 +88,6 @@ struct GuaranteedStateEventQuery {
     std::string severity;          // "critical" ... optional
     int limit{100};                // clamped to [1, kMaxEventsLimit] by the store
     int offset{0};
-};
-
-// ── Overview aggregation result types (Slice A dashboard overview) ───────────
-// Per-rule event activity within a window — powers the per-Guard table + the
-// fleet effectiveness rollup. Counts cover the supplied ISO-8601 `since` cutoff.
-struct GuardianRuleActivity {
-    std::string rule_id;
-    int64_t detected{0};        // drift.detected
-    int64_t remediated{0};      // drift.remediated
-    int64_t failed{0};          // remediation.failed
-    int64_t unhealthy{0};       // guard.unhealthy
-    int64_t distinct_agents{0}; // distinct agents with any event in the window
-    std::string last_activity;  // max timestamp in window ("" if none)
-};
-
-// One day's remediation outcomes — for the overview's 7-day trend.
-struct GuardianDayCount {
-    std::string day;        // YYYY-MM-DD
-    int64_t remediated{0};
-    int64_t failed{0};
-};
-
-// One agent's CURRENT compliance state for one rule (Slice B compliance census).
-// Maintained by insert_event from the agent's on-change status feed (guard.compliant
-// / drift.detected / drift.remediated / remediation.failed / guard.unhealthy). The
-// route folds in agent liveness (offline → "unknown") at query time — this row is the
-// last state the agent REPORTED, not a live probe.
-struct GuardianAgentRuleStatus {
-    std::string agent_id;
-    std::string rule_id;
-    std::string state;       // "compliant" | "drifted" | "errored"
-    std::string updated_at;  // ISO-8601 of the event that set it
 };
 
 // Hard upper bound on `GuaranteedStateEventQuery::limit`. Defence-in-depth
@@ -177,20 +138,6 @@ public:
 
     std::vector<GuaranteedStateEventRow> query_events(const GuaranteedStateEventQuery& q = {}) const;
 
-    // ── Overview aggregations (read-only GROUP BY; no event materialisation) ──
-    // Each takes an ISO-8601 `since` cutoff (empty = all retained events) and
-    // aggregates in SQL — kind to RAM/CPU at fleet scale. See the result structs.
-    std::vector<GuardianRuleActivity> rule_activity(const std::string& since = "") const;
-    std::vector<GuardianDayCount> daily_remediations(const std::string& since = "") const;
-
-    // Every (agent, rule) current compliance state from the pruning-immune status
-    // table (Slice B census). One row per pair; the caller buckets by `state` and
-    // applies its own liveness policy (offline agent → "unknown"). Unlike the event
-    // log this survives retention reaping, so a long-quiet compliant guard stays
-    // visible. Pass a `rule_id` to get just that Guard's per-device rows (the Slice C
-    // drill-down, served by idx_gars_rule); empty = the whole fleet. Read-only.
-    std::vector<GuardianAgentRuleStatus> agent_rule_statuses(const std::string& rule_id = "") const;
-
     std::size_t rule_count() const;
     std::size_t event_count() const;
 
@@ -204,14 +151,6 @@ public:
     // A *reconcile* re-push reads this value WITHOUT bumping it, so catching one
     // lagging agent up never makes the rest of the fleet look stale.
     uint64_t current_policy_generation() const;
-
-    // Bump the persisted policy generation WITHOUT mutating any rule. The
-    // Baseline deploy path calls this: deploying (or undeploying) a Baseline
-    // changes which Guards are active on the fleet — the desired set — without
-    // editing any rule, and the heartbeat reconcile keys off the generation to
-    // decide an agent is stale. Takes the write lock (do NOT call while holding
-    // it). The rule-mutation methods bump internally via the _locked variant.
-    void bump_policy_generation();
 
     // Observability — lock-free cumulative counters for Prometheus scraping.
     // Cover the counts that a Prometheus alert on ingest health wants (bytes
@@ -251,14 +190,6 @@ private:
     // hold it). Single fixed UPDATE — no sqlite3_changes() read, so it does not
     // add a #1033 race site.
     void bump_policy_generation_locked();
-
-    // Upsert one (agent, rule) compliance state into guardian_agent_rule_status.
-    // Caller MUST hold mtx_ as a unique_lock (called from insert_event / insert_events
-    // inside their existing lock + transaction). The ON CONFLICT clause is guarded by
-    // `excluded.updated_at >= existing.updated_at` so a late-arriving older event
-    // cannot regress a newer state. No sqlite3_changes() read (not a #1033 site).
-    void upsert_rule_status_locked(const std::string& agent_id, const std::string& rule_id,
-                                   const char* state, const std::string& updated_at);
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;
     // retention_days <= 0 means "never expire" (returns 0, the sentinel the

@@ -4,7 +4,6 @@
 #include <functional>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <vector>
 
 #include "guaranteed_state.pb.h"
@@ -26,17 +25,6 @@ namespace yuzu::server::guardian {
 // Pro") still matches the target "windows" without the false positives a raw
 // substring test would admit (e.g. "win" inside "darwin").
 bool os_target_matches(std::string_view target, std::string_view agent_os);
-
-// The Baseline gate. Returns the subset of `rules` whose rule_id is in
-// `deployed_rule_ids` — the union of member Guards across all *deployed*
-// Baselines. A Guard reaches an agent ONLY as a member of a deployed Baseline
-// (docs/guardian-baseline-model.md); this filter is applied to the push/reconcile
-// rule source so an enabled-but-undeployed Guard never enforces. Order preserved.
-// An empty `deployed_rule_ids` yields an empty result — correct by model (with
-// nothing deployed, a full_sync push converges agents to zero guards).
-std::vector<GuaranteedStateRuleRow>
-filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
-                        const std::unordered_set<std::string>& deployed_rule_ids);
 
 // Build the GuaranteedStatePush addressed to a SINGLE agent. Includes only
 // enabled rules that (a) target this agent's OS and (b) name this agent in their

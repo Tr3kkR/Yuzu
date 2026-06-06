@@ -67,43 +67,6 @@ struct FileDriftCollector {
         std::lock_guard lk(m);
         return events.size();
     }
-    // Drift = a NON-compliant report. Slice B added the guard.compliant edge (one on
-    // arm / baseline, and one on each drift-clear), so "no drift" intent must count
-    // drifts, not raw events.
-    std::size_t drift_count() {
-        std::lock_guard lk(m);
-        std::size_t n = 0;
-        for (const auto& e : events)
-            if (!e.compliant)
-                ++n;
-        return n;
-    }
-    bool wait_drift_count(std::size_t min, std::chrono::milliseconds to) {
-        std::unique_lock lk(m);
-        return cv.wait_for(lk, to, [&] {
-            std::size_t n = 0;
-            for (const auto& e : events)
-                if (!e.compliant)
-                    ++n;
-            return n >= min;
-        });
-    }
-    GuardDrift last_drift() { // most-recent non-compliant report
-        std::lock_guard lk(m);
-        for (auto it = events.rbegin(); it != events.rend(); ++it)
-            if (!it->compliant)
-                return *it;
-        return {};
-    }
-    bool wait_compliant(std::chrono::milliseconds to) {
-        std::unique_lock lk(m);
-        return cv.wait_for(lk, to, [&] {
-            for (const auto& e : events)
-                if (e.compliant)
-                    return true;
-            return false;
-        });
-    }
 };
 
 void write_file(const fs::path& p, const std::string& s = "x") {
@@ -186,8 +149,7 @@ TEST_CASE("FileGuard file-exists: expect-absent detects creation", "[guardian][g
     fs::remove_all(dir);
 }
 
-TEST_CASE("FileGuard file-exists: compliant present state emits one edge then is quiet",
-          "[guardian][guard][file]") {
+TEST_CASE("FileGuard file-exists: compliant present state is quiet", "[guardian][guard][file]") {
     const auto dir = yuzu::test::unique_temp_path("fileguard-quiet");
     fs::create_directories(dir);
     const auto target = dir / "present.txt";
@@ -197,50 +159,14 @@ TEST_CASE("FileGuard file-exists: compliant present state emits one edge then is
     FileGuard::Config cfg;
     cfg.rule_id = "fg-quiet";
     cfg.path = target.string();
-    cfg.expect_present = true; // present == expected → compliant
+    cfg.expect_present = true; // present == expected → no drift
     cfg.event_debounce_ms = 50;
     FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
 
     REQUIRE(g.start());
-    // Slice B: arming compliant emits ONE guard.compliant edge (so the server can
-    // see the rule is green), then the guard stays silent — never drift.
-    REQUIRE(col->wait_compliant(std::chrono::seconds(5)));
-    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+    std::this_thread::sleep_for(std::chrono::milliseconds(800)); // a compliant guard must not emit
     g.stop();
-    CHECK(col->drift_count() == 0); // no drift while compliant
-    fs::remove_all(dir);
-}
-
-TEST_CASE("FileGuard file-exists: drift then clear emits a fresh compliant edge (Slice B)",
-          "[guardian][guard][file][compliant]") {
-    const auto dir = yuzu::test::unique_temp_path("fileguard-clear");
-    fs::create_directories(dir);
-    const auto target = dir / "watched.txt";
-    write_file(target); // present == expected → compliant on arm
-
-    auto col = std::make_shared<FileDriftCollector>();
-    FileGuard::Config cfg;
-    cfg.rule_id = "fg-clear";
-    cfg.path = target.string();
-    cfg.expect_present = true;
-    cfg.event_debounce_ms = 50;
-    FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
-
-    REQUIRE(g.start());
-    REQUIRE(col->wait_compliant(std::chrono::seconds(5))); // arm compliant edge
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-
-    fs::remove(target); // → absent drift
-    REQUIRE(col->wait_drift_count(1, std::chrono::seconds(5)));
-    const auto after_drift = col->size();
-
-    write_file(target); // restored → a fresh compliant edge (rule went green again)
-    REQUIRE(col->wait_count(after_drift + 1, std::chrono::seconds(5)));
-    {
-        std::lock_guard lk(col->m);
-        CHECK(col->events.back().compliant); // the clear is a compliant edge, not a drift
-    }
-    g.stop();
+    CHECK(col->size() == 0);
     fs::remove_all(dir);
 }
 
@@ -262,15 +188,16 @@ TEST_CASE("FileGuard file-hash-equals: detects a content change", "[guardian][gu
     FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
 
     REQUIRE(g.start());
-    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // arm + baseline (compliant edge)
-    CHECK(col->drift_count() == 0); // baseline-on-arm is compliant, not drift
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // arm + baseline; no drift yet
+    CHECK(col->size() == 0);
     write_file(target, "version-two-different"); // content changes
-    REQUIRE(col->wait_drift_count(1, std::chrono::seconds(5)));
+    REQUIRE(col->wait_count(1, std::chrono::seconds(5)));
     g.stop();
     {
-        const auto d = col->last_drift();
-        CHECK(d.guard_type == "file");
-        CHECK(d.detected_value.size() == 64); // a real SHA-256 hex, not a sentinel
+        std::lock_guard lk(col->m);
+        const auto& last = col->events.back();
+        CHECK(last.guard_type == "file");
+        CHECK(last.detected_value.size() == 64); // a real SHA-256 hex, not a sentinel
     }
     fs::remove_all(dir);
 }
@@ -292,11 +219,11 @@ TEST_CASE("FileGuard file-hash-equals: identical-content rewrite stays quiet",
     FileGuard g(cfg, [col](const GuardDrift& d) { col->push(d); });
 
     REQUIRE(g.start());
-    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // baseline (compliant edge)
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // baseline
     write_file(target, "unchanging"); // rewrite SAME bytes → notification, but hash unchanged
     std::this_thread::sleep_for(std::chrono::milliseconds(600)); // settle + eval window
     g.stop();
-    CHECK(col->drift_count() == 0); // content-change semantics: a no-op rewrite is not drift
+    CHECK(col->size() == 0); // content-change semantics: a no-op rewrite is not drift
     fs::remove_all(dir);
 }
 
@@ -414,10 +341,9 @@ TEST_CASE("FileGuard file-exists: survives parent-dir delete and recreate",
     REQUIRE(g.start());
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-    // 1) delete the whole parent directory → file is absent → drift. (Count drifts,
-    //    not raw events — arming present emitted a compliant edge first, Slice B.)
+    // 1) delete the whole parent directory → file is absent → drift.
     fs::remove_all(parent);
-    REQUIRE(col->wait_drift_count(1, std::chrono::seconds(5)));
+    REQUIRE(col->wait_count(1, std::chrono::seconds(5)));
 
     // 2) recreate the parent + file (compliant again), then delete once more — the
     //    guard must have re-armed via the nearest-ancestor watch and detect again.
@@ -426,7 +352,7 @@ TEST_CASE("FileGuard file-exists: survives parent-dir delete and recreate",
     write_file(target);
     std::this_thread::sleep_for(std::chrono::milliseconds(400)); // let it re-arm + re-baseline present
     fs::remove(target);
-    CHECK(col->wait_drift_count(2, std::chrono::seconds(5))); // second <absent> drift proves survival
+    CHECK(col->wait_count(2, std::chrono::seconds(5))); // second <absent> proves survival
     g.stop();
     fs::remove_all(base);
 }

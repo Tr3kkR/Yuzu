@@ -14,7 +14,6 @@
 
 #include <functional>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -130,26 +129,6 @@ TEST_CASE("build_agent_push: legacy rule with empty spec_json is header-only",
     CHECK(push.rules(0).enforcement_mode() == "audit");
     CHECK(push.rules(0).spark().type().empty());        // no spec blocks filled
     CHECK(push.rules(0).assertion().type().empty());
-}
-
-TEST_CASE("guardian::filter_deployed_members — the Baseline gate", "[guardian_push_builder]") {
-    const std::vector<GuaranteedStateRuleRow> rules{
-        row("a", "windows", ""), row("b", "windows", ""), row("c", "linux", "")};
-
-    SECTION("keeps only rules whose id is a deployed-baseline member, order preserved") {
-        auto out = guardian::filter_deployed_members(rules, {"c", "a"});
-        REQUIRE(out.size() == 2);
-        CHECK(out[0].rule_id == "a");   // input order, not set order
-        CHECK(out[1].rule_id == "c");
-    }
-    SECTION("empty deployed set yields nothing — nothing deployed = nothing enforced") {
-        CHECK(guardian::filter_deployed_members(rules, {}).empty());
-    }
-    SECTION("ids with no matching rule are ignored") {
-        auto out = guardian::filter_deployed_members(rules, {"a", "ghost"});
-        REQUIRE(out.size() == 1);
-        CHECK(out[0].rule_id == "a");
-    }
 }
 
 TEST_CASE("build_agent_push: enforce on a denylisted key is downgraded to audit (H1 backstop)",
