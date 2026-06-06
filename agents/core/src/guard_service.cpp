@@ -107,14 +107,20 @@ private:
     SC_HANDLE h_ = nullptr;
 };
 
-// All run-state transitions + deletion. Pending states are included so the
-// immediate callback always reports the current state regardless of how the OS
-// interprets the mask at registration time; the loop HOLDS on pending and only
-// acts on a terminal state.
+// All run-state transitions. Pending states are included so the immediate callback
+// always reports the current state regardless of how the OS interprets the mask at
+// registration time; the loop HOLDS on pending and only acts on a terminal state.
+// NOT SERVICE_NOTIFY_DELETED / _CREATED / _DELETE_PENDING: those are SCM-handle-only
+// flags — combining any of them with a SERVICE handle makes NotifyServiceStatusChange
+// fail with ERROR_INVALID_PARAMETER (87), silently dropping the watch to the degraded
+// poll (caught in Windows UAT, not by the fail-closed unit test). Deletion is still
+// handled: a deleted service transitions to STOPPED (a run-state notify) and/or the
+// next delivery carries dwNotificationStatus == ERROR_SERVICE_MARKED_FOR_DELETE, both
+// of which drive reconcile() → the absent path.
 constexpr DWORD kNotifyMask = SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED |
                               SERVICE_NOTIFY_START_PENDING | SERVICE_NOTIFY_STOP_PENDING |
                               SERVICE_NOTIFY_CONTINUE_PENDING | SERVICE_NOTIFY_PAUSE_PENDING |
-                              SERVICE_NOTIFY_PAUSED | SERVICE_NOTIFY_DELETED;
+                              SERVICE_NOTIFY_PAUSED;
 
 // Degraded re-arm cadence used ONLY while the watched service is absent (cannot arm
 // a service-level notify) or a notify could not be armed. The healthy watch stays
