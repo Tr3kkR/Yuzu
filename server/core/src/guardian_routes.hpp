@@ -97,9 +97,15 @@ private:
     std::string render_guards_fragment(const std::string& status_filter) const;
     std::string render_events_fragment(const std::string& type_filter,
                                        const std::string& severity_filter) const;
-    std::string render_guard_detail_fragment(const std::string& guard_id) const;
     std::string render_baselines_fragment() const;
-    std::string render_baseline_detail_fragment(const std::string& baseline_id) const;
+
+    /// Page-shaped (non-modal) detail render for the full-page routes
+    /// /guardian/baseline/<id> and /guardian/guard/<id>. Same data sources as the
+    /// modal renderers above, laid out as a stats-forward read page (compliance
+    /// hero + tiles + filterable member/device table). Served into the shared
+    /// page shell (guardian_page_ui.cpp) via an hx-get on load.
+    std::string render_baseline_page_fragment(const std::string& baseline_id) const;
+    std::string render_guard_page_fragment(const std::string& guard_id) const;
 
     /// True iff a DEPLOYED Baseline's current member set differs from the set
     /// captured at its last deploy (`deployed_snapshot`) — i.e. members were

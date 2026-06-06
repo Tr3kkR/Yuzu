@@ -274,6 +274,8 @@ The `frontend-design` plugin (`frontend-design@claude-plugins-official`) is scop
 - **Use it on:** the Cedar & Vale sales deck at `deploy/docker/cedar-vale/app/` (standalone Node app — `deck.css`, `machine.js`, slide assets) and any future standalone marketing/landing page. These are presentation apps, not the product.
 - **Do NOT use it on:** the operator dashboard or any product UI — `server/core/src/*_ui.cpp`, `server/core/static/*`. This explicitly includes the **in-product fleet visualization** (`viz_page_ui.cpp`, `viz_host_page_ui.cpp`, `server/core/static/yuzu-viz*.js`, governed by `docs/fleet-viz-invariants.md`) — despite the name, it is product, not marketing. Product UI stays HTMX-first, server-rendered, dark-theme-only; follow the existing dashboard conventions, never `frontend-design`.
 
+**Product UI — no htmx `hx-on`.** The dashboard CSP is `script-src 'self' 'unsafe-inline'` (no `unsafe-eval`); htmx compiles `hx-on:*` handlers with `new Function()`, which CSP **blocks at runtime — the handler silently does nothing**. Use a plain inline `onclick`/`oninput` (allowed by `unsafe-inline`) calling a JS helper, or a `document.body.addEventListener('htmx:afterSettle', …)` body listener, instead. htmx core attrs (`hx-get`/`hx-post`/`hx-target`/`hx-swap`/`hx-trigger`/`hx-swap-oob`, the `HX-Trigger` response header) are fine — they don't eval. Verify button-driven JS by clicking it in a headless browser and checking for a CSP `pageerror`, not just that the page renders. See memory `project-dashboard-csp-no-hx-on.md`.
+
 ### Issue tracker
 
 GitHub issues at `github.com/Tr3kkR/Yuzu` via the `gh` CLI. See `docs/agents/issue-tracker.md`.

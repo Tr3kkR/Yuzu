@@ -378,3 +378,105 @@ TEST_CASE("create_baseline_from_form rejects an unknown member Guard name",
     // The unknown name is rejected before the Baseline is created — nothing persists.
     CHECK(h.baselines->list_baselines().empty());
 }
+
+// ── Full-page detail routes (governance Gate-3 QA: the /page fragments + page
+//    shells had zero handler-level tests; the GuaranteedState:Read gate and the
+//    shell auth-redirect are the access-control properties these lock). ─────────
+
+TEST_CASE("guard/baseline /page fragments are gated on GuaranteedState:Read",
+          "[guardian_routes][page][rbac]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+    h.denied = {"GuaranteedState:Read"};
+
+    auto g = h.sink.dispatch("GET", "/fragments/guardian/guard/g1/page", "", "");
+    REQUIRE(g != nullptr);
+    CHECK(g->status == 403);
+    auto b = h.sink.dispatch("GET", "/fragments/guardian/baseline/bl1/page", "", "");
+    REQUIRE(b != nullptr);
+    CHECK(b->status == 403);
+}
+
+TEST_CASE("guard/baseline /page fragments render a seeded id",
+          "[guardian_routes][page][render]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+
+    auto g = h.sink.dispatch("GET", "/fragments/guardian/guard/g1/page", "", "");
+    REQUIRE(g != nullptr);
+    CHECK(g->status == 200);
+    CHECK(g->body.find("GuardOne") != std::string::npos);
+    CHECK(g->body.find("All guards") != std::string::npos); // back-link present
+
+    auto b = h.sink.dispatch("GET", "/fragments/guardian/baseline/bl1/page", "", "");
+    REQUIRE(b != nullptr);
+    CHECK(b->status == 200);
+    CHECK(b->body.find("BL1") != std::string::npos);
+    CHECK(b->body.find("All baselines") != std::string::npos);
+}
+
+TEST_CASE("guard/baseline /page fragments return a graceful stub for an unknown id",
+          "[guardian_routes][page][notfound]") {
+    Harness h;
+    auto g = h.sink.dispatch("GET", "/fragments/guardian/guard/nope/page", "", "");
+    REQUIRE(g != nullptr);
+    CHECK(g->status == 200);
+    CHECK(g->body.find("not found") != std::string::npos);
+
+    auto b = h.sink.dispatch("GET", "/fragments/guardian/baseline/nope/page", "", "");
+    REQUIRE(b != nullptr);
+    CHECK(b->status == 200);
+    CHECK(b->body.find("not found") != std::string::npos);
+}
+
+TEST_CASE("guard/baseline detail page shells redirect an unauthenticated request",
+          "[guardian_routes][page][auth]") {
+    Harness h;
+    h.session_user = ""; // unauthenticated → auth_fn returns nullopt
+
+    auto g = h.sink.dispatch("GET", "/guardian/guard/g1", "", "");
+    REQUIRE(g != nullptr);
+    CHECK((g->status == 301 || g->status == 302 || g->status == 303));
+    CHECK(g->get_header_value("Location") == "/login");
+
+    auto b = h.sink.dispatch("GET", "/guardian/baseline/bl1", "", "");
+    REQUIRE(b != nullptr);
+    CHECK((b->status == 301 || b->status == 302 || b->status == 303));
+    CHECK(b->get_header_value("Location") == "/login");
+}
+
+TEST_CASE("guard/baseline detail page shells serve the shell with the fragment URL substituted",
+          "[guardian_routes][page][auth]") {
+    Harness h;
+    auto g = h.sink.dispatch("GET", "/guardian/guard/g1", "", "");
+    REQUIRE(g != nullptr);
+    CHECK(g->status == 200);
+    CHECK(g->body.find("/fragments/guardian/guard/g1/page") != std::string::npos); // {{FRAGMENT}}
+    auto b = h.sink.dispatch("GET", "/guardian/baseline/bl1", "", "");
+    REQUIRE(b != nullptr);
+    CHECK(b->status == 200);
+    CHECK(b->body.find("/fragments/guardian/baseline/bl1/page") != std::string::npos);
+}
+
+// Governance sec-H1: the Guard page renders `severity` into a CSS class attribute.
+// A hostile severity (seeded straight into the store, bypassing create-time enum
+// validation) must be html-escaped at the output, never reflected raw.
+TEST_CASE("guard /page escapes a hostile severity in the class attribute",
+          "[guardian_routes][page][security]") {
+    Harness h;
+    auto r = make_rule("g1", "GuardOne");
+    r.severity = "\"><img src=x onerror=alert(1)>";
+    REQUIRE(h.store->create_rule(r));
+
+    auto g = h.sink.dispatch("GET", "/fragments/guardian/guard/g1/page", "", "");
+    REQUIRE(g != nullptr);
+    CHECK(g->status == 200);
+    // The security property: the payload's '<' and '"' must be HTML-escaped so it
+    // cannot break out of the class attribute. (The inert text "onerror=alert"
+    // survives escaping as harmless &lt;-quoted text — that's expected.)
+    CHECK(g->body.find("<img") == std::string::npos);      // no raw tag injected
+    CHECK(g->body.find("sev-\"><") == std::string::npos);  // attribute not broken out
+    CHECK(g->body.find("&lt;img") != std::string::npos);   // proof it was escaped
+}

@@ -24,11 +24,16 @@ and Jamf.
 
 ## Current state (shipped on `feat/guardian-mvp`)
 
-- **New Guard** authoring is a schema-driven modal (registry + file guards, single
+- **New Guard** authoring is a schema-driven form (registry + file guards, single
   **Mode = Watch/Enforce**, resilience gated to Enforce). Guards create + persist
   for real via `/api/v1/guaranteed-state/rules`.
-- **New Baseline** is a modal shell (member-guards typeahead), but **create is a
-  mock** — there is no Baseline backend yet. This design unblocks building it.
+- **New Baseline** authoring is a form (member-guards typeahead); Baselines now
+  create + persist for real via `BaselineStore` (the create is no longer a mock).
+- **Guard and Baseline detail** open as **full pages** (`/guardian/guard/<id>`,
+  `/guardian/baseline/<id>`) — the read-only detail modal was retired. By-Guard and
+  By-Baseline are stats-forward **card lists** (with a By-Guard search/state/severity/
+  mode filter), and the Fleet stat cards navigate into the matching pre-filtered view.
+  (The New-Guard / New-Baseline / Edit-Baseline **authoring forms** remain modals.)
 - "Watch" replaced "Audit" in the **dashboard UI**; the stored/API `enforcement_mode`
   value is still `"audit"` (a wire-rename is a separate, deferred task).
 

@@ -298,6 +298,7 @@ yuzu_server_core_lib = static_library(
     'src/viz_host_page_ui.cpp',
     'src/compliance_ui.cpp',
     'src/guardian_ui.cpp',
+    'src/guardian_page_ui.cpp',
     'src/cel_eval.cpp',
     'src/compliance_eval.cpp',
     'src/workflow_engine.cpp',

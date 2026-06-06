@@ -114,6 +114,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Guardian dashboard redesign — full-page detail, card views, and a Guard
+  filter (UI only; no REST `/api/v1` change).** The Guard and Baseline detail
+  views are now **full pages** (`/guardian/guard/<id>`, `/guardian/baseline/<id>`)
+  replacing the detail modal. The By-Guard and By-Baseline compliance views are
+  stats-forward **card lists** (not tables); By-Guard gained a **filter bar**
+  (free-text search + state / severity / mode). The Fleet stat cards are now
+  **clickable** (jump to the matching sub-view, pre-filtered). The Guard detail
+  page's per-device rows link to the host page; the Baseline page shows its member
+  Guards and recent events; the Recent Events panel has a free-text search box.
+  Baseline **Edit** moved to the Baselines-section card. A CSP fix removed htmx
+  `hx-on` handlers from the product UI (operators see no functional change).
 - **Breaking — Guardian `enforcement_mode` is immutable after creation.**
   `PUT /api/v1/guaranteed-state/rules/{id}` with an `enforcement_mode` that
   differs from the stored value now returns `400` (`enforcement_mode is immutable

@@ -191,9 +191,15 @@ The Baseline surface is on the dashboard (`/guardian` → Baselines). It is **da
 
 ## Compliance overview
 
-The dashboard's compliance overview (`/guardian`) reports live fleet compliance from a per-(agent, rule) census the server maintains off the `guard.compliant` / `drift.*` event stream (table `guardian_agent_rule_status`, deliberately **not** subject to the event-retention reaper, so a long-quiet compliant Guard keeps its real state). Three views — **Fleet**, **By Guard**, **By Baseline** — each show coverage, a compliant/drifted/error/unknown proportion, and a 7-day enforcement-effectiveness trend, with per-device drill-down.
+The dashboard's compliance overview (`/guardian`) reports live fleet compliance from a per-(agent, rule) census the server maintains off the `guard.compliant` / `drift.*` event stream (table `guardian_agent_rule_status`, deliberately **not** subject to the event-retention reaper, so a long-quiet compliant Guard keeps its real state). The Fleet Status panel has three views:
 
-Compliance derives from **one** liveness-folded rollup: an agent that is currently offline folds to **unknown** (its last state is not reported as live truth). The Fleet census, the per-Guard/Baseline tables, and the drill-downs all read that single rollup, so they cannot disagree.
+- **Fleet** — coverage stat cards, a compliant/drifted/error/unknown proportion bar, a "needs attention" summary, and a 7-day enforcement-effectiveness trend. The stat cards are **clickable**: *Guards* / *Baselines* jump to the matching view, *Agents* opens Fleet Viz, and *Guards drifting* / *Enforcement failures* / *Unhealthy Guards* jump to **By Guard** with the matching filter pre-applied.
+- **By Guard** — one **card** per Guard (compliance bar, severity/mode/enabled pills, 7-day detected/remediated counts), above a **filter bar** (free-text search + state / severity / mode). Clicking a card opens the full **Guard detail page** (`/guardian/guard/<id>`).
+- **By Baseline** — one **card** per Baseline (compliance bar, lifecycle, drift counts). Clicking a card opens the full **Baseline detail page** (`/guardian/baseline/<id>`).
+
+The Guard and Baseline detail pages — which **replaced the old detail modal** — show a compliance hero, stat tiles, and a filterable/searchable **per-device census** (on the Guard page, device rows link to the host page `/viz/host/<id>`); the Baseline page also lists its member Guards and recent events, with **Edit** available from the Baselines section on `/guardian`. The **Recent Events** panel on `/guardian` has a free-text search box that filters rows client-side.
+
+Compliance derives from **one** liveness-folded rollup: an agent that is currently offline folds to **unknown** (its last state is not reported as live truth). The Fleet census, the per-Guard/Baseline **cards**, and the detail **pages** all read that single rollup, so they cannot disagree.
 
 > **The REST `/api/v1/guaranteed-state/status` endpoint still returns placeholder zeros** — the live census is dashboard-only at present. A SIEM/automation integration must not read `/status` for compliance; corroborate against the `/events` stream until the status endpoint is wired to the census (tracked follow-up).
 

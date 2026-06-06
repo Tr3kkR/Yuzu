@@ -75,6 +75,9 @@ extern const char* const kGuardianHtml =
     .stat-num.bad  { color: var(--red); }
     .stat-num.info { color: var(--accent); }
     .stat-num.mute { color: var(--muted); }
+    /* Clickable Fleet stat cards (navigate into the matching status sub-view). */
+    .stat-card-nav { transition: border-color 0.12s; }
+    .stat-card-nav:hover { border-color: var(--accent); }
 
     /* Fleet worst-of badge — the single most-severe state present. */
     .worst-badge {
@@ -196,6 +199,59 @@ extern const char* const kGuardianHtml =
     .baseline-scope { font-size: 0.72rem; color: var(--muted); font-family: var(--mono); margin-top: 0.25rem; }
     .lifecycle-draft    { color: var(--muted); }
     .lifecycle-deployed { color: var(--green); }
+
+    /* ── By-Guard / By-Baseline LIST cards + filter (view-switch) ───────── */
+    .gs-filterbar {
+      display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem;
+      padding: 0.5rem 0.65rem; margin-bottom: 0.8rem;
+    }
+    .gs-filterbar input[type="search"] {
+      flex: 1; min-width: 200px; background: var(--surface); border: 1px solid var(--border);
+      border-radius: 0.4rem; color: var(--fg); padding: 0.32rem 0.55rem; font-size: 0.76rem;
+    }
+    .gs-filterbar select {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 0.4rem;
+      color: var(--fg); padding: 0.32rem 0.45rem; font-size: 0.74rem;
+    }
+    .gs-chips { display: flex; gap: 0.35rem; flex-wrap: wrap; }
+    .gs-chip {
+      font-size: 0.7rem; padding: 0.22rem 0.55rem; border-radius: 0.35rem;
+      border: 1px solid var(--border); color: var(--muted); background: var(--surface);
+      cursor: pointer; white-space: nowrap;
+    }
+    .gs-chip.on { color: var(--fg); border-color: var(--accent); }
+    .gs-rescount { font-size: 0.7rem; color: var(--muted); margin-left: auto; }
+
+    .gs-list { display: flex; flex-direction: column; gap: 0.55rem; }
+    .gs-card {
+      display: grid; grid-template-columns: 1.6fr 1.9fr 1fr; gap: 1rem;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 0.5rem;
+      padding: 0.75rem 0.85rem; cursor: pointer; text-decoration: none; color: inherit;
+    }
+    .gs-card:hover { border-color: var(--accent); }
+    .gs-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .gs-card-name { font-weight: 700; font-size: 0.9rem; color: var(--fg); }
+    .gs-card-sub { font-size: 0.7rem; color: var(--muted); margin-top: 0.25rem; }
+    .gs-cpills { display: flex; gap: 0.35rem; align-items: center; margin-top: 0.45rem; flex-wrap: wrap; }
+    .gs-cpill {
+      font-size: 0.6rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
+      border-radius: 0.25rem; padding: 0.05rem 0.35rem; border: 1px solid var(--border);
+    }
+    .gs-cpill.sev-critical, .gs-cpill.sev-high { color: var(--red); border-color: rgba(255,87,101,0.5); }
+    .gs-cpill.sev-medium { color: var(--yellow); border-color: rgba(255,204,0,0.45); }
+    .gs-cpill.sev-low { color: #a5d6ff; }
+    .gs-cpill.observe { color: #a5d6ff; }
+    .gs-cpill.enforce { color: var(--yellow); border-color: rgba(255,204,0,0.45); }
+    .gs-cpill.on { color: var(--green); }
+    .gs-cpill.off { color: var(--muted); }
+    .gs-pbar { display: flex; height: 16px; border-radius: 4px; overflow: hidden; border: 1px solid var(--border); }
+    .gs-pbar > span { display: flex; align-items: center; justify-content: center; font-size: 0.56rem; color: #04101f; font-weight: 700; }
+    .gs-legend { font-size: 0.68rem; color: var(--muted); margin-top: 0.35rem; }
+    .gs-cr { text-align: right; font-size: 0.7rem; color: var(--muted); }
+    .gs-cr .big { font-size: 1.15rem; font-weight: 700; color: var(--fg); line-height: 1.1; }
+    .gs-view { color: var(--accent); font-size: 0.72rem; font-weight: 600; margin-top: 0.35rem; }
+    @media (max-width: 760px) { .gs-card { grid-template-columns: 1fr; } }
 
     /* ── Detail panel ──────────────────────────────────────── */
     .detail-panel {
@@ -432,7 +488,10 @@ extern const char* const kGuardianHtml =
         <div class="section-header">
           <svg class="icon"><use href="/static/icons.svg#activity"></use></svg>
           Recent Events
-          <span class="htmx-indicator" style="margin-left:auto">&middot;&middot;&middot;</span>
+          <input type="search" id="gs-event-q" placeholder="Filter events&hellip;"
+                 oninput="gsEventFilter()" aria-label="Filter recent events"
+                 style="margin-left:auto;background:var(--surface);border:1px solid var(--border);border-radius:0.4rem;color:var(--fg);padding:0.2rem 0.45rem;font-size:0.72rem;max-width:170px">
+          <span class="htmx-indicator">&middot;&middot;&middot;</span>
         </div>
         <div class="section-body">
           <div id="guardian-events"
@@ -486,6 +545,79 @@ extern const char* const kGuardianHtml =
       for (var i = 0; i < btns.length; i++) btns[i].classList.remove('active');
       btn.classList.add('active');
     }
+
+    /* Fleet stat cards → status sub-view navigation. Clicks the matching view
+       button (which runs the hx-get + sets the active tab), and stashes a filter
+       to apply once the new fragment settles (htmx:afterSettle below). */
+    function gsGoView(view, filterState) {
+      window.__gsPendingFilter = (view === 'guard') ? (filterState || null) : null;
+      var btn = document.querySelector('.view-switch .view-btn[hx-get*="view=' + view + '"]');
+      if (btn) btn.click();
+    }
+    document.body.addEventListener('htmx:afterSettle', function (e) {
+      if (e.target && e.target.id === 'guardian-status' && window.__gsPendingFilter) {
+        var fs = window.__gsPendingFilter;
+        window.__gsPendingFilter = null;
+        var chip = document.querySelector('#guardian-status .gs-chip[data-gstate="' + fs + '"]');
+        if (chip) gsGuardState(chip);
+      }
+    });
+
+    /* ── By-Guard list filter: search + state chip + severity + mode ──────
+       The fragment carries the markup (chips/inputs call these); the functions
+       live here on the page so they survive HTMX fragment swaps. State is read
+       from the active chip, so a freshly-swapped fragment (All active, empty
+       search, "Any" selects) needs no explicit reset. */
+    function gsGuardFilter() {
+      var qi = document.getElementById('gs-guard-q');
+      var q = (qi ? qi.value : '').toLowerCase().trim();
+      var sevEl = document.getElementById('gs-guard-sev');
+      var modeEl = document.getElementById('gs-guard-mode');
+      var sev = sevEl ? sevEl.value : 'all';
+      var mode = modeEl ? modeEl.value : 'all';
+      var activeChip = document.querySelector('#guardian-status .gs-chip.on[data-gstate]');
+      var st = activeChip ? activeChip.getAttribute('data-gstate') : 'all';
+      var cards = document.querySelectorAll('#guardian-status .gs-card[data-gstate]');
+      var shown = 0;
+      for (var i = 0; i < cards.length; i++) {
+        var c = cards[i];
+        var ok = (st === 'all' || c.getAttribute('data-gstate') === st)
+          && (sev === 'all' || c.getAttribute('data-gsev') === sev)
+          && (mode === 'all' || c.getAttribute('data-gmode') === mode)
+          && (!q || (c.getAttribute('data-gname') || '').indexOf(q) !== -1);
+        c.style.display = ok ? '' : 'none';
+        if (ok) shown++;
+      }
+      var rc = document.getElementById('gs-guard-rc');
+      if (rc) rc.textContent = shown + ' of ' + cards.length + ' guards';
+    }
+    function gsGuardState(btn) {
+      var chips = btn.parentNode.querySelectorAll('.gs-chip');
+      for (var i = 0; i < chips.length; i++) chips[i].classList.remove('on');
+      btn.classList.add('on');
+      gsGuardFilter();
+    }
+
+    /* ── Recent Events free-text filter ───────────────────────────────────
+       The search box lives in the section header (outside #guardian-events),
+       so it survives the panel's 5s auto-refresh; the body htmx:afterSettle
+       listener below re-runs this after each swap so the active query keeps
+       applying. Matches the whole event row text (time, type, Guard name, agent). */
+    function gsEventFilter() {
+      var qi = document.getElementById('gs-event-q');
+      var q = (qi ? qi.value : '').toLowerCase().trim();
+      var items = document.querySelectorAll('#guardian-events .event-item');
+      for (var i = 0; i < items.length; i++) {
+        var t = (items[i].textContent || '').toLowerCase();
+        items[i].style.display = (!q || t.indexOf(q) !== -1) ? '' : 'none';
+      }
+    }
+    // Re-apply the events filter after each 5s panel refresh. A body listener,
+    // NOT hx-on — the page CSP forbids 'unsafe-eval' and htmx compiles hx-on
+    // handlers with new Function (which CSP blocks).
+    document.body.addEventListener('htmx:afterSettle', function (e) {
+      if (e.target && e.target.id === 'guardian-events') gsEventFilter();
+    });
 
     /* ── New Guard modal ───────────────────────────────────── */
     function guardianOpenModal() {
