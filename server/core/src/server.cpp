@@ -244,6 +244,10 @@ public:
         metrics_.describe("yuzu_server_default_certs_active",
                           "1 when running with built-in per-install default certificates, else 0",
                           "gauge");
+        metrics_.describe("yuzu_server_cert_expiry_timestamp_seconds",
+                          "Unix timestamp (seconds) at which a server certificate expires, by "
+                          "cert label. The yuzu-tls alert rules fire on (value - time()) < window.",
+                          "gauge");
         metrics_.describe("yuzu_agents_registered_total", "Total number of agent registrations",
                           "counter");
         metrics_.describe("yuzu_commands_dispatched_total",
@@ -1673,25 +1677,57 @@ public:
             cfg_.tls_server_key = default_cert_set_.server_key;
             if (cfg_.tls_ca_cert.empty())
                 cfg_.tls_ca_cert = default_cert_set_.ca_cert;
-            // ONLY the agent surface being on default certs relaxes the agent
-            // listener to request-but-don't-require (per-agent mTLS is PR3). An
-            // operator-supplied agent surface keeps the strict REQUIRE posture.
+            // This flag relaxes ONLY the agent listener to request-but-don't-
+            // require on default certs, so an unenrolled agent can bootstrap before
+            // PR3 mints per-agent client certs. It does NOT relax the higher-
+            // privilege management or gateway-upstream planes — those stay STRICT
+            // even in default mode (see run() #1238 H-1). An operator-supplied
+            // agent surface keeps the strict REQUIRE posture.
+            // INVARIANT: using_default_agent_certs ⟹ using_default_certs (it is set
+            // inside this `if (https_needs/agent_needs)` block, only after
+            // using_default_certs is set above). The /healthz ca-store check keys on
+            // the broader using_default_certs (ca.db is needed whenever ANY default
+            // surface is active); the listener relaxation keys on the agent-specific
+            // flag. Keep them in sync if a future mixed-mode is introduced.
             cfg_.using_default_agent_certs = true;
         }
         metrics_.gauge("yuzu_server_default_certs_active").set(1);
+        // B-4 (#1238): the default CA + leaves are 10-year with NO auto-renewal,
+        // so their eventual expiry is otherwise a silent outage. Publish the
+        // absolute notAfter as a timestamp gauge so the yuzu-tls alert rules
+        // (warn @7d / crit @1d) fire ahead of it. The leaves are sized to the CA's
+        // notAfter, so cert="default-ca" is the binding expiry for the whole set.
+        if (default_cert_set_.ca_expires_at.time_since_epoch().count() != 0) {
+            const auto exp_ts = std::chrono::duration_cast<std::chrono::seconds>(
+                                    default_cert_set_.ca_expires_at.time_since_epoch())
+                                    .count();
+            metrics_.gauge("yuzu_server_cert_expiry_timestamp_seconds", {{"cert", "default-ca"}})
+                .set(static_cast<double>(exp_ts));
+        }
         if (default_cert_set_.freshly_generated && audit_store_ && audit_store_->is_open()) {
             (void)audit_store_->log({.timestamp = std::time(nullptr),
                                      .principal = "system",
                                      .principal_role = "system",
                                      .action = "server.default_certs_generated",
                                      .target_type = "server",
-                                     .target_id = default_cert_set_.ca_fingerprint_sha256,
-                                     .detail = "Generated per-install default CA + server leaves",
+                                     // #1238 should-fix: startup-posture rows key
+                                     // target_id on the feature, not a value, to
+                                     // match sibling rows; fingerprint goes in detail.
+                                     .target_id = "default-certs",
+                                     .detail = "Generated per-install default CA + server leaves; "
+                                               "ca_fingerprint=" +
+                                               default_cert_set_.ca_fingerprint_sha256,
                                      .result = "warning"});
         }
         const std::time_t exp =
             std::chrono::system_clock::to_time_t(default_cert_set_.ca_expires_at);
-        std::string exp_str = std::ctime(&exp);
+        // std::ctime returns nullptr on an out-of-range time_t (reachable with a
+        // 10-year expiry on a 32-bit time_t build) — constructing a std::string
+        // from nullptr is UB and would crash AFTER certs are generated. Guard it.
+        // (The banner runs once at startup, single-threaded, so ctime's shared
+        // static buffer is not a reentrancy concern here.)
+        const char* exp_c = std::ctime(&exp);
+        std::string exp_str = exp_c ? exp_c : "unknown";
         if (!exp_str.empty() && exp_str.back() == '\n')
             exp_str.pop_back();
         spdlog::error("**********************************************************************");
@@ -1813,7 +1849,31 @@ public:
                     return;
                 }
                 mgmt_creds = std::move(mgmt_tls);
+            } else if (cfg_.using_default_agent_certs) {
+                // H-1 (#1238 review): on default certs the AGENT listener relaxes
+                // to request-but-don't-require so an unenrolled agent can bootstrap
+                // before PR3 mints per-agent client certs. The management and
+                // gateway-upstream planes are higher-privilege — do NOT inherit
+                // that relaxation. Build a STRICT (require-client-cert) credential
+                // from the same default server cert/key/CA. In M1 the gRPC mgmt
+                // service is a placeholder so this locks out no real workflow; it
+                // stops the privileged plane silently accepting unauthenticated
+                // peers. A gateway (PR5) presents the default-gateway client leaf,
+                // so the gateway-upstream listener still connects.
+                auto mgmt_tls = build_tls_credentials(
+                    cfg_.tls_server_cert, cfg_.tls_server_key, cfg_.tls_ca_cert,
+                    cfg_.allow_one_way_tls, /*require_client_cert=*/true, "management listener");
+                if (!mgmt_tls) {
+                    spdlog::error("Management TLS credentials (strict, default certs) are invalid; "
+                                  "refusing to start");
+                    startup_failed_ = true;
+                    return;
+                }
+                mgmt_creds = std::move(mgmt_tls);
             } else {
+                // Operator-supplied agent certs: agent_creds is already strict
+                // (require_client_cert = !using_default_agent_certs = true), so the
+                // management plane safely reuses it.
                 mgmt_creds = agent_creds;
             }
         }
@@ -1893,6 +1953,38 @@ public:
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
                 // Reap Subscribe streams for agents that missed heartbeats
                 registry_.reap_stale_sessions(cfg_.session_timeout);
+                // PR3 H-1: tear down any live Subscribe stream whose agent leaf
+                // has since been revoked. The Subscribe establishment gate runs
+                // once; without this sweep a revoked/compromised agent keeps
+                // receiving dispatched commands until it voluntarily reconnects.
+                // ~15s cadence (this thread) is well inside CRL validity windows;
+                // PR4's operator-revoke handler calls the same sweep immediately
+                // for prompt teardown. No-op unless the internal CA is active.
+                if (ca_store_ && ca_store_->is_open()) {
+                    const auto swept = registry_.sweep_revoked(
+                        [this](const std::string& pem) { return is_peer_cert_revoked(pem); });
+                    if (!swept.empty()) {
+                        spdlog::warn("Revocation sweep cancelled {} Subscribe stream(s)",
+                                     swept.size());
+                        // HIGH-1 (#1239 Hermes): a revocation-driven access termination
+                        // is a durable SOC 2 CC6.3/CC7.2 event, not just a metric/log.
+                        // The sweep is low-frequency (fires only on actual revocations),
+                        // so a WAL row per cancelled stream is not a flood risk.
+                        if (audit_store_ && audit_store_->is_open()) {
+                            for (const auto& aid : swept) {
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "agent:" + aid,
+                                     .principal_role = "agent",
+                                     .action = "session.cert_revoked",
+                                     .target_type = "Session",
+                                     .target_id = aid,
+                                     .detail = "reason=revoked_client_cert source=stream_sweep",
+                                     .result = "denied"});
+                            }
+                        }
+                    }
+                }
                 // Publish cert reload counters to Prometheus
                 if (cert_reloader_) {
                     metrics_.gauge("yuzu_server_cert_reloads_total")
@@ -2188,6 +2280,15 @@ public:
         // pointer. Null it before reset for belt-and-braces.
         agent_service_.set_execution_tracker(nullptr);
 
+        // PR3 cpp-safety: the PKI trust callbacks capture `this` and are invoked
+        // from Register/Subscribe/Heartbeat/CheckForUpdate/DownloadUpdate. The
+        // drain above guarantees no handler is mid-invocation; null them for the
+        // same belt-and-braces reason as the tracker so a stray late call cannot
+        // touch released CA state.
+        agent_service_.set_agent_cert_signer(nullptr);
+        agent_service_.set_revocation_checker(nullptr);
+        agent_service_.set_peer_cert_recognizer(nullptr);
+
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
         // PR 3 — bus outlives the tracker by member-order convention,
@@ -2343,6 +2444,52 @@ private:
             spdlog::warn("PKI: agent CSR signing requested but ca.db has no root");
             return std::nullopt;
         }
+
+        // HIGH-2 (#1239 Hermes): block revocation bypass via re-enrollment. A
+        // compromised endpoint whose leaf was revoked could otherwise delete its
+        // local key, reconnect, and trigger this CSR flow to obtain a FRESH leaf
+        // with a new serial — silently resurrecting a revoked identity. If this
+        // agent_id has a revoked, non-expired cert on record, refuse to auto-issue:
+        // clearing a revocation must be a deliberate operator action, not an
+        // automatic side effect of the agent dropping its key. A non-revoked
+        // orphan (benign key loss) is unaffected — only an ACTIVE revocation
+        // blocks re-provisioning. (sign_agent_csr is rate-limited and only runs at
+        // enrollment/renewal, so the list_revoked scan is off the hot path.)
+        //
+        // CONTRACT: ca_issued.subject for an agent cert is the BARE agent_id (set
+        // below at `rec.subject = agent_id`), NOT a "CN=..." DN — so the bare-vs-bare
+        // compare below is correct. Do NOT "fix" this into a DN parse without also
+        // changing the issuance site. Residuals (tracked, narrow): a revoke landing
+        // between this scan and signing still issues (TOCTOU — operator re-revokes;
+        // the sweep then tears it down), and list_revoked() is an O(revoked) scan
+        // (fine at realistic revocation counts; a subject-indexed query is the
+        // follow-up if it ever grows).
+        {
+            const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
+            for (const auto& rev : ca_store_->list_revoked()) {
+                if (rev.subject == agent_id && rev.not_after > now_epoch) {
+                    spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
+                                 "non-expired cert (serial {}) exists; an operator must clear "
+                                 "the revocation before this agent can re-provision",
+                                 agent_id, rev.serial_hex);
+                    metrics_
+                        .counter("yuzu_server_ca_reissue_blocked_total",
+                                 {{"reason", "revoked_identity"}})
+                        .increment();
+                    if (audit_store_ && audit_store_->is_open()) {
+                        (void)audit_store_->log({.timestamp = std::time(nullptr),
+                                                 .principal = "agent:" + agent_id,
+                                                 .principal_role = "agent",
+                                                 .action = "ca.cert.reissue_blocked",
+                                                 .target_type = "AgentCertificate",
+                                                 .target_id = rev.serial_hex,
+                                                 .detail = "reason=revoked_identity cn=" + agent_id,
+                                                 .result = "denied"});
+                    }
+                    return std::nullopt;
+                }
+            }
+        }
         // Hermes MEDIUM-4: per-agent issuance rate-limit. A holder of a valid
         // enrollment credential could otherwise spam Register-with-CSR, each call
         // burning an ECDSA sign + a ca.db row. A legitimate agent issues once per
@@ -2396,7 +2543,11 @@ private:
 
         pki::LeafParams lp;
         lp.subject = {agent_id, "Yuzu"}; // CN=agent_id → #1118 identity match
-        lp.validity = {now, not_after};
+        // H-2: backdate not_before by the clock-skew allowance so an agent whose
+        // clock lags the server can still present this leaf on its immediate
+        // reconnect (a not-yet-valid leaf fails the handshake and the agent does
+        // not recover from clock skew). Mirrors the validity_* helpers.
+        lp.validity = {now - pki::kClockSkewBackdate, not_after};
         lp.usage = pki::LeafUsage{.client_auth = true};
         // Install-scoped URI SAN (defence in depth + forensic identity). The CA
         // fingerprint (colon-stripped → a valid URI authority) is the per-install
@@ -3276,10 +3427,16 @@ private:
             // /api/v1/offload-targets endpoint and every fire_event call
             // silently no-ops on a migration failure (HC-1 from Gate 6).
             bool offload_target_ok = offload_target_store_ && offload_target_store_->is_open();
+            // #1238 B-3: ca.db is load-bearing whenever default certs are active
+            // (issuance / revocation / CRL). It was wired into /readyz but missing
+            // here, so /healthz could report "healthy" with a dead ca.db. Mirrors
+            // the /readyz conjunction; trivially true when not on default certs
+            // (the operator brought their own, so ca.db isn't required).
+            bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
 
             // Determine overall status
             bool all_stores_ok = response_ok && audit_ok && instruction_ok && policy_ok &&
-                                 guaranteed_state_ok && offload_target_ok;
+                                 guaranteed_state_ok && offload_target_ok && ca_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -3292,7 +3449,8 @@ private:
                   {"instructions", instruction_ok ? "ok" : "error"},
                   {"policies", policy_ok ? "ok" : "error"},
                   {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
-                  {"offload_target", offload_target_ok ? "ok" : "error"}}},
+                  {"offload_target", offload_target_ok ? "ok" : "error"},
+                  {"ca", ca_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.

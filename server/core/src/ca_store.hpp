@@ -18,9 +18,11 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 struct sqlite3;
@@ -68,6 +70,11 @@ struct IssuedCertRecord {
     std::string issued_by;             ///< Yuzu principal that triggered issuance.
     std::string enrollment_request_id; ///< Correlation handle to the enrollment.
     std::string cert_pem;              ///< Full issued leaf PEM (forensic/audit).
+    /// SHA-256 fingerprint of the ROOT that signed this leaf. Links the inventory
+    /// to a specific root so a subordinate-CA re-key (PR6, set_root replaces id=1)
+    /// does not orphan issued certs. Empty until a caller populates it; added in
+    /// PR1 so ca.db's schema is stable before first deploy.
+    std::string issuer_fingerprint;
 };
 
 struct CrlVersionRecord {
@@ -76,7 +83,19 @@ struct CrlVersionRecord {
     int64_t this_update{0};
     int64_t next_update{0};
     int64_t published_at{0};
+    /// SHA-256 fingerprint of the root that signed this CRL (see IssuedCertRecord).
+    /// Empty until populated; prevents serving an old-root CRL after a re-key.
+    std::string issuer_fingerprint;
 };
+
+/// Canonicalise a certificate serial to the engine's stored form — uppercase
+/// hex with no colons or whitespace (BN_bn2hex form). The engine emits serials
+/// in this form; an operator/REST-supplied serial (PR4) may arrive lowercase or
+/// colon-decorated, which would otherwise silently miss revoke()/is_revoked()
+/// (a revoked cert that keeps validating). Returns nullopt on an empty or
+/// non-hex input so callers fail closed (mirrors x509_ca::build_crl's bad-serial
+/// precedent). Pure string transform — ca.db deliberately links no crypto.
+[[nodiscard]] std::optional<std::string> normalize_serial_hex(std::string_view serial);
 
 class CaStore {
 public:
@@ -112,9 +131,44 @@ public:
     [[nodiscard]] bool record_crl(const CrlVersionRecord& rec);
     [[nodiscard]] std::optional<CrlVersionRecord> latest_crl();
 
+    /// Builds the signed CRL DER for an allocated `crl_number` over the supplied
+    /// `revoked` inventory. Returns empty to abort (e.g. a bad serial — fail
+    /// closed). Runs under crl_publish_mu_ only (NOT the connection lock), so it
+    /// may load the CA key + sign without blocking issuance, and may even call
+    /// back into CaStore's mu_-guarded methods — though it needn't, as `revoked`
+    /// is supplied. It MUST NOT call publish_next_crl itself (crl_publish_mu_ is a
+    /// plain, non-recursive mutex).
+    using CrlBuilder =
+        std::function<std::vector<uint8_t>(uint64_t crl_number,
+                                           const std::vector<IssuedCertRecord>& revoked)>;
+
+    /// Allocate the next CRL number, build the DER for THAT number, and persist
+    /// it — serialised by crl_publish_mu_ so two concurrent publishers can never
+    /// claim the same number (RFC 5280 §5.2.3 monotonicity) or clobber a
+    /// generation. The crlNumber must be embedded in the signed DER, so the
+    /// allocation and build are fused via `build` (not a bare `INSERT … SELECT
+    /// MAX+1 … RETURNING`); `build` gets the allocated number + the current
+    /// revoked set. The connection lock is taken only for the brief DB steps, NOT
+    /// across signing. Returns the persisted record, or nullopt on any failure
+    /// (nothing inserted; the number is not consumed).
+    [[nodiscard]] std::optional<CrlVersionRecord>
+    publish_next_crl(const CrlBuilder& build, int64_t this_update, int64_t next_update,
+                     const std::string& issuer_fingerprint = {});
+
 private:
+    /// Set once in the constructor (and only nulled there, on a migration
+    /// failure, before the object is handed out). Never mutated afterwards, so
+    /// is_open()'s unlocked read of db_ is race-free.
     sqlite3* db_{nullptr};
-    std::mutex mu_;
+    std::mutex mu_; ///< Connection lock — guards every sqlite call on db_.
+    /// Serialises CRL *publishes* against each other — a distinct, coarser lock
+    /// than mu_ — so two concurrent publish_next_crl callers cannot allocate the
+    /// same crlNumber WITHOUT holding the connection lock across the signing
+    /// callback (which loads the CA key + signs). Acquire crl_publish_mu_ only at
+    /// the top of publish_next_crl, never while holding mu_, to keep lock order
+    /// consistent. (Cross-process publishers — not the M1 single-server model —
+    /// are still caught by record_crl's plain INSERT refusing a duplicate.)
+    std::mutex crl_publish_mu_;
 
     void run_migrations();
 };

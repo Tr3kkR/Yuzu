@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <openssl/bn.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -26,6 +27,14 @@
 #endif
 
 namespace yuzu::agent {
+
+// This module uses OpenSSL 3.0 entry points (EVP_EC_gen, ASN1_TIME_to_tm). The
+// agent is the widest-deployed Yuzu binary, so fail the build loudly on a
+// distro that still ships 1.1.1 rather than emit a binary that link-fails or
+// mis-behaves at runtime on an endpoint (#1239 should-fix).
+static_assert(OPENSSL_VERSION_NUMBER >= 0x30000000L,
+              "Yuzu agent CSR generation requires OpenSSL >= 3.0 "
+              "(EVP_EC_gen / ASN1_TIME_to_tm). Rebuild against OpenSSL 3.x.");
 
 namespace fs = std::filesystem;
 
@@ -69,7 +78,7 @@ std::string bio_to_string(BIO* bio) {
 }
 
 template <typename Fn>
-std::optional<std::string> to_pem(Fn&& write_fn, std::string_view ctx) {
+std::optional<std::string> to_pem(Fn&& write_fn, std::string_view ctx, bool sensitive = false) {
     BIO_ptr bio{BIO_new(BIO_s_mem())};
     if (!bio) {
         log_ssl_errors(ctx);
@@ -79,7 +88,17 @@ std::optional<std::string> to_pem(Fn&& write_fn, std::string_view ctx) {
         log_ssl_errors(ctx);
         return std::nullopt;
     }
-    return bio_to_string(bio.get());
+    auto out = bio_to_string(bio.get());
+    // cpp-safety (#1239): for a private key, scrub the BIO's in-memory copy
+    // before BIO_free (which does NOT zero the buffer). The returned std::string
+    // is the caller's to scrub (agent.cpp zeroes pending_key_pem after persist).
+    if (sensitive) {
+        char* data = nullptr;
+        const long len = BIO_get_mem_data(bio.get(), &data);
+        if (data && len > 0)
+            OPENSSL_cleanse(data, static_cast<std::size_t>(len));
+    }
+    return out;
 }
 
 constexpr std::size_t kMaxPemSize = 1024 * 1024; // 1 MiB — far above any cert/key
@@ -255,7 +274,7 @@ std::optional<KeyAndCsr> generate_key_and_csr(const std::string& agent_id) {
         [&](BIO* b) {
             return PEM_write_bio_PrivateKey(b, key.get(), nullptr, nullptr, 0, nullptr, nullptr);
         },
-        "generate_key_and_csr key to_pem");
+        "generate_key_and_csr key to_pem", /*sensitive=*/true);
     if (!key_pem)
         return std::nullopt;
 
