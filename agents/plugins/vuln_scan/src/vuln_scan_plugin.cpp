@@ -676,7 +676,6 @@ public:
                 std::lock_guard<std::mutex> lock(g_dynamic_rules_mutex);
                 g_dynamic_rules = std::make_shared<std::vector<yuzu::vuln::CveRuleDynamic>>(std::move(loaded));
             }
-            ctx.storage_set("rules.last_loaded", rules_path);
             ctx.write_output("INFO|update_rules|Rules loaded|" + std::to_string(count) + " rules active");
             return 0;
         }
