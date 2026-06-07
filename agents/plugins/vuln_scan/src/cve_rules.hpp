@@ -92,6 +92,9 @@ inline std::pair<long long, std::string_view> split_epoch(std::string_view v) {
     for (char c : epoch_str) {
         if (c < '0' || c > '9')
             return {0, v};
+        // Bounds check: prevent integer overflow on unreasonable epoch values (>99)
+        if (epoch > 9)
+            return {0, v};
         epoch = epoch * 10 + (c - '0');
     }
     return {epoch, v.substr(colon + 1)};
@@ -288,7 +291,7 @@ struct CveRuleDynamic {
 static constexpr int kRuleSchemaVersion = 1;
 
 /// Load rules from a JSON file. Returns empty string on success, error on failure.
-/// Does NOT throw.
+/// Does NOT throw — all exceptions are caught and converted to error strings.
 inline std::string load_rules_from_json(const std::string& path,
                                         std::vector<CveRuleDynamic>& out) {
     std::ifstream f(path);
@@ -298,30 +301,31 @@ inline std::string load_rules_from_json(const std::string& path,
     nlohmann::json j;
     try {
         f >> j;
-    } catch (const nlohmann::json::parse_error& e) {
-        return std::string("JSON parse error: ") + e.what();
+
+        // Validate schema_version (can throw type_error if not an int)
+        if (!j.contains("schema_version") ||
+            j["schema_version"].get<int>() != kRuleSchemaVersion)
+            return "unsupported or missing schema_version (expected 1)";
+
+        if (!j.contains("rules") || !j["rules"].is_array())
+            return "missing or invalid 'rules' array";
+
+        out.clear();
+        for (const auto& r : j["rules"]) {
+            CveRuleDynamic rule;
+            rule.cve_id         = r.value("cve_id",         "");
+            rule.product        = r.value("product",         "");
+            rule.affected_below = r.value("affected_below",  "");
+            rule.fixed_in       = r.value("fixed_in",        "");
+            rule.severity       = r.value("severity",        "MEDIUM");
+            rule.description    = r.value("description",     "");
+            if (!rule.cve_id.empty() && !rule.product.empty() && !rule.affected_below.empty())
+                out.push_back(std::move(rule));
+        }
+        return {};
+    } catch (const nlohmann::json::exception& e) {
+        return std::string("JSON error: ") + e.what();
     }
-
-    if (!j.contains("schema_version") ||
-        j["schema_version"].get<int>() != kRuleSchemaVersion)
-        return "unsupported or missing schema_version (expected 1)";
-
-    if (!j.contains("rules") || !j["rules"].is_array())
-        return "missing or invalid 'rules' array";
-
-    out.clear();
-    for (const auto& r : j["rules"]) {
-        CveRuleDynamic rule;
-        rule.cve_id         = r.value("cve_id",         "");
-        rule.product        = r.value("product",         "");
-        rule.affected_below = r.value("affected_below",  "");
-        rule.fixed_in       = r.value("fixed_in",        "");
-        rule.severity       = r.value("severity",        "MEDIUM");
-        rule.description    = r.value("description",     "");
-        if (!rule.cve_id.empty() && !rule.product.empty() && !rule.affected_below.empty())
-            out.push_back(std::move(rule));
-    }
-    return {};
 }
 
 #endif // YUZU_NO_DYNAMIC_RULES

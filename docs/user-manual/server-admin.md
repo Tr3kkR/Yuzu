@@ -14,7 +14,8 @@ This document covers Yuzu server deployment, configuration, and ongoing administ
 6. [User Management](#user-management)
 7. [Agent Enrollment](#agent-enrollment)
 8. [OTA Agent Updates](#ota-agent-updates)
-9. [RBAC Management](#rbac-management)
+9. [Vulnerability Rule Management](#vulnerability-rule-management)
+10. [RBAC Management](#rbac-management)
 10. [Tag Compliance](#tag-compliance)
 11. [OIDC SSO Configuration](#oidc-sso-configuration)
 12. [Data Storage and Encryption](#data-storage-and-encryption)
@@ -485,6 +486,89 @@ The server can distribute agent binary updates to enrolled endpoints.
 - View all uploaded versions with their upload date, size, and promotion status.
 - Delete old versions to reclaim storage.
 - Only one version can be promoted (active) at a time.
+
+---
+
+## Vulnerability Rule Management
+
+The `vuln_scan` plugin uses a ruleset of known CVEs to detect vulnerable software and kernel versions. Rules are loaded at runtime from a JSON file, allowing updates without agent restart.
+
+### Automatic Weekly Rule Updates
+
+The Yuzu GitHub repository includes a weekly GitHub Actions workflow (`.github/workflows/update-cve-rules.yml`) that automatically:
+
+1. Fetches the latest CVE data from the NIST NVD API v2 (31 product keywords)
+2. Filters by severity (default: HIGH and CRITICAL)
+3. Generates `content/cve_rules.json` with the latest rules
+4. Validates the JSON schema and test-loads into the plugin
+5. Opens a pull request for review before merging
+
+**Workflow schedule:** Every Sunday at 02:00 UTC, or via manual trigger.
+
+**To use automated updates:**
+- Enable GitHub Actions in your Yuzu fork
+- Optionally, set the `NVD_API_KEY` repository secret to increase the NVD API rate limit from 5 req/30s to 50 req/30s (free key available at https://nvd.nist.gov/developers/api/key-request)
+- Merged rule updates are published as GitHub Releases and can be downloaded for offline deployment
+
+### Manual Rule Generation (Air-Gapped Deployments)
+
+For deployments without GitHub Actions access, use the standalone rule generator:
+
+```bash
+python3 scripts/generate-cve-rules.py --min-severity HIGH
+```
+
+This generates `content/cve_rules.json` and `content/cve_rules.json.sha256` for offline deployment.
+
+### Deploying Rule Updates to Endpoints
+
+Once you have a new `cve_rules.json`:
+
+1. Stage the file using the `content_dist.stage` action:
+   ```
+   InstructionSet: content_distribution
+   Action: stage
+   Parameters:
+     url: https://yourserver/path/to/cve_rules.json
+     filename: cve_rules.json
+     sha256: <hash from cve_rules.json.sha256>
+   ```
+
+2. Send the `vuln_scan.update_rules` action to trigger reload:
+   ```
+   InstructionSet: vuln_scan
+   Action: update_rules
+   ```
+
+3. After ~30 seconds, the new rules are active on all target endpoints. The plugin verifies the SHA-256 before loading to prevent tampering.
+
+**Built-in fallback:** If the staged JSON file is unavailable or fails verification, endpoints retain their compiled-in critical CVE ruleset, ensuring continuous protection.
+
+### Rule Format and Validation
+
+Rules use the `yuzu.vuln` schema (version 1):
+
+```json
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "cve_id": "CVE-2024-0001",
+      "product": "openssl",
+      "affected_below": "3.0.4",
+      "fixed_in": "3.0.4",
+      "severity": "CRITICAL",
+      "description": "Buffer overflow in X509 parsing"
+    }
+  ]
+}
+```
+
+Validate locally before deployment:
+
+```bash
+python3 scripts/generate-cve-rules.py --validate-only
+```
 
 ---
 

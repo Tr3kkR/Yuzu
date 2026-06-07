@@ -7,7 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_(no changes since v0.12.0-rc0 — first commit on top of the rc starts a new section here)_
+### Added
+
+- **`vuln_scan` kernel CVE detection (`kernel_scan` action)** — Detects CVEs
+  targeting the running kernel via `uname -r` (Linux), registry CurrentBuildNumber
+  (Windows), or `sw_vers` (macOS). Findings returned by severity.
+
+- **`vuln_scan` binary file version scanning (`binary_scan` action)** — Reads
+  version metadata from PE VERSIONINFO (Windows), Info.plist (macOS), and
+  dpkg/rpm package authority (Linux) and matches against loaded CVE rules.
+  Accepts a `paths` parameter (comma-separated list of absolute paths to scan).
+  Timeout: 120 seconds.
+
+- **`vuln_scan` runtime rule reload (`update_rules` action)** — Reloads CVE
+  rules from `<data_dir>/staged/cve_rules.json` without agent restart. Rules
+  are SHA-256 verified before loading.
+
+- **NVD CVE rule generator script** (`scripts/generate-cve-rules.py`) — Standalone
+  Python tool to build `cve_rules.json` from NIST NVD API v2. Fetches 31 product
+  keywords, filters by severity, caches responses for 24 hours, validates output
+  against schema. Generates initial ruleset with ~335 HIGH+CRITICAL CVEs.
+
+- **Weekly NVD CVE rule auto-update GitHub Actions workflow**
+  (`.github/workflows/update-cve-rules.yml`) — Runs every Sunday 02:00 UTC and
+  on manual trigger. Generates fresh `cve_rules.json`, validates, and opens a PR
+  for review before merging.
+
+- **Standalone `vuln_scan` test scanner** (`scripts/scan_local.cpp`) — Manual
+  testing tool that exercises detection logic without full agent build. Compiles
+  with or without nlohmann JSON support.
+
+- **`binary_scan` and `kernel_scan` InstructionDefinitions** — YAML definitions
+  for the two new actions, wired to the `vuln_scan` plugin.
+
+### Fixed
+
+- **Version comparison correctness for Debian epochs, RPM/Alpine suffixes, and
+  semver pre-release strings** — The CVE matching engine now correctly handles
+  version strings like `2:1.0.1-2ubuntu3` (Debian epoch override), `1.0.1-1.el8`
+  (RPM release suffix), `9.7p1-r3` (Alpine), and `3.0.6-rc1` (semver pre-release).
+  Epochs are authoritative (`2:1.0.0 > 1.99.99`); release suffixes and pre-release
+  qualifiers do not affect ordering.
 
 ## [0.12.0] - 2026-05-03
 
