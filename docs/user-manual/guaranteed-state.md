@@ -12,9 +12,11 @@ Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rul
 |---|---|
 | **Rule** | A YAML document describing a desired state, a detection strategy, and an optional remediation. Stored server-side with `yaml_source` as the authoritative form. |
 | **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. The Windows `registry` guard is live; service/ETW and non-Windows guards are on the roadmap. |
-| **Event** | A record of detected drift, attempted remediation, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. Live `event_type` values from the registry guard: `drift.detected` (drift observed in **audit** mode — no write-back), `drift.remediated` (enforce write-back restored the expected value), `remediation.failed` (enforce attempted but the write was denied — e.g. a read-only-fallback key). |
-| **Push** | An operator-initiated distribution of the active rule set to a scope of agents. Separates deploy authority (`Push`) from authoring authority (`Write`). |
-| **Enforcement mode** | `enforce` (remediate on drift) or `audit` (log drift, do not remediate). |
+| **Event** | A record of detected drift, attempted remediation, a compliant transition, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. Live `event_type` values from the registry guard: `drift.detected` (drift observed in **audit** mode — no write-back), `drift.remediated` (enforce write-back restored the expected value), `remediation.failed` (enforce attempted but the write was denied — e.g. a read-only-fallback key), `guard.compliant` (emitted **once** on the transition into compliant — arm-compliant, baseline-on-arm, or a cleared drift — then silent in steady state, so a healthy guard adds no ongoing fleet traffic; drives the per-(agent, rule) compliance census). |
+| **Baseline** | The named, **deployable** collection of Guards — the *only* deployable unit. A Guard reaches an agent **exclusively** as a member of a *deployed* Baseline; authoring a Guard alone never enforces it anywhere. Has a draft → deployed lifecycle. See [Baselines](#baselines--how-guards-reach-agents). |
+| **Assignment** | A Baseline's targeting: a set of *included* minus *excluded* management groups (exclude wins). **Deferred** — management-group targeting is not wired yet, so deploy is fleet-wide for now and the dashboard labels the assignment area "coming soon." |
+| **Push** | The distribution of the deployed-Baseline rule union to a scope of agents (driven by a Baseline deploy/re-deploy, or the REST `/push`). Separates deploy authority (`Push`) from authoring authority (`Write`). |
+| **Enforcement mode** | `enforce` (remediate on drift) or `audit` (log drift, do not remediate; shown as **Observe** in the dashboard). The wire/stored values are only `enforce` / `audit` — `observe` is a display label, not an API value. **Immutable after creation** — a different posture is a different Guard. |
 | **Scope expression** | A Scope DSL expression (same engine as Instructions) selecting which agents a rule applies to. |
 
 ## Permissions
@@ -156,24 +158,50 @@ curl -H "Authorization: Bearer $YUZU_TOKEN" \
 
 Both require `GuaranteedState:Read`. `/status` response keys (`total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`) match the agent-side proto `GuaranteedStateStatus`. **The agent status is fail-closed:** until the guard self-test lands, an armed guard reports `errored` / `guard_healthy=false`, never `compliant`. Treat the **events stream** (`drift.remediated` / `remediation.failed`), not `/status`, as the source of truth for whether enforcement is working.
 
-### 6. Enable/disable and switch mode from the dashboard
+### 6. Enable/disable a Guard from the dashboard
 
-The Guardian dashboard guard list (`/guardian`) exposes per-guard controls:
+The Guardian dashboard guard list (`/guardian`) exposes a per-Guard **Enable / Disable** toggle. It flips the Guard's `enabled` flag and is **state-only**: it requires `GuaranteedState:Write`, audits under `guaranteed_state.rule.update`, and **does not push**. The change reaches agents on the next Baseline **deploy** or the periodic heartbeat **reconcile**, both of which re-push the union of *deployed* Baselines' enabled members — a disabled Guard is then omitted and the agent disarms it. For scripted control use `PUT /api/v1/guaranteed-state/rules/<id>` with `{"enabled": false}`.
 
-- **Enable / Disable** — toggles the rule's `enabled` flag. Disabling tears the guard down on agents (the next full-sync push omits it).
-- **Switch to Audit / Switch to Enforce** — toggles `enforcement_mode` between `audit` (detect only) and `enforce` (write-back).
-
-Both require **`GuaranteedState:Write` *and* `GuaranteedState:Push`** (they mutate the rule *and* deploy it). On change the server updates the rule, **auto-deploys a full-sync push to all in-scope agents** (so it takes effect live), audits the mutation under `guaranteed_state.rule.update`, and re-renders the list. These are dashboard HTMX fragments, not REST endpoints — for scripted control use `PUT /api/v1/guaranteed-state/rules/<id>` (`enforcement_mode` must be `enforce` or `audit`) then `POST .../push`.
-
-> **Note:** the auto-deploy pushes only to the rule's own `scope_expr` (an empty scope = the whole fleet), so a single toggle does **not** fan out to agents outside that rule's targeting. `full_sync` is always set so an agent that had the rule enabled disarms it correctly on disable (the agent has no per-rule removal verb).
+> **There is no mode toggle.** A Guard's `enforcement_mode` (`enforce` vs `audit`/`observe`) is **fixed at creation and immutable** — a different posture is a different Guard. `PUT /api/v1/guaranteed-state/rules/<id>` with an `enforcement_mode` that differs from the stored value returns **`400`** (`enforcement_mode is immutable — create a new Guard for a different posture (Watch vs Enforce)`). To change mode, author a new Guard and add it to a Baseline.
 >
-> **Dashboard reads require `GuaranteedState:Read`** — an authenticated user without it gets a 403 on each data panel (the page shell still loads). The status rollup shows the live guard count from the store, not a fabricated compliance percentage.
+> **Dashboard reads require `GuaranteedState:Read`** — an authenticated user without it gets a 403 on each data panel (the page shell still loads). The compliance overview shows the live per-(agent, rule) census from the store (see [Compliance overview](#compliance-overview)), not a fabricated percentage.
 >
-> **Offline convergence:** an agent that was offline or unreachable when a rule changed re-converges automatically on reconnect. It reports its applied policy generation (`yuzu.guardian_generation`) in each heartbeat; the server re-pushes when that generation is behind the current store generation (rate-limited per agent). No manual re-push is needed after a network partition.
+> **Offline convergence:** an agent that was offline or unreachable when the deployed set changed re-converges automatically on reconnect. It reports its applied policy generation (`yuzu.guardian_generation`) in each heartbeat; the server re-pushes when that generation is behind the current store generation (rate-limited per agent). No manual re-push is needed after a network partition.
 
 ### 7. Create a Guard from the dashboard
 
 The **+ New Guard** button (top of `/guardian`) opens a structured create form for the Windows registry types: name, severity, enforcement mode, the `registry-value-equals` assertion (hive / key / value name / value type / expected), the remediation action (`alert-only` or `enforce`), and the [resilience policy](#resilience-policy-enforce-retry-behaviour) fieldset (mode + the mode-relevant tuning params; blanks use defaults). Submitting builds the same structured Guard the REST `POST /rules` endpoint accepts and runs it through the **same validation** (so an invalid resilience policy is rejected with an inline banner naming exactly what to fix). On success the Guard is created **unscoped (draft)** — device targeting is set at the Baseline, not per-Guard — and the guard list refreshes in place. Requires `GuaranteedState:Write`; audited under `guaranteed_state.rule.create`.
+
+## Baselines — how Guards reach agents
+
+A **Baseline** is a named collection of Guards and is the **only deployable unit**. Authoring a Guard (REST or the dashboard form) creates it *unscoped and inert* — it enforces nothing until it is a member of a **deployed** Baseline. This mirrors a GPO / Intune configuration profile / Jamf profile: you assemble controls into a baseline and deploy the baseline.
+
+The Baseline surface is on the dashboard (`/guardian` → Baselines). It is **dashboard-only today — there is no `/api/v1` Baseline route yet** (tracked as an agentic-first parity gap); scripted/agentic clients can author and push individual Guards via the REST surface above, but the deployable-collection model is GUI-only for now.
+
+| Action | Securable | Effect |
+|---|---|---|
+| **Create** (name + member Guards) | `Write` | Persists a **draft** Baseline. Enforces nothing yet. |
+| **Edit** (rename, add/remove members) | `Write` | Updates the draft. For a *deployed* Baseline this is a **staged change that does not reach agents** until you re-deploy (see below). |
+| **Deploy / Re-deploy** | `Push` | Marks the Baseline deployed, snapshots its current member set, and converges the fleet to the union of all deployed Baselines' enabled member Guards. |
+| **Delete** | `Delete` | Removes the Baseline; if it was deployed, re-converges the fleet so its Guards are removed from agents no other deployed Baseline still delivers them to. |
+
+**The deployed snapshot is authoritative.** What the fleet enforces is the member set captured **at the last deploy**, not the Baseline's live (possibly-since-edited) membership. So editing a deployed Baseline's members — or disabling a member Guard — is a *staged* change: the dashboard shows a persistent "**members changed since last deploy — Re-deploy to apply**" warning, and the change reaches agents only when someone with `Push` re-deploys. This keeps "what is enforced" gated behind deploy (`Push`) authority, separate from edit (`Write`) authority, so a member edit can never silently change fleet enforcement.
+
+> **Targeting is fleet-wide for now.** A Baseline carries an *assignment* (included − excluded management groups), but management-group targeting is **not yet wired** — every deploy currently converges the **whole fleet**, and the dashboard labels the assignment area as coming-soon. Do not rely on the assignment to contain a Baseline's blast radius yet.
+
+## Compliance overview
+
+The dashboard's compliance overview (`/guardian`) reports live fleet compliance from a per-(agent, rule) census the server maintains off the `guard.compliant` / `drift.*` event stream (table `guardian_agent_rule_status`, deliberately **not** subject to the event-retention reaper, so a long-quiet compliant Guard keeps its real state). The Fleet Status panel has three views:
+
+- **Fleet** — coverage stat cards, a compliant/drifted/error/unknown proportion bar, a "needs attention" summary, and a 7-day enforcement-effectiveness trend. The stat cards are **clickable**: *Guards* / *Baselines* jump to the matching view, *Agents* opens Fleet Viz, and *Guards drifting* / *Enforcement failures* / *Unhealthy Guards* jump to **By Guard** with the matching filter pre-applied.
+- **By Guard** — one **card** per Guard (compliance bar, severity/mode/enabled pills, 7-day detected/remediated counts), above a **filter bar** (free-text search + state / severity / mode). Clicking a card opens the full **Guard detail page** (`/guardian/guard/<id>`).
+- **By Baseline** — one **card** per Baseline (compliance bar, lifecycle, drift counts). Clicking a card opens the full **Baseline detail page** (`/guardian/baseline/<id>`).
+
+The Guard and Baseline detail pages — which **replaced the old detail modal** — show a compliance hero, stat tiles, and a filterable/searchable **per-device census** (on the Guard page, device rows link to the host page `/viz/host/<id>`); the Baseline page also lists its member Guards and recent events, with **Edit** available from the Baselines section on `/guardian`. The **Recent Events** panel on `/guardian` has a free-text search box that filters rows client-side.
+
+Compliance derives from **one** liveness-folded rollup: an agent that is currently offline folds to **unknown** (its last state is not reported as live truth). The Fleet census, the per-Guard/Baseline **cards**, and the detail **pages** all read that single rollup, so they cannot disagree.
+
+> **The REST `/api/v1/guaranteed-state/status` endpoint still returns placeholder zeros** — the live census is dashboard-only at present. A SIEM/automation integration must not read `/status` for compliance; corroborate against the `/events` stream until the status endpoint is wired to the census (tracked follow-up).
 
 ## Resilience policy (enforce-retry behaviour)
 
@@ -218,6 +246,8 @@ curl -H "Authorization: Bearer $YUZU_TOKEN" \
 
 > **Breaking behaviour change.** `enforcement_mode` defaults to **`enforce`**, and enforce mode now **writes to the endpoint registry** on drift. A rule authored on a pre-enforcement build (when Guardian was detect-only) will begin **remediating** on the next push after the agents are upgraded — with no further opt-in. Before upgrading agents: audit existing rules (`GET /api/v1/guaranteed-state/rules`), set `enforcement_mode: audit` on any rule you want to keep detect-only, and re-push. HKLM-scoped enforce rules require the agent service account to have write access to the key.
 
+> **Breaking: Guards now reach agents only via a deployed Baseline.** If you ran a pre-Baseline Guardian build, a Guard alone no longer enforces anywhere — the push fan-out and heartbeat reconcile source their rules from the union of member Guards of **deployed Baselines**. After upgrading, any Guard not in a deployed Baseline is **silently omitted from every agent push** and stops enforcing. To preserve enforcement: create a Baseline containing your active Guards and **Deploy** it (`/guardian` → Baselines). Until you do, the fleet converges to **zero** enforced Guards.
+
 ## Retention
 
 Guardian events are pruned on a rolling window. The default is 30 days. Override with `--guardian-event-retention-days` at server start (or set `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`), or via `PUT /api/v1/config/guardian_event_retention_days` at runtime. See the [Retention Settings](server-admin.md#retention-settings) table in the server administration guide.
@@ -226,9 +256,10 @@ Guardian events are pruned on a rolling window. The default is 30 days. Override
 
 Guardian surfaces readiness and event counts via the standard observability endpoints:
 
-- `/healthz` (authenticated) now reports a `stores.guaranteed_state` key alongside the other store-health entries. If `guaranteed-state.db` fails to open, the server reports `status = "degraded"`.
-- `/readyz` includes `guaranteed_state_store` in the per-store readiness conjunction. A failed store takes the pod out of rotation.
-- Prometheus metrics for Guardian rule push counts, agent apply latency, and parse errors will land in Guardian PR 3+ alongside real enforcement.
+- `/healthz` (authenticated) reports `stores.guaranteed_state` **and `stores.baselines`** alongside the other store-health entries. If either `guaranteed-state.db` or `guardian-baselines.db` fails to open, the server reports `status = "degraded"`.
+- `/readyz` includes both `guaranteed_state_store` and `baseline_store` in the per-store readiness conjunction. A failed store takes the pod out of rotation.
+- `yuzu_server_guardian_baselines_total` reports the number of persisted Baselines.
+- Broader Prometheus metrics — rule push counts, agent apply latency, parse errors, and a fleet compliance-state distribution (compliant/drifted/error/unknown) — are on the roadmap alongside agent-side enforcement metrics.
 
 ## Related documentation
 

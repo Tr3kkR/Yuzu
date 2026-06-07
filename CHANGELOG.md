@@ -135,6 +135,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `docs/user-manual/{authentication,rest-api,server-admin,upgrading}.md`,
     `docs/ops-runbooks/auth-db-recovery.md`.
 
+- **Guardian Baselines — the deployable unit, with baseline-gated deploy.**
+  A **Baseline** is a named collection of Guards and is now the *only* deployable
+  unit: a Guard reaches an agent exclusively as a member of a **deployed**
+  Baseline. New `BaselineStore` (`guardian-baselines.db`): M:N member Guards, an
+  included/excluded management-group assignment (reserved — targeting is deferred,
+  so deploy is fleet-wide for now), and a draft → deployed lifecycle. Dashboard
+  surface only (no REST API yet): create / edit / deploy / re-deploy / delete. The
+  push fan-out and heartbeat reconcile source their rule set from the union of
+  member Guards of deployed Baselines, taken from each Baseline's **deployed
+  snapshot** (what was deployed) — so editing a deployed Baseline's members is a
+  staged change that reaches agents only on a Push-gated re-deploy. New `baselines`
+  row in `/healthz` + `/readyz` and a `yuzu_server_guardian_baselines_total`
+  metric. Audited under `guaranteed_state.baseline.{create,update,deploy,delete}`.
+- **Guardian compliance overview + per-(agent, rule) census.** A new
+  `guard.compliant` event (emitted once on the transition into compliant, then
+  silent) drives a pruning-immune per-(agent, rule) status table
+  (`guardian_agent_rule_status`). The dashboard overview reports live fleet
+  compliance — Fleet / By Guard / By Baseline coverage, a compliant/drifted/error/
+  unknown proportion, a 7-day enforcement-effectiveness trend, and per-device
+  drill-down — from one liveness-folded rollup (offline agents fold to unknown).
+  **Platform honesty:** Guardian arms guards on Windows only today (the registry /
+  file guards are agent-side no-ops on macOS and Linux), but deploy is fleet-wide,
+  so connected macOS/Linux agents are reported as a distinct **"not implemented"**
+  class — a fleet banner with per-platform counts, a separate census segment (in the
+  compliant-share denominator, so the headline % drops when targeted Macs can't be
+  enforced), and explicit per-device rows — never folded into compliant or into the
+  offline "unknown" bucket. An operator can never mistake a no-op platform for an
+  armed one. The REST `/status` endpoint still returns placeholder zeros; the census
+  is dashboard-only for now.
+- Per-Guard `prerequisites` column reserved on the Guard store (stored, not yet
+  evaluated — engine-side evaluation is deferred).
 - **Guardian `file-change` spark — realtime file change/deletion detection (Change B).**
   A new agent guard watches a target file via `ReadDirectoryChangesW` on its
   parent directory — kernel-notified, no polling, so detection is realtime — and
@@ -410,6 +441,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Tests: `tests/unit/server/test_totp.cpp` (RFC 6238 vectors, base32,
     drift / replay) and `tests/unit/server/test_mfa_store.cpp` (end-to-end
     AuthDB enroll → verify → login → recovery → disable).
+
+### Changed
+
+- **Guardian dashboard redesign — full-page detail, card views, and a Guard
+  filter (UI only; no REST `/api/v1` change).** The Guard and Baseline detail
+  views are now **full pages** (`/guardian/guard/<id>`, `/guardian/baseline/<id>`)
+  replacing the detail modal. The By-Guard and By-Baseline compliance views are
+  stats-forward **card lists** (not tables); By-Guard gained a **filter bar**
+  (free-text search + state / severity / mode). The Fleet stat cards are now
+  **clickable** (jump to the matching sub-view, pre-filtered). The Guard detail
+  page's per-device rows link to the host page; the Baseline page shows its member
+  Guards and recent events; the Recent Events panel has a free-text search box.
+  Baseline **Edit** moved to the Baselines-section card. A CSP fix removed htmx
+  `hx-on` handlers from the product UI (operators see no functional change).
+- **Breaking — Guardian `enforcement_mode` is immutable after creation.**
+  `PUT /api/v1/guaranteed-state/rules/{id}` with an `enforcement_mode` that
+  differs from the stored value now returns `400` (`enforcement_mode is immutable
+  — create a new Guard for a different mode`); a different posture (enforce vs
+  audit) is a different Guard. The dashboard's per-Guard **Switch to Audit /
+  Switch to Enforce** toggle is **removed**; the remaining enable/disable toggle
+  is state-only (`Write`, no auto-push) and propagates on the next
+  deploy/reconcile.
+- **Breaking — Guards reach agents only via a deployed Baseline.** After
+  upgrading from a pre-Baseline Guardian build, a Guard not in a deployed Baseline
+  is silently omitted from every agent push and stops enforcing. Create a Baseline
+  containing your active Guards and deploy it — see the upgrade note in
+  `docs/user-manual/guaranteed-state.md`.
 
 ### Fixed
 

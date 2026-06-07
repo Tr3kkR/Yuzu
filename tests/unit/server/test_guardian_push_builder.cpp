@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -131,6 +132,26 @@ TEST_CASE("build_agent_push: legacy rule with empty spec_json is header-only",
     CHECK(push.rules(0).assertion().type().empty());
 }
 
+TEST_CASE("guardian::filter_deployed_members — the Baseline gate", "[guardian_push_builder]") {
+    const std::vector<GuaranteedStateRuleRow> rules{
+        row("a", "windows", ""), row("b", "windows", ""), row("c", "linux", "")};
+
+    SECTION("keeps only rules whose id is a deployed-baseline member, order preserved") {
+        auto out = guardian::filter_deployed_members(rules, {"c", "a"});
+        REQUIRE(out.size() == 2);
+        CHECK(out[0].rule_id == "a");   // input order, not set order
+        CHECK(out[1].rule_id == "c");
+    }
+    SECTION("empty deployed set yields nothing — nothing deployed = nothing enforced") {
+        CHECK(guardian::filter_deployed_members(rules, {}).empty());
+    }
+    SECTION("ids with no matching rule are ignored") {
+        auto out = guardian::filter_deployed_members(rules, {"a", "ghost"});
+        REQUIRE(out.size() == 1);
+        CHECK(out[0].rule_id == "a");
+    }
+}
+
 TEST_CASE("build_agent_push: enforce on a denylisted key is downgraded to audit (H1 backstop)",
           "[guardian_push_builder][denylist][h1]") {
     // A rule can reach enforce mode via the dashboard toggle / metadata-only
@@ -174,4 +195,29 @@ TEST_CASE("build_agent_push: enforce on a denylisted key is downgraded to audit 
     for (const auto& r : push.rules())
         if (r.rule_id() == "danger")
             CHECK(r.assertion().type() == "registry-value-equals");
+}
+
+TEST_CASE("guardian_enforced_on_platform — Windows only today; unknown is open",
+          "[guardian_push_builder][platform]") {
+    using guardian::guardian_enforced_on_platform;
+    // Guards arm only on Windows (RegistryGuard/FileGuard::start() are no-ops
+    // elsewhere) — so darwin/linux must read as NOT enforced and never armed.
+    CHECK(guardian_enforced_on_platform("windows"));
+    CHECK(guardian_enforced_on_platform("Windows"));  // normalize_os lower-cases (exact token)
+    CHECK_FALSE(guardian_enforced_on_platform("darwin"));
+    CHECK_FALSE(guardian_enforced_on_platform("macos"));  // author/alias token too
+    CHECK_FALSE(guardian_enforced_on_platform("linux"));
+    // Unknown OS (disconnect race / partial registration) must NOT be mislabelled
+    // "not implemented" — fail open, same posture as os_target_matches.
+    CHECK(guardian_enforced_on_platform(""));
+}
+
+TEST_CASE("platform_display_name — raw agent token to operator-facing label",
+          "[guardian_push_builder][platform]") {
+    using guardian::platform_display_name;
+    CHECK(platform_display_name("darwin") == "macOS");  // the case that matters
+    CHECK(platform_display_name("windows") == "Windows");
+    CHECK(platform_display_name("linux") == "Linux");
+    CHECK(platform_display_name("macos") == "macOS");  // alias normalises too
+    CHECK(platform_display_name("") == "unknown");
 }
