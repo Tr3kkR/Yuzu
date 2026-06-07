@@ -134,10 +134,19 @@ TEST_CASE("build_agent_push: a service guard reaches an agent ONLY via a deploye
         R"("remediation":{"type":"enforce","params":{}}})";
     const std::vector<GuaranteedStateRuleRow> all{svc};
 
-    SECTION("NOT in any deployed Baseline -> gated out, never reaches the push") {
+    SECTION("NOT in any deployed Baseline -> full-sync push carries zero rules (disarm)") {
+        // Nothing deployed = nothing enforced, but the push is still a *valid*
+        // full_sync teardown: the agent must receive full_sync=true + the current
+        // generation so it disarms any previously-armed copy of this guard, rather
+        // than the header being dropped. The bare empty-filter / empty-input cases
+        // are covered by the filter_deployed_members TEST_CASE; what THIS pins is
+        // that the push header survives an empty deployed member set.
         auto deployed = guardian::filter_deployed_members(all, /*deployed_rule_ids=*/{});
         CHECK(deployed.empty());
-        auto push = guardian::build_agent_push(deployed, "windows", always_in_scope, true, 1);
+        auto push = guardian::build_agent_push(deployed, "windows", always_in_scope,
+                                               /*full_sync=*/true, /*generation=*/9);
+        CHECK(push.full_sync());
+        CHECK(push.policy_generation() == 9);
         CHECK(push.rules_size() == 0);
     }
     SECTION("member of a deployed Baseline -> included, service spark/assertion intact") {
@@ -153,6 +162,27 @@ TEST_CASE("build_agent_push: a service guard reaches an agent ONLY via a deploye
         CHECK(pr.assertion().params().at("service_name") == "Spooler");
         CHECK(pr.remediation().type() == "enforce");
         CHECK(pr.enforcement_mode() == "enforce");
+    }
+    SECTION("member with malformed spec_json -> header-only, never silently dropped") {
+        // A truncated/corrupt spec_json (partial write, hand-authored JSON typo) must
+        // not make the rule vanish from the push: the agent still needs rule_id +
+        // enforcement_mode to reconcile, and an unparseable spec yields a no-op
+        // header-only guard the operator can still SEE, rather than a silent
+        // disappearance. parse(allow_exceptions=false) returns a discarded value, so
+        // !is_object() short-circuits AFTER the header is set — same posture as the
+        // empty-spec legacy row. (dangerous_enforce_in_spec also no-ops on malformed
+        // JSON, so the enforce mode is NOT spuriously downgraded.)
+        GuaranteedStateRuleRow bad = svc;
+        bad.spec_json = R"({"spark":{"type":"service-status-change")";  // truncated mid-object
+        auto deployed = guardian::filter_deployed_members({bad}, {"svc-spooler"});
+        REQUIRE(deployed.size() == 1);
+        auto push = guardian::build_agent_push(deployed, "windows", always_in_scope, true, 1);
+        REQUIRE(push.rules_size() == 1);
+        const auto& pr = push.rules(0);
+        CHECK(pr.rule_id() == "svc-spooler");
+        CHECK(pr.enforcement_mode() == "enforce");   // header intact, not dropped
+        CHECK(pr.spark().type().empty());            // malformed spec → no typed blocks
+        CHECK(pr.assertion().type().empty());
     }
 }
 

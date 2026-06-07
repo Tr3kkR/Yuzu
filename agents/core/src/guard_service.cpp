@@ -122,6 +122,16 @@ constexpr DWORD kNotifyMask = SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_STOPPED |
                               SERVICE_NOTIFY_CONTINUE_PENDING | SERVICE_NOTIFY_PAUSE_PENDING |
                               SERVICE_NOTIFY_PAUSED;
 
+// Compile-time guard against the rc=87 regression: the SCM-handle-only flags
+// (CREATED / DELETED / DELETE_PENDING) must NEVER appear in a mask registered on a
+// SERVICE handle — NotifyServiceStatusChange rejects the combination with
+// ERROR_INVALID_PARAMETER (87), silently dropping the real-time watch to the degraded
+// poll (the bug was found only in Windows UAT, not by the fail-closed unit test).
+static_assert((kNotifyMask & (SERVICE_NOTIFY_CREATED | SERVICE_NOTIFY_DELETED |
+                              SERVICE_NOTIFY_DELETE_PENDING)) == 0,
+              "kNotifyMask must not contain SCM-handle-only notify flags (CREATED/DELETED/"
+              "DELETE_PENDING) — they fail with ERROR_INVALID_PARAMETER on a service handle");
+
 // Degraded re-arm cadence used ONLY while the watched service is absent (cannot arm
 // a service-level notify) or a notify could not be armed. The healthy watch stays
 // fully event-driven (no poll). Mirrors RegistryGuard's kArmFailRetryMs.
