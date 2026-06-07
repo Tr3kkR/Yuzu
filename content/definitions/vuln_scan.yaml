@@ -490,7 +490,7 @@ status:
 apiVersion: yuzu.io/v1alpha1
 kind: InstructionDefinition
 metadata:
-  id: security.vuln_scan.pkg_scan
+  id: security.vulnerability.pkg_scan
   displayName: Language Package CVE Scan (Offline)
   version: 1.0.0
   description: >

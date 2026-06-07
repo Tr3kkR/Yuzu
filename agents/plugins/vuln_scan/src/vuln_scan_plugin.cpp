@@ -397,8 +397,13 @@ std::vector<Finding> do_cve_scan_impl() {
         return g_dynamic_rules;
     }();
     if (dynamic) {
-        for (const auto& r : *dynamic)
+        for (const auto& r : *dynamic) {
+            // Skip ecosystem-tagged rules (npm, PyPI, etc.) — handled by pkg_scan
+            // cve_scan matches only OS-native rules (ecosystem="")
+            if (!r.ecosystem.empty())
+                continue;
             match_rule(r.product, r.affected_below, r.severity, r.cve_id, r.description, r.fixed_in);
+        }
     }
 
     return findings;
