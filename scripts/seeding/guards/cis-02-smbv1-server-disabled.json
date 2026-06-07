@@ -1,0 +1,24 @@
+{
+  "rule_id": "cis-smbv1-server-disabled",
+  "name": "CIS — SMBv1 server disabled",
+  "enabled": true,
+  "enforcement_mode": "audit",
+  "severity": "high",
+  "os_target": "windows",
+  "scope": "",
+  "spark": {
+    "type": "registry-change",
+    "params": { "hive": "HKLM", "key": "SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters" }
+  },
+  "assertion": {
+    "type": "registry-value-equals",
+    "params": {
+      "hive": "HKLM",
+      "key": "SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters",
+      "value_name": "SMB1",
+      "value_type": "REG_DWORD",
+      "expected": "0"
+    }
+  },
+  "remediation": { "type": "alert-only", "params": {} }
+}

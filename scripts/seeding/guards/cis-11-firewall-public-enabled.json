@@ -1,0 +1,24 @@
+{
+  "rule_id": "cis-firewall-public-enabled",
+  "name": "CIS — Windows Firewall enabled (Public profile)",
+  "enabled": true,
+  "enforcement_mode": "audit",
+  "severity": "high",
+  "os_target": "windows",
+  "scope": "",
+  "spark": {
+    "type": "registry-change",
+    "params": { "hive": "HKLM", "key": "SOFTWARE\\Policies\\Microsoft\\WindowsFirewall\\PublicProfile" }
+  },
+  "assertion": {
+    "type": "registry-value-equals",
+    "params": {
+      "hive": "HKLM",
+      "key": "SOFTWARE\\Policies\\Microsoft\\WindowsFirewall\\PublicProfile",
+      "value_name": "EnableFirewall",
+      "value_type": "REG_DWORD",
+      "expected": "1"
+    }
+  },
+  "remediation": { "type": "alert-only", "params": {} }
+}

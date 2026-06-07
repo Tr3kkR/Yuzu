@@ -1,0 +1,24 @@
+{
+  "rule_id": "cis-installer-always-elevated-off",
+  "name": "CIS — Windows Installer never installs with elevated privileges",
+  "enabled": true,
+  "enforcement_mode": "audit",
+  "severity": "high",
+  "os_target": "windows",
+  "scope": "",
+  "spark": {
+    "type": "registry-change",
+    "params": { "hive": "HKLM", "key": "SOFTWARE\\Policies\\Microsoft\\Windows\\Installer" }
+  },
+  "assertion": {
+    "type": "registry-value-equals",
+    "params": {
+      "hive": "HKLM",
+      "key": "SOFTWARE\\Policies\\Microsoft\\Windows\\Installer",
+      "value_name": "AlwaysInstallElevated",
+      "value_type": "REG_DWORD",
+      "expected": "0"
+    }
+  },
+  "remediation": { "type": "alert-only", "params": {} }
+}

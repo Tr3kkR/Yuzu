@@ -1,0 +1,18 @@
+{
+  "rule_id": "demo-spooler-running-enforce",
+  "name": "Demo Spooler always running (enforce)",
+  "enabled": true,
+  "enforcement_mode": "enforce",
+  "severity": "medium",
+  "os_target": "windows",
+  "scope": "",
+  "spark": {
+    "type": "service-status-change",
+    "params": {}
+  },
+  "assertion": {
+    "type": "service-running",
+    "params": { "service_name": "Spooler" }
+  },
+  "remediation": { "type": "enforce", "params": {} }
+}

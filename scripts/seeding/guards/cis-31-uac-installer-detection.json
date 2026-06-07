@@ -1,0 +1,24 @@
+{
+  "rule_id": "cis-uac-installer-detection",
+  "name": "CIS — UAC detect application installations and prompt for elevation",
+  "enabled": true,
+  "enforcement_mode": "audit",
+  "severity": "medium",
+  "os_target": "windows",
+  "scope": "",
+  "spark": {
+    "type": "registry-change",
+    "params": { "hive": "HKLM", "key": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System" }
+  },
+  "assertion": {
+    "type": "registry-value-equals",
+    "params": {
+      "hive": "HKLM",
+      "key": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+      "value_name": "EnableInstallerDetection",
+      "value_type": "REG_DWORD",
+      "expected": "1"
+    }
+  },
+  "remediation": { "type": "alert-only", "params": {} }
+}

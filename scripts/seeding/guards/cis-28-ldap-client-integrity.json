@@ -1,0 +1,24 @@
+{
+  "rule_id": "cis-ldap-client-integrity",
+  "name": "CIS — LDAP client signing requirements (negotiate signing)",
+  "enabled": true,
+  "enforcement_mode": "audit",
+  "severity": "medium",
+  "os_target": "windows",
+  "scope": "",
+  "spark": {
+    "type": "registry-change",
+    "params": { "hive": "HKLM", "key": "SYSTEM\\CurrentControlSet\\Services\\LDAP" }
+  },
+  "assertion": {
+    "type": "registry-value-equals",
+    "params": {
+      "hive": "HKLM",
+      "key": "SYSTEM\\CurrentControlSet\\Services\\LDAP",
+      "value_name": "LDAPClientIntegrity",
+      "value_type": "REG_DWORD",
+      "expected": "1"
+    }
+  },
+  "remediation": { "type": "alert-only", "params": {} }
+}

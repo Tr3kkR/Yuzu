@@ -1,0 +1,24 @@
+{
+  "rule_id": "cis-powershell-scriptblock-logging",
+  "name": "CIS — PowerShell script block logging enabled",
+  "enabled": true,
+  "enforcement_mode": "audit",
+  "severity": "medium",
+  "os_target": "windows",
+  "scope": "",
+  "spark": {
+    "type": "registry-change",
+    "params": { "hive": "HKLM", "key": "SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging" }
+  },
+  "assertion": {
+    "type": "registry-value-equals",
+    "params": {
+      "hive": "HKLM",
+      "key": "SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging",
+      "value_name": "EnableScriptBlockLogging",
+      "value_type": "REG_DWORD",
+      "expected": "1"
+    }
+  },
+  "remediation": { "type": "alert-only", "params": {} }
+}

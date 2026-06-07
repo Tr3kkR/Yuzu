@@ -1,0 +1,24 @@
+{
+  "rule_id": "cis-force-audit-subcategory",
+  "name": "CIS — Force audit policy subcategory settings (SCENoApplyLegacyAuditPolicy)",
+  "enabled": true,
+  "enforcement_mode": "audit",
+  "severity": "medium",
+  "os_target": "windows",
+  "scope": "",
+  "spark": {
+    "type": "registry-change",
+    "params": { "hive": "HKLM", "key": "SYSTEM\\CurrentControlSet\\Control\\Lsa" }
+  },
+  "assertion": {
+    "type": "registry-value-equals",
+    "params": {
+      "hive": "HKLM",
+      "key": "SYSTEM\\CurrentControlSet\\Control\\Lsa",
+      "value_name": "SCENoApplyLegacyAuditPolicy",
+      "value_type": "REG_DWORD",
+      "expected": "1"
+    }
+  },
+  "remediation": { "type": "alert-only", "params": {} }
+}

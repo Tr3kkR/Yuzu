@@ -1,0 +1,24 @@
+{
+  "rule_id": "cis-print-spooler-disabled",
+  "name": "CIS — Print Spooler service disabled (PrintNightmare)",
+  "enabled": true,
+  "enforcement_mode": "audit",
+  "severity": "high",
+  "os_target": "windows",
+  "scope": "",
+  "spark": {
+    "type": "registry-change",
+    "params": { "hive": "HKLM", "key": "SYSTEM\\CurrentControlSet\\Services\\Spooler" }
+  },
+  "assertion": {
+    "type": "registry-value-equals",
+    "params": {
+      "hive": "HKLM",
+      "key": "SYSTEM\\CurrentControlSet\\Services\\Spooler",
+      "value_name": "Start",
+      "value_type": "REG_DWORD",
+      "expected": "4"
+    }
+  },
+  "remediation": { "type": "alert-only", "params": {} }
+}

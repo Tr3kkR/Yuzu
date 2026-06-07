@@ -1,0 +1,8 @@
+{
+  "name": "Demo Enforcements",
+  "description": "Demo Baseline with two enforce Guards: RDP disabled, and a benign service (Print Spooler) kept running.",
+  "member_rule_ids": [
+    "demo-rdp-disabled-enforce",
+    "demo-spooler-running-enforce"
+  ]
+}

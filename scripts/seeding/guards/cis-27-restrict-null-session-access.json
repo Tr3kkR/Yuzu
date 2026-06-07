@@ -1,0 +1,24 @@
+{
+  "rule_id": "cis-restrict-null-session-access",
+  "name": "CIS — Restrict anonymous access to named pipes and shares",
+  "enabled": true,
+  "enforcement_mode": "audit",
+  "severity": "medium",
+  "os_target": "windows",
+  "scope": "",
+  "spark": {
+    "type": "registry-change",
+    "params": { "hive": "HKLM", "key": "SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters" }
+  },
+  "assertion": {
+    "type": "registry-value-equals",
+    "params": {
+      "hive": "HKLM",
+      "key": "SYSTEM\\CurrentControlSet\\Services\\LanmanServer\\Parameters",
+      "value_name": "RestrictNullSessAccess",
+      "value_type": "REG_DWORD",
+      "expected": "1"
+    }
+  },
+  "remediation": { "type": "alert-only", "params": {} }
+}

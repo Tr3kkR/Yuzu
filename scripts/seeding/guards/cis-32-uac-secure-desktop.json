@@ -1,0 +1,24 @@
+{
+  "rule_id": "cis-uac-secure-desktop",
+  "name": "CIS — UAC switch to the secure desktop when prompting",
+  "enabled": true,
+  "enforcement_mode": "audit",
+  "severity": "medium",
+  "os_target": "windows",
+  "scope": "",
+  "spark": {
+    "type": "registry-change",
+    "params": { "hive": "HKLM", "key": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System" }
+  },
+  "assertion": {
+    "type": "registry-value-equals",
+    "params": {
+      "hive": "HKLM",
+      "key": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+      "value_name": "PromptOnSecureDesktop",
+      "value_type": "REG_DWORD",
+      "expected": "1"
+    }
+  },
+  "remediation": { "type": "alert-only", "params": {} }
+}
