@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <sstream>
 #include <nlohmann/json.hpp>
@@ -37,11 +38,27 @@ std::vector<LangPkgInfo> get_lang_packages();
 
 namespace yuzu::vuln {
 
+static bool is_whitelisted_command(const char* cmd) {
+    // Whitelist of allowed package manager tools (compile-time constants only)
+    // Never call system() with untrusted input
+    if (std::strcmp(cmd, "npm") == 0 || std::strcmp(cmd, "pip") == 0 ||
+        std::strcmp(cmd, "pip3") == 0 || std::strcmp(cmd, "cargo") == 0 ||
+        std::strcmp(cmd, "gem") == 0 || std::strcmp(cmd, "dotnet") == 0) {
+        return true;
+    }
+    return false;
+}
+
 static bool command_exists_local(const char* cmd) {
+    // Only execute well-known package manager tools (compile-time constant names)
+    if (!is_whitelisted_command(cmd)) return false;
+
 #ifdef _WIN32
+    // Use "where" builtin to check if cmd exists
     std::string where_cmd = std::string("where ") + cmd + " >NUL 2>&1";
     return system(where_cmd.c_str()) == 0;
 #else
+    // Use "command -v" builtin to check existence
     std::string cmd_str = std::string("command -v ") + cmd + " >/dev/null 2>&1";
     return system(cmd_str.c_str()) == 0;
 #endif
