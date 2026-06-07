@@ -275,9 +275,10 @@ struct CveRuleDynamic {
     std::string fixed_in;
     std::string severity;
     std::string description;
+    std::string ecosystem;  // "npm", "PyPI", "crates.io", etc. Empty = OS-native (v1 compat)
 };
 
-static constexpr int kRuleSchemaVersion = 1;
+static constexpr int kRuleSchemaVersion = 2;
 
 /// Load rules from a JSON file. Returns empty string on success, error on failure.
 /// Does NOT throw — all exceptions are caught and converted to error strings.
@@ -292,9 +293,13 @@ inline std::string load_rules_from_json(const std::string& path,
         f >> j;
 
         // Validate schema_version (can throw type_error if not an int)
-        if (!j.contains("schema_version") ||
-            j["schema_version"].get<int>() != kRuleSchemaVersion)
-            return "unsupported or missing schema_version (expected 1)";
+        if (!j.contains("schema_version")) {
+            return "missing schema_version";
+        }
+        int ver = j["schema_version"].get<int>();
+        if (ver < 1 || ver > kRuleSchemaVersion) {
+            return "unsupported schema_version (supported: 1-2)";
+        }
 
         if (!j.contains("rules") || !j["rules"].is_array())
             return "missing or invalid 'rules' array";
@@ -308,6 +313,7 @@ inline std::string load_rules_from_json(const std::string& path,
             rule.fixed_in       = r.value("fixed_in",        "");
             rule.severity       = r.value("severity",        "MEDIUM");
             rule.description    = r.value("description",     "");
+            rule.ecosystem      = r.value("ecosystem",       "");
             if (!rule.cve_id.empty() && !rule.product.empty() && !rule.affected_below.empty())
                 out.push_back(std::move(rule));
         }
