@@ -43,6 +43,14 @@ struct GuardDrift {
     /// window (H3 / #1209). 0 = sole detection in its window; >0 means a churning
     /// writer's burst was folded into one event. Surfaced as drift_rate on the wire.
     std::uint64_t collapsed_count{0};
+
+    /// True = this report is a COMPLIANT transition (watched state is at / returned
+    /// to expected), NOT a drift. The engine maps it to event_type "guard.compliant"
+    /// so the server can derive a true per-(agent,rule) compliance census instead of
+    /// only "last drift". Emitted on the compliant↔drift EDGE only — steady compliant
+    /// state stays silent (network-kindness / NFR). Remediation fields stay default
+    /// (a compliant edge is never a remediation). Slice B.
+    bool compliant{false};
 };
 
 /// Sink a guard calls on each (debounced) drift detection.

@@ -4425,22 +4425,25 @@ void RestApiV1::register_routes(
                  // Mirrors the POST handler's body.value(...) pattern.
                  updated.name = body.value("name", updated.name);
                  updated.enabled = body.value("enabled", updated.enabled);
-                 updated.enforcement_mode =
-                     body.value("enforcement_mode", updated.enforcement_mode);
-                 // Same enforce|audit guard as create (governance C1/B2), but only
-                 // when the client actually sets the field — so a legacy rule with
-                 // a stale mode can still be updated in its other fields.
-                 if (body.contains("enforcement_mode") && updated.enforcement_mode != "enforce" &&
-                     updated.enforcement_mode != "audit") {
+                 // Mode (Watch/Enforce) is IMMUTABLE after creation — a different
+                 // posture is a different Guard (docs/guardian-baseline-model.md). A
+                 // full-object PUT may echo the current mode, but changing it is a
+                 // 400, not a silent flip: the operator must author a new Guard.
+                 if (body.contains("enforcement_mode") &&
+                     body.value("enforcement_mode", existing->enforcement_mode) !=
+                         existing->enforcement_mode) {
                      res.status = 400;
-                     res.set_content(detail::error_json_a4(400,
-                                                           "enforcement_mode must be 'enforce' or 'audit'",
-                                                           cid, "set enforcement_mode to 'enforce' or 'audit'"),
-                                     "application/json");
+                     res.set_content(
+                         detail::error_json_a4(
+                             400, "enforcement_mode is immutable — create a new Guard for a "
+                                  "different posture (Watch vs Enforce)",
+                             cid, "create a new Guard instead of changing its mode"),
+                         "application/json");
                      audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
-                              "invalid enforcement_mode");
+                              "attempt to change immutable enforcement_mode");
                      return;
                  }
+                 updated.enforcement_mode = existing->enforcement_mode;  // unchanged
                  updated.severity = body.value("severity", updated.severity);
                  updated.os_target = body.value("os_target", updated.os_target);
                  updated.scope_expr = body.value("scope_expr", updated.scope_expr);

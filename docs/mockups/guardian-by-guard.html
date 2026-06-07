@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup — Guardian: By-Guard list (filterable) + full-page Guard detail</title>
+<!--
+  STANDALONE MOCKUP (throwaway, no compile). Same navy palette as
+  guardian-by-baseline.html / guardian-overview.html so it ports cleanly into
+  guardian_ui.cpp. Parallel to the Baseline work:
+    1. By-Guard LIST   — stats-forward cards + a real FILTER BAR
+                         (search · state · severity · mode). Guards scale to
+                         hundreds, so filtering is the headline ask here.
+    2. Guard FULL PAGE — replaces the cramped modal. Real page
+                         (GET /guardian/guard/<id>), back-link + page header,
+                         the "what it checks" spec, a fleet compliance roll-up,
+                         and a FILTERABLE per-device census loaded ON DEMAND.
+  Mode-aware: Observe guards show no remediation tiles; Enforce guards do.
+  Per-device census is on-demand (Refresh) — never auto-loaded (no fleet chatter).
+  Fake (rig-shaped) data: real CIS Windows 11 guard names.
+-->
+<style>
+  :root{
+    --bg:#0e1a2d; --surface:#1a2940; --surface2:#243553; --border:#2d4068;
+    --fg:#cfdbe8; --muted:#8fa3bd; --white:#fff; --accent:#00bceb;
+    --green:#4ed27e; --yellow:#ffcc00; --red:#ff5765; --lightblue:#a5d6ff; --slate:#6f86a6;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg);color:var(--fg);font:14px/1.5 'Inter',system-ui,Segoe UI,sans-serif;margin:0;padding:1.6rem}
+  .wrap{max-width:1040px;margin:0 auto}
+  a{color:inherit;text-decoration:none}
+  h2{font-size:1.15rem;margin:0 0 .15rem;color:var(--white)}
+  .sub{color:var(--muted);font-size:.78rem;margin-bottom:1rem}
+  .sech{font-size:.66rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:700;margin:1.3rem 0 .5rem}
+  .tabs{display:flex;gap:.4rem;margin-bottom:1rem;align-items:center}
+  .tab{background:var(--surface);border:1px solid var(--border);color:var(--muted);border-radius:.4rem;padding:.3rem .8rem;font-size:.78rem;cursor:pointer}
+  .tab.active{color:var(--white);border-color:var(--accent)}
+
+  /* ── filter bar ── */
+  .filterbar{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;background:var(--surface);border:1px solid var(--border);
+    border-radius:.6rem;padding:.6rem .75rem;margin-bottom:.9rem}
+  .filterbar input[type=search]{background:var(--bg);border:1px solid var(--border);border-radius:.4rem;color:var(--fg);
+    padding:.34rem .6rem;font-size:.76rem;min-width:230px;flex:1}
+  .filterbar select{background:var(--bg);border:1px solid var(--border);border-radius:.4rem;color:var(--fg);padding:.34rem .5rem;font-size:.74rem}
+  .chips{display:flex;gap:.35rem;flex-wrap:wrap}
+  .chip{font-size:.7rem;padding:.24rem .6rem;border-radius:.35rem;border:1px solid var(--border);color:var(--muted);background:var(--bg);cursor:pointer;white-space:nowrap}
+  .chip.on{color:var(--white);border-color:var(--accent)}
+  .chip .c{color:var(--muted);font-weight:600}
+  .resultcount{font-size:.7rem;color:var(--muted);margin-left:auto}
+
+  /* ── guard cards ── */
+  .gcard{display:grid;grid-template-columns:1.7fr 1.9fr 1fr;gap:1.1rem;background:var(--surface);border:1px solid var(--border);
+    border-radius:.6rem;padding:.85rem 1rem;margin-bottom:.6rem;cursor:pointer;transition:border-color .12s}
+  .gcard:hover{border-color:var(--accent)}
+  .gcard .name{font-size:.95rem;font-weight:700;color:var(--white)}
+  .gcard .spec{font-size:.7rem;color:var(--muted);margin-top:.25rem;font-family:'SFMono-Regular',Consolas,monospace}
+  .pills{display:flex;gap:.4rem;align-items:center;margin-top:.45rem;flex-wrap:wrap}
+  .col-r{text-align:right;font-size:.7rem;color:var(--muted)}
+  .col-r .big{font-size:1.15rem;font-weight:700;color:var(--white)}
+  .view{color:var(--accent);font-size:.72rem;font-weight:600}
+
+  .sev{font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em;border-radius:.25rem;padding:.05rem .35rem}
+  .sev.high{color:var(--red);border:1px solid rgba(255,87,101,.5)} .sev.medium{color:var(--yellow);border:1px solid rgba(255,204,0,.45)} .sev.low{color:var(--lightblue);border:1px solid var(--border)}
+  .mode{font-size:.6rem;font-weight:700;text-transform:uppercase;letter-spacing:.03em;border-radius:.25rem;padding:.05rem .35rem}
+  .mode.observe{color:var(--lightblue);border:1px solid var(--border)} .mode.enforce{color:var(--yellow);border:1px solid rgba(255,204,0,.45)}
+  .tog{font-size:.6rem;font-weight:700;color:var(--green)} .tog.off{color:var(--muted)}
+
+  /* ── proportion bar ── */
+  .pbar{display:flex;height:16px;border-radius:4px;overflow:hidden;border:1px solid var(--border)}
+  .pbar > span{display:flex;align-items:center;justify-content:center;font-size:.56rem;color:#04101f;font-weight:700}
+  .plegend{display:flex;flex-wrap:wrap;gap:.7rem;margin-top:.35rem;font-size:.62rem;color:var(--muted)}
+  .plegend i{display:inline-block;width:.5rem;height:.5rem;border-radius:2px;margin-right:.25rem;vertical-align:middle}
+  .plegend b{color:var(--white)}
+  .st-ok{color:var(--green);font-weight:600} .st-drift{color:var(--yellow);font-weight:600} .st-err{color:var(--red);font-weight:600} .st-unk{color:var(--slate)} .st-nodep{color:var(--muted)} .muted{color:var(--muted)}
+
+  /* ── stat tiles ── */
+  .strip{display:flex;flex-wrap:wrap;gap:.55rem}
+  .stat{background:var(--surface);border:1px solid var(--border);border-radius:.5rem;padding:.55rem .8rem;min-width:120px;flex:1}
+  .stat .n{font-size:1.4rem;font-weight:700;color:var(--white);line-height:1.1}
+  .stat .l{font-size:.62rem;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+  .stat .sx{font-size:.62rem;color:var(--muted);margin-top:.12rem}
+  .n.good{color:var(--green)} .n.warn{color:var(--yellow)} .n.bad{color:var(--red)} .n.unk{color:var(--slate)} .n.info{color:var(--lightblue)}
+
+  /* ── detail page ── */
+  .back{font-size:.74rem;color:var(--accent);display:inline-block;margin-bottom:.7rem;cursor:pointer}
+  .phead{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;border-bottom:1px solid var(--border);padding-bottom:.9rem}
+  .phead h2{font-size:1.35rem}
+  .phead .hl{display:flex;align-items:center;gap:.55rem;flex-wrap:wrap}
+  .actions{display:flex;gap:.45rem;flex-shrink:0}
+  .btn{font-size:.72rem;padding:.34rem .7rem;border-radius:.35rem;border:1px solid var(--border);background:var(--surface2);color:var(--fg);cursor:pointer}
+  .btn.accent{border-color:var(--accent);color:var(--accent);background:none}
+  .btn.danger{color:var(--red)}
+  .spec-grid{display:grid;grid-template-columns:auto 1fr;gap:.3rem 1rem;font-size:.78rem;background:var(--surface);border:1px solid var(--border);border-radius:.5rem;padding:.7rem .9rem}
+  .spec-grid .k{color:var(--muted)}
+  .spec-grid code{font-family:'SFMono-Regular',Consolas,monospace;color:var(--lightblue)}
+
+  table{width:100%;border-collapse:collapse;font-size:.78rem}
+  th{text-align:left;padding:.42rem .55rem;border-bottom:2px solid var(--border);color:var(--muted);font-size:.6rem;text-transform:uppercase;letter-spacing:.05em;cursor:pointer;user-select:none}
+  td{padding:.42rem .55rem;border-bottom:1px solid var(--border)}
+  tr.click{cursor:pointer} tr.click:hover td{background:var(--surface)}
+  .dname{color:var(--white);font-weight:600}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  .refreshbar{display:flex;align-items:center;gap:.6rem;margin:.2rem 0 .55rem;flex-wrap:wrap}
+  .refreshbar input[type=search]{background:var(--bg);border:1px solid var(--border);border-radius:.4rem;color:var(--fg);padding:.28rem .55rem;font-size:.74rem;min-width:180px}
+
+  .events{font-size:.74rem}
+  .ev{display:flex;gap:.6rem;padding:.32rem 0;border-bottom:1px solid var(--border)}
+  .ev .t{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+  .badge{font-size:.58rem;font-weight:700;padding:.05rem .35rem;border-radius:.25rem;background:rgba(255,204,0,.15);color:var(--yellow);text-transform:uppercase}
+  .note{margin-top:1rem;font-size:.72rem;color:var(--muted);border-top:1px solid var(--border);padding-top:.7rem}
+  .note b{color:var(--lightblue)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<!-- ════════════════ VIEW 1 — BY-GUARD LIST (filterable) ════════════════ -->
+<div id="view-list">
+  <h2>Guardian</h2>
+  <div class="sub">Guaranteed State enforcement — live status, Guards &amp; Baselines</div>
+  <div class="tabs">
+    <span class="tab">Fleet</span>
+    <span class="tab active">By Guard</span>
+    <span class="tab">By Baseline</span>
+  </div>
+
+  <div class="filterbar">
+    <input type="search" id="q" placeholder="Search guards by name or registry key…" oninput="applyFilter()">
+    <div class="chips" id="state-chips">
+      <span class="chip on" data-state="all" onclick="pickState(this)">All <span class="c">21</span></span>
+      <span class="chip" data-state="drift" onclick="pickState(this)">Drifting <span class="c">16</span></span>
+      <span class="chip" data-state="ok" onclick="pickState(this)">Compliant <span class="c">3</span></span>
+      <span class="chip" data-state="unhealthy" onclick="pickState(this)">Unhealthy <span class="c">1</span></span>
+      <span class="chip" data-state="nodep" onclick="pickState(this)">Not deployed <span class="c">1</span></span>
+    </div>
+    <select id="sev" onchange="applyFilter()"><option value="all">Any severity</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select>
+    <select id="mode" onchange="applyFilter()"><option value="all">Any mode</option><option value="observe">Observe</option><option value="enforce">Enforce</option></select>
+    <span class="resultcount" id="rc">21 of 21 guards</span>
+  </div>
+
+  <div id="cards">
+    <!-- drifting · high -->
+    <div class="gcard" data-state="drift" data-sev="high" data-mode="observe" data-name="defender real-time protection rtp" onclick="showDetail()">
+      <div><div class="name">CIS — Defender real-time protection not disabled</div>
+        <div class="spec">reg · DisableRealtimeMonitoring = 0</div>
+        <div class="pills"><span class="sev high">high</span><span class="mode observe">Observe</span><span class="tog">● enabled</span></div></div>
+      <div><div class="pbar"><span style="width:7%;background:var(--green)"></span><span style="width:93%;background:var(--yellow)"></span></div>
+        <div class="plegend"><span class="st-drift">drifted on 138 / 148 agents</span></div></div>
+      <div class="col-r"><div class="big">132</div><div>detected · 7d</div><div style="margin-top:.35rem">1 Baseline</div><div class="view" style="margin-top:.35rem">View →</div></div>
+    </div>
+    <div class="gcard" data-state="drift" data-sev="high" data-mode="observe" data-name="windows firewall domain profile enablefirewall" onclick="showDetail()">
+      <div><div class="name">CIS — Windows Firewall enabled (Domain profile)</div>
+        <div class="spec">reg · EnableFirewall = 1</div>
+        <div class="pills"><span class="sev high">high</span><span class="mode observe">Observe</span><span class="tog">● enabled</span></div></div>
+      <div><div class="pbar"><span style="width:72%;background:var(--green)"></span><span style="width:28%;background:var(--yellow)"></span></div>
+        <div class="plegend"><span class="st-drift">drifted on 41 / 148 agents</span></div></div>
+      <div class="col-r"><div class="big">44</div><div>detected · 7d</div><div style="margin-top:.35rem">1 Baseline</div><div class="view" style="margin-top:.35rem">View →</div></div>
+    </div>
+    <div class="gcard" data-state="drift" data-sev="high" data-mode="observe" data-name="lsass runasppl protected process" onclick="showDetail()">
+      <div><div class="name">CIS — LSASS runs as protected process (RunAsPPL)</div>
+        <div class="spec">reg · RunAsPPL = 1</div>
+        <div class="pills"><span class="sev high">high</span><span class="mode observe">Observe</span><span class="tog">● enabled</span></div></div>
+      <div><div class="pbar"><span style="width:19%;background:var(--green)"></span><span style="width:81%;background:var(--yellow)"></span></div>
+        <div class="plegend"><span class="st-drift">drifted on 120 / 148 agents</span></div></div>
+      <div class="col-r"><div class="big">118</div><div>detected · 7d</div><div style="margin-top:.35rem">1 Baseline</div><div class="view" style="margin-top:.35rem">View →</div></div>
+    </div>
+    <!-- drifting · medium -->
+    <div class="gcard" data-state="drift" data-sev="medium" data-mode="observe" data-name="autoplay non-volume devices" onclick="showDetail()">
+      <div><div class="name">CIS — AutoPlay disabled for non-volume devices</div>
+        <div class="spec">reg · NoAutoplayfornonVolume = 1</div>
+        <div class="pills"><span class="sev medium">medium</span><span class="mode observe">Observe</span><span class="tog">● enabled</span></div></div>
+      <div><div class="pbar"><span style="width:35%;background:var(--green)"></span><span style="width:65%;background:var(--yellow)"></span></div>
+        <div class="plegend"><span class="st-drift">drifted on 96 / 148 agents</span></div></div>
+      <div class="col-r"><div class="big">94</div><div>detected · 7d</div><div style="margin-top:.35rem">1 Baseline</div><div class="view" style="margin-top:.35rem">View →</div></div>
+    </div>
+    <div class="gcard" data-state="drift" data-sev="medium" data-mode="observe" data-name="powershell script block logging" onclick="showDetail()">
+      <div><div class="name">CIS — PowerShell script block logging enabled</div>
+        <div class="spec">reg · EnableScriptBlockLogging = 1</div>
+        <div class="pills"><span class="sev medium">medium</span><span class="mode observe">Observe</span><span class="tog">● enabled</span></div></div>
+      <div><div class="pbar"><span style="width:48%;background:var(--green)"></span><span style="width:52%;background:var(--yellow)"></span></div>
+        <div class="plegend"><span class="st-drift">drifted on 77 / 148 agents</span></div></div>
+      <div class="col-r"><div class="big">79</div><div>detected · 7d</div><div style="margin-top:.35rem">1 Baseline</div><div class="view" style="margin-top:.35rem">View →</div></div>
+    </div>
+    <!-- compliant -->
+    <div class="gcard" data-state="ok" data-sev="high" data-mode="observe" data-name="rdp disabled fdenytsconnections" onclick="showDetail()">
+      <div><div class="name">CIS — RDP disabled</div>
+        <div class="spec">reg · fDenyTSConnections = 1</div>
+        <div class="pills"><span class="sev high">high</span><span class="mode observe">Observe</span><span class="tog">● enabled</span></div></div>
+      <div><div class="pbar"><span style="width:100%;background:var(--green)"></span></div>
+        <div class="plegend"><span class="st-ok">compliant · 148 / 148 agents</span></div></div>
+      <div class="col-r"><div class="big muted">0</div><div>detected · 7d</div><div style="margin-top:.35rem">1 Baseline</div><div class="view" style="margin-top:.35rem">View →</div></div>
+    </div>
+    <div class="gcard" data-state="ok" data-sev="high" data-mode="observe" data-name="uac enabled enablelua" onclick="showDetail()">
+      <div><div class="name">CIS — UAC enabled (EnableLUA)</div>
+        <div class="spec">reg · EnableLUA = 1</div>
+        <div class="pills"><span class="sev high">high</span><span class="mode observe">Observe</span><span class="tog">● enabled</span></div></div>
+      <div><div class="pbar"><span style="width:100%;background:var(--green)"></span></div>
+        <div class="plegend"><span class="st-ok">compliant · 148 / 148 agents</span></div></div>
+      <div class="col-r"><div class="big muted">0</div><div>detected · 7d</div><div style="margin-top:.35rem">1 Baseline</div><div class="view" style="margin-top:.35rem">View →</div></div>
+    </div>
+    <!-- enforce example -->
+    <div class="gcard" data-state="drift" data-sev="high" data-mode="enforce" data-name="demo-reg-flag enforce" onclick="showDetail()">
+      <div><div class="name">demo-reg-flag</div>
+        <div class="spec">reg · DemoGuardFlag = 1 &nbsp;·&nbsp; auto-remediates</div>
+        <div class="pills"><span class="sev high">high</span><span class="mode enforce">Enforce</span><span class="tog">● enabled</span></div></div>
+      <div><div class="pbar"><span style="width:96%;background:var(--green)"></span><span style="width:4%;background:var(--yellow)"></span></div>
+        <div class="plegend"><span class="st-ok">enforced</span> · <span class="st-drift">drift auto-remediated on 6</span></div></div>
+      <div class="col-r"><div class="big">7</div><div>detected · 7 remediated</div><div style="margin-top:.35rem">1 Baseline</div><div class="view" style="margin-top:.35rem">View →</div></div>
+    </div>
+    <!-- unhealthy -->
+    <div class="gcard" data-state="unhealthy" data-sev="high" data-mode="enforce" data-name="edr agent running" onclick="showDetail()">
+      <div><div class="name">edr-agent-running</div>
+        <div class="spec">svc · CrowdStrike running</div>
+        <div class="pills"><span class="sev high">high</span><span class="mode enforce">Enforce</span><span class="tog">● enabled</span></div></div>
+      <div><div class="pbar"><span style="width:91%;background:var(--green)"></span><span style="width:9%;background:var(--red)"></span></div>
+        <div class="plegend"><span class="st-err">enforcement failing on 2 agents</span></div></div>
+      <div class="col-r"><div class="big bad" style="color:var(--red)">2</div><div>failures · 7d</div><div style="margin-top:.35rem">2 Baselines</div><div class="view" style="margin-top:.35rem">View →</div></div>
+    </div>
+    <!-- not deployed -->
+    <div class="gcard" data-state="nodep" data-sev="medium" data-mode="observe" data-name="block usb storage removable" style="opacity:.8" onclick="showDetail()">
+      <div><div class="name">block-usb-storage</div>
+        <div class="spec">reg · USBSTOR Start = 4</div>
+        <div class="pills"><span class="sev medium">medium</span><span class="mode observe">Observe</span><span class="tog off">● enabled</span></div></div>
+      <div><div class="pbar"><span style="width:100%;background:var(--surface2);color:var(--muted)">not in any deployed Baseline</span></div></div>
+      <div class="col-r"><div class="big muted">—</div><div>never reported</div><div style="margin-top:.35rem">0 Baselines</div><div class="view" style="margin-top:.35rem">View →</div></div>
+    </div>
+  </div>
+
+  <div class="note">Showing a representative slice; the live list pages all guards. Filter = <b>search + state + severity + mode</b>,
+    combinable. Cards roll up from the delta status feed + drift-event log (no extra traffic). <i>"State now" mirrors the
+    Baseline cards so the two tabs read the same.</i></div>
+</div>
+
+<!-- ════════════════ VIEW 2 — GUARD FULL PAGE ════════════════ -->
+<div id="view-detail" style="display:none">
+  <span class="back" onclick="showList()">&larr; All guards</span>
+
+  <div class="phead">
+    <div>
+      <div class="hl"><h2>CIS — Windows Firewall enabled (Domain profile)</h2>
+        <span class="sev high">high</span><span class="mode observe">Observe</span><span class="tog">● enabled</span></div>
+      <div class="sub" style="margin:.35rem 0 0">Delivered by <b style="color:var(--lightblue)">1 Baseline</b> (CIS Windows 11) ·
+        reports on change, piggybacked on heartbeat</div>
+    </div>
+    <div class="actions">
+      <button class="btn accent">↻ Refresh census</button>
+      <button class="btn">Add to Baseline</button>
+      <button class="btn">Disable</button>
+      <button class="btn danger">Delete</button>
+    </div>
+  </div>
+
+  <div class="sech">What it checks</div>
+  <div class="spec-grid">
+    <span class="k">Type</span><span>Registry value</span>
+    <span class="k">Key</span><span><code>HKLM\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile</code></span>
+    <span class="k">Value</span><span><code>EnableFirewall</code> (REG_DWORD)</span>
+    <span class="k">Expected</span><span><code>1</code> &nbsp;<span class="muted">— drift = any other value or missing</span></span>
+  </div>
+
+  <div class="sech">Fleet compliance — as of last check-in</div>
+  <div style="display:flex;gap:1.5rem;align-items:center;flex-wrap:wrap">
+    <div style="font-size:2.1rem;font-weight:700;color:var(--white);line-height:1">72%<div style="font-size:.64rem;color:var(--muted);font-weight:400;text-transform:uppercase;letter-spacing:.05em">compliant · 148/148 agents reporting</div></div>
+    <div style="flex:1;min-width:320px">
+      <div class="pbar"><span style="width:72%;background:var(--green)">105</span><span style="width:28%;background:var(--yellow)">41</span><span style="width:0%;background:var(--slate)">2</span></div>
+      <div class="plegend"><span><i style="background:var(--green)"></i>Compliant <b>105</b></span><span><i style="background:var(--yellow)"></i>Drifted <b>41</b></span><span><i style="background:var(--slate)"></i>Unknown <b>2</b></span></div>
+    </div>
+  </div>
+  <div class="strip" style="margin-top:.9rem">
+    <div class="stat"><div class="n warn">41</div><div class="l">Agents drifted</div><div class="sx">of 148</div></div>
+    <div class="stat"><div class="n warn">44</div><div class="l">Drift detected</div><div class="sx">7d</div></div>
+    <div class="stat"><div class="n">2m</div><div class="l">Last activity</div><div class="sx">most recent report</div></div>
+    <div class="stat"><div class="n info">1</div><div class="l">Baselines</div><div class="sx">CIS Windows 11</div></div>
+  </div>
+  <div class="note" style="margin-top:.5rem;border:none;padding:0"><b>Observe guard</b> — reports drift, no auto-remediation,
+    so no "remediated / failed" tiles. Switch to Enforce and a remediation-effectiveness block appears here.</div>
+
+  <div class="sech">Per-device status <span style="font-weight:400;color:var(--muted);text-transform:none;letter-spacing:0">— on-demand census</span></div>
+  <div class="refreshbar">
+    <div class="chips" id="dev-chips">
+      <span class="chip on" data-d="all" onclick="pickDev(this)">All <span class="c">148</span></span>
+      <span class="chip" data-d="drift" onclick="pickDev(this)">Drifted <span class="c">41</span></span>
+      <span class="chip" data-d="ok" onclick="pickDev(this)">Compliant <span class="c">105</span></span>
+      <span class="chip" data-d="unk" onclick="pickDev(this)">Unknown <span class="c">2</span></span>
+    </div>
+    <input type="search" id="dq" placeholder="Search devices…" oninput="applyDev()">
+    <button class="btn accent">↻ Refresh now</button>
+    <span class="resultcount">last refreshed 10:24 · on-demand only</span>
+  </div>
+  <table id="dev">
+    <thead><tr><th>Device</th><th>OS</th><th>Status</th><th>Observed value</th><th>Last reported</th></tr></thead>
+    <tbody>
+      <tr class="click" data-d="drift" data-name="win-prd-0148"><td class="dname">WIN-PRD-0148</td><td class="muted">Windows 11 Pro</td><td class="st-drift">drifted</td><td><code>0</code></td><td class="muted">2m ago</td></tr>
+      <tr class="click" data-d="drift" data-name="win-prd-0142"><td class="dname">WIN-PRD-0142</td><td class="muted">Windows 11 Pro</td><td class="st-drift">drifted</td><td><code>0</code></td><td class="muted">3m ago</td></tr>
+      <tr class="click" data-d="drift" data-name="win-lab-0027"><td class="dname">WIN-LAB-0027</td><td class="muted">Windows 11 Ent</td><td class="st-drift">drifted</td><td><code>(missing)</code></td><td class="muted">5m ago</td></tr>
+      <tr class="click" data-d="ok" data-name="win-prd-0061"><td class="dname">WIN-PRD-0061</td><td class="muted">Windows 11 Pro</td><td class="st-ok">compliant</td><td><code>1</code></td><td class="muted">1m ago</td></tr>
+      <tr class="click" data-d="ok" data-name="win-prd-0003"><td class="dname">WIN-PRD-0003</td><td class="muted">Windows 11 Pro</td><td class="st-ok">compliant</td><td><code>1</code></td><td class="muted">1m ago</td></tr>
+      <tr class="click" data-d="ok" data-name="win-fin-0012"><td class="dname">WIN-FIN-0012</td><td class="muted">Windows 11 Pro</td><td class="st-ok">compliant</td><td><code>1</code></td><td class="muted">2m ago</td></tr>
+      <tr class="click" data-d="unk" data-name="win-dev-0099"><td class="dname">WIN-DEV-0099</td><td class="muted">Windows 11 Pro</td><td class="st-unk">unknown</td><td class="muted">—</td><td class="muted">offline 3d</td></tr>
+    </tbody>
+  </table>
+  <div style="font-size:.7rem;color:var(--accent);cursor:pointer;margin-top:.4rem">view all 148 devices →</div>
+
+  <div class="sech">Recent events (this guard)</div>
+  <div class="events">
+    <div class="ev"><span class="t">10:24:02</span><span class="badge">drift</span><span>Domain firewall disabled — drift on <b>WIN-PRD-0148</b></span></div>
+    <div class="ev"><span class="t">10:23:11</span><span class="badge">drift</span><span>Domain firewall disabled — drift on <b>WIN-PRD-0142</b></span></div>
+    <div class="ev"><span class="t">10:19:48</span><span class="badge">drift</span><span>Domain firewall disabled — drift on <b>WIN-LAB-0027</b></span></div>
+    <div class="ev"><span class="t" style="text-align:center;width:100%;color:var(--accent);cursor:pointer">view all 44 events for this guard →</span></div>
+  </div>
+
+  <div class="note">The per-device census is a <b>scoped, on-demand re-check</b> — it loads only when you open this page or hit
+    Refresh, never on a timer, so a guard page costs no steady-state fleet traffic. Device rows link to the host page.</div>
+</div>
+
+<script>
+  function showDetail(){document.getElementById('view-list').style.display='none';document.getElementById('view-detail').style.display='';window.scrollTo(0,0);}
+  function showList(){document.getElementById('view-detail').style.display='none';document.getElementById('view-list').style.display='';window.scrollTo(0,0);}
+
+  let curState='all';
+  function pickState(el){document.querySelectorAll('#state-chips .chip').forEach(c=>c.classList.remove('on'));el.classList.add('on');curState=el.dataset.state;applyFilter();}
+  function applyFilter(){
+    const q=document.getElementById('q').value.toLowerCase().trim();
+    const sev=document.getElementById('sev').value, mode=document.getElementById('mode').value;
+    let shown=0,total=0;
+    document.querySelectorAll('#cards .gcard').forEach(c=>{
+      total++;
+      const ok=(curState==='all'||c.dataset.state===curState)
+        &&(sev==='all'||c.dataset.sev===sev)
+        &&(mode==='all'||c.dataset.mode===mode)
+        &&(!q||c.dataset.name.includes(q)||c.querySelector('.name').textContent.toLowerCase().includes(q));
+      c.style.display=ok?'':'none';if(ok)shown++;
+    });
+    document.getElementById('rc').textContent=shown+' of '+total+' guards';
+  }
+
+  let curDev='all';
+  function pickDev(el){document.querySelectorAll('#dev-chips .chip').forEach(c=>c.classList.remove('on'));el.classList.add('on');curDev=el.dataset.d;applyDev();}
+  function applyDev(){
+    const q=(document.getElementById('dq').value||'').toLowerCase().trim();
+    document.querySelectorAll('#dev tbody tr').forEach(r=>{
+      const ok=(curDev==='all'||r.dataset.d===curDev)&&(!q||r.dataset.name.includes(q));
+      r.style.display=ok?'':'none';
+    });
+  }
+</script>
+</div>
+</body>
+</html>

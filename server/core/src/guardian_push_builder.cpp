@@ -52,6 +52,17 @@ void fill_block(::yuzu::guardian::v1::GuardianSpecBlock* blk, const nlohmann::js
 
 } // namespace
 
+std::vector<GuaranteedStateRuleRow>
+filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
+                        const std::unordered_set<std::string>& deployed_rule_ids) {
+    std::vector<GuaranteedStateRuleRow> out;
+    out.reserve(rules.size());
+    for (const auto& r : rules)
+        if (deployed_rule_ids.contains(r.rule_id))
+            out.push_back(r);
+    return out;
+}
+
 bool os_target_matches(std::string_view target, std::string_view agent_os) {
     if (target.empty())
         return true;  // rule applies to every OS
@@ -62,6 +73,26 @@ bool os_target_matches(std::string_view target, std::string_view agent_os) {
                       // guard for an agent whose session has no os (disconnect race,
                       // partial registration) — worse than the pre-M4 send-all.
     return normalize_os(target) == normalize_os(agent_os);
+}
+
+bool guardian_enforced_on_platform(std::string_view agent_os) {
+    if (agent_os.empty())
+        return true;  // unknown OS — never mislabel it "not implemented"
+    // Guards arm on Windows only today (guard_registry.cpp / guard_file.cpp start()
+    // return false on every other platform). normalize_os folds darwin->macos and
+    // lower-cases, so a verbose "Windows 11 Pro" still resolves to "windows".
+    return normalize_os(agent_os) == "windows";
+}
+
+std::string platform_display_name(std::string_view agent_os) {
+    const std::string v = normalize_os(agent_os);  // darwin->macos, lower-cased
+    if (v == "windows")
+        return "Windows";
+    if (v == "macos")
+        return "macOS";
+    if (v == "linux")
+        return "Linux";
+    return agent_os.empty() ? std::string{"unknown"} : std::string{agent_os};
 }
 
 ::yuzu::guardian::v1::GuaranteedStatePush
