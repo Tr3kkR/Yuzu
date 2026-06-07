@@ -4480,18 +4480,18 @@ void RestApiV1::register_routes(
                      // SYSTEM-write past the H1 gate (contract §6).
                      if (updated.enforcement_mode == "enforce") {
                          if (std::string why =
-                                 guardian::dangerous_enforce_key_in_spec(updated.spec_json);
+                                 guardian::dangerous_enforce_in_spec(updated.spec_json);
                              !why.empty()) {
                              res.status = 400;
                              res.set_content(
                                  detail::error_json_a4(
                                      400, "enforce mode not permitted: this guard targets " + why,
                                      cid,
-                                     "keep this guard in audit mode, or re-author it against a key "
-                                     "outside the protected persistence/privilege set"),
+                                     "keep this guard in audit mode, or re-author it against a "
+                                     "non-protected target"),
                                  "application/json");
                              audit_fn(req, "guaranteed_state.rule.update", "denied",
-                                      "GuaranteedState", id, "enforce on denylisted key");
+                                      "GuaranteedState", id, "enforce on denylisted target");
                              return;
                          }
                      }

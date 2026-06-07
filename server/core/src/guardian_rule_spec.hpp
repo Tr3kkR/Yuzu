@@ -64,10 +64,22 @@ RuleSpecResult derive_rule_spec(const nlohmann::json& body, const std::string& n
 /// the create-only gate is trivially bypassed.
 std::string dangerous_enforce_registry_key(std::string_view key);
 
-/// Parse a canonical `spec_json` and, iff it carries a `registry-value-equals`
-/// assertion whose key is denylisted, return the class name; else "". For callers
-/// that hold only the stored spec (the toggle, the metadata-only update, and the
-/// push builder), not a fresh request body.
-std::string dangerous_enforce_key_in_spec(const std::string& spec_json);
+/// Non-empty human-readable class name iff ENFORCE-mode STOPPING the named service
+/// would disable a security control (Defender / Security Center / Firewall / Event
+/// Log) or the Yuzu agent's own service (self-destruct / flap); empty = allowed.
+/// The service-control analogue of `dangerous_enforce_registry_key`: enforce
+/// `service-stopped` is the dangerous direction; enforce `service-running` is
+/// protective and never gated. Match is case-insensitive EXACT on the SCM key name
+/// (service names are not path-structured, so substring matching would over-block).
+/// Audit-mode observation of these services is always allowed.
+std::string dangerous_enforce_service_stop(std::string_view service_name);
+
+/// Parse a canonical `spec_json` and return a non-empty reason iff promoting it to
+/// enforce is dangerous — a `registry-value-equals` assertion on a denylisted key,
+/// or a `service-stopped` assertion on a denylisted service. Empty = safe. For the
+/// callers that hold only the stored spec (the mode toggle, the metadata-only
+/// update, and the push backstop), not a fresh request body — every path that
+/// promotes a rule to enforce must share this one check.
+std::string dangerous_enforce_in_spec(const std::string& spec_json);
 
 } // namespace yuzu::server::guardian

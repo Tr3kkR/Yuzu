@@ -21,6 +21,7 @@
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/guard_file.hpp>
 #include <yuzu/agent/guard_registry.hpp>
+#include <yuzu/agent/guard_service.hpp>
 #include <yuzu/agent/kv_store.hpp>
 
 #include "agent.grpc.pb.h"
@@ -576,6 +577,59 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
             return true;
         }
         spdlog::warn("Guardian: file guard for rule '{}' did not start (non-Windows or empty path)",
+                     rule.rule_id());
+        return false;
+    }
+
+    // ── service-status-change Spark (PR5) — ServiceGuard ──────────────────────
+    if (rule.spark().type() == "service-status-change") {
+        const auto& sa = rule.assertion();
+        const std::string atype = sa.type();
+        ServiceGuard::Desired desired;
+        if (atype == "service-running")
+            desired = ServiceGuard::Desired::Running;
+        else if (atype == "service-stopped")
+            desired = ServiceGuard::Desired::Stopped;
+        else
+            return false; // unknown/unsupported assertion stays unarmed (G11: errored upstream)
+        auto aparam = [&sa](const char* k) -> std::string {
+            auto it = sa.params().find(k);
+            return it != sa.params().end() ? it->second : std::string{};
+        };
+        const bool enforce = (rule.enforcement_mode() == "enforce");
+        ServiceGuard::Config cfg;
+        cfg.rule_id = rule.rule_id();
+        cfg.rule_name = rule.name();
+        cfg.service_name = aparam("service_name");
+        cfg.desired = desired;
+        // "enforce" → drive the service to its desired state on drift; any other mode
+        // (audit / observe) only detects and reports.
+        cfg.enforce = enforce;
+        const auto& srem = rule.remediation();
+        auto sget = [&srem](std::string_view k) -> std::string {
+            auto it = srem.params().find(std::string(k));
+            return it != srem.params().end() ? it->second : std::string{};
+        };
+        cfg.resilience = parse_resilience_params(sget, cfg.event_debounce_ms);
+        const std::string log_service = cfg.service_name; // captured before the move below
+
+        auto service_sink = [this](const GuardDrift& d) { emit_guard_event(d); };
+        if (auto it = guards_.find(rule.rule_id()); it != guards_.end()) {
+            if (it->second)
+                it->second->stop();
+            guards_.erase(it);
+        }
+        auto sguard = std::make_unique<ServiceGuard>(std::move(cfg), std::move(service_sink));
+        if (sguard->start()) {
+            guards_.emplace(rule.rule_id(), std::move(sguard));
+            spdlog::info("Guardian: service guard armed for rule '{}' (service={}, expect={}, mode={})",
+                         rule.rule_id(), log_service,
+                         desired == ServiceGuard::Desired::Running ? "running" : "stopped",
+                         enforce ? "enforce" : "audit");
+            return true;
+        }
+        spdlog::warn("Guardian: service guard for rule '{}' did not start "
+                     "(non-Windows or invalid service name)",
                      rule.rule_id());
         return false;
     }

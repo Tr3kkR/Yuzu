@@ -2,7 +2,7 @@
 
 Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rule** is a desired-state assertion about an endpoint — a registry value, a service status, a file presence, a configuration key — plus optional automatic remediation when the endpoint drifts. Unlike the server-side [Policy Engine](policy-engine.md), Guardian runs *inside the agent*, reacts to kernel-backed change notifications in sub-second time, and can repair drift without an operator in the loop.
 
-> **Status — read this first.** Guardian's control plane, the agent guard host, and the **Windows `registry` guard** are live and verified end-to-end. Rules are authored/stored/pushed via the REST API; a push is delivered to in-scope agents over both the direct gRPC stream and the Erlang gateway, the agent arms the guard, and drift is detected sub-second (`agent_id` is server/gateway-asserted, never self-reported). The registry guard runs in two modes: **`enforce`** — on drift the agent *writes the expected value back* via a single in-process `RegSetValueExW` syscall (tens of µs; emits `drift.remediated`, or `remediation.failed` if the write is denied) — and **`audit`** — detect and report only, no write-back. A restarted agent re-arms enforce guards from its local cache and enforces **pre-network** (heal-on-restart); drift in that pre-network window is enforced but not reported until reconnect (durable event buffering is Guardian A3).
+> **Status — read this first.** Guardian's control plane, the agent guard host, and the **Windows `registry`, `file`, and `service` (run-state) guards** are live and verified end-to-end. Rules are authored/stored/pushed via the REST API; a push is delivered to in-scope agents over both the direct gRPC stream and the Erlang gateway, the agent arms the guard, and drift is detected sub-second (`agent_id` is server/gateway-asserted, never self-reported). The registry guard runs in two modes: **`enforce`** — on drift the agent *writes the expected value back* via a single in-process `RegSetValueExW` syscall (tens of µs; emits `drift.remediated`, or `remediation.failed` if the write is denied) — and **`audit`** — detect and report only, no write-back. A restarted agent re-arms enforce guards from its local cache and enforces **pre-network** (heal-on-restart); drift in that pre-network window is enforced but not reported until reconnect (durable event buffering is Guardian A3).
 >
 > **Boundaries you must know before enabling `enforce`:** (1) `enforce` is **HKCU-demo-grade today** — HKLM writes need the agent service account to hold write access; a non-writable key **degrades to a read-only watch that reports `remediation.failed`, it does not silently disarm**. (2) The rule `signature` is **not yet verified** before a guard arms, so the integrity gate on what gets written where is **Push RBAC + mTLS**, not rule signing (deferred — contract G3). (3) Agent status is **fail-closed**: an armed guard reports `errored`/not-healthy, never a green "compliant", until the self-test lands — do not read the agent status proto as proof of enforcement. (4) `enforcement_mode` defaults to **`enforce`** on rule create — see the upgrade note below. Still on the roadmap: non-Windows guards, server-side Prometheus metrics, fight-loop rate-limiting, rule signing, and durable event buffering (A3). Gateway drift forwarding is best-effort (`yuzu_gw_guardian_forward_dropped_total`). Design: `docs/yuzu-guardian-design-v1.1.md`. Rollout plan: `docs/yuzu-guardian-windows-implementation-plan.md`.
 
@@ -11,8 +11,8 @@ Guardian is Yuzu's real-time policy enforcement engine. A **guaranteed-state rul
 | Term | Meaning |
 |---|---|
 | **Rule** | A YAML document describing a desired state, a detection strategy, and an optional remediation. Stored server-side with `yaml_source` as the authoritative form. |
-| **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. The Windows `registry` guard is live; service/ETW and non-Windows guards are on the roadmap. |
-| **Event** | A record of detected drift, attempted remediation, a compliant transition, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. Live `event_type` values from the registry guard: `drift.detected` (drift observed in **audit** mode — no write-back), `drift.remediated` (enforce write-back restored the expected value), `remediation.failed` (enforce attempted but the write was denied — e.g. a read-only-fallback key), `guard.compliant` (emitted **once** on the transition into compliant — arm-compliant, baseline-on-arm, or a cleared drift — then silent in steady state, so a healthy guard adds no ongoing fleet traffic; drives the per-(agent, rule) compliance census). |
+| **Guard** | The agent-side component that watches a kernel signal (Windows registry change, service SCM transition, ETW event) and evaluates the rule. The Windows `registry`, `file`, and `service` (run-state) guards are live; service start-type, ETW, and non-Windows guards are on the roadmap. |
+| **Event** | A record of detected drift, attempted remediation, a compliant transition, or agent sync activity. Queried via `/api/v1/guaranteed-state/events`. Live `event_type` values (all guard types — registry, file, service): `drift.detected` (drift observed in **audit** mode — no remediation), `drift.remediated` (enforce restored the expected state — a registry write-back, or a service start/stop), `remediation.failed` (enforce attempted but the action was denied — e.g. a read-only-fallback registry key or a service-control access denial), `guard.compliant` (emitted **once** on the transition into compliant — arm-compliant, baseline-on-arm, or a cleared drift — then silent in steady state, so a healthy guard adds no ongoing fleet traffic; drives the per-(agent, rule) compliance census). |
 | **Baseline** | The named, **deployable** collection of Guards — the *only* deployable unit. A Guard reaches an agent **exclusively** as a member of a *deployed* Baseline; authoring a Guard alone never enforces it anywhere. Has a draft → deployed lifecycle. See [Baselines](#baselines--how-guards-reach-agents). |
 | **Assignment** | A Baseline's targeting: a set of *included* minus *excluded* management groups (exclude wins). **Deferred** — management-group targeting is not wired yet, so deploy is fleet-wide for now and the dashboard labels the assignment area "coming soon." |
 | **Push** | The distribution of the deployed-Baseline rule union to a scope of agents (driven by a Baseline deploy/re-deploy, or the REST `/push`). Separates deploy authority (`Push`) from authoring authority (`Write`). |
@@ -63,7 +63,7 @@ spec:
     value_type: REG_DWORD
 ```
 
-Two Windows guard types ship today: the **registry** guard (above) and the **file** guard (below). Linux (inotify/netlink/D-Bus) and macOS (Endpoint Security / FSEvents) guards are on the roadmap.
+Three Windows guard types ship today: the **registry** guard (above), the **file** guard (below), and the **service** guard (below). Linux (inotify/netlink/D-Bus) and macOS (Endpoint Security / FSEvents) guards are on the roadmap.
 
 ## File guards — detect a file changed or deleted, in realtime
 
@@ -90,6 +90,36 @@ curl -X POST https://yuzu.example.com/api/v1/guaranteed-state/rules \
 ```
 
 The full type catalog — including these file types and the `expected_hash` format — is discoverable at `GET /api/v1/guaranteed-state/schemas` (see [Schema discovery](#schema-discovery)).
+
+## Service guards — keep a Windows service running (or stopped), in realtime
+
+A `service-status-change` spark watches one Windows service via `NotifyServiceStatusChange` — kernel-notified by the Service Control Manager, **no polling**, so a stop or start is detected in ~0 ms. The watch is resilient: it survives the service being deleted and recreated, and re-arms automatically. The assertion *type* encodes the desired run state; the only param is the service (key) name:
+
+Like every Guard, a service Guard reaches an agent — and therefore enforces — **only as a member of a [deployed Baseline](#baselines--how-guards-reach-agents)**; authoring one alone does nothing on any endpoint.
+
+| Assertion | Drift when | Key params |
+|---|---|---|
+| `service-running` | the service is not Running (stopped, paused, or absent) | `service_name` (required) — the SCM **key** name, e.g. `Spooler`, not the display name |
+| `service-stopped` | the service is Running or paused | `service_name` (required) |
+
+In **enforce** mode the guard drives the service back to its desired state via the Windows service-control API (`StartService` / `ControlService` — never `sc.exe` or `net start`), gated by the same per-rule resilience policy as registry guards. In **audit** mode it only detects and reports. This is the canonical way to keep a security service alive — *Microsoft Defender must always be running; restart it if it stops* — or held down — *the Print Spooler must stay stopped*. Transitional SCM states (`START_PENDING`, `STOP_PENDING`, …) are held: drift is reported only once the service settles into a terminal state, so a normal restart doesn't trigger a spurious enforce loop.
+
+```bash
+# Keep the Print Spooler stopped (PrintNightmare hardening), enforcing.
+curl -X POST https://yuzu.example.com/api/v1/guaranteed-state/rules \
+  -H "Authorization: Bearer $YUZU_TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "rule_id": "spooler-stopped", "name": "Print Spooler held stopped",
+    "enforcement_mode": "enforce",
+    "spark":      {"type": "service-status-change", "params": {}},
+    "assertion":  {"type": "service-stopped", "params": {"service_name": "Spooler"}},
+    "remediation":{"type": "enforce", "params": {}}
+  }'
+```
+
+> **Enforce-stop is denied for protected services.** So that Guardian — a security-enforcement tool — cannot be turned into a security-control *disabler* (or be made to stop itself), the server **rejects** an `enforce` + `service-stopped` rule (HTTP 400, A4 error envelope) targeting these SCM key names, and the push backstop downgrades any that slip through to `audit`: `WinDefend`, `WdNisSvc`, `Sense`, `wscsvc`, `mpssvc`, `EventLog` (security controls); `RpcSs`, `DcomLaunch` (critical infrastructure — stopping them strands the agent and the host); and `YuzuAgent` (the agent's own service). These services can still be **observed** in `audit` mode. `service-running` enforce (keeping a service *up*) is always allowed. The set covers Windows built-in services + the agent — it does **not** cover third-party EDR/AV; protecting those is on the roadmap (an operator-extensible denylist).
+
+> **`service-disabled` (start-type) has no enforce path yet.** A service's *startup type* fires no SCM notification, so it is not a native assertion. You can **detect** start-type drift with a **registry guard in `audit` mode** on `HKLM\SYSTEM\CurrentControlSet\Services\<name>\Start` (`4` = disabled), but you **cannot enforce** it that way — `…\Services\…` is on the registry enforce denylist (it is a privilege/persistence key), so an `enforce` registry write there is rejected by design. To *set* a service's start type, use Group Policy or your MDM; pair it with a `service-stopped` audit guard to alert if the service runs. Like file guards, service guards are authored via the REST API or the seed rig today; a dashboard authoring form follows.
 
 ## Workflow
 
@@ -176,7 +206,7 @@ The **+ New Guard** button (top of `/guardian`) opens a structured create form f
 
 A **Baseline** is a named collection of Guards and is the **only deployable unit**. Authoring a Guard (REST or the dashboard form) creates it *unscoped and inert* — it enforces nothing until it is a member of a **deployed** Baseline. This mirrors a GPO / Intune configuration profile / Jamf profile: you assemble controls into a baseline and deploy the baseline.
 
-The Baseline surface is on the dashboard (`/guardian` → Baselines). It is **dashboard-only today — there is no `/api/v1` Baseline route yet** (tracked as an agentic-first parity gap); scripted/agentic clients can author and push individual Guards via the REST surface above, but the deployable-collection model is GUI-only for now.
+The Baseline surface is on the dashboard (`/guardian` → Baselines). It is **dashboard-only today — there is no `/api/v1` Baseline route yet** (tracked as an agentic-first parity gap); scripted/agentic clients can **author** individual Guards via the REST surface above, but **enforcement requires those Guards to be members of a Baseline an operator deploys** — authoring a Guard (or calling `POST /push`) never enforces a standalone Guard, and the deployable-collection model itself is GUI-only for now.
 
 | Action | Securable | Effect |
 |---|---|---|

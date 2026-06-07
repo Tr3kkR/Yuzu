@@ -30,6 +30,15 @@ constexpr std::string_view kRegistryHives[] = {"HKLM", "HKCU", "HKCR", "HKU"};
 constexpr std::string_view kRegistryValueTypes[] = {"REG_DWORD", "REG_QWORD", "REG_SZ",
                                                     "REG_EXPAND_SZ"};
 
+// Single source for the service run-state tokens (H2). These MUST mirror exactly
+// what the agent's ServiceGuard arms (`service_support::kStates` in
+// guard_service.hpp): each `S` here maps to a `service-<S>` assertion below and to
+// the agent's service spark branch in guardian_engine.cpp. `service-disabled`
+// (start-type config) is intentionally NOT here until the agent decodes it — it is
+// registry-expressible today via the Services\<name>\Start DWORD. Drives the
+// authoring validator and the schema↔handler cross-check test (contract G9).
+constexpr std::string_view kServiceStates[] = {"running", "stopped"};
+
 json string_view_enum(const std::string_view* first, const std::string_view* last) {
     json arr = json::array();
     for (const std::string_view* it = first; it != last; ++it)
@@ -181,6 +190,38 @@ json file_hash_equals_params() {
     };
 }
 
+// service-status-change spark (PR5): matched on `type` only — the watched service
+// is the assertion's `service_name`, mirroring how registry-change derives its
+// target from the assertion. No required params. Real-time on the agent via
+// NotifyServiceStatusChange (Windows MVP).
+json service_status_change_params() {
+    return json{
+        {"type", "object"},
+        {"description", "No params: the watched service is the assertion's `service_name`."},
+        {"properties", json::object()},
+        {"additionalProperties", true},
+    };
+}
+
+// service-running / service-stopped assertion params. The assertion TYPE encodes the
+// desired run state; the only param is the SCM service (key) name. The pattern
+// mirrors the agent's valid_service_name() (alphanumeric + . _ - @, 1..256) so a
+// name the agent would reject cannot be authored.
+json service_assertion_params() {
+    json props = {
+        {"service_name",
+         {{"type", "string"},
+          {"pattern", "^[A-Za-z0-9._@-]{1,256}$"},
+          {"description", "SCM service (key) name, e.g. Spooler — NOT the display name."}}},
+    };
+    return json{
+        {"type", "object"},
+        {"properties", std::move(props)},
+        {"required", json::array({"service_name"})},
+        {"additionalProperties", false},
+    };
+}
+
 json build_catalog() {
     json schemas = json::array();
 
@@ -201,6 +242,9 @@ json build_catalog() {
     add("spark", "file-change",
         block_schema("file-change", "File change trigger (realtime)", file_change_params(),
                      /*params_required=*/false));
+    add("spark", "service-status-change",
+        block_schema("service-status-change", "Service status change trigger (realtime)",
+                     service_status_change_params(), /*params_required=*/false));
     add("assertion", "registry-value-equals",
         block_schema("registry-value-equals", "Registry value equals",
                      registry_value_equals_params(), /*params_required=*/true));
@@ -209,6 +253,15 @@ json build_catalog() {
                      /*params_required=*/true));
     add("assertion", "file-hash-equals",
         block_schema("file-hash-equals", "File content matches a hash", file_hash_equals_params(),
+                     /*params_required=*/true));
+    // Service run-state assertions (PR5). The state is encoded in the assertion TYPE
+    // (one per kServiceStates token); the only param is the service name. The
+    // schema↔handler cross-check binds these to the agent's service_support::kStates.
+    add("assertion", "service-running",
+        block_schema("service-running", "Service must be running", service_assertion_params(),
+                     /*params_required=*/true));
+    add("assertion", "service-stopped",
+        block_schema("service-stopped", "Service must be stopped", service_assertion_params(),
                      /*params_required=*/true));
     // Resilience policy lives in remediation.params for BOTH actions (it is read
     // for every guard); the mode/backoff/bounded params take effect only when the
@@ -266,6 +319,12 @@ const std::vector<std::string_view>& supported_registry_hives() {
 const std::vector<std::string_view>& supported_registry_value_types() {
     static const std::vector<std::string_view> v(std::begin(kRegistryValueTypes),
                                                   std::end(kRegistryValueTypes));
+    return v;
+}
+
+const std::vector<std::string_view>& supported_service_states() {
+    static const std::vector<std::string_view> v(std::begin(kServiceStates),
+                                                  std::end(kServiceStates));
     return v;
 }
 
