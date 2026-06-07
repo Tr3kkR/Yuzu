@@ -236,16 +236,20 @@ def build_rules(min_severity: str = "HIGH") -> list[dict]:
         batch_response = osv_querybatch(OSV_PACKAGES)
         results = batch_response.get("results", [])
 
-        # Collect all unique vuln IDs
-        vuln_ids = set()
-        for result in results:
-            for vuln in result.get("vulns", []):
-                vuln_ids.add(vuln["id"])
+        # Map vuln IDs to their packages for later
+        vuln_to_packages = {}
+        for pkg_idx, (ecosystem, package_name) in enumerate(OSV_PACKAGES):
+            if pkg_idx < len(results):
+                for vuln in results[pkg_idx].get("vulns", []):
+                    vuln_id = vuln["id"]
+                    if vuln_id not in vuln_to_packages:
+                        vuln_to_packages[vuln_id] = []
+                    vuln_to_packages[vuln_id].append((ecosystem, package_name))
 
-        log_stderr(f"Found {len(vuln_ids)} unique vulnerabilities, fetching details...")
+        log_stderr(f"Found {len(vuln_to_packages)} unique vulnerabilities, fetching details...")
 
         # Fetch full details for each vuln
-        for vuln_id in sorted(vuln_ids):
+        for vuln_id in sorted(vuln_to_packages.keys()):
             try:
                 vuln = osv_get_vuln(vuln_id)
             except Exception:
@@ -269,31 +273,51 @@ def build_rules(min_severity: str = "HIGH") -> list[dict]:
                     description = details.split("\n")[0]
             description = description[:120].replace("\n", " ").strip()
 
-            # Extract affected packages and version bounds
+            # Extract version bounds from vuln record
             affected_list = vuln.get("affected", [])
             if not affected_list:
-                # No specific package affected info, skip this vuln
-                continue
-
-            for affected in affected_list:
-                pkg = affected.get("package", {})
-                ecosystem = pkg.get("ecosystem", "")
-                package_name = pkg.get("name", "")
-
-                if not ecosystem or not package_name:
-                    continue
-
-                bounds = extract_version_bounds([affected])
-                if not bounds:
-                    # No version bounds found, skip this package
-                    continue
-
-                for affected_below, fixed_in in bounds:
+                # No version info, use affected packages from batch query
+                for ecosystem, package_name in vuln_to_packages.get(vuln_id, []):
                     rule = {
                         "cve_id": cve_id,
                         "product": package_name,
-                        "affected_below": affected_below,
-                        "fixed_in": fixed_in,
+                        "affected_below": "0",  # Mark all affected; no specific bound
+                        "fixed_in": "unfixed",
+                        "severity": severity,
+                        "description": description,
+                        "ecosystem": ecosystem,
+                    }
+                    rules.append(rule)
+                    seen_cves.add(cve_id)
+                continue
+
+            # Try to extract version bounds from affected entries
+            # These may or may not have ecosystem/package info
+            bounds = extract_version_bounds(affected_list)
+
+            if bounds:
+                # Use bounds from vuln record, but pair with batch-discovered packages
+                for ecosystem, package_name in vuln_to_packages.get(vuln_id, []):
+                    for affected_below, fixed_in in bounds:
+                        rule = {
+                            "cve_id": cve_id,
+                            "product": package_name,
+                            "affected_below": affected_below,
+                            "fixed_in": fixed_in,
+                            "severity": severity,
+                            "description": description,
+                            "ecosystem": ecosystem,
+                        }
+                        rules.append(rule)
+                        seen_cves.add(cve_id)
+            else:
+                # No specific version bounds; mark all versions affected
+                for ecosystem, package_name in vuln_to_packages.get(vuln_id, []):
+                    rule = {
+                        "cve_id": cve_id,
+                        "product": package_name,
+                        "affected_below": "0",
+                        "fixed_in": "unfixed",
                         "severity": severity,
                         "description": description,
                         "ecosystem": ecosystem,
