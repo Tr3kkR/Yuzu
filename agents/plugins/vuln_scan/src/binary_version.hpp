@@ -64,16 +64,36 @@ inline std::string get_bundle_version(const std::string& app_path) {
         nullptr, plist.c_str(), kCFStringEncodingUTF8);
     if (!path_ref)
         return {};
-    CFURLRef url = CFURLCreateWithFileSystemPath(
-        nullptr, path_ref, kCFURLPOSIXPathStyle, false);
+    // Convert CFString path to C string for file reading
+    const char* path_c = reinterpret_cast<const char*>(CFStringGetCStringPtr(path_ref, kCFStringEncodingUTF8));
+    if (!path_c) {
+        CFRelease(path_ref);
+        return {};
+    }
+    // Read the plist file
+    FILE* f = fopen(path_c, "rb");
     CFRelease(path_ref);
-    if (!url)
+    if (!f)
         return {};
-    // Read file data from URL
-    CFDataRef data = CFDataCreateContentsOfURL(url, nullptr);
-    CFRelease(url);
-    if (!data)
+    // Get file size
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (fsize <= 0) {
+        fclose(f);
         return {};
+    }
+    // Read file into memory
+    uint8_t* buf = static_cast<uint8_t*>(malloc(fsize));
+    size_t nread = fread(buf, 1, fsize, f);
+    fclose(f);
+    if (nread != static_cast<size_t>(fsize)) {
+        free(buf);
+        return {};
+    }
+    // Create CFData from buffer (takes ownership)
+    CFDataRef data = CFDataCreateWithBytesNoCopy(
+        nullptr, buf, fsize, kCFAllocatorMalloc);
     CFPropertyListRef plist_ref = CFPropertyListCreateWithData(
         nullptr, data, kCFPropertyListImmutable, nullptr, nullptr);
     CFRelease(data);
